@@ -1804,6 +1804,8 @@ agent policy:
 | `"search_tools"` | Always use the provider-independent `search_tools(query, limit)` plus `call_tool(tool_ref, arguments)` gateway. |
 | `"openai_tool_search_client"` | Require verified OpenAI Responses client Tool Search support and fail before dispatch otherwise. |
 | `"openai_tool_search_client_or_search_tools"` | Select client Tool Search only when the registered provider reports the exact verified capability; otherwise freeze the portable gateway before dispatch. |
+| `"openai_tool_search_hosted"` | Require verified OpenAI Responses server-executed Tool Search support and fail before dispatch otherwise. |
+| `"openai_tool_search_hosted_or_search_tools"` | Select hosted Tool Search only when the registered provider reports the exact verified capability; otherwise freeze the portable gateway before dispatch. |
 
 The portable mode installs the two Cayu-owned definitions as a stable prefix on
 every request. Registering 10, 100, or 1,000 application tools therefore does
@@ -1867,21 +1869,73 @@ a discovery grant name the same function, the targeted interaction grant is the
 only provider-visible binding for that name; the discovery grant remains durable
 but is not projected ambiguously into that request.
 
+OpenAI hosted Tool Search sends every hidden, ceiling-authorized,
+not-already-exposed catalogue function as a bounded deferred candidate with
+`defer_loading=true`, followed by the exact
+`{"type":"tool_search","execution":"server"}` tool. Cayu forces
+`parallel_tool_calls=false` for this projection. OpenAI performs selection and
+returns one adjacent server `tool_search_call` / `tool_search_output` pair;
+Cayu does not execute a local `search_tools` call. Before accepting any loaded
+function, Cayu requires its name, description, and schema to exactly match both
+the candidate sent on that request and the current ceiling-authorized catalogue
+descriptor. A candidate function call without selection evidence, a loaded
+definition outside the candidate set, an altered definition, or a call outside
+the loaded subset fails terminal validation before policy, hooks, or target
+execution.
+
+The candidate projection is capped at 256 functions, 64 KiB per schema, and
+1 MiB of aggregate canonical definitions; Cayu never truncates it because
+silent truncation would change model authority. When direct or targeted exposure
+covers the complete ceiling, Cayu retains the hosted branch identity but omits
+the inert server search tool from the OpenAI request. Loaded grants and the assistant
+completion publish atomically with the branch discovery view. Background
+Responses recovery stores a SHA-256 commitment to the original candidate
+projection plus bounded, name-free SHA-256 hashes for exact native-targeted
+exclusions and replay-loaded grants. It reconstructs the projection from the
+durable session ceiling, frozen direct exposure, targeted exclusions, current
+branch grants, and admitted catalogue, and rejects recovery if an exclusion,
+replay grant, or projection commitment no longer matches.
+Streamed, terminal-only, non-streamed,
+inline-replayed, server-chained, and recovered outputs therefore enter the same
+ordinary policy, approval, hook, effect, secret, environment, execution, and
+tool-round recovery path.
+
+Hosted candidate ownership binds both the exact candidate projection and the
+branch discovery generation. A parent response reference can continue a server
+chain only for that same authority. A fork has a new generation, so Cayu breaks
+the inherited chain and neutrally rebuilds the inherited conversation before
+dispatch even when its bounded candidate definitions are byte-for-byte
+identical. The generation identity is local ownership evidence and is not added
+to the OpenAI wire `tools` array.
+
+`defer_loading=true` is an OpenAI context-loading contract, not a claim that
+Cayu omits candidate schemas from the HTTP request. OpenAI receives the bounded
+candidate definitions so its server-side search can select them; according to
+the provider contract, selected definitions are appended later in model
+context. Provider-native discovery request footprints use schema v7 and record
+only the protocol, candidate and loaded counts, and hosted branch generation;
+they retain no candidate name, description, schema, query, or provider search
+arguments. Request size and tool counts still include the candidates. Actual
+prompt-cache hits and cached-token billing are provider observations and must
+be checked through live usage evidence rather than inferred from the
+deterministic adapter fixture.
+
 OpenAI support is an application assertion on one concrete provider
-registration. List exact model ids in
-`OpenAIProvider.client_tool_search_models`; Cayu does not infer support from a
-model prefix or marketing family. This projection is established only for the
-official OpenAI Responses endpoint; compatible endpoints use portable fallback
-or fail preflight. Capability selection is frozen before dispatch and a provider
-error never changes projections after an ambiguous request. The exact provider
-allow-list and selected delivery protocol are part of execution-profile
-identity; the current loaded-definition projection is part of keyed request
-identity. Inline replay accepts a loaded definition only when its search output
-exactly matches the current canonical catalogue descriptor and branch grant;
-the trusted definition, rather than mutable transcript fields, is rendered to
-OpenAI. Server-retained response references record the exact loaded-name
-ownership and are rebuilt neutrally if the current branch lacks any retained
-tool. A fork therefore keeps the cacheable prefix before its divergence without
+registration. List exact model ids in the separate
+`OpenAIProvider.client_tool_search_models` and
+`OpenAIProvider.hosted_tool_search_models` allow-lists; Cayu does not infer
+support from a model prefix or marketing family. These projections are
+established only for the official OpenAI Responses endpoint; compatible
+endpoints use portable fallback or fail preflight. Capability selection is
+frozen before dispatch and a provider error never changes projections after an
+ambiguous request. The exact provider allow-lists and selected delivery
+protocol are part of execution-profile identity; the current client-loaded or
+hosted-candidate definition projection is part of keyed request identity.
+Inline replay accepts a loaded definition only when its search output exactly
+matches current authority. Server-retained response references record either
+the exact client-loaded names or a commitment to the complete hosted candidate
+projection and are rebuilt neutrally if current branch authority differs. A
+fork therefore keeps the cacheable prefix before its divergence without
 inheriting the parent's callable discovery grants. A loaded name is projected
 only while its canonical search-output schema remains in the exact model
 context. If trimming or compaction removes that evidence, Cayu unloads the name
@@ -1913,6 +1967,7 @@ app.register_provider(
     OpenAIProvider(
         api_key=openai_key,
         client_tool_search_models=(verified_model,),
+        hosted_tool_search_models=(verified_model,),
     ),
     default=True,
 )
@@ -1942,6 +1997,13 @@ The credential-free
 runs the native three-request search, loaded-function call, and result replay
 through the real OpenAI adapter without contacting the API. It proves adapter
 composition, not support for any production model id.
+
+The credential-free
+[`openai_hosted_tool_search`](../examples/openai_hosted_tool_search/) fixture
+runs the exact hosted selection pair, atomic grant publication, ordinary
+function execution, and result replay in two requests through the real OpenAI
+adapter. It does not contact the API, establish model support, or claim a
+provider prompt-cache hit.
 
 ### Targeted tool grants and scoped references
 
@@ -2126,9 +2188,12 @@ When portable tool discovery is enabled, the stable core contains
 OpenAI's runtime-owned `allowed_tools` projection then contains those two core
 functions plus any directly exposed or active native targeted function. Under
 client Tool Search, the search surface and loaded discovery functions are
-callable instead; `call_tool` remains only when a simultaneous targeted gateway
-grant needs it. Both paths resolve against Cayu's durable targeted or
-branch-local discovery authority before target policy or execution.
+callable instead. Under hosted Tool Search, the server search surface and
+deferred candidates replace the portable search gateway, and only the
+provider-selected subset gains branch-local execution authority. `call_tool`
+remains only when a simultaneous targeted gateway grant needs it. Every path
+resolves against Cayu's durable targeted or branch-local discovery authority
+before target policy or execution.
 
 The fallback mode resolves once, before the logical model request exists. A
 capability error after dispatch never retries with a different projection,

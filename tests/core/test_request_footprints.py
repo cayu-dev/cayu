@@ -38,6 +38,7 @@ from cayu.core.messages import FilePart, ProviderStatePart, TextPart, ThinkingPa
 from cayu.providers.anthropic import build_anthropic_payload
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     TargetedToolProjectionRequest,
@@ -160,7 +161,7 @@ def _build(
     )
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 7])
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 8])
 def test_request_footprint_versions_require_supported_exact_integers(
     invalid_version: object,
 ) -> None:
@@ -168,7 +169,7 @@ def test_request_footprint_versions_require_supported_exact_integers(
     footprint_payload["schema_version"] = invalid_version
     with pytest.raises(
         ValidationError,
-        match="schema_version must be integer 1, 2, 3, 4, 5, or 6",
+        match="schema_version must be integer 1 through 7",
     ):
         RequestFootprint.model_validate(footprint_payload)
 
@@ -764,9 +765,112 @@ def test_discovery_view_footprint_tracks_authority_without_changing_provider_pre
     assert "input_schema" not in serialized
     assert "origin_query" not in serialized
 
+    hosted_candidate = {
+        "name": "private_candidate_name",
+        "description": "private candidate description",
+        "input_schema": {
+            "type": "object",
+            "properties": {"private_schema_field": {"type": "string"}},
+        },
+    }
+    hosted = build_request_footprint(
+        request.model_copy(
+            update={
+                "tool_discovery_projection": ToolDiscoveryProjectionRequest(
+                    protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+                    generation_id=f"sha256:{'d' * 64}",
+                    candidate_tools=(hosted_candidate,),
+                )
+            },
+            deep=True,
+        ),
+        observation_id="hosted-discovery-current",
+        tool_discovery_view=ToolDiscoveryViewFootprint(
+            generation_id=f"sha256:{'d' * 64}",
+            revision=1,
+            catalogue_revision=_CATALOGUE_REVISION,
+            ceiling_fingerprint=f"sha256:{'e' * 64}",
+            grant_count=1,
+        ),
+        **common,
+    )
+
+    assert hosted.schema_version == 7
+    assert hosted.tool_discovery_projection is not None
+    assert hosted.tool_discovery_projection.model_dump(mode="json") == {
+        "protocol": OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        "candidate_count": 1,
+        "loaded_count": 0,
+        "generation_id": f"sha256:{'d' * 64}",
+    }
+    hosted_serialized = hosted.model_dump_json()
+    assert "private_candidate_name" not in hosted_serialized
+    assert "private candidate description" not in hosted_serialized
+    assert "private_schema_field" not in hosted_serialized
+
+    replay_loaded = build_request_footprint(
+        request.model_copy(
+            update={
+                "tool_discovery_projection": ToolDiscoveryProjectionRequest(
+                    protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+                    generation_id=f"sha256:{'d' * 64}",
+                    candidate_tools=(hosted_candidate,),
+                    loaded_tools=(hosted_candidate,),
+                )
+            },
+            deep=True,
+        ),
+        observation_id="hosted-discovery-replay-loaded",
+        tool_discovery_view=ToolDiscoveryViewFootprint(
+            generation_id=f"sha256:{'d' * 64}",
+            revision=1,
+            catalogue_revision=_CATALOGUE_REVISION,
+            ceiling_fingerprint=f"sha256:{'e' * 64}",
+            grant_count=1,
+        ),
+        **common,
+    )
+    assert replay_loaded.tool_discovery_projection is not None
+    assert replay_loaded.tool_discovery_projection.loaded_count == 1
+    assert replay_loaded.tools == hosted.tools
+    assert replay_loaded.fingerprints.tool_manifest == hosted.fingerprints.tool_manifest
+    assert replay_loaded.model_dump_json().count("private_") == 0
+
+    forked = build_request_footprint(
+        request.model_copy(
+            update={
+                "tool_discovery_projection": ToolDiscoveryProjectionRequest(
+                    protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+                    generation_id=f"sha256:{'f' * 64}",
+                    candidate_tools=(hosted_candidate,),
+                )
+            },
+            deep=True,
+        ),
+        observation_id="hosted-discovery-fork",
+        tool_discovery_view=ToolDiscoveryViewFootprint(
+            generation_id=f"sha256:{'f' * 64}",
+            revision=0,
+            catalogue_revision=_CATALOGUE_REVISION,
+            ceiling_fingerprint=f"sha256:{'e' * 64}",
+            grant_count=0,
+        ),
+        **common,
+    )
+    assert forked.tools == hosted.tools
+    assert forked.fingerprints.tool_manifest == hosted.fingerprints.tool_manifest
+    assert (
+        forked.fingerprints.provider_neutral_request != hosted.fingerprints.provider_neutral_request
+    )
+
+    mismatched_generation = hosted.model_dump(mode="python")
+    mismatched_generation["tool_discovery_projection"]["generation_id"] = f"sha256:{'f' * 64}"
+    with pytest.raises(ValidationError, match="generation must match the discovery view"):
+        RequestFootprint.model_validate(mismatched_generation)
+
     missing_view = discovered.model_dump(mode="python")
     missing_view["tool_discovery_view"] = None
-    with pytest.raises(ValidationError, match="schema v6 requires tool exposure and discovery"):
+    with pytest.raises(ValidationError, match=r"schema v6\+ requires tool exposure and discovery"):
         RequestFootprint.model_validate(missing_view)
     with pytest.raises(ValidationError, match="zero exactly when grant_count is zero"):
         ToolDiscoveryViewFootprint(

@@ -177,6 +177,14 @@ wall-clock latency, effects, approvals, exact quality, and fixture-priced cost.
 The usage and price values are synthetic and the timing is machine-local, so
 the report explicitly makes no universal cost, latency, or quality claim.
 
+The [OpenAI hosted Tool Search fixture](../examples/openai_hosted_tool_search/)
+runs a separate credential-free two-request vertical through the real OpenAI
+adapter. The fixture receives an exact server search call/output pair, validates
+the loaded schema, atomically publishes one branch-local grant, executes the
+ordinary tool once, and checks replay ordering. It establishes adapter and
+runtime composition only: it neither certifies a production model nor measures
+OpenAI prompt-cache behavior.
+
 ## Observed live evidence
 
 The following observations were recorded during credentialed verification on

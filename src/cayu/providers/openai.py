@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Iterable, Mapping
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, urlencode
 
@@ -73,6 +74,7 @@ from cayu.providers._http import (
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -89,6 +91,7 @@ from cayu.providers.base import (
     NativeStructuredOutputSchemaInvalid,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
+    ToolDiscoveryProjectionResult,
     UsageDialect,
     _preflight_provider_portable_messages,
     call_tool_core_callable,
@@ -122,12 +125,12 @@ _CAYU_CALL_TOOL_NAME = "call_tool"
 _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS = 256
 _OPENAI_CLIENT_TOOL_SEARCH_MAX_QUERY_CHARS = 256
 _OPENAI_CLIENT_TOOL_SEARCH_MAX_RESULTS = 8
+_OPENAI_HOSTED_TOOL_SEARCH_MAX_ARGUMENT_BYTES = 64 * 1024
 _OPENAI_CLIENT_TOOL_SEARCH_DESCRIPTION = (
     "Search the current session's registered tool catalogue. Matching registered "
     "functions are loaded for direct use through the client Tool Search protocol. "
     "Already visible tools are omitted."
 )
-
 _RESERVED_OPENAI_OPTIONS = {
     "background",
     "model",
@@ -546,9 +549,7 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                     else request.request.targeted_tool_projection.marker_id
                 ),
                 discovery_loaded_tool_names=(
-                    None
-                    if request.request.tool_discovery_projection is None
-                    else request.request.tool_discovery_projection.loaded_tool_names
+                    _openai_discovery_ownership_tokens(request.request.tool_discovery_projection)
                 ),
             )
         except asyncio.CancelledError as exc:
@@ -805,26 +806,41 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
         require_clean_nonblank(model, "model")
         require_clean_nonblank(protocol, "protocol")
-        return (
-            protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
-            and self.base_url == _validate_base_url(DEFAULT_OPENAI_BASE_URL)
-            and model in self.client_tool_search_models
-        )
+        if self.base_url != _validate_base_url(DEFAULT_OPENAI_BASE_URL):
+            return False
+        if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+            return model in self.client_tool_search_models
+        if protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+            return model in self.hosted_tool_search_models
+        return False
 
     def preflight_tool_discovery_projection(self, *, model: str, protocol: str) -> None:
         model = require_clean_nonblank(model, "model")
         protocol = require_clean_nonblank(protocol, "protocol")
-        if protocol != OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+        if protocol not in {
+            OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+            OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        }:
             raise ValueError(f"OpenAIProvider does not support projection {protocol!r}.")
         if self.base_url != _validate_base_url(DEFAULT_OPENAI_BASE_URL):
             raise ValueError(
-                "OpenAI client Tool Search is established only for the official OpenAI "
-                "Responses endpoint."
+                "OpenAI Tool Search is established only for the official OpenAI Responses endpoint."
             )
-        if model not in self.client_tool_search_models:
+        allowlist = (
+            self.client_tool_search_models
+            if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+            else self.hosted_tool_search_models
+        )
+        if model not in allowlist:
+            execution = "client" if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL else "hosted"
+            field_name = (
+                "client_tool_search_models"
+                if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+                else "hosted_tool_search_models"
+            )
             raise ValueError(
-                "OpenAI client Tool Search support is not established for model "
-                f"{model!r}; list the exact verified model in client_tool_search_models."
+                f"OpenAI {execution} Tool Search support is not established for model "
+                f"{model!r}; list the exact verified model in {field_name}."
             )
 
     def preflight_targeted_tool_projection(self, *, model: str, protocol: str) -> None:
@@ -869,6 +885,13 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 model=request.model,
                 protocol=discovery_projection.protocol,
             )
+            if projection is not None and (
+                set(discovery_projection.candidate_tool_names)
+                & {cast("str", tool["name"]) for tool in projection.tools}
+            ):
+                raise ValueError(
+                    "A hosted Tool Search candidate cannot also be an additional_tools function."
+                )
 
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
@@ -903,6 +926,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         hosted_web_search_supported: bool | None = None,
         additional_tools_models: Iterable[str] | None = None,
         client_tool_search_models: Iterable[str] | None = None,
+        hosted_tool_search_models: Iterable[str] | None = None,
         background: bool = False,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -933,6 +957,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self.client_tool_search_models = _copy_exact_model_allowlist(
             client_tool_search_models,
             field_name="client_tool_search_models",
+        )
+        self.hosted_tool_search_models = _copy_exact_model_allowlist(
+            hosted_tool_search_models,
+            field_name="hosted_tool_search_models",
         )
         if type(background) is not bool:
             raise TypeError("background must be a bool.")
@@ -999,9 +1027,9 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                                 else request.targeted_tool_projection.marker_id
                             ),
                             discovery_loaded_tool_names=(
-                                None
-                                if request.tool_discovery_projection is None
-                                else request.tool_discovery_projection.loaded_tool_names
+                                _openai_discovery_ownership_tokens(
+                                    request.tool_discovery_projection
+                                )
                             ),
                         )
                         completion_emitted = is_completion
@@ -1034,9 +1062,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                             else request.targeted_tool_projection.marker_id
                         ),
                         discovery_loaded_tool_names=(
-                            None
-                            if request.tool_discovery_projection is None
-                            else request.tool_discovery_projection.loaded_tool_names
+                            _openai_discovery_ownership_tokens(request.tool_discovery_projection)
                         ),
                     )
                     completion_emitted = is_completion
@@ -1278,6 +1304,16 @@ def build_openai_payload(
         raise TypeError("OpenAI payload chain must be a bool.")
 
     options = _effective_openai_request_options_for_request(request)
+    discovery_projection = request.tool_discovery_projection
+    if (
+        discovery_projection is not None
+        and discovery_projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+        and discovery_projection.candidate_tools
+    ):
+        configured_parallel = options.get("parallel_tool_calls")
+        if configured_parallel is not None and configured_parallel is not False:
+            raise ValueError("OpenAI hosted Tool Search requires parallel_tool_calls=false.")
+        options["parallel_tool_calls"] = False
     structured_output_format = _openai_structured_output_format(request.options)
     if structured_output_format is not None and "text" in options:
         raise ValueError("OpenAI option text cannot be combined with native structured output.")
@@ -1538,6 +1574,7 @@ def openai_response_events(
     if not isinstance(output, list):
         raise OpenAIProtocolError("OpenAI response output must be a list.")
 
+    hosted_items, hosted_result = _normalized_hosted_tool_search_items(output)
     events: list[ModelStreamEvent] = []
     provider_state_items: list[dict[str, Any]] = []
     completion_output_items: list[Mapping[str, Any]] = []
@@ -1573,7 +1610,16 @@ def openai_response_events(
             if tool_search_call_count > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS:
                 raise OpenAIProtocolError("OpenAI response contains too many tool search calls.")
             normalized = _normalized_tool_search_call(item, item_index=index)
-            events.append(_tool_search_call_event(normalized))
+            if normalized["execution"] == "client":
+                events.append(_tool_search_call_event(normalized))
+            completion_output_items.append(normalized)
+            provider_state_items.append({"provider": "openai", "state": normalized})
+        elif item_type == "tool_search_output":
+            normalized = hosted_items.get(index)
+            if normalized is None:
+                raise OpenAIProtocolError(
+                    "OpenAI tool_search_output has no adjacent hosted search call."
+                )
             completion_output_items.append(normalized)
             provider_state_items.append({"provider": "openai", "state": normalized})
         elif item_type == "reasoning":
@@ -1616,6 +1662,7 @@ def openai_response_events(
             provider_state_items,
             completion_output_items=completion_output_items,
             reasoning_state=reasoning_state,
+            tool_discovery_result=hosted_result,
         )
     )
     return events
@@ -1852,12 +1899,13 @@ def _openai_background_parser_state(
 ) -> tuple[
     dict[int, _PendingFunctionCall],
     set[int],
-    dict[int, tuple[str, str]],
     dict[int, dict[str, Any]],
+    dict[int, dict[str, Any]],
+    dict[int, str],
 ]:
     parser = metadata.opaque.get("parser")
     if parser is None:
-        return {}, set(), {}, {}
+        return {}, set(), {}, {}, {}
     if type(parser) is not dict:
         raise OpenAIProtocolError("OpenAI recovery parser state must be an object.")
     parser = cast("dict[str, Any]", parser)
@@ -1865,13 +1913,16 @@ def _openai_background_parser_state(
     raw_reasoning = parser.get("pending_reasoning_output_indexes", [])
     raw_tool_search = parser.get("pending_tool_search_calls", [])
     raw_completed_tool_search = parser.get("completed_tool_search_items", [])
+    raw_completed_function_calls = parser.get("completed_function_call_digests", [])
     if (
         type(raw_calls) is not list
         or type(raw_reasoning) is not list
         or type(raw_tool_search) is not list
         or type(raw_completed_tool_search) is not list
+        or type(raw_completed_function_calls) is not list
         or len(raw_tool_search) + len(raw_completed_tool_search)
         > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
+        or len(raw_completed_function_calls) > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
     ):
         raise OpenAIProtocolError("OpenAI recovery parser state is malformed.")
     calls: dict[int, _PendingFunctionCall] = {}
@@ -1893,22 +1944,28 @@ def _openai_background_parser_state(
         if type(raw_index) is not int or raw_index < 0:
             raise OpenAIProtocolError("OpenAI pending reasoning index is malformed.")
         reasoning.add(raw_index)
-    tool_search: dict[int, tuple[str, str]] = {}
+    tool_search: dict[int, dict[str, Any]] = {}
     for raw in raw_tool_search:
         if type(raw) is not dict:
             raise OpenAIProtocolError("OpenAI pending tool-search state is malformed.")
         output_index = raw.get("output_index")
+        execution = raw.get("execution")
         item_id = _mapping_optional_string(raw, "item_id")
         call_id = _mapping_optional_string(raw, "call_id")
         if (
             type(output_index) is not int
             or output_index < 0
             or output_index in tool_search
-            or item_id is None
-            or call_id is None
+            or execution not in {"client", "server"}
+            or (execution == "client" and (item_id is None or call_id is None))
+            or (execution == "server" and call_id is not None)
         ):
             raise OpenAIProtocolError("OpenAI pending tool-search state is malformed.")
-        tool_search[output_index] = (item_id, call_id)
+        tool_search[output_index] = {
+            "execution": execution,
+            "id": item_id,
+            "call_id": call_id,
+        }
     completed_tool_search: dict[int, dict[str, Any]] = {}
     for raw in raw_completed_tool_search:
         if type(raw) is not dict:
@@ -1923,11 +1980,59 @@ def _openai_background_parser_state(
             or not isinstance(item, Mapping)
         ):
             raise OpenAIProtocolError("OpenAI completed tool-search state is malformed.")
-        completed_tool_search[output_index] = _normalized_tool_search_call(
-            item,
-            item_index=output_index,
+        item_type = item.get("type")
+        if item_type == "tool_search_call":
+            completed_tool_search[output_index] = _normalized_tool_search_call(
+                item,
+                item_index=output_index,
+            )
+        elif item_type == "tool_search_output":
+            completed_tool_search[output_index], _loaded_tools = (
+                _normalized_hosted_tool_search_output(
+                    item,
+                    item_index=output_index,
+                )
+            )
+        else:
+            raise OpenAIProtocolError("OpenAI completed tool-search state is malformed.")
+    hosted_call_indexes = {
+        output_index
+        for output_index, item in completed_tool_search.items()
+        if item.get("type") == "tool_search_call" and item.get("execution") == "server"
+    } | {
+        output_index for output_index, item in tool_search.items() if item["execution"] == "server"
+    }
+    hosted_output_indexes = {
+        output_index
+        for output_index, item in completed_tool_search.items()
+        if item.get("type") == "tool_search_output"
+    }
+    if (
+        len(hosted_call_indexes) > 1
+        or len(hosted_output_indexes) > 1
+        or (
+            hosted_output_indexes
+            and next(iter(hosted_output_indexes)) - 1 not in hosted_call_indexes
         )
-    return calls, reasoning, tool_search, completed_tool_search
+    ):
+        raise OpenAIProtocolError("OpenAI hosted Tool Search recovery state is malformed.")
+    completed_function_calls: dict[int, str] = {}
+    for raw in raw_completed_function_calls:
+        if type(raw) is not dict:
+            raise OpenAIProtocolError("OpenAI completed function-call state is malformed.")
+        output_index = raw.get("output_index")
+        item_sha256 = raw.get("item_sha256")
+        if (
+            type(output_index) is not int
+            or output_index < 0
+            or output_index in completed_function_calls
+            or type(item_sha256) is not str
+            or len(item_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in item_sha256)
+        ):
+            raise OpenAIProtocolError("OpenAI completed function-call state is malformed.")
+        completed_function_calls[output_index] = item_sha256
+    return calls, reasoning, tool_search, completed_tool_search, completed_function_calls
 
 
 def _openai_background_recovery_metadata(
@@ -1936,8 +2041,9 @@ def _openai_background_recovery_metadata(
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
     pending_reasoning_items: set[int],
-    pending_tool_search_calls: Mapping[int, tuple[str, str]],
+    pending_tool_search_calls: Mapping[int, Mapping[str, Any]],
     completed_tool_search_items: Mapping[int, Mapping[str, Any]],
+    completed_function_call_digests: Mapping[int, str],
     targeted_tool_marker_id: str | None,
     discovery_loaded_tool_names: tuple[str, ...] | None,
 ) -> ProviderOperationRecoveryMetadata:
@@ -1955,6 +2061,7 @@ def _openai_background_recovery_metadata(
         or pending_reasoning_items
         or pending_tool_search_calls
         or completed_tool_search_items
+        or completed_function_call_digests
     ):
         calls: list[dict[str, object]] = []
         for output_index, pending in sorted(pending_function_calls.items()):
@@ -1972,10 +2079,11 @@ def _openai_background_recovery_metadata(
             "pending_tool_search_calls": [
                 {
                     "output_index": output_index,
-                    "item_id": item_id,
-                    "call_id": call_id,
+                    "execution": pending["execution"],
+                    "item_id": pending["id"],
+                    "call_id": pending["call_id"],
                 }
-                for output_index, (item_id, call_id) in sorted(pending_tool_search_calls.items())
+                for output_index, pending in sorted(pending_tool_search_calls.items())
             ],
             "completed_tool_search_items": [
                 {
@@ -1983,6 +2091,13 @@ def _openai_background_recovery_metadata(
                     "item": copy_json_value(item, "completed tool_search item"),
                 }
                 for output_index, item in sorted(completed_tool_search_items.items())
+            ],
+            "completed_function_call_digests": [
+                {
+                    "output_index": output_index,
+                    "item_sha256": item_sha256,
+                }
+                for output_index, item_sha256 in sorted(completed_function_call_digests.items())
             ],
         }
     return ProviderOperationRecoveryMetadata(cursor=cursor, opaque=opaque)
@@ -1995,8 +2110,9 @@ def _openai_background_event_with_recovery(
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
     pending_reasoning_items: set[int],
-    pending_tool_search_calls: Mapping[int, tuple[str, str]],
+    pending_tool_search_calls: Mapping[int, Mapping[str, Any]],
     completed_tool_search_items: Mapping[int, Mapping[str, Any]],
+    completed_function_call_digests: Mapping[int, str],
     targeted_tool_marker_id: str | None,
     discovery_loaded_tool_names: tuple[str, ...] | None,
 ) -> ModelStreamEvent:
@@ -2009,6 +2125,7 @@ def _openai_background_event_with_recovery(
                 pending_reasoning_items=pending_reasoning_items,
                 pending_tool_search_calls=pending_tool_search_calls,
                 completed_tool_search_items=completed_tool_search_items,
+                completed_function_call_digests=completed_function_call_digests,
                 targeted_tool_marker_id=targeted_tool_marker_id,
                 discovery_loaded_tool_names=discovery_loaded_tool_names,
             )
@@ -2036,6 +2153,7 @@ async def _openai_background_stream_events(
         pending_reasoning_items,
         pending_tool_search_calls,
         completed_tool_search_items,
+        completed_function_call_digests,
     ) = _openai_background_parser_state(state.recovery_metadata)
 
     async def ordered_raw_events() -> AsyncIterator[Mapping[str, Any]]:
@@ -2073,8 +2191,20 @@ async def _openai_background_stream_events(
             item = event.get("item")
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 pending_reasoning_items.add(_stream_output_index(event))
+            if isinstance(item, Mapping) and item.get("type") == "function_call":
+                output_index = _stream_output_index(event)
+                if (
+                    output_index in pending_function_calls
+                    or output_index in completed_function_call_digests
+                    or len(pending_function_calls) + len(completed_function_call_digests)
+                    >= _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
+                ):
+                    raise OpenAIProtocolError(
+                        "OpenAI background function_call added item is malformed."
+                    )
             if isinstance(item, Mapping) and item.get("type") == "tool_search_call":
                 output_index = _stream_output_index(event)
+                execution = item.get("execution")
                 item_id = _mapping_optional_string(item, "id")
                 call_id = _mapping_optional_string(item, "call_id")
                 if (
@@ -2082,15 +2212,34 @@ async def _openai_background_stream_events(
                     or output_index in completed_tool_search_items
                     or len(pending_tool_search_calls) + len(completed_tool_search_items)
                     >= _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
-                    or item_id is None
-                    or call_id is None
-                    or item.get("execution") != "client"
+                    or execution not in {"client", "server"}
+                    or (execution == "client" and (item_id is None or call_id is None))
+                    or (execution == "server" and ("call_id" not in item or call_id is not None))
                     or item.get("status") != "in_progress"
+                    or (
+                        execution == "server"
+                        and any(
+                            pending["execution"] == "server"
+                            for pending in pending_tool_search_calls.values()
+                        )
+                    )
+                    or (
+                        execution == "server"
+                        and any(
+                            completed.get("type") == "tool_search_call"
+                            and completed.get("execution") == "server"
+                            for completed in completed_tool_search_items.values()
+                        )
+                    )
                 ):
                     raise OpenAIProtocolError(
                         "OpenAI background tool_search_call added item is malformed."
                     )
-                pending_tool_search_calls[output_index] = (item_id, call_id)
+                pending_tool_search_calls[output_index] = {
+                    "execution": execution,
+                    "id": item_id,
+                    "call_id": call_id,
+                }
             _record_stream_output_item_added(event, pending_function_calls)
             normalized = ModelStreamEvent.thinking()
         elif event_type == "response.output_item.done":
@@ -2103,19 +2252,58 @@ async def _openai_background_stream_events(
                 output_index = _stream_output_index(event)
                 pending = pending_tool_search_calls.pop(output_index, None)
                 tool_search = _normalized_tool_search_call(item, item_index=output_index)
-                if pending != (tool_search["id"], tool_search["call_id"]):
+                if pending != {
+                    "execution": tool_search["execution"],
+                    "id": tool_search.get("id"),
+                    "call_id": tool_search.get("call_id"),
+                }:
                     raise OpenAIProtocolError(
                         "OpenAI background tool_search_call output identity mismatch."
                     )
                 completed_tool_search_items[output_index] = tool_search
-                normalized = _tool_search_call_event(tool_search)
+                normalized = (
+                    _tool_search_call_event(tool_search)
+                    if tool_search["execution"] == "client"
+                    else ModelStreamEvent.thinking()
+                )
+            elif item.get("type") == "tool_search_output":
+                output_index = _stream_output_index(event)
+                hosted_call = completed_tool_search_items.get(output_index - 1)
+                if (
+                    output_index in completed_tool_search_items
+                    or hosted_call is None
+                    or hosted_call.get("type") != "tool_search_call"
+                    or hosted_call.get("execution") != "server"
+                    or any(
+                        completed.get("type") == "tool_search_output"
+                        for completed in completed_tool_search_items.values()
+                    )
+                ):
+                    raise OpenAIProtocolError(
+                        "OpenAI background tool_search_output has no unique adjacent server call."
+                    )
+                tool_search_output, _loaded_tools = _normalized_hosted_tool_search_output(
+                    item,
+                    item_index=output_index,
+                )
+                completed_tool_search_items[output_index] = tool_search_output
+                normalized = ModelStreamEvent.thinking()
             else:
                 normalized = ModelStreamEvent.thinking()
         elif event_type == "response.function_call_arguments.delta":
             _record_stream_function_call_delta(event, pending_function_calls)
             normalized = ModelStreamEvent.thinking()
         elif event_type == "response.function_call_arguments.done":
-            normalized, _ = _stream_function_call_event(event, pending_function_calls)
+            normalized, output_item = _stream_function_call_event(
+                event,
+                pending_function_calls,
+            )
+            completed_function_call_digests[_stream_output_index(event)] = (
+                _openai_function_call_recovery_digest(
+                    output_item,
+                    item_index=_stream_output_index(event),
+                )
+            )
         elif event_type in {"response.completed", "response.incomplete"}:
             unfinished = {
                 *pending_function_calls,
@@ -2131,6 +2319,7 @@ async def _openai_background_stream_events(
                 completed_tool_search_items,
                 excluded_output_indexes=unfinished,
                 reasoning_state=reasoning_state,
+                emitted_function_call_digests=completed_function_call_digests,
             ):
                 terminal_event = _event_with_server_dynamic_tool_ownership(
                     terminal_event,
@@ -2146,6 +2335,7 @@ async def _openai_background_stream_events(
                     pending_reasoning_items=pending_reasoning_items,
                     pending_tool_search_calls=pending_tool_search_calls,
                     completed_tool_search_items=completed_tool_search_items,
+                    completed_function_call_digests=completed_function_call_digests,
                     targeted_tool_marker_id=targeted_tool_marker_id,
                     discovery_loaded_tool_names=discovery_loaded_tool_names,
                 )
@@ -2187,6 +2377,7 @@ async def _openai_background_stream_events(
             pending_reasoning_items=pending_reasoning_items,
             pending_tool_search_calls=pending_tool_search_calls,
             completed_tool_search_items=completed_tool_search_items,
+            completed_function_call_digests=completed_function_call_digests,
             targeted_tool_marker_id=targeted_tool_marker_id,
             discovery_loaded_tool_names=discovery_loaded_tool_names,
         )
@@ -2298,8 +2489,10 @@ async def _openai_stream_events(
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
     pending_reasoning_items: set[int] = set()
     pending_web_search_calls: dict[int, tuple[str, str]] = {}
-    pending_tool_search_calls: dict[int, tuple[str, str]] = {}
+    pending_tool_search_calls: dict[int, dict[str, Any]] = {}
     seen_tool_search_output_indexes: set[int] = set()
+    hosted_tool_search_call_index: int | None = None
+    hosted_tool_search_output_index: int | None = None
     streamed_text: dict[tuple[int, int], str] = {}
     streamed_text_offsets: dict[tuple[int, int], int] = {}
     streamed_visible_text: list[str] = []
@@ -2399,18 +2592,38 @@ async def _openai_stream_events(
                     )
                 if len(seen_tool_search_output_indexes) >= _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS:
                     raise OpenAIProtocolError("OpenAI stream contains too many tool search calls.")
+                execution = item.get("execution")
                 item_id = _mapping_optional_string(item, "id")
                 call_id = _mapping_optional_string(item, "call_id")
-                if item_id is None or call_id is None:
+                if execution == "client":
+                    if item_id is None or call_id is None:
+                        raise OpenAIProtocolError(
+                            "OpenAI client tool_search_call added requires exact identities."
+                        )
+                elif execution == "server":
+                    if "call_id" not in item or item.get("call_id") is not None:
+                        raise OpenAIProtocolError(
+                            "OpenAI hosted tool_search_call added requires null call_id."
+                        )
+                    if hosted_tool_search_call_index is not None:
+                        raise OpenAIProtocolError(
+                            "OpenAI stream contains multiple hosted tool search calls."
+                        )
+                    hosted_tool_search_call_index = output_index
+                else:
                     raise OpenAIProtocolError(
-                        "OpenAI tool_search_call output_item.added requires exact identities."
+                        "OpenAI tool_search_call added has unsupported execution."
                     )
-                if item.get("execution") != "client" or item.get("status") != "in_progress":
+                if item.get("status") != "in_progress":
                     raise OpenAIProtocolError(
-                        "OpenAI tool_search_call output_item.added must be client/in_progress."
+                        "OpenAI tool_search_call output_item.added must be in progress."
                     )
                 seen_tool_search_output_indexes.add(output_index)
-                pending_tool_search_calls[output_index] = (item_id, call_id)
+                pending_tool_search_calls[output_index] = {
+                    "execution": execution,
+                    "id": item_id,
+                    "call_id": call_id,
+                }
             _record_stream_output_item_added(event, pending_function_calls)
             continue
         if event_type in {
@@ -2465,10 +2678,32 @@ async def _openai_stream_events(
                     item,
                     item_index=output_index,
                 )
-                if (normalized_tool_search["id"], normalized_tool_search["call_id"]) != pending:
+                if (
+                    normalized_tool_search["execution"] != pending["execution"]
+                    or normalized_tool_search.get("id") != pending["id"]
+                    or normalized_tool_search.get("call_id") != pending["call_id"]
+                ):
                     raise OpenAIProtocolError("OpenAI tool_search_call output identity mismatch.")
                 fallback_output_items[output_index] = normalized_tool_search
-                yield _tool_search_call_event(normalized_tool_search)
+                if normalized_tool_search["execution"] == "client":
+                    yield _tool_search_call_event(normalized_tool_search)
+            if isinstance(item, Mapping) and item.get("type") == "tool_search_output":
+                output_index = _stream_output_index(event)
+                if (
+                    output_index in fallback_output_items
+                    or hosted_tool_search_call_index is None
+                    or output_index != hosted_tool_search_call_index + 1
+                    or hosted_tool_search_output_index is not None
+                ):
+                    raise OpenAIProtocolError(
+                        "OpenAI tool_search_output has no unique adjacent server call."
+                    )
+                normalized_output, _loaded_tools = _normalized_hosted_tool_search_output(
+                    item,
+                    item_index=output_index,
+                )
+                fallback_output_items[output_index] = normalized_output
+                hosted_tool_search_output_index = output_index
             _record_stream_output_item_done(
                 event,
                 fallback_output_items,
@@ -2872,11 +3107,91 @@ def _function_call_event(
     )
 
 
+def _openai_function_call_recovery_digest(
+    item: Mapping[str, Any],
+    *,
+    item_index: int,
+) -> str:
+    """Commit to one normalized call without persisting its arguments."""
+
+    _validate_completed_stream_item_status(item, item_index)
+    _function_call_event(item, item_index)
+    normalized: dict[str, Any] = {
+        "type": "function_call",
+        "call_id": item.get("call_id"),
+        "name": item.get("name"),
+        "arguments": item.get("arguments"),
+        "status": item.get("status"),
+    }
+    if item.get("id") is not None:
+        normalized["id"] = item.get("id")
+    material = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(material).hexdigest()
+
+
 def _normalized_tool_search_call(
     item: Mapping[str, Any],
     *,
     item_index: int,
 ) -> dict[str, Any]:
+    execution = item.get("execution")
+    if execution == "server":
+        if not set(item).issubset({"type", "id", "call_id", "execution", "arguments", "status"}):
+            raise OpenAIProtocolError(
+                f"OpenAI hosted tool_search_call item {item_index} has unsupported fields."
+            )
+        if "call_id" not in item or item.get("call_id") is not None:
+            raise OpenAIProtocolError(
+                f"OpenAI hosted tool_search_call item {item_index} requires null call_id."
+            )
+        if item.get("status") != "completed":
+            raise OpenAIProtocolError(
+                f"OpenAI hosted tool_search_call item {item_index} must be completed."
+            )
+        arguments = item.get("arguments")
+        if type(arguments) is not dict:
+            raise OpenAIProtocolError(
+                f"OpenAI hosted tool_search_call item {item_index} arguments must be an object."
+            )
+        copied_arguments = copy_json_value(arguments, "hosted tool_search arguments")
+        if (
+            len(
+                json.dumps(
+                    copied_arguments,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            > _OPENAI_HOSTED_TOOL_SEARCH_MAX_ARGUMENT_BYTES
+        ):
+            raise OpenAIProtocolError(
+                f"OpenAI hosted tool_search_call item {item_index} arguments are oversized."
+            )
+        normalized: dict[str, Any] = {
+            "type": "tool_search_call",
+            "execution": "server",
+            "call_id": None,
+            "status": "completed",
+            "arguments": copied_arguments,
+        }
+        item_id = item.get("id")
+        if item_id is not None:
+            if not isinstance(item_id, str) or not item_id.strip():
+                raise OpenAIProtocolError(
+                    f"OpenAI hosted tool_search_call item {item_index} has invalid id."
+                )
+            normalized["id"] = item_id
+        return normalized
+    if execution != "client":
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} has unsupported execution."
+        )
     item_id = item.get("id")
     call_id = item.get("call_id")
     if not isinstance(item_id, str) or not item_id.strip():
@@ -2886,10 +3201,6 @@ def _normalized_tool_search_call(
     if not isinstance(call_id, str) or not call_id.strip():
         raise OpenAIProtocolError(
             f"OpenAI tool_search_call item {item_index} requires nonblank call_id."
-        )
-    if item.get("execution") != "client":
-        raise OpenAIProtocolError(
-            f"OpenAI tool_search_call item {item_index} must use client execution."
         )
     if item.get("status") != "completed":
         raise OpenAIProtocolError(f"OpenAI tool_search_call item {item_index} must be completed.")
@@ -2934,6 +3245,181 @@ def _normalized_tool_search_call(
     }
 
 
+def _normalized_hosted_tool_search_output(
+    item: Mapping[str, Any],
+    *,
+    item_index: int,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    if not set(item).issubset({"type", "id", "call_id", "execution", "status", "tools"}):
+        raise OpenAIProtocolError(
+            f"OpenAI hosted tool_search_output item {item_index} has unsupported fields."
+        )
+    if item.get("execution") != "server":
+        raise OpenAIProtocolError(
+            f"OpenAI hosted tool_search_output item {item_index} must use server execution."
+        )
+    if "call_id" not in item or item.get("call_id") is not None:
+        raise OpenAIProtocolError(
+            f"OpenAI hosted tool_search_output item {item_index} requires null call_id."
+        )
+    if item.get("status") != "completed":
+        raise OpenAIProtocolError(
+            f"OpenAI hosted tool_search_output item {item_index} must be completed."
+        )
+    raw_tools = item.get("tools")
+    if type(raw_tools) is not list:
+        raise OpenAIProtocolError(
+            f"OpenAI hosted tool_search_output item {item_index} requires a tools array."
+        )
+    loaded_tools: list[dict[str, Any]] = []
+    normalized_tools: list[dict[str, Any]] = []
+    for tool_index, raw_tool in enumerate(raw_tools):
+        if type(raw_tool) is not dict:
+            raise OpenAIProtocolError(
+                "Cayu's hosted Tool Search projection accepts only loaded functions; "
+                f"item {item_index} tool {tool_index} is unsupported."
+            )
+        raw_tool = cast("dict[str, Any]", raw_tool)
+        if not set(raw_tool).issubset(
+            {
+                "type",
+                "name",
+                "description",
+                "parameters",
+                "strict",
+                "defer_loading",
+                "output_schema",
+            }
+        ):
+            raise OpenAIProtocolError(
+                f"OpenAI hosted loaded function {tool_index} has unsupported fields."
+            )
+        if raw_tool.get("type") != "function":
+            raise OpenAIProtocolError(
+                "Cayu's hosted Tool Search projection accepts only loaded functions; "
+                f"item {item_index} tool {tool_index} is unsupported."
+            )
+        name = raw_tool.get("name")
+        description = raw_tool.get("description")
+        parameters = raw_tool.get("parameters")
+        if not isinstance(name, str) or not name.strip():
+            raise OpenAIProtocolError(
+                f"OpenAI hosted loaded function {tool_index} requires a nonblank name."
+            )
+        _validate_openai_tool_name(name)
+        if not isinstance(description, str) or type(parameters) is not dict:
+            raise OpenAIProtocolError(f"OpenAI hosted loaded function {tool_index} is malformed.")
+        if raw_tool.get("defer_loading") is not True:
+            raise OpenAIProtocolError(
+                f"OpenAI hosted loaded function {tool_index} lost defer_loading authority."
+            )
+        strict = raw_tool.get("strict", False)
+        if strict is not False:
+            raise OpenAIProtocolError(
+                f"OpenAI hosted loaded function {tool_index} changed strict mode."
+            )
+        # Cayu has no registered output-schema authority. OpenAI may echo null
+        # for the omitted optional field; a contract-bearing schema must fail closed.
+        if raw_tool.get("output_schema") is not None:
+            raise OpenAIProtocolError(
+                f"OpenAI hosted loaded function {tool_index} added an output schema."
+            )
+        normalized_tool = {
+            "type": "function",
+            "name": name,
+            "description": description,
+            "parameters": copy_json_value(parameters, "hosted loaded parameters"),
+            "strict": strict,
+            "defer_loading": True,
+        }
+        normalized_tools.append(normalized_tool)
+        loaded_tools.append(
+            {
+                "name": name,
+                "description": description,
+                "input_schema": copy_json_value(parameters, "hosted loaded input_schema"),
+            }
+        )
+    try:
+        result = ToolDiscoveryProjectionResult(loaded_tools=tuple(loaded_tools))
+    except (TypeError, ValueError) as exc:
+        raise OpenAIProtocolError(
+            "OpenAI hosted loaded tools are not bounded and canonical."
+        ) from exc
+    normalized = {
+        "type": "tool_search_output",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "tools": normalized_tools,
+    }
+    item_id = item.get("id")
+    if item_id is not None:
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise OpenAIProtocolError(
+                f"OpenAI hosted tool_search_output item {item_index} has invalid id."
+            )
+        normalized["id"] = item_id
+    return normalized, result.loaded_tools
+
+
+def _normalized_hosted_tool_search_items(
+    output: list[Any],
+) -> tuple[dict[int, dict[str, Any]], ToolDiscoveryProjectionResult | None]:
+    """Validate the exact adjacent server call/output sequence in one response."""
+
+    normalized_items: dict[int, dict[str, Any]] = {}
+    result: ToolDiscoveryProjectionResult | None = None
+    pair_start: int | None = None
+    for index, item in enumerate(output):
+        if not isinstance(item, Mapping):
+            continue
+        item_type = item.get("type")
+        if item_type == "tool_search_call" and item.get("execution") == "server":
+            normalized_call = _normalized_tool_search_call(item, item_index=index)
+            if result is not None or index + 1 >= len(output):
+                raise OpenAIProtocolError(
+                    "OpenAI hosted Tool Search must contain one adjacent call/output pair."
+                )
+            raw_output = output[index + 1]
+            if (
+                not isinstance(raw_output, Mapping)
+                or raw_output.get("type") != "tool_search_output"
+            ):
+                raise OpenAIProtocolError(
+                    "OpenAI hosted tool_search_call must be followed by tool_search_output."
+                )
+            normalized_output, loaded_tools = _normalized_hosted_tool_search_output(
+                raw_output,
+                item_index=index + 1,
+            )
+            normalized_items[index] = normalized_call
+            normalized_items[index + 1] = normalized_output
+            result = ToolDiscoveryProjectionResult(loaded_tools=loaded_tools)
+            pair_start = index
+        elif item_type == "tool_search_output" and index not in normalized_items:
+            raise OpenAIProtocolError(
+                "OpenAI hosted tool_search_output must follow its server search call."
+            )
+    if pair_start is not None and any(
+        isinstance(item, Mapping) and item.get("type") == "function_call"
+        for item in output[:pair_start]
+    ):
+        raise OpenAIProtocolError(
+            "OpenAI hosted Tool Search function calls must follow the loaded output."
+        )
+    if pair_start is not None and any(
+        isinstance(item, Mapping)
+        and item.get("type") == "tool_search_call"
+        and item.get("execution") != "server"
+        for item in output
+    ):
+        raise OpenAIProtocolError(
+            "OpenAI hosted Tool Search cannot mix client and server search calls."
+        )
+    return normalized_items, result
+
+
 def _tool_search_call_event(item: Mapping[str, Any]) -> ModelStreamEvent:
     return ModelStreamEvent.tool_call(
         id=cast("str", item["call_id"]),
@@ -2948,6 +3434,7 @@ def _completed_event_from_response(
     *,
     completion_output_items: list[Mapping[str, Any]] | None = None,
     reasoning_state: str = "inline",
+    tool_discovery_result: ToolDiscoveryProjectionResult | None = None,
 ) -> ModelStreamEvent:
     if provider_state_items is None:
         provider_state_items = _provider_state_items_from_response(response)
@@ -3002,6 +3489,7 @@ def _completed_event_from_response(
             response,
             output_items=completion_output_items,
         ),
+        tool_discovery_result=tool_discovery_result,
     )
 
 
@@ -3078,9 +3566,11 @@ def _stream_terminal_events(
     excluded_output_indexes: set[int] | None = None,
     reasoning_state: str = "inline",
     streamed_visible_text: str | None = None,
+    emitted_function_call_digests: Mapping[int, str] | None = None,
 ) -> list[ModelStreamEvent]:
     response = _stream_response_object(event)
     excluded_output_indexes = excluded_output_indexes or set()
+    emitted_function_call_digests = emitted_function_call_digests or {}
     output = response.get("output")
     # Some completed Responses streams deliver every authoritative item through
     # output_item.done and leave the terminal envelope's repeated output empty.
@@ -3096,19 +3586,24 @@ def _stream_terminal_events(
             _reconcile_fallback_visible_text(completed_output_items, streamed_visible_text)
         provider_state_items = _provider_state_items_from_output_items(completed_output_items)
         completion_output_items = list(_sorted_output_items(completed_output_items))
+        _hosted_items, hosted_result = _normalized_hosted_tool_search_items(completion_output_items)
         return [
             _completed_event_from_response(
                 response,
                 provider_state_items,
                 completion_output_items=completion_output_items,
                 reasoning_state=reasoning_state,
+                tool_discovery_result=hosted_result,
             )
         ]
     if not isinstance(output, list):
         raise OpenAIProtocolError("OpenAI response output must be a list.")
 
+    hosted_items, hosted_result = _normalized_hosted_tool_search_items(output)
     terminal_hosted_calls: dict[int, dict[str, Any]] = {}
     terminal_tool_search_calls: dict[int, dict[str, Any]] = {}
+    terminal_tool_search_outputs: dict[int, dict[str, Any]] = {}
+    terminal_function_calls: dict[int, Mapping[str, Any]] = {}
     hosted_call_indexes: dict[str, int] = {}
     completion_output_items: list[Mapping[str, Any]] = []
     for output_index, item in enumerate(output):
@@ -3128,6 +3623,21 @@ def _stream_terminal_events(
             )
             terminal_tool_search_calls[output_index] = normalized_tool_search
             completion_output_items.append(normalized_tool_search)
+            continue
+        if item.get("type") == "tool_search_output":
+            normalized_tool_search_output = hosted_items.get(output_index)
+            if normalized_tool_search_output is None:
+                raise OpenAIProtocolError(
+                    "OpenAI terminal tool_search_output has no hosted search call."
+                )
+            terminal_tool_search_outputs[output_index] = normalized_tool_search_output
+            completion_output_items.append(normalized_tool_search_output)
+            continue
+        if item.get("type") == "function_call":
+            _validate_completed_stream_item_status(item, output_index)
+            _function_call_event(item, output_index)
+            terminal_function_calls[output_index] = item
+            completion_output_items.append(item)
             continue
         if item.get("type") != "web_search_call":
             completion_output_items.append(item)
@@ -3175,14 +3685,40 @@ def _stream_terminal_events(
             )
 
     terminal_events: list[ModelStreamEvent] = []
+    for output_index, terminal_item in terminal_function_calls.items():
+        fallback_item = fallback_output_items.get(output_index)
+        if fallback_item is not None and any(
+            fallback_item.get(key) != terminal_item.get(key)
+            for key in ("type", "id", "call_id", "name", "arguments", "status")
+        ):
+            raise OpenAIProtocolError(
+                "OpenAI terminal function-call evidence conflicts with lifecycle evidence."
+            )
+        emitted_digest = emitted_function_call_digests.get(output_index)
+        if emitted_digest is not None and emitted_digest != _openai_function_call_recovery_digest(
+            terminal_item,
+            item_index=output_index,
+        ):
+            raise OpenAIProtocolError(
+                "OpenAI terminal function-call evidence conflicts with recovered lifecycle "
+                "evidence."
+            )
+        if fallback_item is None and emitted_digest is None:
+            terminal_events.append(_function_call_event(terminal_item, output_index))
     for output_index, terminal_item in terminal_tool_search_calls.items():
         fallback_item = fallback_output_items.get(output_index)
         if fallback_item is not None and fallback_item != terminal_item:
             raise OpenAIProtocolError(
                 "OpenAI terminal tool search evidence conflicts with lifecycle evidence."
             )
-        if fallback_item is None:
+        if fallback_item is None and terminal_item["execution"] == "client":
             terminal_events.append(_tool_search_call_event(terminal_item))
+    for output_index, terminal_item in terminal_tool_search_outputs.items():
+        fallback_item = fallback_output_items.get(output_index)
+        if fallback_item is not None and fallback_item != terminal_item:
+            raise OpenAIProtocolError(
+                "OpenAI terminal tool search output conflicts with lifecycle evidence."
+            )
     for output_index, terminal_item in terminal_hosted_calls.items():
         fallback_item = fallback_output_items.get(output_index)
         if fallback_item is not None and fallback_item.get("type") != "web_search_call":
@@ -3211,6 +3747,7 @@ def _stream_terminal_events(
             provider_state_items,
             completion_output_items=completion_output_items,
             reasoning_state=reasoning_state,
+            tool_discovery_result=hosted_result,
         )
     )
     return terminal_events
@@ -3241,6 +3778,13 @@ def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dic
                     "state": _normalized_tool_search_call(item, item_index=index),
                 }
             )
+            continue
+        if item_type == "tool_search_output":
+            normalized, _loaded_tools = _normalized_hosted_tool_search_output(
+                item,
+                item_index=index,
+            )
+            provider_state_items.append({"provider": "openai", "state": normalized})
             continue
         if item_type == "web_search_call":
             normalized = _normalized_web_search_call(item, item_index=index)
@@ -3281,6 +3825,11 @@ def _provider_state_items_from_output_items(
                 continue
         elif item_type == "tool_search_call":
             item = _normalized_tool_search_call(item, item_index=output_index)
+        elif item_type == "tool_search_output":
+            item, _loaded_tools = _normalized_hosted_tool_search_output(
+                item,
+                item_index=output_index,
+            )
         else:
             raise OpenAIProtocolError(
                 f"Unsupported OpenAI fallback output item type: {item_type!r}."
@@ -3394,6 +3943,18 @@ def _record_stream_output_item_done(
         if existing != normalized:
             raise OpenAIProtocolError(
                 "OpenAI tool_search_call output_item.done conflicts with lifecycle evidence."
+            )
+        output_items[output_index] = normalized
+        return
+    if item_type == "tool_search_output":
+        normalized, _loaded_tools = _normalized_hosted_tool_search_output(
+            item,
+            item_index=output_index,
+        )
+        existing = output_items.get(output_index)
+        if existing != normalized:
+            raise OpenAIProtocolError(
+                "OpenAI tool_search_output output_item.done conflicts with lifecycle evidence."
             )
         output_items[output_index] = normalized
         return
@@ -4263,7 +4824,10 @@ def _openai_neutral_assistant_items(
     pending_text_offset = 0
     tool_search_items_by_call_id: dict[str, dict[str, Any]] = {}
     used_tool_search_call_ids: set[str] = set()
-    if tool_discovery_projection is not None:
+    if (
+        tool_discovery_projection is not None
+        and tool_discovery_projection.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+    ):
         for index, part in enumerate(message.content):
             if (
                 type(part) is not ProviderStatePart
@@ -4422,6 +4986,28 @@ def _server_chain(messages: list[Message]) -> tuple[str | None, list[Message]]:
     return last_id, messages[last_index + 1 :]
 
 
+def _openai_discovery_ownership_tokens(
+    projection: ToolDiscoveryProjectionRequest | None,
+) -> tuple[str, ...] | None:
+    if projection is None:
+        return None
+    if projection.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+        return projection.loaded_tool_names
+    if not projection.candidate_tools:
+        return ()
+    material = json.dumps(
+        {
+            "protocol": projection.protocol,
+            "generation_id": projection.generation_id,
+            "candidate_tools": list(projection.candidate_tools),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (f"hosted:{sha256(material).hexdigest()}",)
+
+
 def _server_prefix_has_unsafe_dynamic_tools(
     server_owned_messages: list[Message],
     *,
@@ -4478,7 +5064,12 @@ def _server_prefix_has_unsafe_dynamic_tools(
         return True
     if owned_names != tuple(sorted(set(owned_names))):
         return True
-    return not set(owned_names).issubset(discovery_projection.loaded_tool_names)
+    expected_tokens = _openai_discovery_ownership_tokens(discovery_projection)
+    if expected_tokens is None:  # pragma: no cover - projection is non-null above
+        return True
+    if discovery_projection.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+        return not set(owned_names).issubset(expected_tokens)
+    return owned_names != expected_tokens
 
 
 def _event_with_server_dynamic_tool_ownership(
@@ -4518,6 +5109,7 @@ def _event_with_server_dynamic_tool_ownership(
         delta=event.delta,
         payload=payload,
         completion=event.completion,
+        tool_discovery_result=event.tool_discovery_result,
         recovery_metadata=event.recovery_metadata,
         provider_operation_status=event.provider_operation_status,
     )
@@ -4569,9 +5161,23 @@ def _openai_provider_state_items(
         if item_type == "tool_search_call":
             if tool_discovery_projection is None:
                 raise OpenAIProtocolError(
-                    "OpenAI tool_search_call state requires an active client Tool Search projection."
+                    "OpenAI tool_search_call state requires an active Tool Search projection."
                 )
             items.append(_normalized_tool_search_call(state, item_index=len(items)))
+            continue
+        if item_type == "tool_search_output":
+            if (
+                tool_discovery_projection is None
+                or tool_discovery_projection.protocol != OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+            ):
+                raise OpenAIProtocolError(
+                    "OpenAI hosted tool_search_output state requires hosted Tool Search."
+                )
+            normalized, _loaded_tools = _normalized_hosted_tool_search_output(
+                state,
+                item_index=len(items),
+            )
+            items.append(normalized)
             continue
         if item_type not in {"message", "function_call", "web_search_call"}:
             raise OpenAIProtocolError(
@@ -4623,6 +5229,87 @@ def _validate_tool_search_replay(
     """Require exact provider call evidence and one matching result per native search."""
 
     if projection is None:
+        return
+    if projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+        candidates_by_name = {
+            cast("str", tool["name"]): tool for tool in projection.candidate_tools
+        }
+        replay_loaded_by_name: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            if message.role is not MessageRole.ASSISTANT:
+                continue
+            states = [
+                part.state
+                for part in message.content
+                if type(part) is ProviderStatePart and part.provider == "openai"
+            ]
+            pair_indexes: list[int] = []
+            for index, state in enumerate(states):
+                item_type = state.get("type")
+                if item_type == "tool_search_output":
+                    if (
+                        index == 0
+                        or states[index - 1].get("type") != "tool_search_call"
+                        or states[index - 1].get("execution") != "server"
+                    ):
+                        raise OpenAIProtocolError(
+                            "Hosted Tool Search replay contains an orphan loaded output."
+                        )
+                    continue
+                if item_type != "tool_search_call":
+                    continue
+                if state.get("execution") != "server":
+                    raise OpenAIProtocolError(
+                        "Hosted Tool Search replay cannot contain a client search call."
+                    )
+                if (
+                    index + 1 >= len(states)
+                    or states[index + 1].get("type") != "tool_search_output"
+                ):
+                    raise OpenAIProtocolError(
+                        "Hosted Tool Search replay requires an adjacent call/output pair."
+                    )
+                _normalized_tool_search_call(state, item_index=index)
+                _normalized_output, loaded_tools = _normalized_hosted_tool_search_output(
+                    states[index + 1],
+                    item_index=index + 1,
+                )
+                for loaded_tool in loaded_tools:
+                    name = cast("str", loaded_tool["name"])
+                    if candidates_by_name.get(name) != loaded_tool:
+                        raise OpenAIProtocolError(
+                            "Hosted Tool Search replay loaded a function outside the current "
+                            "candidate projection."
+                        )
+                    replay_loaded_by_name[name] = loaded_tool
+                pair_indexes.append(index)
+            if len(pair_indexes) > 1:
+                raise OpenAIProtocolError(
+                    "Hosted Tool Search replay contains multiple search pairs in one response."
+                )
+            if pair_indexes and any(
+                state.get("type") == "function_call" for state in states[: pair_indexes[0]]
+            ):
+                raise OpenAIProtocolError(
+                    "Hosted Tool Search replay function calls must follow the loaded output."
+                )
+            if any(
+                state.get("type") == "function_call"
+                and state.get("name") in candidates_by_name
+                and state.get("name") not in replay_loaded_by_name
+                for state in states
+            ):
+                raise OpenAIProtocolError(
+                    "Hosted Tool Search replay called a deferred function outside the loaded "
+                    "subset."
+                )
+        if any(
+            replay_loaded_by_name.get(cast("str", tool["name"])) != tool
+            for tool in projection.loaded_tools
+        ):
+            raise OpenAIProtocolError(
+                "Hosted Tool Search replay-loaded authority has no exact retained output."
+            )
         return
     calls: dict[str, dict[str, Any]] = {}
     pending_results: set[str] = set()
@@ -4918,7 +5605,7 @@ def _openai_request_tools(request: ModelRequest) -> list[dict[str, Any]]:
     projection = request.tool_discovery_projection
     if projection is None:
         return [_openai_tool(tool) for tool in request.tools]
-    for name in projection.loaded_tool_names:
+    for name in (*projection.loaded_tool_names, *projection.candidate_tool_names):
         _validate_openai_tool_name(name)
     cache_anchor_name = targeted_tool_native_cache_anchor_name(request.options)
     search_indexes = [
@@ -4927,20 +5614,21 @@ def _openai_request_tools(request: ModelRequest) -> list[dict[str, Any]]:
         if tool.get("name") == _CAYU_SEARCH_TOOLS_NAME
     ]
     if len(search_indexes) != 1:
-        raise ValueError("OpenAI client Tool Search requires one exact search_tools definition.")
+        raise ValueError("OpenAI Tool Search requires one exact search_tools definition.")
     projected: list[dict[str, Any]] = []
     for index, tool in enumerate(request.tools):
         name = tool.get("name")
         if index == search_indexes[0]:
-            function = _openai_tool(tool)
-            projected.append(
-                {
-                    "type": "tool_search",
-                    "execution": "client",
-                    "description": _OPENAI_CLIENT_TOOL_SEARCH_DESCRIPTION,
-                    "parameters": function["parameters"],
-                }
-            )
+            if projection.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+                function = _openai_tool(tool)
+                projected.append(
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": _OPENAI_CLIENT_TOOL_SEARCH_DESCRIPTION,
+                        "parameters": function["parameters"],
+                    }
+                )
             continue
         if (
             name == _CAYU_CALL_TOOL_NAME
@@ -4949,6 +5637,32 @@ def _openai_request_tools(request: ModelRequest) -> list[dict[str, Any]]:
         ):
             continue
         projected.append(_openai_tool(tool))
+    if projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+        direct_names = {
+            cast("str", tool["name"])
+            for tool in projected
+            if tool.get("type") == "function" and type(tool.get("name")) is str
+        }
+        overlap = sorted(direct_names & set(projection.candidate_tool_names))
+        if overlap:
+            raise ValueError(
+                "Hosted Tool Search candidates cannot also be direct request tools: "
+                + ", ".join(overlap)
+            )
+        projected.extend(
+            {
+                **_openai_tool(tool),
+                "defer_loading": True,
+            }
+            for tool in projection.candidate_tools
+        )
+        if projection.candidate_tools:
+            projected.append(
+                {
+                    "type": "tool_search",
+                    "execution": "server",
+                }
+            )
     return projected
 
 

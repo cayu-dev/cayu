@@ -89,6 +89,47 @@ guard.
 
 ## Unreleased
 
+### OpenAI Responses can defer catalogue schemas through hosted Tool Search
+
+Agents can select `tool_discovery_mode="openai_tool_search_hosted"` or the
+portable fallback mode
+`"openai_tool_search_hosted_or_search_tools"`. Exact model ids must be listed
+separately in `OpenAIProvider.hosted_tool_search_models`; Cayu performs no
+model-family inference and establishes this projection only for the official
+OpenAI Responses endpoint.
+
+Cayu sends bounded ceiling-authorized catalogue functions as
+`defer_loading=true` candidates followed by the server-executed Tool Search
+definition, forces serial tool calls, and validates the exact adjacent hosted
+search call/output pair. Loaded name, description, and schema evidence must
+match the dispatched candidate projection and current catalogue authority
+before Cayu atomically publishes branch-local grants with the assistant tool
+round. The resulting direct function calls retain the ordinary policy,
+approval, hook, effect, secret, environment, execution, result, and recovery
+contracts. Missing, altered, unrelated, oversized, duplicated, or out-of-order
+provider evidence fails closed before target work.
+
+If direct or targeted exposure covers the complete session ceiling, the hosted
+projection is an explicit zero-candidate no-op and Cayu omits the inert server
+search tool from the OpenAI wire request.
+
+Streaming, terminal-only streaming, non-streamed responses, inline replay,
+server-state chaining, and background process-loss recovery preserve the same
+authority. Background stages persist a digest of the original bounded candidate
+projection plus bounded, name-free hashes for exact native-targeted exclusions
+and replay-loaded grants, then reconstruct it from frozen session authority
+before publishing recovered grants. A credential-free two-request example
+exercises the real adapter and runtime without asserting production-model
+support or a provider cache hit.
+
+Server-chain ownership now includes the branch discovery generation as well as
+the exact candidate projection. Forks therefore neutrally rebuild inherited
+history instead of retaining a parent response's loaded server surface, while
+the generation identity stays off the provider wire. Provider-native discovery
+request footprints advance to schema version 7 and expose only protocol,
+candidate/loaded counts, and hosted generation identity; candidate names,
+descriptions, schemas, searches, and arguments remain private.
+
 ### Evals add structured, bounded model-judge contracts
 
 Portable corpus schema V2 can pin a server-published judge profile and evaluate
@@ -284,12 +325,13 @@ all provider adapters. In OpenAI native-targeting mode, runtime-owned
 `allowed_tools` keeps both discovery functions callable without changing the
 cache anchor.
 
-Discovery-enabled conversational request footprints advance to schema version
+Portable discovery-enabled conversational request footprints use schema version
 6 and record only the current view generation/revision, catalogue and ceiling
-identities, and grant count. These observation fields do not enter the provider
-payload: keyed tool-manifest and cache-prefix fingerprints remain stable as
-grants are discovered. Adapter coverage verifies the same two-tool prefix for
-OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex.
+identities, and grant count. Provider-native discovery adds the content-free
+projection summary in schema version 7. These observation fields do not enter
+the provider payload: keyed tool-manifest and cache-prefix fingerprints remain
+stable as grants are discovered. Adapter coverage verifies the same two-tool
+prefix for OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex.
 
 `CayuApp.inspect_tool_discovery_view(...)` and the authenticated
 `GET /api/sessions/{session_id}/tool-view` control-plane route expose a bounded,

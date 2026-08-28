@@ -16947,6 +16947,7 @@ class SessionEngine:
                 else (assistant_message,)
             ),
             events=(publication.completion_event,),
+            operation_record_mutations=publication.operation_record_mutations,
         )
 
         async def commit_and_fan_out_once() -> ModelCompletionPublicationResult:

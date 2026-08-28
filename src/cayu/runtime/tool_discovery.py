@@ -42,7 +42,11 @@ from cayu.core.tools import (
     ToolSpec,
     _runtime_tool_invocation_authority,
 )
-from cayu.providers.base import OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL, ModelProvider
+from cayu.providers.base import (
+    OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    ModelProvider,
+)
 from cayu.runtime.tool_catalogue import (
     SEARCH_TOOLS_NAME,
     ToolCatalogSnapshot,
@@ -88,6 +92,8 @@ class ToolDiscoveryMode(StrEnum):
     SEARCH_TOOLS = SEARCH_TOOLS_NAME
     OPENAI_TOOL_SEARCH_CLIENT = "openai_tool_search_client"
     OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS = "openai_tool_search_client_or_search_tools"
+    OPENAI_TOOL_SEARCH_HOSTED = "openai_tool_search_hosted"
+    OPENAI_TOOL_SEARCH_HOSTED_OR_SEARCH_TOOLS = "openai_tool_search_hosted_or_search_tools"
 
 
 class ToolDiscoveryProjectionKind(StrEnum):
@@ -95,6 +101,7 @@ class ToolDiscoveryProjectionKind(StrEnum):
 
     SEARCH_TOOLS = SEARCH_TOOLS_NAME
     OPENAI_TOOL_SEARCH_CLIENT = "openai_tool_search_client"
+    OPENAI_TOOL_SEARCH_HOSTED = "openai_tool_search_hosted"
 
 
 class ToolDiscoveryViewInconsistentError(RuntimeError):
@@ -136,20 +143,26 @@ def resolve_tool_discovery_projection(
     model = require_durable_clean_nonblank(model, "model")
     if mode is ToolDiscoveryMode.SEARCH_TOOLS:
         return ToolDiscoveryProjectionKind.SEARCH_TOOLS
-    supported = provider.supports_tool_discovery_projection(
-        model=model,
-        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
-    )
+    hosted = mode in {
+        ToolDiscoveryMode.OPENAI_TOOL_SEARCH_HOSTED,
+        ToolDiscoveryMode.OPENAI_TOOL_SEARCH_HOSTED_OR_SEARCH_TOOLS,
+    }
+    protocol = OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL if hosted else OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+    supported = provider.supports_tool_discovery_projection(model=model, protocol=protocol)
     if type(supported) is not bool:
         raise TypeError("Provider tool-discovery capability checks must return a bool.")
     if supported:
-        return ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
-    if mode is ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS:
+        return (
+            ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED
+            if hosted
+            else ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+        )
+    if mode in {
+        ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS,
+        ToolDiscoveryMode.OPENAI_TOOL_SEARCH_HOSTED_OR_SEARCH_TOOLS,
+    }:
         return ToolDiscoveryProjectionKind.SEARCH_TOOLS
-    provider.preflight_tool_discovery_projection(
-        model=model,
-        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
-    )
+    provider.preflight_tool_discovery_projection(model=model, protocol=protocol)
     raise RuntimeError("Provider tool-discovery preflight returned without establishing support.")
 
 
@@ -193,11 +206,12 @@ def tool_discovery_execution_profile_material() -> dict[str, Any]:
 
     return {
         "kind": "cayu:tool-discovery",
-        "schema_version": 2,
+        "schema_version": 3,
         "result_schema_version": TOOL_DISCOVERY_SCHEMA_VERSION,
         "projections": {
             "portable": ToolDiscoveryProjectionKind.SEARCH_TOOLS.value,
             "openai_client": OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+            "openai_hosted": OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
         },
         "view_operation_key": TOOL_DISCOVERY_VIEW_OPERATION_KEY,
         "max_results": TOOL_DISCOVERY_MAX_RESULTS,
@@ -1377,6 +1391,92 @@ def _tool_discovery_search_transition(
     )
 
 
+def hosted_tool_discovery_transition(
+    state: ToolDiscoveryViewState,
+    *,
+    descriptors: Sequence[ToolDescriptor],
+    model_step_id: str,
+    created_at: datetime,
+) -> tuple[ToolDiscoveryViewState, dict[str, str]]:
+    """Grant one exact provider-validated hosted selection without truncation."""
+
+    if type(state) is not ToolDiscoveryViewState:
+        raise TypeError("state must be a ToolDiscoveryViewState.")
+    state = ToolDiscoveryViewState.model_validate(state.model_dump(mode="python"))
+    selected = tuple(descriptors)
+    if not selected:
+        raise ValueError("Hosted Tool Search must load at least one descriptor.")
+    if len(selected) > TOOL_DISCOVERY_MAX_GRANTS:
+        raise ValueError("Hosted Tool Search loaded too many descriptors.")
+    if any(type(descriptor) is not ToolDescriptor for descriptor in selected):
+        raise TypeError("Hosted Tool Search descriptors must be ToolDescriptor values.")
+    tool_ids = tuple(descriptor.tool_id for descriptor in selected)
+    names = tuple(descriptor.name for descriptor in selected)
+    if len(tool_ids) != len(set(tool_ids)) or len(names) != len(set(names)):
+        raise ValueError("Hosted Tool Search loaded duplicate descriptors.")
+
+    existing_by_tool_id = {grant.tool_id: grant for grant in state.grants}
+    next_revision = state.revision + 1
+    new_grants: list[ToolDiscoveryGrantRecord] = []
+    grant_ids_by_name: dict[str, str] = {}
+    for descriptor in selected:
+        definition = _tool_discovery_definition_for_descriptor(descriptor)
+        schema = cast("dict[str, Any]", definition["input_schema"])
+        if (
+            len(canonical_durable_json_bytes(schema, "hosted_tool_search.input_schema"))
+            > TOOL_DISCOVERY_MAX_SCHEMA_BYTES
+        ):
+            raise ValueError("Hosted Tool Search loaded an oversized schema.")
+        grant = existing_by_tool_id.get(descriptor.tool_id)
+        if grant is not None:
+            if not tool_discovery_record_matches_descriptor(grant, descriptor):
+                raise ValueError("Hosted Tool Search matched stale discovery authority.")
+        else:
+            if len(state.grants) + len(new_grants) >= TOOL_DISCOVERY_MAX_GRANTS:
+                raise ValueError("Hosted Tool Search would exceed the durable grant bound.")
+            grant_id = tool_discovery_grant_id(
+                session_id=state.session_id,
+                generation_id=state.generation_id,
+                agent_name=state.agent_name,
+                catalogue_revision=state.catalogue_revision,
+                ceiling_fingerprint=state.ceiling_fingerprint,
+                descriptor=descriptor,
+            )
+            grant = ToolDiscoveryGrantRecord(
+                grant_id=grant_id,
+                tool_ref=tool_discovery_reference(grant_id),
+                tool_id=descriptor.tool_id,
+                tool_name=descriptor.name,
+                catalogue_revision=state.catalogue_revision,
+                descriptor_version=descriptor.version,
+                schema_fingerprint=descriptor.schema_fingerprint,
+                origin_query_sha256=_sha256_identity(
+                    {"protocol": OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL},
+                    "hosted_tool_discovery_origin",
+                ),
+                origin_model_step_id=model_step_id,
+                created_at=created_at,
+                discovered_revision=next_revision,
+            )
+            new_grants.append(grant)
+        grant_ids_by_name[descriptor.name] = grant.grant_id
+
+    desired_state = (
+        ToolDiscoveryViewState.model_validate(
+            {
+                **state.model_dump(mode="python"),
+                "revision": next_revision,
+                "grants": tuple(
+                    sorted((*state.grants, *new_grants), key=lambda item: item.tool_id)
+                ),
+            }
+        )
+        if new_grants
+        else state
+    )
+    return desired_state, grant_ids_by_name
+
+
 class SearchToolsTool(Tool):
     """Cayu-owned stable discovery tool executed through the ordinary tool path."""
 
@@ -1497,6 +1597,7 @@ __all__ = [
     "current_tool_discovery_view",
     "discovered_tool_rejection_event",
     "empty_tool_discovery_view",
+    "hosted_tool_discovery_transition",
     "initial_tool_discovery_operation_records",
     "minimized_tool_discovery_result",
     "resolve_tool_discovery_projection",

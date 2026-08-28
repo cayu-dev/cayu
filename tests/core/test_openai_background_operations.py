@@ -9,9 +9,10 @@ from typing import Any
 import httpx
 import pytest
 
-from cayu import AgentSpec, CayuApp, InMemorySessionStore, RunRequest
+from cayu import AgentSpec, CayuApp, InMemorySessionStore, ResumeRequest, RunRequest
 from cayu.core import EventType, Message
 from cayu.core.messages import MessageRole, ProviderStatePart
+from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import (
     HttpxOpenAITransport,
     ModelRequest,
@@ -31,6 +32,7 @@ from cayu.providers import (
 )
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
 )
@@ -45,7 +47,11 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_discovery import search_tools_spec
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryViewState,
+    search_tools_spec,
+)
 from cayu.runtime.tool_gateway import call_tool_spec
 
 
@@ -106,6 +112,86 @@ def _native_discovery_request() -> ModelRequest:
     )
 
 
+def _hosted_discovery_request() -> ModelRequest:
+    return ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "find a memory tool")],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(
+                {
+                    "name": "remember_knowledge",
+                    "description": "Save durable knowledge.",
+                    "input_schema": _RememberKnowledgeTool.spec.input_schema,
+                },
+            ),
+        ),
+    )
+
+
+class _RememberKnowledgeTool(Tool):
+    spec = ToolSpec(
+        name="remember_knowledge",
+        description="Save durable knowledge.",
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"fact": {"type": "string"}},
+            "required": ["fact"],
+        },
+        effect=ToolEffect.NONE,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="saved")
+
+
+def _hosted_tool_search_completion() -> dict[str, Any]:
+    schema = _RememberKnowledgeTool.spec.input_schema
+    return {
+        "id": "resp_background_123",
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [
+            {
+                "type": "tool_search_call",
+                "execution": "server",
+                "call_id": None,
+                "status": "completed",
+                "arguments": {"paths": ["remember_knowledge"]},
+            },
+            {
+                "type": "tool_search_output",
+                "execution": "server",
+                "call_id": None,
+                "status": "completed",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "remember_knowledge",
+                        "description": "Save durable knowledge.",
+                        "parameters": schema,
+                        "strict": False,
+                        "defer_loading": True,
+                        "output_schema": None,
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_remember",
+                "name": "remember_knowledge",
+                "arguments": '{"fact":"recover hosted authority"}',
+                "status": "completed",
+            },
+        ],
+        "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    }
+
+
 def _created(*, response_id: str = "resp_background_123", sequence_number: int = 0):
     return {
         "type": "response.created",
@@ -119,12 +205,17 @@ def _created(*, response_id: str = "resp_background_123", sequence_number: int =
     }
 
 
-def _completed(*, sequence_number: int = 2, text: str = "finished"):
+def _completed(
+    *,
+    sequence_number: int = 2,
+    text: str = "finished",
+    response_id: str = "resp_background_123",
+):
     return {
         "type": "response.completed",
         "sequence_number": sequence_number,
         "response": {
-            "id": "resp_background_123",
+            "id": response_id,
             "model": "gpt-test",
             "status": "completed",
             "output": [
@@ -1081,7 +1172,17 @@ async def test_openai_background_checkpoints_parser_state_between_tool_events() 
         "arguments": {"text": "hello"},
     }
     assert [event.recovery_metadata.cursor for event in recovered] == [3, 4]  # type: ignore[union-attr]
-    assert "parser" not in recovered[0].recovery_metadata.opaque  # type: ignore[union-attr]
+    completed_call_digests = recovered[0].recovery_metadata.opaque["parser"][  # type: ignore[union-attr]
+        "completed_function_call_digests"
+    ]
+    assert completed_call_digests == [
+        {
+            "output_index": 0,
+            "item_sha256": completed_call_digests[0]["item_sha256"],
+        }
+    ]
+    assert len(completed_call_digests[0]["item_sha256"]) == 64
+    assert "hello" not in repr(recovered[0].recovery_metadata.opaque)  # type: ignore[union-attr]
 
 
 @pytest.mark.anyio
@@ -1181,6 +1282,117 @@ async def test_openai_background_reconnect_does_not_repeat_completed_tool_search
         if item["state"].get("type") == "response_ref"
     )
     assert response_ref["tool_discovery_loaded_tool_names"] == []
+
+
+@pytest.mark.anyio
+async def test_openai_background_recovers_completed_hosted_search_lifecycle() -> None:
+    transport = BackgroundTransport()
+    response = _hosted_tool_search_completion()
+    search_call, search_output, function_call = response["output"]
+    normalized_search_output = {
+        **search_output,
+        "tools": [
+            {key: value for key, value in tool.items() if key != "output_schema"}
+            for tool in search_output["tools"]
+        ],
+    }
+    transport.start_batches.append(
+        [
+            _created(),
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "tool_search_call",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "in_progress",
+                    "arguments": {},
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item": search_call,
+            },
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 3,
+                "output_index": 1,
+                "item": {
+                    "type": "tool_search_output",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "in_progress",
+                    "tools": [],
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 1,
+                "item": search_output,
+            },
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        hosted_tool_search_models=("gpt-test",),
+        transport=transport,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    started = await adapter.start(
+        ProviderOperationStartRequest(
+            request=_hosted_discovery_request(),
+            idempotency_key="hosted-discovery-start",
+        )
+    )
+
+    started_events = [event async for event in started.events]
+
+    assert [event.type for event in started_events] == [
+        ModelStreamEventType.THINKING,
+        ModelStreamEventType.THINKING,
+        ModelStreamEventType.THINKING,
+        ModelStreamEventType.THINKING,
+    ]
+    checkpoint = started_events[-1].recovery_metadata
+    assert checkpoint is not None
+    parser = checkpoint.opaque["parser"]
+    assert isinstance(parser, dict)
+    assert parser["completed_tool_search_items"] == [
+        {"output_index": 0, "item": search_call},
+        {"output_index": 1, "item": normalized_search_output},
+    ]
+    recovered_state = ProviderOperationState(
+        operation_id=started.state.operation_id,
+        stream_protocol=started.state.stream_protocol,
+        recovery_metadata=checkpoint,
+    )
+    transport.reconnect_batches.append(
+        [
+            {
+                "type": "response.completed",
+                "sequence_number": 5,
+                "response": {**response, "output": [search_call, search_output, function_call]},
+            }
+        ]
+    )
+
+    reconnected = await adapter.reconnect(recovered_state)
+    recovered = [event async for event in reconnected.events]
+
+    assert [event.type for event in recovered] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert recovered[0].payload["name"] == "remember_knowledge"
+    assert recovered[-1].tool_discovery_result is not None
+    assert recovered[-1].tool_discovery_result.loaded_tool_names == ("remember_knowledge",)
 
 
 @pytest.mark.anyio
@@ -1334,6 +1546,262 @@ async def test_openai_background_worker_loss_recovers_without_resubmission(
     inspection = await inspect_provider_operation(store, session_id)
     assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
     assert inspection.recovery_reason is None
+
+
+@pytest.mark.anyio
+async def test_openai_background_recovers_hosted_tool_search_authority_atomically() -> None:
+    transport = BackgroundTransport()
+    transport.start_batches.append(
+        [_created(), SimulatedWorkerLoss("worker disappeared after hosted dispatch")]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        hosted_tool_search_models=("gpt-test",),
+        transport=transport,
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-test"),
+        tools=(_RememberKnowledgeTool(),),
+        tool_discovery_mode="openai_tool_search_hosted",
+    )
+    session_id = "openai-hosted-search-worker-loss"
+
+    with pytest.raises(SimulatedWorkerLoss):
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Find and save this lesson.")],
+                )
+            )
+        ]
+
+    [start_call] = transport.start_calls
+    assert start_call["payload"]["tools"] == [
+        {
+            "type": "function",
+            "name": "remember_knowledge",
+            "description": "Save durable knowledge.",
+            "parameters": _RememberKnowledgeTool.spec.input_schema,
+            "strict": False,
+            "defer_loading": True,
+        },
+        {"type": "tool_search", "execution": "server"},
+    ]
+    stage = await store.load_active_model_completion_stage(session_id)
+    assert stage is not None
+    hosted_authority = stage.stage.intent["recovery_context"]["hosted_tool_discovery"]
+    assert hosted_authority == {
+        "protocol": OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        "projection_sha256": hosted_authority["projection_sha256"],
+        "targeted_tool_name_sha256s": [],
+        "loaded_tool_name_sha256s": [],
+    }
+    assert len(hosted_authority["projection_sha256"]) == 64
+    assert "remember_knowledge" not in json.dumps(hosted_authority)
+    transport.retrieve_responses.append(_hosted_tool_search_completion())
+
+    recovered = await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(
+            session_id=session_id,
+            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+        )
+    )
+
+    assert recovered.status is SessionStatus.INTERRUPTED
+    assert len(transport.start_calls) == 1
+    assert len(transport.retrieve_calls) == 1
+    view = ToolDiscoveryViewState.model_validate(
+        await store.load_session_operation(
+            session_id,
+            TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+        )
+    )
+    assert view.revision == 1
+    assert [grant.tool_name for grant in view.grants] == ["remember_knowledge"]
+    checkpoint = await store.load_checkpoint(session_id)
+    assert checkpoint is not None
+    pending_round = checkpoint["pending_tool_round"]
+    [pending_call] = pending_round["tool_calls"]
+    assert pending_call["tool_name"] == "remember_knowledge"
+    assert pending_call["targeted_tool_invocation"]["grant_id"] == view.grants[0].grant_id
+    inspection = await inspect_provider_operation(store, session_id)
+    assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
+
+
+@pytest.mark.anyio
+async def test_openai_background_reconstructs_retained_hosted_replay_authority() -> None:
+    transport = BackgroundTransport()
+    initial_response = {
+        **_hosted_tool_search_completion(),
+        "id": "resp_hosted_replay_initial",
+    }
+    search_call, search_output, function_call = initial_response["output"]
+    transport.start_batches.extend(
+        [
+            [
+                _created(response_id="resp_hosted_replay_initial"),
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {
+                        "type": "tool_search_call",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "in_progress",
+                        "arguments": {},
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": search_call,
+                },
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 3,
+                    "output_index": 1,
+                    "item": {
+                        "type": "tool_search_output",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "in_progress",
+                        "tools": [],
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 4,
+                    "output_index": 1,
+                    "item": search_output,
+                },
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 5,
+                    "output_index": 2,
+                    "item": {
+                        **function_call,
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "sequence_number": 6,
+                    "output_index": 2,
+                    "name": function_call["name"],
+                    "arguments": function_call["arguments"],
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 7,
+                    "response": initial_response,
+                },
+            ],
+            [
+                _created(response_id="resp_hosted_replay_done"),
+                _completed(
+                    sequence_number=1,
+                    response_id="resp_hosted_replay_done",
+                ),
+            ],
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        hosted_tool_search_models=("gpt-test",),
+        transport=transport,
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-test"),
+        tools=(_RememberKnowledgeTool(),),
+        tool_discovery_mode="openai_tool_search_hosted",
+    )
+    session_id = "openai-hosted-replay-worker-loss"
+
+    initial = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "Find and save this lesson.")],
+            )
+        )
+    ]
+    assert initial[-1].type is EventType.SESSION_COMPLETED
+    view = ToolDiscoveryViewState.model_validate(
+        await store.load_session_operation(session_id, TOOL_DISCOVERY_VIEW_OPERATION_KEY)
+    )
+    assert view.revision == 1
+
+    transport.start_batches.append(
+        [
+            _created(response_id="resp_hosted_replay_loss"),
+            SimulatedWorkerLoss("worker disappeared after replay-loaded dispatch"),
+        ]
+    )
+    with pytest.raises(SimulatedWorkerLoss):
+        _ = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "Use the retained loaded tool again.")],
+                )
+            )
+        ]
+
+    stage = await store.load_active_model_completion_stage(session_id)
+    assert stage is not None
+    hosted_authority = stage.stage.intent["recovery_context"]["hosted_tool_discovery"]
+    assert len(hosted_authority["loaded_tool_name_sha256s"]) == 1
+    assert "remember_knowledge" not in json.dumps(hosted_authority)
+    transport.retrieve_responses.append(
+        {
+            "id": "resp_hosted_replay_loss",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_replayed_remember",
+                    "name": "remember_knowledge",
+                    "arguments": '{"fact":"recover retained hosted authority"}',
+                    "status": "completed",
+                }
+            ],
+            "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+        }
+    )
+
+    recovered = await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(
+            session_id=session_id,
+            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+        )
+    )
+
+    assert recovered.status is SessionStatus.INTERRUPTED
+    checkpoint = await store.load_checkpoint(session_id)
+    assert checkpoint is not None
+    [pending_call] = checkpoint["pending_tool_round"]["tool_calls"]
+    assert pending_call["tool_name"] == "remember_knowledge"
+    assert pending_call["targeted_tool_invocation"]["grant_id"] == view.grants[0].grant_id
+    inspection = await inspect_provider_operation(store, session_id)
+    assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED
 
 
 @pytest.mark.anyio

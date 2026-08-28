@@ -85,6 +85,9 @@ corresponding credentials or service.
 - [`openai_client_tool_search/`](openai_client_tool_search/) — credential-free
   native `tool_search_call` / `tool_search_output` projection through the real
   OpenAI adapter and ordinary Cayu tool executor.
+- [`openai_hosted_tool_search/`](openai_hosted_tool_search/) — credential-free
+  server-executed Tool Search selection, atomic branch-local grant publication,
+  replay, and ordinary tool execution through the real OpenAI adapter.
 - [`real_spend_budget_live.py`](real_spend_budget_live.py) — live causal budget enforcement.
 - [`context_counting_live.py`](context_counting_live.py) and
   [`context_pressure_calibration_live.py`](context_pressure_calibration_live.py) — context limits and calibration.

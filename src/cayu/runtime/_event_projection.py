@@ -419,6 +419,9 @@ _REQUEST_CACHE_BREAKPOINT_TTL_VALUES = frozenset({"standard", "extended"})
 _REQUEST_CONTEXT_METHOD_VALUES = frozenset({"local_full_request_estimate"})
 _REQUEST_CONTEXT_CONFIDENCE_VALUES = frozenset({"estimated"})
 _TARGETED_TOOL_PROJECTION_VALUES = frozenset({"call_tool", "openai_additional_tools"})
+_TOOL_DISCOVERY_PROJECTION_PROTOCOL_VALUES = frozenset(
+    {"openai.tool_search.client.v1", "openai.tool_search.hosted.v1"}
+)
 _REQUEST_SAFE_OPTION_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -643,7 +646,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("duplicate_request_risk",): frozenset({True, False}),
     },
     EventType.REQUEST_FOOTPRINT_RECORDED: {
-        ("schema_version",): frozenset({1, 2, 3, 4, 5, 6}),
+        ("schema_version",): frozenset({1, 2, 3, 4, 5, 6, 7}),
         ("request_variant",): _REQUEST_VARIANT_VALUES,
         ("messages", "groups", "*", "role"): _REQUEST_MESSAGE_ROLE_VALUES,
         ("messages", "groups", "*", "part_type"): _REQUEST_MESSAGE_PART_TYPE_VALUES,
@@ -663,6 +666,10 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             "kind",
         ): _REQUEST_PROMPT_CONTRIBUTION_KIND_VALUES,
         ("targeted_tool_grants", "projection"): _TARGETED_TOOL_PROJECTION_VALUES,
+        (
+            "tool_discovery_projection",
+            "protocol",
+        ): _TOOL_DISCOVERY_PROJECTION_PROTOCOL_VALUES,
         ("targeted_native_item_active",): frozenset({True, False}),
         (
             "prompt_contributions",
@@ -1141,6 +1148,10 @@ _REQUEST_FOOTPRINT_NESTED_PATHS = frozenset(
         ("tool_discovery_view", "catalogue_revision"),
         ("tool_discovery_view", "ceiling_fingerprint"),
         ("tool_discovery_view", "grant_count"),
+        ("tool_discovery_projection", "protocol"),
+        ("tool_discovery_projection", "candidate_count"),
+        ("tool_discovery_projection", "loaded_count"),
+        ("tool_discovery_projection", "generation_id"),
     }
     | {
         (*prefix, field_name)
@@ -1842,7 +1853,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
         "operation_id options provider_name prompt_contributions request_variant schema_version "
         "step structured_output targeted_native_item_active targeted_native_item_message_index "
-        "targeted_tool_grants tool_discovery_view tool_exposure tools total",
+        "targeted_tool_grants tool_discovery_projection tool_discovery_view tool_exposure tools total",
         owned_nested_paths=_REQUEST_FOOTPRINT_NESTED_PATHS,
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
@@ -3975,17 +3986,19 @@ def _restore_publication_safe_tool_footprints(
     raw_native_item_active = event.payload.get("targeted_native_item_active")
     raw_native_item_message_index = event.payload.get("targeted_native_item_message_index")
     raw_discovery_view = event.payload.get("tool_discovery_view")
+    raw_discovery_projection = event.payload.get("tool_discovery_projection")
     schema_version = event.payload.get("schema_version")
     if raw_exposure is None:
-        if schema_version in {3, 4, 5, 6} and reject_malformed:
+        if schema_version in {3, 4, 5, 6, 7} and reject_malformed:
             raise ValueError("Request footprint schema v3+ has no tool exposure summary.")
         redacted_payload.pop("tool_exposure", None)
         redacted_payload.pop("targeted_tool_grants", None)
         redacted_payload.pop("targeted_native_item_active", None)
         redacted_payload.pop("targeted_native_item_message_index", None)
         redacted_payload.pop("tool_discovery_view", None)
+        redacted_payload.pop("tool_discovery_projection", None)
         return
-    if schema_version not in {3, 4, 5, 6}:
+    if schema_version not in {3, 4, 5, 6, 7}:
         if reject_malformed:
             raise ValueError("Only request footprint schema v3+ may carry tool exposure.")
         redacted_payload.pop("tool_exposure", None)
@@ -3993,10 +4006,12 @@ def _restore_publication_safe_tool_footprints(
         redacted_payload.pop("targeted_native_item_active", None)
         redacted_payload.pop("targeted_native_item_message_index", None)
         redacted_payload.pop("tool_discovery_view", None)
+        redacted_payload.pop("tool_discovery_projection", None)
         return
 
     from cayu.runtime.request_footprints import (
         TargetedToolGrantFootprint,
+        ToolDiscoveryProjectionFootprint,
         ToolDiscoveryViewFootprint,
         ToolExposureFootprint,
     )
@@ -4013,6 +4028,11 @@ def _restore_publication_safe_tool_footprints(
             if raw_discovery_view is not None
             else None
         )
+        discovery_projection = (
+            ToolDiscoveryProjectionFootprint.model_validate(raw_discovery_projection)
+            if raw_discovery_projection is not None
+            else None
+        )
     except (TypeError, ValueError) as exc:
         if reject_malformed:
             raise ValueError("Request footprint tool evidence is malformed.") from exc
@@ -4021,10 +4041,11 @@ def _restore_publication_safe_tool_footprints(
         redacted_payload.pop("targeted_native_item_active", None)
         redacted_payload.pop("targeted_native_item_message_index", None)
         redacted_payload.pop("tool_discovery_view", None)
+        redacted_payload.pop("tool_discovery_projection", None)
         return
     targeted_grants_required = schema_version in {4, 5}
-    targeted_grants_allowed = schema_version in {4, 5, 6}
-    if targeted_grants_required != (targeted_grants is not None) and schema_version != 6:
+    targeted_grants_allowed = schema_version in {4, 5, 6, 7}
+    if targeted_grants_required and targeted_grants is None:
         if reject_malformed:
             raise ValueError("Only request footprint schema v4+ may carry targeted grant evidence.")
         redacted_payload.pop("targeted_tool_grants", None)
@@ -4034,27 +4055,54 @@ def _restore_publication_safe_tool_footprints(
         if targeted_grants_required:
             redacted_payload.pop("tool_exposure", None)
             redacted_payload.pop("tool_discovery_view", None)
+            redacted_payload.pop("tool_discovery_projection", None)
             return
     if not targeted_grants_allowed and raw_targeted_grants is not None:
         if reject_malformed:
             raise ValueError("Only request footprint schema v4+ may carry targeted grant evidence.")
         redacted_payload.pop("targeted_tool_grants", None)
-    if schema_version == 6:
+        targeted_grants = None
+    if schema_version in {6, 7}:
         if discovery_view is None:
             if reject_malformed:
-                raise ValueError("Request footprint schema v6 has no discovery view evidence.")
+                raise ValueError("Request footprint schema v6+ has no discovery view evidence.")
             redacted_payload.pop("tool_exposure", None)
             redacted_payload.pop("targeted_tool_grants", None)
             redacted_payload.pop("targeted_native_item_active", None)
             redacted_payload.pop("targeted_native_item_message_index", None)
             redacted_payload.pop("tool_discovery_view", None)
+            redacted_payload.pop("tool_discovery_projection", None)
             return
     elif discovery_view is not None:
         if reject_malformed:
-            raise ValueError("Only request footprint schema v6 may carry discovery view evidence.")
+            raise ValueError("Only request footprint schema v6+ may carry discovery view evidence.")
         redacted_payload.pop("tool_discovery_view", None)
         discovery_view = None
-    if schema_version in {5, 6} and targeted_grants is not None:
+    if schema_version == 7:
+        if discovery_projection is None or (
+            discovery_projection.protocol == "openai.tool_search.hosted.v1"
+            and discovery_view is not None
+            and discovery_projection.generation_id != discovery_view.generation_id
+        ):
+            if reject_malformed:
+                raise ValueError(
+                    "Request footprint schema v7 has malformed discovery projection evidence."
+                )
+            redacted_payload.pop("tool_exposure", None)
+            redacted_payload.pop("targeted_tool_grants", None)
+            redacted_payload.pop("targeted_native_item_active", None)
+            redacted_payload.pop("targeted_native_item_message_index", None)
+            redacted_payload.pop("tool_discovery_view", None)
+            redacted_payload.pop("tool_discovery_projection", None)
+            return
+    elif discovery_projection is not None:
+        if reject_malformed:
+            raise ValueError(
+                "Only request footprint schema v7 may carry discovery projection evidence."
+            )
+        redacted_payload.pop("tool_discovery_projection", None)
+        discovery_projection = None
+    if schema_version >= 5 and targeted_grants is not None:
         native_item_valid = (
             type(raw_native_item_active) is bool
             and (
@@ -4077,6 +4125,7 @@ def _restore_publication_safe_tool_footprints(
             redacted_payload.pop("targeted_tool_grants", None)
             redacted_payload.pop("tool_exposure", None)
             redacted_payload.pop("tool_discovery_view", None)
+            redacted_payload.pop("tool_discovery_projection", None)
             return
     elif raw_native_item_active is not None or raw_native_item_message_index is not None:
         if reject_malformed:
@@ -4095,6 +4144,7 @@ def _restore_publication_safe_tool_footprints(
         redacted_payload.pop("targeted_native_item_active", None)
         redacted_payload.pop("targeted_native_item_message_index", None)
         redacted_payload.pop("tool_discovery_view", None)
+        redacted_payload.pop("tool_discovery_projection", None)
         return
 
     # profile_id is an explicitly public application label and exposure_fingerprint
@@ -4109,7 +4159,12 @@ def _restore_publication_safe_tool_footprints(
         )
     if discovery_view is not None:
         redacted_payload["tool_discovery_view"] = discovery_view.model_dump(mode="json")
-    if schema_version in {5, 6} and targeted_grants is not None:
+    if discovery_projection is not None:
+        redacted_payload["tool_discovery_projection"] = discovery_projection.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+    if schema_version >= 5 and targeted_grants is not None:
         redacted_payload["targeted_native_item_active"] = raw_native_item_active
         if raw_native_item_message_index is None:
             redacted_payload.pop("targeted_native_item_message_index", None)

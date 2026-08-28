@@ -131,9 +131,12 @@ from cayu.providers import (
 from cayu.providers._credential_boundary import aclosing_provider_stream
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
+    ToolDiscoveryProjectionResult,
     copy_model_completion,
 )
 from cayu.runtime import _runtime_records as runtime_records
@@ -307,6 +310,7 @@ from cayu.runtime.sessions import (
     ModelCompletionStageAbandonmentResult,
     ModelCompletionStageRequest,
     ModelCompletionStageResult,
+    RuntimePublicationOperationRecordMutation,
     RuntimePublicationResult,
     Session,
     SessionRunFenced,
@@ -314,6 +318,7 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStore,
     _current_session_interaction_id,
+    runtime_publication_operation_record_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import (
@@ -346,6 +351,7 @@ from cayu.runtime.tool_discovery import (
     ToolDiscoverySearchMatch,
     _tool_discovery_definition_for_descriptor,
     current_tool_discovery_view,
+    hosted_tool_discovery_transition,
     resolve_tool_discovery_projection,
     search_tools_spec,
     tool_discovery_generation_id,
@@ -440,6 +446,48 @@ def _provider_operation_progress_contains_secret(
     )
 
 
+class HostedToolDiscoveryRecoveryAuthority(BaseModel):
+    """Compact authority for reconstructing one hosted Tool Search request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    protocol: Literal["openai.tool_search.hosted.v1"] = OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+    projection_sha256: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    targeted_tool_name_sha256s: tuple[str, ...] = Field(
+        default=(),
+        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    )
+    loaded_tool_name_sha256s: tuple[str, ...] = Field(
+        default=(),
+        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    )
+
+    @field_validator(
+        "targeted_tool_name_sha256s",
+        "loaded_tool_name_sha256s",
+        mode="before",
+    )
+    @classmethod
+    def copy_tool_name_sha256s(cls, value: object, info) -> tuple[str, ...]:
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(f"{info.field_name} must be a sequence.")
+        copied = tuple(value)
+        if any(
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            for digest in copied
+        ):
+            raise ValueError(f"{info.field_name} must contain SHA-256 digests.")
+        if copied != tuple(sorted(set(copied))):
+            raise ValueError(f"{info.field_name} must be unique and sorted.")
+        return cast("tuple[str, ...]", copied)
+
+
 class ModelCompletionRecoveryContext(BaseModel):
     """Secret-free run semantics required to publish an offline completion."""
 
@@ -454,6 +502,7 @@ class ModelCompletionRecoveryContext(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     tool_exposure: ResolvedToolExposureAuthority | None = None
+    hosted_tool_discovery: HostedToolDiscoveryRecoveryAuthority | None = None
     task_id: str | None = None
     request_metadata: dict[str, Any] = Field(default_factory=dict)
     structured_output: StructuredOutputSpec | None = None
@@ -957,6 +1006,165 @@ def _durable_assistant_step_result(
     )
 
 
+def _hosted_tool_discovery_projection(
+    *,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    excluded_tool_names: Iterable[str],
+    redactor: SecretRedactor,
+) -> ToolDiscoveryProjectionRequest:
+    """Build the exact bounded, secret-free hosted candidate projection."""
+
+    excluded = frozenset(excluded_tool_names)
+    if any(type(name) is not str for name in excluded):
+        raise TypeError("Excluded tool names must be strings.")
+    ceiling_names = frozenset(
+        tool_capability_ceiling_from_session_metadata(session.metadata).tool_names
+    )
+    descriptors = tuple(
+        descriptor
+        for descriptor in registered_agent.tool_catalogue.descriptors
+        if descriptor.name in ceiling_names and descriptor.name not in excluded
+    )
+    if len(descriptors) > TOOL_DISCOVERY_PROJECTION_MAX_TOOLS:
+        raise ValueError(
+            "OpenAI hosted Tool Search candidate count exceeds the bounded "
+            f"maximum of {TOOL_DISCOVERY_PROJECTION_MAX_TOOLS}; reduce the session "
+            "tool ceiling or use portable search_tools."
+        )
+    candidates = tuple(
+        sorted(
+            (_tool_discovery_definition_for_descriptor(descriptor) for descriptor in descriptors),
+            key=lambda tool: cast("str", tool["name"]),
+        )
+    )
+    redacted_candidates = tuple(
+        _redacted_provider_tool_definitions(
+            candidates,
+            redactor=redactor,
+            field_name="tool_discovery_candidates",
+        )
+    )
+    return ToolDiscoveryProjectionRequest(
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        candidate_tools=redacted_candidates,
+        generation_id=tool_discovery_generation_id(
+            session_id=session.id,
+            root_invocation_id=session.invocation.root_invocation_id,
+        ),
+    )
+
+
+def _hosted_tool_discovery_projection_digest(
+    projection: ToolDiscoveryProjectionRequest,
+) -> str:
+    if projection.protocol != OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+        raise ValueError("Hosted Tool Search authority requires the hosted protocol.")
+    return sha256(
+        canonical_durable_json_bytes(
+            projection.model_dump(mode="json"),
+            "hosted_tool_discovery_projection",
+        )
+    ).hexdigest()
+
+
+def _hosted_tool_name_sha256(name: str) -> str:
+    return sha256(
+        require_durable_clean_nonblank(name, "hosted tool name").encode("utf-8")
+    ).hexdigest()
+
+
+async def _hosted_tool_discovery_publication_authority(
+    *,
+    session_store: SessionStore,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    projection: ToolDiscoveryProjectionRequest | None,
+    stream_event: ModelStreamEvent,
+    tool_calls: list[runtime_records.ToolCallRequest],
+    model_step_id: str,
+    created_at: datetime,
+) -> tuple[tuple[RuntimePublicationOperationRecordMutation, ...], dict[str, str]]:
+    """Validate a hosted selection and prepare its atomic durable grant update."""
+
+    result = stream_event.tool_discovery_result
+    if projection is None or projection.protocol != OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+        if result is not None:
+            raise ValueError("Provider returned hosted Tool Search evidence unexpectedly.")
+        return (), {}
+
+    candidates_by_name = {cast("str", tool["name"]): tool for tool in projection.candidate_tools}
+    candidate_call_names = {call.name for call in tool_calls if call.name in candidates_by_name}
+    replay_loaded_names = frozenset(projection.loaded_tool_names)
+    if result is None:
+        if candidate_call_names - replay_loaded_names:
+            raise ValueError(
+                "Provider called a deferred function without hosted Tool Search evidence."
+            )
+        return (), {}
+
+    loaded_names = result.loaded_tool_names
+    loaded_name_set = frozenset(loaded_names)
+    if candidate_call_names - loaded_name_set - replay_loaded_names:
+        raise ValueError("Provider called a deferred function outside the loaded subset.")
+    selected_descriptors: list[ToolDescriptor] = []
+    ceiling_names = frozenset(
+        tool_capability_ceiling_from_session_metadata(session.metadata).tool_names
+    )
+    for loaded in result.loaded_tools:
+        name = cast("str", loaded["name"])
+        candidate = candidates_by_name.get(name)
+        if candidate is None:
+            raise ValueError("Provider loaded a function outside the requested catalogue.")
+        if loaded != candidate:
+            raise ValueError("Provider altered a hosted Tool Search function definition.")
+        descriptor = registered_agent.tool_catalogue.descriptor_for_name(name)
+        if descriptor.name not in ceiling_names:
+            raise ValueError("Provider loaded a function outside the session tool ceiling.")
+        selected_descriptors.append(descriptor)
+
+    if not selected_descriptors:
+        return (), {}
+
+    raw_view = await session_store.load_session_operation(
+        session.id,
+        TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    )
+    view = current_tool_discovery_view(
+        raw_view,
+        session_id=session.id,
+        generation_id=tool_discovery_generation_id(
+            session_id=session.id,
+            root_invocation_id=session.invocation.root_invocation_id,
+        ),
+        agent_name=registered_agent.spec.name,
+        catalogue=registered_agent.tool_catalogue,
+        ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+    )
+    desired_view, grant_ids = hosted_tool_discovery_transition(
+        view,
+        descriptors=selected_descriptors,
+        model_step_id=model_step_id,
+        created_at=created_at,
+    )
+    newly_loaded_grant_ids = {
+        name: grant_id for name, grant_id in grant_ids.items() if name not in replay_loaded_names
+    }
+    if desired_view == view:
+        return (), newly_loaded_grant_ids
+    if raw_view is None:  # pragma: no cover - current_tool_discovery_view rejects this
+        raise RuntimeError("Hosted Tool Search lost its source discovery view.")
+    mutation = RuntimePublicationOperationRecordMutation(
+        key=TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+        expected_value_digest=runtime_publication_operation_record_value_digest(raw_view),
+        value=desired_view.model_dump(mode="json"),
+    )
+    return (
+        (mutation,),
+        newly_loaded_grant_ids,
+    )
+
+
 def _assistant_step_result_with_published_targeted_authority(
     live_result: AssistantStepResult,
     published_result: AssistantStepResult,
@@ -1066,6 +1274,7 @@ class ModelCompletionPublicationRequest:
     defer_assistant_message: bool
     structured_output_validation: StructuredOutputValidation | None
     tool_exposure: ResolvedToolExposureAuthority | None = None
+    operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.dispatch) is not ModelCompletionDispatch:
@@ -1102,6 +1311,14 @@ class ModelCompletionPublicationRequest:
             None
             if self.tool_exposure is None
             else copy_resolved_tool_exposure_authority(self.tool_exposure)
+        )
+        operation_record_mutations = tuple(
+            RuntimePublicationOperationRecordMutation.model_validate(
+                mutation.model_dump(mode="python")
+                if type(mutation) is RuntimePublicationOperationRecordMutation
+                else mutation
+            )
+            for mutation in self.operation_record_mutations
         )
         if result is not None and result.session_id != dispatch.stage.session_id:
             raise ValueError("Assistant result session does not match its completion stage.")
@@ -1143,6 +1360,7 @@ class ModelCompletionPublicationRequest:
             structured_output_validation,
         )
         object.__setattr__(self, "tool_exposure", tool_exposure)
+        object.__setattr__(self, "operation_record_mutations", operation_record_mutations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1465,6 +1683,7 @@ async def _publish_model_completion(
         defer_assistant_message=request.defer_assistant_message,
         structured_output_validation=request.structured_output_validation,
         tool_exposure=request.tool_exposure,
+        operation_record_mutations=request.operation_record_mutations,
     )
     if publication_cancellation is not None:
         assert terminal_failure is not None
@@ -3285,6 +3504,107 @@ class ModelStepExecutor:
                 interaction_id=operation.interaction_id,
             )
         }
+        hosted_discovery_projection: ToolDiscoveryProjectionRequest | None = None
+        hosted_replay_grant_ids: dict[str, str] = {}
+        if recovery_context is not None and recovery_context.hosted_tool_discovery is not None:
+            if recovery_context.tool_exposure is None:
+                raise ProviderOperationEvidenceError(
+                    "Hosted Tool Search recovery has no durable tool-exposure authority."
+                )
+            try:
+                targeted_name_digests = frozenset(
+                    recovery_context.hosted_tool_discovery.targeted_tool_name_sha256s
+                )
+                targeted_names = frozenset(
+                    descriptor.name
+                    for descriptor in registered_agent.tool_catalogue.descriptors
+                    if _hosted_tool_name_sha256(descriptor.name) in targeted_name_digests
+                )
+                if {
+                    _hosted_tool_name_sha256(name) for name in targeted_names
+                } != targeted_name_digests:
+                    raise ValueError("Hosted Tool Search recovery lost a targeted-tool exclusion.")
+                loaded_name_digests = frozenset(
+                    recovery_context.hosted_tool_discovery.loaded_tool_name_sha256s
+                )
+                loaded_names = frozenset(
+                    descriptor.name
+                    for descriptor in registered_agent.tool_catalogue.descriptors
+                    if _hosted_tool_name_sha256(descriptor.name) in loaded_name_digests
+                )
+                if {_hosted_tool_name_sha256(name) for name in loaded_names} != loaded_name_digests:
+                    raise ValueError("Hosted Tool Search recovery lost replay-loaded authority.")
+                hosted_discovery_projection = _hosted_tool_discovery_projection(
+                    session=session,
+                    registered_agent=registered_agent,
+                    excluded_tool_names=(
+                        *recovery_context.tool_exposure.tool_names,
+                        *targeted_names,
+                    ),
+                    redactor=self._secret_redactor,
+                )
+                if loaded_names:
+                    recovery_view = current_tool_discovery_view(
+                        await self._session_store.load_session_operation(
+                            session.id,
+                            TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                        ),
+                        session_id=session.id,
+                        generation_id=tool_discovery_generation_id(
+                            session_id=session.id,
+                            root_invocation_id=session.invocation.root_invocation_id,
+                        ),
+                        agent_name=registered_agent.spec.name,
+                        catalogue=registered_agent.tool_catalogue,
+                        ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+                    )
+                    grants_by_name = {grant.tool_name: grant for grant in recovery_view.grants}
+                    if any(
+                        name not in grants_by_name
+                        or not tool_discovery_record_matches_descriptor(
+                            grants_by_name[name],
+                            registered_agent.tool_catalogue.descriptor_for_name(name),
+                        )
+                        for name in loaded_names
+                    ):
+                        raise ValueError(
+                            "Hosted Tool Search recovery lost a replay-loaded durable grant."
+                        )
+                    hosted_replay_grant_ids = {
+                        name: grants_by_name[name].grant_id for name in sorted(loaded_names)
+                    }
+                    candidates_by_name = {
+                        cast("str", tool["name"]): tool
+                        for tool in hosted_discovery_projection.candidate_tools
+                    }
+                    if any(name not in candidates_by_name for name in loaded_names):
+                        raise ValueError(
+                            "Hosted Tool Search recovery loaded authority is not a candidate."
+                        )
+                    hosted_discovery_projection = ToolDiscoveryProjectionRequest.model_validate(
+                        {
+                            **hosted_discovery_projection.model_dump(mode="python"),
+                            "loaded_tools": tuple(
+                                candidates_by_name[name] for name in sorted(loaded_names)
+                            ),
+                        }
+                    )
+                recovered_projection_digest = _hosted_tool_discovery_projection_digest(
+                    hosted_discovery_projection
+                )
+            except (TypeError, ValueError) as exc:
+                raise ProviderOperationEvidenceError(
+                    "Hosted Tool Search recovery could not reconstruct its original "
+                    "candidate projection."
+                ) from exc
+            if (
+                recovered_projection_digest
+                != recovery_context.hosted_tool_discovery.projection_sha256
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Hosted Tool Search recovery candidate authority no longer matches "
+                    "the dispatched request."
+                )
         if durable_value_contains_secret(
             operation.state.recovery_metadata.opaque,
             redactor=self._secret_redactor,
@@ -3992,6 +4312,42 @@ class ModelStepExecutor:
         assistant_message: Message | None = None
         step_result: AssistantStepResult | None = None
         classification = None
+        hosted_discovery_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = ()
+        hosted_discovery_grant_ids: dict[str, str] = {}
+        if completion_semantics_valid:
+            try:
+                (
+                    hosted_discovery_mutations,
+                    hosted_discovery_grant_ids,
+                ) = await _hosted_tool_discovery_publication_authority(
+                    session_store=self._session_store,
+                    session=session,
+                    registered_agent=registered_agent,
+                    projection=hosted_discovery_projection,
+                    stream_event=completed_event,
+                    tool_calls=tool_calls,
+                    model_step_id=operation.model_attempt_identity.model_step_id,
+                    created_at=self._clock(),
+                )
+            except (TypeError, ValueError) as exc:
+                completion_semantics_valid = False
+                hosted_discovery_error = ModelProviderError(
+                    "Recovered provider operation returned invalid hosted Tool Search evidence.",
+                    provider=registered_provider.name,
+                    error_type=type(exc).__name__,
+                    error_code="invalid_tool_discovery_projection",
+                    retryable=False,
+                )
+                completion_diagnostics = {
+                    "completion_outcome": "invalid_tool_discovery_projection",
+                    "completion_error": {
+                        "error": str(hosted_discovery_error),
+                        "error_type": type(hosted_discovery_error).__name__,
+                        "stage": "hosted_tool_discovery_validation",
+                        **hosted_discovery_error.error_payload_fields(),
+                    },
+                }
+                retain_post_completion_failure(hosted_discovery_error)
         if completion_semantics_valid:
             try:
                 _require_unique_tool_call_ids(tool_calls)
@@ -4099,6 +4455,10 @@ class ModelStepExecutor:
                     step_result,
                     redactor=self._secret_redactor,
                     targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
+                    native_tool_name_grant_ids={
+                        **hosted_replay_grant_ids,
+                        **hosted_discovery_grant_ids,
+                    },
                 )
             except (TypeError, ValueError):
                 durable_boundary_error = ModelProviderError(
@@ -4201,6 +4561,9 @@ class ModelStepExecutor:
             ),
             structured_output_validation=structured_output_validation,
             tool_exposure=tool_exposure,
+            operation_record_mutations=(
+                () if post_completion_failure is not None else hosted_discovery_mutations
+            ),
         )
         await recover_context_exposure(
             store=self._session_store,
@@ -4374,7 +4737,10 @@ class ModelStepExecutor:
             raise ValueError("Native discovery tool names must be unique.")
         if (
             tool_discovery_projection_kind
-            is not ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+            not in {
+                ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT,
+                ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED,
+            }
             and discovery_native_tool_names
         ):
             raise RuntimeError("Native discovery tools require the OpenAI projection.")
@@ -4383,6 +4749,7 @@ class ModelStepExecutor:
             structured_output=structured_output,
         )
         discovery_native_tools: tuple[dict[str, Any], ...] = ()
+        hosted_discovery_projection: ToolDiscoveryProjectionRequest | None = None
         if tool_discovery_projection_kind is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT:
             discovery_native_tools = _redacted_native_discovery_tools_with_schema_evidence(
                 model_messages,
@@ -4393,6 +4760,36 @@ class ModelStepExecutor:
             discovery_native_tool_names = tuple(
                 cast("str", tool["name"]) for tool in discovery_native_tools
             )
+        elif (
+            tool_discovery_projection_kind is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED
+        ):
+            targeted_native_names = (
+                ()
+                if targeted_tool_native is None
+                else tuple(cast("str", tool["name"]) for tool in targeted_tool_native.tools)
+            )
+            hosted_discovery_projection = _hosted_tool_discovery_projection(
+                session=session,
+                registered_agent=registered_agent,
+                excluded_tool_names=(
+                    *resolved_tool_exposure.tool_names,
+                    *targeted_native_names,
+                ),
+                redactor=self._secret_redactor,
+            )
+            replay_loaded_tools = _redacted_hosted_discovery_tools_with_replay_evidence(
+                model_messages,
+                authorized_names=discovery_native_tool_names,
+                catalogue=registered_agent.tool_catalogue,
+                redactor=self._secret_redactor,
+            )
+            if replay_loaded_tools:
+                hosted_discovery_projection = ToolDiscoveryProjectionRequest.model_validate(
+                    {
+                        **hosted_discovery_projection.model_dump(mode="python"),
+                        "loaded_tools": replay_loaded_tools,
+                    }
+                )
 
         resolved_attachments, unresolvable_prompt_ids = await _resolved_file_attachments(
             messages=model_messages,
@@ -4450,7 +4847,10 @@ class ModelStepExecutor:
         ) or (
             targeted_tool_gateway is not None
             and tool_discovery_projection_kind
-            is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+            in {
+                ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT,
+                ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED,
+            }
         ):
             request_options[CALL_TOOL_CORE_CALLABLE_OPTION] = True
         redacted_messages = [
@@ -4551,6 +4951,9 @@ class ModelStepExecutor:
                 ToolDiscoveryProjectionRequest(loaded_tools=discovery_native_tools)
                 if tool_discovery_projection_kind
                 is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+                else hosted_discovery_projection
+                if tool_discovery_projection_kind
+                is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED
                 else None
             ),
             options=redacted_options,
@@ -5336,6 +5739,8 @@ class ModelStepExecutor:
         )
         tool_calls: list[runtime_records.ToolCallRequest] = []
         provider_state_parts: list[ProviderStatePart] = []
+        hosted_discovery_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = ()
+        hosted_discovery_grant_ids: dict[str, str] = {}
         completed_stream_event: ModelStreamEvent | None = None
         step_result: AssistantStepResult | None = None
         completion_event: Event | None = None
@@ -6295,6 +6700,38 @@ class ModelStepExecutor:
                                 },
                             }
                     if completion_terminal_error is None:
+                        try:
+                            (
+                                hosted_discovery_mutations,
+                                hosted_discovery_grant_ids,
+                            ) = await _hosted_tool_discovery_publication_authority(
+                                session_store=self._session_store,
+                                session=session,
+                                registered_agent=registered_agent,
+                                projection=model_request.tool_discovery_projection,
+                                stream_event=stream_event,
+                                tool_calls=tool_calls,
+                                model_step_id=model_attempt_identity.model_step_id,
+                                created_at=self._clock(),
+                            )
+                        except (TypeError, ValueError) as exc:
+                            completion_terminal_error = ModelProviderError(
+                                "Model provider emitted invalid hosted Tool Search evidence.",
+                                provider=registered_provider.name,
+                                error_type=type(exc).__name__,
+                                error_code="invalid_tool_discovery_projection",
+                                retryable=False,
+                            )
+                            completion_diagnostics = {
+                                "completion_outcome": "invalid_tool_discovery_projection",
+                                "completion_error": {
+                                    "error": str(completion_terminal_error),
+                                    "error_type": type(completion_terminal_error).__name__,
+                                    "stage": "hosted_tool_discovery_validation",
+                                    **completion_terminal_error.error_payload_fields(),
+                                },
+                            }
+                    if completion_terminal_error is None:
                         step_result = _assistant_step_result(
                             session_id=session.id,
                             step=step,
@@ -6884,15 +7321,26 @@ class ModelStepExecutor:
             structured_output_validation = None
             if step_result is not None:
                 try:
+                    overlapping_hosted_grants = (
+                        native_tool_name_grant_ids.keys() & hosted_discovery_grant_ids.keys()
+                    )
+                    if overlapping_hosted_grants:
+                        raise ValueError(
+                            "Hosted discovery duplicated existing native grant authority."
+                        )
+                    publication_native_grant_ids = {
+                        **native_tool_name_grant_ids,
+                        **hosted_discovery_grant_ids,
+                    }
                     candidate_step_result = _durable_assistant_step_result(
                         step_result,
                         redactor=self._secret_redactor,
                         targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-                        native_tool_name_grant_ids=native_tool_name_grant_ids,
+                        native_tool_name_grant_ids=publication_native_grant_ids,
                     )
                     candidate_live_continuation = (
                         None
-                        if targeted_tool_gateway is None and not native_tool_name_grant_ids
+                        if targeted_tool_gateway is None and not publication_native_grant_ids
                         else _assistant_step_result_with_published_targeted_authority(
                             step_result,
                             candidate_step_result,
@@ -6960,6 +7408,9 @@ class ModelStepExecutor:
                     None
                     if tool_exposure is None
                     else resolved_tool_exposure_authority(tool_exposure)
+                ),
+                operation_record_mutations=(
+                    () if terminal_failure is not None else hosted_discovery_mutations
                 ),
             )
             await _publish_model_completion(
@@ -7345,10 +7796,10 @@ class ModelStepRun:
     ) -> dict[str, str]:
         """Load callable native names from the branch's current durable discovery view."""
 
-        if (
-            self._tool_discovery_projection_kind
-            is not ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
-        ):
+        if self._tool_discovery_projection_kind not in {
+            ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT,
+            ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_HOSTED,
+        }:
             return {}
         view = current_tool_discovery_view(
             await self._executor._session_store.load_session_operation(
@@ -8136,8 +8587,38 @@ class ModelStepRun:
                     pending_reservations,
                 )
                 if recovery_context is not None:
+                    hosted_projection = attempt_model_request.tool_discovery_projection
+                    hosted_authority = (
+                        HostedToolDiscoveryRecoveryAuthority(
+                            projection_sha256=(
+                                _hosted_tool_discovery_projection_digest(hosted_projection)
+                            ),
+                            targeted_tool_name_sha256s=tuple(
+                                sorted(
+                                    _hosted_tool_name_sha256(cast("str", tool["name"]))
+                                    for tool in (
+                                        ()
+                                        if attempt_model_request.targeted_tool_projection is None
+                                        else attempt_model_request.targeted_tool_projection.tools
+                                    )
+                                )
+                            ),
+                            loaded_tool_name_sha256s=tuple(
+                                sorted(
+                                    _hosted_tool_name_sha256(name)
+                                    for name in hosted_projection.loaded_tool_names
+                                )
+                            ),
+                        )
+                        if hosted_projection is not None
+                        and hosted_projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+                        else None
+                    )
                     recovery_context = recovery_context.model_copy(
-                        update={"tool_exposure": resolved_tool_exposure_authority(tool_exposure)},
+                        update={
+                            "tool_exposure": resolved_tool_exposure_authority(tool_exposure),
+                            "hosted_tool_discovery": hosted_authority,
+                        },
                         deep=True,
                     )
                 if (
@@ -8155,6 +8636,18 @@ class ModelStepRun:
                         "ModelProvider.provider_operation_mode must return a ProviderOperationMode."
                     )
                 if provider_operation_mode is ProviderOperationMode.BACKGROUND:
+                    if (
+                        attempt_model_request.tool_discovery_projection is not None
+                        and attempt_model_request.tool_discovery_projection.protocol
+                        == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+                        and (
+                            recovery_context is None
+                            or recovery_context.hosted_tool_discovery is None
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Background hosted Tool Search requires durable recovery authority."
+                        )
                     operation_adapter = self._provider.provider_operations
                     if not isinstance(operation_adapter, ProviderOperationAdapter):
                         raise RuntimeError(
@@ -10663,6 +11156,132 @@ def _redacted_native_discovery_tools_with_schema_evidence(
     return tuple(evidenced[name] for name in sorted(evidenced))
 
 
+def _hosted_replay_loaded_tools(
+    call: Mapping[str, Any],
+    output: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Decode only the canonical provider state persisted by the OpenAI adapter."""
+
+    if set(call) not in (
+        {"type", "execution", "call_id", "status", "arguments"},
+        {"type", "id", "execution", "call_id", "status", "arguments"},
+    ) or (
+        call.get("type") != "tool_search_call"
+        or call.get("execution") != "server"
+        or call.get("call_id") is not None
+        or call.get("status") != "completed"
+        or type(call.get("arguments")) is not dict
+    ):
+        raise RuntimeError("Hosted Tool Search replay contains a malformed server call.")
+    if set(output) not in (
+        {"type", "execution", "call_id", "status", "tools"},
+        {"type", "id", "execution", "call_id", "status", "tools"},
+    ) or (
+        output.get("type") != "tool_search_output"
+        or output.get("execution") != "server"
+        or output.get("call_id") is not None
+        or output.get("status") != "completed"
+        or type(output.get("tools")) is not list
+    ):
+        raise RuntimeError("Hosted Tool Search replay contains a malformed loaded output.")
+    loaded: list[dict[str, Any]] = []
+    for raw_tool in cast("list[Any]", output["tools"]):
+        if type(raw_tool) is not dict or set(raw_tool) != {
+            "type",
+            "name",
+            "description",
+            "parameters",
+            "strict",
+            "defer_loading",
+        }:
+            raise RuntimeError("Hosted Tool Search replay contains a malformed loaded function.")
+        if (
+            raw_tool.get("type") != "function"
+            or type(raw_tool.get("name")) is not str
+            or type(raw_tool.get("description")) is not str
+            or type(raw_tool.get("parameters")) is not dict
+            or raw_tool.get("strict") is not False
+            or raw_tool.get("defer_loading") is not True
+        ):
+            raise RuntimeError("Hosted Tool Search replay contains a malformed loaded function.")
+        loaded.append(
+            {
+                "name": raw_tool["name"],
+                "description": raw_tool["description"],
+                "input_schema": raw_tool["parameters"],
+            }
+        )
+    try:
+        return ToolDiscoveryProjectionResult(loaded_tools=tuple(loaded)).loaded_tools
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Hosted Tool Search replay is not bounded and canonical.") from exc
+
+
+def _redacted_hosted_discovery_tools_with_replay_evidence(
+    messages: Iterable[Message],
+    *,
+    authorized_names: Iterable[str],
+    catalogue: ToolCatalogSnapshot,
+    redactor: SecretRedactor,
+) -> tuple[dict[str, Any], ...]:
+    """Keep durable hosted grants whose exact loaded output remains in context."""
+
+    authorized = frozenset(authorized_names)
+    evidenced: dict[str, dict[str, Any]] = {}
+    trusted_definitions: dict[str, dict[str, Any]] = {}
+    for message in messages:
+        if message.role is not MessageRole.ASSISTANT:
+            continue
+        states = [
+            part.state
+            for part in message.content
+            if type(part) is ProviderStatePart and part.provider == "openai"
+        ]
+        pair_count = 0
+        for index, state in enumerate(states):
+            item_type = state.get("type")
+            if item_type == "tool_search_output":
+                if (
+                    index == 0
+                    or states[index - 1].get("type") != "tool_search_call"
+                    or states[index - 1].get("execution") != "server"
+                ):
+                    raise RuntimeError("Hosted Tool Search replay contains an orphan output.")
+                continue
+            if item_type != "tool_search_call":
+                continue
+            if (
+                state.get("execution") != "server"
+                or index + 1 >= len(states)
+                or states[index + 1].get("type") != "tool_search_output"
+            ):
+                raise RuntimeError("Hosted Tool Search replay contains an incomplete pair.")
+            pair_count += 1
+            if pair_count > 1:
+                raise RuntimeError("Hosted Tool Search replay repeats a selection pair.")
+            for loaded in _hosted_replay_loaded_tools(state, states[index + 1]):
+                name = cast("str", loaded["name"])
+                if name not in authorized:
+                    continue
+                trusted = trusted_definitions.get(name)
+                if trusted is None:
+                    descriptor = catalogue.descriptor_for_name(name)
+                    [trusted] = _redacted_provider_tool_definitions(
+                        (_tool_discovery_definition_for_descriptor(descriptor),),
+                        redactor=redactor,
+                        field_name="hosted_discovery_replay_tools",
+                    )
+                    trusted_definitions[name] = trusted
+                if loaded != trusted:
+                    raise RuntimeError(
+                        "Hosted Tool Search replay conflicts with the current catalogue."
+                    )
+                previous = evidenced.setdefault(name, trusted)
+                if previous != trusted:
+                    raise RuntimeError("Hosted Tool Search replay is inconsistent.")
+    return tuple(evidenced[name] for name in sorted(evidenced))
+
+
 def _redacted_provider_tool_definitions(
     tools: Iterable[Mapping[str, Any]],
     *,
@@ -11511,6 +12130,21 @@ def _validate_stream_event(
             value.recovery_metadata.model_dump(mode="python")
         )
     )
+    try:
+        tool_discovery_result = (
+            None
+            if value.tool_discovery_result is None
+            else ToolDiscoveryProjectionResult.model_validate(
+                value.tool_discovery_result.model_dump(mode="python")
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        if completion_error is None:
+            completion_error = extract_durable_value_error(exc) or DurableValueError(
+                "invalid_json_type",
+                "tool_discovery_result",
+            )
+        tool_discovery_result = None
 
     return _ModelStreamBoundaryValue(
         event=ModelStreamEvent.model_construct(
@@ -11518,6 +12152,7 @@ def _validate_stream_event(
             delta=delta,
             payload=payload,
             completion=completion,
+            tool_discovery_result=tool_discovery_result,
             recovery_metadata=recovery_metadata,
         ),
         completion_error=completion_error,

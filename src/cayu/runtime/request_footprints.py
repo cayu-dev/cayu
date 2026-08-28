@@ -39,7 +39,10 @@ from cayu.artifacts.attachments import (
 from cayu.core.messages import FilePart, Message, MessageRole, ToolCallPart, ToolResultPart
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
+    OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
     ModelContextPressureProfile,
     ModelProvider,
     ModelRequest,
@@ -83,7 +86,7 @@ from cayu.runtime.tool_grants import (
     copy_targeted_tool_grant_record,
 )
 
-REQUEST_FOOTPRINT_SCHEMA_VERSION = 6
+REQUEST_FOOTPRINT_SCHEMA_VERSION = 7
 PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION = 1
 REQUEST_FOOTPRINT_CANONICALIZATION_VERSION = 1
 _HMAC_CONTEXT = b"cayu.request-footprint"
@@ -348,6 +351,32 @@ def tool_discovery_view_footprint(
         ceiling_fingerprint=state.ceiling_fingerprint,
         grant_count=len(state.grants),
     )
+
+
+class ToolDiscoveryProjectionFootprint(BaseModel):
+    """Content-free summary of one provider-native discovery projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    protocol: Literal[
+        "openai.tool_search.client.v1",
+        "openai.tool_search.hosted.v1",
+    ]
+    candidate_count: StrictInt = Field(ge=0, le=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS)
+    loaded_count: StrictInt = Field(ge=0, le=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS)
+    generation_id: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> ToolDiscoveryProjectionFootprint:
+        if self.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+            if self.candidate_count != 0 or self.generation_id is not None:
+                raise ValueError("Client Tool Search footprint authority is malformed.")
+        elif self.generation_id is None:
+            raise ValueError("Hosted Tool Search footprint authority is malformed.")
+        return self
 
 
 class RequestComponentTokenEstimates(BaseModel):
@@ -674,13 +703,17 @@ class RequestFootprint(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6]
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7]
     execution_profile_fingerprint: str | None = None
     tool_exposure: ToolExposureFootprint | None = None
     targeted_tool_grants: TargetedToolGrantFootprint | None = None
     targeted_native_item_active: StrictBool | None = None
     targeted_native_item_message_index: StrictInt | None = Field(default=None, ge=0)
     tool_discovery_view: ToolDiscoveryViewFootprint | None = None
+    tool_discovery_projection: ToolDiscoveryProjectionFootprint | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     observation_id: str
     provider_name: str
     model: str
@@ -713,11 +746,10 @@ class RequestFootprint(BaseModel):
             3,
             4,
             5,
+            6,
             REQUEST_FOOTPRINT_SCHEMA_VERSION,
         ):
-            raise ValueError(
-                "Request footprint schema_version must be integer 1, 2, 3, 4, 5, or 6."
-            )
+            raise ValueError("Request footprint schema_version must be integer 1 through 7.")
         return value
 
     @field_validator("execution_profile_fingerprint")
@@ -798,11 +830,25 @@ class RequestFootprint(BaseModel):
             raise ValueError("Request footprint schema v1-v4 cannot carry native item evidence.")
         if self.schema_version < 6 and self.tool_discovery_view is not None:
             raise ValueError("Request footprint schema v1-v5 cannot carry a discovery view.")
-        if self.schema_version == 6 and (
+        if self.schema_version in {6, 7} and (
             self.tool_exposure is None or self.tool_discovery_view is None
         ):
-            raise ValueError("Request footprint schema v6 requires tool exposure and discovery.")
-        if self.schema_version in (5, 6) and self.targeted_tool_grants is not None:
+            raise ValueError("Request footprint schema v6+ requires tool exposure and discovery.")
+        if self.schema_version < 7 and self.tool_discovery_projection is not None:
+            raise ValueError("Request footprint schema v1-v6 cannot carry a discovery projection.")
+        if self.schema_version == 7:
+            projection = self.tool_discovery_projection
+            if projection is None:
+                raise ValueError("Request footprint schema v7 requires a discovery projection.")
+            if (
+                projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+                and self.tool_discovery_view is not None
+                and projection.generation_id != self.tool_discovery_view.generation_id
+            ):
+                raise ValueError(
+                    "Hosted discovery projection generation must match the discovery view."
+                )
+        if self.schema_version >= 5 and self.targeted_tool_grants is not None:
             if self.tool_exposure is None or self.targeted_tool_grants is None:
                 raise ValueError(
                     "A targeted request footprint requires tool exposure and targeted grants."
@@ -1085,6 +1131,16 @@ def build_request_footprint(
                 "tool_discovery_view catalogue_revision must match tool_exposure authority."
             )
 
+    tool_discovery_projection: ToolDiscoveryProjectionFootprint | None = None
+    discovery_projection = model_request.tool_discovery_projection
+    if tool_discovery_view is not None and discovery_projection is not None:
+        tool_discovery_projection = ToolDiscoveryProjectionFootprint(
+            protocol=discovery_projection.protocol,
+            candidate_count=len(discovery_projection.candidate_tools),
+            loaded_count=len(discovery_projection.loaded_tools),
+            generation_id=discovery_projection.generation_id,
+        )
+
     targeted_native_item_active: bool | None = None
     targeted_native_item_message_index: int | None = None
     if targeted_tool_grants is not None:
@@ -1166,6 +1222,8 @@ def build_request_footprint(
         if model_request.targeted_tool_projection is None
         else len(model_request.targeted_tool_projection.tools)
     )
+    if model_request.tool_discovery_projection is not None:
+        projected_tool_count += len(model_request.tool_discovery_projection.candidate_tools)
     omitted_discovery_gateways = (
         sum(tool.get("name") == CALL_TOOL_NAME for tool in model_request.tools)
         if model_request.tool_discovery_projection is not None
@@ -1174,12 +1232,20 @@ def build_request_footprint(
         and not call_tool_core_callable(model_request.options)
         else 0
     )
+    omitted_inert_hosted_search = (
+        sum(tool.get("name") == SEARCH_TOOLS_NAME for tool in model_request.tools)
+        if model_request.tool_discovery_projection is not None
+        and model_request.tool_discovery_projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+        and not model_request.tool_discovery_projection.candidate_tools
+        else 0
+    )
     tools = RequestComponentFootprint(
         count=(
             len(model_request.tools)
             + len(hosted_tool_payloads)
             + projected_tool_count
             - omitted_discovery_gateways
+            - omitted_inert_hosted_search
         ),
         size=_request_size(tool_manifest),
     )
@@ -1426,14 +1492,18 @@ def build_request_footprint(
     return RequestFootprint(
         schema_version=(
             REQUEST_FOOTPRINT_SCHEMA_VERSION
-            if tool_discovery_view is not None
+            if tool_discovery_projection is not None
             else (
-                5
-                if targeted_tool_grants is not None
+                6
+                if tool_discovery_view is not None
                 else (
-                    3
-                    if tool_exposure is not None
-                    else (2 if execution_profile_fingerprint is not None else 1)
+                    5
+                    if targeted_tool_grants is not None
+                    else (
+                        3
+                        if tool_exposure is not None
+                        else (2 if execution_profile_fingerprint is not None else 1)
+                    )
                 )
             )
         ),
@@ -1454,6 +1524,7 @@ def build_request_footprint(
         targeted_native_item_active=targeted_native_item_active,
         targeted_native_item_message_index=targeted_native_item_message_index,
         tool_discovery_view=tool_discovery_view,
+        tool_discovery_projection=tool_discovery_projection,
         observation_id=observation_id,
         provider_name=provider_name,
         model=model_request.model,
@@ -2164,9 +2235,16 @@ def _request_tool_manifest(
     if targeted_projection is not None:
         manifest["targeted_tool_projection"] = targeted_projection.model_dump(mode="json")
     if discovery_projection is not None:
-        manifest["tool_discovery_projection"] = {
+        projection_manifest: dict[str, Any] = {
             "protocol": discovery_projection.protocol,
         }
+        if discovery_projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+            # Hosted candidates are actual top-level provider request tools. Keep
+            # branch generation out of this wire-surface identity so an otherwise
+            # identical fork can reuse the provider-defined prefix after Cayu
+            # neutrally breaks inherited server state.
+            projection_manifest["candidate_tools"] = list(discovery_projection.candidate_tools)
+        manifest["tool_discovery_projection"] = projection_manifest
     return manifest, hosted_tools
 
 

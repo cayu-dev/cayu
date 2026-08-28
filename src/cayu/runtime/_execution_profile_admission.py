@@ -1704,13 +1704,14 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "openai-responses",
-            "version": 4,
+            "version": 5,
             "base_url": provider.base_url,
             "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
             "reasoning_state": provider.reasoning_state,
             "background": provider.background,
             "additional_tools_models": sorted(provider.additional_tools_models),
             "client_tool_search_models": sorted(provider.client_tool_search_models),
+            "hosted_tool_search_models": sorted(provider.hosted_tool_search_models),
             "timeout_s": provider.timeout_s,
             "stream_idle_timeout_s": provider.stream_idle_timeout_s,
         }

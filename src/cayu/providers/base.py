@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -88,6 +89,10 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
 
 OPENAI_ADDITIONAL_TOOLS_PROTOCOL = "openai.additional_tools.v1"
 OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL = "openai.tool_search.client.v1"
+OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL = "openai.tool_search.hosted.v1"
+TOOL_DISCOVERY_PROJECTION_MAX_TOOLS = 256
+TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES = 64 * 1024
+TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES = 1024 * 1024
 TARGETED_TOOL_PROJECTION_MARKER_TYPE = "cayu.targeted-tool-projection-marker"
 TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION = "targeted_tool_native_cache_anchor"
 CALL_TOOL_CORE_CALLABLE_OPTION = "call_tool_core_callable"
@@ -605,8 +610,133 @@ class ToolDiscoveryProjectionRequest(BaseModel):
         revalidate_instances="always",
     )
 
-    protocol: Literal["openai.tool_search.client.v1"] = OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
-    loaded_tools: tuple[dict[str, Any], ...] = Field(default=(), max_length=256)
+    protocol: Literal[
+        "openai.tool_search.client.v1",
+        "openai.tool_search.hosted.v1",
+    ] = OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+    loaded_tools: tuple[dict[str, Any], ...] = Field(
+        default=(),
+        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    )
+    candidate_tools: tuple[dict[str, Any], ...] = Field(
+        default=(),
+        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    )
+    generation_id: str | None = Field(default=None, min_length=71, max_length=71)
+
+    @field_validator("generation_id")
+    @classmethod
+    def validate_generation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.startswith("sha256:") or any(
+            character not in "0123456789abcdef" for character in value[7:]
+        ):
+            raise ValueError("generation_id must be a lowercase SHA-256 identity.")
+        return value
+
+    @field_validator("loaded_tools", "candidate_tools", mode="before")
+    @classmethod
+    def copy_tools(cls, value: object, info) -> tuple[dict[str, Any], ...]:
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(f"{info.field_name} must be a sequence.")
+        copied = copy_durable_json_value(list(value), info.field_name)
+        if type(copied) is not list or any(type(tool) is not dict for tool in copied):
+            raise TypeError(f"{info.field_name} must contain objects.")
+        return tuple(copied)
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> ToolDiscoveryProjectionRequest:
+        if self.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL and self.candidate_tools:
+            raise ValueError("Client Tool Search cannot carry hosted candidate tools.")
+        if self.protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL and self.generation_id is not None:
+            raise ValueError("Client Tool Search cannot carry a hosted generation identity.")
+        if self.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL and self.generation_id is None:
+            raise ValueError("Hosted Tool Search requires a branch-local generation identity.")
+        for field_name, tools in (
+            ("loaded_tools", self.loaded_tools),
+            ("candidate_tools", self.candidate_tools),
+        ):
+            names: list[str] = []
+            total_bytes = 0
+            for tool in tools:
+                if set(tool) != {"name", "description", "input_schema"}:
+                    raise ValueError(f"{field_name} must use the canonical discovery-tool shape.")
+                name = tool.get("name")
+                description = tool.get("description")
+                input_schema = tool.get("input_schema")
+                if type(name) is not str or type(description) is not str:
+                    raise ValueError(f"{field_name} text fields must be strings.")
+                names.append(require_clean_nonblank(name, f"{field_name} tool name"))
+                if type(input_schema) is not dict:
+                    raise ValueError(f"{field_name} input_schema must be an object.")
+                schema_bytes = len(
+                    json.dumps(
+                        input_schema,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                if schema_bytes > TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES:
+                    raise ValueError(
+                        f"{field_name} contains a schema larger than "
+                        f"{TOOL_DISCOVERY_PROJECTION_MAX_SCHEMA_BYTES} bytes."
+                    )
+                total_bytes += len(
+                    json.dumps(
+                        tool,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            if names != sorted(names) or len(names) != len(set(names)):
+                raise ValueError(f"{field_name} must have unique canonical names.")
+            if total_bytes > TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES:
+                raise ValueError(
+                    f"{field_name} cannot exceed "
+                    f"{TOOL_DISCOVERY_PROJECTION_MAX_TOTAL_BYTES} aggregate bytes."
+                )
+        if self.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+            candidates_by_name = {cast("str", tool["name"]): tool for tool in self.candidate_tools}
+            if any(
+                candidates_by_name.get(cast("str", tool["name"])) != tool
+                for tool in self.loaded_tools
+            ):
+                raise ValueError(
+                    "Hosted replay-loaded tools must be an exact subset of candidates."
+                )
+        return self
+
+    @property
+    def loaded_tool_names(self) -> tuple[str, ...]:
+        """Return the canonical names without duplicating projection authority."""
+
+        return tuple(cast("str", tool["name"]) for tool in self.loaded_tools)
+
+    @property
+    def candidate_tool_names(self) -> tuple[str, ...]:
+        """Return hosted candidate names without duplicating projection authority."""
+
+        return tuple(cast("str", tool["name"]) for tool in self.candidate_tools)
+
+
+class ToolDiscoveryProjectionResult(BaseModel):
+    """Normalized provider evidence for one hosted discovery selection."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    protocol: Literal["openai.tool_search.hosted.v1"] = OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+    loaded_tools: tuple[dict[str, Any], ...] = Field(
+        default=(),
+        max_length=TOOL_DISCOVERY_PROJECTION_MAX_TOOLS,
+    )
 
     @field_validator("loaded_tools", mode="before")
     @classmethod
@@ -616,30 +746,16 @@ class ToolDiscoveryProjectionRequest(BaseModel):
         copied = copy_durable_json_value(list(value), "loaded discovery tools")
         if type(copied) is not list or any(type(tool) is not dict for tool in copied):
             raise TypeError("Loaded discovery tools must contain objects.")
-        return tuple(copied)
-
-    @model_validator(mode="after")
-    def validate_loaded_tools(self) -> ToolDiscoveryProjectionRequest:
-        names: list[str] = []
-        for tool in self.loaded_tools:
-            if set(tool) != {"name", "description", "input_schema"}:
-                raise ValueError("Loaded discovery tools must use the canonical tool shape.")
-            name = tool.get("name")
-            description = tool.get("description")
-            input_schema = tool.get("input_schema")
-            if type(name) is not str or type(description) is not str:
-                raise ValueError("Loaded discovery tool text fields must be strings.")
-            names.append(require_clean_nonblank(name, "loaded discovery tool name"))
-            if type(input_schema) is not dict:
-                raise ValueError("Loaded discovery tool input_schema must be an object.")
-        if names != sorted(names) or len(names) != len(set(names)):
-            raise ValueError("Loaded discovery tools must have unique canonical names.")
-        return self
+        copied_tools = cast("list[dict[str, Any]]", copied)
+        copied_tools = sorted(copied_tools, key=lambda tool: str(tool.get("name", "")))
+        validated = ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+            loaded_tools=tuple(copied_tools),
+        )
+        return validated.loaded_tools
 
     @property
     def loaded_tool_names(self) -> tuple[str, ...]:
-        """Return the canonical names without duplicating projection authority."""
-
         return tuple(cast("str", tool["name"]) for tool in self.loaded_tools)
 
 
@@ -733,6 +849,10 @@ class ModelStreamEvent(BaseModel):
     delta: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
     completion: ModelCompletion | None = None
+    tool_discovery_result: ToolDiscoveryProjectionResult | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     recovery_metadata: ProviderOperationRecoveryMetadata | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -759,6 +879,18 @@ class ModelStreamEvent(BaseModel):
     ) -> ModelCompletion | None:
         return copy_model_completion(value)
 
+    @field_validator("tool_discovery_result", mode="before")
+    @classmethod
+    def copy_tool_discovery_result(
+        cls,
+        value: object,
+    ) -> ToolDiscoveryProjectionResult | None:
+        if value is None:
+            return None
+        if type(value) is ToolDiscoveryProjectionResult:
+            value = value.model_dump(mode="python")
+        return ToolDiscoveryProjectionResult.model_validate(value)
+
     @field_validator("type", mode="before")
     @classmethod
     def validate_type(cls, value: object) -> ModelStreamEventType:
@@ -779,6 +911,8 @@ class ModelStreamEvent(BaseModel):
             }:
                 raise ValueError("Completed stream events require completed operation status.")
             return self
+        if self.tool_discovery_result is not None:
+            raise ValueError("Only completed model stream events can carry discovery evidence.")
         if self.completion is not None:
             raise ValueError("Only completed model stream events can include completion metadata.")
         if self.provider_operation_status is not None:
@@ -945,6 +1079,13 @@ def copy_model_stream_event(event: ModelStreamEvent) -> ModelStreamEvent:
         delta=require_durable_text(event.delta, "delta"),
         payload=copy_durable_json_value(event.payload, "payload"),
         completion=copy_model_completion(event.completion),
+        tool_discovery_result=(
+            None
+            if event.tool_discovery_result is None
+            else ToolDiscoveryProjectionResult.model_validate(
+                event.tool_discovery_result.model_dump(mode="python")
+            )
+        ),
         recovery_metadata=(
             None
             if event.recovery_metadata is None

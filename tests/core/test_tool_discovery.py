@@ -15,10 +15,12 @@ from cayu.core.tools import (
     ToolResult,
     ToolSpec,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import ModelProvider, ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    ToolDiscoveryProjectionResult,
 )
 from cayu.runtime import (
     CayuApp,
@@ -26,9 +28,12 @@ from cayu.runtime import (
     InMemorySessionStore,
     MessageWindowContextPolicy,
     ResumeRequest,
+    RetryPolicy,
     RunRequest,
     StaticToolExposurePolicy,
     TargetedToolGrant,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
 )
 from cayu.runtime.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
 from cayu.runtime.tool_catalogue import build_tool_catalog_snapshot, build_tool_descriptor
@@ -81,6 +86,15 @@ class _RememberKnowledgeTool(Tool):
         del ctx
         self.calls.append(dict(args))
         return ToolResult(content=f"remembered: {args['fact']}")
+
+
+class _ChangedRememberKnowledgeTool(_RememberKnowledgeTool):
+    spec = ToolSpec(
+        name="remember_knowledge",
+        description="Save changed knowledge with incompatible catalogue authority.",
+        input_schema=_RememberKnowledgeTool.spec.input_schema,
+        execution_profile_identity=_RememberKnowledgeTool.spec.execution_profile_identity,
+    )
 
 
 class _NoiseTool(Tool):
@@ -303,6 +317,512 @@ class _NativeDiscoveryProvider(ModelProvider):
         assert results[-1].content == expected_result
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedDiscoveryProvider(ModelProvider):
+    name = "hosted-discovery-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self, *, evidence: str = "valid") -> None:
+        self.requests: list[ModelRequest] = []
+        self.evidence = evidence
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        projection = request.tool_discovery_projection
+        assert projection is not None
+        assert projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+        assert projection.candidate_tool_names == ("remember_knowledge",)
+        if len(self.requests) == 1:
+            if self.evidence == "empty":
+                yield ModelStreamEvent(
+                    type="completed",
+                    payload={"finish_reason": "stop"},
+                    tool_discovery_result=ToolDiscoveryProjectionResult(),
+                )
+                return
+            yield ModelStreamEvent.tool_call(
+                id="hosted-native-tool-call",
+                name="remember_knowledge",
+                arguments={"fact": "Hosted discovery binds durable authority atomically."},
+            )
+            if self.evidence == "missing":
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            loaded_tools = projection.candidate_tools
+            if self.evidence == "altered":
+                loaded_tools = (
+                    {
+                        **projection.candidate_tools[0],
+                        "description": "Provider-altered authority.",
+                    },
+                )
+            elif self.evidence == "unrelated":
+                loaded_tools = (
+                    {
+                        **projection.candidate_tools[0],
+                        "name": "unrelated_tool",
+                    },
+                )
+            yield ModelStreamEvent(
+                type="completed",
+                payload={"finish_reason": "tool_calls"},
+                tool_discovery_result=ToolDiscoveryProjectionResult(
+                    loaded_tools=loaded_tools,
+                ),
+            )
+            return
+        results = [
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result" and part.tool_name == "remember_knowledge"
+        ]
+        assert results[-1].content == (
+            "remembered: Hosted discovery binds durable authority atomically."
+        )
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedReplayDiscoveryProvider(ModelProvider):
+    name = "hosted-replay-discovery-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-replay-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        projection = request.tool_discovery_projection
+        assert projection is not None
+        assert projection.candidate_tool_names == ("remember_knowledge",)
+        request_number = len(self.requests)
+        if request_number == 1:
+            assert projection.loaded_tool_names == ()
+            yield ModelStreamEvent.tool_call(
+                id="hosted-replay-first-call",
+                name="remember_knowledge",
+                arguments={"fact": "Hosted replay grants the tool."},
+            )
+            candidate = projection.candidate_tools[0]
+            yield ModelStreamEvent(
+                type="completed",
+                payload={
+                    "finish_reason": "tool_calls",
+                    "provider_state": [
+                        {
+                            "provider": "openai",
+                            "state": {
+                                "type": "tool_search_call",
+                                "execution": "server",
+                                "call_id": None,
+                                "status": "completed",
+                                "arguments": {"paths": ["remember_knowledge"]},
+                            },
+                        },
+                        {
+                            "provider": "openai",
+                            "state": {
+                                "type": "tool_search_output",
+                                "execution": "server",
+                                "call_id": None,
+                                "status": "completed",
+                                "tools": [
+                                    {
+                                        "type": "function",
+                                        "name": candidate["name"],
+                                        "description": candidate["description"],
+                                        "parameters": candidate["input_schema"],
+                                        "strict": False,
+                                        "defer_loading": True,
+                                    }
+                                ],
+                            },
+                        },
+                    ],
+                },
+                tool_discovery_result=ToolDiscoveryProjectionResult(
+                    loaded_tools=projection.candidate_tools,
+                ),
+            )
+            return
+        assert projection.loaded_tool_names == ("remember_knowledge",)
+        if request_number == 2:
+            yield ModelStreamEvent.text_delta("first call complete")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        if request_number == 3:
+            yield ModelStreamEvent.tool_call(
+                id="hosted-replay-later-call",
+                name="remember_knowledge",
+                arguments={"fact": "Hosted replay reuses durable authority."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert request_number == 4
+        yield ModelStreamEvent.text_delta("replayed call complete")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedDiscoveryAndTargetedProvider(ModelProvider):
+    name = "hosted-discovery-and-targeted-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-and-targeted-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self, *, load_noise: bool = True) -> None:
+        self.requests: list[ModelRequest] = []
+        self.load_noise = load_noise
+
+    def supports_targeted_tool_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_ADDITIONAL_TOOLS_PROTOCOL
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        targeted = request.targeted_tool_projection
+        assert targeted is not None
+        assert [tool["name"] for tool in targeted.tools] == ["remember_knowledge"]
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tool_names == (("noise_000",) if self.load_noise else ())
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="hosted-targeted-call",
+                name="remember_knowledge",
+                arguments={"fact": "Targeted authority wins hosted name precedence."},
+            )
+            if self.load_noise:
+                yield ModelStreamEvent(
+                    type="completed",
+                    payload={"finish_reason": "tool_calls"},
+                    tool_discovery_result=ToolDiscoveryProjectionResult(
+                        loaded_tools=discovery.candidate_tools,
+                    ),
+                )
+            else:
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert len(self.requests) == 2
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedMultiDiscoveryProvider(ModelProvider):
+    name = "hosted-multi-discovery-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-multi-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tool_names == ("noise_000", "remember_knowledge")
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="hosted-multi-call",
+                name="remember_knowledge",
+                arguments={"fact": "Multi-load grants an exact canonical subset."},
+            )
+            yield ModelStreamEvent(
+                type="completed",
+                payload={"finish_reason": "tool_calls"},
+                tool_discovery_result=ToolDiscoveryProjectionResult(
+                    loaded_tools=tuple(reversed(discovery.candidate_tools)),
+                ),
+            )
+            return
+        assert len(self.requests) == 2
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedDirectExposureProvider(ModelProvider):
+    name = "hosted-direct-exposure-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-direct-exposure-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tool_names == ("noise_000",)
+        assert [tool["name"] for tool in request.tools] == [
+            "search_tools",
+            "call_tool",
+            "remember_knowledge",
+        ]
+        yield ModelStreamEvent(
+            type="completed",
+            payload={"finish_reason": "stop"},
+            tool_discovery_result=ToolDiscoveryProjectionResult(),
+        )
+
+
+class _HostedZeroCandidateProvider(ModelProvider):
+    name = "hosted-zero-candidate-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-zero-candidate-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tools == ()
+        assert [tool["name"] for tool in request.tools] == [
+            "search_tools",
+            "call_tool",
+            "remember_knowledge",
+        ]
+        yield ModelStreamEvent.text_delta("No discovery needed.")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedForkProvider(ModelProvider):
+    name = "hosted-fork-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-fork-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tool_names == ("remember_knowledge",)
+        request_number = len(self.requests)
+        if request_number in {1, 4}:
+            fact = (
+                "Parent hosted discovery authority."
+                if request_number == 1
+                else "Parent resume requires fresh hosted evidence."
+            )
+            yield ModelStreamEvent.tool_call(
+                id=f"hosted-parent-call-{request_number}",
+                name="remember_knowledge",
+                arguments={"fact": fact},
+            )
+            yield ModelStreamEvent(
+                type="completed",
+                payload={"finish_reason": "tool_calls"},
+                tool_discovery_result=ToolDiscoveryProjectionResult(
+                    loaded_tools=discovery.candidate_tools,
+                ),
+            )
+            return
+        if request_number == 3:
+            yield ModelStreamEvent.tool_call(
+                id="hosted-child-guessed-call",
+                name="remember_knowledge",
+                arguments={"fact": "A child cannot inherit hosted authority."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert request_number in {2, 5}
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _HostedRetryProvider(ModelProvider):
+    name = "hosted-retry-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-retry-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.projections = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        self.projections.append(discovery)
+        if len(self.projections) == 1:
+            raise ModelProviderError(
+                "temporary hosted provider failure",
+                provider=self.name,
+                status_code=503,
+                retryable=True,
+            )
+        assert len(self.projections) == 2
+        yield ModelStreamEvent(
+            type="completed",
+            payload={"finish_reason": "stop"},
+            tool_discovery_result=ToolDiscoveryProjectionResult(),
+        )
+
+
+class _HostedCancellationProvider(ModelProvider):
+    name = "hosted-cancellation-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-cancellation-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.call_emitted = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tool_names == ("remember_knowledge",)
+        yield ModelStreamEvent.tool_call(
+            id="hosted-cancelled-call",
+            name="remember_knowledge",
+            arguments={"fact": "Uncommitted hosted selection must not execute."},
+        )
+        self.call_emitted.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+
+
+class _HostedCompactionProvider(ModelProvider):
+    name = "hosted-compaction-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:hosted-compaction-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.candidate_tool_names == ("remember_knowledge",)
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="hosted-compaction-initial-call",
+                name="remember_knowledge",
+                arguments={"fact": "Compacted hosted authority."},
+            )
+            yield ModelStreamEvent(
+                type="completed",
+                payload={"finish_reason": "tool_calls"},
+                tool_discovery_result=ToolDiscoveryProjectionResult(
+                    loaded_tools=discovery.candidate_tools,
+                ),
+            )
+            return
+        if len(self.requests) == 2:
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        assert len(self.requests) == 3
+        assert all(
+            not (
+                part.type == "provider_state"
+                and part.state.get("type") in {"tool_search_call", "tool_search_output"}
+            )
+            for message in request.messages
+            for part in message.content
+        )
+        yield ModelStreamEvent.tool_call(
+            id="hosted-compaction-stale-call",
+            name="remember_knowledge",
+            arguments={"fact": "Compacted evidence must not remain callable."},
+        )
+        yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
 
 class _SecretBearingDiscoveryTool(Tool):
@@ -952,6 +1472,583 @@ def test_native_discovery_routes_loaded_name_through_the_same_grant_and_hooks() 
     asyncio.run(run())
 
 
+def test_hosted_discovery_publishes_loaded_grant_before_the_native_call() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedDiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+        policy = _RecordingPolicy()
+        hook = _RecordingHook()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+            tool_policy=policy,
+            runtime_hooks=(hook,),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-session",
+                    messages=[Message.text("user", "Find and save this lesson.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [
+            {"fact": "Hosted discovery binds durable authority atomically."}
+        ]
+        assert [request.tool_discovery_projection.protocol for request in provider.requests] == [
+            OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        ]
+        assert [request.tool_name for request in policy.requests] == ["remember_knowledge"]
+        assert hook.before == ["remember_knowledge"]
+        assert hook.after == ["remember_knowledge"]
+        state = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-discovery-session",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert state.revision == 1
+        assert [grant.tool_name for grant in state.grants] == ["remember_knowledge"]
+        footprints = [
+            event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert [footprint["schema_version"] for footprint in footprints] == [7, 7]
+        assert [footprint["tool_discovery_projection"] for footprint in footprints] == [
+            {
+                "protocol": OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+                "candidate_count": 1,
+                "loaded_count": 0,
+                "generation_id": state.generation_id,
+            }
+        ] * 2
+        serialized_footprints = json.dumps(footprints, sort_keys=True)
+        assert "remember_knowledge" not in serialized_footprints
+        assert "Hosted discovery binds durable authority atomically" not in serialized_footprints
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_accepts_an_empty_selection_without_granting_authority() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedDiscoveryProvider(evidence="empty")
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-empty-selection",
+                    messages=[Message.text("user", "Use a tool only if one is relevant.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == []
+        state = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-discovery-empty-selection",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert state.revision == 0
+        assert state.grants == ()
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_reuses_a_grant_only_while_exact_replay_evidence_remains() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedReplayDiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+        session_id = "hosted-discovery-replay"
+
+        initial = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Find and save the first lesson.")],
+                )
+            )
+        ]
+        assert initial[-1].type is EventType.SESSION_COMPLETED
+
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "Use the retained loaded tool again.")],
+                )
+            )
+        ]
+
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [
+            {"fact": "Hosted replay grants the tool."},
+            {"fact": "Hosted replay reuses durable authority."},
+        ]
+        view = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(session_id, TOOL_DISCOVERY_VIEW_OPERATION_KEY)
+        )
+        assert view.revision == 1
+        assert [grant.tool_name for grant in view.grants] == ["remember_knowledge"]
+        footprints = [
+            event.payload
+            for event in (*initial, *resumed)
+            if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert [item["tool_discovery_projection"]["loaded_count"] for item in footprints] == [
+            0,
+            1,
+            1,
+            1,
+        ]
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_atomically_grants_a_canonical_multi_load() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedMultiDiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered, _NoiseTool(0)),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-multi-load",
+                    messages=[Message.text("user", "Load the exact relevant subset.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [{"fact": "Multi-load grants an exact canonical subset."}]
+        state = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-discovery-multi-load",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert state.revision == 1
+        assert [grant.tool_name for grant in state.grants] == [
+            "noise_000",
+            "remember_knowledge",
+        ]
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_excludes_current_direct_exposure_from_candidates() -> None:
+    async def run() -> None:
+        provider = _HostedDirectExposureProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberKnowledgeTool(), _NoiseTool(0)),
+            tool_discovery_mode="openai_tool_search_hosted",
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="direct-memory",
+                tools=("remember_knowledge",),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-direct-exposure",
+                    messages=[Message.text("user", "Use the current direct surface.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_is_a_noop_when_direct_exposure_covers_the_ceiling() -> None:
+    async def run() -> None:
+        provider = _HostedZeroCandidateProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberKnowledgeTool(),),
+            tool_discovery_mode="openai_tool_search_hosted",
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="direct-memory",
+                tools=("remember_knowledge",),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-zero-candidate",
+                    messages=[Message.text("user", "Use only the direct surface.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
+        [footprint] = [
+            event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert footprint["tool_discovery_projection"]["candidate_count"] == 0
+        assert footprint["tools"]["count"] == 1
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_fork_resets_authority_and_parent_resume_reselects() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedForkProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        parent = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-fork-parent",
+                    messages=[Message.text("user", "Find and save the parent lesson.")],
+                )
+            )
+        ]
+        assert parent[-1].type is EventType.SESSION_COMPLETED
+
+        _ = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="hosted-fork-parent",
+                    session_id="hosted-fork-child",
+                )
+            )
+        ]
+        child = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="hosted-fork-child",
+                    messages=[Message.text("user", "Try copied hosted authority.")],
+                )
+            )
+        ]
+        assert child[-1].type is EventType.SESSION_FAILED
+        child_view = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-fork-child",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert child_view.revision == 0
+        assert child_view.grants == ()
+
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="hosted-fork-parent",
+                    messages=[Message.text("user", "Save a second parent lesson.")],
+                )
+            )
+        ]
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [
+            {"fact": "Parent hosted discovery authority."},
+            {"fact": "Parent resume requires fresh hosted evidence."},
+        ]
+        generation_ids = [
+            request.tool_discovery_projection.generation_id
+            for request in provider.requests
+            if request.tool_discovery_projection is not None
+        ]
+        assert generation_ids[0] == generation_ids[1] == generation_ids[3] == generation_ids[4]
+        assert generation_ids[2] != generation_ids[0]
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_retry_preserves_the_exact_branch_candidate_projection() -> None:
+    async def run() -> None:
+        provider = _HostedRetryProvider()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberKnowledgeTool(),),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-retry",
+                    messages=[Message.text("user", "Retry without changing authority.")],
+                    retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.projections) == 2
+        assert provider.projections[0] == provider.projections[1]
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_cancellation_cannot_publish_or_execute_unfinished_selection() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedCancellationProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        async def collect() -> list:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="hosted-discovery-cancelled",
+                        messages=[Message.text("user", "Cancel after an uncommitted call.")],
+                    )
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(provider.call_emitted.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert provider.cancelled.is_set()
+        assert remembered.calls == []
+        state = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-discovery-cancelled",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert state.revision == 0
+        assert state.grants == ()
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_compaction_removes_replay_authority() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedCompactionProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+            context_policy=MessageWindowContextPolicy(max_messages=2),
+        )
+
+        initial = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-compaction",
+                    messages=[Message.text("user", "Load and use the memory tool.")],
+                )
+            )
+        ]
+        assert initial[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [{"fact": "Compacted hosted authority."}]
+
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="hosted-discovery-compaction",
+                    messages=[Message.text("user", "Try the old loaded function again.")],
+                )
+            )
+        ]
+
+        assert resumed[-1].type is EventType.SESSION_FAILED
+        assert remembered.calls == [{"fact": "Compacted hosted authority."}]
+        state = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-discovery-compaction",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert state.revision == 1
+        assert [grant.tool_name for grant in state.grants] == ["remember_knowledge"]
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_catalogue_drift_rejects_resume_before_provider_dispatch() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        initial_provider = _HostedDiscoveryProvider(evidence="empty")
+        initial_app = CayuApp(session_store=store, enable_logging=False)
+        initial_app.register_provider(initial_provider, default=True)
+        initial_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberKnowledgeTool(),),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+        initial = [
+            event
+            async for event in initial_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-catalogue-drift",
+                    messages=[Message.text("user", "Establish the original catalogue.")],
+                )
+            )
+        ]
+        assert initial[-1].type is EventType.SESSION_COMPLETED
+
+        changed_provider = _HostedDiscoveryProvider(evidence="empty")
+        changed_app = CayuApp(session_store=store, enable_logging=False)
+        changed_app.register_provider(changed_provider, default=True)
+        changed_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_ChangedRememberKnowledgeTool(),),
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+        with pytest.raises(
+            ValueError,
+            match="Tool discovery view conflicts with current session authority",
+        ):
+            _ = [
+                event
+                async for event in changed_app.resume(
+                    ResumeRequest(
+                        session_id="hosted-discovery-catalogue-drift",
+                        messages=[Message.text("user", "Use the changed catalogue.")],
+                    )
+                )
+            ]
+
+        assert changed_provider.requests == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("evidence", ["missing", "altered", "unrelated"])
+def test_hosted_discovery_rejects_untrusted_selection_before_tool_execution(
+    evidence: str,
+) -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedDiscoveryProvider(evidence=evidence)
+        remembered = _RememberKnowledgeTool()
+        policy = _RecordingPolicy()
+        hook = _RecordingHook()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+            tool_policy=policy,
+            runtime_hooks=(hook,),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"hosted-discovery-rejected-{evidence}",
+                    messages=[Message.text("user", "Do not trust malformed selection.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert remembered.calls == []
+        assert policy.requests == []
+        assert hook.before == []
+        assert hook.after == []
+        state = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                f"hosted-discovery-rejected-{evidence}",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert state.revision == 0
+        assert state.grants == ()
+
+    asyncio.run(run())
+
+
 def test_native_discovery_redacts_loaded_definitions_before_provider_dispatch() -> None:
     async def run() -> None:
         secret = "native-discovery-secret-canary"
@@ -1081,6 +2178,164 @@ def test_targeted_native_grant_takes_precedence_over_same_name_discovery_grant()
             for request in provider.requests
             if request.tool_discovery_projection is not None
         ] == [(), (), ()]
+
+    asyncio.run(run())
+
+
+def test_targeted_native_grant_takes_precedence_over_hosted_candidate_name() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedDiscoveryAndTargetedProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered, _NoiseTool(0)),
+            targeted_tool_mode="openai_additional_tools",
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-targeted-overlap",
+                    messages=[Message.text("user", "Save the lesson and load other tools.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="hosted-targeted-overlap",
+                            tool_id="cayu:remember_knowledge",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [{"fact": "Targeted authority wins hosted name precedence."}]
+        [targeted_record] = await store.list_targeted_tool_grants(
+            "hosted-discovery-targeted-overlap"
+        )
+        started = next(
+            event
+            for event in events
+            if event.type is EventType.TOOL_CALL_STARTED and event.tool_name == "remember_knowledge"
+        )
+        assert started.payload["grant_id"] == targeted_record.grant_id
+        discovery_view = await app.inspect_tool_discovery_view("hosted-discovery-targeted-overlap")
+        assert [grant.tool_name for grant in discovery_view.grants] == ["noise_000"]
+
+    asyncio.run(run())
+
+
+def test_targeted_native_grant_can_cover_the_complete_hosted_candidate_set() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedDiscoveryAndTargetedProvider(load_noise=False)
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            targeted_tool_mode="openai_additional_tools",
+            tool_discovery_mode="openai_tool_search_hosted",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-targeted-complete-overlap",
+                    messages=[Message.text("user", "Use the targeted memory tool.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="hosted-targeted-complete-overlap",
+                            tool_id="cayu:remember_knowledge",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [{"fact": "Targeted authority wins hosted name precedence."}]
+        discovery_view = await app.inspect_tool_discovery_view(
+            "hosted-discovery-targeted-complete-overlap"
+        )
+        assert discovery_view.revision == 0
+        assert discovery_view.grants == ()
+        assert all(
+            request.tool_discovery_projection is not None
+            and request.tool_discovery_projection.candidate_tools == ()
+            for request in provider.requests
+        )
+
+    asyncio.run(run())
+
+
+def test_hosted_discovery_approval_resume_uses_the_published_branch_grant() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _HostedDiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_hosted",
+            tool_policy=_RequireRememberApprovalPolicy(),
+        )
+
+        paused = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="hosted-discovery-approval",
+                    messages=[Message.text("user", "Find and save the lesson.")],
+                )
+            )
+        ]
+
+        approval = next(
+            event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        assert paused[-1].type is EventType.SESSION_INTERRUPTED
+        assert remembered.calls == []
+        view = ToolDiscoveryViewState.model_validate(
+            await store.load_session_operation(
+                "hosted-discovery-approval",
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert [grant.tool_name for grant in view.grants] == ["remember_knowledge"]
+
+        resumed = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="hosted-discovery-approval",
+                    approval_id=approval.payload["approval_id"],
+                    tool_round_id=approval.payload["tool_round_id"],
+                    tool_call_id=approval.payload["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [
+            {"fact": "Hosted discovery binds durable authority atomically."}
+        ]
 
     asyncio.run(run())
 

@@ -64,10 +64,12 @@ from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
     OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     TargetedToolProjectionRequest,
     ToolDiscoveryProjectionRequest,
+    ToolDiscoveryProjectionResult,
 )
 from cayu.providers.openai import openai_stream_events
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
@@ -1178,6 +1180,609 @@ def test_build_openai_payload_projects_client_tool_search_and_replays_loaded_too
     assert neutral_payload["input"][1]["id"] == "ts_search_1"
 
 
+def test_build_openai_payload_projects_bounded_hosted_tool_search_candidates() -> None:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"fact": {"type": "string"}},
+        "required": ["fact"],
+    }
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Save this lesson.")],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(
+                {
+                    "name": "remember_knowledge",
+                    "description": "Save durable knowledge.",
+                    "input_schema": schema,
+                },
+            ),
+        ),
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["parallel_tool_calls"] is False
+    assert payload["tools"] == [
+        {
+            "type": "function",
+            "name": "remember_knowledge",
+            "description": "Save durable knowledge.",
+            "parameters": schema,
+            "strict": False,
+            "defer_loading": True,
+        },
+        {"type": "tool_search", "execution": "server"},
+    ]
+
+
+def test_build_openai_payload_omits_inert_hosted_search_for_zero_candidates() -> None:
+    direct_tool = {
+        "name": "remember_knowledge",
+        "description": "Save durable knowledge.",
+        "input_schema": {"type": "object"},
+    }
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Use the direct tool surface.")],
+        tools=[search_tools_spec(), call_tool_spec(), direct_tool],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+        ),
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["tools"] == [
+        {
+            "type": "function",
+            "name": "remember_knowledge",
+            "description": "Save durable knowledge.",
+            "parameters": {"type": "object"},
+            "strict": False,
+        }
+    ]
+    assert "parallel_tool_calls" not in payload
+
+
+def test_hosted_tool_search_projection_requires_branch_generation_identity() -> None:
+    with pytest.raises(ValidationError, match="branch-local generation identity"):
+        ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            candidate_tools=(
+                {
+                    "name": "remember_knowledge",
+                    "description": "Save durable knowledge.",
+                    "input_schema": {"type": "object"},
+                },
+            ),
+        )
+
+
+def test_hosted_tool_search_projection_requires_exact_replay_loaded_candidates() -> None:
+    candidate = {
+        "name": "remember_knowledge",
+        "description": "Save durable knowledge.",
+        "input_schema": {"type": "object"},
+    }
+
+    with pytest.raises(ValidationError, match="exact subset of candidates"):
+        ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(candidate,),
+            loaded_tools=({**candidate, "description": "Altered replay."},),
+        )
+
+
+def test_build_openai_payload_accepts_later_calls_to_a_retained_hosted_tool() -> None:
+    schema = {"type": "object", "properties": {}}
+    candidate = {
+        "name": "remember_knowledge",
+        "description": "Save durable knowledge.",
+        "input_schema": schema,
+    }
+    selection = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "tool_search_call",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "arguments": {"paths": ["remember_knowledge"]},
+                },
+            ),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "tool_search_output",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "remember_knowledge",
+                            "description": "Save durable knowledge.",
+                            "parameters": schema,
+                            "strict": False,
+                            "defer_loading": True,
+                        }
+                    ],
+                },
+            ),
+        ),
+    )
+    later_call = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "function_call",
+                    "call_id": "call_retained_remember",
+                    "name": "remember_knowledge",
+                    "arguments": '{"fact":"reuse retained schema"}',
+                    "status": "completed",
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "Load the memory tool."),
+            selection,
+            Message.text("user", "Use it again."),
+            later_call,
+        ],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(candidate,),
+            loaded_tools=(candidate,),
+        ),
+    )
+
+    payload = build_openai_payload(request)
+
+    assert any(
+        item.get("type") == "function_call" and item.get("call_id") == "call_retained_remember"
+        for item in payload["input"]
+    )
+
+
+def test_build_openai_payload_rejects_replay_loaded_authority_without_retained_evidence() -> None:
+    candidate = {
+        "name": "remember_knowledge",
+        "description": "Save durable knowledge.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Use a no-longer-retained selection.")],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(candidate,),
+            loaded_tools=(candidate,),
+        ),
+    )
+
+    with pytest.raises(OpenAIProtocolError, match="no exact retained output"):
+        build_openai_payload(request)
+
+
+def test_openai_response_events_normalizes_hosted_search_without_local_search_call() -> None:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"fact": {"type": "string"}},
+        "required": ["fact"],
+    }
+    response = {
+        "id": "resp_hosted_search",
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [
+            {
+                "type": "tool_search_call",
+                "execution": "server",
+                "call_id": None,
+                "status": "completed",
+                "arguments": {"paths": ["remember_knowledge"]},
+            },
+            {
+                "type": "tool_search_output",
+                "execution": "server",
+                "call_id": None,
+                "status": "completed",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "remember_knowledge",
+                        "description": "Save durable knowledge.",
+                        "parameters": schema,
+                        "strict": False,
+                        "defer_loading": True,
+                        "output_schema": None,
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_remember",
+                "name": "remember_knowledge",
+                "arguments": '{"fact":"cache hosted definitions"}',
+                "status": "completed",
+            },
+        ],
+    }
+
+    events = openai_response_events(response)
+
+    assert [event.type for event in events] == ["tool_call", "completed"]
+    assert events[0].payload == {
+        "id": "call_remember",
+        "name": "remember_knowledge",
+        "arguments": {"fact": "cache hosted definitions"},
+    }
+    result = events[-1].tool_discovery_result
+    assert result is not None
+    assert result.loaded_tools == (
+        {
+            "name": "remember_knowledge",
+            "description": "Save durable knowledge.",
+            "input_schema": schema,
+        },
+    )
+    provider_states = events[-1].payload["provider_state"]
+    assert [item["state"]["type"] for item in provider_states] == [
+        "tool_search_call",
+        "tool_search_output",
+        "function_call",
+    ]
+    assert "output_schema" not in provider_states[1]["state"]["tools"][0]
+
+
+def test_openai_response_events_rejects_malformed_hosted_search_sequences() -> None:
+    schema = {"type": "object", "properties": {}}
+    search_call = {
+        "type": "tool_search_call",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "arguments": {"paths": ["remember_knowledge"]},
+    }
+    search_output = {
+        "type": "tool_search_output",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "tools": [
+            {
+                "type": "function",
+                "name": "remember_knowledge",
+                "description": "Save durable knowledge.",
+                "parameters": schema,
+                "defer_loading": True,
+            }
+        ],
+    }
+    function_call = {
+        "type": "function_call",
+        "call_id": "call_remember",
+        "name": "remember_knowledge",
+        "arguments": "{}",
+        "status": "completed",
+    }
+    client_call = {
+        "type": "tool_search_call",
+        "id": "ts_client",
+        "call_id": "call_client",
+        "execution": "client",
+        "status": "completed",
+        "arguments": {"query": "memory"},
+    }
+    cases = (
+        ([search_call], "one adjacent call/output pair"),
+        ([search_output], "must follow its server search call"),
+        (
+            [function_call, search_call, search_output],
+            "function calls must follow the loaded output",
+        ),
+        (
+            [search_call, search_output, client_call],
+            "cannot mix client and server search calls",
+        ),
+        (
+            [search_call, search_output, search_call, search_output],
+            "one adjacent call/output pair",
+        ),
+    )
+
+    for output, error in cases:
+        with pytest.raises(OpenAIProtocolError, match=error):
+            openai_response_events(
+                {
+                    "id": "resp_malformed_hosted_search",
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": output,
+                }
+            )
+
+    changed_strict_output = {
+        **search_output,
+        "tools": [{**search_output["tools"][0], "strict": True}],
+    }
+    with pytest.raises(OpenAIProtocolError, match="changed strict mode"):
+        openai_response_events(
+            {
+                "id": "resp_changed_hosted_strict",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [search_call, changed_strict_output],
+            }
+        )
+
+    changed_output_schema = {
+        **search_output,
+        "tools": [
+            {
+                **search_output["tools"][0],
+                "output_schema": {"type": "object"},
+            }
+        ],
+    }
+    with pytest.raises(OpenAIProtocolError, match="added an output schema"):
+        openai_response_events(
+            {
+                "id": "resp_changed_hosted_output_schema",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [search_call, changed_output_schema],
+            }
+        )
+
+
+@pytest.mark.parametrize("location", ["call", "output", "loaded_function"])
+def test_openai_response_events_rejects_unknown_hosted_search_fields(location: str) -> None:
+    search_call = {
+        "type": "tool_search_call",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "arguments": {"paths": ["remember_knowledge"]},
+    }
+    search_output = {
+        "type": "tool_search_output",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "tools": [
+            {
+                "type": "function",
+                "name": "remember_knowledge",
+                "description": "Save durable knowledge.",
+                "parameters": {"type": "object"},
+                "strict": False,
+                "defer_loading": True,
+            }
+        ],
+    }
+    target = {
+        "call": search_call,
+        "output": search_output,
+        "loaded_function": search_output["tools"][0],
+    }[location]
+    target["provider_extension"] = "must not be normalized away"
+
+    with pytest.raises(OpenAIProtocolError, match="unsupported fields"):
+        openai_response_events(
+            {
+                "id": "resp_unknown_hosted_field",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [search_call, search_output],
+            }
+        )
+
+
+def test_openai_response_events_canonicalizes_empty_and_unordered_hosted_selections() -> None:
+    schema = {"type": "object", "properties": {}}
+    search_call = {
+        "type": "tool_search_call",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "arguments": {"paths": ["zeta_tool", "alpha_tool"]},
+    }
+
+    empty_events = openai_response_events(
+        {
+            "id": "resp_empty_hosted_search",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                search_call,
+                {
+                    "type": "tool_search_output",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "tools": [],
+                },
+            ],
+        }
+    )
+    assert empty_events[-1].tool_discovery_result == ToolDiscoveryProjectionResult()
+
+    unordered_events = openai_response_events(
+        {
+            "id": "resp_unordered_hosted_search",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                search_call,
+                {
+                    "type": "tool_search_output",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": name,
+                            "description": f"Run {name}.",
+                            "parameters": schema,
+                            "strict": False,
+                            "defer_loading": True,
+                        }
+                        for name in ("zeta_tool", "alpha_tool")
+                    ],
+                },
+            ],
+        }
+    )
+    result = unordered_events[-1].tool_discovery_result
+    assert result is not None
+    assert result.loaded_tool_names == ("alpha_tool", "zeta_tool")
+
+    with pytest.raises(OpenAIProtocolError, match="arguments are oversized"):
+        openai_response_events(
+            {
+                "id": "resp_oversized_hosted_search",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {**search_call, "arguments": {"query": "x" * (64 * 1024)}},
+                    {
+                        "type": "tool_search_output",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "completed",
+                        "tools": [],
+                    },
+                ],
+            }
+        )
+
+
+def test_build_openai_payload_rejects_orphan_hosted_search_replay() -> None:
+    schema = {"type": "object", "properties": {}}
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "Save this lesson."),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(
+                    ProviderStatePart(
+                        provider="openai",
+                        state={
+                            "type": "tool_search_output",
+                            "execution": "server",
+                            "call_id": None,
+                            "status": "completed",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "remember_knowledge",
+                                    "description": "Save durable knowledge.",
+                                    "parameters": schema,
+                                    "defer_loading": True,
+                                }
+                            ],
+                        },
+                    ),
+                ),
+            ),
+        ],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(
+                {
+                    "name": "remember_knowledge",
+                    "description": "Save durable knowledge.",
+                    "input_schema": schema,
+                },
+            ),
+        ),
+    )
+
+    with pytest.raises(OpenAIProtocolError, match="orphan loaded output"):
+        build_openai_payload(request)
+
+
+def test_build_openai_payload_rejects_altered_hosted_search_replay() -> None:
+    schema = {"type": "object", "properties": {}}
+    candidate = {
+        "name": "remember_knowledge",
+        "description": "Save durable knowledge.",
+        "input_schema": schema,
+    }
+    assistant = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "tool_search_call",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "arguments": {"paths": ["remember_knowledge"]},
+                },
+            ),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "tool_search_output",
+                    "execution": "server",
+                    "call_id": None,
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "remember_knowledge",
+                            "description": "Provider-altered authority.",
+                            "parameters": schema,
+                            "strict": False,
+                            "defer_loading": True,
+                        }
+                    ],
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Save this lesson."), assistant],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+            candidate_tools=(candidate,),
+        ),
+    )
+
+    with pytest.raises(OpenAIProtocolError, match="outside the current candidate projection"):
+        build_openai_payload(request)
+
+
 def test_build_openai_payload_rejects_altered_tool_search_replay() -> None:
     schema = {
         "type": "object",
@@ -1381,6 +1986,267 @@ async def test_openai_stream_events_normalizes_client_tool_search_lifecycle_once
 
 
 @pytest.mark.anyio
+async def test_openai_stream_events_normalizes_hosted_tool_search_lifecycle() -> None:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"fact": {"type": "string"}},
+        "required": ["fact"],
+    }
+    completed_search = {
+        "type": "tool_search_call",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "arguments": {"paths": ["remember_knowledge"]},
+    }
+    completed_output = {
+        "type": "tool_search_output",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "tools": [
+            {
+                "type": "function",
+                "name": "remember_knowledge",
+                "description": "Save durable knowledge.",
+                "parameters": schema,
+                "strict": False,
+                "defer_loading": True,
+                "output_schema": None,
+            }
+        ],
+    }
+    completed_function = {
+        "type": "function_call",
+        "id": "fc_hosted_1",
+        "call_id": "call_hosted_1",
+        "name": "remember_knowledge",
+        "arguments": '{"fact":"streamed hosted discovery"}',
+        "status": "completed",
+    }
+
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "tool_search_call",
+                "execution": "server",
+                "call_id": None,
+                "status": "in_progress",
+                "arguments": {},
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": completed_search,
+        }
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "tool_search_output",
+                "execution": "server",
+                "call_id": None,
+                "status": "in_progress",
+                "tools": completed_output["tools"],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": completed_output,
+        }
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "type": "function_call",
+                "id": "fc_hosted_1",
+                "call_id": "call_hosted_1",
+                "name": "remember_knowledge",
+                "arguments": "",
+                "status": "in_progress",
+            },
+        }
+        yield {
+            "type": "response.function_call_arguments.done",
+            "output_index": 2,
+            "item_id": "fc_hosted_1",
+            "name": "remember_knowledge",
+            "arguments": '{"fact":"streamed hosted discovery"}',
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": completed_function,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_hosted_search",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    tool_calls = [event for event in events if event.type is ModelStreamEventType.TOOL_CALL]
+    assert tool_calls == [
+        ModelStreamEvent.tool_call(
+            id="call_hosted_1",
+            name="remember_knowledge",
+            arguments={"fact": "streamed hosted discovery"},
+        )
+    ]
+    result = events[-1].tool_discovery_result
+    assert result is not None
+    assert result.loaded_tool_names == ("remember_knowledge",)
+    assert [item["state"]["type"] for item in events[-1].payload["provider_state"]] == [
+        "tool_search_call",
+        "tool_search_output",
+        "function_call",
+    ]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_terminal_hosted_selection_conflict() -> None:
+    schema = {"type": "object", "properties": {}}
+    completed_search = {
+        "type": "tool_search_call",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "arguments": {"paths": ["remember_knowledge"]},
+    }
+    completed_output = {
+        "type": "tool_search_output",
+        "execution": "server",
+        "call_id": None,
+        "status": "completed",
+        "tools": [
+            {
+                "type": "function",
+                "name": "remember_knowledge",
+                "description": "Save durable knowledge.",
+                "parameters": schema,
+                "strict": False,
+                "defer_loading": True,
+            }
+        ],
+    }
+
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                **completed_search,
+                "status": "in_progress",
+                "arguments": {},
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": completed_search,
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": completed_output,
+        }
+        altered_output = {
+            **completed_output,
+            "tools": [
+                {
+                    **completed_output["tools"][0],
+                    "description": "Altered terminal definition.",
+                }
+            ],
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_conflicting_hosted_search",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [completed_search, altered_output],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="conflicts with lifecycle evidence"):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_emits_terminal_only_hosted_function_call() -> None:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"fact": {"type": "string"}},
+        "required": ["fact"],
+    }
+
+    async def raw_events():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_terminal_hosted_search",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "tool_search_call",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "completed",
+                        "arguments": {"paths": ["remember_knowledge"]},
+                    },
+                    {
+                        "type": "tool_search_output",
+                        "execution": "server",
+                        "call_id": None,
+                        "status": "completed",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "remember_knowledge",
+                                "description": "Save durable knowledge.",
+                                "parameters": schema,
+                                "strict": False,
+                                "defer_loading": True,
+                            }
+                        ],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_terminal_hosted",
+                        "name": "remember_knowledge",
+                        "arguments": '{"fact":"terminal hosted discovery"}',
+                        "status": "completed",
+                    },
+                ],
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert events[0] == ModelStreamEvent.tool_call(
+        id="call_terminal_hosted",
+        name="remember_knowledge",
+        arguments={"fact": "terminal hosted discovery"},
+    )
+    assert events[-1].type is ModelStreamEventType.COMPLETED
+    assert events[-1].tool_discovery_result is not None
+    assert events[-1].tool_discovery_result.loaded_tool_names == ("remember_knowledge",)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("case", ["duplicate", "mismatch", "unfinished"])
 async def test_openai_stream_events_rejects_invalid_tool_search_lifecycle(case: str) -> None:
     added = {
@@ -1471,7 +2337,7 @@ async def test_openai_incomplete_stream_drops_an_unfinished_tool_search_call() -
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("execution", "server", "must use client execution"),
+        ("execution", "server", "requires null call_id"),
         ("status", "incomplete", "must be completed"),
         ("arguments", {"query": ""}, "requires a bounded query"),
         ("arguments", {"query": "memory", "unknown": True}, "unsupported arguments"),
@@ -1529,6 +2395,42 @@ def test_openai_provider_requires_explicit_client_tool_search_model_support() ->
             model="gpt-verified",
             protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
         )
+
+
+def test_openai_provider_requires_separate_hosted_tool_search_model_support() -> None:
+    provider = OpenAIProvider(
+        api_key="test-key",
+        client_tool_search_models=("gpt-client",),
+        hosted_tool_search_models=("gpt-hosted",),
+    )
+
+    assert provider.supports_tool_discovery_projection(
+        model="gpt-hosted",
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    )
+    assert not provider.supports_tool_discovery_projection(
+        model="gpt-client",
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    )
+    with pytest.raises(ValueError, match="hosted Tool Search support is not established"):
+        provider.preflight_tool_discovery_projection(
+            model="gpt-client",
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        )
+
+    background = OpenAIProvider(
+        api_key="test-key",
+        hosted_tool_search_models=("gpt-hosted",),
+        background=True,
+    )
+    assert background.supports_tool_discovery_projection(
+        model="gpt-hosted",
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    )
+    background.preflight_tool_discovery_projection(
+        model="gpt-hosted",
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    )
 
 
 def test_build_openai_payload_passes_provider_cache_options() -> None:
@@ -6272,6 +7174,89 @@ def test_openai_server_chain_keeps_a_safe_subset_of_current_discovery_authority(
 
     assert payload["previous_response_id"] == "resp_with_existing_discovery_tools"
     assert len(payload["input"]) == 1
+
+
+def test_openai_server_chain_requires_the_exact_hosted_candidate_projection() -> None:
+    candidate = {
+        "name": "remember_knowledge",
+        "description": "Save durable knowledge.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+    projection = ToolDiscoveryProjectionRequest(
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        generation_id=f"sha256:{'d' * 64}",
+        candidate_tools=(candidate,),
+    )
+    [authority_token] = openai_module._openai_discovery_ownership_tokens(projection)
+    replay_loaded_projection = ToolDiscoveryProjectionRequest(
+        protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+        generation_id=projection.generation_id,
+        candidate_tools=projection.candidate_tools,
+        loaded_tools=projection.candidate_tools,
+    )
+    assert openai_module._openai_discovery_ownership_tokens(replay_loaded_projection) == (
+        authority_token,
+    )
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_with_hosted_candidates",
+                    "targeted_tool_marker_id": None,
+                    "tool_discovery_loaded_tool_names": [authority_token],
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "parent turn"),
+            response_ref,
+            Message.text("user", "continue"),
+        ],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=projection,
+    )
+
+    chained = build_openai_payload(request, reasoning_state="server")
+    changed = build_openai_payload(
+        request.model_copy(
+            update={
+                "tool_discovery_projection": ToolDiscoveryProjectionRequest(
+                    protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+                    generation_id=f"sha256:{'d' * 64}",
+                    candidate_tools=({**candidate, "description": "Changed authority."},),
+                )
+            },
+            deep=True,
+        ),
+        reasoning_state="server",
+    )
+    forked = build_openai_payload(
+        request.model_copy(
+            update={
+                "tool_discovery_projection": ToolDiscoveryProjectionRequest(
+                    protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+                    generation_id=f"sha256:{'e' * 64}",
+                    candidate_tools=(candidate,),
+                )
+            },
+            deep=True,
+        ),
+        reasoning_state="server",
+    )
+
+    assert chained["previous_response_id"] == "resp_with_hosted_candidates"
+    assert len(chained["input"]) == 1
+    assert "previous_response_id" not in changed
+    assert [item["role"] for item in changed["input"]] == ["user", "user"]
+    assert "previous_response_id" not in forked
+    assert [item["role"] for item in forked["input"]] == ["user", "user"]
+    assert forked["tools"] == chained["tools"]
 
 
 def test_openai_server_chain_drops_inactive_targeted_provider_authority() -> None:
