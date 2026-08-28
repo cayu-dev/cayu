@@ -31,6 +31,7 @@ from cayu.mcp._jsonrpc import (
     jsonrpc_authority_mapping,
     jsonrpc_notification_payload,
     jsonrpc_request_payload,
+    jsonrpc_tool_contract_evidence,
     merge_jsonrpc_authority_mapping,
     resource_definition_from_payload,
     resource_result_from_payload,
@@ -88,6 +89,8 @@ from cayu.mcp.base import (
     _credential_safe_mcp_cancellation,
     _mcp_session_close_task,
     _McpCallerCancellationBoundary,
+    _McpToolDiscovery,
+    _McpToolDispatchSignal,
     _retain_mcp_session_close,
     copy_mcp_server_spec,
 )
@@ -603,7 +606,18 @@ class StdioMcpSession(McpSession):
             raise
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+        discovery = await self._discover_builtin_tools_for_toolset()
+        await discovery.commit()
+        return discovery.definitions
+
+    async def _discover_tools_for_toolset(self) -> _McpToolDiscovery:
+        if type(self).list_tools is not StdioMcpSession.list_tools:
+            return await McpSession._discover_tools_for_toolset(self)
+        return await self._discover_builtin_tools_for_toolset()
+
+    async def _discover_builtin_tools_for_toolset(self) -> _McpToolDiscovery:
         transport_names: dict[str, str] = {}
+        private_contract_hashes: list[str] = []
         parsed_tool_count = 0
 
         def parse_tools_page(result: Any) -> dict[str, Any]:
@@ -643,6 +657,7 @@ class StdioMcpSession(McpSession):
                 method,
                 params,
                 authority_mapping=transport_names,
+                private_tool_contract_hashes=private_contract_hashes,
                 paginated=True,
                 result_parser=parse_tools_page,
             )
@@ -658,27 +673,72 @@ class StdioMcpSession(McpSession):
             )
         except BaseException:
             transport_names.clear()
+            private_contract_hashes.clear()
             raise
         definitions = tuple(tools)
-        async with self._authority_mapping_lock:
-            merge_result = merge_jsonrpc_authority_mapping(
-                self._tool_transport_names,
-                transport_names,
-                max_items=self.max_list_items,
-            )
-            if merge_result.error is not None:
+        private_hashes = tuple(private_contract_hashes)
+        private_contract_hashes.clear()
+
+        async def commit_transport_names() -> None:
+            async with self._authority_mapping_lock:
+                if self._closed:
+                    transport_names.clear()
+                    raise McpProtocolError(
+                        "MCP stdio session closed before tool discovery was published."
+                    )
+                self._tool_transport_names = {
+                    public: raw for public, raw in transport_names.items() if public != raw
+                }
                 transport_names.clear()
-                raise McpProtocolError(
-                    self._secret_redactor.redact_text(merge_result.error)
-                ) from None
-            self._tool_transport_names = {
-                public: raw for public, raw in merge_result.mapping.items() if public != raw
-            }
-            merge_result.mapping.clear()
+
+        try:
+            return _McpToolDiscovery(
+                definitions,
+                private_contract_hashes=private_hashes,
+                commit=commit_transport_names,
+                discard=transport_names.clear,
+            )
+        except BaseException:
             transport_names.clear()
-        return definitions
+            raise
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+        call = self._call_tool_request(name, arguments, dispatch_signal=None)
+        name = ""
+        arguments = {}
+        return await call
+
+    async def _call_tool_with_dispatch_signal(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        dispatch_signal: _McpToolDispatchSignal,
+    ) -> McpToolResult:
+        if type(self) is not StdioMcpSession:
+            call = McpSession._call_tool_with_dispatch_signal(
+                self,
+                name,
+                arguments,
+                dispatch_signal=dispatch_signal,
+            )
+        else:
+            call = self._call_tool_request(
+                name,
+                arguments,
+                dispatch_signal=dispatch_signal,
+            )
+        name = ""
+        arguments = {}
+        return await call
+
+    async def _call_tool_request(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        dispatch_signal: _McpToolDispatchSignal | None,
+    ) -> McpToolResult:
         tool_name = require_clean_nonblank(name, "tool name")
         if type(arguments) is not dict:
             if mcp_json_value_nesting_too_deep(arguments):
@@ -704,6 +764,7 @@ class StdioMcpSession(McpSession):
             "tools/call",
             request_params,
             result_parser=tool_result_from_payload,
+            dispatch_signal=dispatch_signal,
         )
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
@@ -962,8 +1023,10 @@ class StdioMcpSession(McpSession):
         params: dict[str, Any],
         *,
         authority_mapping: dict[str, str] | None = None,
+        private_tool_contract_hashes: list[str] | None = None,
         paginated: bool = False,
         result_parser: Callable[[Any], Any] | None = None,
+        dispatch_signal: _McpToolDispatchSignal | None = None,
     ) -> Any:
         if self._closed:
             raise McpProtocolError("MCP stdio session is closed.")
@@ -1027,6 +1090,11 @@ class StdioMcpSession(McpSession):
         write_cancellation_boundary = _McpCallerCancellationBoundary()
         try:
             await write_cancellation_boundary.checkpoint()
+            if dispatch_signal is not None:
+                # _write_with_timeout() creates its owned write task before its
+                # first suspension. Once this task yields, target execution is an
+                # uncertain outcome and refresh must let the exact call settle.
+                dispatch_signal.mark_dispatched()
             await self._write_with_timeout(
                 payload,
                 timeout_message=f"MCP request {request_id} write timed out.",
@@ -1171,6 +1239,7 @@ class StdioMcpSession(McpSession):
         redacted_response = redaction_result.response
         mapping_result = JsonrpcAuthorityMappingResult({})
         mapping_error = redaction_result.error
+        private_evidence_error: str | None = None
         private_cursor: Any = None
         raw_result: Any = None
         if paginated and mapping_error is None:
@@ -1190,6 +1259,14 @@ class StdioMcpSession(McpSession):
                 method=method_name,
             )
             mapping_error = mapping_result.error
+        if mapping_error is None and private_tool_contract_hashes is not None:
+            evidence_result = jsonrpc_tool_contract_evidence(
+                response,
+                server_name=self.server.name,
+            )
+            private_evidence_error = evidence_result.error
+            if private_evidence_error is None:
+                private_tool_contract_hashes.extend(evidence_result.hashes)
         if mapping_error is None and authority_mapping is not None:
             merge_result = merge_jsonrpc_authority_mapping(
                 authority_mapping,
@@ -1203,6 +1280,8 @@ class StdioMcpSession(McpSession):
             merge_result.mapping.clear()
         if mapping_error is not None and authority_mapping is not None:
             authority_mapping.clear()
+        if mapping_error is not None and private_tool_contract_hashes is not None:
+            private_tool_contract_hashes.clear()
         mapping_result.mapping.clear()
         raw_result = None
         response.clear()
@@ -1258,6 +1337,13 @@ class StdioMcpSession(McpSession):
                 request_id=request_id,
                 method_name=method_name,
             )
+        if private_evidence_error is not None:
+            if private_tool_contract_hashes is not None:
+                private_tool_contract_hashes.clear()
+            private_cursor = None
+            if type(result) in {dict, list}:
+                result.clear()
+            raise McpProtocolError(private_evidence_error) from None
         if not paginated:
             return result
         if type(result) is dict:

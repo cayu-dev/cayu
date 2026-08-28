@@ -35,6 +35,7 @@ from cayu.runtime.tool_grants import (
 from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
 
 if TYPE_CHECKING:
+    from cayu.mcp import McpToolset
     from cayu.runtime.loop_policies import LoopPolicy
     from cayu.runtime.tool_catalogue import ToolCatalogSnapshot
     from cayu.runtime.tool_exposure import (
@@ -77,6 +78,7 @@ class RegisteredAgentState:
     context_behavior_execution_profile_identities: Mapping[
         int, ExecutionProfileBehaviorIdentity | None
     ] = field(default_factory=dict)
+    mcp_toolsets: tuple[McpToolset, ...] = ()
     registration_source: str | None = None
     registration_symbol: str | None = None
 

@@ -181,7 +181,14 @@ toolset = await connect_mcp_toolset(
     ),
     client=HttpMcpClient(secret_resolver=vault),
 )
-# toolset.tools -> register on the agent; await toolset.close() when done.
+# Static snapshot:
+# app.register_agent(spec, tools=toolset.tools)
+#
+# Explicit complete-source registration with manual atomic refresh:
+# app.register_agent(spec, mcp_toolsets=(toolset,))
+# result = await app.refresh_mcp_toolset(toolset)
+#
+# await toolset.close() when the application shuts down.
 ```
 
 `secret_headers` are resolved through the HTTP client's secret resolver. For a

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import sqlite3
@@ -12,10 +13,12 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.mcp as mcp_module
+import cayu.runtime._execution_profile_admission as execution_profile_admission
 from cayu import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     DEFAULT_MCP_MAX_LIST_ITEMS,
@@ -45,6 +48,10 @@ from cayu import (
     McpToolDefinition,
     McpToolResult,
     McpToolset,
+    McpToolsetRefreshBlocked,
+    McpToolsetRefreshResult,
+    McpToolsetRefreshState,
+    McpToolsetUnavailable,
     Message,
     RunRequest,
     SessionIdentity,
@@ -59,6 +66,7 @@ from cayu import (
     mcp_tool_manifest_hash,
     mcp_tool_manifest_identity,
     mcp_tool_manifest_tools,
+    mcp_toolset_manifest_diff,
 )
 from cayu import (
     StdioMcpClient as _StdioMcpClient,
@@ -155,6 +163,70 @@ class FakeMcpSession(McpSession):
         self.closed = True
         if self.close_error is not None:
             raise self.close_error
+
+
+class BlockingRefreshMcpSession(FakeMcpSession):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.refresh_started = asyncio.Event()
+        self.release_refresh = asyncio.Event()
+
+    async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+        self.refresh_started.set()
+        await self.release_refresh.wait()
+        return await super().list_tools()
+
+
+class BlockingCallMcpSession(FakeMcpSession):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.call_started = asyncio.Event()
+        self.release_call = asyncio.Event()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+        self.calls.append((name, arguments))
+        self.call_started.set()
+        await self.release_call.wait()
+        return McpToolResult(content=[{"type": "text", "text": "old call settled"}])
+
+    async def _call_tool_with_dispatch_signal(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        dispatch_signal,
+    ) -> McpToolResult:
+        self.calls.append((name, arguments))
+        self.call_started.set()
+        dispatch_signal.mark_dispatched()
+        await self.release_call.wait()
+        return McpToolResult(content=[{"type": "text", "text": "old call settled"}])
+
+
+class PreDispatchBlockingMcpSession(FakeMcpSession):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.call_entered = asyncio.Event()
+        self.release_dispatch = asyncio.Event()
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+        self.call_entered.set()
+        await self.release_dispatch.wait()
+        return await super().call_tool(name, arguments)
+
+
+class BlockingCloseMcpSession(FakeMcpSession):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.close_started = asyncio.Event()
+        self.release_close = asyncio.Event()
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.release_close.wait()
+        await super().close()
 
 
 class FakeMcpClient(McpClient):
@@ -266,6 +338,1083 @@ def test_connect_mcp_toolset_returns_cayu_tool_adapters() -> None:
         "mcp_structured_content": {"echoed": "from adapter"},
     }
     assert result.is_error is False
+
+
+def test_mcp_toolset_constructor_does_not_expose_refresh_authority() -> None:
+    assert tuple(inspect.signature(McpToolset).parameters) == (
+        "server",
+        "session",
+        "definitions",
+    )
+
+
+def test_static_mcp_adapter_registration_does_not_enable_live_refresh() -> None:
+    async def run() -> None:
+        toolset = _fake_toolset()
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=toolset.tools,
+        )
+
+        with pytest.raises(ValueError, match="explicit mcp_toolsets"):
+            await app.refresh_mcp_toolset(toolset)
+
+        assert toolset.refresh_state is McpToolsetRefreshState.READY
+        await toolset.tools[0].run(
+            ToolContext(session_id="static", agent_name="assistant"),
+            {"text": "still callable"},
+        )
+
+    asyncio.run(run())
+
+
+def test_static_mcp_registration_prevents_cross_application_refresh_ownership() -> None:
+    toolset = _fake_toolset()
+    static_app = CayuApp(enable_logging=False)
+    static_app.register_agent(
+        AgentSpec(name="static", model="fake-model"),
+        tools=toolset.tools,
+    )
+    refresh_app = CayuApp(enable_logging=False)
+
+    with pytest.raises(ValueError, match="static registrations"):
+        refresh_app.register_agent(
+            AgentSpec(name="refreshable", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+
+    assert static_app.list_agents() == ("static",)
+    assert refresh_app.list_agents() == ()
+
+
+def test_distinct_toolset_wrappers_share_one_live_session_source_owner() -> None:
+    definitions = _fake_tool_definitions("echo")
+    session = FakeMcpSession(definitions=definitions)
+    server = _fake_server_spec().model_copy(update={"connection_id": "shared-session"})
+    static_toolset = McpToolset(
+        server=server,
+        session=session,
+        definitions=definitions,
+    )
+    refreshable_toolset = McpToolset(
+        server=server,
+        session=session,
+        definitions=definitions,
+    )
+    static_app = CayuApp(enable_logging=False)
+    refreshable_app = CayuApp(enable_logging=False)
+
+    assert static_toolset._refresh_source is refreshable_toolset._refresh_source
+    static_app.register_agent(
+        AgentSpec(name="static", model="fake-model"),
+        tools=static_toolset.tools,
+    )
+    with pytest.raises(ValueError, match="static registrations"):
+        refreshable_app.register_agent(
+            AgentSpec(name="refreshable", model="fake-model"),
+            mcp_toolsets=(refreshable_toolset,),
+        )
+
+    assert static_app.list_agents() == ("static",)
+    assert refreshable_app.list_agents() == ()
+
+
+def test_static_mcp_registration_can_share_one_source_across_applications() -> None:
+    toolset = _fake_toolset()
+    first = CayuApp(enable_logging=False)
+    second = CayuApp(enable_logging=False)
+
+    first.register_agent(
+        AgentSpec(name="first", model="fake-model"),
+        tools=toolset.tools,
+    )
+    second.register_agent(
+        AgentSpec(name="second", model="fake-model"),
+        tools=toolset.tools,
+    )
+
+    assert first.list_agents() == ("first",)
+    assert second.list_agents() == ("second",)
+
+
+def test_refresh_owned_mcp_source_prevents_cross_application_static_registration() -> None:
+    toolset = _fake_toolset()
+    refresh_app = CayuApp(enable_logging=False)
+    refresh_app.register_agent(
+        AgentSpec(name="refreshable", model="fake-model"),
+        mcp_toolsets=(toolset,),
+    )
+    static_app = CayuApp(enable_logging=False)
+
+    with pytest.raises(ValueError, match="refresh-owned"):
+        static_app.register_agent(
+            AgentSpec(name="static", model="fake-model"),
+            tools=toolset.tools,
+        )
+
+    assert refresh_app.list_agents() == ("refreshable",)
+    assert static_app.list_agents() == ()
+
+
+def test_refreshable_mcp_registration_requires_stable_connection_identity() -> None:
+    app = CayuApp(enable_logging=False)
+
+    with pytest.raises(ValueError, match="connection_id"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(_fake_toolset(connection_id=None),),
+        )
+
+
+def test_refreshable_mcp_source_has_one_application_publication_owner() -> None:
+    toolset = _fake_toolset()
+    first = CayuApp(enable_logging=False)
+    second = CayuApp(enable_logging=False)
+    first.register_agent(
+        AgentSpec(name="first", model="fake-model"),
+        mcp_toolsets=(toolset,),
+    )
+
+    with pytest.raises(ValueError, match="only one CayuApp"):
+        second.register_agent(
+            AgentSpec(name="second", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+
+    assert second.list_agents() == ()
+
+
+def test_refreshable_mcp_sources_require_unique_application_connection_identities() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="first", model="fake-model"),
+        mcp_toolsets=(_fake_toolset(definitions=_fake_tool_definitions("echo")),),
+    )
+
+    with pytest.raises(ValueError, match="unique connection identities"):
+        app.register_agent(
+            AgentSpec(name="second", model="fake-model"),
+            mcp_toolsets=(_fake_toolset(definitions=_fake_tool_definitions("search")),),
+        )
+
+    assert app.list_agents() == ("first",)
+
+
+def test_complete_mcp_source_registration_changes_execution_profile_identity() -> None:
+    def resolve(app: CayuApp):
+        return execution_profile_admission.resolve_execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            runtime_name="cayu",
+            runtime_version="test",
+            redactor=app._secret_redactor,
+            process_identity="shared-test-process",
+            registered_environment=app._get_registered_environment(None),
+            runtime_hooks=app._runtime_hooks,
+            loop_policies=app._loop_policies,
+            loop_policy_identities=app._loop_policy_execution_profile_identities,
+            invocation_loop_policies=(),
+            invocation_loop_policy_identities=(),
+        )
+
+    static_toolset = _fake_toolset()
+    complete_toolset = _fake_toolset()
+    static_app = CayuApp(enable_logging=False)
+    complete_app = CayuApp(enable_logging=False)
+    static_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=static_toolset.tools,
+    )
+    complete_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        mcp_toolsets=(complete_toolset,),
+    )
+
+    assert (
+        static_app._agents["assistant"].tool_catalogue.revision
+        == complete_app._agents["assistant"].tool_catalogue.revision
+    )
+    assert resolve(static_app).fingerprint != resolve(complete_app).fingerprint
+
+
+def test_mcp_refresh_keeps_unchanged_snapshot_and_generation() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+
+        result = await app.refresh_mcp_toolset(toolset)
+        await toolset.tools[0].run(
+            ToolContext(session_id="unchanged", agent_name="assistant"),
+            {"text": "same"},
+        )
+        return result, app.get_agent("assistant"), toolset.session.calls
+
+    result, registered, calls = asyncio.run(run())
+
+    assert result.status == "unchanged"
+    assert result.toolset is not None
+    assert result.toolset.generation == 1
+    assert result.previous_generation == result.generation == 1
+    assert result.diff.changed is False
+    assert tuple(registered.tools) == ("mcp__local-mcp__echo",)
+    assert calls == [("echo", {"text": "same"})]
+
+
+def test_mcp_refresh_atomically_replaces_every_registered_agent() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        app = CayuApp(enable_logging=False)
+        for name in ("first", "second"):
+            app.register_agent(
+                AgentSpec(name=name, model="fake-model"),
+                mcp_toolsets=(toolset,),
+            )
+        stale_adapter = toolset.tools[0]
+        session.definitions = _fake_tool_definitions("echo", "search")
+
+        result = await app.refresh_mcp_toolset(toolset)
+        first = app.get_agent("first")
+        second = app.get_agent("second")
+        with pytest.raises(McpToolsetUnavailable, match="stale"):
+            await stale_adapter.run(
+                ToolContext(session_id="stale", agent_name="first"),
+                {"text": "must not dispatch"},
+            )
+        current_adapter = first.tools["mcp__local-mcp__search"].tool
+        await current_adapter.run(
+            ToolContext(session_id="current", agent_name="first"),
+            {"text": "dispatch"},
+        )
+        return result, first, second, session.calls
+
+    result, first, second, calls = asyncio.run(run())
+
+    assert result.status == "accepted"
+    assert result.previous_generation == 1
+    assert result.generation == 2
+    assert result.diff.added_tools == ("mcp__local-mcp__search",)
+    assert result.diff.removed_tools == ()
+    assert tuple(first.tools) == (
+        "mcp__local-mcp__echo",
+        "mcp__local-mcp__search",
+    )
+    assert tuple(second.tools) == tuple(first.tools)
+    assert calls == [("search", {"text": "dispatch"})]
+
+
+def test_mcp_refresh_publishes_new_catalogue_to_later_runtime_sessions() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = FakeProvider(
+            [
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            ]
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="before-mcp-refresh",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "before")],
+                )
+            )
+        )
+
+        session.definitions = _fake_tool_definitions("echo", "search")
+        refresh = await app.refresh_mcp_toolset(toolset)
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="after-mcp-refresh",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "after")],
+                )
+            )
+        )
+        return refresh, provider.requests
+
+    refresh, requests = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert [[tool["name"] for tool in request.tools] for request in requests] == [
+        ["mcp__local-mcp__echo"],
+        ["mcp__local-mcp__echo", "mcp__local-mcp__search"],
+    ]
+
+
+def test_mcp_refresh_policy_block_quarantines_until_verified_retry() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.definitions = _fake_tool_definitions("echo", "search")
+
+        with pytest.raises(McpToolsetRefreshBlocked, match="Policy action: block"):
+            await app.refresh_mcp_toolset(toolset)
+        assert toolset.refresh_state is McpToolsetRefreshState.QUARANTINED
+        with pytest.raises(McpToolsetUnavailable, match="not ready"):
+            await toolset.tools[0].run(
+                ToolContext(session_id="blocked", agent_name="assistant"),
+                {"text": "must not dispatch"},
+            )
+        assert tuple(app.get_agent("assistant").tools) == ("mcp__local-mcp__echo",)
+
+        session.definitions = _fake_tool_definitions("echo")
+        retry = await app.refresh_mcp_toolset(toolset)
+        await toolset.tools[0].run(
+            ToolContext(session_id="restored", agent_name="assistant"),
+            {"text": "safe"},
+        )
+        return retry, session.calls
+
+    retry, calls = asyncio.run(run())
+
+    assert retry.status == "unchanged"
+    assert retry.generation == 1
+    assert retry.toolset.refresh_state is McpToolsetRefreshState.READY
+    assert calls == [("echo", {"text": "safe"})]
+
+
+def test_mcp_refresh_applies_unchanged_manifest_policy_before_restoring_ready() -> None:
+    async def run() -> McpToolsetRefreshState:
+        toolset = _fake_toolset()
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_unchanged=McpManifestPolicyAction.BLOCK,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+
+        with pytest.raises(McpToolsetRefreshBlocked, match="unchanged"):
+            await app.refresh_mcp_toolset(toolset)
+        return toolset.refresh_state
+
+    assert asyncio.run(run()) is McpToolsetRefreshState.QUARANTINED
+
+
+def test_mcp_refresh_fences_calls_before_candidate_publication() -> None:
+    async def run():
+        definitions = _fake_tool_definitions("echo")
+        session = BlockingRefreshMcpSession(definitions=definitions)
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "refresh-fence"}),
+            session=session,
+            definitions=definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.definitions = _fake_tool_definitions("echo", "search")
+        refresh = asyncio.create_task(app.refresh_mcp_toolset(toolset))
+        await session.refresh_started.wait()
+
+        assert toolset.refresh_state is McpToolsetRefreshState.REFRESHING
+        with pytest.raises(McpToolsetUnavailable, match="not ready"):
+            await toolset.tools[0].run(
+                ToolContext(session_id="refreshing", agent_name="assistant"),
+                {"text": "must not dispatch"},
+            )
+        session.release_refresh.set()
+        result = await refresh
+        return result, session.calls
+
+    result, calls = asyncio.run(run())
+
+    assert result.status == "accepted"
+    assert calls == []
+
+
+def test_mcp_generation_fence_cancellation_does_not_retain_call_arguments() -> None:
+    secret = "mcp-generation-fence-cancellation-canary"
+
+    async def run() -> asyncio.CancelledError:
+        toolset = _fake_toolset()
+        source = toolset._refresh_source
+        async with source.lock:
+            call = asyncio.create_task(
+                toolset.tools[0].run(
+                    ToolContext(session_id="cancelled-fence", agent_name="assistant"),
+                    {"text": secret},
+                )
+            )
+            await asyncio.sleep(0)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await call
+        return exc_info.value
+
+    cancellation = asyncio.run(run())
+
+    _assert_traceback_does_not_retain_text(cancellation, secret)
+
+
+@pytest.mark.parametrize("dispatched", [False, True])
+@pytest.mark.parametrize("child_outcome", ["cancelled", "suppressed", "translated"])
+def test_mcp_generation_fence_keeps_caller_cancellation_authoritative(
+    dispatched: bool,
+    child_outcome: str,
+) -> None:
+    secret = "mcp-generation-fence-authority-canary"
+
+    class CancellationOutcomeSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(definitions=_fake_tool_definitions("echo"))
+            self._secret_redactor = SecretRedactor(secret)
+            self.call_started = asyncio.Event()
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
+            del name, arguments
+            self.call_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                if child_outcome == "translated":
+                    raise RuntimeError(f"extension settlement exposed {secret}") from None
+                if child_outcome == "suppressed":
+                    return McpToolResult(content=[{"type": "text", "text": "suppressed"}])
+                raise
+            raise AssertionError("Cancellation test child returned unexpectedly.")
+
+        async def _call_tool_with_dispatch_signal(
+            self,
+            name: str,
+            arguments: dict[str, Any],
+            *,
+            dispatch_signal,
+        ) -> McpToolResult:
+            if dispatched:
+                dispatch_signal.mark_dispatched()
+            return await self.call_tool(name, arguments)
+
+    async def run() -> tuple[asyncio.CancelledError, bool]:
+        session = CancellationOutcomeSession()
+        toolset = McpToolset(
+            server=_fake_server_spec(),
+            session=session,
+            definitions=session.definitions,
+        )
+        call = asyncio.create_task(
+            toolset.tools[0].run(
+                ToolContext(session_id="cancelled-call", agent_name="assistant"),
+                {"text": "cancel me"},
+            )
+        )
+        await session.call_started.wait()
+        call.cancel(f"caller authority {secret}")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await call
+        return exc_info.value, call.cancelled()
+
+    cancellation, cancelled = asyncio.run(run())
+
+    assert cancelled is True
+    assert cancellation.__context__ is None
+    assert secret not in "".join(traceback.format_exception(cancellation))
+    assert REDACTED_SECRET in str(cancellation)
+    if child_outcome == "translated":
+        assert isinstance(cancellation.__cause__, McpProtocolError)
+        assert REDACTED_SECRET in str(cancellation.__cause__)
+    else:
+        assert cancellation.__cause__ is None
+    _assert_traceback_does_not_retain_text(cancellation, secret)
+
+
+def test_mcp_refresh_allows_already_dispatched_call_to_settle() -> None:
+    async def run():
+        definitions = _fake_tool_definitions("echo")
+        session = BlockingCallMcpSession(definitions=definitions)
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "in-flight-call"}),
+            session=session,
+            definitions=definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        call = asyncio.create_task(
+            toolset.tools[0].run(
+                ToolContext(session_id="in-flight", agent_name="assistant"),
+                {"text": "already dispatched"},
+            )
+        )
+        await session.call_started.wait()
+        session.definitions = _fake_tool_definitions("echo", "search")
+
+        refresh = await app.refresh_mcp_toolset(toolset)
+        assert call.done() is False
+        session.release_call.set()
+        result = await call
+        return refresh, result, session.calls
+
+    refresh, result, calls = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert result.content == "old call settled"
+    assert calls == [("echo", {"text": "already dispatched"})]
+
+
+def test_mcp_refresh_waits_for_custom_session_call_without_dispatch_proof() -> None:
+    async def run():
+        definitions = _fake_tool_definitions("echo")
+        session = PreDispatchBlockingMcpSession(definitions=definitions)
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "pre-dispatch-call"}),
+            session=session,
+            definitions=definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        call = asyncio.create_task(
+            toolset.tools[0].run(
+                ToolContext(session_id="pre-dispatch", agent_name="assistant"),
+                {"text": "must run before refresh"},
+            )
+        )
+        await session.call_entered.wait()
+        session.definitions = _fake_tool_definitions("echo", "search")
+        refresh = asyncio.create_task(app.refresh_mcp_toolset(toolset))
+        await asyncio.sleep(0)
+
+        assert refresh.done() is False
+        assert toolset.refresh_state is McpToolsetRefreshState.READY
+        assert session.calls == []
+
+        session.release_dispatch.set()
+        result = await call
+        assert session.calls == [("echo", {"text": "must run before refresh"})]
+        refreshed = await refresh
+        return result, refreshed
+
+    result, refreshed = asyncio.run(run())
+
+    assert result.content == "ok"
+    assert refreshed.status == "accepted"
+    assert refreshed.generation == 2
+
+
+def test_http_mcp_refresh_can_publish_after_transport_owns_pending_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run():
+        server = McpServerSpec(
+            name="http",
+            connection_id="http-dispatch-proof",
+            url="https://mcp.example/rpc",
+        )
+        definitions = _fake_tool_definitions("echo")
+        session = HttpMcpSession(
+            server=server,
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(500))
+            ),
+            url="https://mcp.example/rpc",
+            client_name="cayu-test",
+            client_version="1",
+        )
+        session._initialize_result = McpInitializeResult(protocol_version=MCP_PROTOCOL_VERSION)
+        call_dispatched = asyncio.Event()
+        release_call = asyncio.Event()
+
+        async def send(
+            payload: dict[str, Any],
+            request_id: int,
+            *,
+            budget: Any,
+            failure_redactor: SecretRedactor | None = None,
+        ) -> dict[str, Any]:
+            del budget, failure_redactor
+            method = payload.get("method")
+            payload.clear()
+            if method == "tools/call":
+                call_dispatched.set()
+                await release_call.wait()
+                result = {"content": [{"type": "text", "text": "old call settled"}]}
+            elif method == "tools/list":
+                result = {
+                    "tools": [
+                        definition.model_dump(mode="json", by_alias=True)
+                        for definition in _fake_tool_definitions("echo", "search")
+                    ]
+                }
+            else:  # pragma: no cover - the focused transport path has no other request
+                raise AssertionError(f"Unexpected MCP request: {method}")
+            return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+        monkeypatch.setattr(session, "_send", send)
+        toolset = McpToolset(server=server, session=session, definitions=definitions)
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        call = asyncio.create_task(
+            toolset.tools[0].run(
+                ToolContext(session_id="http-in-flight", agent_name="assistant"),
+                {"text": "already dispatched"},
+            )
+        )
+        try:
+            await asyncio.wait_for(call_dispatched.wait(), timeout=1.0)
+            refreshed = await asyncio.wait_for(app.refresh_mcp_toolset(toolset), timeout=1.0)
+            assert call.done() is False
+            release_call.set()
+            result = await call
+            return refreshed, result
+        finally:
+            release_call.set()
+            with suppress(BaseException):
+                await call
+            await toolset.close()
+
+    refreshed, result = asyncio.run(run())
+
+    assert refreshed.status == "accepted"
+    assert refreshed.generation == 2
+    assert result.content == "old call settled"
+
+
+def test_independent_mcp_sources_refresh_concurrently_without_lost_publication() -> None:
+    async def run():
+        first_definitions = _fake_tool_definitions("echo")
+        second_definitions = _fake_tool_definitions("lookup")
+        first_session = BlockingRefreshMcpSession(definitions=first_definitions)
+        second_session = BlockingRefreshMcpSession(definitions=second_definitions)
+        first_toolset = McpToolset(
+            server=_fake_server_spec().model_copy(
+                update={"name": "first", "connection_id": "first-source"}
+            ),
+            session=first_session,
+            definitions=first_definitions,
+        )
+        second_toolset = McpToolset(
+            server=_fake_server_spec().model_copy(
+                update={"name": "second", "connection_id": "second-source"}
+            ),
+            session=second_session,
+            definitions=second_definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(first_toolset, second_toolset),
+        )
+        first_session.definitions = _fake_tool_definitions("echo", "search")
+        second_session.definitions = _fake_tool_definitions("lookup", "inspect")
+
+        first_refresh = asyncio.create_task(app.refresh_mcp_toolset(first_toolset))
+        second_refresh = asyncio.create_task(app.refresh_mcp_toolset(second_toolset))
+        await asyncio.wait_for(
+            asyncio.gather(
+                first_session.refresh_started.wait(),
+                second_session.refresh_started.wait(),
+            ),
+            timeout=1.0,
+        )
+        first_session.release_refresh.set()
+        second_session.release_refresh.set()
+        results = await asyncio.gather(first_refresh, second_refresh)
+        return results, tuple(app.get_agent("assistant").tools)
+
+    results, tools = asyncio.run(run())
+
+    assert [result.status for result in results] == ["accepted", "accepted"]
+    assert [result.generation for result in results] == [2, 2]
+    assert tools == (
+        "mcp__first__echo",
+        "mcp__first__search",
+        "mcp__second__inspect",
+        "mcp__second__lookup",
+    )
+
+
+def test_mcp_refresh_transport_failure_quarantines_until_retry() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.list_tools_error = McpProtocolError("refresh failed")
+
+        with pytest.raises(McpProtocolError, match="refresh failed"):
+            await app.refresh_mcp_toolset(toolset)
+        assert toolset.refresh_state is McpToolsetRefreshState.QUARANTINED
+        with pytest.raises(McpToolsetUnavailable, match="not ready"):
+            await toolset.tools[0].run(
+                ToolContext(session_id="failed", agent_name="assistant"),
+                {"text": "must not dispatch"},
+            )
+
+        session.list_tools_error = None
+        retry = await app.refresh_mcp_toolset(toolset)
+        return retry, toolset.refresh_state
+
+    retry, state = asyncio.run(run())
+
+    assert retry.status == "unchanged"
+    assert state is McpToolsetRefreshState.READY
+
+
+def test_mcp_refresh_redacts_transport_failure_before_quarantine() -> None:
+    secret = "mcp-refresh-transport-secret-canary"
+
+    class SecretRefreshSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(definitions=_fake_tool_definitions("echo"))
+            self._secret_redactor = SecretRedactor(secret)
+
+        async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+            raise RuntimeError(f"server leaked {secret}")
+
+    async def run() -> tuple[BaseException, McpToolsetRefreshState]:
+        session = SecretRefreshSession()
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "redacted"}),
+            session=session,
+            definitions=session.definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        with pytest.raises(McpProtocolError) as exc_info:
+            await app.refresh_mcp_toolset(toolset)
+        return exc_info.value, toolset.refresh_state
+
+    error, state = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.QUARANTINED
+    assert secret not in "".join(traceback.format_exception(error))
+    _assert_traceback_does_not_retain_text(error, secret)
+
+
+def test_mcp_refresh_detaches_rejected_secret_definitions_before_quarantine() -> None:
+    secret = "mcp-refresh-definition-secret-canary"
+    definition = McpToolDefinition(
+        name="duplicate",
+        description=f"private description {secret}",
+        input_schema={"type": "object"},
+    )
+
+    async def run() -> tuple[BaseException, McpToolsetRefreshState]:
+        session = FakeMcpSession(definitions=_fake_tool_definitions("echo"))
+        session._secret_redactor = SecretRedactor(secret)
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "redacted-definition"}),
+            session=session,
+            definitions=session.definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.definitions = (definition, definition)
+        with pytest.raises(McpProtocolError) as exc_info:
+            await app.refresh_mcp_toolset(toolset)
+        return exc_info.value, toolset.refresh_state
+
+    error, state = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.QUARANTINED
+    assert secret not in "".join(traceback.format_exception(error))
+    _assert_traceback_does_not_retain_text(error, secret)
+
+
+def test_mcp_refresh_cancellation_quarantines_source() -> None:
+    async def run():
+        definitions = _fake_tool_definitions("echo")
+        session = BlockingRefreshMcpSession(definitions=definitions)
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "cancelled"}),
+            session=session,
+            definitions=definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        refresh = asyncio.create_task(app.refresh_mcp_toolset(toolset))
+        await session.refresh_started.wait()
+        refresh.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await refresh
+        return toolset.refresh_state
+
+    assert asyncio.run(run()) is McpToolsetRefreshState.QUARANTINED
+
+
+def test_mcp_close_wins_in_flight_refresh_with_typed_fenced_outcome() -> None:
+    async def run() -> tuple[BaseException, McpToolsetRefreshState]:
+        definitions = _fake_tool_definitions("echo")
+        session = BlockingRefreshMcpSession(definitions=definitions)
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "closed-refresh"}),
+            session=session,
+            definitions=definitions,
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        refresh = asyncio.create_task(app.refresh_mcp_toolset(toolset))
+        await session.refresh_started.wait()
+        await toolset.close()
+        session.release_refresh.set()
+
+        with pytest.raises(McpToolsetUnavailable, match="closed during refresh") as exc_info:
+            await refresh
+        return exc_info.value, toolset.refresh_state
+
+    error, state = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.CLOSED
+    assert error.__cause__ is None
+
+
+def test_concurrent_mcp_close_callers_await_session_cleanup() -> None:
+    async def run() -> tuple[bool, int, McpToolsetRefreshState]:
+        definitions = _fake_tool_definitions("echo")
+        session = BlockingCloseMcpSession(definitions=definitions)
+        toolset = McpToolset(
+            server=_fake_server_spec(),
+            session=session,
+            definitions=definitions,
+        )
+        first = asyncio.create_task(toolset.close())
+        await session.close_started.wait()
+        second = asyncio.create_task(toolset.close())
+        await asyncio.sleep(0)
+        second_returned_early = second.done()
+        session.release_close.set()
+        await asyncio.gather(first, second)
+        return second_returned_early, session.close_calls, toolset.refresh_state
+
+    second_returned_early, close_calls, state = asyncio.run(run())
+
+    assert second_returned_early is False
+    assert close_calls == 2
+    assert state is McpToolsetRefreshState.CLOSED
+
+
+def test_mcp_refresh_collision_rejects_candidate_without_partial_publication() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+
+        static_toolset = _fake_toolset(
+            definitions=_fake_tool_definitions("search"),
+            connection_id="static-collision",
+        )
+        colliding_tool = static_toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(colliding_tool,),
+            mcp_toolsets=(toolset,),
+        )
+        previous_agent = app._agents["assistant"]
+        session.definitions = _fake_tool_definitions("echo", "search")
+
+        with pytest.raises(ValueError, match="collides"):
+            await app.refresh_mcp_toolset(toolset)
+        return toolset.refresh_state, previous_agent, app._agents["assistant"]
+
+    state, previous_agent, current_agent = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.QUARANTINED
+    assert current_agent is previous_agent
+    assert tuple(current_agent.tools) == (
+        "mcp__local-mcp__search",
+        "mcp__local-mcp__echo",
+    )
+
+
+def test_mcp_toolset_manifest_diff_rejects_unrelated_sources() -> None:
+    first = _fake_toolset()
+    second = _fake_toolset()
+
+    with pytest.raises(ValueError, match="one source"):
+        mcp_toolset_manifest_diff(first, second)
+
+
+def test_mcp_refresh_classifies_provider_rename_with_stable_cayu_name_as_changed() -> None:
+    async def run() -> McpToolsetRefreshResult:
+        original = McpToolDefinition(
+            name="lookup value",
+            description="Lookup a value.",
+            input_schema={"type": "object"},
+        )
+        renamed = original.model_copy(update={"name": "lookup@value"})
+        session = FakeMcpSession(definitions=(original,))
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "stable-alias"}),
+            session=session,
+            definitions=session.definitions,
+        )
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_tools_added=McpManifestPolicyAction.BLOCK,
+                on_tools_removed=McpManifestPolicyAction.BLOCK,
+                on_tools_changed=McpManifestPolicyAction.ALLOW,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.definitions = (renamed,)
+
+        return await app.refresh_mcp_toolset(toolset)
+
+    result = asyncio.run(run())
+
+    assert result.status == "accepted"
+    assert result.policy_action == "allow"
+    assert result.diff.added_tools == ()
+    assert result.diff.removed_tools == ()
+    assert result.diff.changed_tools == ("mcp__local-mcp__lookup_value",)
+
+
+def test_mcp_refresh_classifies_private_rename_under_stable_public_name() -> None:
+    first_private_name = "mcp-private-name-alpha"
+    second_private_name = "mcp-private-name-beta"
+
+    async def run() -> tuple[McpToolsetRefreshResult, str, list[tuple[str, dict[str, Any]]]]:
+        original = _fake_tool_definitions(first_private_name)
+        session = FakeMcpSession(definitions=original)
+        session._secret_redactor = SecretRedactor((first_private_name, second_private_name))
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(update={"connection_id": "private-rename"}),
+            session=session,
+            definitions=original,
+        )
+        public_name = toolset.tools[0].name
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_tools_added=McpManifestPolicyAction.BLOCK,
+                on_tools_removed=McpManifestPolicyAction.BLOCK,
+                on_tools_changed=McpManifestPolicyAction.ALLOW,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.definitions = _fake_tool_definitions(second_private_name)
+
+        result = await app.refresh_mcp_toolset(toolset)
+        await result.toolset.tools[0].run(
+            ToolContext(session_id="private-rename", agent_name="assistant"),
+            {"text": "new binding"},
+        )
+        return result, public_name, session.calls
+
+    result, public_name, calls = asyncio.run(run())
+
+    assert result.status == "accepted"
+    assert result.policy_action == "allow"
+    assert result.diff.added_tools == ()
+    assert result.diff.removed_tools == ()
+    assert result.diff.changed_tools == (public_name,)
+    assert calls == [(second_private_name, {"text": "new binding"})]
+    public_result = repr(result.diff.policy_input())
+    assert first_private_name not in public_result
+    assert second_private_name not in public_result
+
+
+def test_mcp_refresh_never_exposes_private_name_for_private_contract_change() -> None:
+    private_name = "mcp-private-contract-name"
+    first_private_description = "mcp-private-description-alpha"
+    second_private_description = "mcp-private-description-beta"
+
+    async def run() -> tuple[McpToolsetRefreshResult, str]:
+        original = _fake_tool_definitions(
+            private_name,
+            description=first_private_description,
+        )
+        session = FakeMcpSession(definitions=original)
+        session._secret_redactor = SecretRedactor(
+            (private_name, first_private_description, second_private_description)
+        )
+        toolset = McpToolset(
+            server=_fake_server_spec().model_copy(
+                update={"connection_id": "private-contract-change"}
+            ),
+            session=session,
+            definitions=original,
+        )
+        public_name = toolset.tools[0].name
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_tools_changed=McpManifestPolicyAction.ALLOW,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        session.definitions = _fake_tool_definitions(
+            private_name,
+            description=second_private_description,
+        )
+        return await app.refresh_mcp_toolset(toolset), public_name
+
+    result, public_name = asyncio.run(run())
+
+    assert result.status == "accepted"
+    assert result.diff.changed_tools == (public_name,)
+    public_result = repr(result.diff.policy_input())
+    assert private_name not in public_result
+    assert first_private_description not in public_result
+    assert second_private_description not in public_result
 
 
 def test_agent_catalogue_reuses_authoritative_mcp_contract_identity() -> None:
@@ -6015,6 +7164,104 @@ def test_stdio_post_parse_failure_does_not_retain_secret_payload(
 
     assert mapping == {}
     _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+def test_stdio_private_tool_refresh_commits_only_the_accepted_transport_authority(
+    tmp_path: Path,
+) -> None:
+    first_private_name = "mcp-stdio-private-refresh-name-alpha"
+    second_private_name = "mcp-stdio-private-refresh-name-beta"
+    first_private_description = "mcp-stdio-private-refresh-description-alpha"
+    second_private_description = "mcp-stdio-private-refresh-description-beta"
+    catalogue_path = tmp_path / "tools.json"
+
+    def publish_catalogue(*, name: str, description: str) -> None:
+        catalogue_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "name": name,
+                        "description": description,
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                        },
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    publish_catalogue(
+        name=first_private_name,
+        description=first_private_description,
+    )
+    spec = McpServerSpec(
+        name="private-stdio-refresh",
+        connection_id="private-stdio-refresh",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_TOOL_CATALOGUE_FILE": str(catalogue_path)},
+        secret_env={
+            "CAYU_FAKE_MCP_REFRESH_NAME_ALPHA": SecretRef(name="name_alpha"),
+            "CAYU_FAKE_MCP_REFRESH_NAME_BETA": SecretRef(name="name_beta"),
+            "CAYU_FAKE_MCP_REFRESH_DESCRIPTION_ALPHA": SecretRef(name="description_alpha"),
+            "CAYU_FAKE_MCP_REFRESH_DESCRIPTION_BETA": SecretRef(name="description_beta"),
+        },
+    )
+    vault = StaticVault(
+        {
+            "name_alpha": first_private_name,
+            "name_beta": second_private_name,
+            "description_alpha": first_private_description,
+            "description_beta": second_private_description,
+        }
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            spec,
+            client=StdioMcpClient(secret_resolver=vault),
+        )
+        session = toolset.session
+        assert isinstance(session, StdioMcpSession)
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_tools_changed=McpManifestPolicyAction.ALLOW,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            publish_catalogue(
+                name=second_private_name,
+                description=second_private_description,
+            )
+            refresh = await app.refresh_mcp_toolset(toolset)
+            call_result = await refresh.toolset.call_tool(
+                refresh.toolset.definitions[0].name,
+                {"text": "new private authority"},
+            )
+            return refresh, call_result, dict(session._tool_transport_names)
+        finally:
+            await toolset.close()
+
+    refresh, call_result, mapping = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert refresh.diff.changed_tools == (refresh.toolset.tools[0].name,)
+    assert mapping == {REDACTED_SECRET: second_private_name}
+    assert call_result.content[0]["text"] == "echo: new private authority"
+    public_refresh = repr(refresh.diff.policy_input())
+    for secret in (
+        first_private_name,
+        second_private_name,
+        first_private_description,
+        second_private_description,
+    ):
+        assert secret not in public_refresh
 
 
 @pytest.mark.parametrize(

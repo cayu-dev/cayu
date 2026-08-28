@@ -9060,6 +9060,56 @@ The first MCP implementation supports stdio servers:
 - `connect_mcp_toolset(...)` initializes the server, lists tools, and returns
   one `McpToolset` that owns the live MCP session and its `McpToolAdapter`
   instances.
+- Passing those adapters through `register_agent(..., tools=toolset.tools)` is
+  an immutable static registration. It never opts into refresh or background
+  work. Passing the source through
+  `register_agent(..., mcp_toolsets=(toolset,))` instead explicitly tracks the
+  complete admitted source. Refreshable sources require a stable
+  `McpServerSpec.connection_id` that uniquely identifies the source within the
+  application; arbitrary subsets and aliases remain static so a later server
+  addition cannot silently become application authority.
+- `await app.refresh_mcp_toolset(toolset)` is the trigger-independent refresh
+  boundary. It fences new undispatched calls, fetches one complete bounded
+  `tools/list`, constructs a detached next-generation toolset, compares both
+  public redacted and private binding evidence, and applies the configured
+  `McpManifestPolicy`. Built-in transports retain only hashes of the unredacted
+  candidate contracts and stage their exact public-to-transport identity map;
+  the live map is replaced only after policy acceptance while the source
+  generation fence is held. A policy-accepted unchanged result restores the
+  existing generation. An accepted changed result rebuilds all affected
+  registered tool maps, canonical catalogues, capabilities, and expose-all
+  snapshots before publishing them together by one copy-on-write
+  application-state replacement.
+  Tool-name collisions, missing configured workflow/static-exposure tools,
+  malformed or incomplete discovery, cancellation, and policy rejection publish
+  nothing and quarantine the source.
+- Toolset generations are immutable dispatch leases. Calls that crossed the
+  source fence before refresh may settle against their recorded generation;
+  older adapters that have not dispatched fail after publication instead of
+  rebinding to a same-named replacement. A quarantined or refreshing source
+  rejects every new adapter dispatch. Closing any generation closes the one
+  shared session and fences every snapshot. Stdio and Streamable HTTP mark the
+  boundary only after their transport owns a possibly dispatched request. A
+  third-party `McpSession` that does not implement the internal positive proof
+  keeps the source fence until the call settles, favoring safety over refresh
+  concurrency.
+- One refreshable source has one `CayuApp` publication owner. The source may be
+  registered by several agents in that application, and one refresh updates all
+  of them atomically. Static and refreshable registration of the same source in
+  any applications sharing its live session is rejected; static-only sharing
+  remains supported. Separately constructed toolset wrappers around the same
+  `McpSession` share this source identity and cannot bypass its ownership mode.
+  Different sources may fetch and validate candidates concurrently; a short
+  application publication lock rebuilds from the latest registered state so
+  concurrent accepted refreshes cannot overwrite one another. Existing durable
+  session capability ceilings remain name-bounded and cannot acquire
+  server-added tools; catalogue/profile continuation and dynamic-reference
+  reconstruction still perform their ordinary fail-closed checks against the
+  newly registered generation.
+- Manual refresh does not consume `notifications/tools/list_changed`, start a
+  listener, or poll. The current clients negotiate MCP through 2025-06-18;
+  legacy change-signal ownership and the MCP 2026-07-28
+  `subscriptions/listen`/cache-hint protocol remain separate capabilities.
 - Callers must close the toolset when the application or environment shuts down.
   Tool adapters intentionally reuse that initialized session instead of launching
   a fresh MCP process for every tool call.

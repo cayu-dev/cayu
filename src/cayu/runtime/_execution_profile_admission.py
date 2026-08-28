@@ -566,6 +566,24 @@ def resolve_execution_profile_identity(
             },
         }
     )
+    mcp_tool_source_material = (
+        None
+        if not registered_agent.mcp_toolsets
+        else {
+            "kind": "cayu:mcp-tool-sources",
+            "schema_version": 1,
+            "sources": [
+                {
+                    "manifest_identity": toolset.manifest_identity,
+                    "registration_mode": "complete",
+                }
+                for toolset in sorted(
+                    registered_agent.mcp_toolsets,
+                    key=lambda item: item.manifest_identity,
+                )
+            ],
+        }
+    )
     return build_execution_profile_identity(
         runtime_name=runtime_name,
         runtime_version=runtime_version,
@@ -595,6 +613,11 @@ def resolve_execution_profile_identity(
                 {}
                 if tool_discovery_material is None
                 else {"tool_discovery": tool_discovery_material}
+            ),
+            **(
+                {}
+                if mcp_tool_source_material is None
+                else {"mcp_tool_sources": mcp_tool_source_material}
             ),
             **(
                 {}

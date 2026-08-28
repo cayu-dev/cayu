@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 
@@ -174,6 +177,106 @@ class McpToolDefinition(BaseModel):
         return copy_durable_json_object(value, info.field_name)
 
 
+def _mcp_tool_private_contract_hash(definition: McpToolDefinition) -> str:
+    """Hash one unredacted tool contract without retaining its private values."""
+
+    if type(definition) is not McpToolDefinition:
+        raise TypeError("definition must be an McpToolDefinition.")
+    payload = definition.model_dump(mode="json", warnings=False)
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(b"cayu.mcp.private-tool-contract.v1\0")
+    digest.update(encoded)
+    payload.clear()
+    return f"sha256:{digest.hexdigest()}"
+
+
+class _McpToolDiscovery:
+    """Detached catalogue candidate with one-shot private-authority publication."""
+
+    __slots__ = (
+        "_commit_callback",
+        "_discard_callback",
+        "_settled",
+        "definitions",
+        "private_contract_hashes",
+    )
+
+    def __init__(
+        self,
+        definitions: tuple[McpToolDefinition, ...],
+        *,
+        private_contract_hashes: tuple[str, ...] | None = None,
+        commit: Callable[[], Awaitable[None]] | None = None,
+        discard: Callable[[], None] | None = None,
+    ) -> None:
+        if type(definitions) is not tuple or any(
+            type(definition) is not McpToolDefinition for definition in definitions
+        ):
+            raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
+        if private_contract_hashes is None:
+            resolved_hashes = tuple(
+                _mcp_tool_private_contract_hash(definition) for definition in definitions
+            )
+        else:
+            if type(private_contract_hashes) is not tuple:
+                raise TypeError("private_contract_hashes must be a tuple.")
+            resolved_hashes = private_contract_hashes
+        if len(resolved_hashes) != len(definitions):
+            raise ValueError("Private MCP contract evidence must match the discovered tools.")
+        for contract_hash in resolved_hashes:
+            if (
+                type(contract_hash) is not str
+                or len(contract_hash) != 71
+                or not contract_hash.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in contract_hash[7:])
+            ):
+                raise ValueError("Private MCP contract evidence must contain SHA-256 identifiers.")
+        if commit is not None and not callable(commit):
+            raise TypeError("commit must be callable.")
+        if discard is not None and not callable(discard):
+            raise TypeError("discard must be callable.")
+        self.definitions = definitions
+        self.private_contract_hashes = resolved_hashes
+        self._commit_callback = commit
+        self._discard_callback = discard
+        self._settled = False
+
+    async def commit(self) -> None:
+        """Publish staged transport authority exactly once."""
+
+        if self._settled:
+            raise RuntimeError("MCP tool discovery authority is already settled.")
+        callback = self._commit_callback
+        try:
+            if callback is not None:
+                await callback()
+        except BaseException:
+            self.discard()
+            raise
+        self._settled = True
+        self._commit_callback = None
+        self._discard_callback = None
+
+    def discard(self) -> None:
+        """Erase uncommitted transport authority without exposing its values."""
+
+        if self._settled:
+            return
+        callback = self._discard_callback
+        self._settled = True
+        self._commit_callback = None
+        self._discard_callback = None
+        if callback is not None:
+            callback()
+
+
 class McpToolResult(BaseModel):
     """Result returned by an MCP tools/call request."""
 
@@ -258,9 +361,36 @@ class McpSession(ABC):
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
         """Return tools advertised by the server."""
 
+    async def _discover_tools_for_toolset(self) -> _McpToolDiscovery:
+        """Stage toolset discovery; transports may defer private authority publication."""
+
+        return _McpToolDiscovery(await self.list_tools())
+
     @abstractmethod
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
         """Call one server tool."""
+
+    async def _call_tool_with_dispatch_signal(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        dispatch_signal: _McpToolDispatchSignal,
+    ) -> McpToolResult:
+        """Call a tool without claiming transport dispatch for an extension.
+
+        The base implementation deliberately leaves ``dispatch_signal`` pending.
+        The generation fence therefore remains held until an arbitrary third-party
+        session settles. Built-in sessions override this seam and signal only after
+        their exact transport implementation owns a possibly dispatched request.
+        """
+
+        if not isinstance(dispatch_signal, _McpToolDispatchSignal):
+            raise TypeError("dispatch_signal must be an _McpToolDispatchSignal.")
+        call = self.call_tool(name, arguments)
+        name = ""
+        arguments = {}
+        return await call
 
     @abstractmethod
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
@@ -289,6 +419,27 @@ class McpClient(ABC):
     @abstractmethod
     async def connect(self, server: McpServerSpec) -> McpSession:
         """Connect to one MCP server."""
+
+
+class _McpToolDispatchSignal:
+    """One-shot proof that a tool call may already have reached its transport."""
+
+    __slots__ = ("_future",)
+
+    def __init__(self) -> None:
+        self._future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    @property
+    def future(self) -> asyncio.Future[None]:
+        return self._future
+
+    def mark_dispatched(self) -> None:
+        if not self._future.done():
+            self._future.set_result(None)
+
+    def close(self) -> None:
+        if not self._future.done():
+            self._future.cancel()
 
 
 _RETAINED_SESSION_CLOSE_TASKS: set[asyncio.Task[None]] = set()

@@ -7,7 +7,7 @@ import os
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from hashlib import sha256
@@ -77,7 +77,15 @@ from cayu.environments import (
     copy_bound_workspace,
     copy_environment,
 )
-from cayu.mcp.tools import McpToolAdapter
+from cayu.mcp.tools import (
+    McpToolAdapter,
+    McpToolset,
+    McpToolsetRefreshBlocked,
+    McpToolsetRefreshResult,
+    McpToolsetRefreshState,
+    McpToolsetUnavailable,
+    mcp_toolset_manifest_diff,
+)
 from cayu.providers import (
     ModelProvider,
     OpenAIWebSearch,
@@ -320,6 +328,7 @@ from cayu.runtime.loop_policies import (
 from cayu.runtime.manifest import AppManifest, describe_app
 from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
+    McpManifestPolicyAction,
     copy_mcp_manifest_policy,
 )
 from cayu.runtime.provider_operations import (
@@ -1185,6 +1194,9 @@ class CayuApp:
             clock=self._clock,
         )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
+        self._mcp_refresh_owner = object()
+        self._mcp_publication_lock = asyncio.Lock()
+        self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
         self._knowledge_publications_sealed = False
         self._fork_group_evaluator_agents: dict[str, str] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
@@ -2031,6 +2043,7 @@ class CayuApp:
         spec: AgentSpec,
         *,
         tools: Iterable[Tool] | None = None,
+        mcp_toolsets: Iterable[McpToolset] | None = None,
         hosted_tools: Iterable[OpenAIWebSearch] | None = None,
         context_policy: ContextPolicy | None = None,
         context_overflow_policy: ContextPolicy | None = None,
@@ -2111,6 +2124,41 @@ class CayuApp:
         else:
             raise TypeError("execution_requirements must be ExecutionRequirements or None.")
 
+        requested_mcp_toolsets = _copy_refreshable_mcp_toolsets(mcp_toolsets)
+        resolved_mcp_toolsets: list[McpToolset] = []
+        seen_mcp_sources: set[int] = set()
+        seen_mcp_manifest_identities: set[str] = set()
+        for index, toolset in enumerate(requested_mcp_toolsets):
+            source_key = _mcp_refresh_source_key(toolset)
+            if source_key in seen_mcp_sources:
+                raise ValueError("mcp_toolsets must contain unique MCP sources.")
+            seen_mcp_sources.add(source_key)
+            current = self._refreshable_mcp_toolsets.get(source_key)
+            resolved = toolset if current is None else current
+            if resolved.refresh_state is not McpToolsetRefreshState.READY:
+                raise ValueError("A refreshable MCP source must be ready during registration.")
+            if not resolved.manifest_identity_is_explicit:
+                raise ValueError(
+                    f"mcp_toolsets[{index}] requires an explicit McpServerSpec.connection_id."
+                )
+            if resolved.manifest_identity in seen_mcp_manifest_identities:
+                raise ValueError("mcp_toolsets must contain unique MCP connection identities.")
+            seen_mcp_manifest_identities.add(resolved.manifest_identity)
+            if current is None and any(
+                registered.manifest_identity == resolved.manifest_identity
+                for registered in self._refreshable_mcp_toolsets.values()
+            ):
+                raise ValueError(
+                    "Refreshable MCP sources require unique connection identities "
+                    "within one CayuApp."
+                )
+            if current is None and _agents_contain_mcp_source(self._agents, resolved):
+                raise ValueError(
+                    "A refreshable MCP source cannot also be registered through static tools."
+                )
+            resolved_mcp_toolsets.append(resolved)
+        stored_mcp_toolsets = tuple(resolved_mcp_toolsets)
+
         if tools is None:
             agent_tools = []
         else:
@@ -2120,6 +2168,24 @@ class CayuApp:
                 agent_tools = list(tools)
             except TypeError as exc:
                 raise TypeError("Agent tools must be an iterable of Tool instances.") from exc
+
+        refreshable_source_keys = {
+            _mcp_refresh_source_key(toolset) for toolset in stored_mcp_toolsets
+        }
+        static_mcp_toolsets: dict[int, McpToolset] = {}
+        for tool in agent_tools:
+            if isinstance(tool, McpToolAdapter):
+                source_key = _mcp_refresh_source_key(tool.toolset)
+                if (
+                    source_key in refreshable_source_keys
+                    or source_key in self._refreshable_mcp_toolsets
+                ):
+                    raise ValueError(
+                        "A refreshable MCP source cannot also be registered through static tools."
+                    )
+                static_mcp_toolsets.setdefault(source_key, tool.toolset)
+        for toolset in stored_mcp_toolsets:
+            agent_tools.extend(sorted(toolset.tools, key=lambda tool: tool.name))
 
         tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
         for tool in agent_tools:
@@ -2235,6 +2301,7 @@ class CayuApp:
                 for index, policy in enumerate(stored_loop_policies)
             ),
             execution_requirements=stored_execution_requirements,
+            mcp_toolsets=stored_mcp_toolsets,
             context_behavior_execution_profile_identities=(
                 _snapshot_context_behavior_execution_profile_identities(
                     stored_context_policy,
@@ -2245,17 +2312,150 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
-        if self._knowledge_publications_sealed:
-            for registered_tool in tools_by_name.values():
-                lifecycle = getattr(
-                    registered_tool.tool,
-                    "_knowledge_publication_lifecycle",
-                    None,
-                )
-                if isinstance(lifecycle, KnowledgePublicationLifecycle):
-                    lifecycle.seal()
+        newly_claimed_static: list[McpToolset] = []
+        newly_claimed_refreshable: list[McpToolset] = []
+        try:
+            for toolset in static_mcp_toolsets.values():
+                if toolset._refresh_source.claim_static_owner(self._mcp_refresh_owner):
+                    newly_claimed_static.append(toolset)
+            for toolset in stored_mcp_toolsets:
+                source_key = _mcp_refresh_source_key(toolset)
+                if source_key in self._refreshable_mcp_toolsets:
+                    continue
+                toolset._refresh_source.claim_refresh_owner(self._mcp_refresh_owner)
+                newly_claimed_refreshable.append(toolset)
+            if self._knowledge_publications_sealed:
+                for registered_tool in tools_by_name.values():
+                    lifecycle = getattr(
+                        registered_tool.tool,
+                        "_knowledge_publication_lifecycle",
+                        None,
+                    )
+                    if isinstance(lifecycle, KnowledgePublicationLifecycle):
+                        lifecycle.seal()
+        except BaseException:
+            for toolset in newly_claimed_refreshable:
+                toolset._refresh_source.release_refresh_owner(self._mcp_refresh_owner)
+            for toolset in newly_claimed_static:
+                toolset._refresh_source.release_static_owner(self._mcp_refresh_owner)
+            raise
         self._agents[stored_spec.name] = registered_agent
+        for toolset in stored_mcp_toolsets:
+            self._refreshable_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
         return spec
+
+    async def refresh_mcp_toolset(
+        self,
+        toolset: McpToolset,
+    ) -> McpToolsetRefreshResult:
+        """Re-list and atomically publish one explicitly registered MCP source."""
+
+        if not isinstance(toolset, McpToolset):
+            raise TypeError("toolset must be a McpToolset.")
+        source_key = _mcp_refresh_source_key(toolset)
+        current = self._refreshable_mcp_toolsets.get(source_key)
+        if current is None:
+            raise ValueError("MCP toolset refresh requires explicit mcp_toolsets= registration.")
+        source = current._refresh_source
+        previous_generation = current.generation
+        refresh_started = False
+        discovery = None
+        try:
+            await source.begin_refresh(
+                owner=self._mcp_refresh_owner,
+                expected_generation=previous_generation,
+            )
+            refresh_started = True
+            candidate, discovery = await current._prepare_refresh()
+            staged_discovery = discovery
+            diff = mcp_toolset_manifest_diff(current, candidate)
+            decision = None
+            if self._mcp_manifest_policy is not None:
+                decision = self._mcp_manifest_policy.decide(
+                    status="changed" if diff.changed else "unchanged",
+                    diff=diff.policy_input(),
+                )
+                if decision.action is McpManifestPolicyAction.BLOCK:
+                    source.quarantine_refresh(
+                        owner=self._mcp_refresh_owner,
+                        expected_generation=previous_generation,
+                    )
+                    raise McpToolsetRefreshBlocked(decision.reason)
+            if not diff.changed:
+                await source.finish_unchanged(
+                    owner=self._mcp_refresh_owner,
+                    expected_generation=previous_generation,
+                    publish=discovery.commit,
+                )
+                discovery = None
+                return McpToolsetRefreshResult(
+                    toolset=current,
+                    status="unchanged",
+                    previous_generation=previous_generation,
+                    generation=previous_generation,
+                    previous_manifest_hash=current.manifest_hash,
+                    manifest_hash=current.manifest_hash,
+                    diff=diff,
+                    policy_action=(None if decision is None else decision.action.value),
+                )
+
+            async def publish() -> None:
+                async with self._mcp_publication_lock:
+                    published_current = self._refreshable_mcp_toolsets.get(source_key)
+                    if (
+                        published_current is None
+                        or published_current._refresh_source is not source
+                        or published_current.generation != previous_generation
+                    ):
+                        raise McpToolsetUnavailable(
+                            "MCP application publication authority changed during refresh."
+                        )
+                    replacements = {
+                        name: _registered_agent_after_mcp_refresh(
+                            registered_agent,
+                            source=source,
+                            candidate=candidate,
+                            redactor=self._secret_redactor,
+                            timeout_seconds=self._tool_timeout_seconds,
+                        )
+                        for name, registered_agent in self._agents.items()
+                        if _registered_agent_contains_mcp_source(registered_agent, source)
+                    }
+                    if not replacements:
+                        raise RuntimeError("Refreshable MCP source lost its agent registrations.")
+                    next_agents = {**self._agents, **replacements}
+                    next_toolsets = dict(self._refreshable_mcp_toolsets)
+                    next_toolsets[source_key] = candidate
+                    await staged_discovery.commit()
+                    self._agents = next_agents
+                    self._refreshable_mcp_toolsets = next_toolsets
+
+            await source.publish_refresh(
+                owner=self._mcp_refresh_owner,
+                expected_generation=previous_generation,
+                generation=candidate.generation,
+                publish=publish,
+            )
+            discovery = None
+            return McpToolsetRefreshResult(
+                toolset=candidate,
+                status="accepted",
+                previous_generation=previous_generation,
+                generation=candidate.generation,
+                previous_manifest_hash=current.manifest_hash,
+                manifest_hash=candidate.manifest_hash,
+                diff=diff,
+                policy_action=(None if decision is None else decision.action.value),
+            )
+        except BaseException:
+            if discovery is not None:
+                discovery.discard()
+            if refresh_started:
+                source.quarantine_refresh(
+                    owner=self._mcp_refresh_owner,
+                    expected_generation=previous_generation,
+                )
+            raise
 
     def register_completion_verifier(
         self,
@@ -7528,6 +7728,126 @@ def _validate_provider_model_patterns(value: Iterable[str] | None) -> tuple[str,
     return tuple(
         require_clean_nonblank(pattern, f"model_patterns[{index}]")
         for index, pattern in enumerate(patterns)
+    )
+
+
+def _copy_refreshable_mcp_toolsets(
+    value: Iterable[McpToolset] | None,
+) -> tuple[McpToolset, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes | bytearray | Mapping):
+        raise TypeError("mcp_toolsets must be an iterable of McpToolset instances.")
+    try:
+        iterator = iter(value)
+    except TypeError as exc:
+        raise TypeError("mcp_toolsets must be an iterable of McpToolset instances.") from exc
+    copied = tuple(islice(iterator, 10_001))
+    if len(copied) > 10_000:
+        raise ValueError("mcp_toolsets cannot contain more than 10,000 sources.")
+    for index, toolset in enumerate(copied):
+        if not isinstance(toolset, McpToolset):
+            raise TypeError(f"mcp_toolsets[{index}] must be a McpToolset.")
+    return copied
+
+
+def _mcp_refresh_source_key(toolset: McpToolset) -> int:
+    if not isinstance(toolset, McpToolset):
+        raise TypeError("toolset must be a McpToolset.")
+    return id(toolset._refresh_source)
+
+
+def _registered_agent_contains_mcp_source(
+    registered_agent: runtime_records.RegisteredAgentState,
+    source: object,
+) -> bool:
+    return any(toolset._refresh_source is source for toolset in registered_agent.mcp_toolsets)
+
+
+def _agents_contain_mcp_source(
+    agents: Mapping[str, runtime_records.RegisteredAgentState],
+    toolset: McpToolset,
+) -> bool:
+    source = toolset._refresh_source
+    return any(
+        isinstance(registered.tool, McpToolAdapter)
+        and registered.tool.toolset._refresh_source is source
+        for agent in agents.values()
+        for registered in agent.tools.values()
+    )
+
+
+def _registered_agent_after_mcp_refresh(
+    registered_agent: runtime_records.RegisteredAgentState,
+    *,
+    source: object,
+    candidate: McpToolset,
+    redactor: SecretRedactor,
+    timeout_seconds: float | None,
+) -> runtime_records.RegisteredAgentState:
+    if not _registered_agent_contains_mcp_source(registered_agent, source):
+        raise ValueError("Registered agent does not contain the refreshed MCP source.")
+    refreshed_toolsets = tuple(
+        candidate if toolset._refresh_source is source else toolset
+        for toolset in registered_agent.mcp_toolsets
+    )
+    dynamic_sources = {_mcp_refresh_source_key(toolset) for toolset in refreshed_toolsets}
+    tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
+    for name, registered in registered_agent.tools.items():
+        tool = registered.tool
+        if (
+            isinstance(tool, McpToolAdapter)
+            and _mcp_refresh_source_key(tool.toolset) in dynamic_sources
+        ):
+            continue
+        tools_by_name[name] = registered
+    for toolset in refreshed_toolsets:
+        for adapter in sorted(toolset.tools, key=lambda tool: tool.name):
+            registered = _validate_registered_tool(
+                adapter,
+                redactor=redactor,
+                timeout_seconds=timeout_seconds,
+            )
+            if registered.name in tools_by_name:
+                raise ValueError(
+                    f"Refreshed MCP tool collides with registered tool: {registered.name}"
+                )
+            tools_by_name[registered.name] = registered
+
+    executable_names = frozenset((*tools_by_name, *registered_agent.runtime_tools))
+    missing_workflow_tools = tuple(
+        name for name in registered_agent.spec.workflow_tool_names if name not in executable_names
+    )
+    if missing_workflow_tools:
+        raise ValueError("MCP refresh removed a configured workflow tool.")
+    exposure_policy = registered_agent.tool_exposure_policy
+    if isinstance(exposure_policy, StaticToolExposurePolicy) and any(
+        name not in tools_by_name for name in exposure_policy.tools
+    ):
+        raise ValueError("MCP refresh removed a statically exposed tool.")
+
+    descriptors_by_name = {
+        tool.name: _registered_tool_descriptor(tool) for tool in tools_by_name.values()
+    }
+    tool_catalogue = build_tool_catalog_snapshot(descriptors_by_name.values())
+    tool_capabilities = tuple(
+        RegisteredToolCapability(**descriptors_by_name[name].exposure_capability_material())
+        for name in tools_by_name
+    )
+    all_registered_tool_exposure = ResolvedToolExposure(
+        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+        catalogue_revision=tool_catalogue.revision,
+        tools=tool_capabilities,
+        registered_count=len(tool_capabilities),
+        ceiling_count=len(tool_capabilities),
+    )
+    return replace(
+        registered_agent,
+        tools=MappingProxyType(tools_by_name),
+        tool_catalogue=tool_catalogue,
+        tool_capabilities=all_registered_tool_exposure.tools,
+        all_registered_tool_exposure=all_registered_tool_exposure,
+        mcp_toolsets=refreshed_toolsets,
     )
 
 

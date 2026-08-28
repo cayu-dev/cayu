@@ -11,9 +11,14 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 from cayu import (
     DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S,
     DEFAULT_HTTP_MCP_TIMEOUT_S,
+    AgentSpec,
+    CayuApp,
     HttpMcpClient,
+    McpManifestPolicy,
+    McpManifestPolicyAction,
     McpProtocolError,
     McpServerSpec,
+    McpToolsetRefreshBlocked,
     StdioMcpClient,
     connect_mcp_toolset,
 )
@@ -84,6 +89,7 @@ class FakeMcpHttpServer:
         self.invalid_portable_result_on = invalid_portable_result_on
         self.invalid_portable_canary = invalid_portable_canary
         self.calls: list[tuple[str, dict[str, str]]] = []  # (method, lowercased headers)
+        self.tool_call_names: list[str] = []
         self.initialized = False
         self.deleted = False
 
@@ -126,6 +132,8 @@ class FakeMcpHttpServer:
         if self.bad_jsonrpc_on is not None and method == self.bad_jsonrpc_on:
             return self._respond(request_id, method, result=self._result_for(method), jsonrpc="1.0")
         params = body.get("params", {})
+        if method == "tools/call":
+            self.tool_call_names.append(params.get("name"))
         return self._respond(request_id, method, result=self._result_for(method, params))
 
     def _result_for(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1281,6 +1289,212 @@ def test_http_toolset_end_to_end() -> None:
     names, result = asyncio.run(run())
     assert names == ["mcp__remote__search"]
     assert result.is_error is False
+
+
+def test_http_subclass_inheriting_list_tools_keeps_builtin_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExtendedHttpSession(HttpMcpSession):
+        pass
+
+    class DelegatingHttpSession(HttpMcpSession):
+        async def list_tools(self):
+            return await super().list_tools()
+
+    async def exercise(session_type):
+        session = session_type(
+            server=_server_spec(),
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            ),
+            url="https://mcp.example/rpc",
+            client_name="cayu",
+            client_version="0.1.0",
+            secret_redactor=SecretRedactor(),
+        )
+
+        async def send(
+            _payload: dict[str, Any],
+            request_id: int,
+            *,
+            budget: Any,
+            failure_redactor: SecretRedactor | None = None,
+        ) -> dict[str, Any]:
+            del budget
+            assert failure_redactor is session.secret_redactor
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"tools": _DEFAULT_TOOLS},
+            }
+
+        monkeypatch.setattr(session, "_send", send)
+        try:
+            return await session.list_tools()
+        finally:
+            await session.close()
+
+    async def run():
+        return await exercise(ExtendedHttpSession), await exercise(DelegatingHttpSession)
+
+    inherited_definitions, delegated_definitions = asyncio.run(run())
+
+    assert [definition.name for definition in inherited_definitions] == ["search"]
+    assert [definition.name for definition in delegated_definitions] == ["search"]
+
+
+def test_http_private_contract_refresh_is_blocked_without_committing_transport_authority() -> None:
+    private_name = "mcp-http-private-refresh-name"
+    first_description = "mcp-http-private-refresh-description-alpha"
+    second_description = "mcp-http-private-refresh-description-beta"
+    initial_tools = [
+        {
+            "name": private_name,
+            "description": first_description,
+            "inputSchema": {"type": "object"},
+        }
+    ]
+    server = FakeMcpHttpServer(tools=initial_tools)
+    vault = StaticVault(
+        {
+            "name": private_name,
+            "first_description": first_description,
+            "second_description": second_description,
+        }
+    )
+    spec = _server_spec(
+        connection_id="private-http-block",
+        secret_headers={
+            "x-private-name": SecretRef(name="name"),
+            "x-private-description-alpha": SecretRef(name="first_description"),
+            "x-private-description-beta": SecretRef(name="second_description"),
+        },
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            spec,
+            client=HttpMcpClient(transport=server.transport, secret_resolver=vault),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        initial_mapping = dict(session._tool_transport_names)
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_tools_changed=McpManifestPolicyAction.BLOCK,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            server.tools = [
+                {
+                    "name": private_name,
+                    "description": second_description,
+                    "inputSchema": {"type": "object"},
+                }
+            ]
+            with pytest.raises(McpToolsetRefreshBlocked) as exc_info:
+                await app.refresh_mcp_toolset(toolset)
+            blocked_mapping = dict(session._tool_transport_names)
+            blocked_state = toolset.refresh_state
+
+            server.tools = initial_tools
+            recovery = await app.refresh_mcp_toolset(toolset)
+            return (
+                initial_mapping,
+                blocked_mapping,
+                blocked_state,
+                recovery,
+                recovery.toolset.refresh_state,
+                exc_info.value,
+            )
+        finally:
+            await toolset.close()
+
+    initial_mapping, blocked_mapping, blocked_state, recovery, recovery_state, error = asyncio.run(
+        run()
+    )
+
+    assert initial_mapping == {REDACTED_SECRET: private_name}
+    assert blocked_mapping == initial_mapping
+    assert blocked_state == "quarantined"
+    assert recovery.status == "unchanged"
+    assert recovery_state == "ready"
+    public_error = repr(error)
+    assert private_name not in public_error
+    assert first_description not in public_error
+    assert second_description not in public_error
+
+
+def test_http_private_tool_rename_commits_exact_new_transport_authority() -> None:
+    first_private_name = "mcp-http-private-refresh-name-alpha"
+    second_private_name = "mcp-http-private-refresh-name-beta"
+    server = FakeMcpHttpServer(
+        tools=[
+            {
+                "name": first_private_name,
+                "description": "Private rename test.",
+                "inputSchema": {"type": "object"},
+            }
+        ]
+    )
+    vault = StaticVault({"first_name": first_private_name, "second_name": second_private_name})
+    spec = _server_spec(
+        connection_id="private-http-rename",
+        secret_headers={
+            "x-private-name-alpha": SecretRef(name="first_name"),
+            "x-private-name-beta": SecretRef(name="second_name"),
+        },
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            spec,
+            client=HttpMcpClient(transport=server.transport, secret_resolver=vault),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        app = CayuApp(
+            enable_logging=False,
+            mcp_manifest_policy=McpManifestPolicy(
+                on_tools_changed=McpManifestPolicyAction.ALLOW,
+            ),
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            server.tools = [
+                {
+                    "name": second_private_name,
+                    "description": "Private rename test.",
+                    "inputSchema": {"type": "object"},
+                }
+            ]
+            refresh = await app.refresh_mcp_toolset(toolset)
+            call_result = await refresh.toolset.call_tool(
+                refresh.toolset.definitions[0].name,
+                {},
+            )
+            return refresh, call_result, dict(session._tool_transport_names)
+        finally:
+            await toolset.close()
+
+    refresh, call_result, mapping = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert refresh.diff.changed_tools == (refresh.toolset.tools[0].name,)
+    assert mapping == {REDACTED_SECRET: second_private_name}
+    assert server.tool_call_names[-1] == second_private_name
+    assert call_result.is_error is False
+    public_refresh = repr(refresh.diff.policy_input())
+    assert first_private_name not in public_refresh
+    assert second_private_name not in public_refresh
 
 
 def test_default_client_for_picks_transport_by_spec() -> None:

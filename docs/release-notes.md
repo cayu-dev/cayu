@@ -113,6 +113,41 @@ eval runs to version 9, published results to version 8, and the
 server/dashboard contract from version 36 to 37. Upgrade servers, generated
 clients, and dashboards together. No storage migration is required.
 
+### Explicit live MCP catalogue refresh
+
+- `CayuApp.register_agent(..., mcp_toolsets=(toolset,))` now declares that the
+  application tracks the complete admitted tool list for that MCP source.
+  Existing `tools=toolset.tools` registration remains a static snapshot and
+  starts no refresh work.
+- `await app.refresh_mcp_toolset(toolset)` performs one bounded full
+  `tools/list`, constructs detached immutable adapters, applies the configured
+  `McpManifestPolicy`, and publishes every affected agent catalogue through one
+  copy-on-write generation. A policy-accepted unchanged manifest retains the
+  current generation.
+- Refresh fences undispatched calls before discovery starts. Accepted
+  publication makes every older adapter snapshot stale; failed or blocked
+  refresh quarantines the source until another complete verified refresh
+  succeeds. Built-in transports signal only after they own a possibly
+  dispatched request; extension sessions without that proof retain the fence
+  until their call settles. Their discovery path hashes unredacted contracts
+  before redaction and stages the exact public-to-transport name map; only an
+  accepted or verified-unchanged refresh commits that map while the generation
+  fence is held. Blocked candidates cannot rebind dispatch, and a committed
+  complete catalogue replaces stale names instead of merging them forward.
+  Already-dispatched calls are not rebound.
+- Refreshable sources require an explicit stable
+  `McpServerSpec.connection_id` that is unique within the application, cannot
+  also be registered through static adapters sharing that live source, and
+  cannot be refresh-owned by multiple `CayuApp` instances. Server additions
+  enter only new application catalogue generations; existing durable session
+  ceilings do not widen. Distinct `McpToolset` wrappers around one live session
+  share the same source owner and generation fence. Independent sources can
+  fetch candidates concurrently while final application publication remains
+  serialized and copy-on-write.
+- This slice is trigger-independent and manual. Cayu still ignores legacy MCP
+  list-change notifications, performs no background polling, and does not yet
+  negotiate MCP 2026-07-28.
+
 ### Classified transient provider failures retry by default
 
 `RetryPolicy()` now permits five total attempts instead of disabling retries.

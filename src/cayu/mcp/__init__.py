@@ -52,12 +52,18 @@ from cayu.mcp.stdio import (
 from cayu.mcp.tools import (
     McpToolAdapter,
     McpToolset,
+    McpToolsetManifestDiff,
+    McpToolsetRefreshBlocked,
+    McpToolsetRefreshResult,
+    McpToolsetRefreshState,
+    McpToolsetUnavailable,
     connect_mcp_toolset,
     mcp_cayu_tool_name,
     mcp_tool_manifest_hash,
     mcp_tool_manifest_identity,
     mcp_tool_manifest_server_hash,
     mcp_tool_manifest_tools,
+    mcp_toolset_manifest_diff,
 )
 
 __all__ = [
@@ -96,6 +102,11 @@ __all__ = [
     "McpToolDefinition",
     "McpToolResult",
     "McpToolset",
+    "McpToolsetManifestDiff",
+    "McpToolsetRefreshBlocked",
+    "McpToolsetRefreshResult",
+    "McpToolsetRefreshState",
+    "McpToolsetUnavailable",
     "McpTransportLimits",
     "StdioMcpClient",
     "StdioMcpProcessLifetime",
@@ -106,4 +117,5 @@ __all__ = [
     "mcp_tool_manifest_identity",
     "mcp_tool_manifest_server_hash",
     "mcp_tool_manifest_tools",
+    "mcp_toolset_manifest_diff",
 ]

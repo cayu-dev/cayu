@@ -132,9 +132,15 @@ credentials keep provider credentials out of the tool process.
 ## mcp
 
 Use `McpServerSpec`, an MCP client, and `McpToolset`/`McpToolAdapter` to expose
-remote tools. Apply `McpManifestPolicy` to the discovered manifest before tools
-are registered. Test discovery limits, timeouts, naming collisions, and policy
-rejection without trusting server-provided descriptions as authority.
+remote tools. Register `tools=toolset.tools` for a static snapshot, or explicitly
+register `mcp_toolsets=(toolset,)` when the application owns the complete source
+and needs `await app.refresh_mcp_toolset(toolset)`. Refreshable sources require a
+stable `connection_id`; wrappers sharing one live session also share one source
+owner and generation fence, and additions never widen existing session ceilings.
+Apply `McpManifestPolicy`, and test discovery limits, quarantine, stale snapshots,
+timeouts, naming collisions, and policy rejection without trusting server-provided
+descriptions as authority. Cayu does not yet consume MCP list-change notifications
+or negotiate MCP 2026-07-28.
 
 ## sessions
 

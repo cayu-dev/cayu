@@ -21,6 +21,7 @@ from cayu.mcp.base import (
     McpResourceResult,
     McpToolDefinition,
     McpToolResult,
+    _mcp_tool_private_contract_hash,
     _McpCallerCancellationBoundary,
 )
 from cayu.vaults import SecretRedactor
@@ -65,6 +66,14 @@ class JsonrpcRedactionResult:
     """Exception-free result for redacting one untrusted transport response."""
 
     response: dict[str, Any]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class JsonrpcToolContractEvidenceResult:
+    """Exception-free private tool hashes detached from an untrusted response."""
+
+    hashes: tuple[str, ...]
     error: str | None = None
 
 
@@ -230,6 +239,34 @@ def jsonrpc_authority_mapping(
                 )
             mapping[redacted_authority] = raw_authority
     return JsonrpcAuthorityMappingResult(mapping)
+
+
+def jsonrpc_tool_contract_evidence(
+    raw_response: dict[str, Any],
+    *,
+    server_name: str,
+) -> JsonrpcToolContractEvidenceResult:
+    """Hash raw tools/list contracts before workload-secret redaction erases them."""
+
+    raw_result = raw_response.get("result")
+    if type(raw_result) is not dict:
+        return JsonrpcToolContractEvidenceResult(())
+    raw_tools = raw_result.get("tools")
+    if type(raw_tools) is not list:
+        return JsonrpcToolContractEvidenceResult(())
+    hashes: list[str] = []
+    try:
+        for raw_tool in raw_tools:
+            definition = tool_definition_from_payload(raw_tool, server_name)
+            hashes.append(_mcp_tool_private_contract_hash(definition))
+            definition = None
+    except (McpProtocolError, RecursionError, TypeError, ValueError):
+        hashes.clear()
+        return JsonrpcToolContractEvidenceResult(
+            (),
+            "MCP tools/list returned an invalid tool definition.",
+        )
+    return JsonrpcToolContractEvidenceResult(tuple(hashes))
 
 
 def merge_jsonrpc_authority_mapping(

@@ -4,9 +4,13 @@ import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha1
-from typing import Any
+from threading import Lock
+from typing import Any, NoReturn
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -23,9 +27,13 @@ from cayu.mcp.base import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
+    _attach_mcp_session_cleanup_failure,
     _close_mcp_session_after_primary_failure,
     _credential_safe_mcp_cancellation,
+    _mcp_tool_private_contract_hash,
     _McpCallerCancellationBoundary,
+    _McpToolDiscovery,
+    _McpToolDispatchSignal,
     _retain_mcp_session_close_if_fenced,
     copy_mcp_server_spec,
 )
@@ -38,12 +46,413 @@ _UNSAFE_TOOL_NAME_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _MAX_STRUCTURED_CONTENT_TEXT_BYTES = 20_000
 _MAX_SERVER_INSTRUCTIONS_DESCRIPTION_CHARS = 1_000
 _MAX_MCP_DISCOVERY_ERROR_BYTES = 4096
+_MCP_SESSION_SOURCE_ATTRIBUTE = "_cayu_internal_mcp_tool_source_v1"
+_MCP_SESSION_SOURCE_BIND_LOCK = Lock()
+_MISSING_MCP_SESSION_SOURCE = object()
+
+
+class McpToolsetRefreshState(StrEnum):
+    """Live dispatch state for one refreshable MCP source."""
+
+    READY = "ready"
+    REFRESHING = "refreshing"
+    QUARANTINED = "quarantined"
+    CLOSED = "closed"
+
+
+class McpToolsetUnavailable(McpProtocolError):
+    """Raised when an MCP snapshot no longer has live dispatch authority."""
+
+
+class McpToolsetRefreshBlocked(RuntimeError):
+    """Raised when application policy rejects a refreshed MCP manifest."""
+
+
+@dataclass(frozen=True, slots=True)
+class McpToolsetManifestDiff:
+    """Bounded application-visible difference between two MCP snapshots."""
+
+    server_changed: bool
+    added_tools: tuple[str, ...] = ()
+    removed_tools: tuple[str, ...] = ()
+    changed_tools: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.server_changed) is not bool:
+            raise TypeError("server_changed must be a bool.")
+        for field_name in ("added_tools", "removed_tools", "changed_tools"):
+            values = getattr(self, field_name)
+            if type(values) is not tuple:
+                raise TypeError(f"{field_name} must be a tuple.")
+            if values != tuple(sorted(set(values))):
+                raise ValueError(f"{field_name} must be unique and sorted.")
+            for value in values:
+                require_clean_nonblank(value, field_name)
+        categorized_names = self.added_tools + self.removed_tools + self.changed_tools
+        if len(categorized_names) != len(set(categorized_names)):
+            raise ValueError("MCP manifest tool changes must have disjoint categories.")
+
+    @property
+    def changed(self) -> bool:
+        return bool(
+            self.server_changed or self.added_tools or self.removed_tools or self.changed_tools
+        )
+
+    def policy_input(self) -> dict[str, Any]:
+        """Return a detached value accepted by ``McpManifestPolicy``."""
+
+        return {
+            "server_changed": self.server_changed,
+            "added_tools": list(self.added_tools),
+            "removed_tools": list(self.removed_tools),
+            "changed_tools": list(self.changed_tools),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class McpToolsetRefreshResult:
+    """Accepted result of one trigger-independent MCP catalogue refresh."""
+
+    toolset: McpToolset
+    status: str
+    previous_generation: int
+    generation: int
+    previous_manifest_hash: str
+    manifest_hash: str
+    diff: McpToolsetManifestDiff
+    policy_action: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.toolset, McpToolset):
+            raise TypeError("toolset must be a McpToolset.")
+        if self.status not in {"accepted", "unchanged"}:
+            raise ValueError("status must be accepted or unchanged.")
+        if type(self.previous_generation) is not int or self.previous_generation < 1:
+            raise ValueError("previous_generation must be a positive integer.")
+        if type(self.generation) is not int or self.generation < 1:
+            raise ValueError("generation must be a positive integer.")
+        if self.status == "unchanged" and self.generation != self.previous_generation:
+            raise ValueError("An unchanged refresh cannot advance the source generation.")
+        if self.status == "accepted" and self.generation != self.previous_generation + 1:
+            raise ValueError("An accepted refresh must advance the source generation once.")
+        for field_name in ("previous_manifest_hash", "manifest_hash"):
+            value = getattr(self, field_name)
+            if (
+                type(value) is not str
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in value[7:])
+            ):
+                raise ValueError(f"{field_name} must be a SHA-256 identifier.")
+        if not isinstance(self.diff, McpToolsetManifestDiff):
+            raise TypeError("diff must be an McpToolsetManifestDiff.")
+        if self.toolset.generation != self.generation:
+            raise ValueError("toolset generation must match the refresh result.")
+        if self.status == "unchanged" and self.diff.changed:
+            raise ValueError("An unchanged refresh cannot report manifest changes.")
+        if self.status == "accepted" and not self.diff.changed:
+            raise ValueError("An accepted refresh must report a manifest change.")
+        if self.status == "unchanged" and self.previous_manifest_hash != self.manifest_hash:
+            raise ValueError("An unchanged refresh must retain its manifest hash.")
+        if self.policy_action not in {None, "allow", "alert"}:
+            raise ValueError("policy_action must be allow, alert, or None.")
+
+
+class _McpToolSource:
+    """Own one MCP session and the dispatch fence shared by immutable snapshots."""
+
+    def __init__(self, session: McpSession) -> None:
+        self.session = session
+        self.lock = asyncio.Lock()
+        self.generation = 1
+        self.state = McpToolsetRefreshState.READY
+        self.refresh_owner: object | None = None
+        self.static_owners: set[object] = set()
+
+    def claim_refresh_owner(self, owner: object) -> None:
+        if self.static_owners:
+            raise ValueError(
+                "An MCP toolset with static registrations cannot acquire refresh ownership."
+            )
+        if self.refresh_owner is not None and self.refresh_owner is not owner:
+            raise ValueError("An MCP toolset can be refresh-owned by only one CayuApp.")
+        self.refresh_owner = owner
+
+    def release_refresh_owner(self, owner: object) -> None:
+        if self.refresh_owner is owner:
+            self.refresh_owner = None
+
+    def claim_static_owner(self, owner: object) -> bool:
+        if self.refresh_owner is not None:
+            raise ValueError(
+                "A refresh-owned MCP toolset cannot also be registered through static tools."
+            )
+        if owner in self.static_owners:
+            return False
+        self.static_owners.add(owner)
+        return True
+
+    def release_static_owner(self, owner: object) -> None:
+        self.static_owners.discard(owner)
+
+    def require_refresh_owner(self, owner: object) -> None:
+        if self.refresh_owner is not owner:
+            raise ValueError("The CayuApp does not own refresh authority for this MCP toolset.")
+
+    async def begin_refresh(self, *, owner: object, expected_generation: int) -> None:
+        async with self.lock:
+            self.require_refresh_owner(owner)
+            if self.state is McpToolsetRefreshState.CLOSED:
+                raise McpToolsetUnavailable("MCP toolset is closed.")
+            if self.generation != expected_generation:
+                raise McpToolsetUnavailable("MCP toolset refresh authority is stale.")
+            if self.state is McpToolsetRefreshState.REFRESHING:
+                raise McpToolsetUnavailable("MCP toolset refresh is already in progress.")
+            self.state = McpToolsetRefreshState.REFRESHING
+
+    def quarantine_refresh(self, *, owner: object, expected_generation: int) -> None:
+        self.require_refresh_owner(owner)
+        if (
+            self.state is McpToolsetRefreshState.REFRESHING
+            and self.generation == expected_generation
+        ):
+            self.state = McpToolsetRefreshState.QUARANTINED
+
+    async def finish_unchanged(
+        self,
+        *,
+        owner: object,
+        expected_generation: int,
+        publish: Callable[[], Awaitable[None]],
+    ) -> None:
+        async with self.lock:
+            self.require_refresh_owner(owner)
+            if (
+                self.state is not McpToolsetRefreshState.REFRESHING
+                or self.generation != expected_generation
+            ):
+                raise McpToolsetUnavailable("MCP toolset refresh authority changed.")
+            try:
+                await publish()
+            except BaseException:
+                self.state = McpToolsetRefreshState.QUARANTINED
+                raise
+            self.state = McpToolsetRefreshState.READY
+
+    async def publish_refresh(
+        self,
+        *,
+        owner: object,
+        expected_generation: int,
+        generation: int,
+        publish: Callable[[], Awaitable[None]],
+    ) -> None:
+        async with self.lock:
+            self.require_refresh_owner(owner)
+            if (
+                self.state is not McpToolsetRefreshState.REFRESHING
+                or self.generation != expected_generation
+                or generation != expected_generation + 1
+            ):
+                raise McpToolsetUnavailable("MCP toolset refresh authority changed.")
+            try:
+                await publish()
+            except BaseException:
+                self.state = McpToolsetRefreshState.QUARANTINED
+                raise
+            self.generation = generation
+            self.state = McpToolsetRefreshState.READY
+
+    async def call_tool(
+        self,
+        *,
+        generation: int,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> McpToolResult:
+        call_name = name
+        call_arguments = arguments
+        name = ""
+        arguments = {}
+        call_task: asyncio.Task[McpToolResult] | None = None
+        dispatch_signal: _McpToolDispatchSignal | None = None
+        try:
+            async with self.lock:
+                if self.state is not McpToolsetRefreshState.READY:
+                    raise McpToolsetUnavailable("MCP toolset is not ready for dispatch.")
+                if self.generation != generation:
+                    raise McpToolsetUnavailable("MCP toolset snapshot is stale.")
+                dispatch_signal = _McpToolDispatchSignal()
+                call_task = asyncio.create_task(
+                    self.session._call_tool_with_dispatch_signal(
+                        call_name,
+                        call_arguments,
+                        dispatch_signal=dispatch_signal,
+                    )
+                )
+                call_name = ""
+                call_arguments = {}
+                cancellation_boundary = _McpCallerCancellationBoundary()
+                caller_cancellation: asyncio.CancelledError | None = None
+                try:
+                    await cancellation_boundary.checkpoint()
+                    done, _pending = await asyncio.wait(
+                        (call_task, dispatch_signal.future),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError as cancellation:
+                    if cancellation_boundary.caller_cancelled():
+                        caller_cancellation = cancellation
+                    else:
+                        raise
+                except BaseException:
+                    call_task.cancel()
+                    with suppress(BaseException):
+                        await call_task
+                    raise
+                if caller_cancellation is not None:
+                    settlement = _raise_caller_cancellation_after_mcp_call_settles(
+                        call_task,
+                        caller_cancellation,
+                        redactor=self.session.secret_redactor,
+                    )
+                    caller_cancellation = None
+                    try:
+                        await settlement
+                    finally:
+                        settlement = None
+                    raise AssertionError("MCP cancellation settlement returned unexpectedly.")
+                if call_task in done:
+                    return call_task.result()
+            caller_cancellation = None
+            try:
+                return await call_task
+            except asyncio.CancelledError as cancellation:
+                if cancellation_boundary.caller_cancelled():
+                    caller_cancellation = cancellation
+                else:
+                    raise
+            if caller_cancellation is None:
+                raise AssertionError("MCP caller cancellation evidence was lost.")
+            settlement = _raise_caller_cancellation_after_mcp_call_settles(
+                call_task,
+                caller_cancellation,
+                redactor=self.session.secret_redactor,
+            )
+            caller_cancellation = None
+            try:
+                await settlement
+            finally:
+                settlement = None
+            raise AssertionError("MCP cancellation settlement returned unexpectedly.")
+        finally:
+            if dispatch_signal is not None:
+                dispatch_signal.close()
+            dispatch_signal = None
+            call_task = None
+            call_name = ""
+            call_arguments = {}
+
+    async def close(self) -> None:
+        async with self.lock:
+            self.state = McpToolsetRefreshState.CLOSED
+        await self.session.close()
+
+
+async def _raise_caller_cancellation_after_mcp_call_settles(
+    call_task: asyncio.Task[McpToolResult],
+    caller_cancellation: asyncio.CancelledError,
+    *,
+    redactor: SecretRedactor,
+) -> NoReturn:
+    """Settle one cancelled child while keeping caller cancellation authoritative."""
+
+    call_task.cancel()
+    while not call_task.done():
+        cancellation_boundary = _McpCallerCancellationBoundary()
+        try:
+            await cancellation_boundary.checkpoint()
+            await asyncio.shield(call_task)
+        except asyncio.CancelledError:
+            if cancellation_boundary.caller_cancelled():
+                continue
+            if not call_task.done():
+                continue
+            break
+        except BaseException:
+            if not call_task.done():
+                continue
+            break
+
+    settlement_failure: BaseException | None = None
+    try:
+        call_task.result()
+    except asyncio.CancelledError:
+        pass
+    except BaseException as error:
+        settlement_failure = credential_safe_mcp_transport_failure(
+            error,
+            redactor=redactor,
+            context="MCP tool cancellation settlement failed",
+            preserve_cause=True,
+        )
+        error = None
+
+    safe_cancellation = _credential_safe_mcp_cancellation(
+        caller_cancellation,
+        redactor=redactor,
+    )
+    del caller_cancellation
+    has_settlement_failure = settlement_failure is not None
+    if settlement_failure is not None:
+        _attach_mcp_session_cleanup_failure(safe_cancellation, settlement_failure)
+    settlement_failure = None
+    del call_task, redactor
+    if has_settlement_failure:
+        raise safe_cancellation
+    raise safe_cancellation from None
+
+
+def _mcp_tool_source_for_session(session: McpSession, *, generation: int) -> _McpToolSource:
+    """Return the unique generation fence attached to one live session."""
+
+    with _MCP_SESSION_SOURCE_BIND_LOCK:
+        session_state = vars(session)
+        existing = session_state.get(
+            _MCP_SESSION_SOURCE_ATTRIBUTE,
+            _MISSING_MCP_SESSION_SOURCE,
+        )
+        if existing is _MISSING_MCP_SESSION_SOURCE:
+            source = _McpToolSource(session)
+            object.__setattr__(session, _MCP_SESSION_SOURCE_ATTRIBUTE, source)
+            return source
+        if not isinstance(existing, _McpToolSource) or existing.session is not session:
+            raise RuntimeError("MCP session source ownership state is invalid.")
+        if existing.generation != generation:
+            raise ValueError("A live MCP session cannot be wrapped as an older toolset generation.")
+        if existing.state is McpToolsetRefreshState.CLOSED:
+            raise McpToolsetUnavailable("A closed MCP session cannot create another toolset.")
+        return existing
+
+
+def _require_mcp_session_source(session: McpSession, source: _McpToolSource) -> None:
+    with _MCP_SESSION_SOURCE_BIND_LOCK:
+        if vars(session).get(_MCP_SESSION_SOURCE_ATTRIBUTE) is not source:
+            raise RuntimeError("MCP session lost its immutable source ownership state.")
 
 
 @dataclass(frozen=True, slots=True)
 class _McpManifestToolEvidence:
     cayu_name: str
     mcp_name: str
+    contract_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _McpRefreshBindingEvidence:
+    """Private contract evidence indexed by its sanitized public identity."""
+
+    public_cayu_name: str
     contract_hash: str
 
 
@@ -184,19 +593,124 @@ class McpToolset:
         session: McpSession,
         definitions: tuple[McpToolDefinition, ...],
     ) -> None:
+        self.__initialize(
+            server=server,
+            session=session,
+            definitions=definitions,
+            private_contract_hashes=None,
+            source=None,
+            generation=1,
+        )
+
+    @classmethod
+    def _from_discovery(
+        cls,
+        *,
+        server: McpServerSpec,
+        session: McpSession,
+        definitions: tuple[McpToolDefinition, ...],
+        private_contract_hashes: tuple[str, ...],
+    ) -> McpToolset:
+        toolset = object.__new__(cls)
+        toolset.__initialize(
+            server=server,
+            session=session,
+            definitions=definitions,
+            private_contract_hashes=private_contract_hashes,
+            source=None,
+            generation=1,
+        )
+        return toolset
+
+    @classmethod
+    def _from_refresh(
+        cls,
+        *,
+        server: McpServerSpec,
+        session: McpSession,
+        definitions: tuple[McpToolDefinition, ...],
+        private_contract_hashes: tuple[str, ...],
+        source: _McpToolSource,
+        generation: int,
+    ) -> McpToolset:
+        toolset = object.__new__(cls)
+        toolset.__initialize(
+            server=server,
+            session=session,
+            definitions=definitions,
+            private_contract_hashes=private_contract_hashes,
+            source=source,
+            generation=generation,
+        )
+        return toolset
+
+    def __initialize(
+        self,
+        *,
+        server: McpServerSpec,
+        session: McpSession,
+        definitions: tuple[McpToolDefinition, ...],
+        private_contract_hashes: tuple[str, ...] | None,
+        source: _McpToolSource | None,
+        generation: int,
+    ) -> None:
         if type(server) is not McpServerSpec:
-            raise TypeError("server must be an McpServerSpec.")
+            raise TypeError("server must be a McpServerSpec.")
         if not isinstance(session, McpSession):
-            raise TypeError("session must be an McpSession.")
-        self.__session = session
+            raise TypeError("session must be a McpSession.")
+        if type(definitions) is not tuple or any(
+            type(definition) is not McpToolDefinition for definition in definitions
+        ):
+            raise TypeError("definitions must be a tuple of McpToolDefinition instances.")
+        if type(generation) is not int or generation < 1:
+            raise ValueError("generation must be a positive integer.")
+        if source is None:
+            if generation != 1:
+                raise ValueError("A new MCP source must begin at generation 1.")
+            resolved_source = _mcp_tool_source_for_session(
+                session,
+                generation=generation,
+            )
+        else:
+            if not isinstance(source, _McpToolSource):
+                raise TypeError("source must be an _McpToolSource.")
+            if source.session is not session:
+                raise ValueError("Refreshed MCP snapshots must retain the same session.")
+            _require_mcp_session_source(session, source)
+            if source.state is not McpToolsetRefreshState.REFRESHING:
+                raise ValueError("A refreshed MCP snapshot requires an active source refresh.")
+            if generation != source.generation + 1:
+                raise ValueError("A refreshed MCP snapshot must be the next source generation.")
+            resolved_source = source
+        self.__source = resolved_source
+        self.__generation = generation
+        self.__session = resolved_source.session
         redactor = session.secret_redactor
         raw_definitions = tuple(definition.model_copy(deep=True) for definition in definitions)
+        if private_contract_hashes is None:
+            resolved_private_contract_hashes = tuple(
+                _mcp_tool_private_contract_hash(definition) for definition in raw_definitions
+            )
+        else:
+            if type(private_contract_hashes) is not tuple:
+                raise TypeError("private_contract_hashes must be a tuple.")
+            resolved_private_contract_hashes = private_contract_hashes
+        if len(resolved_private_contract_hashes) != len(raw_definitions):
+            raise ValueError("Private MCP contract evidence must match the tool definitions.")
+        for contract_hash in resolved_private_contract_hashes:
+            if (
+                type(contract_hash) is not str
+                or len(contract_hash) != 71
+                or not contract_hash.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in contract_hash[7:])
+            ):
+                raise ValueError("Private MCP contract evidence must contain SHA-256 identifiers.")
         raw_server = server.model_copy(deep=True)
         raw_initialize_result = session.initialize_result
         self.__binding_server = raw_server
         self.__server = _redact_server_spec(raw_server, redactor=redactor)
         self.__initialize_result = _redact_initialize_result(
-            session.initialize_result,
+            raw_initialize_result,
             redactor=redactor,
         )
         self.__definitions = tuple(
@@ -267,6 +781,25 @@ class McpToolset:
             ),
             tool_count=len(self.__definitions),
         )
+        self.__refresh_binding_evidence = tuple(
+            sorted(
+                (
+                    _McpRefreshBindingEvidence(
+                        public_cayu_name=mcp_cayu_tool_name(
+                            self.__server.name,
+                            public_definition.name,
+                        ),
+                        contract_hash=private_contract_hash,
+                    )
+                    for public_definition, private_contract_hash in zip(
+                        self.__definitions,
+                        resolved_private_contract_hashes,
+                        strict=True,
+                    )
+                ),
+                key=lambda entry: entry.public_cayu_name,
+            )
+        )
         self.__tools = tuple(
             McpToolAdapter(toolset=self, definition=definition) for definition in raw_definitions
         )
@@ -281,12 +814,106 @@ class McpToolset:
         return self.__session
 
     @property
+    def generation(self) -> int:
+        """Immutable source generation represented by this toolset snapshot."""
+
+        return self.__generation
+
+    @property
     def definitions(self) -> tuple[McpToolDefinition, ...]:
         return tuple(definition.model_copy(deep=True) for definition in self.__definitions)
 
     @property
     def tools(self) -> tuple[McpToolAdapter, ...]:
         return self.__tools
+
+    @property
+    def refresh_state(self) -> McpToolsetRefreshState:
+        """Return the source's current dispatch state."""
+
+        return self.__source.state
+
+    @property
+    def _refresh_source(self) -> _McpToolSource:
+        return self.__source
+
+    async def _prepare_refresh(self) -> tuple[McpToolset, _McpToolDiscovery]:
+        cancellation_boundary = _McpCallerCancellationBoundary()
+        definitions: tuple[McpToolDefinition, ...] = ()
+        discovery: _McpToolDiscovery | None = None
+        try:
+            await cancellation_boundary.checkpoint()
+            discovery = await self.__session._discover_tools_for_toolset()
+            definitions = discovery.definitions
+            if self.__source.state is McpToolsetRefreshState.CLOSED:
+                definitions = ()
+                raise McpToolsetUnavailable("MCP toolset closed during refresh.")
+            candidate = McpToolset._from_refresh(
+                server=self.__binding_server,
+                session=self.__session,
+                definitions=definitions,
+                private_contract_hashes=discovery.private_contract_hashes,
+                source=self.__source,
+                generation=self.__generation + 1,
+            )
+            prepared = (candidate, discovery)
+            discovery = None
+            return prepared
+        except McpToolsetUnavailable:
+            definitions = ()
+            raise
+        except asyncio.CancelledError as exc:
+            definitions = ()
+            if cancellation_boundary.caller_cancelled():
+                safe_cancellation = _credential_safe_mcp_cancellation(
+                    exc,
+                    redactor=self.__session.secret_redactor,
+                )
+                raise safe_cancellation from None
+            public_error = credential_safe_mcp_transport_failure(
+                exc,
+                redactor=self.__session.secret_redactor,
+                context="MCP tool refresh was cancelled unexpectedly",
+                max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                preserve_cause=True,
+            )
+            raise public_error from None
+        except TimeoutError as exc:
+            definitions = ()
+            if not self.__session.secret_redactor.has_values:
+                raise
+            public_error = credential_safe_mcp_transport_failure(
+                exc,
+                redactor=self.__session.secret_redactor,
+                context="MCP tool refresh failed",
+                max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                preserve_cause=True,
+            )
+            raise public_error from None
+        except (BaseExceptionGroup, Exception) as exc:
+            definitions = ()
+            if not self.__session.secret_redactor.has_values:
+                raise
+            public_error = credential_safe_mcp_transport_failure(
+                exc,
+                redactor=self.__session.secret_redactor,
+                context="MCP tool refresh failed",
+                max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                preserve_cause=True,
+            )
+            raise public_error from None
+        except BaseException as fatal:
+            definitions = ()
+            public_error = credential_safe_mcp_fatal_signal(
+                fatal,
+                redactor=self.__session.secret_redactor,
+                context="MCP tool refresh failed",
+                max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+            )
+            raise public_error from None
+        finally:
+            if discovery is not None:
+                discovery.discard()
 
     def _bind_adapter_definition(self, definition: McpToolDefinition) -> _McpAdapterBinding:
         """Bind an adapter only to a definition advertised by this toolset."""
@@ -335,6 +962,18 @@ class McpToolset:
         return self.__manifest_snapshot
 
     @property
+    def _binding_manifest_snapshot(self) -> _McpManifestSnapshot:
+        """Return private construction-time evidence for refresh comparison."""
+
+        return self.__binding_snapshot
+
+    @property
+    def _refresh_binding_snapshot(self) -> tuple[_McpRefreshBindingEvidence, ...]:
+        """Return private contract hashes keyed only by sanitized public names."""
+
+        return self.__refresh_binding_evidence
+
+    @property
     def manifest_identity_is_explicit(self) -> bool:
         """Whether the cached manifest identity came from an explicit connection ID."""
 
@@ -374,15 +1013,27 @@ class McpToolset:
         mcp_client = client if client is not None else _default_client_for(authoritative_server)
         session = await mcp_client.connect(copy_mcp_server_spec(authoritative_server))
         sanitized_error: BaseException | None = None
+        discovery: _McpToolDiscovery | None = None
         discovery_cancellation_boundary = _McpCallerCancellationBoundary()
         try:
-            await discovery_cancellation_boundary.checkpoint()
-            definitions = await session.list_tools()
-            return cls(
-                server=authoritative_server,
-                session=session,
-                definitions=definitions,
-            )
+            try:
+                await discovery_cancellation_boundary.checkpoint()
+                discovery = await session._discover_tools_for_toolset()
+                definitions = discovery.definitions
+                toolset = cls._from_discovery(
+                    server=authoritative_server,
+                    session=session,
+                    definitions=definitions,
+                    private_contract_hashes=discovery.private_contract_hashes,
+                )
+                await discovery.commit()
+                discovery = None
+                return toolset
+            except BaseException:
+                if discovery is not None:
+                    discovery.discard()
+                    discovery = None
+                raise
         except asyncio.CancelledError as exc:
             if not discovery_cancellation_boundary.caller_cancelled():
                 public_error = credential_safe_mcp_transport_failure(
@@ -554,7 +1205,11 @@ class McpToolset:
                 call_name = ""
                 call_arguments = {}
                 raise TypeError("MCP tool arguments must be an object.")
-        call = self.__session.call_tool(call_name, call_arguments)
+        call = self.__source.call_tool(
+            generation=self.__generation,
+            name=call_name,
+            arguments=call_arguments,
+        )
         call_name = ""
         call_arguments = {}
         try:
@@ -566,7 +1221,7 @@ class McpToolset:
             call = None
 
     async def close(self) -> None:
-        await self.__session.close()
+        await self.__source.close()
 
 
 async def connect_mcp_toolset(
@@ -577,6 +1232,58 @@ async def connect_mcp_toolset(
     """Connect to one MCP server and return its initialized toolset."""
 
     return await McpToolset.connect(server, client=client)
+
+
+def mcp_toolset_manifest_diff(
+    previous: McpToolset,
+    current: McpToolset,
+) -> McpToolsetManifestDiff:
+    """Compare two immutable snapshots of the same MCP source."""
+
+    if not isinstance(previous, McpToolset) or not isinstance(current, McpToolset):
+        raise TypeError("MCP manifest diff requires two McpToolset snapshots.")
+    if previous._refresh_source is not current._refresh_source:
+        raise ValueError("MCP manifest diff snapshots must share one source session.")
+    if current.generation != previous.generation + 1:
+        raise ValueError("MCP manifest diff requires the next source generation.")
+
+    previous_tools = {
+        entry.cayu_name: entry.contract_hash for entry in previous._manifest_snapshot.tools
+    }
+    current_tools = {
+        entry.cayu_name: entry.contract_hash for entry in current._manifest_snapshot.tools
+    }
+    added_keys = current_tools.keys() - previous_tools.keys()
+    removed_keys = previous_tools.keys() - current_tools.keys()
+    shared_keys = current_tools.keys() & previous_tools.keys()
+    changed_keys = {key for key in shared_keys if current_tools[key] != previous_tools[key]}
+
+    # Binding evidence is intentionally private because it can contain values
+    # redacted from the public snapshot. A private-only change still needs to
+    # trip manifest policy, but its raw identity must not cross the boundary.
+    previous_binding = {
+        entry.public_cayu_name: entry.contract_hash for entry in previous._refresh_binding_snapshot
+    }
+    current_binding = {
+        entry.public_cayu_name: entry.contract_hash for entry in current._refresh_binding_snapshot
+    }
+    binding_changed_keys = {
+        key
+        for key in previous_binding.keys() & current_binding.keys()
+        if previous_binding[key] != current_binding[key]
+    }
+    changed_names = changed_keys | binding_changed_keys
+
+    return McpToolsetManifestDiff(
+        server_changed=(
+            previous._manifest_snapshot.server_hash != current._manifest_snapshot.server_hash
+            or previous._binding_manifest_snapshot.server_hash
+            != current._binding_manifest_snapshot.server_hash
+        ),
+        added_tools=tuple(sorted(added_keys)),
+        removed_tools=tuple(sorted(removed_keys)),
+        changed_tools=tuple(sorted(changed_names)),
+    )
 
 
 def _redact_server_spec(

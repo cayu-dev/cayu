@@ -128,7 +128,7 @@ This requires both deterministic orchestration and LLM orchestrator agents.
 
 Cayu follows an agent/environment/session separation:
 
-- `Agent`: an `AgentSpec` — model, system prompt, and metadata. Tools, model-visible tool exposure, optional provider-neutral catalogue discovery, and tool authorization are attached separately at `register_agent(spec, tools=..., tool_exposure_policy=..., tool_discovery_mode=..., tool_policy=...)`.
+- `Agent`: an `AgentSpec` — model, system prompt, and metadata. Tools, explicit complete-source MCP registrations, model-visible tool exposure, optional provider-neutral catalogue discovery, and tool authorization are attached separately at `register_agent(spec, tools=..., mcp_toolsets=..., tool_exposure_policy=..., tool_discovery_mode=..., tool_policy=...)`.
 - `Environment`: workspace, artifact store, runner, vault, credential proxy, MCP servers, and execution metadata.
 - `Session`: one run of an agent in an environment, with messages, status, events, and checkpoints.
 

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 
 def main() -> None:
@@ -201,6 +202,17 @@ def main() -> None:
                 }
             )
         elif method == "tools/list":
+            catalogue_path = os.environ.get("CAYU_FAKE_MCP_TOOL_CATALOGUE_FILE")
+            if catalogue_path is not None:
+                tools = json.loads(Path(catalogue_path).read_text(encoding="utf-8"))
+                _write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"tools": tools},
+                    }
+                )
+                continue
             echo_tool = {
                 "name": "echo",
                 "description": "Echo text.",
@@ -245,7 +257,15 @@ def main() -> None:
                         "params": {},
                     }
                 )
-            if name != "echo":
+            catalogue_path = os.environ.get("CAYU_FAKE_MCP_TOOL_CATALOGUE_FILE")
+            known_tool_names = {"echo"}
+            if catalogue_path is not None:
+                known_tool_names = {
+                    tool.get("name")
+                    for tool in json.loads(Path(catalogue_path).read_text(encoding="utf-8"))
+                    if type(tool) is dict
+                }
+            if name not in known_tool_names:
                 _write(
                     {
                         "jsonrpc": "2.0",
