@@ -324,6 +324,7 @@ from cayu.runtime.user_input import (
     pending_user_input_interruption_payload,
 )
 from cayu.runtime.workspace_observation_recovery import (
+    WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
     WorkspaceObservationArtifactState,
     WorkspaceObservationEvidenceState,
     WorkspaceObservationLifecycle,
@@ -336,6 +337,7 @@ from cayu.runtime.workspace_observation_recovery import (
     restore_workspace_observation_cancellation_requests,
     workspace_observation_artifact_metadata_matches,
     workspace_observation_authority_matches,
+    workspace_observation_checkpoint_value,
     workspace_observation_event_digest,
     workspace_observation_observer_authority_matches,
     workspace_observation_terminal_from_delta_status,
@@ -13306,16 +13308,26 @@ class RecoveryCoordinator:
                     ):
                         terminal_status = WorkspaceObservationTerminalStatus.INCOMPLETE
                         terminal_detail = "workspace_revision_evidence_incomplete"
-                tool_outcome_available = await self._repair_workspace_observation_terminal_stage(
+                repaired_lifecycle = await self._repair_workspace_observation_terminal_stage(
                     session=session,
                     durable_lifecycle=durable_lifecycle,
                     lifecycle=lifecycle,
                     capture_status=("recorded" if delta_evidence_valid else "failed"),
                     capture_detail_code=(None if delta_evidence_valid else terminal_detail),
                 )
-                if not tool_outcome_available:
+                if repaired_lifecycle is None:
                     terminal_status = WorkspaceObservationTerminalStatus.AMBIGUOUS
                     terminal_detail = "durable_tool_outcome_evidence_missing"
+                else:
+                    durable_lifecycle = repaired_lifecycle
+                    lifecycle = lifecycle.model_copy(
+                        update={
+                            "tool_outcome_event_digest": (
+                                repaired_lifecycle.tool_outcome_event_digest
+                            ),
+                        },
+                        deep=True,
+                    )
                 final_event = prepare_runtime_event(
                     _workspace_mutation_incomplete_event(
                         lifecycle=lifecycle,
@@ -13362,17 +13374,27 @@ class RecoveryCoordinator:
                 else "worker_lost_before_tool_outcome_was_durable"
             )
 
-            if lifecycle.tool_outcome_event_id is not None and not (
-                await self._repair_workspace_observation_terminal_stage(
+            if lifecycle.tool_outcome_event_id is not None:
+                repaired_lifecycle = await self._repair_workspace_observation_terminal_stage(
                     session=session,
                     durable_lifecycle=durable_lifecycle,
                     lifecycle=lifecycle,
                     capture_status="failed",
                     capture_detail_code=detail_code,
                 )
-            ):
-                terminal_status = WorkspaceObservationTerminalStatus.AMBIGUOUS
-                detail_code = "durable_tool_outcome_evidence_missing"
+                if repaired_lifecycle is None:
+                    terminal_status = WorkspaceObservationTerminalStatus.AMBIGUOUS
+                    detail_code = "durable_tool_outcome_evidence_missing"
+                else:
+                    durable_lifecycle = repaired_lifecycle
+                    lifecycle = lifecycle.model_copy(
+                        update={
+                            "tool_outcome_event_digest": (
+                                repaired_lifecycle.tool_outcome_event_digest
+                            ),
+                        },
+                        deep=True,
+                    )
 
             terminal_event = prepare_runtime_event(
                 _workspace_mutation_incomplete_event(
@@ -13426,6 +13448,24 @@ class RecoveryCoordinator:
         if execution_profile_snapshot is None:
             raise RuntimeError(
                 "Workspace observation has no authoritative active invocation profile."
+            )
+        if (
+            pending_round.source_run_epoch is None
+            or pending_round.execution_profile_fingerprint is None
+        ):
+            raise RuntimeError(
+                "Workspace observation pending tool round has incomplete execution authority."
+            )
+        if (
+            pending_round.execution_profile_fingerprint
+            != execution_profile_snapshot.profile.fingerprint
+            or (
+                pending_round.interaction_id is not None
+                and pending_round.interaction_id != execution_profile_snapshot.interaction_id
+            )
+        ):
+            raise RuntimeError(
+                "Workspace observation conflicts with its active invocation profile."
             )
         pending_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         pending_calls = {call.tool_call_id: call for call in pending_round.tool_calls}
@@ -13524,13 +13564,18 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Workspace observation conflicts with its registered environment authority."
                 )
-            if (
-                lifecycle.interaction_id != execution_profile_snapshot.interaction_id
-                or lifecycle.source_run_epoch != execution_profile_snapshot.run_epoch
-            ):
+            if lifecycle.interaction_id != execution_profile_snapshot.interaction_id:
                 raise RuntimeError(
                     "Workspace observation conflicts with its active invocation profile."
                 )
+            # Recovery leases may rebind the active invocation profile to a
+            # newer run epoch while the pending round and workspace effect
+            # retain the epoch in which the effect was originally dispatched.
+            # Authenticate the historical effect against that durable round,
+            # while the checks above independently authenticate the round to
+            # the current immutable invocation profile.
+            if lifecycle.source_run_epoch != pending_round.source_run_epoch:
+                raise RuntimeError("Workspace observation conflicts with its pending tool round.")
             if (
                 lifecycle.model_step_id != pending_identity.model_step_id
                 or lifecycle.model_attempt_id != pending_identity.model_attempt_id
@@ -13585,7 +13630,7 @@ class RecoveryCoordinator:
             return None
         matches = [
             item
-            for item in tool_round_recovery.staged_terminal_records(pending_round)
+            for item in pending_round.staged_terminals
             if item.tool_call_id == lifecycle.tool_call_id
         ]
         if not matches:
@@ -13618,11 +13663,11 @@ class RecoveryCoordinator:
         lifecycle: WorkspaceObservationLifecycle,
         capture_status: Literal["recorded", "failed"],
         capture_detail_code: str | None,
-    ) -> bool:
-        """Repair one staged tool outcome, or verify its exact durable event."""
+    ) -> WorkspaceObservationLifecycle | None:
+        """Repair one staged tool outcome and return its exact lifecycle binding."""
 
         if lifecycle.tool_outcome_event_id is None or lifecycle.tool_outcome_event_digest is None:
-            return False
+            return None
         checkpoint = await await_workspace_observation_store_read(
             lambda: self._session_store.load_checkpoint(session.id),
             operation="Workspace observation terminal-stage checkpoint read",
@@ -13631,17 +13676,26 @@ class RecoveryCoordinator:
             checkpoint,
             redactor=self._secret_redactor,
         )
-        matching_stage = None
+        matching_raw_stages = []
+        matching_safe_stages = []
         if pending_round is not None:
-            matching_stage = next(
-                (
-                    item
-                    for item in tool_round_recovery.staged_terminal_records(pending_round)
-                    if item.tool_call_id == lifecycle.tool_call_id
-                ),
-                None,
+            matching_raw_stages = [
+                item
+                for item in pending_round.staged_terminals
+                if item.tool_call_id == lifecycle.tool_call_id
+            ]
+            matching_safe_stages = [
+                item
+                for item in tool_round_recovery.staged_terminal_records(pending_round)
+                if item.tool_call_id == lifecycle.tool_call_id
+            ]
+        if len(matching_raw_stages) > 1 or len(matching_safe_stages) > 1:
+            raise RuntimeError("Workspace observation has duplicate staged tool outcomes.")
+        if bool(matching_raw_stages) != bool(matching_safe_stages):
+            raise RuntimeError(
+                "Workspace observation staged tool outcome projection is incomplete."
             )
-        if matching_stage is None:
+        if not matching_raw_stages:
             durable = await await_workspace_observation_store_read(
                 lambda: self._session_store.query_events(
                     EventQuery(
@@ -13652,7 +13706,7 @@ class RecoveryCoordinator:
                 ),
                 operation="Workspace observation tool-outcome event read",
             )
-            return (
+            available = (
                 len(durable) == 1
                 and self._validated_workspace_observation_tool_outcome(
                     durable[0].event,
@@ -13660,12 +13714,20 @@ class RecoveryCoordinator:
                 )
                 is not None
             )
-        staged_event = self._validated_workspace_observation_tool_outcome(
-            matching_stage.event,
+            return durable_lifecycle if available else None
+        authenticated_event = self._validated_workspace_observation_tool_outcome(
+            matching_raw_stages[0].event,
             lifecycle=lifecycle,
         )
-        if staged_event is None:
+        if authenticated_event is None:
             raise RuntimeError("Workspace observation tool outcome conflicts with its stage.")
+        staged_event = self._validated_workspace_observation_tool_outcome(
+            matching_safe_stages[0].event,
+            lifecycle=lifecycle,
+            require_bound_identity=False,
+        )
+        if staged_event is None or staged_event.id != authenticated_event.id:
+            raise RuntimeError("Workspace observation safe tool outcome conflicts with its stage.")
         identity = ToolRoundIdentity(
             model_step_id=lifecycle.model_step_id,
             model_attempt_id=lifecycle.model_attempt_id,
@@ -13678,6 +13740,12 @@ class RecoveryCoordinator:
         else:
             payload["workspace_mutation_capture_detail_code"] = capture_detail_code
         staged_event = staged_event.model_copy(update={"payload": payload}, deep=True)
+        projected_lifecycle = durable_lifecycle.model_copy(
+            update={
+                "tool_outcome_event_digest": workspace_observation_event_digest(staged_event),
+            },
+            deep=True,
+        )
         stage_transform = tool_round_recovery.projected_staged_terminal_transform(
             tool_round_identity=identity,
             event=staged_event,
@@ -13694,7 +13762,15 @@ class RecoveryCoordinator:
             )
             if current != durable_lifecycle:
                 raise RuntimeError("Workspace observation changed before stage repair.")
-            return stage_transform(current_session, current_checkpoint)
+            updated_checkpoint = stage_transform(current_session, current_checkpoint)
+            observations = workspace_observations_from_checkpoint(updated_checkpoint)
+            if observations.get(durable_lifecycle.window_id) != durable_lifecycle:
+                raise RuntimeError("Workspace observation changed during stage repair.")
+            observations[durable_lifecycle.window_id] = projected_lifecycle
+            updated_checkpoint[WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY] = (
+                workspace_observation_checkpoint_value(observations)
+            )
+            return updated_checkpoint
 
         await await_workspace_observation_store_mutation(
             lambda: self._session_store.transform_checkpoint(
@@ -13703,7 +13779,7 @@ class RecoveryCoordinator:
             ),
             operation="Workspace observation terminal-stage repair",
         )
-        return True
+        return projected_lifecycle
 
     @staticmethod
     def _validated_workspace_observation_tool_outcome(
@@ -13767,7 +13843,16 @@ class RecoveryCoordinator:
             checkpoint,
             redactor=self._secret_redactor,
         )
-        matching_stages = (
+        matching_raw_stages = (
+            []
+            if pending_round is None
+            else [
+                item
+                for item in pending_round.staged_terminals
+                if item.tool_call_id == lifecycle.tool_call_id
+            ]
+        )
+        matching_safe_stages = (
             []
             if pending_round is None
             else [
@@ -13776,17 +13861,32 @@ class RecoveryCoordinator:
                 if item.tool_call_id == lifecycle.tool_call_id
             ]
         )
-        if len(matching_stages) > 1:
+        if len(matching_raw_stages) > 1 or len(matching_safe_stages) > 1:
             raise RuntimeError("Workspace observation has duplicate staged tool outcomes.")
-        if matching_stages:
+        if bool(matching_raw_stages) != bool(matching_safe_stages):
+            raise RuntimeError(
+                "Workspace observation staged tool outcome projection is incomplete."
+            )
+        if matching_raw_stages:
             if (
                 self._validated_workspace_observation_tool_outcome(
-                    matching_stages[0].event,
+                    matching_raw_stages[0].event,
                     lifecycle=lifecycle,
                 )
                 is None
             ):
                 raise RuntimeError("Workspace observation tool outcome conflicts with its stage.")
+            if (
+                self._validated_workspace_observation_tool_outcome(
+                    matching_safe_stages[0].event,
+                    lifecycle=lifecycle,
+                    require_bound_identity=False,
+                )
+                is None
+            ):
+                raise RuntimeError(
+                    "Workspace observation safe tool outcome conflicts with its stage."
+                )
             return True
         if lifecycle.tool_outcome_event_id is None:
             return False

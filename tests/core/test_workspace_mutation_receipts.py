@@ -19,6 +19,7 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime._tool_round_executor as tool_round_executor_module
+import cayu.runtime._tool_round_recovery as tool_round_recovery_module
 import cayu.tools._operation_boundary as operation_boundary_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import exception_cause, iter_exception_tree
@@ -1086,6 +1087,8 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
         self.workspace_observation_read_cancelled = False
         self.cancel_workspace_observation_mutation = False
         self.workspace_observation_mutation_cancelled = False
+        self.fail_after_recovery_projection = False
+        self.recovery_projection_failed = False
         self.hide_workspace_delta = False
         self.workspace_delta_event_id = None
 
@@ -1133,6 +1136,25 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
             self.workspace_observation_mutation_cancelled = True
             raise asyncio.CancelledError("store-owned workspace observation mutation cancellation")
         result = await super().transform_checkpoint(session_id, transform)
+        if self.fail_after_recovery_projection and not self.recovery_projection_failed:
+            checkpoint = await super().load_checkpoint(session_id)
+            pending_round = tool_round_recovery_module.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=SecretRedactor(),
+            )
+            observations = workspace_observations_from_checkpoint(checkpoint)
+            if (
+                pending_round is not None
+                and observations
+                and any(
+                    item.event.payload.get("secret_scope_incomplete") is True
+                    and item.event.payload.get("workspace_mutation_capture_status")
+                    in {"recorded", "failed"}
+                    for item in pending_round.staged_terminals
+                )
+            ):
+                self.recovery_projection_failed = True
+                raise _WorkspaceObservationProcessLoss("recovery-terminal-stage")
         if not self.failed and self.phase == "terminal-stage":
             checkpoint = await self.load_checkpoint(session_id)
             observations = None if checkpoint is None else checkpoint.get("workspace_observations")
@@ -8334,6 +8356,294 @@ def test_recovery_retains_late_artifact_intent_until_store_cleanup(
     assert hashlib.sha256(content).hexdigest() == expected_digest
 
 
+def test_workspace_observation_recovery_accepts_rebound_invocation_epoch(tmp_path) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase="after-capture")
+        workspace_root = tmp_path / "workspace"
+        artifact_root = tmp_path / "artifacts"
+        workspace_root.mkdir()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(_BulkProvider(), default=True)
+        first_app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        session_id = "session-workspace-observation-rebound-epoch"
+        with pytest.raises(_WorkspaceObservationProcessLoss, match="after-capture"):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "write many files")],
+                ),
+            )
+
+        store.failed = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        def rebound_profile(session, checkpoint):
+            assert checkpoint is not None
+            updated = copy.deepcopy(checkpoint)
+            observation = next(iter(updated["workspace_observations"].values()))
+            pending_round = updated["pending_tool_round"]
+            active_profile = updated["active_invocation_execution_profile"]
+            assert observation["source_run_epoch"] == pending_round["source_run_epoch"]
+            assert active_profile["run_epoch"] < session.run_epoch
+            active_profile["run_epoch"] = session.run_epoch
+            return updated
+
+        await store.transform_checkpoint(session_id, rebound_profile)
+        rebound_checkpoint = await store.load_checkpoint(session_id)
+        assert rebound_checkpoint is not None
+        assert (
+            next(iter(rebound_checkpoint["workspace_observations"].values()))["source_run_epoch"]
+            < rebound_checkpoint["active_invocation_execution_profile"]["run_epoch"]
+        )
+
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(_BulkProvider(), default=True)
+        recovery_app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(name="assistant", model="bulk-model"),
+            tools=[_BulkWriteTool()],
+        )
+        await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        return [
+            record.event for record in await store.query_events(EventQuery(session_id=session_id))
+        ]
+
+    durable_events = asyncio.run(run())
+
+    finalized = [
+        event for event in durable_events if event.type == EventType.WORKSPACE_OBSERVATION_FINALIZED
+    ]
+    assert len(finalized) == 1
+
+
+def test_workspace_observation_recovery_authenticates_raw_stage_before_safe_projection(
+    tmp_path,
+) -> None:
+    async def run():
+        store = _WorkspaceObservationProcessLossStore(phase="delta-publication")
+        workspace_root = tmp_path / "workspace"
+        artifact_root = tmp_path / "artifacts"
+        workspace_root.mkdir()
+        first_provider = _ScriptedProvider()
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(first_provider, default=True)
+        first_app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                runner=LocalRunner(workspace_root),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        first_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="scripted-model",
+                workflow_tool_names=("exec_command",),
+            ),
+            tools=[ExecCommandTool()],
+        )
+        session_id = "session-workspace-observation-raw-stage-authority"
+        with pytest.raises(_WorkspaceObservationProcessLoss, match="delta-publication"):
+            await collect_events(
+                first_app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "resolve")],
+                ),
+            )
+
+        def retain_incomplete_publication(_session, checkpoint):
+            assert checkpoint is not None
+            updated = copy.deepcopy(checkpoint)
+            publication = updated["pending_tool_round"]["assistant_publication"]
+            assert publication is not None
+            publication.update(
+                {
+                    "state": "blocked",
+                    "message": None,
+                    "covered_tool_call_ids": [],
+                    "secret_resolution_scope": "dynamic",
+                    "reason": "incomplete_invocation_secret_scope",
+                }
+            )
+            return updated
+
+        await store.transform_checkpoint(session_id, retain_incomplete_publication)
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        lifecycle = WorkspaceObservationLifecycle.model_validate(
+            next(iter(checkpoint["workspace_observations"].values()))
+        )
+        pending_round = tool_round_recovery_module.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=SecretRedactor(),
+        )
+        assert pending_round is not None
+        raw_stage = next(
+            item
+            for item in pending_round.staged_terminals
+            if item.tool_call_id == lifecycle.tool_call_id
+        )
+        safe_stage = next(
+            item
+            for item in tool_round_recovery_module.staged_terminal_records(pending_round)
+            if item.tool_call_id == lifecycle.tool_call_id
+        )
+        assert lifecycle.tool_outcome_event_digest == workspace_observation_event_digest(
+            raw_stage.event
+        )
+        assert workspace_observation_event_digest(
+            safe_stage.event
+        ) != workspace_observation_event_digest(raw_stage.event)
+        assert safe_stage.event.payload["secret_scope_incomplete"] is True
+        raw_stage_digest = workspace_observation_event_digest(raw_stage.event)
+
+        store.failed = True
+        store.fail_after_recovery_projection = True
+        await store.release_run_fence(session_id)
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        recovery_provider = _ScriptedProvider()
+        recovery_app = CayuApp(session_store=store, enable_logging=False)
+        recovery_app.register_provider(recovery_provider, default=True)
+        recovery_app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                runner=LocalRunner(workspace_root),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        recovery_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="scripted-model",
+                workflow_tool_names=("exec_command",),
+            ),
+            tools=[ExecCommandTool()],
+        )
+        with pytest.raises(_WorkspaceObservationProcessLoss, match="recovery-terminal-stage"):
+            await recovery_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        assert store.recovery_projection_failed is True
+        projected_checkpoint = await store.load_checkpoint(session_id)
+        projected_lifecycle = next(
+            iter(workspace_observations_from_checkpoint(projected_checkpoint).values())
+        )
+        projected_round = tool_round_recovery_module.pending_tool_round_from_checkpoint(
+            projected_checkpoint,
+            redactor=SecretRedactor(),
+        )
+        assert projected_round is not None
+        projected_stage = next(
+            item
+            for item in projected_round.staged_terminals
+            if item.tool_call_id == projected_lifecycle.tool_call_id
+        )
+        projected_stage_digest = workspace_observation_event_digest(projected_stage.event)
+        assert projected_stage_digest != raw_stage_digest
+        assert projected_lifecycle.tool_outcome_event_digest == projected_stage_digest
+
+        retry_provider = _ScriptedProvider()
+        retry_app = CayuApp(session_store=store, enable_logging=False)
+        retry_app.register_provider(retry_provider, default=True)
+        retry_app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                runner=LocalRunner(workspace_root),
+                artifact_store=LocalArtifactStore(
+                    artifact_root,
+                    store_id="artifact-store",
+                ),
+                binding=DeterministicWorkspaceBinding(),
+            ),
+            default=True,
+        )
+        retry_app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="scripted-model",
+                workflow_tool_names=("exec_command",),
+            ),
+            tools=[ExecCommandTool()],
+        )
+        recovery = await retry_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return (
+            first_provider,
+            recovery_provider,
+            retry_provider,
+            recovery,
+            projected_stage_digest,
+            [record.event for record in durable],
+        )
+
+    (
+        first_provider,
+        recovery_provider,
+        retry_provider,
+        recovery,
+        projected_stage_digest,
+        durable_events,
+    ) = asyncio.run(run())
+
+    assert first_provider.requests == 1
+    assert recovery_provider.requests == 0
+    assert retry_provider.requests == 0
+    assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+    finalized = [
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    ]
+    assert len(finalized) == 1
+    assert finalized[0].payload["tool_outcome_event_digest"] == projected_stage_digest
+
+
 @pytest.mark.parametrize(
     ("authority_update", "expected_error"),
     [
@@ -8347,7 +8657,7 @@ def test_recovery_retains_late_artifact_intent_until_store_cleanup(
         ({"source_run_epoch": 999}, "belongs to a future run epoch"),
         (
             {"source_run_epoch": 0},
-            "conflicts with its active invocation profile",
+            "conflicts with its pending tool round",
         ),
         (
             {"interaction_id": "foreign-interaction"},
