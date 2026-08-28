@@ -375,6 +375,11 @@ REVISIONS: tuple[Revision, ...] = (
     # do not touch this independent catalog, so revision-67 processes remain
     # compatible while calibration-aware EvalStore implementations require 68.
     Revision(revision=68, kind=RevisionKind.ADDITIVE, compatible_from=67),
+    # Durable agent work contexts and per-agent/task recall checkpoints are new
+    # independent authoritative records. Pre-69 binaries never read or write
+    # these tables, so the transition is additive and needs no inferred data or
+    # compatibility path.
+    Revision(revision=69, kind=RevisionKind.ADDITIVE, compatible_from=67),
 )
 
 #: The revision an empty database is initialized to.

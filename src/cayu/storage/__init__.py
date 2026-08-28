@@ -124,6 +124,7 @@ from cayu.storage.memory import (
     prepare_knowledge_relations,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.storage.work_context_sqlite import SQLiteAgentWorkContextStore
 
 __all__ = [
     "BUILTIN_KNOWLEDGE_KINDS",
@@ -234,6 +235,7 @@ __all__ = [
     "KnowledgeStatus",
     "KnowledgeStore",
     "KnowledgeVisibility",
+    "PostgresAgentWorkContextStore",
     "PostgresBudgetLedger",
     "PostgresEmbeddingKnowledgeStore",
     "PostgresEvalStore",
@@ -241,6 +243,7 @@ __all__ = [
     "PostgresKnowledgeStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
+    "SQLiteAgentWorkContextStore",
     "SQLiteBudgetLedger",
     "SQLiteEvalStore",
     "SQLiteEventWatcherStore",
@@ -265,6 +268,7 @@ def __getattr__(name: str):
         return SQLiteEvalStore
     if name in {
         "PostgresBudgetLedger",
+        "PostgresAgentWorkContextStore",
         "PostgresEmbeddingKnowledgeStore",
         "PostgresEvalStore",
         "PostgresEventWatcherStore",

@@ -18,6 +18,82 @@ The current `KnowledgeStore` is therefore one memory source. `SessionStore`
 transcript search is another. The WRRF types in `cayu.retrieval` are
 source-neutral and do not turn transcripts or artifacts into knowledge.
 
+## Durable agent work context and recall checkpoints
+
+`AgentWorkContext` is the application's immutable, revisioned description of
+what one stable task is currently about: its goal, scope identities, optional
+workflow position, and bounded entity, artifact, repository-path, code-symbol,
+and planned-action identities. It is application/runtime-owned state. It is not
+prompt text, a model-authored plan, a `TaskStore` replacement, or another
+workflow engine. Cayu never makes it provider-visible by itself.
+
+`AgentWorkContextStore` deliberately remains a narrow independent boundary.
+Its in-memory, SQLite, and PostgreSQL implementations retain exact historical
+revisions and one indexed current pointer. Creation and append use
+compare-and-swap; a stale concurrent writer cannot overwrite the winner.
+Publication operation IDs provide exact replay receipts. Publishing
+semantically identical content records a no-change receipt without inventing a
+new revision. The API exposes exact current, revision, receipt, and checkpoint
+reads only; it has no unbounded task-list operation. Storage revision 69 adds
+only empty authoritative tables and does not infer, copy, or backfill context
+from tasks, sessions, transcripts, or knowledge.
+
+The PostgreSQL implementation accepts caller-owned pools only when they retain
+the built-in transactional connection and cursor behavior. Autocommit pools,
+behavior-changing callbacks, subclasses, and configuration drift fail before
+mutation authority is acquired, preserving atomic history/head/receipt writes
+and transaction-scoped advisory locks.
+
+`AgentRecallCheckpoint` is a separate compare-and-swap record for one exact
+agent, task, knowledge namespace, and access-policy fingerprint. It binds the
+work-context revision and hash, the captured knowledge-change and
+semantic-index-readiness high-water marks, and the last safely processed
+sequence within each captured frontier. Its meaning is intentionally narrow:
+the named processor completed that bounded freshness range against that exact
+work context. It is not evidence of relevance, attention, provider exposure,
+notification consumption, task completion, or side-effect authority.
+
+For an unchanged work context, a checkpoint may advance monotonically through
+the future delta-processing lane, but neither processed sequence may exceed
+the high-water mark captured from its owning durable source, and captured
+high-water marks never regress for the same checkpoint key. Advancement binds
+only the task's current work-context revision and hash; PostgreSQL shares that
+task fence among checkpoint writers and excludes concurrent context
+publication while the binding is committed. A changed work-context hash
+requires a full-index processing result before the checkpoint can move; an old
+delta cursor is never silently inherited in a way that would make older
+knowledge ineligible. Changing the access-policy fingerprint creates a distinct
+checkpoint key. The compare-and-swap revision and processed sequences establish
+ordering; `updated_at` is attributable event time and is not used as concurrency
+authority because distributed worker clocks may skew.
+Checkpoint advancement happens only after processing, so a crash or
+cancellation beforehand leaves the prior frontier available for an idempotent
+retry. This release stores those facts only; it does not run the future
+full-index/delta coordinator or wake an idle agent.
+
+The nearby context concepts have different lifetimes and owners:
+
+- `RecallSituation` is ephemeral caller input for one retrieval boundary. Its
+  optional `work_context` text may be derived from a durable
+  `AgentWorkContext`, but the two are not interchangeable.
+- A provider-facing memory focus or future memory delta is a bounded context
+  composition outcome. The runtime context composer alone decides its content
+  and placement; the durable work-context store does not inject either.
+- `TaskStore` and application workflow state retain scheduling, lifecycle, and
+  authority. Work-context workflow fields are descriptive foreign identities,
+  not control-plane commands.
+- `RecallReceipt` records retrieval and admission, while `ContextExposure`
+  records what reached a provider boundary. Neither fact can be inferred from
+  a recall checkpoint.
+- A future notification consumer must keep its own delivery/consumption
+  evidence. Advancing a checkpoint does not acknowledge a notification.
+
+The checked [agent work-context performance baseline](../benchmarks/memory/agent-work-context-performance-v1.json)
+measures current-runtime zero-record store construction, indexed current reads,
+CAS revision appends, CAS checkpoint advances, and incremental SQLite storage
+without provider calls. Its runner and fixed regression ceilings are documented
+with the other hermetic memory benchmarks.
+
 ## Bounded cross-source recall
 
 `RecallEngine` runs registered `RecallSource` adapters concurrently under

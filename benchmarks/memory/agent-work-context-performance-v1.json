@@ -1,0 +1,87 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_checkpoint_advance_p95_ms": 5.0,
+    "memory_current_read_p95_ms": 1.0,
+    "memory_revision_append_p95_ms": 5.0,
+    "memory_zero_record_construction_p95_ms": 1.0,
+    "sqlite_checkpoint_advance_p50_ms": 25.0,
+    "sqlite_checkpoint_advance_p95_ms": 250.0,
+    "sqlite_current_read_p95_ms": 10.0,
+    "sqlite_revision_append_p50_ms": 25.0,
+    "sqlite_revision_append_p95_ms": 250.0,
+    "sqlite_storage_bytes_per_durable_record": 32768,
+    "sqlite_zero_record_construction_p50_ms": 50.0,
+    "sqlite_zero_record_construction_p95_ms": 250.0
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "current_store_with_zero_work_context_records"
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "checkpoint_advance_latency": {
+        "p50_ms": 0.052187,
+        "p95_ms": 0.075333
+      },
+      "current_read_latency": {
+        "p50_ms": 0.235459,
+        "p95_ms": 0.291667
+      },
+      "durable_record_count": 153,
+      "incremental_storage_bytes": null,
+      "populated_storage_bytes": null,
+      "revision_append_latency": {
+        "p50_ms": 0.975875,
+        "p95_ms": 1.159375
+      },
+      "sample_count": 50,
+      "storage_bytes_per_durable_record": null,
+      "zero_record_construction_latency": {
+        "p50_ms": 0.000625,
+        "p95_ms": 0.001208
+      },
+      "zero_record_storage_bytes": null
+    },
+    {
+      "backend": "sqlite",
+      "checkpoint_advance_latency": {
+        "p50_ms": 0.660104,
+        "p95_ms": 0.80575
+      },
+      "current_read_latency": {
+        "p50_ms": 0.449416,
+        "p95_ms": 0.521458
+      },
+      "durable_record_count": 153,
+      "incremental_storage_bytes": 176128,
+      "populated_storage_bytes": 1626112,
+      "revision_append_latency": {
+        "p50_ms": 1.366875,
+        "p95_ms": 1.514292
+      },
+      "sample_count": 50,
+      "storage_bytes_per_durable_record": 1151.163399,
+      "zero_record_construction_latency": {
+        "p50_ms": 6.948084,
+        "p95_ms": 7.162834
+      },
+      "zero_record_storage_bytes": 1449984
+    }
+  ],
+  "schema_version": "cayu.agent_work_context_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "backends": [
+      "memory",
+      "sqlite"
+    ],
+    "provider_calls": 0,
+    "samples": 50
+  }
+}

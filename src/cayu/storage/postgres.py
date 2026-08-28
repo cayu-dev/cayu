@@ -586,6 +586,7 @@ from cayu.storage import migrations as schema
 from cayu.storage._postgres_verified_work import (
     PostgresVerifiedWorkMixin,
     _PostgresMutationConnectionOwner,
+    _require_quiescent_postgres_mutation_connection,
     _require_quiescent_postgres_mutation_pool,
 )
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
@@ -758,6 +759,24 @@ from cayu.storage.memory import (
     prepare_knowledge_maintenance_decision,
     prepare_knowledge_publication,
     prepare_knowledge_relations,
+)
+from cayu.work_context import (
+    AgentRecallCheckpoint,
+    AgentRecallCheckpointKey,
+    AgentWorkContext,
+    AgentWorkContextConflict,
+    AgentWorkContextPublicationReceipt,
+    AgentWorkContextStore,
+    _bounded_identity,
+    _positive_revision,
+    agent_work_context_publication_request_sha256,
+    copy_agent_recall_checkpoint,
+    copy_agent_recall_checkpoint_key,
+    copy_agent_work_context,
+    copy_agent_work_context_publication_receipt,
+    validate_agent_recall_checkpoint_advance,
+    validate_agent_recall_checkpoint_work_context,
+    validate_agent_work_context_publication,
 )
 
 # A fixed 63-bit advisory-lock key. Every Cayu store sharing a database takes this
@@ -3196,6 +3215,124 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    69: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_work_context_revisions (
+            task_id TEXT COLLATE "C" NOT NULL,
+            revision INTEGER NOT NULL CHECK (
+                revision > 0 AND revision <= 2147483647
+            ),
+            content_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                content_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            operation_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            record_json JSONB NOT NULL CHECK (jsonb_typeof(record_json) = 'object'),
+            published_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (task_id, revision)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_work_context_heads (
+            task_id TEXT COLLATE "C" PRIMARY KEY,
+            current_revision INTEGER NOT NULL CHECK (
+                current_revision > 0 AND current_revision <= 2147483647
+            ),
+            FOREIGN KEY (task_id, current_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_work_context_publications (
+            operation_id TEXT COLLATE "C" PRIMARY KEY,
+            task_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            context_revision INTEGER NOT NULL CHECK (
+                context_revision > 0 AND context_revision <= 2147483647
+            ),
+            changed BOOLEAN NOT NULL,
+            receipt_json JSONB NOT NULL CHECK (jsonb_typeof(receipt_json) = 'object'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            FOREIGN KEY (task_id, context_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_checkpoints (
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                access_policy_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            revision INTEGER NOT NULL CHECK (
+                revision > 0 AND revision <= 2147483647
+            ),
+            work_context_revision INTEGER NOT NULL CHECK (
+                work_context_revision > 0 AND work_context_revision <= 2147483647
+            ),
+            work_context_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                work_context_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            knowledge_sequence BIGINT NOT NULL CHECK (
+                knowledge_sequence >= 0
+                AND knowledge_sequence <= 9223372036854775807
+            ),
+            index_readiness_sequence BIGINT NOT NULL CHECK (
+                index_readiness_sequence >= 0
+                AND index_readiness_sequence <= 9223372036854775807
+            ),
+            knowledge_high_water_sequence BIGINT NOT NULL CHECK (
+                knowledge_high_water_sequence >= 0
+                AND knowledge_high_water_sequence <= 9223372036854775807
+            ),
+            index_readiness_high_water_sequence BIGINT NOT NULL CHECK (
+                index_readiness_high_water_sequence >= 0
+                AND index_readiness_high_water_sequence <= 9223372036854775807
+            ),
+            processing_mode TEXT COLLATE "C" NOT NULL CHECK (
+                processing_mode IN ('full_index', 'delta')
+            ),
+            processing_id TEXT COLLATE "C" NOT NULL,
+            operation_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            record_json JSONB NOT NULL CHECK (jsonb_typeof(record_json) = 'object'),
+            updated_at TIMESTAMPTZ NOT NULL,
+            CHECK (knowledge_sequence <= knowledge_high_water_sequence),
+            CHECK (index_readiness_sequence <= index_readiness_high_water_sequence),
+            PRIMARY KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, revision
+            ),
+            FOREIGN KEY (task_id, work_context_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_checkpoint_heads (
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            current_revision INTEGER NOT NULL CHECK (
+                current_revision > 0 AND current_revision <= 2147483647
+            ),
+            PRIMARY KEY (
+                agent_id, task_id, knowledge_namespace, access_policy_sha256
+            ),
+            FOREIGN KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, current_revision
+            ) REFERENCES cayu_agent_recall_checkpoints(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, revision
+            ) ON DELETE RESTRICT
+        )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4761,6 +4898,8 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_maintenance_schema(cur)
                         if current_state.revision >= 67:
                             await self._validate_knowledge_maintenance_proposal_schema(cur)
+                        if current_state.revision >= 69:
+                            await self._validate_agent_work_context_schema(cur)
                         if self._min_required_revision >= 45:
                             await self._validate_task_retry_series_schema(cur)
                         if self._min_required_revision >= 46:
@@ -4969,6 +5108,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_maintenance_schema(cur)
         if state.revision >= 67:
             await self._validate_knowledge_maintenance_proposal_schema(cur)
+        if state.revision >= 69:
+            await self._validate_agent_work_context_schema(cur)
         if self._min_required_revision >= 45:
             await self._validate_task_retry_series_schema(cur)
         if self._min_required_revision >= 46:
@@ -5135,6 +5276,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_maintenance_proposal_schema(cur)
         if revision.revision == 68:
             await self._validate_eval_judge_calibration_schema(cur)
+        if revision.revision == 69:
+            await self._validate_agent_work_context_schema(cur)
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -6472,6 +6615,275 @@ class _PostgresStoreBase:
             f"{name!r} conflicts with Cayu's pending maintenance proposal "
             "contract. Recreate the prerelease knowledge schema with "
             "schema_mode=CREATE or MIGRATE."
+        )
+
+    async def _validate_agent_work_context_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_agent_work_context_revisions": (
+                ("task_id", "text", "NO", "C"),
+                ("revision", "integer", "NO", None),
+                ("content_sha256", "text", "NO", "C"),
+                ("operation_id", "text", "NO", "C"),
+                ("record_json", "jsonb", "NO", None),
+                ("published_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_work_context_heads": (
+                ("task_id", "text", "NO", "C"),
+                ("current_revision", "integer", "NO", None),
+            ),
+            "cayu_agent_work_context_publications": (
+                ("operation_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("context_revision", "integer", "NO", None),
+                ("changed", "boolean", "NO", None),
+                ("receipt_json", "jsonb", "NO", None),
+                ("committed_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_checkpoints": (
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("revision", "integer", "NO", None),
+                ("work_context_revision", "integer", "NO", None),
+                ("work_context_sha256", "text", "NO", "C"),
+                ("knowledge_sequence", "bigint", "NO", None),
+                ("index_readiness_sequence", "bigint", "NO", None),
+                ("knowledge_high_water_sequence", "bigint", "NO", None),
+                ("index_readiness_high_water_sequence", "bigint", "NO", None),
+                ("processing_mode", "text", "NO", "C"),
+                ("processing_id", "text", "NO", "C"),
+                ("operation_id", "text", "NO", "C"),
+                ("record_json", "jsonb", "NO", None),
+                ("updated_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_checkpoint_heads": (
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("current_revision", "integer", "NO", None),
+            ),
+        }
+        for table, expected in expected_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable, collation_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_agent_work_context_schema_error(table)
+
+        required_constraints = {
+            "cayu_agent_work_context_revisions": (
+                ("p", ("primary key (task_id, revision)",), ("task_id", "revision")),
+                ("u", ("unique (operation_id)",), ("operation_id",)),
+                ("c", ("revision", "> 0", "2147483647"), ("revision",)),
+                ("c", ("content_sha256", "[0-9a-f]{64}"), ("content_sha256",)),
+                ("c", ("jsonb_typeof(record_json)", "object"), ("record_json",)),
+            ),
+            "cayu_agent_work_context_heads": (
+                ("p", ("primary key (task_id)",), ("task_id",)),
+                (
+                    "c",
+                    ("current_revision", "> 0", "2147483647"),
+                    ("current_revision",),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (task_id, current_revision) references ",
+                        "cayu_agent_work_context_revisions(task_id, revision)",
+                        "on delete restrict",
+                    ),
+                    ("task_id", "current_revision"),
+                ),
+            ),
+            "cayu_agent_work_context_publications": (
+                ("p", ("primary key (operation_id)",), ("operation_id",)),
+                (
+                    "f",
+                    (
+                        "foreign key (task_id, context_revision) references ",
+                        "cayu_agent_work_context_revisions(task_id, revision)",
+                        "on delete restrict",
+                    ),
+                    ("task_id", "context_revision"),
+                ),
+                ("c", ("request_sha256", "[0-9a-f]{64}"), ("request_sha256",)),
+                (
+                    "c",
+                    ("context_revision", "> 0", "2147483647"),
+                    ("context_revision",),
+                ),
+                ("c", ("jsonb_typeof(receipt_json)", "object"), ("receipt_json",)),
+            ),
+            "cayu_agent_recall_checkpoints": (
+                (
+                    "p",
+                    (
+                        "primary key (agent_id, task_id, knowledge_namespace, ",
+                        "access_policy_sha256, revision)",
+                    ),
+                    (
+                        "agent_id",
+                        "task_id",
+                        "knowledge_namespace",
+                        "access_policy_sha256",
+                        "revision",
+                    ),
+                ),
+                ("u", ("unique (operation_id)",), ("operation_id",)),
+                (
+                    "f",
+                    (
+                        "foreign key (task_id, work_context_revision) references ",
+                        "cayu_agent_work_context_revisions(task_id, revision)",
+                        "on delete restrict",
+                    ),
+                    ("task_id", "work_context_revision"),
+                ),
+                ("c", ("revision", "> 0", "2147483647"), ("revision",)),
+                (
+                    "c",
+                    ("work_context_revision", "> 0", "2147483647"),
+                    ("work_context_revision",),
+                ),
+                (
+                    "c",
+                    ("access_policy_sha256", "[0-9a-f]{64}"),
+                    ("access_policy_sha256",),
+                ),
+                (
+                    "c",
+                    ("work_context_sha256", "[0-9a-f]{64}"),
+                    ("work_context_sha256",),
+                ),
+                (
+                    "c",
+                    ("knowledge_sequence", ">= 0", "9223372036854775807"),
+                    ("knowledge_sequence",),
+                ),
+                (
+                    "c",
+                    ("index_readiness_sequence", ">= 0", "9223372036854775807"),
+                    ("index_readiness_sequence",),
+                ),
+                (
+                    "c",
+                    ("knowledge_high_water_sequence", ">= 0", "9223372036854775807"),
+                    ("knowledge_high_water_sequence",),
+                ),
+                (
+                    "c",
+                    (
+                        "index_readiness_high_water_sequence",
+                        ">= 0",
+                        "9223372036854775807",
+                    ),
+                    ("index_readiness_high_water_sequence",),
+                ),
+                (
+                    "c",
+                    ("knowledge_sequence", "<=", "knowledge_high_water_sequence"),
+                    ("knowledge_sequence", "knowledge_high_water_sequence"),
+                ),
+                (
+                    "c",
+                    (
+                        "index_readiness_sequence",
+                        "<=",
+                        "index_readiness_high_water_sequence",
+                    ),
+                    ("index_readiness_sequence", "index_readiness_high_water_sequence"),
+                ),
+                ("c", ("processing_mode", "full_index", "delta"), ("processing_mode",)),
+                ("c", ("jsonb_typeof(record_json)", "object"), ("record_json",)),
+            ),
+            "cayu_agent_recall_checkpoint_heads": (
+                (
+                    "p",
+                    (
+                        "primary key (agent_id, task_id, knowledge_namespace, ",
+                        "access_policy_sha256)",
+                    ),
+                    ("agent_id", "task_id", "knowledge_namespace", "access_policy_sha256"),
+                ),
+                (
+                    "c",
+                    ("current_revision", "> 0", "2147483647"),
+                    ("current_revision",),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (agent_id, task_id, knowledge_namespace, ",
+                        "access_policy_sha256, current_revision) references ",
+                        "cayu_agent_recall_checkpoints(agent_id, task_id, ",
+                        "knowledge_namespace, access_policy_sha256, revision)",
+                        "on delete restrict",
+                    ),
+                    (
+                        "agent_id",
+                        "task_id",
+                        "knowledge_namespace",
+                        "access_policy_sha256",
+                        "current_revision",
+                    ),
+                ),
+            ),
+        }
+        for table, required in required_constraints.items():
+            await cur.execute(
+                """
+                SELECT constraint_record.contype,
+                       pg_get_constraintdef(constraint_record.oid),
+                       constraint_record.conkey
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = %s
+                """,
+                (table,),
+            )
+            actual = tuple(
+                (
+                    str(kind),
+                    " ".join(str(definition).lower().split()),
+                    tuple(int(column) for column in (constrained_columns or ())),
+                )
+                for kind, definition, constrained_columns in await cur.fetchall()
+            )
+            column_numbers = {
+                column[0]: index for index, column in enumerate(expected_columns[table], start=1)
+            }
+            for expected_kind, fragments, constrained_column_names in required:
+                expected_conkey = tuple(
+                    column_numbers[column_name] for column_name in constrained_column_names
+                )
+                if not any(
+                    kind == expected_kind
+                    and conkey == expected_conkey
+                    and all(fragment in definition for fragment in fragments)
+                    for kind, definition, conkey in actual
+                ):
+                    self._raise_agent_work_context_schema_error(table)
+
+    @staticmethod
+    def _raise_agent_work_context_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's agent work-context/checkpoint contract. "
+            "Run schema_mode=MIGRATE to install the additive revision or recreate "
+            "the database."
         )
 
     async def _validate_knowledge_index_readiness_schema(self, cur: Any) -> None:
@@ -10436,6 +10848,449 @@ async def _lock_knowledge_change_sequence(cur: Any) -> None:
     await cur.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended('cayu-knowledge-change-sequence', 0))"
     )
+
+
+async def _lock_agent_work_context_identity(
+    cur: Any,
+    category: str,
+    identity: str,
+) -> None:
+    """Serialize one work-context identity without exposing it as a lock key."""
+
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"cayu-agent-work-context:{category}:{identity}",),
+    )
+
+
+async def _lock_agent_work_context_identity_shared(
+    cur: Any,
+    category: str,
+    identity: str,
+) -> None:
+    """Share one work-context identity lock with readers that publish progress."""
+
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+        (f"cayu-agent-work-context:{category}:{identity}",),
+    )
+
+
+class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
+    """PostgreSQL work-context/checkpoint store with transaction-fenced CAS."""
+
+    _min_required_revision = 69
+
+    def __init__(
+        self,
+        conninfo: str | None = None,
+        *,
+        pool: AsyncConnectionPool | None = None,
+        min_size: int = 1,
+        max_size: int = 8,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if pool is not None:
+            _require_quiescent_postgres_mutation_pool(
+                pool,
+                boundary_name="work-context",
+            )
+        self._clock = utc_clock(clock)
+        super().__init__(
+            conninfo,
+            pool=pool,
+            min_size=min_size,
+            max_size=max_size,
+            schema_mode=schema_mode,
+        )
+        self._postgres_mutation_allowed_configure = (
+            None if pool is not None else _configure_store_connection
+        )
+        _require_quiescent_postgres_mutation_pool(
+            self._pool,
+            allowed_configure=self._postgres_mutation_allowed_configure,
+            boundary_name="work-context",
+        )
+
+    async def _ensure_ready(self) -> None:
+        _require_quiescent_postgres_mutation_pool(
+            self._pool,
+            allowed_configure=self._postgres_mutation_allowed_configure,
+            boundary_name="work-context",
+        )
+        await super()._ensure_ready()
+
+    @asynccontextmanager
+    async def _mutation_cursor(self) -> AsyncIterator[Any]:
+        async with self._pool.connection() as conn:
+            _require_quiescent_postgres_mutation_connection(
+                conn,
+                boundary_name="work-context",
+            )
+            async with conn.cursor() as cur:
+                yield cur
+
+    async def publish_work_context(
+        self,
+        context: AgentWorkContext,
+        *,
+        expected_revision: int | None,
+    ) -> AgentWorkContextPublicationReceipt:
+        context = copy_agent_work_context(context)
+        request_sha256 = agent_work_context_publication_request_sha256(
+            context,
+            expected_revision,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "publication-operation",
+                context.operation_id,
+            )
+            replay = await self._load_publication(cur, context.operation_id)
+            if replay is not None:
+                if replay.request_sha256 != request_sha256:
+                    raise AgentWorkContextConflict("publication_operation_reused")
+                return copy_agent_work_context_publication_receipt(replay)
+            await _lock_agent_work_context_identity(cur, "task", context.task_id)
+            current = await self._load_context(cur, context.task_id, revision=None)
+            validate_agent_work_context_publication(
+                context,
+                expected_revision,
+                current,
+            )
+            changed = current is None or current.content_sha256 != context.content_sha256
+            result = context if changed else current
+            assert result is not None
+            receipt = AgentWorkContextPublicationReceipt(
+                operation_id=context.operation_id,
+                request_sha256=request_sha256,
+                expected_revision=expected_revision,
+                requested_content_sha256=context.content_sha256,
+                changed=changed,
+                context=result,
+                committed_at=self._clock(),
+            )
+            if changed:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_agent_work_context_revisions (
+                        task_id, revision, content_sha256, operation_id,
+                        record_json, published_at
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                    """,
+                    (
+                        context.task_id,
+                        context.revision,
+                        context.content_sha256,
+                        context.operation_id,
+                        _dumps(context.model_dump(mode="json")),
+                        context.published_at,
+                    ),
+                )
+                if expected_revision is None:
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_agent_work_context_heads (
+                            task_id, current_revision
+                        ) VALUES (%s, %s)
+                        """,
+                        (context.task_id, context.revision),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE cayu_agent_work_context_heads
+                        SET current_revision = %s
+                        WHERE task_id = %s AND current_revision = %s
+                        """,
+                        (
+                            context.revision,
+                            context.task_id,
+                            expected_revision,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise AgentWorkContextConflict("stale_context_revision")
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_work_context_publications (
+                    operation_id, task_id, request_sha256, context_revision,
+                    changed, receipt_json, committed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    receipt.operation_id,
+                    result.task_id,
+                    receipt.request_sha256,
+                    result.revision,
+                    receipt.changed,
+                    _dumps(receipt.model_dump(mode="json")),
+                    receipt.committed_at,
+                ),
+            )
+            return copy_agent_work_context_publication_receipt(receipt)
+
+    async def load_work_context(
+        self,
+        task_id: str,
+        *,
+        revision: int | None = None,
+    ) -> AgentWorkContext | None:
+        task_id = _bounded_identity(task_id, "task_id")
+        if revision is not None:
+            _positive_revision(revision, "revision")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            context = await self._load_context(cur, task_id, revision=revision)
+            return None if context is None else copy_agent_work_context(context)
+
+    async def load_work_context_publication(
+        self,
+        operation_id: str,
+    ) -> AgentWorkContextPublicationReceipt | None:
+        operation_id = _bounded_identity(operation_id, "operation_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            receipt = await self._load_publication(cur, operation_id)
+            return None if receipt is None else copy_agent_work_context_publication_receipt(receipt)
+
+    async def advance_recall_checkpoint(
+        self,
+        checkpoint: AgentRecallCheckpoint,
+        *,
+        expected_revision: int | None,
+    ) -> AgentRecallCheckpoint:
+        if expected_revision is not None:
+            _positive_revision(expected_revision, "expected_revision")
+        checkpoint = copy_agent_recall_checkpoint(checkpoint)
+        key = checkpoint.key()
+        key_identity = key.fingerprint()
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "checkpoint-operation",
+                checkpoint.operation_id,
+            )
+            replay = await self._load_checkpoint_by_operation(
+                cur,
+                checkpoint.operation_id,
+            )
+            if replay is not None:
+                replay_expected_revision = None if replay.revision == 1 else replay.revision - 1
+                if replay != checkpoint or expected_revision != replay_expected_revision:
+                    raise AgentWorkContextConflict("checkpoint_operation_reused")
+                return copy_agent_recall_checkpoint(replay)
+            await _lock_agent_work_context_identity(cur, "checkpoint", key_identity)
+            await _lock_agent_work_context_identity_shared(
+                cur,
+                "task",
+                checkpoint.task_id,
+            )
+            work_context = await self._load_context(
+                cur,
+                checkpoint.task_id,
+                revision=checkpoint.work_context_revision,
+            )
+            current_work_context = await self._load_context(
+                cur,
+                checkpoint.task_id,
+                revision=None,
+            )
+            validate_agent_recall_checkpoint_work_context(
+                checkpoint,
+                work_context,
+                current_work_context,
+            )
+            current = await self._load_checkpoint(cur, key, revision=None)
+            validate_agent_recall_checkpoint_advance(
+                checkpoint,
+                expected_revision,
+                current,
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_checkpoints (
+                    agent_id, task_id, knowledge_namespace, access_policy_sha256,
+                    revision, work_context_revision, work_context_sha256,
+                    knowledge_sequence, index_readiness_sequence, processing_mode,
+                    knowledge_high_water_sequence,
+                    index_readiness_high_water_sequence,
+                    processing_id, operation_id, record_json, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                )
+                """,
+                (
+                    checkpoint.agent_id,
+                    checkpoint.task_id,
+                    checkpoint.knowledge_namespace,
+                    checkpoint.access_policy_sha256,
+                    checkpoint.revision,
+                    checkpoint.work_context_revision,
+                    checkpoint.work_context_sha256,
+                    checkpoint.knowledge_sequence,
+                    checkpoint.index_readiness_sequence,
+                    checkpoint.processing_mode.value,
+                    checkpoint.knowledge_high_water_sequence,
+                    checkpoint.index_readiness_high_water_sequence,
+                    checkpoint.processing_id,
+                    checkpoint.operation_id,
+                    _dumps(checkpoint.model_dump(mode="json")),
+                    checkpoint.updated_at,
+                ),
+            )
+            if current is None:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_agent_recall_checkpoint_heads (
+                        agent_id, task_id, knowledge_namespace,
+                        access_policy_sha256, current_revision
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (*key.sort_key(), checkpoint.revision),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE cayu_agent_recall_checkpoint_heads
+                    SET current_revision = %s
+                    WHERE agent_id = %s AND task_id = %s
+                      AND knowledge_namespace = %s AND access_policy_sha256 = %s
+                      AND current_revision = %s
+                    """,
+                    (
+                        checkpoint.revision,
+                        *key.sort_key(),
+                        expected_revision,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise AgentWorkContextConflict("stale_checkpoint_revision")
+            return copy_agent_recall_checkpoint(checkpoint)
+
+    async def load_recall_checkpoint(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        revision: int | None = None,
+    ) -> AgentRecallCheckpoint | None:
+        key = copy_agent_recall_checkpoint_key(key)
+        if revision is not None:
+            _positive_revision(revision, "revision")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            checkpoint = await self._load_checkpoint(cur, key, revision=revision)
+            return None if checkpoint is None else copy_agent_recall_checkpoint(checkpoint)
+
+    @staticmethod
+    async def _load_context(
+        cur: Any,
+        task_id: str,
+        *,
+        revision: int | None,
+    ) -> AgentWorkContext | None:
+        if revision is None:
+            await cur.execute(
+                """
+                SELECT revision.record_json::text
+                FROM cayu_agent_work_context_heads AS head
+                JOIN cayu_agent_work_context_revisions AS revision
+                  ON revision.task_id = head.task_id
+                 AND revision.revision = head.current_revision
+                WHERE head.task_id = %s
+                """,
+                (task_id,),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT record_json::text
+                FROM cayu_agent_work_context_revisions
+                WHERE task_id = %s AND revision = %s
+                """,
+                (task_id, revision),
+            )
+        row = await cur.fetchone()
+        return None if row is None else AgentWorkContext.model_validate_json(str(row[0]))
+
+    @staticmethod
+    async def _load_publication(
+        cur: Any,
+        operation_id: str,
+    ) -> AgentWorkContextPublicationReceipt | None:
+        await cur.execute(
+            """
+            SELECT receipt_json::text
+            FROM cayu_agent_work_context_publications
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else AgentWorkContextPublicationReceipt.model_validate_json(str(row[0]))
+        )
+
+    @staticmethod
+    async def _load_checkpoint(
+        cur: Any,
+        key: AgentRecallCheckpointKey,
+        *,
+        revision: int | None,
+    ) -> AgentRecallCheckpoint | None:
+        if revision is None:
+            await cur.execute(
+                """
+                SELECT checkpoint.record_json::text
+                FROM cayu_agent_recall_checkpoint_heads AS head
+                JOIN cayu_agent_recall_checkpoints AS checkpoint
+                  ON checkpoint.agent_id = head.agent_id
+                 AND checkpoint.task_id = head.task_id
+                 AND checkpoint.knowledge_namespace = head.knowledge_namespace
+                 AND checkpoint.access_policy_sha256 = head.access_policy_sha256
+                 AND checkpoint.revision = head.current_revision
+                WHERE head.agent_id = %s AND head.task_id = %s
+                  AND head.knowledge_namespace = %s
+                  AND head.access_policy_sha256 = %s
+                """,
+                key.sort_key(),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT record_json::text
+                FROM cayu_agent_recall_checkpoints
+                WHERE agent_id = %s AND task_id = %s
+                  AND knowledge_namespace = %s AND access_policy_sha256 = %s
+                  AND revision = %s
+                """,
+                (*key.sort_key(), revision),
+            )
+        row = await cur.fetchone()
+        return None if row is None else AgentRecallCheckpoint.model_validate_json(str(row[0]))
+
+    @staticmethod
+    async def _load_checkpoint_by_operation(
+        cur: Any,
+        operation_id: str,
+    ) -> AgentRecallCheckpoint | None:
+        await cur.execute(
+            """
+            SELECT record_json::text
+            FROM cayu_agent_recall_checkpoints
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else AgentRecallCheckpoint.model_validate_json(str(row[0]))
 
 
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):

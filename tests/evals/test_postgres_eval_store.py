@@ -334,7 +334,7 @@ def test_postgres_revision_sixty_eight_rejects_missing_calibration_constraint(
                     "ALTER TABLE cayu_eval_judge_calibrations DROP CONSTRAINT "
                     "cayu_eval_judge_calibrations_document_size_check"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 68")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 68")
             await conn.commit()
 
         conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)

@@ -130,6 +130,36 @@ request footprints advance to schema version 7 and expose only protocol,
 candidate/loaded counts, and hosted generation identity; candidate names,
 descriptions, schemas, searches, and arguments remain private.
 
+### Agent work context and recall progress are durable, revisioned facts
+
+Applications can publish a bounded `AgentWorkContext` under a stable task ID and
+retain immutable exact revisions across restarts. Semantic no-change publication
+does not fabricate a revision, while exact operation receipts and
+compare-and-swap current pointers make retry and concurrent writers
+deterministic. A narrow `AgentWorkContextStore` has copy-safe in-memory, SQLite,
+and PostgreSQL implementations without expanding `TaskStore` or
+`KnowledgeStore`.
+
+`AgentRecallCheckpoint` independently records the captured knowledge-change
+and semantic-index-readiness high-water marks plus the frontiers processed by
+one exact agent/task/namespace/access view. Advances are monotonic,
+compare-and-swap fenced, and cannot move beyond either captured source
+frontier or lower a previously captured high-water mark. Only the task's current
+work-context revision and hash may become the new checkpoint basis. A
+work-context change requires a full-index processing basis, preventing an old
+delta cursor from making older knowledge permanently ineligible. CAS revisions
+and processed sequences—not caller wall-clock timestamps—order progress, so
+clock skew cannot strand a valid checkpoint.
+Checkpoints do not claim provider exposure, notification consumption,
+relevance, or task completion; runtime recall coordination remains a later
+layer.
+
+Additive storage revision 69 installs only the new empty authoritative tables.
+It performs no task, session, transcript, or knowledge backfill and adds no
+legacy compatibility path. The hermetic performance baseline covers zero-record
+construction, indexed current reads, revision appends, checkpoint advances, and
+incremental SQLite storage.
+
 ### Evals add structured, bounded model-judge contracts
 
 Portable corpus schema V2 can pin a server-published judge profile and evaluate

@@ -1996,7 +1996,10 @@ def test_sqlite_revision_67_adds_empty_proposal_storage_without_backfill(tmp_pat
     store._connection.close()
     connection = sqlite_support.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 68
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema_migrations.LATEST_REVISION
+        )
         assert (
             connection.execute(
                 "SELECT text FROM cayu_knowledge_revisions "

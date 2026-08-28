@@ -3129,6 +3129,126 @@ _MIGRATION_STEPS: dict[int, str] = {
             )
         );
     """,
+    69: """
+        CREATE TABLE IF NOT EXISTS cayu_agent_work_context_revisions (
+            task_id TEXT COLLATE BINARY NOT NULL,
+            revision INTEGER NOT NULL CHECK (
+                revision > 0 AND revision <= 2147483647
+            ),
+            content_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(content_sha256) = 64
+                AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            operation_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+            record_json TEXT NOT NULL CHECK (
+                json_valid(record_json) AND json_type(record_json) = 'object'
+            ),
+            published_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, revision)
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_work_context_heads (
+            task_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            current_revision INTEGER NOT NULL CHECK (
+                current_revision > 0 AND current_revision <= 2147483647
+            ),
+            FOREIGN KEY (task_id, current_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_work_context_publications (
+            operation_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            task_id TEXT COLLATE BINARY NOT NULL,
+            request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            context_revision INTEGER NOT NULL CHECK (
+                context_revision > 0 AND context_revision <= 2147483647
+            ),
+            changed INTEGER NOT NULL CHECK (changed IN (0, 1)),
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+            ),
+            committed_at TEXT NOT NULL,
+            FOREIGN KEY (task_id, context_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_checkpoints (
+            agent_id TEXT COLLATE BINARY NOT NULL,
+            task_id TEXT COLLATE BINARY NOT NULL,
+            knowledge_namespace TEXT COLLATE BINARY NOT NULL,
+            access_policy_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(access_policy_sha256) = 64
+                AND access_policy_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            revision INTEGER NOT NULL CHECK (
+                revision > 0 AND revision <= 2147483647
+            ),
+            work_context_revision INTEGER NOT NULL CHECK (
+                work_context_revision > 0 AND work_context_revision <= 2147483647
+            ),
+            work_context_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(work_context_sha256) = 64
+                AND work_context_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            knowledge_sequence INTEGER NOT NULL CHECK (
+                knowledge_sequence >= 0
+                AND knowledge_sequence <= 9223372036854775807
+            ),
+            index_readiness_sequence INTEGER NOT NULL CHECK (
+                index_readiness_sequence >= 0
+                AND index_readiness_sequence <= 9223372036854775807
+            ),
+            knowledge_high_water_sequence INTEGER NOT NULL CHECK (
+                knowledge_high_water_sequence >= 0
+                AND knowledge_high_water_sequence <= 9223372036854775807
+            ),
+            index_readiness_high_water_sequence INTEGER NOT NULL CHECK (
+                index_readiness_high_water_sequence >= 0
+                AND index_readiness_high_water_sequence <= 9223372036854775807
+            ),
+            processing_mode TEXT COLLATE BINARY NOT NULL CHECK (
+                processing_mode IN ('full_index', 'delta')
+            ),
+            processing_id TEXT COLLATE BINARY NOT NULL,
+            operation_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+            record_json TEXT NOT NULL CHECK (
+                json_valid(record_json) AND json_type(record_json) = 'object'
+            ),
+            updated_at TEXT NOT NULL,
+            CHECK (knowledge_sequence <= knowledge_high_water_sequence),
+            CHECK (
+                index_readiness_sequence <= index_readiness_high_water_sequence
+            ),
+            PRIMARY KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, revision
+            ),
+            FOREIGN KEY (task_id, work_context_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_checkpoint_heads (
+            agent_id TEXT COLLATE BINARY NOT NULL,
+            task_id TEXT COLLATE BINARY NOT NULL,
+            knowledge_namespace TEXT COLLATE BINARY NOT NULL,
+            access_policy_sha256 TEXT COLLATE BINARY NOT NULL,
+            current_revision INTEGER NOT NULL CHECK (
+                current_revision > 0 AND current_revision <= 2147483647
+            ),
+            PRIMARY KEY (
+                agent_id, task_id, knowledge_namespace, access_policy_sha256
+            ),
+            FOREIGN KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, current_revision
+            ) REFERENCES cayu_agent_recall_checkpoints(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, revision
+            ) ON DELETE RESTRICT
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3833,6 +3953,27 @@ def _sqlite_has_unique_index(
         if index_columns == columns:
             return True
     return False
+
+
+def _sqlite_foreign_key_groups(
+    connection: sqlite3.Connection,
+    table: str,
+) -> set[tuple[str, tuple[str, ...], tuple[str, ...], str]]:
+    grouped: dict[int, list[sqlite3.Row]] = {}
+    for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+        grouped.setdefault(int(row[0]), []).append(row)
+    result: set[tuple[str, tuple[str, ...], tuple[str, ...], str]] = set()
+    for rows in grouped.values():
+        ordered = sorted(rows, key=lambda row: int(row[1]))
+        result.add(
+            (
+                str(ordered[0][2]),
+                tuple(str(row[3]) for row in ordered),
+                tuple(str(row[4]) for row in ordered),
+                str(ordered[0][6]).upper(),
+            )
+        )
+    return result
 
 
 def _validate_revision_37_knowledge_fts_schema(connection: sqlite3.Connection) -> None:
@@ -4672,6 +4813,8 @@ def reconcile_schema(
         _validate_revision_63_knowledge_schema(connection)
     if current.revision >= 67:
         _validate_revision_67_knowledge_schema(connection)
+    if current.revision >= 69:
+        _validate_revision_69_work_context_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -5776,6 +5919,224 @@ def _raise_revision_67_sqlite_schema_error(name: str) -> NoReturn:
         "SQLite schema object "
         f"{name!r} conflicts with Cayu's pending maintenance proposal contract. "
         "Recreate the prerelease knowledge database with schema_mode=CREATE or MIGRATE."
+    )
+
+
+def _validate_revision_69_work_context_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_agent_work_context_revisions": (
+            ("task_id", "TEXT", 1, 1),
+            ("revision", "INTEGER", 1, 2),
+            ("content_sha256", "TEXT", 1, 0),
+            ("operation_id", "TEXT", 1, 0),
+            ("record_json", "TEXT", 1, 0),
+            ("published_at", "TEXT", 1, 0),
+        ),
+        "cayu_agent_work_context_heads": (
+            ("task_id", "TEXT", 1, 1),
+            ("current_revision", "INTEGER", 1, 0),
+        ),
+        "cayu_agent_work_context_publications": (
+            ("operation_id", "TEXT", 1, 1),
+            ("task_id", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("context_revision", "INTEGER", 1, 0),
+            ("changed", "INTEGER", 1, 0),
+            ("receipt_json", "TEXT", 1, 0),
+            ("committed_at", "TEXT", 1, 0),
+        ),
+        "cayu_agent_recall_checkpoints": (
+            ("agent_id", "TEXT", 1, 1),
+            ("task_id", "TEXT", 1, 2),
+            ("knowledge_namespace", "TEXT", 1, 3),
+            ("access_policy_sha256", "TEXT", 1, 4),
+            ("revision", "INTEGER", 1, 5),
+            ("work_context_revision", "INTEGER", 1, 0),
+            ("work_context_sha256", "TEXT", 1, 0),
+            ("knowledge_sequence", "INTEGER", 1, 0),
+            ("index_readiness_sequence", "INTEGER", 1, 0),
+            ("knowledge_high_water_sequence", "INTEGER", 1, 0),
+            ("index_readiness_high_water_sequence", "INTEGER", 1, 0),
+            ("processing_mode", "TEXT", 1, 0),
+            ("processing_id", "TEXT", 1, 0),
+            ("operation_id", "TEXT", 1, 0),
+            ("record_json", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "cayu_agent_recall_checkpoint_heads": (
+            ("agent_id", "TEXT", 1, 1),
+            ("task_id", "TEXT", 1, 2),
+            ("knowledge_namespace", "TEXT", 1, 3),
+            ("access_policy_sha256", "TEXT", 1, 4),
+            ("current_revision", "INTEGER", 1, 0),
+        ),
+    }
+    for table, expected in expected_columns.items():
+        actual = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            _raise_revision_69_sqlite_schema_error(table)
+
+    unique_keys = (
+        ("cayu_agent_work_context_revisions", ("task_id", "revision")),
+        ("cayu_agent_work_context_revisions", ("operation_id",)),
+        ("cayu_agent_work_context_heads", ("task_id",)),
+        ("cayu_agent_work_context_publications", ("operation_id",)),
+        (
+            "cayu_agent_recall_checkpoints",
+            (
+                "agent_id",
+                "task_id",
+                "knowledge_namespace",
+                "access_policy_sha256",
+                "revision",
+            ),
+        ),
+        ("cayu_agent_recall_checkpoints", ("operation_id",)),
+        (
+            "cayu_agent_recall_checkpoint_heads",
+            ("agent_id", "task_id", "knowledge_namespace", "access_policy_sha256"),
+        ),
+    )
+    for table, columns in unique_keys:
+        if not _sqlite_has_unique_index(connection, table, columns):
+            _raise_revision_69_sqlite_schema_error(table)
+
+    required_foreign_keys = {
+        "cayu_agent_work_context_heads": {
+            (
+                "cayu_agent_work_context_revisions",
+                ("task_id", "current_revision"),
+                ("task_id", "revision"),
+                "RESTRICT",
+            ),
+        },
+        "cayu_agent_work_context_publications": {
+            (
+                "cayu_agent_work_context_revisions",
+                ("task_id", "context_revision"),
+                ("task_id", "revision"),
+                "RESTRICT",
+            ),
+        },
+        "cayu_agent_recall_checkpoints": {
+            (
+                "cayu_agent_work_context_revisions",
+                ("task_id", "work_context_revision"),
+                ("task_id", "revision"),
+                "RESTRICT",
+            ),
+        },
+        "cayu_agent_recall_checkpoint_heads": {
+            (
+                "cayu_agent_recall_checkpoints",
+                (
+                    "agent_id",
+                    "task_id",
+                    "knowledge_namespace",
+                    "access_policy_sha256",
+                    "current_revision",
+                ),
+                (
+                    "agent_id",
+                    "task_id",
+                    "knowledge_namespace",
+                    "access_policy_sha256",
+                    "revision",
+                ),
+                "RESTRICT",
+            ),
+        },
+    }
+    for table, expected in required_foreign_keys.items():
+        actual = _sqlite_foreign_key_groups(connection, table)
+        if actual != expected:
+            _raise_revision_69_sqlite_schema_error(table)
+
+    required_sql = {
+        "cayu_agent_work_context_revisions": (
+            "task_id text collate binary not null",
+            "revision integer not null check ( revision > 0 and revision <= 2147483647 )",
+            "content_sha256 text collate binary not null",
+            "operation_id text collate binary not null unique",
+            "length(content_sha256) = 64",
+            "content_sha256 not glob '*[^0-9a-f]*'",
+            "json_valid(record_json)",
+            "json_type(record_json) = 'object'",
+        ),
+        "cayu_agent_work_context_heads": (
+            "task_id text collate binary not null primary key",
+            "current_revision > 0",
+            "current_revision <= 2147483647",
+        ),
+        "cayu_agent_work_context_publications": (
+            "operation_id text collate binary not null primary key",
+            "task_id text collate binary not null",
+            "request_sha256 text collate binary not null",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "context_revision > 0",
+            "context_revision <= 2147483647",
+            "changed in (0, 1)",
+            "json_valid(receipt_json)",
+            "json_type(receipt_json) = 'object'",
+        ),
+        "cayu_agent_recall_checkpoints": (
+            "agent_id text collate binary not null",
+            "task_id text collate binary not null",
+            "knowledge_namespace text collate binary not null",
+            "access_policy_sha256 text collate binary not null",
+            "revision integer not null check ( revision > 0 and revision <= 2147483647 )",
+            "work_context_sha256 text collate binary not null",
+            "processing_mode text collate binary not null",
+            "processing_id text collate binary not null",
+            "operation_id text collate binary not null unique",
+            "length(access_policy_sha256) = 64",
+            "access_policy_sha256 not glob '*[^0-9a-f]*'",
+            "work_context_revision > 0",
+            "work_context_revision <= 2147483647",
+            "length(work_context_sha256) = 64",
+            "work_context_sha256 not glob '*[^0-9a-f]*'",
+            "knowledge_sequence >= 0",
+            "knowledge_sequence <= 9223372036854775807",
+            "index_readiness_sequence >= 0",
+            "index_readiness_sequence <= 9223372036854775807",
+            "knowledge_high_water_sequence >= 0",
+            "knowledge_high_water_sequence <= 9223372036854775807",
+            "index_readiness_high_water_sequence >= 0",
+            "index_readiness_high_water_sequence <= 9223372036854775807",
+            "knowledge_sequence <= knowledge_high_water_sequence",
+            "index_readiness_sequence <= index_readiness_high_water_sequence",
+            "processing_mode in ('full_index', 'delta')",
+            "json_valid(record_json)",
+            "json_type(record_json) = 'object'",
+        ),
+        "cayu_agent_recall_checkpoint_heads": (
+            "agent_id text collate binary not null",
+            "task_id text collate binary not null",
+            "knowledge_namespace text collate binary not null",
+            "access_policy_sha256 text collate binary not null",
+            "current_revision > 0",
+            "current_revision <= 2147483647",
+        ),
+    }
+    for table, fragments in required_sql.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+        if any(fragment not in normalized for fragment in fragments):
+            _raise_revision_69_sqlite_schema_error(table)
+
+
+def _raise_revision_69_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's agent work-context/checkpoint contract. "
+        "Run schema_mode=MIGRATE to install the additive revision or recreate the database."
     )
 
 
@@ -7607,6 +7968,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_67_knowledge_schema(connection)
         if rev.revision == 68:
             _validate_eval_judge_calibration_schema(connection)
+        if rev.revision == 69:
+            _validate_revision_69_work_context_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

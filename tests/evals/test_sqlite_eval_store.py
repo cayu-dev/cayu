@@ -350,7 +350,7 @@ def test_sqlite_revision_sixty_eight_rejects_conflicting_calibration_table(
                 document_bytes INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
-            DELETE FROM cayu_schema_migrations WHERE revision = 68;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 68;
             PRAGMA user_version = 67;
             """
         )

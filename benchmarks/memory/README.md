@@ -83,6 +83,26 @@ for the fixed ceilings and interpretation. SQLite persistence enforces a sustain
 median ceiling separately from a wider emergency p95 cap because hosted-runner fsync
 scheduling is not a stable product-tail signal.
 
+## Agent work-context and checkpoint overhead
+
+`agent-work-context-performance-v1.json` is the hermetic 50-sample baseline for
+the independent durable agent work-context store. Regenerate it, or check its
+fixed regression ceilings without provider calls, with:
+
+```bash
+PYTHONPATH=src python scripts/run_agent_work_context_performance.py \
+  --output benchmarks/memory/agent-work-context-performance-v1.json \
+  --check
+```
+
+The zero-record lane repeatedly constructs and closes a current-schema empty
+store; it is not a historical pre-feature binary comparison. The populated
+lanes measure indexed current reads, semantic revision appends through
+compare-and-swap, checkpoint advances through compare-and-swap, and incremental
+SQLite bytes per durable revision/receipt/checkpoint record. In-memory and
+SQLite provide the credential-free timing matrix; PostgreSQL runs the same
+behavioral conformance contract in its integration suite.
+
 ## Revision-bound knowledge-relation overhead
 
 `knowledge-relation-performance-v1.json` is the hermetic baseline for 50 matching

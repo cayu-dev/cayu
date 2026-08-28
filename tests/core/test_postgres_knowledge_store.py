@@ -4764,7 +4764,7 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
             connection.cursor() as cursor,
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cursor.fetchone() == (68,)
+            assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
             await cursor.execute(
                 "SELECT text FROM cayu_knowledge_revisions "
                 "WHERE entry_id = 'revision-66-entry' AND revision = 1"

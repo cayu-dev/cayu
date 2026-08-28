@@ -105,62 +105,49 @@ def _require_quiescent_postgres_mutation_pool(
     pool: Any,
     *,
     allowed_configure: Any = None,
+    boundary_name: str = "verified-work",
 ) -> None:
     """Authenticate the driver behavior used by bounded mutation settlement."""
 
+    boundary = f"Postgres {boundary_name} mutations"
     if type(pool) is not AsyncConnectionPool:
-        raise TypeError(
-            "Postgres verified-work mutations require the built-in "
-            "AsyncConnectionPool implementation."
-        )
+        raise TypeError(f"{boundary} require the built-in AsyncConnectionPool implementation.")
     if pool.connection_class is not PsycopgAsyncConnection:
-        raise TypeError(
-            "Postgres verified-work mutations require the built-in psycopg "
-            "AsyncConnection implementation."
-        )
+        raise TypeError(f"{boundary} require the built-in psycopg AsyncConnection implementation.")
     if pool._configure is not allowed_configure:
-        raise TypeError(
-            "Postgres verified-work mutations do not accept an unverified pool configure callback."
-        )
+        raise TypeError(f"{boundary} do not accept an unverified pool configure callback.")
     if pool._check is not None:
-        raise TypeError("Postgres verified-work mutations do not accept a pool check callback.")
+        raise TypeError(f"{boundary} do not accept a pool check callback.")
     if pool._reset is not None:
-        raise TypeError("Postgres verified-work mutations do not accept a pool reset callback.")
+        raise TypeError(f"{boundary} do not accept a pool reset callback.")
     if pool._reconnect_failed is not None:
-        raise TypeError("Postgres verified-work mutations do not accept a pool reconnect callback.")
+        raise TypeError(f"{boundary} do not accept a pool reconnect callback.")
     if type(pool.conninfo) is not str:
-        raise TypeError("Postgres verified-work mutations require a static pool connection string.")
+        raise TypeError(f"{boundary} require a static pool connection string.")
     kwargs = pool.kwargs
     if kwargs is not None:
         if type(kwargs) is not dict:
-            raise TypeError(
-                "Postgres verified-work mutations require static pool connection options."
-            )
+            raise TypeError(f"{boundary} require static pool connection options.")
         if _POSTGRES_CONNECTION_BEHAVIOR_KWARGS.intersection(kwargs):
-            raise TypeError(
-                "Postgres verified-work mutations do not accept connection behavior "
-                "factories in pool options."
-            )
+            raise TypeError(f"{boundary} do not accept connection behavior factories in options.")
         if kwargs.get("autocommit", False) is not False:
-            raise TypeError("Postgres verified-work mutations require transactional connections.")
+            raise TypeError(f"{boundary} require transactional connections.")
 
 
-def _require_quiescent_postgres_mutation_connection(connection: Any) -> None:
+def _require_quiescent_postgres_mutation_connection(
+    connection: Any,
+    *,
+    boundary_name: str = "verified-work",
+) -> None:
     """Verify that checkout preserved the pool's authenticated connection type."""
 
+    boundary = f"Postgres {boundary_name} mutation checkout"
     if type(connection) is not PsycopgAsyncConnection:
-        raise TypeError(
-            "Postgres verified-work mutation checkout returned an unsupported "
-            "connection implementation."
-        )
+        raise TypeError(f"{boundary} returned an unsupported connection implementation.")
     if connection.autocommit is not False:
-        raise TypeError(
-            "Postgres verified-work mutation checkout returned an autocommit connection."
-        )
+        raise TypeError(f"{boundary} returned an autocommit connection.")
     if connection.cursor_factory is not AsyncCursor or connection.row_factory is not tuple_row:
-        raise TypeError(
-            "Postgres verified-work mutation checkout returned unsupported cursor behavior."
-        )
+        raise TypeError(f"{boundary} returned unsupported cursor behavior.")
 
 
 class _PostgresMutationOwnerCancellation:
