@@ -11,10 +11,12 @@ from tests.evals.eval_store_conformance import (
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
+    assert_judge_calibration_store_conformance,
     assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_judge_calibration import _calibration_report
 
 import cayu.storage.evals_sqlite as evals_sqlite_module
 from cayu.evals.corpus import EvalCorpusDocument
@@ -95,13 +97,17 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
                 result=result,
             )
             await assert_scenario_progress_conformance(store, corpus=corpus)
+            await assert_judge_calibration_store_conformance(
+                store,
+                report=await _calibration_report(),
+            )
         finally:
             await store.close()
 
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_sixty_eight_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -113,7 +119,7 @@ def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
     try:
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64) "
+            "WHERE revision BETWEEN 47 AND 68 "
             "ORDER BY revision"
         ).fetchall()
         invocation_column = connection.execute("PRAGMA table_info(cayu_eval_runs)").fetchall()
@@ -134,6 +140,7 @@ def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
                 "OR name LIKE 'idx_cayu_eval_result_records_%' "
                 "OR name LIKE 'idx_cayu_eval_scenarios_%' "
                 "OR name LIKE 'idx_cayu_eval_authored_suites_%' "
+                "OR name LIKE 'idx_cayu_eval_judge_calibrations_%' "
                 "OR name = 'idx_cayu_eval_baseline_mutations_scope')"
             ).fetchall()
         }
@@ -158,6 +165,10 @@ def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
         (62, "breaking", 62),
         (63, "breaking", 63),
         (64, "additive", 63),
+        (65, "breaking", 65),
+        (66, "breaking", 66),
+        (67, "breaking", 67),
+        (68, "additive", 67),
     ]
     assert next(row for row in invocation_column if row[1] == "invocation_json")[2:4] == (
         "TEXT",
@@ -174,6 +185,7 @@ def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
         "cayu_eval_baseline_mutations",
         "cayu_eval_baselines",
         "cayu_eval_authored_suites",
+        "cayu_eval_judge_calibrations",
         "cayu_eval_cases",
         "cayu_eval_corpora",
         "cayu_eval_result_records",
@@ -187,6 +199,8 @@ def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
         "idx_cayu_eval_authored_suites_catalog",
         "idx_cayu_eval_authored_suites_id_catalog",
         "idx_cayu_eval_authored_suites_target_catalog",
+        "idx_cayu_eval_judge_calibrations_definition",
+        "idx_cayu_eval_judge_calibrations_target",
         "idx_cayu_eval_result_records_contract",
         "idx_cayu_eval_result_records_target_catalog",
         "idx_cayu_eval_runs_target_catalog",
@@ -234,7 +248,7 @@ def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_pr
         connection.close()
 
 
-def test_sqlite_eval_store_requires_revision_sixty_four_authoring_schema(
+def test_sqlite_eval_store_requires_revision_sixty_eight_calibration_schema(
     tmp_path,
 ) -> None:
     path = tmp_path / "evals-revision-56-validate.db"
@@ -253,7 +267,7 @@ def test_sqlite_eval_store_requires_revision_sixty_four_authoring_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 64"):
+    with pytest.raises(SchemaTooOld, match="requires >= 68"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
@@ -304,6 +318,53 @@ def test_sqlite_revision_sixty_four_rejects_conflicting_authored_suite_table(
         assert (
             connection.execute(
                 "SELECT 1 FROM cayu_schema_migrations WHERE revision = 64"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_sixty_eight_rejects_conflicting_calibration_table(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals.db"
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE cayu_eval_judge_calibrations;
+            CREATE TABLE cayu_eval_judge_calibrations (
+                revision TEXT COLLATE BINARY PRIMARY KEY,
+                run_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+                definition_revision TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                trial_count INTEGER NOT NULL,
+                report_json TEXT NOT NULL,
+                document_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            DELETE FROM cayu_schema_migrations WHERE revision = 68;
+            PRAGMA user_version = 67;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="calibration safety constraints"):
+        SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+    connection = sqlite3.connect(path)
+    try:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM cayu_schema_migrations WHERE revision = 68"
             ).fetchone()
             is None
         )

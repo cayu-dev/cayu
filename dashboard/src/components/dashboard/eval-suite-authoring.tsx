@@ -6,6 +6,7 @@ import {
   ScenarioAuthoring,
   type ScenarioAuthoringState,
 } from "@/components/dashboard/scenario-authoring"
+import { StructuredJudgeEditor } from "@/components/dashboard/structured-judge-editor"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -30,12 +31,17 @@ import {
   fetchEvalAuthoredSuite,
   fetchEvalAuthoredSuites,
   fetchEvalScenario,
+  fetchEvalTargets,
   launchEvalAuthoredSuiteRun,
   previewEvalAuthoredSuite,
   previewEvalAuthoredSuiteRun,
   saveEvalAuthoredSuite,
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
+import {
+  newStructuredJudgeAssertion,
+  structuredAssertionFromReviewedSuite,
+} from "@/lib/eval-judge-authoring"
 import {
   authoredSuiteRunPreviewIdentity,
   blankEvalScenarioDraft,
@@ -56,7 +62,11 @@ import {
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
 import type { PromotionAssertion } from "@/lib/evaluation-promotion"
-import type { EvalCaseDraftV1, EvalScenarioDraftV2 } from "@/lib/generated/server-api"
+import type {
+  EvalCaseDraftV2,
+  EvalScenarioDraftV2,
+  StructuredModelJudgeAssertionDraftV1,
+} from "@/lib/generated/server-api"
 
 const FIELD_LABEL = "mb-1 block text-xs font-medium text-muted-foreground"
 
@@ -102,6 +112,32 @@ export function EvalSuiteAuthoringAction({
     queryFn: ({ signal }) => fetchEvalAuthoredSuites({ target_key: targetKey, limit: 50 }, signal),
     enabled: open,
   })
+  const targets = useQuery({
+    queryKey: EVAL_TARGET_QUERY_KEY,
+    queryFn: ({ signal }) => fetchEvalTargets(signal),
+    enabled: open,
+  })
+  const target = targets.data?.items.find((item) => item.target_key === targetKey)
+  const independentJudgeProfile = target?.judge_profiles?.find(
+    (profile) =>
+      target.judge_profile_routes?.find(
+        (route) =>
+          route.judge_profile_key === profile.key &&
+          route.judge_profile_revision === profile.revision,
+      )?.candidate_route_relation === "independent_model",
+  )
+  const sameModelJudgeProfile = target?.judge_profiles?.find(
+    (profile) =>
+      target.judge_profile_routes?.find(
+        (route) =>
+          route.judge_profile_key === profile.key &&
+          route.judge_profile_revision === profile.revision,
+      )?.candidate_route_relation === "same_model" &&
+      profile.same_model_use === "allowed_and_labeled",
+  )
+  const defaultJudgeProfile = independentJudgeProfile ?? sameModelJudgeProfile
+  const defaultJudgeIsSameModel =
+    independentJudgeProfile === undefined && sameModelJudgeProfile !== undefined
   const activeCaseIndex = Math.max(0, caseRowKeys.indexOf(activeCaseKey))
   const activeCase = draft.cases[activeCaseIndex] ?? draft.cases[0]
   const activeCaseRowKey = caseRowKeys[activeCaseIndex]
@@ -126,6 +162,25 @@ export function EvalSuiteAuthoringAction({
     suitePreviewIdentity === currentIdentity &&
     !unsavedScenarioReference &&
     !activeScenarioDirty
+  const activeStructuredJudges =
+    activeCase?.assertions.filter(
+      (assertion): assertion is StructuredModelJudgeAssertionDraftV1 =>
+        assertion.kind === "structured_model_judge",
+    ) ?? []
+  const activeDeterministicAssertions =
+    activeCase?.assertions.filter(
+      (assertion): assertion is PromotionAssertion => assertion.kind !== "structured_model_judge",
+    ) ?? []
+  const reviewedActiveCase =
+    suitePreview && previewCurrent
+      ? suitePreview.suite.cases.find((item) => item.id === activeCase?.id)
+      : undefined
+  const defaultCalibrationMessages =
+    activeCase && "input" in activeCase.stimulus ? (activeCase.stimulus.input.messages ?? []) : []
+  const defaultCalibrationTask =
+    defaultCalibrationMessages.length > 0
+      ? defaultCalibrationMessages.map((message) => message.text).join("\n")
+      : (activeCase?.name ?? "Evaluate the saved scenario.")
   const launchSelection = useMemo(() => {
     const selected = draft.cases
       .filter((_, index) => {
@@ -931,15 +986,88 @@ export function EvalSuiteAuthoringAction({
                     )}
 
                     <ExpectedBehaviorEditor
-                      assertions={activeCase.assertions as PromotionAssertion[]}
+                      assertions={activeDeterministicAssertions}
                       evidence={undefined}
                       onChange={(assertions) =>
                         editDraft((next) => {
                           const current = next.cases[activeCaseIndex]
-                          if (current) current.assertions = assertions
+                          if (current)
+                            current.assertions = [...assertions, ...activeStructuredJudges]
                         })
                       }
                     />
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed border-border p-3">
+                      <div>
+                        <div className="text-sm font-medium">AI judge</div>
+                        <div className="text-xs text-muted-foreground">
+                          Add a structured rubric when deterministic checks do not capture answer
+                          quality.
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={
+                          authoringLocked ||
+                          defaultJudgeProfile === undefined ||
+                          activeCase.assertions.length >= 64
+                        }
+                        onClick={() => {
+                          const profile = defaultJudgeProfile
+                          if (!profile) return
+                          editDraft((next) => {
+                            const current = next.cases[activeCaseIndex]
+                            if (current) {
+                              current.assertions.push(
+                                newStructuredJudgeAssertion(
+                                  profile,
+                                  current.assertions.map((item) => item.id),
+                                ),
+                              )
+                            }
+                          })
+                        }}
+                      >
+                        <Plus />{" "}
+                        {defaultJudgeIsSameModel ? "Add same-model AI judge" : "Add AI judge"}
+                      </Button>
+                      {(target?.judge_profiles?.length ?? 0) === 0 && (
+                        <div className="w-full text-xs text-muted-foreground">
+                          This target does not publish a trusted judge profile yet.
+                        </div>
+                      )}
+                    </div>
+
+                    {activeStructuredJudges.map((assertion) => {
+                      const assertionIndex = activeCase.assertions.indexOf(assertion)
+                      return (
+                        <StructuredJudgeEditor
+                          key={`${activeCaseRowKey}:${assertionIndex}`}
+                          assertion={assertion}
+                          target={target}
+                          reviewedAssertion={structuredAssertionFromReviewedSuite(
+                            assertion,
+                            reviewedActiveCase?.assertions ?? [],
+                          )}
+                          defaultTask={defaultCalibrationTask}
+                          disabled={authoringLocked}
+                          onChange={(updated) =>
+                            editDraft((next) => {
+                              const current = next.cases[activeCaseIndex]
+                              if (current) current.assertions[assertionIndex] = updated
+                            })
+                          }
+                          onRemove={() =>
+                            editDraft((next) => {
+                              const current = next.cases[activeCaseIndex]
+                              if (current) current.assertions.splice(assertionIndex, 1)
+                            })
+                          }
+                        />
+                      )
+                    })}
                   </>
                 )}
               </fieldset>
@@ -1070,8 +1198,8 @@ function SimpleInputEditor({
   evalCase,
   edit,
 }: {
-  evalCase: EvalCaseDraftV1
-  edit: (evalCase: EvalCaseDraftV1) => void
+  evalCase: EvalCaseDraftV2
+  edit: (evalCase: EvalCaseDraftV2) => void
 }) {
   if (!("input" in evalCase.stimulus)) return null
   const messages = evalCase.stimulus.input.messages
@@ -1195,7 +1323,7 @@ function Field({
   )
 }
 
-function isScenarioCase(evalCase: EvalCaseDraftV1): evalCase is EvalCaseDraftV1 & {
+function isScenarioCase(evalCase: EvalCaseDraftV2): evalCase is EvalCaseDraftV2 & {
   stimulus: { kind?: "scenario"; scenario_id: string; scenario_revision: string }
 } {
   return "scenario_revision" in evalCase.stimulus

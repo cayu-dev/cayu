@@ -146,18 +146,23 @@ perform project discovery.
 
 ## Author-first suite contracts
 
-`EvalSuiteDraftV1` is the bounded, authority-free SDK contract used to create a
-reusable evaluation without a prior production session. A draft contains one
-stable suite ID, a published target key, ordinary `TrialRequestSpec` settings,
-and one or more `EvalCaseDraftV1` values. Each case selects exactly one
-stimulus:
+`EvalSuiteDraftV1` remains the closed deterministic authoring contract.
+`EvalSuiteDraftV2` is the bounded, authority-free SDK and Control Plane
+contract for a reusable evaluation that may also contain revision-free
+`StructuredModelJudgeAssertionDraftV1` material. The server—not the browser—
+compiles rubric and public-reference drafts into content-addressed immutable
+identities during preview. A draft contains one stable suite ID, a published
+target key, ordinary `TrialRequestSpec` settings, and one or more case drafts.
+Each case selects exactly one stimulus:
 
 - `EvalSimpleInputStimulusV1` carries the existing portable `RunInputSpec`;
 - `EvalScenarioStimulusV1` links an exact, separately persisted scenario ID and
   content revision.
 
-`compile_eval_suite_draft(...)` sorts cases by stable ID and computes immutable
-case, suite-spec, and complete suite-document revisions. Captured source
+`compile_eval_suite_authoring_draft(...)` preserves the V1 wire contract or
+compiles an explicit V2 draft, sorts cases by stable ID, and computes immutable
+case, suite-spec, rubric, public-reference, and complete suite-document
+revisions. Captured source
 identity is optional for authored cases; Cayu does not fabricate production
 provenance for a fresh input. When a source-less authored case is adapted to the
 existing corpus runner, Cayu uses an explicitly domain-tagged authored-definition
@@ -178,8 +183,10 @@ Protected servers with durable Evals expose preview/save/catalog/download at
 `/api/evals/suites`. Preview canonicalizes a draft without persistence or
 execution and reports target or scenario-reference readiness. Save accepts only
 the exact reviewed revision, scans it through the target's credential-redaction
-boundary, and atomically verifies every scenario reference. SQLite and
-PostgreSQL persistence requires storage revision 64. These authoring contracts
+boundary, and atomically verifies every scenario reference. The authored-suite
+catalog was introduced at storage revision 64; the current calibration-aware
+SQLite and PostgreSQL EvalStore implementations require revision 68. These
+authoring contracts
 do not create provider, tool, environment, fixture, secret, or runtime
 authority, and they do not change the existing one-trial execution default.
 
@@ -188,14 +195,15 @@ authority, and they do not change the existing one-trial execution default.
 For an ordinary project started with `cayu serve`, users do not need to write an
 Evals-specific Python suite. Select a server-published target on the **Evals**
 page and choose **New evaluation**. The authoring sheet supports the complete
-deterministic workflow:
+deterministic and structured-judge workflow:
 
 1. name a reusable suite and set its per-case timeout;
 2. add, duplicate, remove, and select cases;
 3. enter one or more ordered user messages for a simple fresh session, or build
    and save a controlled multi-stage scenario;
 4. define expected behavior with status, output, tool, model-step, usage, token,
-   and cost assertions;
+   and cost assertions, and optionally add a one-to-eight-criterion AI judge
+   rubric using a current trusted server-published profile;
 5. check current target and scenario readiness, save the reviewed immutable
    suite revision, and check either the full suite or an explicit subset;
 6. launch the selected cases and follow the resulting durable run in the normal
@@ -233,9 +241,45 @@ Control Plane-authored suite launches currently use exactly one trial per case,
 and every admitted run has maximum concurrency one. Simple cases share one run;
 each independently recoverable scenario has its own run, so deployments with
 multiple coordinators may process those durable runs independently. The browser
-exposes only deterministic assertions in this workflow; portable model-judge
-assertions still require a trusted server-resolved evaluator and are not
-silently fabricated by the client.
+can author structured rubric, threshold, permitted evidence, and public or
+server-held private reference identity, but it cannot create a provider,
+credential, judge application, privacy policy, or private-reference content.
+Only profiles and private-reference identities published for the selected
+target are selectable.
+
+### Control Plane: calibrate an AI judge
+
+After adding a structured judge, choose **Check suite**. A successful preview
+returns the exact compiled rubric, reference, profile, implementation, and
+evidence-policy identity. The rubric editor then exposes **Calibrate on fixed
+evidence**:
+
+1. provide an operator-declared source ID, known task, and candidate output,
+   plus the fixed transcript only when the reviewed evidence selection requires
+   one;
+2. enter a human score from `0` to `1` for every criterion;
+3. choose one to ten repeated judge calls and check the token/cost ceiling;
+4. run calibration and inspect every typed criterion judgment, aggregate
+   disagreement, pass/fail agreement, evaluator error, usage, and cost record.
+
+Calibration invokes only the isolated judge path. It never starts the candidate
+agent, calls candidate tools, prepares fixtures, or creates environment effects.
+Repeated trials therefore measure judge agreement and stability over one exact,
+content-addressed operator-supplied evidence snapshot. The declared source ID is
+part of that hash and preserves the operator's link to the source material; it
+does **not** prove that the pasted evidence came from that source, measure
+candidate reliability, or measure end-to-end task success. Same-model judging is never
+silently chosen: the server publishes the candidate-route relationship, the
+user must explicitly select the labelled profile, the profile must permit it,
+and the preview and report retain the relationship.
+
+Completed calibration reports are immutable and durable in SQLite/PostgreSQL
+storage revision 68. The run request carries a stable run ID, so a response-loss
+retry or server restart returns the already stored report without paying for or
+executing the judge again. Public reference truth crosses the application
+redaction boundary before persistence. Private reference content stays inside
+the server-owned judge binding and is absent from the browser, portable suite,
+calibration evidence, and report.
 
 The protected HTTP contract mirrors the same review boundary:
 
@@ -246,7 +290,13 @@ The protected HTTP contract mirrors the same review boundary:
 - `POST /api/evals/suites/{revision}/runs/preview` freezes and preflights a full
   or subset selection;
 - `POST /api/evals/suites/{revision}/runs` admits that selection with an
-  `Idempotency-Key`.
+  `Idempotency-Key`;
+- `POST /api/evals/judge-calibrations/preview` compiles fixed evidence and human
+  labels and reports exact judge work without execution;
+- `POST /api/evals/judge-calibrations` runs or idempotently recovers the reviewed
+  calibration;
+- `GET /api/evals/judge-calibrations/{revision}` loads an immutable completed
+  report.
 
 These routes select existing server-owned application authority. They never
 accept providers, secrets, tool implementations, environment objects, database
@@ -633,8 +683,9 @@ Profiles with trusted pricing also retain the exact currency-local estimated
 cost and priced/unpriced step partition; profiles without pricing publish an
 explicit unavailable cost state rather than an invented zero.
 Suite-authoring schema V1 deliberately remains closed over its existing kinds;
-Control Plane rubric/profile/reference authoring arrives with the separately
-versioned authoring contract rather than silently widening V1.
+schema V2 carries the separately versioned revision-free rubric/reference draft
+and immutable structured-judge document contracts rather than silently widening
+V1.
 
 `run_corpus_suite(...)` and corpus-mode
 `run_eval_plan(...)` execute that compiled suite through `run_eval_suite(...)`,
@@ -1955,6 +2006,23 @@ credential-gated and never falls back to a scripted provider; a missing or
 mismatched selected credential exits before project creation or application
 execution. Nightly verification exposes it as
 `evals-release-acceptance-live`.
+
+The separate judge-calibration live contract proves the evaluator authority
+boundary with a real provider and a candidate sentinel that must receive zero
+requests:
+
+```bash
+CAYU_PROVIDER=openai OPENAI_API_KEY=... \
+  uv run python examples/evals_judge_calibration_live.py
+
+CAYU_PROVIDER=anthropic ANTHROPIC_API_KEY=... \
+  uv run python examples/evals_judge_calibration_live.py
+```
+
+It registers the selected provider only inside an explicit `ModelJudgeTarget`,
+previews the immutable fixed evidence, executes one judge trial through the
+protected HTTP contract, and fails if the candidate provider is called.
+Nightly verification exposes it as `evals-judge-calibration-live`.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable

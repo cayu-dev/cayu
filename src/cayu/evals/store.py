@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
 from pydantic import (
@@ -30,6 +30,12 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     json_utf8_size_within_limit,
     revalidate_model_input,
+)
+from cayu.evals.calibration import (
+    EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    EvalJudgeCalibrationReportV1,
+    eval_judge_calibration_report_from_json,
+    eval_judge_calibration_report_to_json,
 )
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
@@ -81,10 +87,13 @@ from cayu.evals.scenario import (
 )
 from cayu.evals.suite_authoring import (
     EVAL_SUITE_AUTHORING_MAX_BYTES,
+    EvalCaseDefinition,
     EvalCaseDefinitionV1,
+    EvalCaseDefinitionV2,
     EvalScenarioStimulusV1,
-    EvalSuiteDocumentV1,
+    EvalSuiteDocument,
     eval_suite_document_from_json,
+    validate_expected_eval_suite_revision,
 )
 from cayu.runtime.invocation import (
     InvocationOrigin,
@@ -187,6 +196,10 @@ class EvalAuthoredSuiteReferenceError(ValueError):
     """An authored suite references an unavailable or incompatible scenario."""
 
 
+class EvalJudgeCalibrationConflict(ValueError):
+    """A calibration revision or run identity resolves to contradictory content."""
+
+
 class EvalStorePublicationRejected(ValueError):
     """Public eval data could not cross the active credential-redaction boundary."""
 
@@ -282,13 +295,13 @@ def _prepare_scenario_for_store(
 
 
 def _prepare_authored_suite_for_store(
-    document: EvalSuiteDocumentV1,
+    document: EvalSuiteDocument,
     *,
     redact_json: Callable[[Any], Any],
-) -> tuple[EvalSuiteDocumentV1, bytes]:
+) -> tuple[EvalSuiteDocument, bytes]:
     """Validate and serialize one authored suite after credential scanning."""
 
-    validated = _exact_model(document, EvalSuiteDocumentV1, "document")
+    validated = validate_expected_eval_suite_revision(document, document.revision)
     payload = validated.model_dump(mode="json")
     _require_publication_safe(
         payload,
@@ -304,6 +317,28 @@ def _prepare_authored_suite_for_store(
     if len(wire_document) > EVAL_SUITE_AUTHORING_MAX_BYTES:
         raise EvalStoreResultTooLarge(EVAL_SUITE_AUTHORING_MAX_BYTES)
     return validated, wire_document
+
+
+def _prepare_judge_calibration_for_store(
+    report: EvalJudgeCalibrationReportV1,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> tuple[EvalJudgeCalibrationReportV1, bytes]:
+    """Validate and scan one complete fixed-evidence calibration report."""
+
+    if type(report) is not EvalJudgeCalibrationReportV1:
+        raise TypeError("report must be an exact EvalJudgeCalibrationReportV1.")
+    validated = EvalJudgeCalibrationReportV1.model_validate(_model_python_input(report))
+    payload = validated.model_dump(mode="json")
+    _require_publication_safe(
+        payload,
+        redact_json=redact_json,
+        resource_name="Judge calibration report",
+    )
+    wire = eval_judge_calibration_report_to_json(validated).encode("utf-8")
+    if len(wire) > EVAL_JUDGE_CALIBRATION_MAX_BYTES:
+        raise EvalStoreResultTooLarge(EVAL_JUDGE_CALIBRATION_MAX_BYTES)
+    return validated, wire
 
 
 def _prepare_run_request_for_store(
@@ -2460,12 +2495,12 @@ def _prepare_scenario_catalog_for_store(
 
 
 def authored_suite_catalog_entry(
-    document: EvalSuiteDocumentV1,
+    document: EvalSuiteDocument,
     *,
     created_at: datetime,
     document_bytes: int,
 ) -> EvalAuthoredSuiteCatalogEntry:
-    validated = _exact_model(document, EvalSuiteDocumentV1, "document")
+    validated = validate_expected_eval_suite_revision(document, document.revision)
     simple_input_count = sum(case.stimulus.kind == "simple_input" for case in validated.cases)
     return EvalAuthoredSuiteCatalogEntry(
         revision=validated.revision,
@@ -2486,25 +2521,27 @@ def authored_suite_catalog_entry(
 
 
 def authored_suite_scenario_cases(
-    document: EvalSuiteDocumentV1,
-) -> tuple[tuple[EvalCaseDefinitionV1, EvalScenarioStimulusV1], ...]:
-    validated = _exact_model(document, EvalSuiteDocumentV1, "document")
+    document: EvalSuiteDocument,
+) -> tuple[tuple[EvalCaseDefinition, EvalScenarioStimulusV1], ...]:
+    validated = validate_expected_eval_suite_revision(document, document.revision)
     return tuple(
-        (case, cast("EvalScenarioStimulusV1", case.stimulus))
+        (case, case.stimulus)
         for case in validated.cases
         if type(case.stimulus) is EvalScenarioStimulusV1
     )
 
 
 def validate_authored_suite_scenario(
-    document: EvalSuiteDocumentV1,
-    case: EvalCaseDefinitionV1,
+    document: EvalSuiteDocument,
+    case: EvalCaseDefinition,
     scenario: EvalScenarioDocumentV2 | None,
 ) -> None:
     """Validate one content-addressed scenario reference without inferring fallback."""
 
-    if type(case) is not EvalCaseDefinitionV1 or type(case.stimulus) is not EvalScenarioStimulusV1:
-        raise TypeError("case must be an exact scenario-backed EvalCaseDefinitionV1.")
+    if type(case) not in {EvalCaseDefinitionV1, EvalCaseDefinitionV2}:
+        raise TypeError("case must be an exact authored eval case definition.")
+    if type(case.stimulus) is not EvalScenarioStimulusV1:
+        raise TypeError("case must be an exact scenario-backed authored case definition.")
     reference = case.stimulus
     if scenario is None:
         raise EvalAuthoredSuiteReferenceError(
@@ -2645,6 +2682,7 @@ class EvalStore(ABC):
     scenarios: ClassVar[bool] = False
     scenario_execution: ClassVar[bool] = False
     suite_authoring: ClassVar[bool] = False
+    judge_calibrations: ClassVar[bool] = False
 
     @abstractmethod
     async def close(self) -> None:
@@ -2708,7 +2746,7 @@ class EvalStore(ABC):
 
     async def save_authored_suite(
         self,
-        document: EvalSuiteDocumentV1,
+        document: EvalSuiteDocument,
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalAuthoredSuiteCatalogEntry:
@@ -2722,7 +2760,7 @@ class EvalStore(ABC):
         revision: str,
         *,
         max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
-    ) -> EvalSuiteDocumentV1 | None:
+    ) -> EvalSuiteDocument | None:
         """Load one authored suite without crossing the caller byte ceiling."""
 
         del revision, max_bytes
@@ -2736,6 +2774,39 @@ class EvalStore(ABC):
 
         del query
         raise NotImplementedError("Authored eval suite persistence is not supported.")
+
+    async def save_judge_calibration(
+        self,
+        report: EvalJudgeCalibrationReportV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalJudgeCalibrationReportV1:
+        """Scan and atomically retain every trial in one completed calibration."""
+
+        del report, redact_json
+        raise NotImplementedError("Judge calibration persistence is not supported.")
+
+    async def load_judge_calibration(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    ) -> EvalJudgeCalibrationReportV1 | None:
+        """Load one immutable completed calibration by content revision."""
+
+        del revision, max_bytes
+        raise NotImplementedError("Judge calibration persistence is not supported.")
+
+    async def load_judge_calibration_by_run_id(
+        self,
+        run_id: str,
+        *,
+        max_bytes: int = EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    ) -> EvalJudgeCalibrationReportV1 | None:
+        """Recover one completed calibration after retry or server restart."""
+
+        del run_id, max_bytes
+        raise NotImplementedError("Judge calibration persistence is not supported.")
 
     @abstractmethod
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
@@ -2976,6 +3047,7 @@ class InMemoryEvalStore(EvalStore):
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
+    judge_calibrations: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -2992,6 +3064,8 @@ class InMemoryEvalStore(EvalStore):
         self._scenarios: dict[str, EvalScenarioCatalogEntry] = {}
         self._authored_suite_documents: dict[str, bytes] = {}
         self._authored_suites: dict[str, EvalAuthoredSuiteCatalogEntry] = {}
+        self._judge_calibration_documents: dict[str, bytes] = {}
+        self._judge_calibration_revisions_by_run_id: dict[str, str] = {}
         self._suites: dict[str, tuple[EvalSuiteCatalogEntry, ...]] = {}
         self._cases: dict[str, tuple[EvalCaseCatalogEntry, ...]] = {}
         self._runs: dict[str, _MemoryRunState] = {}
@@ -3172,7 +3246,7 @@ class InMemoryEvalStore(EvalStore):
 
     async def save_authored_suite(
         self,
-        document: EvalSuiteDocumentV1,
+        document: EvalSuiteDocument,
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalAuthoredSuiteCatalogEntry:
@@ -3218,7 +3292,7 @@ class InMemoryEvalStore(EvalStore):
         revision: str,
         *,
         max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
-    ) -> EvalSuiteDocumentV1 | None:
+    ) -> EvalSuiteDocument | None:
         revision = _sha256_revision(revision, "revision")
         max_bytes = _read_limit(max_bytes, hard_max=EVAL_SUITE_AUTHORING_MAX_BYTES)
         async with self._lock:
@@ -3261,6 +3335,66 @@ class InMemoryEvalStore(EvalStore):
                     or (item.created_at == created_at and item.revision > revision)
                 ]
             return _bounded_authored_suite_page(items, query)
+
+    async def save_judge_calibration(
+        self,
+        report: EvalJudgeCalibrationReportV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalJudgeCalibrationReportV1:
+        validated, payload = _prepare_judge_calibration_for_store(
+            report,
+            redact_json=redact_json,
+        )
+        async with self._lock:
+            existing = self._judge_calibration_documents.get(validated.revision)
+            run_revision = self._judge_calibration_revisions_by_run_id.get(validated.run_id)
+            if existing is not None:
+                if existing != payload or run_revision != validated.revision:
+                    raise EvalJudgeCalibrationConflict(
+                        "Judge calibration revision or run ID has conflicting content."
+                    )
+                return eval_judge_calibration_report_from_json(existing.decode("utf-8"))
+            if run_revision is not None:
+                raise EvalJudgeCalibrationConflict(
+                    "Judge calibration revision or run ID has conflicting content."
+                )
+            self._judge_calibration_documents[validated.revision] = payload
+            self._judge_calibration_revisions_by_run_id[validated.run_id] = validated.revision
+            return validated.model_copy(deep=True)
+
+    async def load_judge_calibration(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    ) -> EvalJudgeCalibrationReportV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_JUDGE_CALIBRATION_MAX_BYTES)
+        async with self._lock:
+            payload = self._judge_calibration_documents.get(revision)
+            if payload is None:
+                return None
+            if len(payload) > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return eval_judge_calibration_report_from_json(payload.decode("utf-8"))
+
+    async def load_judge_calibration_by_run_id(
+        self,
+        run_id: str,
+        *,
+        max_bytes: int = EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    ) -> EvalJudgeCalibrationReportV1 | None:
+        run_id = _portable_id(run_id, "run_id")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_JUDGE_CALIBRATION_MAX_BYTES)
+        async with self._lock:
+            revision = self._judge_calibration_revisions_by_run_id.get(run_id)
+            payload = None if revision is None else self._judge_calibration_documents.get(revision)
+            if payload is None:
+                return None
+            if len(payload) > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return eval_judge_calibration_report_from_json(payload.decode("utf-8"))
 
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
         query = _exact_model(query, EvalSuiteCatalogQuery, "query")

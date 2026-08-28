@@ -10,10 +10,12 @@ from tests.evals.eval_store_conformance import (
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
+    assert_judge_calibration_store_conformance,
     assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_judge_calibration import _calibration_report
 
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.store import (
@@ -107,13 +109,17 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
                 result=result,
             )
             await assert_scenario_progress_conformance(store, corpus=corpus)
+            await assert_judge_calibration_store_conformance(
+                store,
+                report=await _calibration_report(),
+            )
         finally:
             await store.close()
 
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_sixty_eight_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -133,7 +139,7 @@ def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) ->
         ):
             await cur.execute(
                 "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64) "
+                "WHERE revision BETWEEN 47 AND 68 "
                 "ORDER BY revision"
             )
             assert await cur.fetchall() == [
@@ -155,6 +161,10 @@ def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) ->
                 (62, "breaking", 62),
                 (63, "breaking", 63),
                 (64, "additive", 63),
+                (65, "breaking", 65),
+                (66, "breaking", 66),
+                (67, "breaking", 67),
+                (68, "additive", 67),
             ]
             await cur.execute(
                 "SELECT data_type, is_nullable, column_default "
@@ -193,6 +203,7 @@ def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) ->
                 "OR indexname LIKE 'idx_cayu_eval_result_records_%' "
                 "OR indexname LIKE 'idx_cayu_eval_scenarios_%' "
                 "OR indexname LIKE 'idx_cayu_eval_authored_suites_%' "
+                "OR indexname LIKE 'idx_cayu_eval_judge_calibrations_%' "
                 "OR indexname = 'idx_cayu_eval_baseline_mutations_scope') "
                 "ORDER BY indexname"
             )
@@ -201,6 +212,8 @@ def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) ->
                 "idx_cayu_eval_authored_suites_id_catalog",
                 "idx_cayu_eval_authored_suites_target_catalog",
                 "idx_cayu_eval_baseline_mutations_scope",
+                "idx_cayu_eval_judge_calibrations_definition",
+                "idx_cayu_eval_judge_calibrations_target",
                 "idx_cayu_eval_result_records_contract",
                 "idx_cayu_eval_result_records_target_catalog",
                 "idx_cayu_eval_runs_target_catalog",
@@ -217,6 +230,7 @@ def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) ->
                 "cayu_eval_baseline_mutations",
                 "cayu_eval_baselines",
                 "cayu_eval_authored_suites",
+                "cayu_eval_judge_calibrations",
                 "cayu_eval_cases",
                 "cayu_eval_corpora",
                 "cayu_eval_result_records",
@@ -293,6 +307,48 @@ def test_postgres_revision_sixty_four_rejects_missing_authored_suite_constraint(
             conn.cursor() as cur,
         ):
             await cur.execute("SELECT 1 FROM cayu_schema_migrations WHERE revision = 64")
+            assert await cur.fetchone() is None
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_sixty_eight_rejects_missing_calibration_constraint(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await initialized.load_judge_calibration("sha256:" + "a" * 64)
+        finally:
+            await initialized.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "ALTER TABLE cayu_eval_judge_calibrations DROP CONSTRAINT "
+                    "cayu_eval_judge_calibrations_document_size_check"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 68")
+            await conn.commit()
+
+        conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="judge calibration constraints"):
+                await conflicting.load_judge_calibration("sha256:" + "a" * 64)
+        finally:
+            await conflicting.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT 1 FROM cayu_schema_migrations WHERE revision = 68")
             assert await cur.fetchone() is None
 
     asyncio.run(exercise())

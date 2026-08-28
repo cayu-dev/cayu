@@ -106,7 +106,7 @@ or in CI.
 | AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
 | Chat Completions live | `GEMINI_API_KEY`; or `OPENROUTER_API_KEY` plus explicit `CAYU_OPENROUTER_MODEL` | provider-dependent | `gemini-eval`, `chat-completions-contract`, `openrouter-contract` |
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
-| OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
+| OpenAI/Anthropic contracts | provider API key; server extra for judge calibration; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live`, `evals-judge-calibration-live` |
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
 | Advanced runtime examples | `ANTHROPIC_API_KEY` for prompt-cache compaction; `GEMINI_API_KEY` for the other primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-bounded-fork-group`, `advanced-prompt-cache-compaction`, `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
 | Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
@@ -196,7 +196,7 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 37 live example files across `examples/` and its provider subdirectories:
+There are 38 live example files across `examples/` and its provider subdirectories:
 
 | prerequisite | examples |
 | --- | --- |
@@ -207,7 +207,7 @@ There are 37 live example files across `examples/` and its provider subdirectori
 | AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | Playwright Chromium | `dashboard_behavior_live.py` |
-| OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `tool_result_projection_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
+| OpenAI or Anthropic key | `structured_output_live.py`, `evals_judge_calibration_live.py`, `evals_release_acceptance_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `tool_result_projection_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
 | OpenAI key | `knowledge_embedding_live.py`, `real_spend_budget_live.py` |
 
 The deterministic runner examples use `_live_checks.py` and raise on wrong
@@ -218,7 +218,8 @@ validation scenarios used by the credential-free workspace conformance suite.
 Those live checks prove provider integration and a real sandbox boundary; the
 ordinary pytest suite remains hermetic.
 `artifact_file_live.py`, `tool_result_projection_live.py`,
-`context_counting_live.py`, and `structured_output_live.py` assert structural
+`context_counting_live.py`, `structured_output_live.py`, and
+`evals_judge_calibration_live.py` assert structural
 provider/runtime behavior and
 report `verified`; `knowledge_embedding_live.py` verifies a real OpenAI embedding
 and semantic-retrieval result. The context-pressure, knowledge-recall, and

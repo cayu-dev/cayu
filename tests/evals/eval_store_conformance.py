@@ -9,6 +9,7 @@ from typing import Literal
 
 import pytest
 
+from cayu.evals.calibration import EvalJudgeCalibrationReportV1
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -1116,6 +1117,38 @@ async def assert_eval_store_conformance(
                 cursor=target_page.next_cursor,
             )
         )
+
+
+async def assert_judge_calibration_store_conformance(
+    store: EvalStore,
+    *,
+    report: EvalJudgeCalibrationReportV1,
+) -> None:
+    """Pin immutable calibration persistence and restart lookup for each backend."""
+
+    assert store.judge_calibrations is True
+    assert await store.load_judge_calibration(report.revision) is None
+    assert await store.load_judge_calibration_by_run_id(report.run_id) is None
+
+    stored = await store.save_judge_calibration(
+        report,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert stored == report
+    assert (
+        await store.save_judge_calibration(
+            report,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        == report
+    )
+    assert await store.load_judge_calibration(report.revision) == report
+    assert await store.load_judge_calibration_by_run_id(report.run_id) == report
+
+    with pytest.raises(EvalStoreResultTooLarge):
+        await store.load_judge_calibration(report.revision, max_bytes=1)
+    with pytest.raises(EvalStoreResultTooLarge):
+        await store.load_judge_calibration_by_run_id(report.run_id, max_bytes=1)
 
 
 async def assert_captured_eval_store_conformance(

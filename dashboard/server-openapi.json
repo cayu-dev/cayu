@@ -9674,6 +9674,139 @@
         "title": "EvalCaseDefinitionV1",
         "type": "object"
       },
+      "EvalCaseDefinitionV2": {
+        "additionalProperties": false,
+        "description": "One immutable V2 case revision with structured-judge fidelity.",
+        "properties": {
+          "assertions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                  "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                  "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                  "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                  "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                  "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                  "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
+                  "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stimulus": {
+            "discriminator": {
+              "mapping": {
+                "scenario": "#/components/schemas/EvalScenarioStimulusV1",
+                "simple_input": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalScenarioStimulusV1"
+              }
+            ],
+            "title": "Stimulus"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "stimulus",
+          "assertions",
+          "revision"
+        ],
+        "title": "EvalCaseDefinitionV2",
+        "type": "object"
+      },
       "EvalCaseDraftV1": {
         "additionalProperties": false,
         "description": "Bounded, revision-free case material accepted by authoring previews.",
@@ -9796,6 +9929,134 @@
           "assertions"
         ],
         "title": "EvalCaseDraftV1",
+        "type": "object"
+      },
+      "EvalCaseDraftV2": {
+        "additionalProperties": false,
+        "description": "Revision-free V2 case material accepted by authoring previews.",
+        "properties": {
+          "assertions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                  "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                  "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                  "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                  "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                  "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                  "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionDraftV1",
+                  "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/StructuredModelJudgeAssertionDraftV1"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stimulus": {
+            "discriminator": {
+              "mapping": {
+                "scenario": "#/components/schemas/EvalScenarioStimulusV1",
+                "simple_input": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalScenarioStimulusV1"
+              }
+            ],
+            "title": "Stimulus"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "stimulus",
+          "assertions"
+        ],
+        "title": "EvalCaseDraftV2",
         "type": "object"
       },
       "EvalCaseSpec": {
@@ -10469,6 +10730,571 @@
         "title": "EvalExecutionTargetMaterialIdentityV1",
         "type": "object"
       },
+      "EvalJudgeCalibrationCriterionLabelV1": {
+        "additionalProperties": false,
+        "description": "One human score for an exact rubric criterion.",
+        "properties": {
+          "criterion_id": {
+            "title": "Criterion Id",
+            "type": "string"
+          },
+          "score": {
+            "title": "Score",
+            "type": "string"
+          }
+        },
+        "required": [
+          "criterion_id",
+          "score"
+        ],
+        "title": "EvalJudgeCalibrationCriterionLabelV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationDefinitionV1": {
+        "additionalProperties": false,
+        "description": "Immutable calibration inputs; invoking it can only execute the judge.",
+        "properties": {
+          "assertion": {
+            "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationEvidenceV1"
+          },
+          "human_label": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationHumanLabelV1"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "trials": {
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "id",
+          "target_key",
+          "assertion",
+          "evidence",
+          "human_label",
+          "trials"
+        ],
+        "title": "EvalJudgeCalibrationDefinitionV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "target_unavailable",
+              "judge_profile_unavailable",
+              "judge_profile_changed",
+              "same_model_forbidden",
+              "reference_unavailable",
+              "evidence_not_allowed",
+              "unsafe_public_material",
+              "invalid_contract"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "EvalJudgeCalibrationDiagnostic",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationDraftV1": {
+        "additionalProperties": false,
+        "description": "Revision-free browser material for one calibration run.",
+        "properties": {
+          "assertion": {
+            "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
+          },
+          "evidence_source_id": {
+            "title": "Evidence Source Id",
+            "type": "string"
+          },
+          "final_output": {
+            "title": "Final Output",
+            "type": "string"
+          },
+          "human_criteria": {
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgeCalibrationCriterionLabelV1"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Human Criteria",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "task": {
+            "title": "Task",
+            "type": "string"
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript"
+          },
+          "trials": {
+            "default": 1,
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "target_key",
+          "assertion",
+          "evidence_source_id",
+          "task",
+          "final_output",
+          "human_criteria"
+        ],
+        "title": "EvalJudgeCalibrationDraftV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationEvidenceProvenanceV1": {
+        "additionalProperties": false,
+        "description": "Operator-declared origin for fixed evidence, without implied verification.",
+        "properties": {
+          "kind": {
+            "const": "operator_supplied",
+            "default": "operator_supplied",
+            "title": "Kind",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "title": "EvalJudgeCalibrationEvidenceProvenanceV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationEvidenceV1": {
+        "additionalProperties": false,
+        "description": "Content-addressed, public-safe candidate evidence that is never executed.",
+        "properties": {
+          "final_output": {
+            "title": "Final Output",
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationEvidenceProvenanceV1"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "task": {
+            "title": "Task",
+            "type": "string"
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript"
+          }
+        },
+        "required": [
+          "revision",
+          "provenance",
+          "task",
+          "final_output"
+        ],
+        "title": "EvalJudgeCalibrationEvidenceV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationHumanLabelV1": {
+        "additionalProperties": false,
+        "description": "Human ground truth bound to one exact structured rubric.",
+        "properties": {
+          "aggregate_score": {
+            "title": "Aggregate Score",
+            "type": "string"
+          },
+          "criteria": {
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgeCalibrationCriterionLabelV1"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Criteria",
+            "type": "array"
+          },
+          "rubric_revision": {
+            "title": "Rubric Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rubric_revision",
+          "criteria",
+          "aggregate_score"
+        ],
+        "title": "EvalJudgeCalibrationHumanLabelV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationPreviewRequest": {
+        "additionalProperties": false,
+        "description": "Authority-free fixed evidence and human labels; preview never executes.",
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationDraftV1"
+          }
+        },
+        "required": [
+          "draft"
+        ],
+        "title": "EvalJudgeCalibrationPreviewRequest",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationPreviewResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_route_relation": {
+            "anyOf": [
+              {
+                "enum": [
+                  "independent_model",
+                  "same_model"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Route Relation"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationDefinitionV1"
+          },
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgeCalibrationDiagnostic"
+            },
+            "maxItems": 16,
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "judge_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JudgeProfileIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          },
+          "work": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalJudgeCalibrationWorkPreview"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "definition",
+          "ready"
+        ],
+        "title": "EvalJudgeCalibrationPreviewResponse",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationReportV1": {
+        "additionalProperties": false,
+        "description": "Immutable completed calibration with every fixed-evidence judge trial.",
+        "properties": {
+          "candidate_route_relation": {
+            "enum": [
+              "independent_model",
+              "same_model"
+            ],
+            "title": "Candidate Route Relation",
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationDefinitionV1"
+          },
+          "judge_profile": {
+            "$ref": "#/components/schemas/JudgeProfileIdentityV1"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "trials": {
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgeCalibrationTrialV1"
+            },
+            "maxItems": 10,
+            "minItems": 1,
+            "title": "Trials",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "run_id",
+          "definition",
+          "judge_profile",
+          "candidate_route_relation",
+          "trials"
+        ],
+        "title": "EvalJudgeCalibrationReportV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationRunRequest": {
+        "additionalProperties": false,
+        "description": "One reviewed immutable definition guarded by exact preview identity.",
+        "properties": {
+          "definition": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationDefinitionV1"
+          },
+          "expected_definition_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Definition Revision",
+            "type": "string"
+          },
+          "run_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "expected_definition_revision",
+          "definition"
+        ],
+        "title": "EvalJudgeCalibrationRunRequest",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationRunResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "report": {
+            "$ref": "#/components/schemas/EvalJudgeCalibrationReportV1"
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "title": "EvalJudgeCalibrationRunResponse",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationTrialV1": {
+        "additionalProperties": false,
+        "description": "One lossless judge observation compared with the fixed human label.",
+        "properties": {
+          "aggregate_absolute_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aggregate Absolute Error"
+          },
+          "judgment": {
+            "$ref": "#/components/schemas/PublishedAssertionResult"
+          },
+          "pass_agreement": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pass Agreement"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "sequence": {
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "sequence",
+          "judgment"
+        ],
+        "title": "EvalJudgeCalibrationTrialV1",
+        "type": "object"
+      },
+      "EvalJudgeCalibrationWorkPreview": {
+        "additionalProperties": false,
+        "properties": {
+          "cost_currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Currency"
+          },
+          "judge_calls": {
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Judge Calls",
+            "type": "integer"
+          },
+          "max_estimated_cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Estimated Cost"
+          },
+          "max_input_tokens": {
+            "minimum": 1.0,
+            "title": "Max Input Tokens",
+            "type": "integer"
+          },
+          "max_output_tokens": {
+            "minimum": 1.0,
+            "title": "Max Output Tokens",
+            "type": "integer"
+          },
+          "max_total_tokens": {
+            "minimum": 1.0,
+            "title": "Max Total Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "judge_calls",
+          "max_input_tokens",
+          "max_output_tokens",
+          "max_total_tokens"
+        ],
+        "title": "EvalJudgeCalibrationWorkPreview",
+        "type": "object"
+      },
       "EvalJudgeEvidenceSelectionV1": {
         "additionalProperties": false,
         "description": "Candidate evidence a public judge profile is requested to receive.",
@@ -10492,6 +11318,71 @@
           }
         },
         "title": "EvalJudgeEvidenceSelectionV1",
+        "type": "object"
+      },
+      "EvalJudgePrivateReferenceCatalogEntry": {
+        "additionalProperties": false,
+        "description": "Safe identity of evaluator-only truth published for one exact judge.",
+        "properties": {
+          "judge_profile_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Judge Profile Key",
+            "type": "string"
+          },
+          "judge_profile_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Judge Profile Revision",
+            "type": "string"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/PrivateJudgeReferenceV1"
+          }
+        },
+        "required": [
+          "judge_profile_key",
+          "judge_profile_revision",
+          "reference"
+        ],
+        "title": "EvalJudgePrivateReferenceCatalogEntry",
+        "type": "object"
+      },
+      "EvalJudgeProfileRouteCatalogEntry": {
+        "additionalProperties": false,
+        "description": "Server-derived relationship between one judge and the candidate route.",
+        "properties": {
+          "candidate_route_relation": {
+            "enum": [
+              "independent_model",
+              "same_model"
+            ],
+            "title": "Candidate Route Relation",
+            "type": "string"
+          },
+          "judge_profile_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Judge Profile Key",
+            "type": "string"
+          },
+          "judge_profile_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Judge Profile Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "judge_profile_key",
+          "judge_profile_revision",
+          "candidate_route_relation"
+        ],
+        "title": "EvalJudgeProfileRouteCatalogEntry",
         "type": "object"
       },
       "EvalMemoryAttributionCapturePolicyV1": {
@@ -12511,6 +13402,12 @@
           "code": {
             "enum": [
               "target_unavailable",
+              "judge_profile_unavailable",
+              "judge_profile_changed",
+              "judge_evidence_not_allowed",
+              "judge_reference_unavailable",
+              "same_model_forbidden",
+              "unsafe_public_material",
               "scenario_store_unavailable",
               "scenario_unavailable",
               "scenario_id_mismatch",
@@ -12674,6 +13571,46 @@
         "title": "EvalSuiteDocumentV1",
         "type": "object"
       },
+      "EvalSuiteDocumentV2": {
+        "additionalProperties": false,
+        "description": "Immutable V2 suite preserving structured rubric and judge contracts.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseDefinitionV2"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "default": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteSpec"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "target_key",
+          "suite",
+          "cases"
+        ],
+        "title": "EvalSuiteDocumentV2",
+        "type": "object"
+      },
       "EvalSuiteDraftV1": {
         "additionalProperties": false,
         "description": "Revision-free suite material edited by an SDK or Control Plane client.",
@@ -12723,12 +13660,75 @@
         "title": "EvalSuiteDraftV1",
         "type": "object"
       },
+      "EvalSuiteDraftV2": {
+        "additionalProperties": false,
+        "description": "Explicit V2 editor material with structured-judge authoring support.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseDraftV2"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "default": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "trial_request": {
+            "$ref": "#/components/schemas/TrialRequestSpec"
+          }
+        },
+        "required": [
+          "id",
+          "target_key",
+          "name",
+          "cases"
+        ],
+        "title": "EvalSuiteDraftV2",
+        "type": "object"
+      },
       "EvalSuitePreviewRequest": {
         "additionalProperties": false,
         "description": "Authority-free editor material; preview never persists or executes it.",
         "properties": {
           "draft": {
-            "$ref": "#/components/schemas/EvalSuiteDraftV1"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteDraftV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDraftV2"
+              }
+            ],
+            "title": "Draft"
           }
         },
         "required": [
@@ -12756,7 +13756,15 @@
             "type": "boolean"
           },
           "suite": {
-            "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+              }
+            ],
+            "title": "Suite"
           }
         },
         "required": [
@@ -12779,7 +13787,15 @@
             "type": "string"
           },
           "suite": {
-            "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+              }
+            ],
+            "title": "Suite"
           }
         },
         "required": [
@@ -12799,7 +13815,15 @@
             "$ref": "#/components/schemas/EvalSuiteSelectionV1"
           },
           "suite": {
-            "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+              }
+            ],
+            "title": "Suite"
           }
         },
         "required": [
@@ -12960,6 +13984,24 @@
           "execution_profile_ready": {
             "title": "Execution Profile Ready",
             "type": "boolean"
+          },
+          "judge_private_references": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgePrivateReferenceCatalogEntry"
+            },
+            "maxItems": 8192,
+            "title": "Judge Private References",
+            "type": "array"
+          },
+          "judge_profile_routes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgeProfileRouteCatalogEntry"
+            },
+            "maxItems": 32,
+            "title": "Judge Profile Routes",
+            "type": "array"
           },
           "judge_profiles": {
             "default": [],
@@ -20468,6 +21510,53 @@
         "title": "ProviderStatePart",
         "type": "object"
       },
+      "PublicJudgeReferenceDraftV1": {
+        "additionalProperties": false,
+        "description": "Revision-free public reference truth accepted from an editor.",
+        "properties": {
+          "expected_answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Answer"
+          },
+          "expected_facts": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Expected Facts",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "public_reference",
+            "default": "public_reference",
+            "title": "Kind",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "PublicJudgeReferenceDraftV1",
+        "type": "object"
+      },
       "PublicJudgeReferenceV1": {
         "additionalProperties": false,
         "description": "Evaluator-only, deliberately portable reference truth.",
@@ -23421,7 +24510,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "32",
+            "default": "33",
             "title": "Contract Version",
             "type": "string"
           },
@@ -24505,6 +25594,85 @@
         "title": "StoreManifest",
         "type": "object"
       },
+      "StructuredModelJudgeAssertionDraftV1": {
+        "additionalProperties": false,
+        "description": "Revision-free rubric assertion material compiled only by the server.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/EvalJudgeEvidenceSelectionV1"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "judge_profile_key": {
+            "title": "Judge Profile Key",
+            "type": "string"
+          },
+          "judge_profile_revision": {
+            "title": "Judge Profile Revision",
+            "type": "string"
+          },
+          "kind": {
+            "const": "structured_model_judge",
+            "default": "structured_model_judge",
+            "title": "Kind",
+            "type": "string"
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "private_reference": "#/components/schemas/PrivateJudgeReferenceV1",
+                    "public_reference": "#/components/schemas/PublicJudgeReferenceDraftV1"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PublicJudgeReferenceDraftV1"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PrivateJudgeReferenceV1"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference"
+          },
+          "rubric": {
+            "$ref": "#/components/schemas/StructuredRubricDraftV1"
+          },
+          "threshold": {
+            "default": "0.5",
+            "title": "Threshold",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "judge_profile_key",
+          "judge_profile_revision",
+          "rubric"
+        ],
+        "title": "StructuredModelJudgeAssertionDraftV1",
+        "type": "object"
+      },
       "StructuredModelJudgeAssertionSpec": {
         "additionalProperties": false,
         "description": "Typed rubric judgment bound to an exact trusted server profile.",
@@ -24669,6 +25837,37 @@
           "weight"
         ],
         "title": "StructuredRubricCriterionV1",
+        "type": "object"
+      },
+      "StructuredRubricDraftV1": {
+        "additionalProperties": false,
+        "description": "Revision-free structured rubric material accepted from an editor.",
+        "properties": {
+          "criteria": {
+            "items": {
+              "$ref": "#/components/schemas/StructuredRubricCriterionV1"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Criteria",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "criteria"
+        ],
+        "title": "StructuredRubricDraftV1",
         "type": "object"
       },
       "StructuredRubricV1": {
@@ -27625,7 +28824,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "32",
+            "default": "33",
             "title": "Contract Version",
             "type": "string"
           }
@@ -28984,6 +30183,136 @@
           }
         },
         "summary": "List Eval Cases"
+      }
+    },
+    "/api/evals/judge-calibrations": {
+      "post": {
+        "operationId": "run_eval_judge_calibration_api_evals_judge_calibrations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalJudgeCalibrationRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalJudgeCalibrationRunResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Run Eval Judge Calibration"
+      }
+    },
+    "/api/evals/judge-calibrations/preview": {
+      "post": {
+        "operationId": "preview_eval_judge_calibration_api_evals_judge_calibrations_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalJudgeCalibrationPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalJudgeCalibrationPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Preview Eval Judge Calibration"
+      }
+    },
+    "/api/evals/judge-calibrations/{calibration_revision}": {
+      "get": {
+        "operationId": "get_eval_judge_calibration_api_evals_judge_calibrations__calibration_revision__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "calibration_revision",
+            "required": true,
+            "schema": {
+              "title": "Calibration Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalJudgeCalibrationReportV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Judge Calibration"
       }
     },
     "/api/evals/memory-reports": {
@@ -30971,7 +32300,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+                    }
+                  ],
+                  "title": "Response Get Eval Authored Suite Api Evals Suites  Suite Revision  Get"
                 }
               }
             },

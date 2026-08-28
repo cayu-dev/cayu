@@ -10,15 +10,23 @@ from cayu.evals.corpus import (
     FinalOutputContainsAssertionSpec,
     RootStatusAssertionSpec,
     RunInputSpec,
+    StructuredRubricCriterionV1,
     TrialRequestSpec,
 )
 from cayu.evals.suite_authoring import (
     EvalCaseDraftV1,
+    EvalCaseDraftV2,
     EvalScenarioStimulusV1,
     EvalSimpleInputStimulusV1,
+    EvalSuiteDocumentV2,
     EvalSuiteDraftV1,
+    EvalSuiteDraftV2,
+    PublicJudgeReferenceDraftV1,
+    StructuredModelJudgeAssertionDraftV1,
+    StructuredRubricDraftV1,
     add_eval_case,
     compile_eval_suite_draft,
+    compile_eval_suite_draft_v2,
     duplicate_eval_case,
     eval_suite_document_from_json,
     eval_suite_document_to_json,
@@ -27,6 +35,10 @@ from cayu.evals.suite_authoring import (
     validate_eval_suite_selection,
     validate_expected_eval_suite_revision,
 )
+
+
+def _revision(character: str) -> str:
+    return "sha256:" + character * 64
 
 
 def _case(
@@ -73,6 +85,72 @@ def test_suite_draft_compiles_to_canonical_immutable_revisions() -> None:
 
     restored = eval_suite_document_from_json(eval_suite_document_to_json(first))
     assert restored == first
+
+
+def test_v2_structured_judge_draft_compiles_server_owned_nested_revisions_and_round_trips() -> None:
+    assertion = StructuredModelJudgeAssertionDraftV1(
+        id="quality",
+        judge_profile_key="quality-judge",
+        judge_profile_revision=_revision("a"),
+        rubric=StructuredRubricDraftV1(
+            id="answer-quality",
+            criteria=(
+                StructuredRubricCriterionV1(
+                    id="correctness",
+                    name="Correctness",
+                    description="The answer is correct.",
+                    weight="0.4",
+                ),
+                StructuredRubricCriterionV1(
+                    id="usefulness",
+                    name="Usefulness",
+                    description="The answer helps the user.",
+                    weight="0.6",
+                ),
+            ),
+        ),
+        reference=PublicJudgeReferenceDraftV1(
+            id="refund-policy",
+            expected_answer="Refunds are available within 30 days.",
+            expected_facts=("The refund window is 30 days.",),
+        ),
+        threshold="0.7",
+    )
+    draft = EvalSuiteDraftV2(
+        id="refund-quality",
+        target_key="assistant.default",
+        name="Refund quality",
+        cases=(
+            EvalCaseDraftV2(
+                id="refund-request",
+                name="Refund request",
+                stimulus=EvalSimpleInputStimulusV1(
+                    input=RunInputSpec(
+                        messages=(CorpusUserMessageSpec(text="Can I get a refund?"),)
+                    )
+                ),
+                assertions=(assertion,),
+            ),
+        ),
+    )
+
+    document = compile_eval_suite_draft_v2(draft)
+    compiled = document.cases[0].assertions[0]
+
+    assert document.schema_version == 2
+    assert compiled.kind == "structured_model_judge"
+    assert compiled.rubric.revision.startswith("sha256:")
+    assert compiled.reference is not None
+    assert compiled.reference.revision.startswith("sha256:")
+    assert eval_suite_document_from_json(eval_suite_document_to_json(document)) == document
+
+    editable = EvalSuiteDraftV2.from_document(document)
+    editable_assertion = editable.cases[0].assertions[0]
+    assert type(editable_assertion) is StructuredModelJudgeAssertionDraftV1
+    assert "revision" not in editable_assertion.rubric.model_dump(mode="json")
+    assert editable_assertion.reference is not None
+    assert "revision" not in editable_assertion.reference.model_dump(mode="json")
+    assert compile_eval_suite_draft_v2(editable) == EvalSuiteDocumentV2.model_validate(document)
 
 
 def test_simple_and_exact_scenario_stimuli_are_distinct() -> None:

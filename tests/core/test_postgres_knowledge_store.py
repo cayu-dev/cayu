@@ -4744,7 +4744,7 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 67")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 67")
             await connection.commit()
 
         migrator = PostgresKnowledgeStore(
@@ -4764,7 +4764,7 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
             connection.cursor() as cursor,
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cursor.fetchone() == (67,)
+            assert await cursor.fetchone() == (68,)
             await cursor.execute(
                 "SELECT text FROM cayu_knowledge_revisions "
                 "WHERE entry_id = 'revision-66-entry' AND revision = 1"

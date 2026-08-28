@@ -14,6 +14,8 @@ corresponding credentials or service.
   commands through an explicit environment.
 - [`structured_output_live.py`](structured_output_live.py) — provider-native typed
   output.
+- [`evals_judge_calibration_live.py`](evals_judge_calibration_live.py) — a real,
+  explicitly configured judge calibrating fixed evidence without candidate execution.
 - [`server_example.py`](server_example.py) — authenticated control-plane application.
 
 ## Tools and providers

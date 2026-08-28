@@ -102,10 +102,11 @@ session store, and are bounded by explicit timeout, token, and optional
 priced-cost ceilings; profile/reference/privacy drift, public-reference secret
 conflicts, unrepresentable threshold boundaries, and judge failures produce no
 candidate score. Successful judgments retain observed judge token usage and an
-exact priced cost or explicit unavailable cost state. The server contract advances to 32
-so target catalogs can expose safe `judge_profiles`. Suite-authoring V1 remains
-unchanged; Control Plane rubric authoring follows in its separately versioned
-contract.
+exact priced cost or explicit unavailable cost state. Server contract version 31
+introduced the safe `judge_profiles` target catalog while suite-authoring V1
+remains strict and compatible. Version 33 adds suite-authoring V2 plus protected
+Control Plane rubric-authoring and fixed-evidence calibration routes; independently
+deployed dashboards, servers, and generated clients must be upgraded together.
 
 ### Repeated memory experiments publish exact paired reports
 

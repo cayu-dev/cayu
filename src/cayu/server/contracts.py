@@ -25,6 +25,11 @@ from pydantic import (
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar_text
 from cayu.core.events import EVENT_ID_MAX_CHARS
+from cayu.evals.calibration import (
+    EvalJudgeCalibrationDefinitionV1,
+    EvalJudgeCalibrationDraftV1,
+    EvalJudgeCalibrationReportV1,
+)
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -32,6 +37,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TRIALS,
     JudgeProfileIdentityV1,
+    PrivateJudgeReferenceV1,
     RunInputSpec,
     TrialRequestSpec,
 )
@@ -70,8 +76,8 @@ from cayu.evals.store import (
 )
 from cayu.evals.suite_authoring import (
     EvalSuiteAuthoringAssertionSpecV1,
-    EvalSuiteDocumentV1,
-    EvalSuiteDraftV1,
+    EvalSuiteDocument,
+    EvalSuiteDraft,
     EvalSuiteSelectionV1,
 )
 from cayu.runtime.aggregates import (
@@ -1011,6 +1017,28 @@ class EvalExecutionProfileDiagnostic(ApiBaseModel):
         return cls(code=code, message=message, remediation=remediation)
 
 
+class EvalJudgePrivateReferenceCatalogEntry(ApiBaseModel):
+    """Safe identity of evaluator-only truth published for one exact judge."""
+
+    judge_profile_key: PromotionPortableId
+    judge_profile_revision: EvalRevision
+    reference: PrivateJudgeReferenceV1
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> EvalJudgePrivateReferenceCatalogEntry:
+        if self.reference.kind != "private_reference":
+            raise ValueError("Judge private-reference catalogs require private identities.")
+        return self
+
+
+class EvalJudgeProfileRouteCatalogEntry(ApiBaseModel):
+    """Server-derived relationship between one judge and the candidate route."""
+
+    judge_profile_key: PromotionPortableId
+    judge_profile_revision: EvalRevision
+    candidate_route_relation: Literal["independent_model", "same_model"]
+
+
 class EvalTargetCatalogEntry(ApiBaseModel):
     """Bounded public identity for one server-owned eval execution target."""
 
@@ -1039,6 +1067,14 @@ class EvalTargetCatalogEntry(ApiBaseModel):
     cost_budget_available: StrictBool
     cost_budget_currencies: tuple[StrictStr, ...] = Field(max_length=32)
     judge_profiles: tuple[JudgeProfileIdentityV1, ...] = Field(default=(), max_length=32)
+    judge_profile_routes: tuple[EvalJudgeProfileRouteCatalogEntry, ...] = Field(
+        default=(),
+        max_length=32,
+    )
+    judge_private_references: tuple[EvalJudgePrivateReferenceCatalogEntry, ...] = Field(
+        default=(),
+        max_length=8_192,
+    )
     execution_profile_ready: StrictBool
     execution_profile: EvalExecutionProfileV1 | None
     execution_profile_diagnostics: tuple[EvalExecutionProfileDiagnostic, ...] = Field(max_length=4)
@@ -1087,6 +1123,46 @@ class EvalTargetCatalogEntry(ApiBaseModel):
         if keys != tuple(sorted(set(keys))):
             raise ValueError("Judge profiles must be unique and sorted by key.")
         return value
+
+    @field_validator("judge_profile_routes")
+    @classmethod
+    def validate_judge_profile_routes(
+        cls,
+        value: tuple[EvalJudgeProfileRouteCatalogEntry, ...],
+    ) -> tuple[EvalJudgeProfileRouteCatalogEntry, ...]:
+        identities = tuple((item.judge_profile_key, item.judge_profile_revision) for item in value)
+        if identities != tuple(sorted(set(identities))):
+            raise ValueError("Judge profile routes must be unique and canonically sorted.")
+        return value
+
+    @field_validator("judge_private_references")
+    @classmethod
+    def validate_judge_private_references(
+        cls,
+        value: tuple[EvalJudgePrivateReferenceCatalogEntry, ...],
+    ) -> tuple[EvalJudgePrivateReferenceCatalogEntry, ...]:
+        identities = tuple(
+            (item.judge_profile_key, item.reference.key, item.reference.revision) for item in value
+        )
+        if identities != tuple(sorted(set(identities))):
+            raise ValueError("Judge private references must be unique and canonically sorted.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_judge_reference_profiles(self) -> EvalTargetCatalogEntry:
+        profiles = {(item.key, item.revision) for item in self.judge_profiles}
+        route_profiles = {
+            (item.judge_profile_key, item.judge_profile_revision)
+            for item in self.judge_profile_routes
+        }
+        if route_profiles != profiles:
+            raise ValueError("Every judge profile requires one exact candidate-route relation.")
+        if any(
+            (item.judge_profile_key, item.judge_profile_revision) not in profiles
+            for item in self.judge_private_references
+        ):
+            raise ValueError("Judge private references require their exact published profile.")
+        return self
 
     @model_validator(mode="after")
     def validate_cost_budget_availability(self) -> EvalTargetCatalogEntry:
@@ -1500,6 +1576,12 @@ class EvalScenarioSaveResponse(ApiBaseModel):
 class EvalSuiteAuthoringDiagnostic(ApiBaseModel):
     code: Literal[
         "target_unavailable",
+        "judge_profile_unavailable",
+        "judge_profile_changed",
+        "judge_evidence_not_allowed",
+        "judge_reference_unavailable",
+        "same_model_forbidden",
+        "unsafe_public_material",
         "scenario_store_unavailable",
         "scenario_unavailable",
         "scenario_id_mismatch",
@@ -1513,11 +1595,11 @@ class EvalSuiteAuthoringDiagnostic(ApiBaseModel):
 class EvalSuitePreviewRequest(ApiBaseModel):
     """Authority-free editor material; preview never persists or executes it."""
 
-    draft: EvalSuiteDraftV1
+    draft: EvalSuiteDraft
 
 
 class EvalSuitePreviewResponse(ApiBaseModel):
-    suite: EvalSuiteDocumentV1
+    suite: EvalSuiteDocument
     full_selection: EvalSuiteSelectionV1
     ready: StrictBool
     diagnostics: tuple[EvalSuiteAuthoringDiagnostic, ...] = ()
@@ -1527,13 +1609,82 @@ class EvalSuiteSaveRequest(ApiBaseModel):
     """One reviewed canonical suite revision guarded by optimistic identity."""
 
     expected_suite_revision: EvalRevision
-    suite: EvalSuiteDocumentV1
+    suite: EvalSuiteDocument
 
 
 class EvalSuiteSaveResponse(ApiBaseModel):
     entry: EvalAuthoredSuiteCatalogEntry
-    suite: EvalSuiteDocumentV1
+    suite: EvalSuiteDocument
     full_selection: EvalSuiteSelectionV1
+
+
+class EvalJudgeCalibrationDiagnostic(ApiBaseModel):
+    code: Literal[
+        "target_unavailable",
+        "judge_profile_unavailable",
+        "judge_profile_changed",
+        "same_model_forbidden",
+        "reference_unavailable",
+        "evidence_not_allowed",
+        "unsafe_public_material",
+        "invalid_contract",
+    ]
+    message: StrictStr = Field(min_length=1, max_length=2_048)
+
+
+class EvalJudgeCalibrationPreviewRequest(ApiBaseModel):
+    """Authority-free fixed evidence and human labels; preview never executes."""
+
+    draft: EvalJudgeCalibrationDraftV1
+
+
+class EvalJudgeCalibrationWorkPreview(ApiBaseModel):
+    judge_calls: StrictInt = Field(ge=1, le=10)
+    max_input_tokens: StrictInt = Field(ge=1)
+    max_output_tokens: StrictInt = Field(ge=1)
+    max_total_tokens: StrictInt = Field(ge=1)
+    max_estimated_cost: StrictStr | None = None
+    cost_currency: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_cost(self) -> EvalJudgeCalibrationWorkPreview:
+        if (self.max_estimated_cost is None) != (self.cost_currency is None):
+            raise ValueError("Calibration cost preview requires complete priced identity.")
+        return self
+
+
+class EvalJudgeCalibrationPreviewResponse(ApiBaseModel):
+    definition: EvalJudgeCalibrationDefinitionV1
+    ready: StrictBool
+    diagnostics: tuple[EvalJudgeCalibrationDiagnostic, ...] = Field(default=(), max_length=16)
+    judge_profile: JudgeProfileIdentityV1 | None = None
+    candidate_route_relation: Literal["independent_model", "same_model"] | None = None
+    work: EvalJudgeCalibrationWorkPreview | None = None
+
+    @model_validator(mode="after")
+    def validate_readiness(self) -> EvalJudgeCalibrationPreviewResponse:
+        material = (
+            self.judge_profile,
+            self.candidate_route_relation,
+            self.work,
+        )
+        if self.ready != all(item is not None for item in material):
+            raise ValueError("Calibration readiness contradicts its authority preview.")
+        if self.ready == bool(self.diagnostics):
+            raise ValueError("Calibration readiness contradicts its diagnostics.")
+        return self
+
+
+class EvalJudgeCalibrationRunRequest(ApiBaseModel):
+    """One reviewed immutable definition guarded by exact preview identity."""
+
+    run_id: PromotionPortableId
+    expected_definition_revision: EvalRevision
+    definition: EvalJudgeCalibrationDefinitionV1
+
+
+class EvalJudgeCalibrationRunResponse(ApiBaseModel):
+    report: EvalJudgeCalibrationReportV1
 
 
 class EvalAuthoredSuiteRunSelectionRequest(ApiBaseModel):

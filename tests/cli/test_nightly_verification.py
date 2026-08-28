@@ -885,6 +885,11 @@ def test_lambda_metadata_isolation_live_check_retains_verified_adapter_evidence(
         ),
         ("structured-output-live", "provider-contract", "examples/structured_output_live.py"),
         (
+            "evals-judge-calibration-live",
+            "provider-contract",
+            "examples/evals_judge_calibration_live.py",
+        ),
+        (
             "knowledge-embedding-live",
             "provider-embedding",
             "examples/knowledge_embedding_live.py",

@@ -38,6 +38,7 @@ from cayu import (
     InMemoryTaskStore,
     Message,
     MessageRole,
+    ModelJudgeTarget,
     ModelPrice,
     PriceBook,
     RetryPolicy,
@@ -144,10 +145,12 @@ class DashboardContractProvider(ModelProvider):
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
+        self.judge_requests: list[ModelRequest] = []
         self.direct_requests: list[ModelRequest] = []
         self.direct_completions = 0
         self.recovery_requests: list[ModelRequest] = []
         self.replay_markers: list[str] = []
+        self.promotion_outputs = 0
         self._approval_seeded = False
         self._scenario_approval_seeded = False
         self._direct_started = asyncio.Condition()
@@ -177,6 +180,33 @@ class DashboardContractProvider(ModelProvider):
             for part in message.content
             if isinstance(part, TextPart)
         )
+        if "criterion ids must appear exactly once" in request_text.lower():
+            self.judge_requests.append(request)
+            yield ModelStreamEvent.text_delta(
+                json.dumps(
+                    {
+                        "criteria": [
+                            {
+                                "criterion_id": "correctness",
+                                "score": 1,
+                                "explanation": "The known output satisfies the fixed task.",
+                            }
+                        ]
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            yield ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 24,
+                        "total_tokens": 144,
+                    },
+                }
+            )
+            return
         if "promote this captured dashboard run" in request_text.lower():
             if self.block_next_promotion_run:
                 self.block_next_promotion_run = False
@@ -194,7 +224,10 @@ class DashboardContractProvider(ModelProvider):
                 )
                 yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
                 return
-            yield ModelStreamEvent.text_delta("dashboard eval promotion output")
+            self.promotion_outputs += 1
+            yield ModelStreamEvent.text_delta(
+                f"dashboard eval promotion output {self.promotion_outputs}"
+            )
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
         if "exercise one fresh control plane-authored evaluation" in request_text.lower():
@@ -388,6 +421,21 @@ async def main() -> None:
     )
     app, provider, store, task_store = await _seed_app()
     price_book = _dashboard_price_book()
+    judge_app = CayuApp(enable_logging=False)
+    judge_app.register_provider(provider, default=True)
+    judge_app.register_agent(AgentSpec(name="dashboard-contract-judge", model=MODEL_NAME))
+    judge = ModelJudgeTarget(
+        key="dashboard-quality-judge",
+        label="Dashboard quality judge",
+        app=judge_app,
+        agent_name="dashboard-contract-judge",
+        max_input_tokens=3_072,
+        max_output_tokens=1_024,
+        max_total_tokens=4_096,
+        max_estimated_cost="0.01",
+        price_book=price_book,
+        allow_same_model=True,
+    )
     evals_directory = tempfile.TemporaryDirectory(prefix="cayu-dashboard-evals-")
     eval_store = SQLiteEvalStore(Path(evals_directory.name) / "evals.sqlite")
     provider.block_next_promotion_run = True
@@ -411,6 +459,7 @@ async def main() -> None:
                         request_base=RunRequest(agent_name=AGENT_NAME, messages=[]),
                         application_release_id="dashboard-browser-contract",
                         price_book=price_book,
+                        model_judges=(judge,),
                     ),
                     store=eval_store,
                     poll_interval_seconds=0.05,
@@ -1195,6 +1244,7 @@ async def _run_browser_contract(
             "captured_evaluation_preview_and_assertion_authoring",
             "scenario_authoring_and_controlled_execution",
             "authored_eval_suite_creation_and_subset_launch",
+            "structured_judge_authoring_and_fixed_evidence_calibration",
             "authored_eval_suite_reuse",
             "captured_result_save_and_baseline",
             "eval_result_catalog_navigation",
@@ -1579,6 +1629,10 @@ async def _exercise_captured_evaluation(
         name="Case input message 1",
         exact=True,
     ).fill("Exercise one fresh Control Plane-authored evaluation.")
+    await authoring.get_by_role("button", name="Add same-model AI judge", exact=True).click()
+    await expect(authoring.get_by_test_id("judge-profile-summary")).to_contain_text(
+        re.compile(r"same model as candidate", re.IGNORECASE)
+    )
     await authoring.get_by_role("button", name="Add case", exact=True).click()
     case_list = authoring.get_by_test_id("authored-suite-cases")
     case_id_input = authoring.get_by_test_id("authored-case-id")
@@ -1617,6 +1671,60 @@ async def _exercise_captured_evaluation(
     await authoring.get_by_label("Select Case 2 for launch", exact=True).uncheck()
     await authoring.get_by_test_id("authored-suite-preview").click()
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
+    await case_list.get_by_role("button").filter(has_text="Authored primary behavior").click()
+    calibration = authoring.get_by_test_id("judge-calibration")
+    await expect(calibration).to_be_visible()
+    await calibration.get_by_label("Evidence source ID", exact=True).fill(
+        "dashboard-reviewed-known-output"
+    )
+    known_output = calibration.get_by_label("Known candidate output", exact=True)
+    await known_output.fill("dashboard authored evaluation output")
+    await calibration.get_by_label("Repeated judge calls", exact=True).fill("2")
+    runs_before_calibration_response = await page.request.get(
+        f"{base_url}/api/evals/runs?target_key=dashboard.regressions&limit=100"
+    )
+    require_equal(
+        runs_before_calibration_response.status,
+        200,
+        "the calibration contract must read the durable run catalog",
+    )
+    runs_before_calibration = len((await runs_before_calibration_response.json())["items"])
+    judge_requests_before_calibration = len(provider.judge_requests)
+    await calibration.get_by_role("button", name="Check calibration", exact=True).click()
+    await expect(calibration.get_by_text("Calibration is ready", exact=True)).to_be_visible()
+    await expect(calibration.get_by_text(re.compile(r"2 judge calls"))).to_be_visible()
+    await expect(calibration.get_by_text(re.compile(r"Same-model judge:"))).to_be_visible()
+    await calibration.get_by_role("button", name="Run calibration", exact=True).click()
+    await expect(calibration.get_by_text(re.compile(r"Calibration complete"))).to_be_visible(
+        timeout=20_000
+    )
+    await expect(calibration.get_by_text(re.compile(r"Trial 1: passed"))).to_be_visible()
+    await expect(calibration.get_by_text(re.compile(r"Trial 2: passed"))).to_be_visible()
+    await expect(
+        calibration.get_by_text(re.compile(r"correctness: judge 1 · human 1"))
+    ).to_have_count(2)
+    await expect(calibration.get_by_text(re.compile(r"Usage: 1 model step"))).to_have_count(2)
+    await expect(calibration.get_by_text(re.compile(r"Cost: .* USD"))).to_have_count(2)
+    require_equal(
+        len(provider.judge_requests),
+        judge_requests_before_calibration + 2,
+        "fixed-evidence calibration must invoke only the two requested judge trials",
+    )
+    runs_after_calibration_response = await page.request.get(
+        f"{base_url}/api/evals/runs?target_key=dashboard.regressions&limit=100"
+    )
+    require_equal(
+        runs_after_calibration_response.status,
+        200,
+        "the calibration contract must re-read the durable run catalog",
+    )
+    require_equal(
+        len((await runs_after_calibration_response.json())["items"]),
+        runs_before_calibration,
+        "fixed-evidence calibration must not admit a candidate eval run",
+    )
+    await known_output.fill("edited evidence invalidates the completed report")
+    await expect(calibration.get_by_text(re.compile(r"Calibration complete"))).to_have_count(0)
     suite_save_started = asyncio.Event()
     release_suite_save = asyncio.Event()
 

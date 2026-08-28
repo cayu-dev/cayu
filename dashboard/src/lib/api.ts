@@ -41,6 +41,11 @@ import type {
   EvalCorpusCatalogEntry,
   EvalCorpusCatalogPage,
   EvalCorpusDocument,
+  EvalJudgeCalibrationPreviewRequest,
+  EvalJudgeCalibrationPreviewResponse,
+  EvalJudgeCalibrationReportV1,
+  EvalJudgeCalibrationRunRequest,
+  EvalJudgeCalibrationRunResponse,
   EvalResultComparisonResponse,
   EvalResultDetailResponse,
   EvalResultPage,
@@ -63,7 +68,8 @@ import type {
   EvalScenarioSaveResponse,
   EvalSuiteCatalogPage,
   EvalSuiteDocumentV1,
-  EvalSuiteDraftV1,
+  EvalSuiteDocumentV2,
+  EvalSuiteDraftV2,
   EvalSuitePreviewRequest,
   EvalSuitePreviewResponse,
   EvalSuiteSaveRequest,
@@ -253,8 +259,8 @@ export type EvalScenarioRunLaunch = EvalScenarioRunCreateRequest
 export type EvalScenarioApproval = EvalScenarioApprovalRequest
 export type EvalScenarioEntry = EvalScenarioCatalogEntry
 export type EvalScenariosPage = EvalScenarioCatalogPage
-export type EvalAuthoredSuite = EvalSuiteDocumentV1
-export type EvalAuthoredSuiteDraft = EvalSuiteDraftV1
+export type EvalAuthoredSuite = EvalSuiteDocumentV1 | EvalSuiteDocumentV2
+export type EvalAuthoredSuiteDraft = EvalSuiteDraftV2
 export type EvalAuthoredSuitePreviewRequestBody = EvalSuitePreviewRequest
 export type EvalAuthoredSuitePreview = EvalSuitePreviewResponse
 export type EvalAuthoredSuiteSave = EvalSuiteSaveRequest
@@ -264,6 +270,11 @@ export type EvalAuthoredSuiteRunSelection = EvalAuthoredSuiteRunSelectionRequest
 export type EvalAuthoredSuiteRunLaunch = EvalAuthoredSuiteRunLaunchRequest
 export type EvalAuthoredSuiteRunPreview = EvalAuthoredSuiteRunPreviewResponse
 export type EvalAuthoredSuiteRunLaunched = EvalAuthoredSuiteRunLaunchResponse
+export type EvalJudgeCalibrationPreviewBody = EvalJudgeCalibrationPreviewRequest
+export type EvalJudgeCalibrationPreview = EvalJudgeCalibrationPreviewResponse
+export type EvalJudgeCalibrationRun = EvalJudgeCalibrationRunRequest
+export type EvalJudgeCalibrationRunResult = EvalJudgeCalibrationRunResponse
+export type EvalJudgeCalibrationReport = EvalJudgeCalibrationReportV1
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
 export type EvalSuitesQuery = NonNullable<
   ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData["query"]
@@ -643,6 +654,30 @@ export async function previewEvalAuthoredSuite(
 ): Promise<EvalAuthoredSuitePreview> {
   return requestJson<EvalAuthoredSuitePreview>("/evals/suites/preview", {
     method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function previewEvalJudgeCalibration(
+  body: EvalJudgeCalibrationPreviewBody,
+  signal?: AbortSignal,
+): Promise<EvalJudgeCalibrationPreview> {
+  return requestJson<EvalJudgeCalibrationPreview>("/evals/judge-calibrations/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function runEvalJudgeCalibration(
+  body: EvalJudgeCalibrationRun,
+  signal?: AbortSignal,
+): Promise<EvalJudgeCalibrationRunResult> {
+  return requestJson<EvalJudgeCalibrationRunResult>("/evals/judge-calibrations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal,
   })

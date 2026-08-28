@@ -698,6 +698,18 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="evals-judge-calibration-live",
+        capability="explicit real-provider fixed-evidence judge calibration",
+        lane="provider-contract",
+        command=("uv", "run", "python", "examples/evals_judge_calibration_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY", "Cayu server extra"),
+        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
+        required_modules=("fastapi",),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="bedrock-provider-live",
         capability="Amazon Bedrock text, tool structured output, usage, and token counting",
         lane="provider-contract",

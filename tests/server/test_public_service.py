@@ -2464,6 +2464,8 @@ def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_pat
                     "cost_budget_available": False,
                     "cost_budget_currencies": [],
                     "judge_profiles": [],
+                    "judge_profile_routes": [],
+                    "judge_private_references": [],
                     "execution_profile_ready": True,
                     "execution_profile": execution_profile,
                     "execution_profile_diagnostics": [],

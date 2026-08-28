@@ -1,3 +1,4 @@
+import { validateStructuredJudgeAssertion } from "./eval-judge-authoring.ts"
 import {
   durableTextLength,
   isPythonBlank,
@@ -8,10 +9,13 @@ import {
   validateDeterministicAssertions,
 } from "./evaluation-promotion.ts"
 import type {
-  EvalCaseDraftV1,
+  EvalCaseDraftV2,
   EvalScenarioDraftV2,
   EvalSuiteDocumentV1,
-  EvalSuiteDraftV1,
+  EvalSuiteDocumentV2,
+  EvalSuiteDraftV2,
+  StructuredModelJudgeAssertionDraftV1,
+  StructuredModelJudgeAssertionSpec,
 } from "./generated/server-api"
 
 const SHA256_REVISION_PATTERN = /^sha256:[a-f0-9]{64}$/
@@ -19,11 +23,12 @@ const SHA256_REVISION_PATTERN = /^sha256:[a-f0-9]{64}$/
 export const EVAL_SUITE_MAX_CASES = 1_000
 
 export type EvalSuiteDraftValidation =
-  | { ok: true; draft: EvalSuiteDraftV1 }
+  | { ok: true; draft: EvalSuiteDraftV2 }
   | { ok: false; error: string }
 
-export function newEvalSuiteDraft(targetKey: string): EvalSuiteDraftV1 {
+export function newEvalSuiteDraft(targetKey: string): EvalSuiteDraftV2 {
   return {
+    schema_version: 2,
     id: "evaluation-suite",
     target_key: targetKey,
     name: "Evaluation suite",
@@ -34,9 +39,9 @@ export function newEvalSuiteDraft(targetKey: string): EvalSuiteDraftV1 {
 }
 
 export function newSimpleEvalCase(
-  existing: readonly EvalCaseDraftV1[],
+  existing: readonly EvalCaseDraftV2[],
   preferredId?: string,
-): EvalCaseDraftV1 {
+): EvalCaseDraftV2 {
   if (preferredId === undefined && existing.length >= EVAL_SUITE_MAX_CASES) {
     throw new Error(`An eval suite cannot contain more than ${EVAL_SUITE_MAX_CASES} cases.`)
   }
@@ -63,7 +68,7 @@ export function newSimpleEvalCase(
 
 export function blankEvalScenarioDraft(
   targetKey: string,
-  evalCase: EvalCaseDraftV1,
+  evalCase: EvalCaseDraftV2,
 ): EvalScenarioDraftV2 {
   return {
     id: portableScenarioId(evalCase.id),
@@ -91,21 +96,31 @@ export function blankEvalScenarioDraft(
   }
 }
 
-export function evalSuiteDraftFromDocument(document: EvalSuiteDocumentV1): EvalSuiteDraftV1 {
+export function evalSuiteDraftFromDocument(
+  document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2,
+): EvalSuiteDraftV2 {
   return structuredClone({
+    schema_version: 2,
     id: document.suite.id,
     target_key: document.target_key,
     name: document.suite.name,
     description: document.suite.description ?? null,
     trial_request: document.suite.trial_request ?? { trials: 1, timeout_seconds: 300 },
-    cases: document.cases.map(({ revision: _revision, ...evalCase }) => evalCase),
+    cases: document.cases.map(({ revision: _revision, ...evalCase }) => ({
+      ...evalCase,
+      assertions: evalCase.assertions.map((assertion) =>
+        assertion.kind === "structured_model_judge"
+          ? structuredJudgeDraftFromSpec(assertion)
+          : assertion,
+      ),
+    })),
   })
 }
 
 export function duplicateEvalSuiteCase(
-  cases: readonly EvalCaseDraftV1[],
+  cases: readonly EvalCaseDraftV2[],
   index: number,
-): EvalCaseDraftV1 {
+): EvalCaseDraftV2 {
   if (cases.length >= EVAL_SUITE_MAX_CASES) {
     throw new Error(`An eval suite cannot contain more than ${EVAL_SUITE_MAX_CASES} cases.`)
   }
@@ -119,8 +134,8 @@ export function duplicateEvalSuiteCase(
 }
 
 export function evalSuitePreviewMatchesDraft(
-  document: EvalSuiteDocumentV1,
-  draft: EvalSuiteDraftV1,
+  document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2,
+  draft: EvalSuiteDraftV2,
 ): boolean {
   return JSON.stringify(evalSuiteDraftFromDocument(document)) === JSON.stringify(draft)
 }
@@ -142,7 +157,7 @@ export function scenarioArtifactBindingsRequireMaterialization(
   )
 }
 
-export function validateEvalSuiteDraft(draft: EvalSuiteDraftV1): EvalSuiteDraftValidation {
+export function validateEvalSuiteDraft(draft: EvalSuiteDraftV2): EvalSuiteDraftValidation {
   try {
     requirePortableId(draft.id, "Suite ID")
     requirePortableId(draft.target_key, "Target key")
@@ -197,7 +212,24 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV1): EvalSuiteDraftV
           throw new Error(`${label} must reference a saved immutable scenario revision.`)
         }
       }
-      validateDeterministicAssertions(evalCase.assertions as readonly PromotionAssertion[])
+      const assertionIds = new Set<string>()
+      const deterministic: PromotionAssertion[] = []
+      for (const assertion of evalCase.assertions) {
+        requirePortableId(assertion.id, `${label} assertion ID`)
+        if (assertionIds.has(assertion.id)) {
+          throw new Error(`${label} assertion ID ${assertion.id} is duplicated.`)
+        }
+        assertionIds.add(assertion.id)
+        if (assertion.kind === "structured_model_judge") {
+          validateStructuredJudgeAssertion(assertion)
+        } else {
+          deterministic.push(assertion as PromotionAssertion)
+        }
+      }
+      if (evalCase.assertions.length < 1 || evalCase.assertions.length > 64) {
+        throw new Error(`${label} must contain between 1 and 64 assertions.`)
+      }
+      if (deterministic.length > 0) validateDeterministicAssertions(deterministic)
     }
     return { ok: true, draft }
   } catch (error) {
@@ -206,6 +238,18 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV1): EvalSuiteDraftV
       error: error instanceof Error ? error.message : "The authored eval suite is invalid.",
     }
   }
+}
+
+function structuredJudgeDraftFromSpec(
+  assertion: StructuredModelJudgeAssertionSpec,
+): StructuredModelJudgeAssertionDraftV1 {
+  const { revision: _rubricRevision, ...rubric } = assertion.rubric
+  const reference = assertion.reference
+  if (reference?.kind === "public_reference") {
+    const { revision: _referenceRevision, ...publicReference } = reference
+    return { ...assertion, rubric, reference: publicReference }
+  }
+  return { ...assertion, rubric, reference }
 }
 
 function nextPortableId(prefix: string, existing: readonly string[]): string {

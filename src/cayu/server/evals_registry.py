@@ -15,6 +15,7 @@ from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedErro
 from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
+    _candidate_judge_route_relation,
     evaluation_target_identity,
     model_judge_profile,
 )
@@ -44,6 +45,8 @@ from cayu.server.contracts import (
     MAX_EVAL_TARGET_COMPONENT_CHARS,
     MAX_EVAL_TARGETS,
     EvalExecutionProfileDiagnostic,
+    EvalJudgePrivateReferenceCatalogEntry,
+    EvalJudgeProfileRouteCatalogEntry,
     EvalTargetCatalogEntry,
     EvalTargetCatalogResponse,
 )
@@ -619,6 +622,8 @@ def generated_eval_target_registry(
             cost_budget_available=bool(cost_budget_currencies),
             cost_budget_currencies=cost_budget_currencies,
             judge_profiles=(),
+            judge_profile_routes=(),
+            judge_private_references=(),
             execution_profile_ready=False,
             execution_profile=None,
             execution_profile_diagnostics=(
@@ -652,6 +657,39 @@ def explicit_eval_target_registry(
     identity = evaluation_target_identity(target)
     agent_name = _target_identity_component(target.request_base.agent_name, "agent_name")
     cost_budget_currencies = cost_budget_currencies_for_target(target)
+    judge_profiles = tuple(
+        sorted(
+            (model_judge_profile(judge) for judge in target.model_judges),
+            key=lambda profile: profile.key,
+        )
+    )
+    profiles_by_key = {profile.key: profile for profile in judge_profiles}
+    judge_profile_routes = tuple(
+        EvalJudgeProfileRouteCatalogEntry(
+            judge_profile_key=profile.key,
+            judge_profile_revision=profile.revision,
+            candidate_route_relation=_candidate_judge_route_relation(target, profile),
+        )
+        for profile in judge_profiles
+    )
+    judge_private_references = tuple(
+        sorted(
+            (
+                EvalJudgePrivateReferenceCatalogEntry(
+                    judge_profile_key=judge.key,
+                    judge_profile_revision=profiles_by_key[judge.key].revision,
+                    reference=reference.portable_identity(),
+                )
+                for judge in target.model_judges
+                for reference in judge.private_references
+            ),
+            key=lambda item: (
+                item.judge_profile_key,
+                item.reference.key,
+                item.reference.revision,
+            ),
+        )
+    )
     entry = EvalTargetCatalogEntry(
         target_key=target.key,
         project_id=None,
@@ -667,12 +705,9 @@ def explicit_eval_target_registry(
         max_steps=target.request_base.max_steps,
         cost_budget_available=bool(cost_budget_currencies),
         cost_budget_currencies=cost_budget_currencies,
-        judge_profiles=tuple(
-            sorted(
-                (model_judge_profile(judge) for judge in target.model_judges),
-                key=lambda profile: profile.key,
-            )
-        ),
+        judge_profiles=judge_profiles,
+        judge_profile_routes=judge_profile_routes,
+        judge_private_references=judge_private_references,
         execution_profile_ready=False,
         execution_profile=None,
         execution_profile_diagnostics=(EvalExecutionProfileDiagnostic.for_code("not_resolved"),),

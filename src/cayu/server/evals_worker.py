@@ -35,7 +35,7 @@ from cayu.evals.store import (
     EvalRunStatus,
     EvalScenarioTrialFailureCode,
 )
-from cayu.evals.suite_authoring import EvalSuiteDocumentV1
+from cayu.evals.suite_authoring import EvalSuiteDocument
 from cayu.evals.suite_execution import corpus_for_authored_scenario_case
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
@@ -293,7 +293,7 @@ class EvalRunCoordinator:
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
             if scenario is None:
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
-            authored_suite: EvalSuiteDocumentV1 | None = None
+            authored_suite: EvalSuiteDocument | None = None
             if scenario_invocation.authored_suite_revision is not None:
                 try:
                     authored_suite = await self._config.store.load_authored_suite(
@@ -395,7 +395,7 @@ class EvalRunCoordinator:
         corpus: EvalCorpusDocument,
         scenario: EvalScenarioDocumentV2,
         binding: ScenarioLaunchBindingV2,
-        authored_suite: EvalSuiteDocumentV1 | None,
+        authored_suite: EvalSuiteDocument | None,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
         target: CorpusTarget,

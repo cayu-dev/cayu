@@ -4853,6 +4853,43 @@ export type EvalCaseDefinitionV1 = {
 };
 
 /**
+ * EvalCaseDefinitionV2
+ *
+ * One immutable V2 case revision with structured-judge fidelity.
+ */
+export type EvalCaseDefinitionV2 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    source?: EvaluationSourceIdentityV1 | null;
+    /**
+     * Stimulus
+     */
+    stimulus: ({
+        kind: 'simple_input';
+    } & EvalSimpleInputStimulusV1) | ({
+        kind: 'scenario';
+    } & EvalScenarioStimulusV1);
+};
+
+/**
  * EvalCaseDraftV1
  *
  * Bounded, revision-free case material accepted by authoring previews.
@@ -4862,6 +4899,39 @@ export type EvalCaseDraftV1 = {
      * Assertions
      */
     assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    source?: EvaluationSourceIdentityV1 | null;
+    /**
+     * Stimulus
+     */
+    stimulus: ({
+        kind: 'simple_input';
+    } & EvalSimpleInputStimulusV1) | ({
+        kind: 'scenario';
+    } & EvalScenarioStimulusV1);
+};
+
+/**
+ * EvalCaseDraftV2
+ *
+ * Revision-free V2 case material accepted by authoring previews.
+ */
+export type EvalCaseDraftV2 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
     /**
      * Description
      */
@@ -5233,6 +5303,328 @@ export type EvalExecutionTargetMaterialIdentityV1 = {
 };
 
 /**
+ * EvalJudgeCalibrationCriterionLabelV1
+ *
+ * One human score for an exact rubric criterion.
+ */
+export type EvalJudgeCalibrationCriterionLabelV1 = {
+    /**
+     * Criterion Id
+     */
+    criterion_id: string;
+    /**
+     * Score
+     */
+    score: string;
+};
+
+/**
+ * EvalJudgeCalibrationDefinitionV1
+ *
+ * Immutable calibration inputs; invoking it can only execute the judge.
+ */
+export type EvalJudgeCalibrationDefinitionV1 = {
+    assertion: StructuredModelJudgeAssertionSpec;
+    evidence: EvalJudgeCalibrationEvidenceV1;
+    human_label: EvalJudgeCalibrationHumanLabelV1;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Trials
+     */
+    trials: number;
+};
+
+/**
+ * EvalJudgeCalibrationDiagnostic
+ */
+export type EvalJudgeCalibrationDiagnostic = {
+    /**
+     * Code
+     */
+    code: 'target_unavailable' | 'judge_profile_unavailable' | 'judge_profile_changed' | 'same_model_forbidden' | 'reference_unavailable' | 'evidence_not_allowed' | 'unsafe_public_material' | 'invalid_contract';
+    /**
+     * Message
+     */
+    message: string;
+};
+
+/**
+ * EvalJudgeCalibrationDraftV1
+ *
+ * Revision-free browser material for one calibration run.
+ */
+export type EvalJudgeCalibrationDraftV1 = {
+    assertion: StructuredModelJudgeAssertionSpec;
+    /**
+     * Evidence Source Id
+     */
+    evidence_source_id: string;
+    /**
+     * Final Output
+     */
+    final_output: string;
+    /**
+     * Human Criteria
+     */
+    human_criteria: Array<EvalJudgeCalibrationCriterionLabelV1>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Task
+     */
+    task: string;
+    /**
+     * Transcript
+     */
+    transcript?: string | null;
+    /**
+     * Trials
+     */
+    trials?: number;
+};
+
+/**
+ * EvalJudgeCalibrationEvidenceProvenanceV1
+ *
+ * Operator-declared origin for fixed evidence, without implied verification.
+ */
+export type EvalJudgeCalibrationEvidenceProvenanceV1 = {
+    /**
+     * Kind
+     */
+    kind?: 'operator_supplied';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Source Id
+     */
+    source_id: string;
+};
+
+/**
+ * EvalJudgeCalibrationEvidenceV1
+ *
+ * Content-addressed, public-safe candidate evidence that is never executed.
+ */
+export type EvalJudgeCalibrationEvidenceV1 = {
+    /**
+     * Final Output
+     */
+    final_output: string;
+    provenance: EvalJudgeCalibrationEvidenceProvenanceV1;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Task
+     */
+    task: string;
+    /**
+     * Transcript
+     */
+    transcript?: string | null;
+};
+
+/**
+ * EvalJudgeCalibrationHumanLabelV1
+ *
+ * Human ground truth bound to one exact structured rubric.
+ */
+export type EvalJudgeCalibrationHumanLabelV1 = {
+    /**
+     * Aggregate Score
+     */
+    aggregate_score: string;
+    /**
+     * Criteria
+     */
+    criteria: Array<EvalJudgeCalibrationCriterionLabelV1>;
+    /**
+     * Rubric Revision
+     */
+    rubric_revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * EvalJudgeCalibrationPreviewRequest
+ *
+ * Authority-free fixed evidence and human labels; preview never executes.
+ */
+export type EvalJudgeCalibrationPreviewRequest = {
+    draft: EvalJudgeCalibrationDraftV1;
+};
+
+/**
+ * EvalJudgeCalibrationPreviewResponse
+ */
+export type EvalJudgeCalibrationPreviewResponse = {
+    /**
+     * Candidate Route Relation
+     */
+    candidate_route_relation?: 'independent_model' | 'same_model' | null;
+    definition: EvalJudgeCalibrationDefinitionV1;
+    /**
+     * Diagnostics
+     */
+    diagnostics?: Array<EvalJudgeCalibrationDiagnostic>;
+    judge_profile?: JudgeProfileIdentityV1 | null;
+    /**
+     * Ready
+     */
+    ready: boolean;
+    work?: EvalJudgeCalibrationWorkPreview | null;
+};
+
+/**
+ * EvalJudgeCalibrationReportV1
+ *
+ * Immutable completed calibration with every fixed-evidence judge trial.
+ */
+export type EvalJudgeCalibrationReportV1 = {
+    /**
+     * Candidate Route Relation
+     */
+    candidate_route_relation: 'independent_model' | 'same_model';
+    definition: EvalJudgeCalibrationDefinitionV1;
+    judge_profile: JudgeProfileIdentityV1;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Run Id
+     */
+    run_id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Trials
+     */
+    trials: Array<EvalJudgeCalibrationTrialV1>;
+};
+
+/**
+ * EvalJudgeCalibrationRunRequest
+ *
+ * One reviewed immutable definition guarded by exact preview identity.
+ */
+export type EvalJudgeCalibrationRunRequest = {
+    definition: EvalJudgeCalibrationDefinitionV1;
+    /**
+     * Expected Definition Revision
+     */
+    expected_definition_revision: string;
+    /**
+     * Run Id
+     */
+    run_id: string;
+};
+
+/**
+ * EvalJudgeCalibrationRunResponse
+ */
+export type EvalJudgeCalibrationRunResponse = {
+    report: EvalJudgeCalibrationReportV1;
+};
+
+/**
+ * EvalJudgeCalibrationTrialV1
+ *
+ * One lossless judge observation compared with the fixed human label.
+ */
+export type EvalJudgeCalibrationTrialV1 = {
+    /**
+     * Aggregate Absolute Error
+     */
+    aggregate_absolute_error?: string | null;
+    judgment: PublishedAssertionResult;
+    /**
+     * Pass Agreement
+     */
+    pass_agreement?: boolean | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Sequence
+     */
+    sequence: number;
+};
+
+/**
+ * EvalJudgeCalibrationWorkPreview
+ */
+export type EvalJudgeCalibrationWorkPreview = {
+    /**
+     * Cost Currency
+     */
+    cost_currency?: string | null;
+    /**
+     * Judge Calls
+     */
+    judge_calls: number;
+    /**
+     * Max Estimated Cost
+     */
+    max_estimated_cost?: string | null;
+    /**
+     * Max Input Tokens
+     */
+    max_input_tokens: number;
+    /**
+     * Max Output Tokens
+     */
+    max_output_tokens: number;
+    /**
+     * Max Total Tokens
+     */
+    max_total_tokens: number;
+};
+
+/**
  * EvalJudgeEvidenceSelectionV1
  *
  * Candidate evidence a public judge profile is requested to receive.
@@ -5250,6 +5642,43 @@ export type EvalJudgeEvidenceSelectionV1 = {
      * Schema Version
      */
     schema_version?: 1;
+};
+
+/**
+ * EvalJudgePrivateReferenceCatalogEntry
+ *
+ * Safe identity of evaluator-only truth published for one exact judge.
+ */
+export type EvalJudgePrivateReferenceCatalogEntry = {
+    /**
+     * Judge Profile Key
+     */
+    judge_profile_key: string;
+    /**
+     * Judge Profile Revision
+     */
+    judge_profile_revision: string;
+    reference: PrivateJudgeReferenceV1;
+};
+
+/**
+ * EvalJudgeProfileRouteCatalogEntry
+ *
+ * Server-derived relationship between one judge and the candidate route.
+ */
+export type EvalJudgeProfileRouteCatalogEntry = {
+    /**
+     * Candidate Route Relation
+     */
+    candidate_route_relation: 'independent_model' | 'same_model';
+    /**
+     * Judge Profile Key
+     */
+    judge_profile_key: string;
+    /**
+     * Judge Profile Revision
+     */
+    judge_profile_revision: string;
 };
 
 /**
@@ -6264,7 +6693,7 @@ export type EvalSuiteAuthoringDiagnostic = {
     /**
      * Code
      */
-    code: 'target_unavailable' | 'scenario_store_unavailable' | 'scenario_unavailable' | 'scenario_id_mismatch' | 'scenario_target_mismatch' | 'scenario_source_mismatch';
+    code: 'target_unavailable' | 'judge_profile_unavailable' | 'judge_profile_changed' | 'judge_evidence_not_allowed' | 'judge_reference_unavailable' | 'same_model_forbidden' | 'unsafe_public_material' | 'scenario_store_unavailable' | 'scenario_unavailable' | 'scenario_id_mismatch' | 'scenario_target_mismatch' | 'scenario_source_mismatch';
     /**
      * Message
      */
@@ -6357,6 +6786,31 @@ export type EvalSuiteDocumentV1 = {
 };
 
 /**
+ * EvalSuiteDocumentV2
+ *
+ * Immutable V2 suite preserving structured rubric and judge contracts.
+ */
+export type EvalSuiteDocumentV2 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseDefinitionV2>;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 2;
+    suite: EvalSuiteSpec;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
  * EvalSuiteDraftV1
  *
  * Revision-free suite material edited by an SDK or Control Plane client.
@@ -6386,12 +6840,48 @@ export type EvalSuiteDraftV1 = {
 };
 
 /**
+ * EvalSuiteDraftV2
+ *
+ * Explicit V2 editor material with structured-judge authoring support.
+ */
+export type EvalSuiteDraftV2 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseDraftV2>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 2;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    trial_request?: TrialRequestSpec;
+};
+
+/**
  * EvalSuitePreviewRequest
  *
  * Authority-free editor material; preview never persists or executes it.
  */
 export type EvalSuitePreviewRequest = {
-    draft: EvalSuiteDraftV1;
+    /**
+     * Draft
+     */
+    draft: EvalSuiteDraftV1 | EvalSuiteDraftV2;
 };
 
 /**
@@ -6407,7 +6897,10 @@ export type EvalSuitePreviewResponse = {
      * Ready
      */
     ready: boolean;
-    suite: EvalSuiteDocumentV1;
+    /**
+     * Suite
+     */
+    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
 };
 
 /**
@@ -6420,7 +6913,10 @@ export type EvalSuiteSaveRequest = {
      * Expected Suite Revision
      */
     expected_suite_revision: string;
-    suite: EvalSuiteDocumentV1;
+    /**
+     * Suite
+     */
+    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
 };
 
 /**
@@ -6429,7 +6925,10 @@ export type EvalSuiteSaveRequest = {
 export type EvalSuiteSaveResponse = {
     entry: EvalAuthoredSuiteCatalogEntry;
     full_selection: EvalSuiteSelectionV1;
-    suite: EvalSuiteDocumentV1;
+    /**
+     * Suite
+     */
+    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
 };
 
 /**
@@ -6528,6 +7027,14 @@ export type EvalTargetCatalogEntry = {
      * Execution Profile Ready
      */
     execution_profile_ready: boolean;
+    /**
+     * Judge Private References
+     */
+    judge_private_references?: Array<EvalJudgePrivateReferenceCatalogEntry>;
+    /**
+     * Judge Profile Routes
+     */
+    judge_profile_routes?: Array<EvalJudgeProfileRouteCatalogEntry>;
     /**
      * Judge Profiles
      */
@@ -10472,6 +10979,34 @@ export type ProviderStatePart = {
 };
 
 /**
+ * PublicJudgeReferenceDraftV1
+ *
+ * Revision-free public reference truth accepted from an editor.
+ */
+export type PublicJudgeReferenceDraftV1 = {
+    /**
+     * Expected Answer
+     */
+    expected_answer?: string | null;
+    /**
+     * Expected Facts
+     */
+    expected_facts?: Array<string>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'public_reference';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * PublicJudgeReferenceV1
  *
  * Evaluator-only, deliberately portable reference truth.
@@ -12629,6 +13164,48 @@ export type StoreManifest = {
 };
 
 /**
+ * StructuredModelJudgeAssertionDraftV1
+ *
+ * Revision-free rubric assertion material compiled only by the server.
+ */
+export type StructuredModelJudgeAssertionDraftV1 = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    evidence?: EvalJudgeEvidenceSelectionV1;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Judge Profile Key
+     */
+    judge_profile_key: string;
+    /**
+     * Judge Profile Revision
+     */
+    judge_profile_revision: string;
+    /**
+     * Kind
+     */
+    kind?: 'structured_model_judge';
+    /**
+     * Reference
+     */
+    reference?: ({
+        kind: 'public_reference';
+    } & PublicJudgeReferenceDraftV1) | ({
+        kind: 'private_reference';
+    } & PrivateJudgeReferenceV1) | null;
+    rubric: StructuredRubricDraftV1;
+    /**
+     * Threshold
+     */
+    threshold?: string;
+};
+
+/**
  * StructuredModelJudgeAssertionSpec
  *
  * Typed rubric judgment bound to an exact trusted server profile.
@@ -12724,6 +13301,26 @@ export type StructuredRubricCriterionV1 = {
      * Weight
      */
     weight: string;
+};
+
+/**
+ * StructuredRubricDraftV1
+ *
+ * Revision-free structured rubric material accepted from an editor.
+ */
+export type StructuredRubricDraftV1 = {
+    /**
+     * Criteria
+     */
+    criteria: Array<StructuredRubricCriterionV1>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
 };
 
 /**
@@ -15125,6 +15722,128 @@ export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetRespo
 
 export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponse = ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses[keyof ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses];
 
+export type RunEvalJudgeCalibrationApiEvalsJudgeCalibrationsPostData = {
+    body: EvalJudgeCalibrationRunRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/judge-calibrations';
+};
+
+export type RunEvalJudgeCalibrationApiEvalsJudgeCalibrationsPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type RunEvalJudgeCalibrationApiEvalsJudgeCalibrationsPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: EvalJudgeCalibrationRunResponse;
+};
+
+export type RunEvalJudgeCalibrationApiEvalsJudgeCalibrationsPostResponse = RunEvalJudgeCalibrationApiEvalsJudgeCalibrationsPostResponses[keyof RunEvalJudgeCalibrationApiEvalsJudgeCalibrationsPostResponses];
+
+export type PreviewEvalJudgeCalibrationApiEvalsJudgeCalibrationsPreviewPostData = {
+    body: EvalJudgeCalibrationPreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/judge-calibrations/preview';
+};
+
+export type PreviewEvalJudgeCalibrationApiEvalsJudgeCalibrationsPreviewPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PreviewEvalJudgeCalibrationApiEvalsJudgeCalibrationsPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalJudgeCalibrationPreviewResponse;
+};
+
+export type PreviewEvalJudgeCalibrationApiEvalsJudgeCalibrationsPreviewPostResponse = PreviewEvalJudgeCalibrationApiEvalsJudgeCalibrationsPreviewPostResponses[keyof PreviewEvalJudgeCalibrationApiEvalsJudgeCalibrationsPreviewPostResponses];
+
+export type GetEvalJudgeCalibrationApiEvalsJudgeCalibrationsCalibrationRevisionGetData = {
+    body?: never;
+    path: {
+        /**
+         * Calibration Revision
+         */
+        calibration_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/judge-calibrations/{calibration_revision}';
+};
+
+export type GetEvalJudgeCalibrationApiEvalsJudgeCalibrationsCalibrationRevisionGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalJudgeCalibrationApiEvalsJudgeCalibrationsCalibrationRevisionGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalJudgeCalibrationReportV1;
+};
+
+export type GetEvalJudgeCalibrationApiEvalsJudgeCalibrationsCalibrationRevisionGetResponse = GetEvalJudgeCalibrationApiEvalsJudgeCalibrationsCalibrationRevisionGetResponses[keyof GetEvalJudgeCalibrationApiEvalsJudgeCalibrationsCalibrationRevisionGetResponses];
+
 export type BuildStoredMemoryReportApiEvalsMemoryReportsPostData = {
     body: MemoryExperimentReportRequest;
     path?: never;
@@ -16684,9 +17403,11 @@ export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetErrors = {
 
 export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses = {
     /**
+     * Response Get Eval Authored Suite Api Evals Suites  Suite Revision  Get
+     *
      * Successful Response
      */
-    200: EvalSuiteDocumentV1;
+    200: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
 };
 
 export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponse = GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses[keyof GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses];

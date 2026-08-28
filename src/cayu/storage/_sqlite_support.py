@@ -2993,6 +2993,32 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_eval_authored_suites_id_catalog
             ON cayu_eval_authored_suites(suite_id, created_at DESC, revision ASC);
     """,
+    68: """
+        CREATE TABLE IF NOT EXISTS cayu_eval_judge_calibrations (
+            revision TEXT COLLATE BINARY PRIMARY KEY,
+            run_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+            definition_revision TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            trial_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_judge_calibrations_trial_count_check
+                CHECK (trial_count >= 1 AND trial_count <= 10),
+            report_json TEXT NOT NULL
+                CONSTRAINT cayu_eval_judge_calibrations_report_json_check
+                CHECK (json_valid(report_json) AND json_type(report_json) = 'object'),
+            document_bytes INTEGER NOT NULL
+                CONSTRAINT cayu_eval_judge_calibrations_document_bytes_check
+                CHECK (document_bytes >= 1 AND document_bytes <= 2097152)
+                CONSTRAINT cayu_eval_judge_calibrations_document_size_check
+                CHECK (document_bytes = length(CAST(report_json AS BLOB))),
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_judge_calibrations_target
+            ON cayu_eval_judge_calibrations(target_key, created_at DESC, revision ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_judge_calibrations_definition
+            ON cayu_eval_judge_calibrations(
+                definition_revision, created_at DESC, revision ASC
+            );
+    """,
     65: """
         DROP VIEW IF EXISTS cayu_knowledge_current_entries;
         CREATE VIEW cayu_knowledge_current_entries AS
@@ -4692,6 +4718,8 @@ def reconcile_schema(
         _validate_eval_authored_suite_schema(connection)
     if app_min_supported >= 66:
         _validate_local_execution_attempt_schema(connection)
+    if app_min_supported >= 68:
+        _validate_eval_judge_calibration_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -6615,6 +6643,93 @@ def _raise_eval_authored_suite_schema_error(name: str) -> NoReturn:
     )
 
 
+def _validate_eval_judge_calibration_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = (
+        ("revision", "TEXT", 0, 1),
+        ("run_id", "TEXT", 1, 0),
+        ("definition_revision", "TEXT", 1, 0),
+        ("target_key", "TEXT", 1, 0),
+        ("trial_count", "INTEGER", 1, 0),
+        ("report_json", "TEXT", 1, 0),
+        ("document_bytes", "INTEGER", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_eval_judge_calibrations)")
+    )
+    if actual_columns != expected_columns:
+        _raise_eval_judge_calibration_schema_error("cayu_eval_judge_calibrations")
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_eval_judge_calibrations'"
+    ).fetchone()
+    normalized = (
+        ""
+        if table_row is None or table_row[0] is None
+        else "".join(str(table_row[0]).lower().split())
+    )
+    required_fragments = (
+        "run_idtextcollatebinarynotnullunique",
+        "check(trial_count>=1andtrial_count<=10)",
+        "check(json_valid(report_json)andjson_type(report_json)='object')",
+        "check(document_bytes>=1anddocument_bytes<=2097152)",
+        "check(document_bytes=length(cast(report_jsonasblob)))",
+    )
+    if "revisiontextcollatebinaryprimarykey" not in normalized or any(
+        fragment not in normalized for fragment in required_fragments
+    ):
+        _raise_eval_judge_calibration_schema_error("calibration safety constraints")
+    index_rows = tuple(connection.execute("PRAGMA index_list(cayu_eval_judge_calibrations)"))
+    unique_rows = tuple(row for row in index_rows if bool(row[2]) and str(row[3]) == "u")
+    if len(unique_rows) != 1:
+        _raise_eval_judge_calibration_schema_error("run_id uniqueness")
+    unique_columns = tuple(
+        str(row[2])
+        for row in connection.execute(f"PRAGMA index_xinfo({unique_rows[0][1]})")
+        if bool(row[5])
+    )
+    if unique_columns != ("run_id",) or any(
+        bool(row[2]) and str(row[3]) == "c" for row in index_rows
+    ):
+        _raise_eval_judge_calibration_schema_error("run_id uniqueness")
+    expected_indexes = {
+        "idx_cayu_eval_judge_calibrations_target": (
+            ("target_key", 0, "BINARY"),
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+        "idx_cayu_eval_judge_calibrations_definition": (
+            ("definition_revision", 0, "BINARY"),
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+    }
+    for index_name, expected in expected_indexes.items():
+        metadata = next((row for row in index_rows if str(row[1]) == index_name), None)
+        actual = tuple(
+            (str(row[2]), int(row[3]), str(row[4]).upper())
+            for row in connection.execute(f"PRAGMA index_xinfo({index_name})")
+            if bool(row[5])
+        )
+        if (
+            metadata is None
+            or bool(metadata[2])
+            or str(metadata[3]) != "c"
+            or bool(metadata[4])
+            or actual != expected
+        ):
+            _raise_eval_judge_calibration_schema_error(index_name)
+
+
+def _raise_eval_judge_calibration_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        f"SQLite schema object {name!r} conflicts with Cayu's revision-68 "
+        "judge-calibration contract. Run `cayu storage migrate` or restore the "
+        "database from a known-good backup."
+    )
+
+
 def _validate_verified_work_schema(
     connection: sqlite3.Connection,
     *,
@@ -7490,6 +7605,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_local_execution_attempt_schema(connection)
         if rev.revision == 67:
             _validate_revision_67_knowledge_schema(connection)
+        if rev.revision == 68:
+            _validate_eval_judge_calibration_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

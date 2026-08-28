@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
+from cayu.evals.calibration import (
+    EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    EvalJudgeCalibrationReportV1,
+    eval_judge_calibration_report_from_json,
+)
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_BYTES,
     EvalCorpusDocument,
@@ -48,6 +53,7 @@ from cayu.evals.store import (
     EvalCorpusCatalogEntry,
     EvalCorpusCatalogPage,
     EvalCorpusConflict,
+    EvalJudgeCalibrationConflict,
     EvalResultConflict,
     EvalResultPage,
     EvalResultQuery,
@@ -96,6 +102,7 @@ from cayu.evals.store import (
     _prepare_baseline_update_for_store,
     _prepare_captured_result_for_store,
     _prepare_corpus_catalog_for_store,
+    _prepare_judge_calibration_for_store,
     _prepare_result_for_store,
     _prepare_run_request_for_store,
     _prepare_scenario_catalog_for_store,
@@ -120,14 +127,14 @@ from cayu.evals.store import (
 )
 from cayu.evals.suite_authoring import (
     EVAL_SUITE_AUTHORING_MAX_BYTES,
-    EvalSuiteDocumentV1,
+    EvalSuiteDocument,
     eval_suite_document_from_json,
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 64
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 68
 
 _RUN_COLUMNS = """
     run_id,
@@ -298,6 +305,7 @@ class SQLiteEvalStore(EvalStore):
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
+    judge_calibrations: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -596,7 +604,7 @@ class SQLiteEvalStore(EvalStore):
 
     async def save_authored_suite(
         self,
-        document: EvalSuiteDocumentV1,
+        document: EvalSuiteDocument,
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalAuthoredSuiteCatalogEntry:
@@ -697,7 +705,7 @@ class SQLiteEvalStore(EvalStore):
         revision: str,
         *,
         max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
-    ) -> EvalSuiteDocumentV1 | None:
+    ) -> EvalSuiteDocument | None:
         revision = _sha256_revision(revision, "revision")
         max_bytes = _read_limit(max_bytes, hard_max=EVAL_SUITE_AUTHORING_MAX_BYTES)
 
@@ -768,6 +776,126 @@ class SQLiteEvalStore(EvalStore):
             )
 
         return await self._run(operation)
+
+    async def save_judge_calibration(
+        self,
+        report: EvalJudgeCalibrationReportV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalJudgeCalibrationReportV1:
+        validated, payload = await asyncio.to_thread(
+            _prepare_judge_calibration_for_store,
+            report,
+            redact_json=redact_json,
+        )
+        document_text = payload.decode("utf-8")
+
+        def operation(connection: sqlite3.Connection) -> str:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                rows = connection.execute(
+                    """
+                    SELECT revision, run_id, report_json
+                    FROM cayu_eval_judge_calibrations
+                    WHERE revision = ? OR run_id = ?
+                    """,
+                    (validated.revision, validated.run_id),
+                ).fetchall()
+                if rows:
+                    if len(rows) != 1 or (
+                        rows[0]["revision"],
+                        rows[0]["run_id"],
+                        rows[0]["report_json"],
+                    ) != (validated.revision, validated.run_id, document_text):
+                        raise EvalJudgeCalibrationConflict(
+                            "Judge calibration revision or run ID has conflicting content."
+                        )
+                    connection.commit()
+                    return rows[0]["report_json"]
+                connection.execute(
+                    """
+                    INSERT INTO cayu_eval_judge_calibrations (
+                        revision, run_id, definition_revision, target_key,
+                        trial_count, report_json, document_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        validated.revision,
+                        validated.run_id,
+                        validated.definition.revision,
+                        validated.definition.target_key,
+                        len(validated.trials),
+                        document_text,
+                        len(payload),
+                        _format_datetime(datetime.now(UTC)),
+                    ),
+                )
+                connection.commit()
+                return document_text
+            except BaseException:
+                connection.rollback()
+                raise
+
+        stored = await self._run(operation)
+        return await asyncio.to_thread(eval_judge_calibration_report_from_json, stored)
+
+    async def load_judge_calibration(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    ) -> EvalJudgeCalibrationReportV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_JUDGE_CALIBRATION_MAX_BYTES)
+
+        def operation(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                """
+                SELECT report_json, document_bytes
+                FROM cayu_eval_judge_calibrations
+                WHERE revision = ?
+                """,
+                (revision,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["document_bytes"] > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return row["report_json"]
+
+        stored = await self._run(operation)
+        if stored is None:
+            return None
+        return await asyncio.to_thread(eval_judge_calibration_report_from_json, stored)
+
+    async def load_judge_calibration_by_run_id(
+        self,
+        run_id: str,
+        *,
+        max_bytes: int = EVAL_JUDGE_CALIBRATION_MAX_BYTES,
+    ) -> EvalJudgeCalibrationReportV1 | None:
+        run_id = _portable_id(run_id, "run_id")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_JUDGE_CALIBRATION_MAX_BYTES)
+
+        def operation(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                """
+                SELECT report_json, document_bytes
+                FROM cayu_eval_judge_calibrations
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["document_bytes"] > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return row["report_json"]
+
+        stored = await self._run(operation)
+        if stored is None:
+            return None
+        return await asyncio.to_thread(eval_judge_calibration_report_from_json, stored)
 
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
         query = _exact_model(query, EvalSuiteCatalogQuery, "query")

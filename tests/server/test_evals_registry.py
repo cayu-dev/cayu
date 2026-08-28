@@ -158,6 +158,7 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
         assert entry.cost_budget_available is False
         assert entry.cost_budget_currencies == ()
         assert entry.judge_profiles == ()
+        assert entry.judge_profile_routes == ()
         runtime_target = first.get(entry.target_key)
         assert runtime_target is not None
         assert runtime_target.request_base.agent_name == entry.agent_name
@@ -178,6 +179,13 @@ def test_explicit_catalog_publishes_safe_exact_judge_profiles() -> None:
     assert profile.model == "judge-model"
     assert profile.allowed_evidence == ("final_output", "public_reference")
     assert profile.same_model_use == "forbidden"
+    assert len(entry.judge_profile_routes) == 1
+    route = entry.judge_profile_routes[0]
+    assert (route.judge_profile_key, route.judge_profile_revision) == (
+        profile.key,
+        profile.revision,
+    )
+    assert route.candidate_route_relation == "independent_model"
     serialized = entry.model_dump_json()
     assert "provider_options" not in serialized
     assert "system_prompt" not in serialized

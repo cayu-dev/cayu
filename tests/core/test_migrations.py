@@ -418,6 +418,23 @@ def test_revision_sixty_seven_breaks_for_pending_maintenance_proposals() -> None
         )
 
 
+def test_revision_sixty_eight_adds_judge_calibration_reports() -> None:
+    revision = m.revision(68)
+    state = m.SchemaState(revision=68, compatible_from=67)
+
+    assert revision.kind is m.RevisionKind.ADDITIVE
+    assert revision.compatible_from == 67
+    # Older writers do not use the new table and remain safe during rollout.
+    m.validate(state, app_latest=67, app_min_supported=67)
+    m.validate(state, app_latest=68, app_min_supported=68)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 68"):
+        m.validate(
+            m.SchemaState(revision=67, compatible_from=67),
+            app_latest=68,
+            app_min_supported=68,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

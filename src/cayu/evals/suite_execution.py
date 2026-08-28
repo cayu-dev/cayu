@@ -16,10 +16,10 @@ from cayu.evals.execution import CorpusTarget, evaluation_target_identity
 from cayu.evals.scenario import EvalScenarioDocumentV2
 from cayu.evals.scenario_preflight import ScenarioLaunchBindingV2, ScenarioLaunchSettingsV2
 from cayu.evals.suite_authoring import (
-    EvalCaseDefinitionV1,
+    EvalCaseDefinition,
     EvalScenarioStimulusV1,
     EvalSimpleInputStimulusV1,
-    EvalSuiteDocumentV1,
+    EvalSuiteDocument,
     EvalSuiteSelectionV1,
     validate_eval_suite_selection,
     validate_expected_eval_suite_revision,
@@ -29,7 +29,7 @@ _AUTHORED_SOURCE_APPLICATION_RELEASE_ID = "cayu-authored-case-v1"
 _AUTHORED_SOURCE_MANIFEST_SCHEMA_VERSION = "authored-eval-case-v1"
 
 
-def authored_suite_launch_settings(document: EvalSuiteDocumentV1) -> ScenarioLaunchSettingsV2:
+def authored_suite_launch_settings(document: EvalSuiteDocument) -> ScenarioLaunchSettingsV2:
     """Return the safe PR-02 launch bounds shared by authored scenario cases."""
 
     validated = validate_expected_eval_suite_revision(document, document.revision)
@@ -45,7 +45,7 @@ def authored_suite_launch_settings(document: EvalSuiteDocumentV1) -> ScenarioLau
 
 
 def corpus_for_authored_simple_selection(
-    document: EvalSuiteDocumentV1,
+    document: EvalSuiteDocument,
     selection: EvalSuiteSelectionV1,
     target: CorpusTarget,
     *,
@@ -70,7 +70,7 @@ def corpus_for_authored_simple_selection(
 
 
 def corpus_for_authored_scenario_case(
-    document: EvalSuiteDocumentV1,
+    document: EvalSuiteDocument,
     case_id: str,
     scenario: EvalScenarioDocumentV2,
     binding: ScenarioLaunchBindingV2,
@@ -125,8 +125,8 @@ def corpus_for_authored_scenario_case(
 
 
 def _corpus_for_authored_cases(
-    document: EvalSuiteDocumentV1,
-    cases: tuple[EvalCaseDefinitionV1, ...],
+    document: EvalSuiteDocument,
+    cases: tuple[EvalCaseDefinition, ...],
     target: CorpusTarget,
     *,
     scenario_inputs: dict[str, RunInputSpec] | None = None,
@@ -181,7 +181,7 @@ def _corpus_for_authored_cases(
     )
 
 
-def _authored_definition_source(case: EvalCaseDefinitionV1) -> EvaluationSourceIdentityV1:
+def _authored_definition_source(case: EvalCaseDefinition) -> EvaluationSourceIdentityV1:
     """Project stable definition provenance without pretending a production capture."""
 
     fingerprint = hashlib.sha256(

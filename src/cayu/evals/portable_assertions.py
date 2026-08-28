@@ -687,20 +687,6 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
             expected_pricing_profile_fingerprint=None,
             bind_pricing_profile=True,
         )
-        try:
-            current_revision = _model_judge_implementation_revision(
-                key=self._binding.key,
-                app=self._binding.app,
-                agent_name=self._binding.agent_name,
-            )
-        except Exception:
-            return self._with_public_contract(
-                self.error("Trusted structured judge configuration became invalid.")
-            )
-        if current_revision != self._binding.implementation_revision:
-            return self._with_public_contract(
-                self.error("Trusted structured judge implementation changed after compilation.")
-            )
         if evidence.final_output_state != "complete":
             return self._with_public_contract(
                 self.unavailable("Final-output evidence was not retained completely.")
@@ -727,10 +713,58 @@ class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
                         "Structured judge transcript evidence exceeded its portable bound."
                     )
                 )
-        result = await self._judge._evaluate_material(
+        return await self.evaluate_retained_material(
             task=task,
             final_output=evidence.final_output,
             transcript_text=transcript,
+        )
+
+    async def evaluate_retained_material(
+        self,
+        *,
+        task: str,
+        final_output: str,
+        transcript_text: str | None,
+    ) -> EvalAssertionResult:
+        """Judge one fixed evidence snapshot without candidate runtime execution."""
+
+        if self._spec.evidence.include_transcript != (transcript_text is not None):
+            return self._with_public_contract(
+                self.unavailable("Fixed evidence does not match the transcript selection.")
+            )
+        try:
+            current_revision = _model_judge_implementation_revision(
+                key=self._binding.key,
+                app=self._binding.app,
+                agent_name=self._binding.agent_name,
+            )
+        except Exception:
+            return self._with_public_contract(
+                self.error("Trusted structured judge configuration became invalid.")
+            )
+        if current_revision != self._binding.implementation_revision:
+            return self._with_public_contract(
+                self.error("Trusted structured judge implementation changed after compilation.")
+            )
+        if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
+            return self._with_public_contract(
+                self.unavailable("Structured judge task evidence exceeded its portable bound.")
+            )
+        if len(final_output) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
+            return self._with_public_contract(
+                self.unavailable("Structured judge final-output evidence exceeded its bound.")
+            )
+        if (
+            transcript_text is not None
+            and len(transcript_text) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS
+        ):
+            return self._with_public_contract(
+                self.unavailable("Structured judge transcript evidence exceeded its bound.")
+            )
+        result = await self._judge._evaluate_material(
+            task=task,
+            final_output=final_output,
+            transcript_text=transcript_text,
         )
         return self._with_public_contract(
             EvalAssertionResult(

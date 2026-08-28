@@ -59,6 +59,7 @@ def _load_example(name: str, *, directory: Path = EXAMPLES_DIR) -> ModuleType:
 artifact_file_live = _load_example("artifact_file_live")
 bedrock_provider_live = _load_example("bedrock_provider_live", directory=EXAMPLES_DIR / "aws")
 context_counting_live = _load_example("context_counting_live")
+evals_judge_calibration_live = _load_example("evals_judge_calibration_live")
 knowledge_embedding_live = _load_example("knowledge_embedding_live")
 real_spend_budget_live = _load_example("real_spend_budget_live")
 structured_output_live = _load_example("structured_output_live")
@@ -590,6 +591,46 @@ def test_structured_output_contract_validates_expected_invoice_and_usage() -> No
     }
     prompt = provider.requests[0].messages[-1].content[0].text
     assert "Use the exact line-item description 'Managed hosting'." in prompt
+
+
+def test_eval_judge_calibration_live_contract_uses_only_explicit_judge_authority(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta(
+                '{"criteria":[{"criterion_id":"correctness","score":1,'
+                '"explanation":"Paris is correct."}]}'
+            ),
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "total_tokens": 120,
+                    },
+                }
+            ),
+        ],
+        name="judge-live-test",
+    )
+
+    evidence = evals_judge_calibration_live._run_contract(
+        judge_provider=provider,
+        provider_name=provider.name,
+        model="judge-live-model",
+        store_path=tmp_path / "evals.sqlite",
+    )
+
+    assert evidence["provider"] == "judge-live-test"
+    assert evidence["model"] == "judge-live-model"
+    assert evidence["candidate_provider_calls"] == 0
+    assert evidence["trials"] == 1
+    assert evidence["total_tokens"] == 120
+    assert evidence["evidence_revision"].startswith("sha256:")
+    assert evidence["judge_profile_revision"].startswith("sha256:")
+    assert len(provider.requests) == 1
 
 
 def test_structured_output_schema_rejects_paraphrased_line_item_description() -> None:
