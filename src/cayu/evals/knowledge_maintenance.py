@@ -1873,7 +1873,7 @@ async def _entries_match_query(
         listed is None
         or listed.query != query
         or listed.truncated
-        or listed.total_entries_known != len(expected)
+        or (listed.total_entries_known is not None and listed.total_entries_known != len(expected))
         or len(listed.entries) != len(expected)
     ):
         return False

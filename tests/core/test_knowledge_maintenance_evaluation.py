@@ -160,6 +160,12 @@ class _UnexpectedApprovalEntryStore(_DecisionAwareEvidenceStore):
         return receipt
 
 
+class _UnknownListTotalStore(_DecisionAwareEvidenceStore):
+    async def list_entries(self, query, *, access_scope=None):
+        result = await super().list_entries(query, access_scope=access_scope)
+        return result.model_copy(update={"total_entries_known": None})
+
+
 class _WrongPublicationReceiptStore(_DecisionAwareEvidenceStore):
     async def publish_maintenance_proposal(self, *args, **kwargs):
         receipt = await super().publish_maintenance_proposal(*args, **kwargs)
@@ -1017,6 +1023,19 @@ def test_maintenance_lifecycle_rejects_unexpected_namespace_entries() -> None:
 
     assert result.cases[0].storage_outcome == "applied"
     assert result.cases[0].lifecycle_correct is False
+
+
+def test_maintenance_lifecycle_accepts_an_unknown_optional_list_total() -> None:
+    result = asyncio.run(
+        run_knowledge_maintenance_evaluation(
+            _corpus_for_scenario(KnowledgeMaintenanceEvaluationScenario.DUPLICATE_MERGE),
+            _UnknownListTotalStore(),
+            backend="memory",
+        )
+    )
+
+    assert result.cases[0].storage_outcome == "applied"
+    assert result.cases[0].lifecycle_correct is True
 
 
 def test_maintenance_publication_rejects_a_dishonest_receipt() -> None:
