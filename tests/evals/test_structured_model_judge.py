@@ -832,6 +832,8 @@ def test_hosted_tool_activity_is_an_evaluator_error_without_a_candidate_score():
 
 
 class _NonDeletingSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def delete_session(self, session_id: str) -> bool:
         del session_id
         raise RuntimeError("source judge store must not be used")

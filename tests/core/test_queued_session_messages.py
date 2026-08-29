@@ -204,6 +204,8 @@ class BlockingTool(Tool):
 
 
 class InterruptTrackingStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.interrupting_started = asyncio.Event()
@@ -215,12 +217,14 @@ class InterruptTrackingStore(InMemorySessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         checkpoint_transform,
+        **kwargs,
     ):
         result = await super().transition_status_and_checkpoint(
             session_id,
             from_statuses=from_statuses,
             to_status=to_status,
             checkpoint_transform=checkpoint_transform,
+            **kwargs,
         )
         if to_status is SessionStatus.INTERRUPTING:
             self.interrupting_started.set()
@@ -228,6 +232,8 @@ class InterruptTrackingStore(InMemorySessionStore):
 
 
 class CompletionFenceStore(InterruptTrackingStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.completion_started = asyncio.Event()
@@ -241,6 +247,10 @@ class CompletionFenceStore(InterruptTrackingStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
+        model_completion_stage_settlement=None,
+        expected_session_instance_id: str | None = None,
+        expected_active_invocation_profile=None,
+        expected_invocation_authority_state="active",
     ):
         if only_if_no_queued_messages:
             self.completion_started.set()
@@ -251,10 +261,16 @@ class CompletionFenceStore(InterruptTrackingStore):
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_stage_settlement,
+            expected_session_instance_id=expected_session_instance_id,
+            expected_active_invocation_profile=expected_active_invocation_profile,
+            expected_invocation_authority_state=expected_invocation_authority_state,
         )
 
 
 class DeliveryFenceStore(InterruptTrackingStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, block_on_call: int) -> None:
         super().__init__()
         self._block_on_call = block_on_call
@@ -289,6 +305,8 @@ class DeliveryFenceStore(InterruptTrackingStore):
 
 
 class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.lost_acknowledgement = False

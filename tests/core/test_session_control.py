@@ -23,6 +23,8 @@ from cayu.runtime._session_control import (
 
 
 class _CountingSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.load_calls = 0

@@ -1086,6 +1086,8 @@ class FailingProvider(ModelProvider):
 
 
 class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(
         self,
         *,
@@ -1107,6 +1109,9 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
         to_status,
         only_if_no_queued_messages=False,
         model_completion_stage_settlement=None,
+        expected_session_instance_id=None,
+        expected_active_invocation_profile=None,
+        expected_invocation_authority_state="active",
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_model_completion_stage_settlements.append(model_completion_stage_settlement)
@@ -1117,6 +1122,9 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_stage_settlement,
+            expected_session_instance_id=expected_session_instance_id,
+            expected_active_invocation_profile=expected_active_invocation_profile,
+            expected_invocation_authority_state=expected_invocation_authority_state,
         )
         if self.remaining_lost_acknowledgements > 0:
             self.remaining_lost_acknowledgements -= 1
@@ -1127,6 +1135,8 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
 
 
 class CommitThenLoseTerminalPublicationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.armed = False
@@ -1153,6 +1163,8 @@ class CommitThenLoseTerminalPublicationStore(InMemorySessionStore):
 
 
 class RejectBeforeInteractionTransitionCommitStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(
         self,
         *,
@@ -1175,6 +1187,8 @@ class RejectBeforeInteractionTransitionCommitStore(InMemorySessionStore):
 
 
 class CommitAndBlockInteractionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, fail_after_release: bool) -> None:
         super().__init__()
         self.fail_after_release = fail_after_release
@@ -1198,6 +1212,8 @@ class CommitAndBlockInteractionTransitionStore(InMemorySessionStore):
 
 
 class CommitThenLoseAndBlockInterruptedTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.second_attempt_dispatched = asyncio.Event()
@@ -1218,6 +1234,8 @@ class CommitThenLoseAndBlockInterruptedTransitionStore(InMemorySessionStore):
 
 
 class FailThenBlockInterruptedTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.second_attempt_dispatched = asyncio.Event()
@@ -1238,6 +1256,8 @@ class FailThenBlockInterruptedTransitionStore(InMemorySessionStore):
 
 
 class BlockingSiblingInteractionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, commit_before_release: bool) -> None:
         super().__init__()
         self.commit_before_release = commit_before_release
@@ -1265,6 +1285,8 @@ class BlockingSiblingInteractionTransitionStore(InMemorySessionStore):
 
 
 class QueueGuardedInteractionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.dispatched = asyncio.Event()
@@ -1281,6 +1303,8 @@ class QueueGuardedInteractionTransitionStore(InMemorySessionStore):
 
 
 class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.attempted_events: list[Event] = []
@@ -1296,6 +1320,10 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
+        model_completion_stage_settlement=None,
+        expected_session_instance_id: str | None = None,
+        expected_active_invocation_profile=None,
+        expected_invocation_authority_state="active",
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_from_statuses.append(set(from_statuses))
@@ -1306,6 +1334,10 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_stage_settlement,
+            expected_session_instance_id=expected_session_instance_id,
+            expected_active_invocation_profile=expected_active_invocation_profile,
+            expected_invocation_authority_state=expected_invocation_authority_state,
         )
         if not self._lost_acknowledgement:
             self._lost_acknowledgement = True
@@ -1317,6 +1349,8 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
 
 
 class CorruptThenReplayInteractionTransitionResultStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, corruption: str) -> None:
         super().__init__()
         self.corruption = corruption
@@ -1362,6 +1396,8 @@ class CorruptThenReplayInteractionTransitionResultStore(InMemorySessionStore):
 
 
 class CancelledCorruptInteractionTransitionResultStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.second_attempt_dispatched = asyncio.Event()
@@ -1389,6 +1425,8 @@ class CancelledCorruptInteractionTransitionResultStore(InMemorySessionStore):
 
 class ThreadDispatchedInteractionTransitionStore(InMemorySessionStore):
     """Model a cancellation-opaque store mutation dispatched to a worker thread."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -1446,6 +1484,8 @@ class BlockingInteractionTransitionDiagnosticSink(EventSink):
 
 
 class ChildCancelledInteractionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.attempts = 0
@@ -1459,6 +1499,8 @@ class ChildCancelledInteractionTransitionStore(InMemorySessionStore):
 
 
 class GroupedChildCancelledInteractionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.attempts = 0
@@ -1481,6 +1523,8 @@ class GroupedChildCancelledInteractionTransitionStore(InMemorySessionStore):
 
 
 class CancelledInteractionTransitionFailureStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failures: list[Exception] = [
@@ -1503,6 +1547,8 @@ class CancelledInteractionTransitionFailureStore(InMemorySessionStore):
 
 
 class PostCommitCancelledSQLiteInteractionTransitionStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.failures: list[Exception] = [
@@ -1528,6 +1574,8 @@ class PostCommitCancelledSQLiteInteractionTransitionStore(SQLiteSessionStore):
 
 
 class PostSettlementFenceSQLiteInteractionTransitionStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.second_attempt_dispatched = asyncio.Event()
@@ -1556,6 +1604,8 @@ class PostSettlementFenceSQLiteInteractionTransitionStore(SQLiteSessionStore):
 
 
 class PrunablePostCommitSQLiteInteractionTransitionStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.failures: list[Exception] = [
@@ -1592,6 +1642,8 @@ class PrunablePostCommitSQLiteInteractionTransitionStore(SQLiteSessionStore):
 
 
 class ConflictingInteractionTransitionReceiptStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.second_attempt_dispatched = asyncio.Event()
@@ -1629,6 +1681,8 @@ class ConflictingInteractionTransitionReceiptStore(InMemorySessionStore):
 
 
 class IncoherentInteractionTransitionReceiptStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.second_attempt_dispatched = asyncio.Event()
@@ -1662,6 +1716,8 @@ class IncoherentInteractionTransitionReceiptStore(InMemorySessionStore):
 
 
 class DistinctInteractionTransitionFailureStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.nested_failures: list[Exception] = [
@@ -1687,6 +1743,8 @@ class DistinctInteractionTransitionFailureStore(InMemorySessionStore):
 
 
 class ReusedInteractionTransitionFailureStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failure = ConnectionError("same acknowledgement failure")
@@ -4033,6 +4091,8 @@ def test_batch_recovery_attributes_repairs_before_terminal_reconciliation() -> N
 
 def test_batch_recovery_fault_isolates_and_retries_interaction_reconciliation() -> None:
     class FailingInteractionReconciliationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.interaction_failures_remaining = 3
@@ -4111,6 +4171,8 @@ def test_batch_recovery_fault_isolates_and_retries_interaction_reconciliation() 
 
 def test_cancelled_terminal_recovery_settles_interaction_reconciliation() -> None:
     class CancelledInteractionReconciliationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.interaction_failures_remaining = 3

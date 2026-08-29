@@ -896,6 +896,8 @@ class _UnformattableAssertionName(EvalAssertion):
 
 
 class _UnavailableEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
         raise NotImplementedError
 
@@ -1027,12 +1029,16 @@ class _ProviderTimeout(ModelProvider):
 
 
 class _NeverReturningLoadStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
         await asyncio.Event().wait()
         return None
 
 
 class _BlockedRecallEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(
         self,
         *,
@@ -1122,6 +1128,8 @@ class _BlockedRecallEvidenceStore(InMemorySessionStore):
 
 
 class _ChildCancelledRecallEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, cancel_on_call: int) -> None:
         super().__init__()
         self.cancel_on_call = cancel_on_call
@@ -1135,6 +1143,8 @@ class _ChildCancelledRecallEvidenceStore(InMemorySessionStore):
 
 
 class _ChangingLineageStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.root_lineage_reads = 0
@@ -1162,6 +1172,8 @@ class _ChangingLineageStore(InMemorySessionStore):
 
 
 class _FailingRevalidationLineageStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.root_lineage_reads = 0
@@ -1175,6 +1187,8 @@ class _FailingRevalidationLineageStore(InMemorySessionStore):
 
 
 class _FailingRevalidationTerminalEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.terminal_evidence_reads = 0
@@ -1187,6 +1201,8 @@ class _FailingRevalidationTerminalEvidenceStore(InMemorySessionStore):
 
 
 class _ChangedRevalidationTerminalEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.terminal_evidence_reads = 0
@@ -1204,6 +1220,8 @@ class _ChangedRevalidationTerminalEvidenceStore(InMemorySessionStore):
 
 
 class _ContradictoryRevalidationTerminalEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.terminal_evidence_reads = 0
@@ -1223,6 +1241,8 @@ class _ContradictoryRevalidationTerminalEvidenceStore(InMemorySessionStore):
 
 
 class _ContradictoryInterruptedRevalidationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.interrupted_evidence_reads = 0
@@ -1254,6 +1274,8 @@ class _ContradictoryInterruptedRevalidationStore(InMemorySessionStore):
 
 
 class _BlockedRevalidationLineageStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.lineage_reads = 0
@@ -1278,6 +1300,8 @@ class _BlockedRevalidationLineageStore(InMemorySessionStore):
 
 
 class _CancellationResistantTerminalEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.read_started = asyncio.Event()
@@ -1306,6 +1330,8 @@ class _CancellationResistantTerminalEvidenceStore(InMemorySessionStore):
 
 
 class _ForgedLineagePageStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def query_session_lineage(self, query):
         result = await super().query_session_lineage(query)
         return result.model_copy(
@@ -1317,6 +1343,8 @@ class _ForgedLineagePageStore(InMemorySessionStore):
 
 
 class _ForgedTerminalEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
         evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
         boundary = evidence.boundary.model_copy(update={"total_bytes": 1})
@@ -1324,6 +1352,8 @@ class _ForgedTerminalEvidenceStore(InMemorySessionStore):
 
 
 class _BlockingSQLiteRecallEvidenceStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.read_started = ThreadEvent()
@@ -1357,6 +1387,8 @@ class _BlockingSQLiteRecallEvidenceStore(SQLiteSessionStore):
 
 
 class _ProcessControlRecallEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.read_started = asyncio.Event()
@@ -4115,6 +4147,8 @@ def test_llm_judge_deletes_its_session_after_grading():
 def test_llm_judge_session_cleanup_is_best_effort():
     # A store without delete_session support must not fail the assertion.
     class NoDeleteStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def delete_session(self, session_id: str) -> None:
             raise NotImplementedError("This SessionStore does not support delete_session.")
 
@@ -5130,6 +5164,7 @@ def test_fresh_eval_rejects_validator_bypassed_terminal_boundary():
 
 def test_fresh_eval_without_authoritative_lineage_cannot_prove_empty():
     class NoLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_session_lineage = False
 
     result = asyncio.run(

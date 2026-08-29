@@ -101,6 +101,8 @@ class _SideEffectTool(Tool):
 
 
 class _ToolPublicationAcknowledgementLostStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.tool_publication_calls = 0

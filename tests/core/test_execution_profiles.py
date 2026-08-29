@@ -923,6 +923,8 @@ class RuntimeVerifiedEgressAuthorityAdoptionHandler(RecordingEgressAuthorityAdop
 class CompetingEgressTransitionAdmissionStore(InMemorySessionStore):
     """Advance a verified transition immediately before invocation admission."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.competing_target = None
@@ -1126,12 +1128,14 @@ class OpaqueConfiguredLoopPolicy(LoopPolicy):
 class ConcurrentCompletedAdoptionStore(InMemorySessionStore):
     """Make one adoption finish before its already-preflighted peer commits."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.adoption_count = 0
         self.both_adoptions_prepared = asyncio.Event()
 
-    async def admit_execution_profile_resume(self, session_id: str, **kwargs):
+    async def admit_session_invocation(self, session_id: str, *, admission):
         self.adoption_count += 1
         adoption_index = self.adoption_count
         if adoption_index == 2:
@@ -1143,18 +1147,20 @@ class ConcurrentCompletedAdoptionStore(InMemorySessionStore):
                 if session is not None and session.status is SessionStatus.COMPLETED:
                     break
                 await asyncio.sleep(0)
-        return await super().admit_execution_profile_resume(session_id, **kwargs)
+        return await super().admit_session_invocation(session_id, admission=admission)
 
 
 class CommitThenRaiseAdoptionStore(InMemorySessionStore):
     """Lose the acknowledgement after the atomic adoption commit."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_after_commit = True
 
-    async def admit_execution_profile_resume(self, session_id: str, **kwargs):
-        result = await super().admit_execution_profile_resume(session_id, **kwargs)
+    async def admit_session_invocation(self, session_id: str, *, admission):
+        result = await super().admit_session_invocation(session_id, admission=admission)
         if self.fail_after_commit:
             self.fail_after_commit = False
             raise RuntimeError("adoption commit acknowledgement lost")
@@ -1163,6 +1169,8 @@ class CommitThenRaiseAdoptionStore(InMemorySessionStore):
 
 class BlockingAliasResolutionStore(InMemorySessionStore):
     """Pause one public session-alias lookup at its real store boundary."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -6890,14 +6898,15 @@ def test_adoption_replay_validates_request_after_commit_acknowledgement_loss() -
             profile_adoption=intent,
         )
 
-        with pytest.raises(RuntimeError, match="acknowledgement lost"):
-            await _collect(app.resume(exact_request))
-        assert provider.requests == []
+        applied = await _collect(app.resume(exact_request))
+        assert EventType.SESSION_COMPLETED in {event.type for event in applied}
+        assert store.fail_after_commit is False
+        assert len(provider.requests) == 1
 
         replayed = await _collect(app.resume(exact_request))
         assert len(replayed) == 1
         assert replayed[0].type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
-        assert provider.requests == []
+        assert len(provider.requests) == 1
 
         with pytest.raises(ValueError, match="idempotency key"):
             await _collect(
@@ -6909,7 +6918,7 @@ def test_adoption_replay_validates_request_after_commit_acknowledgement_loss() -
                     )
                 )
             )
-        assert provider.requests == []
+        assert len(provider.requests) == 1
 
     asyncio.run(exercise())
 

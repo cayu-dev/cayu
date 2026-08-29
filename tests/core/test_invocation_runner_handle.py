@@ -94,6 +94,8 @@ class _BlockingRunner(Runner):
 
 
 class _BlockingCancellationProjectionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._armed = False
@@ -117,6 +119,8 @@ class _BlockingCancellationProjectionStore(InMemorySessionStore):
 
 
 class _FatalCancellationProjectionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._armed = False
@@ -1012,6 +1016,8 @@ def test_runtime_persists_runner_start_before_dispatch_and_seals_completion() ->
 
 def test_runtime_runner_start_persistence_failure_prevents_dispatch() -> None:
     class RejectRunnerStartStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.runner_start_attempts = 0

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
-from cayu._validation import copy_durable_json_object
+from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.runtime._model_completion_publication import ModelStepPublicationCheckpoint
 
@@ -15,12 +15,16 @@ if TYPE_CHECKING:
     from cayu.runtime.sessions import CheckpointRootFieldProjection
 
 CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
+WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY = "workspace_observations"
 ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY = "active_invocation_execution_profile"
+INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY = "invocation_lifecycle_receipt"
+INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE = "cayu.invocation-lifecycle-command-receipt-ledger"
+INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION = 1
 AUTOMATIC_RECALL_CHECKPOINT_KEY = "automatic_recall"
 COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY = "completion_result_event_publications"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY = "runtime_authored_user_message"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION = 1
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 4
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 5
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -257,6 +261,7 @@ def _migrate_checkpoint_v2_to_v3(checkpoint: dict[str, Any]) -> dict[str, Any]:
 
     migrated = copy_durable_json_object(checkpoint, "checkpoint")
     migrated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
+    migrated.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 3
     return migrated
 
@@ -268,8 +273,51 @@ def _migrate_checkpoint_v3_to_v4(checkpoint: dict[str, Any]) -> dict[str, Any]:
     # A v3 writer could not have produced this runtime-owned root.  Discarding
     # a caller-forged value prevents an old arbitrary checkpoint field from
     # becoming recovery authority after upgrade.
-    migrated.pop("workspace_observations", None)
+    migrated.pop(WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY, None)
     migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 4
+    return migrated
+
+
+def _empty_invocation_lifecycle_receipt_history() -> dict[str, Any]:
+    """Return authenticated evidence that pre-v5 lifecycle provenance is ambiguous."""
+
+    receipt_history = {
+        "record_type": INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
+        "schema_version": INVOCATION_LIFECYCLE_RECEIPT_LEDGER_SCHEMA_VERSION,
+        "receipts": [],
+        "release_capacity_command_identity": None,
+    }
+    return {
+        **receipt_history,
+        "record_sha256": sha256(
+            canonical_durable_json_bytes(
+                receipt_history,
+                "invocation lifecycle receipt ledger",
+            )
+        ).hexdigest(),
+    }
+
+
+def _migrate_checkpoint_v4_to_v5(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Reserve the invocation-lifecycle authority plane for v5 readers."""
+
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    # A v4 writer treated this name as ordinary caller/application checkpoint
+    # state.  It cannot become positive lifecycle authority merely because a
+    # newer runtime recognizes the same spelling.
+    migrated.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+    # Version 4 protected the active-profile spelling only after migration, but
+    # its supported generic checkpoint entrances could subsequently replace the
+    # value.  Remove that value from the live authority key.  A valid empty
+    # receipt ledger records only that lifecycle authority history existed; it
+    # contains no command receipt that could authorize admission, recovery,
+    # settlement, cleanup, or replay.
+    if ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in migrated:
+        migrated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+        migrated[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = (
+            _empty_invocation_lifecycle_receipt_history()
+        )
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 5
     return migrated
 
 
@@ -290,6 +338,11 @@ _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
             source_version=3,
             target_version=4,
             migrate=_migrate_checkpoint_v3_to_v4,
+        ),
+        CheckpointMigration(
+            source_version=4,
+            target_version=5,
+            migrate=_migrate_checkpoint_v4_to_v5,
         ),
     ),
 )
@@ -339,10 +392,28 @@ def decode_runtime_checkpoint(
     """Decode one root checkpoint into the current runtime-owned schema."""
 
     try:
-        return _RUNTIME_CHECKPOINT_MIGRATOR.decode(
+        source_version = None
+        if type(checkpoint) is dict:
+            raw_source_version = checkpoint.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+            if CHECKPOINT_SCHEMA_VERSION_KEY not in checkpoint:
+                source_version = _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION
+            elif type(raw_source_version) is int:
+                source_version = raw_source_version
+        decoded = _RUNTIME_CHECKPOINT_MIGRATOR.decode(
             checkpoint,
             session_id=session_id,
         )
+        if decoded is not None and source_version in {3, 4}:
+            # Versions 3 and 4 recognized active-invocation authority, but their
+            # generic checkpoint writers could replace *or delete* that root.
+            # Absence is therefore not positive evidence that a session was
+            # never governed. Preserve no pre-v5 value as live authority and
+            # retain only a non-executable history tombstone.
+            decoded.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
+            decoded[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = (
+                _empty_invocation_lifecycle_receipt_history()
+            )
+        return decoded
     except CheckpointCompatibilityError as error:
         checkpoint = None
         error.__traceback__ = None
@@ -365,15 +436,26 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return copy_durable_json_object(current, "checkpoint")
-    if writer_version not in {1, 2, 3}:
+    if writer_version not in {1, 2, 3, 4}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     projected = copy_durable_json_object(current, "checkpoint")
-    if writer_version < 4 and "workspace_observations" in projected:
+    if writer_version < 4 and WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY in projected:
         raise ValueError(
             "Active workspace-observation recovery state cannot be represented by an "
             f"older v{writer_version} writer."
         )
+    if (
+        writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION
+        and INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in projected
+    ):
+        raise ValueError(
+            "Invocation lifecycle receipt authority cannot be represented by an older "
+            f"v{writer_version} writer."
+        )
+    if writer_version == 4:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 4
+        return projected
     if writer_version == 3:
         projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 3
         return projected

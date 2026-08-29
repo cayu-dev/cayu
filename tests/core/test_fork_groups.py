@@ -569,6 +569,8 @@ class _FailOnceLoadTaskStore(InMemoryTaskStore):
 
 
 class _FailOnceLoadSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_session_id: str | None = None
@@ -1973,6 +1975,7 @@ def test_task_backed_fork_group_persists_link_before_task_is_claimable() -> None
 
 def test_task_backed_fork_group_worker_rejects_missing_group_authority() -> None:
     class AuthorityHidingSessionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         hide_group = False
 
         async def load_session_operation(

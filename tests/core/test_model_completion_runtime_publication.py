@@ -57,6 +57,8 @@ class _EchoTool(Tool):
 
 
 class _PromotionAcknowledgementLostStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.lost_acknowledgement = False
@@ -71,6 +73,8 @@ class _PromotionAcknowledgementLostStore(InMemorySessionStore):
 
 class _LegacyPublicationOverrideStore(InMemorySessionStore):
     """Exercise the established public publication signatures without catch-all kwargs."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -127,6 +131,8 @@ class _LegacyPublicationOverrideStore(InMemorySessionStore):
 
 class _PreAssistantPublicationStageStore(InMemorySessionStore):
     """Store one terminal tool-round stage in the additive pre-field v2 shape."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()

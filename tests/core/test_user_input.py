@@ -11,7 +11,7 @@ from tests.core._event_projection_support import (
     private_events_for_public_events,
 )
 from tests.core._execution_profile_fixtures import (
-    checkpoint_with_rebound_test_invocation_profile,
+    rebind_test_invocation,
 )
 
 from cayu.core import (
@@ -55,6 +55,7 @@ from cayu.runtime import (
     UserInputResponse,
 )
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime import sessions as sessions_module
 from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -64,7 +65,6 @@ from cayu.runtime.checkpoints import (
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
-    checkpoint_with_active_invocation_execution_profile,
 )
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor, StaticVault
@@ -197,41 +197,49 @@ class _BlockingTool(Tool):
 
 
 class _RecordingReleaseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.release_calls: dict[str, int] = {}
 
-    async def release_run_fence(self, session_id: str) -> None:
-        self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
-        await super().release_run_fence(session_id)
+    async def release_session_invocation(self, command) -> None:
+        self.release_calls[command.session_id] = self.release_calls.get(command.session_id, 0) + 1
+        await super().release_session_invocation(command)
 
 
-class _FailingReleaseAfterCleanupStore(_RecordingReleaseStore):
+class _CommitThenRaiseReleaseStore(_RecordingReleaseStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_next_release = False
 
-    async def release_run_fence(self, session_id: str) -> None:
-        await super().release_run_fence(session_id)
+    async def release_session_invocation(self, command) -> None:
+        await super().release_session_invocation(command)
         if self.fail_next_release:
             self.fail_next_release = False
             raise RuntimeError("run fence release unavailable")
 
 
 class _FailingReleaseBeforeCleanupStore(_RecordingReleaseStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_next_release = False
 
-    async def release_run_fence(self, session_id: str) -> None:
-        self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
+    async def release_session_invocation(self, command) -> None:
+        self.release_calls[command.session_id] = self.release_calls.get(command.session_id, 0) + 1
         if self.fail_next_release:
             self.fail_next_release = False
             raise RuntimeError("run fence release unavailable before cleanup")
-        await InMemorySessionStore.release_run_fence(self, session_id)
+        await InMemorySessionStore.release_session_invocation(self, command)
 
 
 class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.block_next_running_transition = False
@@ -245,12 +253,14 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         checkpoint_transform,
+        **kwargs,
     ) -> Session:
         session = await super().transition_status_and_checkpoint(
             session_id,
             from_statuses=from_statuses,
             to_status=to_status,
             checkpoint_transform=checkpoint_transform,
+            **kwargs,
         )
         if self.block_next_running_transition and to_status == SessionStatus.RUNNING:
             self.block_next_running_transition = False
@@ -262,6 +272,8 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
 
 
 class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.block_next_interrupted_transition = False
@@ -276,6 +288,10 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
+        model_completion_stage_settlement=None,
+        expected_session_instance_id: str | None = None,
+        expected_active_invocation_profile=None,
+        expected_invocation_authority_state="active",
     ):
         if self.block_next_interrupted_transition and to_status == SessionStatus.INTERRUPTED:
             self.block_next_interrupted_transition = False
@@ -289,6 +305,10 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_stage_settlement,
+            expected_session_instance_id=expected_session_instance_id,
+            expected_active_invocation_profile=expected_active_invocation_profile,
+            expected_invocation_authority_state=expected_invocation_authority_state,
         )
 
 
@@ -511,7 +531,8 @@ def test_resolve_user_input_rejects_versionless_root_with_reserved_authority() -
         assert versionless is not None
         versionless.pop(CHECKPOINT_SCHEMA_VERSION_KEY, None)
         versionless["future_additive_field"] = {"kept": True}
-        await store.checkpoint(session_id, versionless)
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await store.checkpoint(session_id, versionless)
 
         with pytest.raises(
             RuntimeError,
@@ -569,7 +590,8 @@ def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() 
         future_checkpoint = await store.load_checkpoint(session_id)
         assert future_checkpoint is not None
         future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
-        await store.checkpoint(session_id, future_checkpoint)
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await store.checkpoint(session_id, future_checkpoint)
 
         with pytest.raises(CheckpointCompatibilityError) as caught:
             await _drain(
@@ -650,10 +672,10 @@ def test_resolve_user_input_releases_run_fence_once_after_handoff() -> None:
     assert close_has_active_tasks is False
 
 
-def test_resolve_user_input_task_cancellation_finalizes_and_preserves_pending_state() -> None:
+def test_resolve_user_input_task_cancellation_reconciles_release_acknowledgement_loss() -> None:
     async def run() -> None:
         session_id = "s_resolution_task_cancelled"
-        store = _FailingReleaseAfterCleanupStore()
+        store = _CommitThenRaiseReleaseStore()
         blocking_tool = _BlockingTool()
         app, _ = _build(
             [
@@ -698,7 +720,7 @@ def test_resolve_user_input_task_cancellation_finalizes_and_preserves_pending_st
             await resolution_task
         except asyncio.CancelledError as cancellation:
             assert cancellation.args == ("cancel user-input resolution",)
-            assert any(
+            assert not any(
                 "run fence release" in note for note in getattr(cancellation, "__notes__", ())
             )
         else:
@@ -1728,6 +1750,8 @@ def test_fork_of_paused_session_is_rejected() -> None:
 
 
 class _FailOnceAppendStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     # Fails the next round-close append once armed (so the initial run — which also uses this
     # method to open the tool round — is unaffected).
     def __init__(self) -> None:
@@ -2168,6 +2192,8 @@ def test_recover_user_input_supplies_outcome_and_completes(
 
 def test_recover_user_input_reconciles_ambiguous_append_acknowledgement() -> None:
     class AmbiguousRecoveryAppendStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_recovery_ack = False
@@ -2738,28 +2764,7 @@ def test_worker_recovery_preserves_pending_user_input() -> None:
         "input_id"
     ]
     # Simulate the crash window with the profile rebound in the same running-epoch claim.
-    checkpoint = asyncio.run(store.load_checkpoint("s_crashrec"))
-    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
-    assert active_profile is not None
-
-    def claim_running(current_session: Session, current_checkpoint: dict | None) -> dict:
-        return checkpoint_with_active_invocation_execution_profile(
-            current_checkpoint,
-            session_id=current_session.id,
-            interaction_id=active_profile.interaction_id,
-            run_epoch=current_session.run_epoch + 1,
-            profile=active_profile.profile,
-            expected=active_profile,
-        )
-
-    asyncio.run(
-        store.transition_status_and_checkpoint(
-            "s_crashrec",
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=claim_running,
-        )
-    )
+    asyncio.run(rebind_test_invocation(store, "s_crashrec"))
     result = asyncio.run(
         app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id="s_crashrec"))
     )
@@ -2824,12 +2829,7 @@ def test_worker_recovery_rejects_corrupted_pending_user_input(
             return updated
 
         await store.transform_checkpoint(session_id, corrupt_checkpoint)
-        await store.transition_status_and_checkpoint(
-            session_id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=checkpoint_with_rebound_test_invocation_profile,
-        )
+        await rebind_test_invocation(store, session_id)
         checkpoint_before = await store.load_checkpoint(session_id)
         transcript_before = await store.load_transcript(session_id)
         events_before = await store.load_events(session_id)

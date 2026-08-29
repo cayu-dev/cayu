@@ -610,15 +610,20 @@ def test_runtime_evidence_does_not_claim_redaction_when_a_bound_prevents_lookahe
 
 def test_runtime_evidence_distinguishes_unsupported_and_contradictory_memory() -> None:
     class UnsupportedMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_recall_evidence = False
 
     class ContradictoryMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def list_context_exposures(self, query):
             missing_receipt = _receipt("missing")
             exposure, _items = _exposure("orphan", missing_receipt)
             return ContextExposurePage(items=(exposure,), truncated=False)
 
     class OutOfOrderMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def list_recall_receipts(self, query):
             return RecallReceiptPage(
                 items=(_receipt("two"), _receipt("one")),
@@ -626,6 +631,8 @@ def test_runtime_evidence_distinguishes_unsupported_and_contradictory_memory() -
             )
 
     class DuplicateAttemptMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def list_recall_receipts(self, query):
             return RecallReceiptPage(items=(_receipt("one"),), truncated=False)
 
@@ -662,6 +669,8 @@ def test_runtime_evidence_distinguishes_unsupported_and_contradictory_memory() -
 
 def test_runtime_evidence_distinguishes_read_failure_and_shares_bounds_across_sessions() -> None:
     class FailingMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def list_recall_receipts(self, query):
             raise OSError("private database failure")
 
@@ -709,6 +718,8 @@ def test_runtime_evidence_rejects_a_custom_store_page_before_reserializing_exces
     record_kind: str,
 ) -> None:
     class OverLimitMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def list_recall_receipts(self, query):
             if record_kind != "receipt":
                 return await super().list_recall_receipts(query)
@@ -758,6 +769,8 @@ def test_runtime_evidence_rejects_a_custom_store_page_before_reserializing_exces
 
 def test_runtime_evidence_rejects_over_limit_item_rows_as_a_bounded_read_failure() -> None:
     class OverLimitItemMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_recall_item_exposures(self, session_id, exposure_id):
             items = await super().load_recall_item_exposures(session_id, exposure_id)
             return items * 65

@@ -145,6 +145,7 @@ from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._memory_evidence import (
     MemoryEvidenceKey,
     MemoryEvidenceReference,
@@ -239,6 +240,7 @@ from cayu.runtime.context import (
     copy_context_pressure_estimate,
     estimate_context_pressure,
     noteify_unresolvable_prompt_files,
+    project_runtime_managed_context_checkpoint,
     sanitize_context_build_error_checkpoint,
     sanitize_context_build_result_checkpoint,
     sanitize_context_compaction_telemetry,
@@ -2419,6 +2421,7 @@ class ModelStepBudgetEvaluationRequest:
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
     execution_profile: ExecutionProfileIdentity | None
+    invocation_context: InvocationContext | None = None
 
 
 @dataclass(frozen=True)
@@ -2433,6 +2436,7 @@ class ModelStepLimitEvaluationRequest:
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
     execution_profile: ExecutionProfileIdentity | None
+    invocation_context: InvocationContext | None = None
 
 
 @dataclass(frozen=True)
@@ -2447,6 +2451,7 @@ class ModelStepBudgetReservationFailureRequest:
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
     execution_profile: ExecutionProfileIdentity | None
+    invocation_context: InvocationContext | None = None
 
 
 BudgetEvaluationEventStream = Callable[
@@ -2999,8 +3004,24 @@ class ModelStepExecutor:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
+        invocation_context: InvocationContext | None = None,
     ) -> ProviderOperationSnapshot | None:
         """Cancel one durably identified operation after its worker disappears."""
+
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_provider is not invocation_context.registered_provider
+            or environment_name
+            != (
+                None
+                if invocation_context.registered_environment is None
+                else invocation_context.registered_environment.spec.name
+            )
+        ):
+            raise RuntimeError(
+                "Provider-operation cancellation substituted frozen invocation authority."
+            )
 
         provider = registered_provider.provider
         adapter = provider.provider_operations
@@ -3200,8 +3221,24 @@ class ModelStepExecutor:
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
         model_completion_publisher: ModelCompletionPublisher,
+        invocation_context: InvocationContext | None = None,
     ) -> ProviderOperationRecoveryResult:
         """Recover start-only evidence without persisting or replaying a raw request."""
+
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_provider is not invocation_context.registered_provider
+            or environment_name
+            != (
+                None
+                if invocation_context.registered_environment is None
+                else invocation_context.registered_environment.spec.name
+            )
+        ):
+            raise RuntimeError(
+                "Provider-operation start recovery substituted frozen invocation authority."
+            )
 
         provider = registered_provider.provider
         adapter = provider.provider_operations
@@ -3444,6 +3481,7 @@ class ModelStepExecutor:
             environment_name=environment_name,
             recovery_context=recovery_context,
             model_completion_publisher=model_completion_publisher,
+            invocation_context=invocation_context,
         )
         return ProviderOperationRecoveryResult(
             status=recovered.status,
@@ -3463,8 +3501,24 @@ class ModelStepExecutor:
         environment_name: str | None,
         recovery_context: ModelCompletionRecoveryContext | None,
         model_completion_publisher: ModelCompletionPublisher,
+        invocation_context: InvocationContext | None = None,
     ) -> ProviderOperationRecoveryResult:
         """Retrieve and atomically publish one exact offline provider operation."""
+
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_provider is not invocation_context.registered_provider
+            or environment_name
+            != (
+                None
+                if invocation_context.registered_environment is None
+                else invocation_context.registered_environment.spec.name
+            )
+        ):
+            raise RuntimeError(
+                "Provider-operation recovery substituted frozen invocation authority."
+            )
 
         provider = registered_provider.provider
         adapter = provider.provider_operations
@@ -4636,6 +4690,7 @@ class ModelStepExecutor:
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         validate_live_model_semantics: Callable[[], None],
         initial_tool_exposure: ResolvedToolExposure | None = None,
         previous_tool_exposure_profile_id: str | None = None,
@@ -4667,6 +4722,7 @@ class ModelStepExecutor:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             validate_live_model_semantics=validate_live_model_semantics,
             initial_tool_exposure=initial_tool_exposure,
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
@@ -4991,6 +5047,7 @@ class ModelStepExecutor:
         | None = None,
         model_completion_publisher: ModelCompletionPublisher | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         tool_exposure: ResolvedToolExposure | None = None,
         tool_exposure_evidence: ToolExposure | None = None,
         targeted_tool_grants: TargetedToolGrantFootprint | None = None,
@@ -4998,6 +5055,13 @@ class ModelStepExecutor:
         native_tool_grant_ids: Mapping[str, str] | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_provider is not registered_provider
+            or invocation_context.profile is not execution_profile
+        ):
+            raise RuntimeError("Model retry execution lost frozen invocation authority.")
         retry_policy = copy_retry_policy(retry_policy)
         request_variant = RequestVariant(request_variant)
         structured_output = copy_structured_output_spec(structured_output)
@@ -5285,6 +5349,7 @@ class ModelStepExecutor:
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 tool_exposure=resolved_tool_exposure,
                 targeted_tool_gateway=targeted_tool_gateway,
                 native_tool_grant_ids=native_grant_ids,
@@ -5717,6 +5782,7 @@ class ModelStepExecutor:
         | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
         tool_exposure: ResolvedToolExposure | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
         native_tool_grant_ids: Mapping[str, str],
@@ -5916,6 +5982,7 @@ class ModelStepExecutor:
                     completion_dispatch.stage
                 ),
                 model_completion_publisher=model_completion_publisher,
+                invocation_context=invocation_context,
             )
             if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
                 raise ProviderOperationEvidenceError(
@@ -7539,6 +7606,7 @@ class ModelStepRun:
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
         validate_live_model_semantics: Callable[[], None],
         initial_tool_exposure: ResolvedToolExposure | None,
         previous_tool_exposure_profile_id: str | None,
@@ -7567,6 +7635,15 @@ class ModelStepRun:
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
         self._execution_profile = execution_profile
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_provider is not registered_provider
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise ValueError("Model-step execution lost frozen invocation authority.")
+        self._invocation_context = invocation_context
         self._validate_live_model_semantics = validate_live_model_semantics
         capability_ceiling = tool_capability_ceiling_from_session_metadata(
             self._session.metadata,
@@ -9106,6 +9183,7 @@ class ModelStepRun:
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=self._execution_profile,
+                invocation_context=self._invocation_context,
                 tool_exposure=tool_exposure,
                 tool_exposure_evidence=tool_exposure_evidence,
                 targeted_tool_grants=self._targeted_tool_grants,
@@ -9536,6 +9614,7 @@ class ModelStepRun:
                     turn_usage_tracker=self._turn_usage_tracker,
                     active_run=self._active_run,
                     execution_profile=self._execution_profile,
+                    invocation_context=self._invocation_context,
                 )
             )
         if rejection.limit_evaluation is None:
@@ -9554,6 +9633,7 @@ class ModelStepRun:
                 turn_usage_tracker=self._turn_usage_tracker,
                 active_run=self._active_run,
                 execution_profile=self._execution_profile,
+                invocation_context=self._invocation_context,
             )
         )
 
@@ -10465,6 +10545,7 @@ class ModelStepRun:
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         budget_events = self._executor._apply_budget_evaluation(request)
         try:
@@ -10489,6 +10570,7 @@ class ModelStepRun:
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         limit_events = self._executor._apply_limit_evaluation(request)
         try:
@@ -10522,6 +10604,7 @@ class ModelStepRun:
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         budget_events = self._executor._apply_budget_evaluation(request)
         try:
@@ -10547,6 +10630,7 @@ class ModelStepRun:
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         limit_events = self._executor._apply_limit_evaluation(request)
         try:
@@ -10576,6 +10660,7 @@ class ModelStepRun:
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         terminal_events = self._executor._stop_for_budget_reservation_failure(request)
         try:
@@ -11595,7 +11680,9 @@ async def _build_context(
         force_bounded_compaction=force_bounded_compaction,
     )
     if isinstance(context_policy, RuntimeManagedContextPolicy):
-        checkpoint = await session_store.load_checkpoint(session.id)
+        checkpoint = project_runtime_managed_context_checkpoint(
+            await session_store.load_checkpoint(session.id)
+        )
         try:
             with (
                 _context_secret_redactor_scope(secret_redactor),

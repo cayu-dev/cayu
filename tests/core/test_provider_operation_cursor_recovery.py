@@ -508,6 +508,8 @@ class _MalformedOutputRecoveryProvider(_CursorReplayProvider):
 
 
 class _ProgressPublishBarrierStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.pause_next_progress = False

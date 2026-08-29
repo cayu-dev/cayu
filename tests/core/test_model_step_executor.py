@@ -43,6 +43,8 @@ from cayu.runtime.usage import session_usage_summary
 
 def test_context_usage_state_uses_one_latest_completed_event_query() -> None:
     class TrackingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.event_queries: list[EventQuery] = []
@@ -100,6 +102,8 @@ def test_context_usage_state_uses_one_latest_completed_event_query() -> None:
 
 def test_context_usage_state_pages_past_compaction_completions() -> None:
     class TrackingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.event_queries: list[EventQuery] = []

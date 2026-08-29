@@ -416,6 +416,7 @@ def test_trajectory_from_session_accepts_a_failed_terminal_root():
 
 def test_trajectory_from_session_requires_the_bounded_lineage_capability():
     class NoLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_session_lineage = False
 
     with pytest.raises(SessionTrajectoryError) as captured:
@@ -779,6 +780,8 @@ def test_trajectory_from_session_accepts_an_exact_transcript_bound_with_zero_rec
 
 def test_trajectory_from_session_ignores_excluded_origin_payloads_outside_retained_budget():
     class IdentityOnlyOriginStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events_bounded(self, query, *, max_bytes):
             raise AssertionError("Trajectory admission must not hydrate origin event payloads.")
 
@@ -893,6 +896,8 @@ def test_trajectory_from_session_enforces_the_record_byte_bound():
 
 def test_trajectory_from_session_classifies_descendant_enumeration_failures():
     class FailingLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             raise RuntimeError("lineage unavailable")
 
@@ -913,6 +918,8 @@ def test_trajectory_from_session_classifies_descendant_enumeration_failures():
 
 def test_trajectory_from_session_does_not_trust_store_owned_trajectory_errors():
     class ForgedContradictionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             raise SessionTrajectoryError(
                 SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
@@ -937,6 +944,8 @@ def test_trajectory_from_session_does_not_trust_store_owned_trajectory_errors():
 
 def test_trajectory_from_session_does_not_trust_result_validation_errors():
     class ForgedResultStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             result = await super().query_session_lineage(query)
             result = result.model_copy(update={"has_more": True})
@@ -969,6 +978,8 @@ def test_trajectory_from_session_does_not_trust_result_validation_errors():
 
 def test_trajectory_from_session_rejects_a_contradictory_parent_projection():
     class ContradictoryParentStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             result = await super().query_session_lineage(query)
             if query.parent_session_id != "root" or not result.children:
@@ -1000,6 +1011,8 @@ def test_trajectory_from_session_rejects_a_contradictory_parent_projection():
 
 def test_trajectory_from_session_rejects_missing_child_origin_evidence():
     class MissingOriginStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             result = await super().query_session_lineage(query)
             if query.parent_session_id != "root" or not result.children:
@@ -1123,6 +1136,8 @@ def test_trajectory_from_session_rejects_matching_untrusted_origin_lineage(
 
 def test_trajectory_from_session_rejects_matching_lineage_when_reader_loses_authority():
     class AuthorityDroppingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_terminal_session_evidence(self, session_id, *, limits=None):
             evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
             return type(evidence).model_validate(evidence.model_dump(mode="python"))
@@ -1193,6 +1208,8 @@ def test_trajectory_from_session_accepts_an_authoritative_fork_origin(
 
 def test_trajectory_from_session_revalidates_promoted_memory_evidence():
     class MemoryChangingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self):
             super().__init__()
             self.terminal_evidence_reads = 0
@@ -1274,6 +1291,8 @@ def test_runtime_child_start_persists_authoritative_parent_lineage():
 
 def test_trajectory_from_session_rejects_an_admitted_child_read_failure():
     class FailingChildReadStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_terminal_session_evidence(self, session_id, *, limits=None):
             if session_id == "child":
                 raise RuntimeError("store read failed")
@@ -1306,6 +1325,7 @@ def test_trajectory_from_session_rejects_a_closure_that_changes_during_capture(
     max_sessions,
 ):
     class ChangingClosureStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         root_queries = 0
 
         async def query_session_lineage(self, query):
@@ -1413,6 +1433,7 @@ def test_fresh_descendant_capture_marks_a_global_session_limit_incomplete():
 
 def test_fresh_descendant_capture_without_lineage_excludes_post_terminal_child():
     class NoLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_session_lineage = False
 
     async def scenario():

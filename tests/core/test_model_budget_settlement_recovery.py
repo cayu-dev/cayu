@@ -141,6 +141,8 @@ class _CrashBeforeFirstReconciliation(InMemoryBudgetLedger):
 
 
 class _CrashBeforeFirstSettlementEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_enabled = True
@@ -186,6 +188,8 @@ class _LoseEveryDispatchFenceAcknowledgement(InMemoryBudgetLedger):
 
 
 class _LoseFirstSettlementEventAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.acknowledgement_loss_enabled = True
@@ -199,6 +203,8 @@ class _LoseFirstSettlementEventAcknowledgementStore(InMemorySessionStore):
 
 
 class _RejectFirstModelStageDispatchReceipt(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.reject_dispatch_receipt = True

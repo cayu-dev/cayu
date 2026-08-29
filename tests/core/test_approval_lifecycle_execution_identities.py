@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import rebind_test_invocation
 
 from cayu import (
     AgentSpec,
@@ -40,7 +41,6 @@ from cayu.runtime import (
 )
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
-    checkpoint_with_active_invocation_execution_profile,
 )
 
 
@@ -85,6 +85,8 @@ class _ExpiringApprovalPolicy(ToolPolicy):
 
 
 class _FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_pending_tool_round_once = False
@@ -102,6 +104,8 @@ class _FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
 
 
 class _FailingTerminalToolEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_terminal_once = False
@@ -406,23 +410,7 @@ def test_approval_request_drift_is_rejected_while_a_mixed_round_can_still_execut
         )
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         assert active_profile is not None
-        current = await store.load(session_id)
-        assert current is not None
-        await store.transition_status_and_checkpoint(
-            session_id,
-            from_statuses={current.status},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=lambda session, current_checkpoint: (
-                checkpoint_with_active_invocation_execution_profile(
-                    current_checkpoint,
-                    session_id=session.id,
-                    interaction_id=active_profile.interaction_id,
-                    run_epoch=session.run_epoch + 1,
-                    profile=active_profile.profile,
-                    expected=active_profile,
-                )
-            ),
-        )
+        await rebind_test_invocation(store, session_id)
 
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)

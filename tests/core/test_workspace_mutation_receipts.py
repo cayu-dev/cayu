@@ -13,7 +13,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from tests.core._execution_profile_fixtures import versioned_test_provider_identity
+from tests.core._execution_profile_fixtures import (
+    interrupt_and_release_test_invocation,
+    versioned_test_provider_identity,
+)
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
@@ -756,6 +759,8 @@ class _ThreadBackedBeforeObserverBinding(DeterministicWorkspaceBinding):
 
 
 class _FailAfterObservationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed = False
@@ -776,6 +781,8 @@ class _FailAfterObservationStore(InMemorySessionStore):
 
 
 class _ChildCancelledAfterObservationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed = False
@@ -796,6 +803,8 @@ class _ChildCancelledAfterObservationStore(InMemorySessionStore):
 
 
 class _BlockingAfterObservationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.started = asyncio.Event()
@@ -819,6 +828,8 @@ class _BlockingAfterObservationStore(InMemorySessionStore):
 
 
 class _CancelledFailedWorkspacePublicationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.publication_started = asyncio.Event()
@@ -889,6 +900,8 @@ def _malformed_workspace_publication_result(
 
 
 class _CommittedMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.corrupted = False
@@ -915,6 +928,8 @@ class _CommittedMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
 
 
 class _UncommittedMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.prior_result: RuntimePublicationResult | None = None
@@ -943,6 +958,8 @@ class _UncommittedMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
 class _UncommittedConflictingWorkspaceAcknowledgementStore(
     _UncommittedMalformedWorkspaceAcknowledgementStore
 ):
+    invocation_lifecycle_command_version = 1
+
     async def publish_runtime_publication(self, session_id, *, request, **kwargs):
         if request.kind == "workspace-observation" and request.intent.get("phase") == (
             "before-evidence"
@@ -977,6 +994,8 @@ class _UncommittedConflictingWorkspaceAcknowledgementStore(
 
 
 class _TracebackMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.returned_session = None
@@ -992,6 +1011,8 @@ class _TracebackMalformedWorkspaceAcknowledgementStore(InMemorySessionStore):
 
 
 class _FailingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore):
+    invocation_lifecycle_command_version = 1
+
     async def append_event(self, session_id, event):
         if event.type == EventType.TOOL_CALL_COMPLETED:
             raise ConnectionError("terminal publication failed")
@@ -999,6 +1020,8 @@ class _FailingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore):
 
 
 class _BlockingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.terminal_started = asyncio.Event()
@@ -1014,6 +1037,8 @@ class _BlockingTerminalAfterBlockingCaptureStore(_BlockingAfterObservationStore)
 
 
 class _BlockingInterruptionCleanupStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.cleanup_started = asyncio.Event()
@@ -1043,6 +1068,12 @@ class _BlockingInterruptionCleanupStore(InMemorySessionStore):
         if self.fail_next_run_fence_release:
             self.fail_next_run_fence_release = False
             raise RuntimeError("interruption run-fence release failed")
+
+    async def release_session_invocation(self, command):
+        if self.fail_next_run_fence_release:
+            self.fail_next_run_fence_release = False
+            raise RuntimeError("interruption run-fence release failed")
+        return await super().release_session_invocation(command)
 
 
 class _WorkspaceObservationProcessLoss(BaseException):
@@ -1080,6 +1111,8 @@ class _WorkspaceObservationRecoveryFactory(EnvironmentFactory):
 
 
 class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, phase: str) -> None:
         super().__init__()
         self.phase = phase
@@ -1104,6 +1137,32 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
             self.workspace_observation_read_cancelled = True
             raise asyncio.CancelledError("store-owned workspace observation cancellation")
         return await super().load_checkpoint(session_id)
+
+    async def force_transform_checkpoint_for_test(self, session_id, transform):
+        """Inject corrupt durable state that the public transform boundary rejects."""
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            current = self._checkpoints.get(session_id)
+            transformed = transform(
+                session.model_copy(deep=True),
+                None if current is None else copy.deepcopy(current),
+            )
+            if transformed is not None:
+                self._checkpoints[session_id] = copy.deepcopy(transformed)
+
+    async def force_advance_run_epoch_for_test(self, session_id):
+        """Model a process-loss handoff after its invocation context is gone."""
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            self._sessions[session_id] = session.model_copy(
+                update={"run_epoch": session.run_epoch + 1}
+            )
 
     async def publish_runtime_publication(self, session_id, *, request, **kwargs):
         result = await super().publish_runtime_publication(
@@ -2714,11 +2773,15 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
         durable_before_recovery = await store.query_events(
             EventQuery(session_id="session-dynamic-identity-intent")
         )
-        await store.release_run_fence("session-dynamic-identity-intent")
-        await store.update_status(
+        await interrupt_and_release_test_invocation(
+            store,
             "session-dynamic-identity-intent",
-            first_recovery_status,
         )
+        if first_recovery_status is SessionStatus.FAILED:
+            await store.update_status(
+                "session-dynamic-identity-intent",
+                SessionStatus.FAILED,
+            )
         recovery_app, recovery_provider = registered_app()
         first_recovery = await recovery_app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
@@ -2737,7 +2800,10 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
             ):
                 pass
         second_checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
-        await store.release_run_fence("session-dynamic-identity-intent")
+        await interrupt_and_release_test_invocation(
+            store,
+            "session-dynamic-identity-intent",
+        )
         await store.update_status(
             "session-dynamic-identity-intent",
             SessionStatus.INTERRUPTING,
@@ -7629,8 +7695,7 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
 
         store.failed = True
         store.hide_workspace_delta = hide_workspace_delta
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_provider = _ScriptedProvider()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(recovery_provider, default=True)
@@ -7790,8 +7855,7 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
         assert checkpoint_before is not None
         assert workspace_observations_from_checkpoint(checkpoint_before)
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
 
         # The replacement registration intentionally has no access to the
         # historical concrete workspace. Recovery must not invoke it merely to
@@ -7912,8 +7976,7 @@ def test_workspace_observation_recovery_does_not_fabricate_caller_cancellation(
             store.cancel_workspace_observation_read = True
         else:
             store.cancel_workspace_observation_mutation = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_provider = _ScriptedProvider()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(recovery_provider, default=True)
@@ -8095,8 +8158,7 @@ def test_workspace_observation_recovery_reports_partial_artifact_state(
 
         store.failed = True
         store.hide_workspace_delta = crash_phase == "delta-publication"
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_provider = _BulkProvider()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(recovery_provider, default=True)
@@ -8225,8 +8287,7 @@ def test_recovery_does_not_downgrade_failed_delta_when_artifact_is_missing(
         await artifact_store.delete(after_artifact["artifact_id"])
 
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(_BulkProvider(), default=True)
         recovery_app.register_environment(
@@ -8313,8 +8374,7 @@ def test_recovery_retains_late_artifact_intent_until_store_cleanup(
         assert artifact["state"] == "intent"
 
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(_BulkProvider(), default=True)
         recovery_app.register_environment(
@@ -8395,6 +8455,7 @@ def test_workspace_observation_recovery_accepts_rebound_invocation_epoch(tmp_pat
         store.failed = True
         await store.release_run_fence(session_id)
         await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await store.force_advance_run_epoch_for_test(session_id)
 
         def rebound_profile(session, checkpoint):
             assert checkpoint is not None
@@ -8407,7 +8468,7 @@ def test_workspace_observation_recovery_accepts_rebound_invocation_epoch(tmp_pat
             active_profile["run_epoch"] = session.run_epoch
             return updated
 
-        await store.transform_checkpoint(session_id, rebound_profile)
+        await store.force_transform_checkpoint_for_test(session_id, rebound_profile)
         rebound_checkpoint = await store.load_checkpoint(session_id)
         assert rebound_checkpoint is not None
         assert (
@@ -8736,10 +8797,9 @@ def test_workspace_observation_recovery_rejects_foreign_authority_before_artifac
                 observations[foreign["window_id"]] = foreign
             return copied
 
-        await store.transform_checkpoint(session_id, forge_cross_session_lifecycle)
+        await store.force_transform_checkpoint_for_test(session_id, forge_cross_session_lifecycle)
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         forged_checkpoint = await store.load_checkpoint(session_id)
         tracking_store = _ReadTrackingArtifactStore(
             artifact_root,
@@ -8843,8 +8903,7 @@ def test_workspace_observation_recovery_rejects_same_name_observer_authority_cha
         )
 
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_binding = (
             impostor_binding_type()
             if original_is_runtime_builtin
@@ -8945,12 +9004,11 @@ def test_workspace_observation_recovery_rejects_foreign_durable_tool_outcome(
             )
             return copied
 
-        await store.transform_checkpoint(session_id, forge_tool_outcome)
+        await store.force_transform_checkpoint_for_test(session_id, forge_tool_outcome)
         assert foreign_event is not None
         await store.append_event(session_id, foreign_event)
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
 
         recovery_provider = _BulkProvider()
         tracking_store = _ReadTrackingArtifactStore(
@@ -9079,10 +9137,11 @@ def test_workspace_observation_recovery_rejects_foreign_delta_event(
             lifecycle["mutation_event_digest"] = workspace_observation_event_digest(foreign_delta)
             return copied
 
-        await store.transform_checkpoint(session_id, point_lifecycle_to_foreign_delta)
+        await store.force_transform_checkpoint_for_test(
+            session_id, point_lifecycle_to_foreign_delta
+        )
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         recovery_provider = _ScriptedProvider()
         recovery_app = CayuApp(session_store=store, enable_logging=False)
         recovery_app.register_provider(recovery_provider, default=True)
@@ -9176,10 +9235,11 @@ def test_workspace_observation_recovery_validates_delta_before_artifact_read(
             lifecycle["mutation_event_digest"] = workspace_observation_event_digest(foreign_delta)
             return copied
 
-        await store.transform_checkpoint(session_id, point_lifecycle_to_foreign_delta)
+        await store.force_transform_checkpoint_for_test(
+            session_id, point_lifecycle_to_foreign_delta
+        )
         store.failed = True
-        await store.release_run_fence(session_id)
-        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await interrupt_and_release_test_invocation(store, session_id)
         tracking_store = _ReadTrackingArtifactStore(
             artifact_root,
             store_id="artifact-store",

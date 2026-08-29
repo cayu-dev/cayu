@@ -210,6 +210,8 @@ def _provider(*, trials: int = 2, output: str = "Approved") -> ScriptedModelProv
 
 
 class _MissingExposureEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def list_context_exposures(self, query):
         del query
         return ContextExposurePage(items=(), truncated=False)

@@ -4,7 +4,22 @@ from __future__ import annotations
 
 from dataclasses import replace
 from functools import wraps
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast, overload
+
+if TYPE_CHECKING:
+    from cayu.runtime._invocation_lifecycle import (
+        AdmitInvocationCommand,
+        CreateInvocationCommand,
+        InvocationLifecycleCommand,
+        InvocationMutationResult,
+        InvocationReleaseResult,
+        RebindInvocationCommand,
+        RejectInvocationCommand,
+        ReleaseInvocationCommand,
+        SettleInvocationCommand,
+    )
+    from cayu.runtime.execution_profiles import ExecutionProfileRejectionResult
+    from cayu.runtime.sessions import InteractionTransitionResult
 
 from cayu._validation import copy_durable_json_object
 from cayu.runtime.checkpoints import (
@@ -12,6 +27,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
     validate_runtime_checkpoint_root_projection,
@@ -26,9 +42,12 @@ from cayu.runtime.sessions import (
     RuntimePublicationRequest,
     Session,
     SessionInvocationAdmission,
+    SessionOperationInitializer,
     SessionOperationPublication,
     SessionStore,
     _apply_runtime_publication_checkpoint_mutation,
+    _copy_checkpoint_for_transform,
+    _invocation_lifecycle_authority_read_scope,
     _replace_checkpoint_preserving_completion_result_event_publications,
     _runtime_publication_checkpoint_codec_scope,
     runtime_publication_checkpoint_value_digest,
@@ -64,25 +83,37 @@ def _versioned_checkpoint_transform(
         checkpoint: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         decoded = None
+        callback_checkpoint = None
         transformed = None
         try:
+            if session.id != session_id:
+                raise RuntimeError("Checkpoint transform received another session's authority.")
             decoded = decode_runtime_checkpoint(checkpoint, session_id=session_id)
-            transformed = checkpoint_transform(session, decoded)
+            callback_checkpoint = _copy_checkpoint_for_transform(
+                decoded,
+                session_id=session_id,
+            )
+            transformed = checkpoint_transform(session, callback_checkpoint)
             if transformed is None:
                 if stamp_empty:
-                    return {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
-                return decoded if stamp_noop and checkpoint is not None else None
+                    transformed = {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
+                elif stamp_noop and checkpoint is not None:
+                    transformed = decoded
+                else:
+                    return None
             result = decode_runtime_checkpoint(transformed, session_id=session_id)
-            if preserve_completion_result_publications:
-                return _replace_checkpoint_preserving_completion_result_event_publications(
-                    checkpoint,
-                    {} if result is None else result,
-                )
-            return result
+            return _replace_checkpoint_preserving_completion_result_event_publications(
+                decoded,
+                {} if result is None else result,
+                preserve_completion_result_publications=(preserve_completion_result_publications),
+                session_id=session_id,
+            )
         except BaseException:
             checkpoint = None
             if decoded is not None:
                 decoded.clear()
+            if callback_checkpoint is not None:
+                callback_checkpoint.clear()
             if transformed is not None:
                 transformed.clear()
             raise
@@ -113,11 +144,18 @@ def _versioned_operation_transform(
         operation_record: dict[str, Any] | None,
     ) -> SessionOperationPublication:
         decoded = None
+        callback_checkpoint = None
         publication = None
         versioned = None
         try:
+            if session.id != session_id:
+                raise RuntimeError("Session operation received another session's authority.")
             decoded = decode_runtime_checkpoint(checkpoint, session_id=session_id)
-            publication = operation_transform(session, decoded, operation_record)
+            callback_checkpoint = _copy_checkpoint_for_transform(
+                decoded,
+                session_id=session_id,
+            )
+            publication = operation_transform(session, callback_checkpoint, operation_record)
             if type(publication) is not SessionOperationPublication:
                 raise TypeError(
                     "Session operation transform must return a SessionOperationPublication."
@@ -131,6 +169,7 @@ def _versioned_operation_transform(
             versioned = _replace_checkpoint_preserving_completion_result_event_publications(
                 checkpoint,
                 versioned,
+                session_id=session_id,
             )
             return SessionOperationPublication(
                 checkpoint=versioned,
@@ -141,6 +180,8 @@ def _versioned_operation_transform(
             checkpoint = None
             if decoded is not None:
                 decoded.clear()
+            if callback_checkpoint is not None:
+                callback_checkpoint.clear()
             if publication is not None:
                 publication.checkpoint.clear()
             if versioned is not None:
@@ -181,6 +222,52 @@ class _RuntimeCheckpointSessionStore:
         )
         return callable(checker) and checker() is True
 
+    @overload
+    async def apply_invocation_lifecycle_command(
+        self,
+        command: CreateInvocationCommand | AdmitInvocationCommand | RebindInvocationCommand,
+    ) -> InvocationMutationResult: ...
+
+    @overload
+    async def apply_invocation_lifecycle_command(
+        self,
+        command: RejectInvocationCommand,
+    ) -> ExecutionProfileRejectionResult: ...
+
+    @overload
+    async def apply_invocation_lifecycle_command(
+        self,
+        command: SettleInvocationCommand,
+    ) -> InteractionTransitionResult: ...
+
+    @overload
+    async def apply_invocation_lifecycle_command(
+        self,
+        command: ReleaseInvocationCommand,
+    ) -> InvocationReleaseResult: ...
+
+    async def apply_invocation_lifecycle_command(
+        self,
+        command: object,
+    ) -> object:
+        """Apply lifecycle commands without bypassing the root checkpoint codec."""
+
+        checker = getattr(
+            self._store,
+            "_supports_invocation_lifecycle_command_protocol",
+            None,
+        )
+        if not callable(checker) or checker() is not True:
+            raise NotImplementedError(
+                "This SessionStore does not support invocation lifecycle command version 1."
+            )
+        from cayu.runtime._invocation_lifecycle import apply_invocation_lifecycle_command
+
+        return await apply_invocation_lifecycle_command(
+            cast("SessionStore", self),
+            cast("InvocationLifecycleCommand", command),
+        )
+
     async def create(
         self,
         request: Any,
@@ -189,21 +276,52 @@ class _RuntimeCheckpointSessionStore:
         interaction_started_event: Any = None,
         interaction_source_messages: Any = None,
         checkpoint_transform: CheckpointTransform | None = None,
-        operation_initializer: Any = None,
+        result_checkpoint_transform: CheckpointTransform | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
+        versioned_result_transform = None
+        if result_checkpoint_transform is not None:
+
+            def transform_result_checkpoint(
+                session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any] | None:
+                return _versioned_checkpoint_transform(
+                    session.id,
+                    result_checkpoint_transform,
+                )(session, checkpoint)
+
+            versioned_result_transform = transform_result_checkpoint
         if checkpoint_transform is None:
             if operation_initializer is None:
+                if versioned_result_transform is None:
+                    return await self._store.create(
+                        request,
+                        identity=identity,
+                        interaction_started_event=interaction_started_event,
+                        interaction_source_messages=interaction_source_messages,
+                    )
                 return await self._store.create(
                     request,
                     identity=identity,
                     interaction_started_event=interaction_started_event,
                     interaction_source_messages=interaction_source_messages,
+                    result_checkpoint_transform=versioned_result_transform,
+                )
+            if versioned_result_transform is None:
+                return await self._store.create(
+                    request,
+                    identity=identity,
+                    interaction_started_event=interaction_started_event,
+                    interaction_source_messages=interaction_source_messages,
+                    operation_initializer=operation_initializer,
                 )
             return await self._store.create(
                 request,
                 identity=identity,
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=interaction_source_messages,
+                result_checkpoint_transform=versioned_result_transform,
                 operation_initializer=operation_initializer,
             )
 
@@ -217,12 +335,30 @@ class _RuntimeCheckpointSessionStore:
             )(session, checkpoint)
 
         if operation_initializer is None:
+            if versioned_result_transform is None:
+                return await self._store.create(
+                    request,
+                    identity=identity,
+                    interaction_started_event=interaction_started_event,
+                    interaction_source_messages=interaction_source_messages,
+                    checkpoint_transform=transform_initial_checkpoint,
+                )
             return await self._store.create(
                 request,
                 identity=identity,
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=interaction_source_messages,
                 checkpoint_transform=transform_initial_checkpoint,
+                result_checkpoint_transform=versioned_result_transform,
+            )
+        if versioned_result_transform is None:
+            return await self._store.create(
+                request,
+                identity=identity,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=interaction_source_messages,
+                checkpoint_transform=transform_initial_checkpoint,
+                operation_initializer=operation_initializer,
             )
         return await self._store.create(
             request,
@@ -230,6 +366,7 @@ class _RuntimeCheckpointSessionStore:
             interaction_started_event=interaction_started_event,
             interaction_source_messages=interaction_source_messages,
             checkpoint_transform=transform_initial_checkpoint,
+            result_checkpoint_transform=versioned_result_transform,
             operation_initializer=operation_initializer,
         )
 
@@ -240,6 +377,46 @@ class _RuntimeCheckpointSessionStore:
         except BaseException:
             checkpoint = None
             raise
+
+    async def load_session_checkpoint_snapshot(
+        self,
+        session_id: str,
+    ) -> tuple[Session, dict[str, Any] | None]:
+        """Atomically read runtime authority, writing only an actual schema migration."""
+
+        checker = getattr(
+            self._store,
+            "_supports_invocation_lifecycle_command_protocol",
+            None,
+        )
+        if not callable(checker) or checker() is not True:
+            raise NotImplementedError(
+                "This SessionStore does not support invocation lifecycle command version 1."
+            )
+
+        snapshot: tuple[Session, dict[str, Any] | None] | None = None
+
+        def capture_snapshot(
+            session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal snapshot
+            if session.id != session_id:
+                raise RuntimeError("Checkpoint snapshot received another session's authority.")
+            decoded = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+            snapshot = (
+                session.model_copy(deep=True),
+                (None if decoded is None else copy_durable_json_object(decoded, "checkpoint")),
+            )
+            if decoded == checkpoint:
+                return None
+            return decoded
+
+        with _invocation_lifecycle_authority_read_scope():
+            await self._store.transform_checkpoint(session_id, capture_snapshot)
+        if snapshot is None:
+            raise RuntimeError("Runtime checkpoint snapshot was not produced.")
+        return snapshot
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         checkpoint = None
@@ -257,6 +434,7 @@ class _RuntimeCheckpointSessionStore:
                 return _replace_checkpoint_preserving_completion_result_event_publications(
                     current,
                     encoded_checkpoint,
+                    session_id=session_id,
                 )
 
             await self._store.transform_checkpoint(session_id, replace_checkpoint)
@@ -286,6 +464,7 @@ class _RuntimeCheckpointSessionStore:
         session_id: str,
         *,
         checkpoint_transform: CheckpointTransform,
+        result_checkpoint_transform: CheckpointTransform | None = None,
         **kwargs: Any,
     ) -> Session:
         return await self._store.transition_status_and_checkpoint(
@@ -295,6 +474,10 @@ class _RuntimeCheckpointSessionStore:
                 checkpoint_transform,
                 preserve_completion_result_publications=True,
             ),
+            result_checkpoint_transform=_optional_versioned_checkpoint_transform(
+                session_id,
+                result_checkpoint_transform,
+            ),
             **kwargs,
         )
 
@@ -303,6 +486,7 @@ class _RuntimeCheckpointSessionStore:
         session_id: str,
         *,
         checkpoint_transform: CheckpointTransform,
+        result_checkpoint_transform: CheckpointTransform | None = None,
         execution_profile: ExecutionProfileIdentity,
         **kwargs: Any,
     ) -> Session:
@@ -312,6 +496,10 @@ class _RuntimeCheckpointSessionStore:
                 session_id,
                 checkpoint_transform,
                 preserve_completion_result_publications=True,
+            ),
+            result_checkpoint_transform=_optional_versioned_checkpoint_transform(
+                session_id,
+                result_checkpoint_transform,
             ),
             execution_profile=execution_profile,
             **kwargs,
@@ -332,6 +520,10 @@ class _RuntimeCheckpointSessionStore:
                     admission.checkpoint_transform,
                     stamp_empty=True,
                     preserve_completion_result_publications=True,
+                ),
+                result_checkpoint_transform=_optional_versioned_checkpoint_transform(
+                    session_id,
+                    admission.result_checkpoint_transform,
                 ),
             ),
         )
@@ -423,6 +615,7 @@ class _RuntimeCheckpointSessionStore:
         session_id: str,
         *,
         checkpoint_transform: CheckpointTransform,
+        result_checkpoint_transform: CheckpointTransform | None = None,
         **kwargs: Any,
     ) -> Session:
         return await self._store.fence_run_and_transform_checkpoint(
@@ -431,6 +624,10 @@ class _RuntimeCheckpointSessionStore:
                 session_id,
                 checkpoint_transform,
                 preserve_completion_result_publications=True,
+            ),
+            result_checkpoint_transform=_optional_versioned_checkpoint_transform(
+                session_id,
+                result_checkpoint_transform,
             ),
             **kwargs,
         )
@@ -537,20 +734,42 @@ class _RuntimeCheckpointSessionStore:
         self,
         request: RuntimePublicationRequest,
     ) -> RuntimePublicationRequest:
+        schema_operations = tuple(
+            operation
+            for operation in request.mutation.operations
+            if operation.key == CHECKPOINT_SCHEMA_VERSION_KEY
+        )
+        if schema_operations:
+            if request.kind != "workspace-observation":
+                raise ValueError(
+                    "Only workspace-observation publications may carry a root checkpoint "
+                    "schema stamp."
+                )
+            if len(schema_operations) != 1:
+                raise ValueError("Runtime publication carries duplicate schema operations.")
+            schema_operation = schema_operations[0]
+            supported_schema_digests = {
+                runtime_publication_checkpoint_value_digest(version)
+                for version in range(1, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1)
+            }
+            if (
+                schema_operation.action != "set"
+                or schema_operation.value != CURRENT_CHECKPOINT_SCHEMA_VERSION
+                or schema_operation.expected_value_digest not in supported_schema_digests | {None}
+            ):
+                raise ValueError(
+                    "Runtime publication carries an invalid root checkpoint schema stamp."
+                )
         if any(
-            operation.key == CHECKPOINT_SCHEMA_VERSION_KEY
+            operation.key
+            in {
+                ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            }
             for operation in request.mutation.operations
         ):
             raise ValueError(
-                "Runtime publication callers cannot mutate the root checkpoint schema version."
-            )
-        if any(
-            operation.key == ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
-            for operation in request.mutation.operations
-        ):
-            raise ValueError(
-                "Runtime publication callers cannot mutate active invocation "
-                "execution-profile authority."
+                "Runtime publication callers cannot mutate active invocation lifecycle authority."
             )
         if any(
             operation.key == COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY
@@ -560,6 +779,8 @@ class _RuntimeCheckpointSessionStore:
                 "Runtime publication callers cannot mutate completion-result event "
                 "publication authority."
             )
+        if schema_operations:
+            return request
         schema_operation = RuntimePublicationCheckpointOperation(
             key=CHECKPOINT_SCHEMA_VERSION_KEY,
             expected_value_digest=runtime_publication_checkpoint_value_digest(
@@ -636,6 +857,7 @@ class _RuntimeCheckpointSessionStore:
 
         writer_checkpoint = raw_checkpoint
         preserved_active_profile: dict[str, Any] | None = None
+        preserved_lifecycle_receipt: dict[str, Any] | None = None
         if writer_version != CURRENT_CHECKPOINT_SCHEMA_VERSION and raw_checkpoint is not None:
             current_checkpoint = decode_runtime_checkpoint(
                 raw_checkpoint,
@@ -661,6 +883,31 @@ class _RuntimeCheckpointSessionStore:
                     writer_checkpoint.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY),
                     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
                 )
+            if (
+                current_checkpoint is not None
+                and INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in current_checkpoint
+            ):
+                if any(
+                    operation.key == INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY
+                    for operation in mutation.operations
+                ):
+                    raise ValueError(
+                        "An older runtime publication cannot mutate invocation lifecycle "
+                        "receipt authority."
+                    )
+                if writer_checkpoint is raw_checkpoint:
+                    writer_checkpoint = copy_durable_json_object(
+                        current_checkpoint,
+                        "checkpoint",
+                    )
+                if writer_checkpoint is None:
+                    raise RuntimeError(
+                        "A versioned checkpoint writer lost current lifecycle authority."
+                    )
+                preserved_lifecycle_receipt = copy_durable_json_object(
+                    writer_checkpoint.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY),
+                    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+                )
 
         source_checkpoint = runtime_checkpoint_writer_view(
             writer_checkpoint,
@@ -668,8 +915,30 @@ class _RuntimeCheckpointSessionStore:
             session_id=session.id,
         )
 
+        applied_mutation = mutation
+        if raw_checkpoint is None:
+            applied_operations = tuple(
+                (
+                    RuntimePublicationCheckpointOperation(
+                        key=operation.key,
+                        expected_value_digest=runtime_publication_checkpoint_value_digest(
+                            CURRENT_CHECKPOINT_SCHEMA_VERSION
+                        ),
+                        action=operation.action,
+                        value=operation.value,
+                    )
+                    if operation.key == CHECKPOINT_SCHEMA_VERSION_KEY
+                    and operation.expected_value_digest is None
+                    and operation.action == "set"
+                    and operation.value == CURRENT_CHECKPOINT_SCHEMA_VERSION
+                    else operation
+                )
+                for operation in mutation.operations
+            )
+            applied_mutation = RuntimePublicationMutation(operations=applied_operations)
+
         target_checkpoint = _apply_runtime_publication_checkpoint_mutation(
-            mutation,
+            applied_mutation,
             source_checkpoint,
         )
         decoded_target = decode_runtime_checkpoint(target_checkpoint, session_id=session.id)
@@ -681,6 +950,15 @@ class _RuntimeCheckpointSessionStore:
                 )
             decoded_target[ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY] = (
                 preserved_active_profile
+            )
+        if preserved_lifecycle_receipt is not None:
+            if decoded_target is None:
+                raise ValueError(
+                    "An older runtime publication cannot remove invocation lifecycle "
+                    "receipt authority."
+                )
+            decoded_target[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = (
+                preserved_lifecycle_receipt
             )
         return decoded_target
 
@@ -767,3 +1045,14 @@ def runtime_checkpoint_session_store(
         "SessionStore",
         _RuntimeCheckpointSessionStore(store),
     )
+
+
+async def load_runtime_session_checkpoint_snapshot(
+    store: SessionStore,
+    session_id: str,
+) -> tuple[Session, dict[str, Any] | None]:
+    """Load one atomic runtime-only session/checkpoint authority snapshot."""
+
+    if not isinstance(store, _RuntimeCheckpointSessionStore):
+        raise TypeError("Runtime checkpoint snapshots require the private store adapter.")
+    return await store.load_session_checkpoint_snapshot(session_id)

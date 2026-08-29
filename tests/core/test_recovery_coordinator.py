@@ -423,6 +423,8 @@ def test_recovery_cancellation_generation_ignores_handled_prior_cancel() -> None
 
 def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> None:
     class PausingClaimStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.first_claim_ready = asyncio.Event()
@@ -435,11 +437,13 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
             *,
             statuses: set[SessionStatus],
             checkpoint_transform: CheckpointTransform,
+            **kwargs,
         ) -> Session:
             fenced = await super().fence_run_and_transform_checkpoint(
                 session_id,
                 statuses=statuses,
                 checkpoint_transform=checkpoint_transform,
+                **kwargs,
             )
             if not self.first_claim_paused:
                 self.first_claim_paused = True
@@ -537,6 +541,8 @@ def test_initial_incomplete_recovery_claim_cannot_fence_replacement_owner() -> N
 
 def test_initial_incomplete_recovery_reconciles_ambiguous_atomic_claim() -> None:
     class CommitThenRaiseClaimStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_claim_acknowledgement = True
@@ -547,11 +553,13 @@ def test_initial_incomplete_recovery_reconciles_ambiguous_atomic_claim() -> None
             *,
             statuses: set[SessionStatus],
             checkpoint_transform: CheckpointTransform,
+            **kwargs,
         ) -> Session:
             fenced = await super().fence_run_and_transform_checkpoint(
                 session_id,
                 statuses=statuses,
                 checkpoint_transform=checkpoint_transform,
+                **kwargs,
             )
             if self.lose_claim_acknowledgement:
                 self.lose_claim_acknowledgement = False

@@ -1174,6 +1174,8 @@ def test_store_rejects_malformed_structured_output_auxiliary_publications(
 
 
 class _LostPublicationAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.request_identities: list[int] = []
@@ -1199,6 +1201,8 @@ class _ProviderControlledExceptionGroup(BaseExceptionGroup):
 
 
 class _CommitThenProviderControlledGroupStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
@@ -1322,6 +1326,8 @@ def test_ambiguous_acknowledgement_reuses_exact_prepared_request() -> None:
 
 
 class _CommitThenBlockStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.committed = asyncio.Event()
@@ -1449,6 +1455,8 @@ def test_exact_replay_preserves_repeated_real_caller_cancellation() -> None:
 
 
 class _BlockBeforeCommitStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.publication_started = asyncio.Event()
@@ -1521,6 +1529,8 @@ def test_cancel_before_commit_defers_cancellation_through_exactly_one_commit() -
 
 
 class _AuxiliaryPublicationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0

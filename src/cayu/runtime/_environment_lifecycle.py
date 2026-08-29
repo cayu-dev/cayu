@@ -116,6 +116,17 @@ from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._invocation_lifecycle import (
+    InvocationContext,
+    ReleaseInvocationCommand,
+    _release_invocation_command_with_cleanup_authority,
+    invocation_lifecycle_receipt_history_present,
+)
+from cayu.runtime._terminal_evidence import (
+    TERMINAL_EVIDENCE_EVENT_TYPES,
+    TERMINAL_EVIDENCE_QUERY_LIMIT,
+    classify_current_terminal_evidence,
+)
 from cayu.runtime.egress_authority_transitions import (
     _EGRESS_AUTHORITY_PARKED_OUTCOME,
     EgressAuthorityAdoptionHandler,
@@ -125,6 +136,7 @@ from cayu.runtime.egress_authority_transitions import (
 )
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
+    active_invocation_execution_profile_from_checkpoint,
     event_with_execution_profile_authority,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
@@ -133,9 +145,14 @@ from cayu.runtime.sessions import (
     EventOrder,
     EventQuery,
     Session,
+    SessionRunFenced,
+    SessionStatus,
     SessionStore,
+    _current_session_invocation_settlement_transition,
+    _current_session_invocation_terminal_event,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
+    _session_run_operation_from_checkpoint,
     session_user_metadata,
 )
 from cayu.runtime.workspace_observation_recovery import (
@@ -271,6 +288,7 @@ class _EnvironmentCleanupSettlementOutcome:
 class _ActiveEnvironmentSetup:
     registered_environment: runtime_records.RegisteredEnvironment
     execution_profile: ExecutionProfileIdentity | None = None
+    invocation_context: InvocationContext | None = field(default=None, repr=False)
     cleanup_started: bool = False
     cleanup_finished: bool = False
     prebind_release_tombstone: bool = False
@@ -300,6 +318,56 @@ def _retain_cleanup_execution_profile(
         return
     if owner.execution_profile != execution_profile:
         raise RuntimeError("Environment cleanup owner execution profile changed.")
+
+
+def _retain_cleanup_invocation_context(
+    owner: _ActiveEnvironmentSetup,
+    invocation_context: InvocationContext | None,
+) -> None:
+    if invocation_context is None:
+        return
+    if type(invocation_context) is not InvocationContext:
+        raise TypeError("invocation_context must be an InvocationContext.")
+    current = owner.invocation_context
+    if current is invocation_context:
+        return
+    if current is not None and (
+        current.active_profile != invocation_context.active_profile
+        or current.binding != invocation_context.binding
+        or current.profile is not invocation_context.profile
+        or current.registered_agent is not invocation_context.registered_agent
+        or current.registered_provider is not invocation_context.registered_provider
+        or current.runtime_hooks is not invocation_context.runtime_hooks
+        or current.loop_policies is not invocation_context.loop_policies
+        or current.request_loop_policies is not invocation_context.request_loop_policies
+        or current.budget_policy is not invocation_context.budget_policy
+        or current.tool_capability_ceiling != invocation_context.tool_capability_ceiling
+        or current.targeted_tool_grants != invocation_context.targeted_tool_grants
+    ):
+        raise RuntimeError("Environment cleanup owner invocation context changed.")
+    if current is not None:
+        if current.registered_environment is not owner.registered_environment:
+            raise RuntimeError("Environment cleanup owner lost its retained environment context.")
+        if invocation_context.registered_environment is owner.registered_environment:
+            owner.invocation_context = invocation_context
+        return
+    if invocation_context.registered_environment is not owner.registered_environment:
+        raise RuntimeError("Environment cleanup context does not own the retained environment.")
+    owner.invocation_context = invocation_context
+
+
+def _advance_cleanup_environment(
+    owner: _ActiveEnvironmentSetup,
+    registered_environment: runtime_records.RegisteredEnvironment,
+) -> None:
+    context = owner.invocation_context
+    if context is not None:
+        context = context.with_registered_environment(
+            registered_environment,
+            validated_profile=context.profile,
+        )
+    owner.registered_environment = registered_environment
+    owner.invocation_context = context
 
 
 class EnvironmentLifecycle:
@@ -448,12 +516,34 @@ class EnvironmentLifecycle:
         *,
         session_id: str,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> None:
         """Release one invocation epoch only after retained cleanup is quiescent."""
 
+        if invocation_context is not None:
+            if type(invocation_context) is not InvocationContext:
+                raise TypeError("invocation_context must be an InvocationContext.")
+            if invocation_context.binding.session_id != session_id:
+                raise ValueError("Cleanup context belongs to another session.")
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise ValueError("Cleanup execution profile conflicts with its context.")
+            execution_profile = invocation_context.profile
+
         run_epoch = _current_session_run_epoch(session_id)
+        if invocation_context is not None:
+            context_run_epoch = invocation_context.binding.run_epoch
+            # Recovery and retained cleanup can execute while a successor epoch
+            # is task-locally active. The frozen context, not that ambient
+            # token, is the exact authority for the cleanup being settled.
+            # _release_quiescent_invocation_fence separately refuses to mutate
+            # a positively newer durable epoch.
+            run_epoch = context_run_epoch
         if run_epoch is None:
             raise RuntimeError("Environment cleanup has no active session run-fence epoch.")
+        terminal_event = _current_session_invocation_terminal_event(session_id)
         key = (session_id, run_epoch)
         tasks = getattr(self, "_deferred_run_fence_release_tasks", None)
         if tasks is None:
@@ -471,6 +561,7 @@ class EnvironmentLifecycle:
         setup_owner = self._active_environment_setups.get(session_id)
         if setup_owner is not None:
             _retain_cleanup_execution_profile(setup_owner, execution_profile)
+            _retain_cleanup_invocation_context(setup_owner, invocation_context)
         if session_id in self._deferred_factory_cleanup_tasks:
             self._retain_deferred_factory_cleanup_execution_profile(
                 session_id,
@@ -483,7 +574,11 @@ class EnvironmentLifecycle:
             _deactivate_session_run_fence(session_id)
             return
         if not self._has_retained_environment_cleanup(session_id):
-            await self._session_store.release_run_fence(session_id)
+            await self._release_quiescent_invocation_fence(
+                session_id,
+                invocation_context=invocation_context,
+                terminal_event=terminal_event,
+            )
             return
         state_changed = asyncio.Event()
         events[key] = state_changed
@@ -494,7 +589,11 @@ class EnvironmentLifecycle:
                 if not self._has_retained_environment_cleanup(session_id):
                     break
                 await state_changed.wait()
-            await self._session_store.release_run_fence(session_id)
+            await self._release_quiescent_invocation_fence(
+                session_id,
+                invocation_context=invocation_context,
+                terminal_event=terminal_event,
+            )
 
         task = asyncio.create_task(
             release_when_quiescent(),
@@ -511,6 +610,130 @@ class EnvironmentLifecycle:
                 completed,
             )
         )
+
+    async def _release_quiescent_invocation_fence(
+        self,
+        session_id: str,
+        *,
+        invocation_context: InvocationContext | None,
+        terminal_event: Event | None,
+    ) -> None:
+        """Release active invocation authority only after exact terminal settlement."""
+
+        session = await self._session_store.load(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_profile is None:
+            if invocation_lifecycle_receipt_history_present(checkpoint):
+                raise RuntimeError("Environment cleanup lost durable invocation profile authority.")
+            await self._session_store.release_run_fence(session_id)
+            return
+        stale_invocation = False
+        if invocation_context is not None:
+            if invocation_context.binding.session_instance_id != session.instance_id:
+                raise RuntimeError("Cleanup context lost exact session-incarnation authority.")
+            if session.run_epoch < invocation_context.binding.run_epoch:
+                raise RuntimeError("Cleanup context is ahead of durable invocation authority.")
+            stale_invocation = session.run_epoch > invocation_context.binding.run_epoch
+            if not stale_invocation and invocation_context.active_profile != active_profile:
+                raise RuntimeError("Cleanup context lost exact active invocation authority.")
+            if stale_invocation:
+                # A positively newer session epoch owns every subsequent
+                # cleanup decision. Even if an invalid/custom transition left
+                # the older profile projection in place, the stale finalizer
+                # must not inspect settlement receipts or release authority on
+                # the successor's behalf.
+                return
+        transition = _current_session_invocation_settlement_transition(session_id)
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        # Prefer exact terminal evidence for the current durable status. An
+        # older invocation's settlement receipt can legitimately remain after
+        # a later run reaches its own terminal state; consulting that stale
+        # receipt first would misclassify positive current evidence as an
+        # authority conflict.
+        if transition is None and terminal_event is None and run_operation is not None:
+            if run_operation.run_epoch != active_profile.run_epoch:
+                raise RuntimeError(
+                    "Invocation cleanup run operation conflicts with active authority."
+                )
+            expected_terminal_type = {
+                SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+                SessionStatus.FAILED: EventType.SESSION_FAILED,
+                SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+            }.get(session.status)
+            if expected_terminal_type is not None:
+                evidence_records = await self._session_store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_types=TERMINAL_EVIDENCE_EVENT_TYPES,
+                        order_by=EventOrder.SEQUENCE_DESC,
+                        limit=TERMINAL_EVIDENCE_QUERY_LIMIT,
+                    )
+                )
+                durable_evidence = classify_current_terminal_evidence(
+                    evidence_events=tuple(record.event for record in evidence_records),
+                    expected_event_type=expected_terminal_type,
+                    run_operation_id=run_operation.operation_id,
+                    interruption_request_id=None,
+                )
+                if len(durable_evidence.events) > 1:
+                    raise RuntimeError(
+                        "Invocation cleanup found conflicting durable terminal evidence."
+                    )
+                if durable_evidence.events:
+                    terminal_event = durable_evidence.events[0]
+        if transition is None and terminal_event is None:
+            try:
+                transition = await self._session_store.load_invocation_settlement_transition(
+                    session_id,
+                    expected_session_instance_id=session.instance_id,
+                    expected_active_invocation_profile=active_profile,
+                )
+            except SessionRunFenced:
+                # A receipt from an older invocation is not settlement proof
+                # for this run. Retain the current fence and preserve the
+                # process-control or primary failure that initiated cleanup.
+                return
+        use_terminal_event = terminal_event is not None and (
+            transition is None or transition.to_status is not session.status
+        )
+        if transition is None and not use_terminal_event:
+            if stale_invocation:
+                # A newer epoch won before this owner durably settled. Preserve
+                # the original run-fence failure and leave successor cleanup to
+                # that epoch's exact owner.
+                return
+            # A process-loss signal can unwind this in-process owner without a
+            # terminal publication even though a recoverable provider/tool
+            # operation remains durable. Absence of settlement is authority to
+            # retain the fence, not authority to replace the primary signal
+            # with a cleanup error. Recovery must reconstruct and rebind the
+            # invocation before it can release this epoch.
+            return
+        command_fields: dict[str, Any]
+        if use_terminal_event:
+            assert terminal_event is not None
+            command_fields = {"terminal_session_event": terminal_event}
+        else:
+            assert transition is not None
+            command_fields = {"settlement_transition": transition}
+        command = _release_invocation_command_with_cleanup_authority(
+            ReleaseInvocationCommand(
+                session_id=session.id,
+                expected_session_instance_id=session.instance_id,
+                expected_run_epoch=active_profile.run_epoch,
+                expected_active_profile=active_profile,
+                **command_fields,
+            )
+        )
+        try:
+            await self._session_store.apply_invocation_lifecycle_command(command)
+        except SessionRunFenced:
+            if stale_invocation:
+                return
+            raise
 
     def _reserve_environment_owner_admission(self, session_id: str) -> None:
         if (
@@ -584,6 +807,8 @@ class EnvironmentLifecycle:
                     session_id=session_id,
                     original_error=None,
                     allow_deferred_settlement=True,
+                    execution_profile=expected_owner.execution_profile,
+                    invocation_context=expected_owner.invocation_context,
                 )
             except asyncio.CancelledError as error:
                 task = asyncio.current_task()
@@ -830,9 +1055,17 @@ class EnvironmentLifecycle:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> Event | None:
         """Persist the factory acceptance boundary before provisioning begins."""
 
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError("Environment factory start lost frozen invocation authority.")
         if registered_environment is not None:
             await registered_environment.workspace_mutation_fence.wait_until_available()
         await self._settle_retained_environment_cleanups()
@@ -870,8 +1103,16 @@ class EnvironmentLifecycle:
         started_event: Event | None,
         operation: EnvironmentFactoryOperation,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         adopted_factory_result: EnvironmentFactoryResult | None = None,
     ) -> EnvironmentFactoryResolutionResult:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError("Environment factory resolution lost frozen invocation authority.")
         if registered_environment is None or registered_environment.factory is None:
             if started_event is not None:
                 raise AssertionError("Factory start event exists without a registered factory.")
@@ -1160,6 +1401,8 @@ class EnvironmentLifecycle:
                         allocation_receipt,
                     )
                 ),
+                registration_source=registered_environment.registration_source,
+                registration_symbol=registered_environment.registration_symbol,
                 workspace_mutation_fence=(
                     registered_environment.workspace_mutation_fence.child_fence()
                 ),
@@ -1169,6 +1412,14 @@ class EnvironmentLifecycle:
                 _ActiveEnvironmentSetup(
                     registered_environment=resolved_environment,
                     execution_profile=execution_profile,
+                    invocation_context=(
+                        None
+                        if invocation_context is None
+                        else invocation_context.with_registered_environment(
+                            resolved_environment,
+                            validated_profile=invocation_context.profile,
+                        )
+                    ),
                 ),
             )
         except BaseException as exc:
@@ -1356,9 +1607,17 @@ class EnvironmentLifecycle:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> Event | None:
         """Persist the binding acceptance boundary before workspace setup begins."""
 
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError("Environment binding start lost frozen invocation authority.")
         await self._settle_retained_environment_cleanups()
         self._require_no_retained_cleanup_for_session(session.id)
         if (
@@ -1489,7 +1748,15 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         started_event: Event | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> EnvironmentBindingResult:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError("Environment binding lost frozen invocation authority.")
         if registered_environment is None:
             if started_event is not None:
                 raise AssertionError("Binding start event exists without an environment.")
@@ -1516,13 +1783,17 @@ class EnvironmentLifecycle:
                     events=[],
                     error=exc,
                 )
-            adopted_environment = replace(
-                registered_environment,
-                unclaimed_factory_result=None,
+            adopted_environment = (
+                registered_environment
+                if registered_environment.unclaimed_factory_result is None
+                else replace(
+                    registered_environment,
+                    unclaimed_factory_result=None,
+                )
             )
             setup_owner = self._active_environment_setups.get(session.id)
             if setup_owner is not None:
-                setup_owner.registered_environment = adopted_environment
+                _advance_cleanup_environment(setup_owner, adopted_environment)
             return EnvironmentBindingResult(
                 registered_environment=adopted_environment,
                 events=[],
@@ -1556,9 +1827,13 @@ class EnvironmentLifecycle:
                     events=[],
                     error=exc,
                 )
-            adopted_environment = replace(
-                registered_environment,
-                unclaimed_factory_result=None,
+            adopted_environment = (
+                registered_environment
+                if registered_environment.unclaimed_factory_result is None
+                else replace(
+                    registered_environment,
+                    unclaimed_factory_result=None,
+                )
             )
             self._active_environment_setups.pop(session.id, None)
             return EnvironmentBindingResult(
@@ -1581,10 +1856,12 @@ class EnvironmentLifecycle:
             setup_owner = _ActiveEnvironmentSetup(
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             self._active_environment_setups[session.id] = setup_owner
         else:
             _retain_cleanup_execution_profile(setup_owner, execution_profile)
+            _retain_cleanup_invocation_context(setup_owner, invocation_context)
         self._release_pending_environment_owner_admission(session.id)
         release_failed_binding_reservations: Callable[[], None] | None = None
         try:
@@ -1677,9 +1954,12 @@ class EnvironmentLifecycle:
                     # reuse its stale pre-bind factory result. The deferred
                     # task remains the mutation owner, while both records share
                     # one session identity for admission accounting.
-                    setup_owner.registered_environment = replace(
-                        registered_environment,
-                        unclaimed_factory_result=None,
+                    _advance_cleanup_environment(
+                        setup_owner,
+                        replace(
+                            registered_environment,
+                            unclaimed_factory_result=None,
+                        ),
                     )
                     setup_owner.cleanup_started = True
                     setup_owner.prebind_release_tombstone = True
@@ -1691,7 +1971,7 @@ class EnvironmentLifecycle:
             # look authoritative and release the same factory result twice.
             setup_owner = self._active_environment_setups.get(session.id)
             if setup_owner is not None:
-                setup_owner.registered_environment = registered_environment
+                _advance_cleanup_environment(setup_owner, registered_environment)
                 setup_owner.cleanup_started = True
                 setup_owner.prebind_release_tombstone = True
             if ordinary_failure:
@@ -1765,6 +2045,8 @@ class EnvironmentLifecycle:
                 registered_environment.unclaimed_factory_result is not None
             ),
             live_allocation_fingerprint=(registered_environment.live_allocation_fingerprint),
+            registration_source=registered_environment.registration_source,
+            registration_symbol=registered_environment.registration_symbol,
             binding_generation_id=registered_environment.binding_generation_id,
             workspace_mutation_fence=(registered_environment.workspace_mutation_fence),
         )
@@ -1772,7 +2054,7 @@ class EnvironmentLifecycle:
         # before publishing it so cancellation or an event-store failure cannot
         # leave cleanup using the stale pre-bound value.
         setup_owner.release_failed_binding_reservations = None
-        setup_owner.registered_environment = bound_registered_environment
+        _advance_cleanup_environment(setup_owner, bound_registered_environment)
         events.append(
             await self._event_writer.emit(
                 _event_with_binding_generation_authority(
@@ -1814,7 +2096,7 @@ class EnvironmentLifecycle:
             bound_registered_environment,
             preserve_factory_allocation=False,
         )
-        setup_owner.registered_environment = adopted_environment
+        _advance_cleanup_environment(setup_owner, adopted_environment)
         return EnvironmentBindingResult(
             registered_environment=adopted_environment,
             events=events,
@@ -1937,10 +2219,25 @@ class EnvironmentLifecycle:
         session: Session,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> EnvironmentBindingFinalizeResult:
+        if invocation_context is not None:
+            if invocation_context.binding.session_id != session.id:
+                raise ValueError("Terminal cleanup context belongs to another session.")
+            if registered_environment is not invocation_context.registered_environment:
+                raise RuntimeError(
+                    "Terminal cleanup substituted the frozen registered environment."
+                )
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise RuntimeError("Terminal cleanup substituted its execution profile.")
+            execution_profile = invocation_context.profile
         setup_owner = self._active_environment_setups.get(session.id)
         if setup_owner is not None:
             _retain_cleanup_execution_profile(setup_owner, execution_profile)
+            _retain_cleanup_invocation_context(setup_owner, invocation_context)
         if session.id in self._deferred_factory_cleanup_tasks:
             self._retain_deferred_factory_cleanup_execution_profile(
                 session.id,
@@ -2475,15 +2772,29 @@ class EnvironmentLifecycle:
         original_error: BaseException | None,
         allow_deferred_settlement: bool = False,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> None:
         """Release a live setup when no terminal event can own its cleanup."""
 
+        setup_owner = self._active_environment_setups.get(session_id)
+        if invocation_context is None and setup_owner is not None:
+            invocation_context = setup_owner.invocation_context
+        if invocation_context is not None:
+            if invocation_context.binding.session_id != session_id:
+                raise ValueError("Environment abort context belongs to another session.")
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise RuntimeError("Environment abort substituted its execution profile.")
+            execution_profile = invocation_context.profile
         try:
             await self._abort_environment_setup_once(
                 session_id=session_id,
                 original_error=original_error,
                 allow_deferred_settlement=allow_deferred_settlement,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
         finally:
             self._signal_environment_cleanup_state_changed(session_id)
@@ -2495,6 +2806,7 @@ class EnvironmentLifecycle:
         original_error: BaseException | None,
         allow_deferred_settlement: bool = False,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> None:
         """Perform one exact-owner setup cleanup attempt."""
 
@@ -2511,6 +2823,7 @@ class EnvironmentLifecycle:
                 self._release_pending_environment_owner_admission(session_id)
             return
         _retain_cleanup_execution_profile(setup_owner, execution_profile)
+        _retain_cleanup_invocation_context(setup_owner, invocation_context)
         if setup_owner.cleanup_started and not setup_owner.cleanup_finished:
             return
         if setup_owner.cleanup_settlement_started:

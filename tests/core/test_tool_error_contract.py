@@ -79,6 +79,8 @@ class _OperationalValueErrorRuntime:
 
 
 class _OperationalValueErrorSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def load(self, session_id):
         del session_id
         raise ValueError("session load failed")

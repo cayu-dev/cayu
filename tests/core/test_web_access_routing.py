@@ -131,6 +131,8 @@ class _RaisingFetchAdapter(_FetchAdapter):
 
 
 class _CrashAfterStagedWebTerminalStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crashed = False

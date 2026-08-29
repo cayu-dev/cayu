@@ -17,7 +17,10 @@ from examples.webbridge.daily_check import (
     register_daily_checker,
 )
 from examples.webbridge.research import browse_extract_verify
-from tests.core._execution_profile_fixtures import create_admitted_session
+from tests.core._execution_profile_fixtures import (
+    create_admitted_session,
+    interrupt_and_release_test_invocation,
+)
 
 from cayu import (
     CayuApp,
@@ -631,10 +634,9 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
             ),
             worker_id="daily-worker-a",
         )
-        await first_sessions.transition_status(
+        await interrupt_and_release_test_invocation(
+            first_sessions,
             admitted.session.id,
-            from_statuses={SessionStatus.RUNNING},
-            to_status=SessionStatus.INTERRUPTED,
         )
         released = await first_tasks.release_attached_task_worker(
             created.id,

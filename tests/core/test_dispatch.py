@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr
 from tests.core._execution_profile_fixtures import (
+    admit_test_invocation,
     checkpoint_with_rebound_test_invocation_profile,
     runtime_interaction_started_event,
 )
@@ -31,6 +32,11 @@ from cayu.core import (
     ToolResult,
     ToolSpec,
 )
+from cayu.core.events import (
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -38,7 +44,10 @@ from cayu.runtime import (
     DispatchRequest,
     DispatchStatus,
     EventQuery,
+    ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
     ExecutionProfilePolicy,
     ExecutionProfilePolicyAction,
     ExecutionProfilePolicyRequest,
@@ -51,6 +60,8 @@ from cayu.runtime import (
     InvocationOriginTrust,
     ModelTarget,
     NativeStructuredOutputUnsupported,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     RuntimeHook,
@@ -59,6 +70,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionInvocation,
     SessionInvocationBinding,
+    SessionModelTransition,
     SessionStatus,
     SessionStatusConflict,
     StructuredOutputSpec,
@@ -92,7 +104,9 @@ from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
     build_execution_profile_identity,
+    changed_execution_profile_components,
     checkpoint_with_active_invocation_execution_profile,
+    execution_profile_decision_payload,
     execution_profile_from_session_metadata,
 )
 from cayu.runtime.public_authority import (
@@ -102,6 +116,8 @@ from cayu.runtime.public_authority import (
 from cayu.runtime.sessions import (
     QueuedDispatchTerminalReceipt,
     _checkpoint_with_session_run_operation,
+    _invocation_lifecycle_authority_mutation_scope,
+    session_input_messages_sha256,
 )
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.runtime.workspace_observation_recovery import (
@@ -770,15 +786,6 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
             envelope = _QueuedDispatchEnvelope.model_validate(queued_task.input["dispatch"])
             assert envelope.source_profile != envelope.required_profile
 
-            recovery_checkpoint = checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
-                session_id=session_id,
-                interaction_id=interaction_id,
-                run_epoch=session.run_epoch - 1,
-                profile=envelope.required_profile,
-                expected=active_profile,
-            )
-            recovery_checkpoint.pop("last_model_step_publication", None)
             pending_round = tool_round_recovery.PendingToolRound(
                 model_step_id=f"mstep_{'1' * 32}",
                 model_attempt_id=f"matt_{'2' * 32}",
@@ -793,19 +800,112 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
                     )
                 ],
             )
-            recovery_checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
-                pending_round.model_dump(mode="json")
+            changed = changed_execution_profile_components(
+                active_profile.profile,
+                envelope.required_profile,
             )
-            await sessions.checkpoint(session_id, recovery_checkpoint)
-            await sessions.append_event(
-                session_id,
-                runtime_interaction_started_event(
-                    producer,
-                    session_id=session_id,
-                    interaction_id=interaction_id,
-                    agent_name="assistant",
+            actor = ResolutionActor(
+                subject="dispatch-target-adoption-fixture",
+                source=ResolutionActorSource.REQUEST,
+            )
+            decision_fields = {
+                "kind": ExecutionProfileDecisionKind.ADOPTED,
+                "expected_profile": active_profile.profile,
+                "candidate_profile": envelope.required_profile,
+                "changed_component_classes": changed,
+                "policy_identity": "tests:dispatch-target-adoption:v1",
+                "policy_reason": "Stage an admitted target profile before restart.",
+                "authority_decision": ExecutionProfileAuthorityDecision.AUTHORIZED,
+                "idempotency_identity": "dispatch-target-adoption",
+                "adoption_request_fingerprint": "a" * 64,
+                "actor": actor,
+                "reason": "Exercise queued target recovery after durable admission.",
+            }
+            decision = ExecutionProfileDecision(
+                **decision_fields,
+                event=event_with_runtime_envelope_authority(
+                    Event(
+                        type=EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+                        session_id=session_id,
+                        agent_name="assistant",
+                        payload=execution_profile_decision_payload(**decision_fields),
+                    ),
+                    "session_id",
                 ),
             )
+
+            def stage_pending_recovery(_session, current):
+                updated = dict(current or {})
+                updated.pop("last_model_step_publication", None)
+                updated[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
+                    pending_round.model_dump(mode="json")
+                )
+                return updated
+
+            interaction_started = runtime_interaction_started_event(
+                producer,
+                session_id=session_id,
+                interaction_id=interaction_id,
+                agent_name="assistant",
+            )
+            source_transcript = await sessions.load_transcript(session_id)
+            target = ModelTarget(provider_name="fake", model="upgraded-model")
+            model_transition_event = event_with_runtime_payload_authority(
+                event_with_runtime_envelope_authority(
+                    event_with_runtime_generated_id(
+                        Event(
+                            id=str(uuid4()),
+                            type=EventType.SESSION_MODEL_SWITCHED,
+                            session_id=session_id,
+                            interaction_id=interaction_id,
+                            timestamp=interaction_started.timestamp,
+                            agent_name="assistant",
+                            payload={
+                                "source_provider_name": session.provider_name,
+                                "source_model": session.model,
+                                "target_provider_name": target.provider_name,
+                                "target_model": target.model,
+                                "provider_changed": False,
+                                "model_changed": True,
+                                "provider_state_parts_dropped": 0,
+                                "thinking_parts_dropped": 0,
+                                "source_transcript_cursor": len(source_transcript),
+                                "cache_state_dropped": True,
+                                "full_transcript_projection": True,
+                            },
+                        )
+                    ),
+                    "session_id",
+                    "interaction_id",
+                ),
+                "source_provider_name",
+                "source_model",
+                "target_provider_name",
+                "target_model",
+            )
+            await admit_test_invocation(
+                sessions,
+                session_id,
+                interaction_started_event=interaction_started,
+                model_transition=SessionModelTransition(
+                    target=target,
+                    event=model_transition_event,
+                    source_transcript_digest=session_input_messages_sha256(source_transcript),
+                    source_transcript_cursor=len(source_transcript),
+                ),
+                target_profile=envelope.required_profile,
+                execution_profile_decision=decision,
+                checkpoint_transform=stage_pending_recovery,
+            )
+            interaction_records = await sessions.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                    event_type=EventType.INTERACTION_STARTED,
+                    limit=1,
+                )
+            )
+            assert len(interaction_records) == 1
         finally:
             await sessions.close()
             await tasks.close()
@@ -827,6 +927,7 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
         restarted_dispatcher = TaskStoreDispatcher(
             restarted_tasks,
             task_type=_DISPATCH_TASK_TYPE,
+            recover_stalled_sessions_after_seconds=0,
         )
         worker_tool = ProfileTool("profile_tool")
         worker_provider = FakeProvider([_batch("recovered")])
@@ -843,6 +944,9 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
                 worker_id="worker_target_recovery",
             )
             assert result is not None
+            assert result.status is DispatchStatus.SUBMITTED
+            assert result.metadata["requeued"] is True
+            assert result.metadata["recovered_session"] is True
             terminal_task = await restarted_tasks.load_task(submitted.metadata["queue_task_id"])
             assert terminal_task is not None
             terminal_events = await restarted_sessions.load_events(session_id)
@@ -864,8 +968,8 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
         scenario()
     )
 
-    assert status is DispatchStatus.INTERRUPTED
-    assert task_status is TaskStatus.COMPLETED
+    assert status is DispatchStatus.SUBMITTED
+    assert task_status is TaskStatus.PENDING
     assert failed_payloads == []
     assert source_fingerprint != required_fingerprint
 
@@ -2139,7 +2243,10 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
             )
             return updated
 
-        await h.store.transform_checkpoint(session_id, add_pending_recovery)
+        # This profile-selection fixture deliberately stages a released
+        # recovery snapshot without executing a runtime admission.
+        with _invocation_lifecycle_authority_mutation_scope():
+            await h.store.transform_checkpoint(session_id, add_pending_recovery)
         await h.store.update_status(session_id, SessionStatus.INTERRUPTED)
         recovery_envelope = await h.app._prepare_queued_dispatch(
             _dispatch_request(session_id, "d_released_pending_profile"),
@@ -2204,15 +2311,14 @@ def test_redelivery_replays_old_terminal_dispatch_during_newer_profile_ownership
         receipts = checkpoint["queued_dispatch_terminal_receipts"]["receipts"]
         terminal_run_epoch = next(iter(receipts.values()))["run_epoch"]
         assert session.run_epoch > terminal_run_epoch
-        await h.store.transform_checkpoint(
+        await admit_test_invocation(
+            h.store,
             session.id,
-            lambda _session, current: checkpoint_with_active_invocation_execution_profile(
-                current,
+            interaction_started_event=runtime_interaction_started_event(
+                h.app,
                 session_id=session.id,
-                interaction_id=released_profile.interaction_id,
-                run_epoch=session.run_epoch,
-                profile=released_profile.profile,
-                expected=released_profile,
+                interaction_id="interaction_newer_dispatch_owner",
+                agent_name="assistant",
             ),
         )
 
@@ -2456,17 +2562,9 @@ def test_terminal_redelivery_settles_independently_of_a_newer_active_invocation(
 
     interaction_id = "interaction_after_queued_terminal"
     asyncio.run(
-        h.store.transition_status_and_checkpoint(
+        admit_test_invocation(
+            h.store,
             "sess_dispatch_newer_epoch",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=lambda session, checkpoint: (
-                checkpoint_with_rebound_test_invocation_profile(
-                    session,
-                    checkpoint,
-                    interaction_id=interaction_id,
-                )
-            ),
             interaction_started_event=runtime_interaction_started_event(
                 h.app,
                 session_id="sess_dispatch_newer_epoch",
@@ -2820,6 +2918,8 @@ def test_process_next_rejects_peer_terminalization_without_exact_dispatch_eviden
 
 def test_terminal_session_status_without_exact_event_keeps_queue_task_reclaimable() -> None:
     class RejectFirstQueuedTerminalEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.blocked_event_id: str | None = None
@@ -3410,7 +3510,7 @@ def test_restart_retains_terminal_receipt_when_invocation_profile_is_missing(
         def remove_profile(_session, checkpoint):
             assert checkpoint is not None
             updated = dict(checkpoint)
-            updated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+            updated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
             return updated
 
         await h.store.transform_checkpoint(session_id, remove_profile)
@@ -3655,11 +3755,16 @@ def test_queue_acknowledgement_rejects_task_status_conflicting_with_terminal_eve
                 expected=active_profile,
             )
 
-        await h.store.transition_status_and_checkpoint(
+        await admit_test_invocation(
+            h.store,
             session_id,
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
             checkpoint_transform=stage_queued_run,
+            interaction_started_event=runtime_interaction_started_event(
+                h.app,
+                session_id=session_id,
+                interaction_id="interaction_terminal_status_conflict",
+                agent_name="assistant",
+            ),
         )
         await h.store.update_status(session_id, SessionStatus.COMPLETED)
         await h.store.append_event(
@@ -3694,6 +3799,7 @@ def test_provider_pending_status_ack_loss_retains_queued_dispatch_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class LoseInterruptedStatusAcknowledgement(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         lose_next_interrupted_ack = False
 
         async def update_status(self, session_id: str, status: SessionStatus):
@@ -3961,17 +4067,9 @@ def test_conflict_after_worker_crash_recovers_stalled_session_and_reruns() -> No
     # Simulate the crash: the session is stuck RUNNING with no live run anywhere.
     interaction_id = "interaction_dispatch_worker_crash"
     asyncio.run(
-        h.store.transition_status_and_checkpoint(
+        admit_test_invocation(
+            h.store,
             "sess_crash",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=lambda session, checkpoint: (
-                checkpoint_with_rebound_test_invocation_profile(
-                    session,
-                    checkpoint,
-                    interaction_id=interaction_id,
-                )
-            ),
             interaction_started_event=runtime_interaction_started_event(
                 h.app,
                 session_id="sess_crash",
@@ -4039,10 +4137,9 @@ def test_crashed_queued_run_recovery_preserves_terminal_identity_and_does_not_re
         )
 
     asyncio.run(
-        h.store.transition_status_and_checkpoint(
+        admit_test_invocation(
+            h.store,
             "sess_queued_crash",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
             checkpoint_transform=claim_crashed_queued_run,
             interaction_started_event=runtime_interaction_started_event(
                 h.app,

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from tests.core._execution_profile_fixtures import rebind_test_invocation
 
 import cayu.runtime._invocation_secrets as invocation_secrets
 from cayu._exception_groups import iter_exception_tree
@@ -449,11 +450,7 @@ def test_tool_round_interrupt_close_persists_missing_results():
     app, store, _ = _app_with_completed_session("sess_guard_interrupt")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
-        session = await store.transition_status(
-            "sess_guard_interrupt",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await rebind_test_invocation(store, "sess_guard_interrupt")
         runner = await _tool_round_run(app, session, limits=RunLimits())
         tool_calls = [_tool_call()]
         checkpoint, _pending_round = checkpoint_with_pending_tool_round(
@@ -494,11 +491,7 @@ def test_tool_round_interrupt_close_handles_requested_cancellation():
     app, store, _ = _app_with_completed_session("sess_guard_cancel_interrupt")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
-        session = await store.transition_status(
-            "sess_guard_cancel_interrupt",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await rebind_test_invocation(store, "sess_guard_cancel_interrupt")
         session = await store.update_status(
             session.id,
             SessionStatus.INTERRUPTING,
@@ -543,11 +536,7 @@ def test_grouped_cancellation_remains_authoritative_when_interrupt_closure_fails
     closure_secret = "interrupt-closure-secret-canary-ABCDEFGHIJKLMNOP"
 
     async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
-        session = await store.transition_status(
-            "sess_grouped_close_failure",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await rebind_test_invocation(store, "sess_grouped_close_failure")
         runner = await _tool_round_run(app, session, limits=RunLimits())
         tool_calls = [_tool_call()]
         checkpoint, _pending_round = checkpoint_with_pending_tool_round(
@@ -680,11 +669,7 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
     app, store, tool = _app_with_completed_session("sess_runner_limit")
 
     async def scenario() -> tuple[list[Event], bool]:
-        session = await store.transition_status(
-            "sess_runner_limit",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await rebind_test_invocation(store, "sess_runner_limit")
         runner = await _tool_round_run(
             app,
             session,
@@ -729,11 +714,7 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
     app, store, tool = _app_with_completed_session("sess_runner_execute")
 
     async def scenario() -> tuple[list[Event], list[Message], bool]:
-        session = await store.transition_status(
-            "sess_runner_execute",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await rebind_test_invocation(store, "sess_runner_execute")
         runner = await _tool_round_run(
             app,
             session,
@@ -800,11 +781,7 @@ def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:
     identity = _tool_round_identity()
 
     async def scenario() -> list[Event]:
-        session = await store.transition_status(
-            "sess_tool_round_budget_identity",
-            from_statuses={SessionStatus.COMPLETED},
-            to_status=SessionStatus.RUNNING,
-        )
+        session = await rebind_test_invocation(store, "sess_tool_round_budget_identity")
         runner = await _tool_round_run(
             app,
             session,

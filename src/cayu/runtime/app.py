@@ -89,7 +89,10 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._checkpoint_store import (
+    load_runtime_session_checkpoint_snapshot,
+    runtime_checkpoint_session_store,
+)
 from cayu.runtime._completion_decision_application_coordinator import (
     CompletionDecisionApplicationCoordinator,
 )
@@ -127,6 +130,14 @@ from cayu.runtime._execution_profile_identity_validation import (
 )
 from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
+)
+from cayu.runtime._invocation_lifecycle import (
+    AdmittedInvocationBinding,
+    InvocationContext,
+    InvocationMutationResult,
+    _authenticated_invocation_context,
+    invocation_lifecycle_receipt_history_present,
+    prepare_rebind_invocation_command,
 )
 from cayu.runtime._isolated_tool_process import (
     isolated_tool_execution_contract,
@@ -334,7 +345,6 @@ from cayu.runtime.retry_policy import (
     copy_retry_policy,
 )
 from cayu.runtime.sessions import (
-    CheckpointTransform,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -1256,6 +1266,8 @@ class CayuApp:
             recover_provider_operation_start=self._recover_provider_operation_start,
             cancel_provider_operation=self._cancel_provider_operation,
             interaction_transition_replay_failures=_interaction_transition_replay_failures,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self._runtime_session_store,
@@ -2958,6 +2970,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None = None,
     ) -> ProviderOperationRecoveryResult:
         recovery_context = model_completion_recovery_context_from_stage(stage)
         publication_context = recovery_context or ModelCompletionRecoveryContext()
@@ -2977,6 +2990,7 @@ class CayuApp:
             environment_name=_environment_name(registered_environment),
             recovery_context=recovery_context,
             model_completion_publisher=publish,
+            invocation_context=invocation_context,
         )
 
     async def _recover_provider_operation_start(
@@ -2987,6 +3001,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None = None,
     ) -> ProviderOperationRecoveryResult:
         recovery_context = model_completion_recovery_context_from_stage(stage)
         publication_context = recovery_context or ModelCompletionRecoveryContext()
@@ -3005,6 +3020,7 @@ class CayuApp:
             registered_provider=registered_provider,
             environment_name=_environment_name(registered_environment),
             model_completion_publisher=publish,
+            invocation_context=invocation_context,
         )
 
     async def _cancel_provider_operation(
@@ -3015,6 +3031,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        invocation_context: InvocationContext | None = None,
     ) -> ProviderOperationSnapshot | None:
         return await self._model_step_executor.cancel_provider_operation_for_interruption(
             session=session,
@@ -3023,6 +3040,7 @@ class CayuApp:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             environment_name=_environment_name(registered_environment),
+            invocation_context=invocation_context,
         )
 
     def _get_registered_provider(
@@ -3446,6 +3464,37 @@ class CayuApp:
                 "Work-attempt predecessor settlement remains active or ambiguous."
             )
 
+    async def _load_work_attempt_runtime_checkpoint(
+        self,
+        session_id: str,
+        *,
+        operation_name: str,
+    ) -> dict[str, Any] | None:
+        """Load authenticated runtime checkpoint authority for work recovery."""
+
+        raw_checkpoint = await read_work_attempt_session_store(
+            lambda: self._runtime_session_store.load_checkpoint(session_id),
+            operation_name=operation_name,
+            redactor=self._secret_redactor,
+        )
+        checkpoint_validation = capture_work_attempt_checkpoint_result(
+            raw_checkpoint,
+            operation_name=operation_name,
+            redactor=self._secret_redactor,
+        )
+        del raw_checkpoint
+        if checkpoint_validation.failure is not None:
+            raise_task_store_operation_failure(checkpoint_validation.failure)
+        checkpoint = checkpoint_validation.result
+        del checkpoint_validation
+        if active_invocation_execution_profile_from_checkpoint(
+            checkpoint
+        ) is None and invocation_lifecycle_receipt_history_present(checkpoint):
+            raise WorkAttemptRecoveryRequired(
+                "Work-attempt recovery lost durable invocation profile authority."
+            )
+        return checkpoint
+
     async def recover_work_attempt(
         self,
         request: WorkAttemptRecoveryRequest,
@@ -3509,6 +3558,14 @@ class CayuApp:
         del prior_validation
         if prior is None:
             raise RuntimeError("Work-attempt recovery authority lookup returned no authority.")
+        # Reject ambiguous migrated lifecycle state before claiming the next
+        # TaskStore generation.  The runtime adapter is the sole owner of root
+        # checkpoint migration; bypassing it here could reinterpret pre-v5
+        # caller-writable state as executable recovery authority.
+        await self._load_work_attempt_runtime_checkpoint(
+            prior.session_id,
+            operation_name="Work-attempt recovery checkpoint preflight",
+        )
         claimed_outcome = await capture_task_store_operation(
             lambda: task_store.claim_work_attempt_recovery(claim_request),
             operation_name="Work-attempt recovery claim",
@@ -3558,7 +3615,7 @@ class CayuApp:
             raise RuntimeError("Recovered admission has no durable recovery evidence.")
         if already_active:
             raw_session = await read_work_attempt_session_store(
-                lambda session_id=claimed.session_id: self.session_store.load(session_id),
+                lambda session_id=claimed.session_id: self._runtime_session_store.load(session_id),
                 operation_name="Recovered work-attempt session lookup",
                 redactor=self._secret_redactor,
             )
@@ -3577,21 +3634,10 @@ class CayuApp:
             if session is None:
                 raise RuntimeError("Recovered work-attempt session lookup returned no session.")
             profile = execution_profile_from_session_metadata(session.metadata)
-            raw_checkpoint = await read_work_attempt_session_store(
-                lambda session_id=session.id: self.session_store.load_checkpoint(session_id),
+            checkpoint = await self._load_work_attempt_runtime_checkpoint(
+                session.id,
                 operation_name="Recovered work-attempt checkpoint lookup",
-                redactor=self._secret_redactor,
             )
-            checkpoint_validation = capture_work_attempt_checkpoint_result(
-                raw_checkpoint,
-                operation_name="Recovered work-attempt checkpoint lookup",
-                redactor=self._secret_redactor,
-            )
-            del raw_checkpoint
-            if checkpoint_validation.failure is not None:
-                raise_task_store_operation_failure(checkpoint_validation.failure)
-            checkpoint = checkpoint_validation.result
-            del checkpoint_validation
             recovery_authority = work_attempt_recovery_session_authority(claimed.claim)
             checkpoint_recovery_authority = work_attempt_recovery_session_authority_from_checkpoint(
                 checkpoint
@@ -3637,7 +3683,7 @@ class CayuApp:
                 lease_seconds=stable.lease_seconds,
             )
         raw_session = await read_work_attempt_session_store(
-            lambda session_id=claimed.session_id: self.session_store.load(session_id),
+            lambda session_id=claimed.session_id: self._runtime_session_store.load(session_id),
             operation_name="Work-attempt recovery session lookup",
             redactor=self._secret_redactor,
         )
@@ -3673,26 +3719,15 @@ class CayuApp:
             )
         recovery_authority = work_attempt_recovery_session_authority(claimed.claim)
         recovery_marker = recovery_authority.checkpoint_value()
-        raw_checkpoint = await read_work_attempt_session_store(
-            lambda session_id=session.id: self.session_store.load_checkpoint(session_id),
+        checkpoint = await self._load_work_attempt_runtime_checkpoint(
+            session.id,
             operation_name="Work-attempt recovery checkpoint lookup",
-            redactor=self._secret_redactor,
         )
-        checkpoint_validation = capture_work_attempt_checkpoint_result(
-            raw_checkpoint,
-            operation_name="Work-attempt recovery checkpoint lookup",
-            redactor=self._secret_redactor,
-        )
-        del raw_checkpoint
-        if checkpoint_validation.failure is not None:
-            raise_task_store_operation_failure(checkpoint_validation.failure)
-        checkpoint = checkpoint_validation.result
-        del checkpoint_validation
         pending_initial_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
         if pending_initial_interaction_id is not None:
             raw_deferred_input = await read_work_attempt_session_store(
-                lambda session_id=session.id: self.session_store.load_deferred_interaction_input(
-                    session_id
+                lambda session_id=session.id: (
+                    self._runtime_session_store.load_deferred_interaction_input(session_id)
                 ),
                 operation_name="Work-attempt recovery deferred-input lookup",
                 redactor=self._secret_redactor,
@@ -3717,8 +3752,8 @@ class CayuApp:
         )
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         active_model_completion = await read_work_attempt_session_store(
-            lambda session_id=session.id: self.session_store.load_active_model_completion_stage(
-                session_id
+            lambda session_id=session.id: (
+                self._runtime_session_store.load_active_model_completion_stage(session_id)
             ),
             operation_name="Work-attempt recovery active model-stage lookup",
             redactor=self._secret_redactor,
@@ -3973,22 +4008,33 @@ class CayuApp:
                 updated[WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY] = recovery_marker
                 return updated
 
-            def transition_recovered_session(
-                source_session_id: str = session.id,
-                *,
-                checkpoint_transform: CheckpointTransform = claim_recovered_session_execution,
-            ) -> Awaitable[Session]:
-                return self.session_store.transition_status_and_checkpoint(
-                    source_session_id,
-                    from_statuses={
-                        SessionStatus.RUNNING,
-                        SessionStatus.COMPLETED,
-                        SessionStatus.FAILED,
-                        SessionStatus.INTERRUPTED,
-                    },
-                    to_status=SessionStatus.RUNNING,
-                    checkpoint_transform=checkpoint_transform,
-                )
+            recovery_rebind = prepare_rebind_invocation_command(
+                session,
+                checkpoint,
+                expected_statuses={
+                    SessionStatus.RUNNING,
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                    SessionStatus.INTERRUPTED,
+                },
+                target_status=SessionStatus.RUNNING,
+                checkpoint_transform=claim_recovered_session_execution,
+            )
+
+            async def transition_recovered_session() -> Session:
+                try:
+                    result = await self._runtime_session_store.apply_invocation_lifecycle_command(
+                        recovery_rebind
+                    )
+                except SessionRunFenced as exc:
+                    raise WorkAttemptRecoveryRequired(
+                        "Session authority changed after recovery was claimed."
+                    ) from exc
+                if type(result) is not InvocationMutationResult:
+                    raise RuntimeError(
+                        "Work-attempt recovery rebind returned an incompatible result."
+                    )
+                return result.session
 
             mutation = settle_work_attempt_session_mutation(
                 transition_recovered_session,
@@ -4017,11 +4063,18 @@ class CayuApp:
                     source_session_sha256,
                     source_checkpoint_sha256,
                     claim_recovered_session_execution,
+                    recovery_rebind,
                     transition_recovered_session,
                     mutation,
                 )
                 raise
-            del mutation, transition_recovered_session, session
+            del (
+                mutation,
+                transition_recovered_session,
+                recovery_rebind,
+                claim_recovered_session_execution,
+                session,
+            )
             recovered_session_validation = capture_work_attempt_session_result(
                 raw_recovered_session,
                 operation_name="Work-attempt session recovery",
@@ -4034,21 +4087,10 @@ class CayuApp:
             del recovered_session_validation
             if session is None:
                 raise RuntimeError("Work-attempt session recovery returned no session.")
-            raw_checkpoint = await read_work_attempt_session_store(
-                lambda: self.session_store.load_checkpoint(session.id),
+            checkpoint = await self._load_work_attempt_runtime_checkpoint(
+                session.id,
                 operation_name="Recovered work-attempt checkpoint lookup",
-                redactor=self._secret_redactor,
             )
-            checkpoint_validation = capture_work_attempt_checkpoint_result(
-                raw_checkpoint,
-                operation_name="Recovered work-attempt checkpoint lookup",
-                redactor=self._secret_redactor,
-            )
-            del raw_checkpoint
-            if checkpoint_validation.failure is not None:
-                raise_task_store_operation_failure(checkpoint_validation.failure)
-            checkpoint = checkpoint_validation.result
-            del checkpoint_validation
             if (
                 work_attempt_recovery_session_authority_from_checkpoint(checkpoint)
                 != recovery_authority
@@ -4621,25 +4663,10 @@ class CayuApp:
     ) -> tuple[Session, dict[str, Any] | None]:
         """Load session and checkpoint authority under one store-owned boundary."""
 
-        snapshot: tuple[Session, dict[str, Any] | None] | None = None
-
-        def capture_snapshot(
-            session: Session,
-            checkpoint: dict[str, Any] | None,
-        ) -> None:
-            nonlocal snapshot
-            snapshot = (
-                session.model_copy(deep=True),
-                None if checkpoint is None else deepcopy(checkpoint),
-            )
-            # ``None`` is the documented read-only result for this atomic
-            # checkpoint-transform boundary.
-            return None
-
-        await self.session_store.transform_checkpoint(session_id, capture_snapshot)
-        if snapshot is None:
-            raise RuntimeError("Queued dispatch session snapshot was not produced.")
-        return snapshot
+        return await load_runtime_session_checkpoint_snapshot(
+            self._runtime_session_store,
+            session_id,
+        )
 
     async def _load_queued_dispatch_terminal_event(
         self,
@@ -6273,7 +6300,49 @@ class CayuApp:
             raise RuntimeError(
                 "Recovery run does not reference the active invocation execution profile."
             )
-        execution_profile = expected_profile.profile
+        invocation_context = request.invocation_context
+        if invocation_context is None:
+            execution_profile = expected_profile.profile
+            invocation_context = _authenticated_invocation_context(
+                active_profile=expected_profile,
+                binding=AdmittedInvocationBinding(
+                    session_id=request.session.id,
+                    session_instance_id=request.session.instance_id,
+                    interaction_id=expected_profile.interaction_id,
+                    run_epoch=request.session.run_epoch,
+                    agent_name=request.session.agent_name,
+                    provider_name=request.session.provider_name,
+                    model=request.session.model,
+                    runtime_name=request.session.runtime_name,
+                    runtime_version=request.session.runtime_version,
+                    environment_name=request.session.environment_name,
+                ),
+                validated_profile=execution_profile,
+                registered_agent=request.registered_agent,
+                registered_provider=request.registered_provider,
+                registered_environment=request.registered_environment,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                request_loop_policies=request.request_loop_policies,
+                budget_policy=request.budget_policy,
+                tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(
+                    request.session.metadata
+                ),
+            )
+        else:
+            execution_profile = invocation_context.profile
+            if (
+                invocation_context.active_profile is not expected_profile
+                or invocation_context.active_profile.profile is not expected_profile.profile
+                or invocation_context.registered_agent is not request.registered_agent
+                or invocation_context.registered_provider is not request.registered_provider
+                or invocation_context.registered_environment is not request.registered_environment
+                or invocation_context.runtime_hooks is not self._runtime_hooks
+                or invocation_context.loop_policies is not self._loop_policies
+                or invocation_context.request_loop_policies is not request.request_loop_policies
+                or invocation_context.budget_policy is not request.budget_policy
+            ):
+                raise RuntimeError("Recovery run substituted frozen invocation authority.")
         initial_tool_exposure = (
             None
             if request.initial_model_step_tool_exposure is None
@@ -6285,20 +6354,15 @@ class CayuApp:
         )
         stream = self._run_session(
             session=request.session,
-            registered_agent=request.registered_agent,
-            registered_provider=request.registered_provider,
-            registered_environment=request.registered_environment,
-            execution_profile=execution_profile,
+            invocation_context=invocation_context,
             messages=request.messages,
             messages_to_append=request.messages_to_append,
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
-            budget_policy=copy_budget_policy(request.budget_policy),
             retry_policy=request.retry_policy,
             structured_output=request.structured_output,
             thinking=request.thinking,
-            request_loop_policies=request.request_loop_policies,
             request_metadata=request.request_metadata,
             task_id=request.task_id,
             task_worker_id=request.task_worker_id,
@@ -6370,6 +6434,7 @@ class CayuApp:
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         )
 
     def _fail_provider_operation_resolution(
@@ -6383,6 +6448,7 @@ class CayuApp:
             registered_environment=request.registered_environment,
             execution_profile=request.execution_profile,
             legacy_resolution_without_profile=request.legacy_resolution_without_profile,
+            invocation_context=request.invocation_context,
         )
 
     def _stop_recovery_session_for_limit_reached(
@@ -6405,6 +6471,7 @@ class CayuApp:
             requested_approval_decision=request.requested_approval_decision,
             approval_resolution_request_digest=request.approval_resolution_request_digest,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         )
 
     def _interrupt_session_for_recovery(
@@ -6417,6 +6484,7 @@ class CayuApp:
             registered_environment=request.registered_environment,
             environment_name=request.environment_name,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         )
 
     def _pending_session_interrupt_checkpoint_for_recovery(
@@ -6435,6 +6503,7 @@ class CayuApp:
     ) -> Session:
         finalized, _, _ = await self._session_engine._publish_sibling_interaction_transition(
             session=request.session,
+            invocation_context=request.invocation_context,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             environment_name=request.environment_name,
@@ -6450,6 +6519,7 @@ class CayuApp:
                 run_started_at=request.run_started_at,
                 usage_tracker=request.usage_tracker,
                 active_run=request.active_run,
+                invocation_context=request.invocation_context,
             )
         return finalized
 
@@ -6867,20 +6937,15 @@ class CayuApp:
         self,
         *,
         session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext,
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
-        budget_policy: BudgetPolicy | None,
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
-        request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
         task_id: str | None,
         task_worker_id: str | None,
@@ -6896,6 +6961,10 @@ class CayuApp:
         previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
+        if type(invocation_context) is not InvocationContext:
+            raise TypeError("invocation_context must be an authenticated InvocationContext.")
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
         interaction_id = _current_session_interaction_id(session.id)
         targeted_tool_projection = resolve_targeted_tool_projection(
             registered_agent.targeted_tool_mode,
@@ -6921,20 +6990,15 @@ class CayuApp:
             )
         stream = self._session_engine._run_session(
             session=session,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
+            invocation_context=invocation_context,
             messages=messages,
             messages_to_append=messages_to_append,
             max_steps=max_steps,
             limits=limits,
             budget_limits=budget_limits,
-            budget_policy=budget_policy,
             retry_policy=retry_policy,
             structured_output=structured_output,
             thinking=thinking,
-            request_loop_policies=request_loop_policies,
             request_metadata=request_metadata,
             request_trace_metadata=request_metadata,
             targeted_tool_grants=targeted_tool_grant_footprint(
@@ -6973,6 +7037,7 @@ class CayuApp:
         run_started_at: float,
         usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        invocation_context: InvocationContext | None = None,
     ) -> Event:
         events = await self._session_engine._emit_turn_completed_once(
             session=session,
@@ -6982,6 +7047,7 @@ class CayuApp:
             run_started_at=run_started_at,
             usage_tracker=usage_tracker,
             active_run=active_run,
+            invocation_context=invocation_context,
         )
         return events[-1]
 
@@ -7044,6 +7110,7 @@ class CayuApp:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncIterator[Event]:
         # This adapter is owned by RecoveryCoordinator, not SessionEngine._run_session,
         # so its terminal transition must consume the sibling cancellation handoff.
@@ -7066,6 +7133,7 @@ class CayuApp:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             reconcile_transition_cancellation=True,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -7155,6 +7223,7 @@ class CayuApp:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -7165,6 +7234,7 @@ class CayuApp:
             registered_environment=registered_environment,
             environment_name=environment_name,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
@@ -7261,6 +7331,7 @@ class CayuApp:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncIterator[Event]:
         stream = self._session_engine._emit_terminal_event_with_hooks(
             event=event,
@@ -7269,6 +7340,7 @@ class CayuApp:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

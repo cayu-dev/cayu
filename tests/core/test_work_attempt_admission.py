@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sqlite3
 import traceback as traceback_module
@@ -70,6 +71,7 @@ from cayu import (
     WorkEvidenceReference,
 )
 from cayu._validation import canonical_durable_json_bytes
+from cayu.core.events import event_with_runtime_envelope_authority
 from cayu.runtime import (
     CheckpointTransform,
     DeferredInteractionInput,
@@ -77,6 +79,21 @@ from cayu.runtime import (
     EventRecord,
     EventSink,
     InMemoryEventSink,
+    InteractionTransitionSpec,
+    ReleaseInvocationCommand,
+    SettleInvocationCommand,
+)
+from cayu.runtime import sessions as sessions_module
+from cayu.runtime._invocation_lifecycle import (
+    _release_invocation_command_with_cleanup_authority,
+)
+from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+)
+from cayu.runtime.execution_profiles import (
+    active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.work_attempt_admission import (
@@ -358,6 +375,8 @@ class _SecretBearingTaskResultStore(InMemoryTaskStore):
 class _SecretBearingSessionCreationResult(InMemorySessionStore):
     """Commit session creation, then substitute a secret-bearing return identity."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, secret: str) -> None:
         super().__init__()
         self._secret = secret
@@ -370,6 +389,7 @@ class _SecretBearingSessionCreationResult(InMemorySessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        **kwargs: Any,
     ) -> Session:
         session = await super().create(
             request,
@@ -377,12 +397,15 @@ class _SecretBearingSessionCreationResult(InMemorySessionStore):
             interaction_started_event=interaction_started_event,
             interaction_source_messages=interaction_source_messages,
             checkpoint_transform=checkpoint_transform,
+            **kwargs,
         )
         return session.model_copy(update={"id": self._secret})
 
 
 class _SecretBearingCheckpointResult(InMemorySessionStore):
     """Return a secret-bearing checkpoint after committing session creation."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -395,8 +418,31 @@ class _SecretBearingCheckpointResult(InMemorySessionStore):
         return {**checkpoint, "extension_diagnostic": self._secret}
 
 
+class _MalformedReceiptIdentityCheckpointResult(InMemorySessionStore):
+    """Return a malformed receipt whose identity field contains a workload secret."""
+
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self._secret = secret
+
+    async def load_checkpoint(self, session_id: str) -> dict[str, object] | None:
+        checkpoint = await super().load_checkpoint(session_id)
+        if checkpoint is None:
+            return None
+        forged = copy.deepcopy(checkpoint)
+        ledger = forged.get(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+        if type(ledger) is dict and type(ledger.get("receipts")) is list:
+            receipt = ledger["receipts"][0]
+            receipt["result_session"]["provider_name"] = self._secret
+        return forged
+
+
 class _FailWorkAttemptDeferredInputRead(InMemorySessionStore):
     """Raise one secret-bearing authority-read failure after session publication."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -426,6 +472,8 @@ class _BlockingWorkAttemptEventSink(EventSink):
 
 class _LeaseAdvancingWorkAttemptSessionStore(InMemorySessionStore):
     """Spend more than one task-store lease during selected event lookups."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self, now: list[datetime]) -> None:
         super().__init__()
@@ -592,6 +640,8 @@ class _IneligibleWorkAttemptTransitionStore(InMemoryTaskStore):
 
 
 class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.create_started = asyncio.Event()
@@ -606,6 +656,7 @@ class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        **kwargs: Any,
     ) -> Session:
         if self._block_first_create:
             self._block_first_create = False
@@ -617,10 +668,13 @@ class _BlockFirstWorkAttemptSessionCreation(InMemorySessionStore):
             interaction_started_event=interaction_started_event,
             interaction_source_messages=interaction_source_messages,
             checkpoint_transform=checkpoint_transform,
+            **kwargs,
         )
 
 
 class _BlockFirstWorkAttemptRecoveryTransition(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.transition_started = asyncio.Event()
@@ -640,6 +694,8 @@ class _BlockFirstWorkAttemptRecoveryTransition(InMemorySessionStore):
 
 
 class _BlockFirstWorkAttemptSettlementFence(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fence_committed = asyncio.Event()
@@ -652,11 +708,13 @@ class _BlockFirstWorkAttemptSettlementFence(InMemorySessionStore):
         *,
         statuses: set[SessionStatus],
         checkpoint_transform: CheckpointTransform,
+        **kwargs,
     ) -> Session:
         fenced = await super().fence_run_and_transform_checkpoint(
             session_id,
             statuses=statuses,
             checkpoint_transform=checkpoint_transform,
+            **kwargs,
         )
         if self._block_first_fence:
             self._block_first_fence = False
@@ -666,48 +724,58 @@ class _BlockFirstWorkAttemptSettlementFence(InMemorySessionStore):
 
 
 class _BlockNextWorkAttemptCheckpointLoad(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.load_started = asyncio.Event()
         self.release_load = asyncio.Event()
-        self.block_next_load = False
+        self.loads_before_block: int | None = None
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
-        if self.block_next_load:
-            self.block_next_load = False
+        if self.loads_before_block == 0:
+            self.loads_before_block = None
             self.load_started.set()
             await self.release_load.wait()
+        elif self.loads_before_block is not None:
+            self.loads_before_block -= 1
         return await super().load_checkpoint(session_id)
 
 
 class _FailOnceWorkAttemptRunFenceRelease(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_next_release = False
 
-    async def release_run_fence(self, session_id: str) -> None:
+    async def release_session_invocation(self, command) -> None:
         if self.fail_next_release:
             self.fail_next_release = False
             raise RuntimeError("transient work-attempt run fence release failure")
-        await super().release_run_fence(session_id)
+        await super().release_session_invocation(command)
 
 
 class _BlockFirstWorkAttemptRunFenceRelease(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.release_started = asyncio.Event()
         self.release_cleanup = asyncio.Event()
         self.release_calls = 0
 
-    async def release_run_fence(self, session_id: str) -> None:
+    async def release_session_invocation(self, command) -> None:
         self.release_calls += 1
         if self.release_calls == 1:
             self.release_started.set()
             await self.release_cleanup.wait()
-        await super().release_run_fence(session_id)
+        await super().release_session_invocation(command)
 
 
 class _FailWorkAttemptSettlementFence(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
@@ -718,12 +786,15 @@ class _FailWorkAttemptSettlementFence(InMemorySessionStore):
         *,
         statuses: set[SessionStatus],
         checkpoint_transform: CheckpointTransform,
+        **kwargs,
     ) -> Session:
-        del session_id, statuses, checkpoint_transform
+        del session_id, statuses, checkpoint_transform, kwargs
         raise RuntimeError(self._message)
 
 
 class _BlockFirstWorkAttemptContinuationAdmission(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.admission_started = asyncio.Event()
@@ -739,6 +810,8 @@ class _BlockFirstWorkAttemptContinuationAdmission(InMemorySessionStore):
 
 
 class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
@@ -751,6 +824,7 @@ class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        **kwargs: Any,
     ) -> Session:
         del (
             request,
@@ -758,11 +832,14 @@ class _CancelFirstWorkAttemptSessionCreation(InMemorySessionStore):
             interaction_started_event,
             interaction_source_messages,
             checkpoint_transform,
+            kwargs,
         )
         raise asyncio.CancelledError(self._message)
 
 
 class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
@@ -777,6 +854,7 @@ class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        **kwargs: Any,
     ) -> Session:
         del (
             request,
@@ -784,6 +862,7 @@ class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
             interaction_started_event,
             interaction_source_messages,
             checkpoint_transform,
+            kwargs,
         )
         self.create_started.set()
         await self.release_create.wait()
@@ -791,6 +870,8 @@ class _FailCancelledWorkAttemptSessionCreation(InMemorySessionStore):
 
 
 class _FailWorkAttemptSessionCreation(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
@@ -803,6 +884,7 @@ class _FailWorkAttemptSessionCreation(InMemorySessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        **kwargs: Any,
     ) -> Session:
         del (
             request,
@@ -810,6 +892,7 @@ class _FailWorkAttemptSessionCreation(InMemorySessionStore):
             interaction_started_event,
             interaction_source_messages,
             checkpoint_transform,
+            kwargs,
         )
         raise RuntimeError(self._message)
 
@@ -2382,6 +2465,54 @@ def test_secret_bearing_work_attempt_store_results_are_diagnostic_safe(
     assert all(secret not in str(item.message) for item in caught_warnings)
 
 
+def test_work_attempt_receipt_structure_does_not_conflict_with_equal_secret() -> None:
+    async def scenario() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        app, run, execution = await _configured_public_initial_admission(
+            prefix="receipt-structure-secret-collision",
+            sessions=sessions,
+            tasks=tasks,
+            redactor=SecretRedactor("command_identity"),
+        )
+        admitted = await app.admit_work_attempt(run, execution=execution)
+        assert admitted.state is WorkAttemptAdmissionState.ACTIVE
+        assert await sessions.load(admitted.session_id) is not None
+
+    asyncio.run(scenario())
+
+
+def test_malformed_receipt_identity_is_diagnostic_safe_through_public_admission(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "malformed-receipt-provider-secret"
+
+    async def scenario() -> BaseException:
+        sessions = _MalformedReceiptIdentityCheckpointResult(secret)
+        tasks = InMemoryTaskStore()
+        app, run, execution = await _configured_public_initial_admission(
+            prefix="malformed-receipt-identity",
+            sessions=sessions,
+            tasks=tasks,
+            redactor=SecretRedactor(secret),
+        )
+        with pytest.raises(RuntimeError) as captured:
+            await app.admit_work_attempt(run, execution=execution)
+        return captured.value
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        error = asyncio.run(scenario())
+
+    _assert_secret_absent_from_work_attempt_error(error, secret)
+    captured = capsys.readouterr()
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in str(item.message) for item in caught_warnings)
+
+
 def test_secret_bearing_historical_claim_is_diagnostic_safe_through_recovery(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
@@ -3158,6 +3289,88 @@ def test_public_first_crash_recovery_needs_no_direct_store_mutation(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_public_work_attempt_recovery_rejects_deleted_v4_lifecycle_authority_before_claim(
+    backend: str,
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        sessions: SessionStore = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "v4-work-recovery-sessions.sqlite")
+        )
+        tasks: TaskStore = (
+            InMemoryTaskStore(clock=lambda: now[0])
+            if backend == "memory"
+            else SQLiteTaskStore(
+                tmp_path / "v4-work-recovery-tasks.sqlite",
+                clock=lambda: now[0],
+            )
+        )
+        app, run, execution = await _configured_public_initial_admission(
+            prefix=f"v4-work-recovery-{backend}",
+            sessions=sessions,
+            tasks=tasks,
+            redactor=SecretRedactor(),
+        )
+        execution = execution.model_copy(update={"lease_seconds": 1})
+        admitted = await app.admit_work_attempt(run, execution=execution)
+
+        def delete_v4_lifecycle_roots(_session, current):
+            assert current is not None
+            updated = dict(current)
+            updated[CHECKPOINT_SCHEMA_VERSION_KEY] = 4
+            updated.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, None)
+            updated.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
+            return updated
+
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await sessions.transform_checkpoint(
+                admitted.session_id,
+                delete_v4_lifecycle_roots,
+            )
+
+        admission_before = await tasks.load_work_attempt_admission(admitted.admission_id)
+        session_before = await sessions.load(admitted.session_id)
+        checkpoint_before = await sessions.load_checkpoint(admitted.session_id)
+        events_before = await sessions.load_events(admitted.session_id)
+        now[0] += timedelta(seconds=2)
+
+        replacement = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            enable_logging=False,
+        )
+        replacement.register_provider(_RecordingProvider(), default=True)
+        replacement.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
+        with pytest.raises(
+            WorkAttemptRecoveryRequired,
+            match="lost durable invocation profile authority",
+        ):
+            await replacement.recover_work_attempt(
+                WorkAttemptRecoveryRequest(
+                    admission_id=admitted.admission_id,
+                    claim_id=f"v4-work-recovery-{backend}-claim-2",
+                    worker_id=f"v4-work-recovery-{backend}-worker-2",
+                    generation=2,
+                    lease_seconds=300,
+                )
+            )
+
+        assert await tasks.load_work_attempt_admission(admitted.admission_id) == admission_before
+        assert await sessions.load(admitted.session_id) == session_before
+        assert await sessions.load_checkpoint(admitted.session_id) == checkpoint_before
+        assert await sessions.load_events(admitted.session_id) == events_before
+
+        if backend == "sqlite":
+            await sessions.close()
+            await tasks.close()
+
+    asyncio.run(scenario())
+
+
 def test_migrated_source_only_initial_input_keeps_recovery_fenced(tmp_path) -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
@@ -3308,7 +3521,9 @@ def test_first_crash_settlement_rejects_a_claim_that_expires_before_handoff(
             generation=2,
             lease_seconds=1,
         )
-        sessions.block_next_load = True
+        # The first read is the pre-claim migration preflight. Block the second,
+        # post-claim snapshot so the claim itself expires during the handoff.
+        sessions.loads_before_block = 1
         pending = asyncio.create_task(replacement.recover_work_attempt(generation_two))
         await asyncio.wait_for(sessions.load_started.wait(), timeout=10)
         now[0] += timedelta(seconds=2)
@@ -3621,6 +3836,19 @@ def test_public_recovery_fences_stale_generation_and_replays_exact_receipt() -> 
         assert recovered_session.status is SessionStatus.RUNNING
         assert recovered_session.run_epoch == prior_epoch + 3
         assert recovered_session.run_epoch == committed_epoch
+        recovered_checkpoint = await sessions.load_checkpoint(first.session_id)
+        assert recovered_checkpoint is not None
+        lifecycle_receipts = recovered_checkpoint[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY][
+            "receipts"
+        ]
+        assert any(
+            receipt["command_identity"]
+            == (
+                f"rebind:{first.session_id}:{recovered_session.instance_id}:"
+                f"{recovered_session.run_epoch}"
+            )
+            for receipt in lifecycle_receipts
+        )
         assert await sessions.load_deferred_interaction_input(first.session_id) is None
         assert await restarted_app.recover_work_attempt(recovery_request) == recovered
 
@@ -4494,8 +4722,46 @@ def test_public_rejected_continue_admission_preserves_contract_and_adds_interact
         )
         proposal = await app.submit_work_attempt_proposal(first_proposal_request)
         assert await sessions.load_deferred_interaction_input(first.session_id) is None
-        await sessions.update_status(first.session_id, SessionStatus.COMPLETED)
-        await sessions.release_run_fence(first.session_id)
+        first_session = await sessions.load(first.session_id)
+        first_checkpoint = await sessions.load_checkpoint(first.session_id)
+        first_active_profile = active_invocation_execution_profile_from_checkpoint(first_checkpoint)
+        assert first_session is not None
+        assert first_active_profile is not None
+        first_terminal_event = event_with_runtime_envelope_authority(
+            Event(
+                type=EventType.INTERACTION_COMPLETED,
+                session_id=first.session_id,
+                interaction_id=first.interaction_id,
+                agent_name="worker",
+            ),
+            "session_id",
+            "interaction_id",
+        )
+        first_settlement = InteractionTransitionSpec(
+            event=first_terminal_event,
+            from_statuses=(SessionStatus.RUNNING,),
+            to_status=SessionStatus.COMPLETED,
+        )
+        await app._runtime_session_store.apply_invocation_lifecycle_command(
+            SettleInvocationCommand(
+                session_id=first.session_id,
+                expected_session_instance_id=first_session.instance_id,
+                expected_run_epoch=first_session.run_epoch,
+                expected_active_profile=first_active_profile,
+                transition=first_settlement,
+            )
+        )
+        await app._runtime_session_store.apply_invocation_lifecycle_command(
+            _release_invocation_command_with_cleanup_authority(
+                ReleaseInvocationCommand(
+                    session_id=first.session_id,
+                    expected_session_instance_id=first_session.instance_id,
+                    expected_run_epoch=first_session.run_epoch,
+                    expected_active_profile=first_active_profile,
+                    settlement_transition=first_settlement,
+                )
+            )
+        )
         verifier_claim = await _claim_completion_verification(
             tasks,
             CompletionVerificationClaimRequest(

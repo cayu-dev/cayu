@@ -641,6 +641,7 @@ def test_contract_reports_disabled_dashboard_without_inventing_pricing_availabil
 
 def test_contract_rejects_an_invalid_session_store_capability_declaration() -> None:
     class InvalidCapabilityStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_usage_aggregates = "yes"  # type: ignore[assignment]
 
     with pytest.raises(
@@ -655,6 +656,7 @@ def test_contract_rejects_an_invalid_session_store_capability_declaration() -> N
 
 def test_contract_rejects_an_invalid_session_topology_capability_declaration() -> None:
     class InvalidCapabilityStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_session_topology = "yes"  # type: ignore[assignment]
 
     with pytest.raises(

@@ -995,6 +995,8 @@ def test_explicit_compaction_failure_does_not_retain_raw_transcript_secret() -> 
 
 def test_explicit_compaction_rechecks_cursor_after_projecting_snapshot() -> None:
     class SnapshotBarrierStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.snapshot_loaded = asyncio.Event()
@@ -1060,6 +1062,8 @@ def test_explicit_compaction_rechecks_cursor_after_projecting_snapshot() -> None
 
 def test_explicit_compaction_replay_does_not_repeat_sanitized_work_after_lost_ack() -> None:
     class LostTerminalAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False

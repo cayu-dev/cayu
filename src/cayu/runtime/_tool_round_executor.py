@@ -102,6 +102,7 @@ from cayu.runtime._interruption_coordinator import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
+from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitGate,
@@ -426,6 +427,7 @@ class ToolRoundLimitRequest:
     turn_usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
     execution_profile: ExecutionProfileIdentity | None
+    invocation_context: InvocationContext | None = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +443,7 @@ class InterruptedToolRoundRequest:
     cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None
     cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
     execution_profile: ExecutionProfileIdentity | None = None
+    invocation_context: InvocationContext | None = None
 
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
@@ -929,6 +932,7 @@ class ToolRoundExecutor:
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> ToolRoundRun:
         return ToolRoundRun(
             self,
@@ -949,6 +953,7 @@ class ToolRoundExecutor:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         )
 
     def _targeted_tool_use_request(
@@ -1001,12 +1006,20 @@ class ToolRoundExecutor:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         pending_round: tool_round_recovery.PendingToolRound,
+        invocation_context: InvocationContext | None = None,
     ) -> tuple[
         tool_round_recovery.PendingToolRound,
         list[runtime_records.ToolCallRequest],
         tuple[Event, ...],
     ]:
         """Resolve and durably bind dynamic-tool calls before policy evaluation."""
+
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+        ):
+            raise RuntimeError("Targeted-tool resolution substituted frozen invocation authority.")
 
         source_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
         if not any(
@@ -1644,8 +1657,16 @@ class ToolRoundExecutor:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         tool_call: runtime_records.ToolCallRequest,
         task_id: str | None,
+        invocation_context: InvocationContext | None = None,
     ) -> tuple[Event, ...]:
         """Rejoin a previously bound targeted use before paused execution resumes."""
+
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+        ):
+            raise RuntimeError("Targeted-tool rejoin lost frozen invocation authority.")
 
         invocation = tool_call.targeted_tool_invocation
         if invocation is None:
@@ -1775,7 +1796,14 @@ class ToolRoundExecutor:
         tool_calls: list[runtime_records.ToolCallRequest],
         request_metadata: dict[str, Any],
         tool_exposure: ResolvedToolExposureAuthority | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> runtime_records.ToolRoundPolicyPlan:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+        ):
+            raise RuntimeError("Tool policy substituted frozen invocation authority.")
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         approval_policy_result: ToolPolicyResult | None = None
         approval_tool_call: runtime_records.ToolCallRequest | None = None
@@ -2715,6 +2743,7 @@ class ToolRoundExecutor:
         task_id: str | None,
         model_step: int | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         check_policy: bool = True,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
@@ -2740,6 +2769,13 @@ class ToolRoundExecutor:
         ) = None,
         rejoin_targeted_invocation: bool = False,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise RuntimeError("Tool execution lost frozen invocation authority.")
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         identity_payload = tool_round_identity.payload()
         tool_round_id = tool_round_identity.tool_round_id
@@ -2751,6 +2787,7 @@ class ToolRoundExecutor:
                 registered_environment=registered_environment,
                 tool_call=tool_call,
                 task_id=task_id,
+                invocation_context=invocation_context,
             )
             for rejoined_event in rejoined_events:
                 yield rejoined_event, None
@@ -3090,6 +3127,7 @@ class ToolRoundExecutor:
                 result=result,
                 task_id=task_id,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 redactor=invocation_redactor,
                 output_redactor=provisional_output_redactor,
                 deferred_terminal_stager=deferred_terminal_stager,
@@ -3152,6 +3190,7 @@ class ToolRoundExecutor:
                     result=result,
                     task_id=task_id,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                     redactor=invocation_redactor,
                     output_redactor=provisional_output_redactor,
                     deferred_terminal_stager=deferred_terminal_stager,
@@ -3207,6 +3246,7 @@ class ToolRoundExecutor:
             anchor_event=anchor_event,
             task_id=task_id,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             resolution=before_resolution,
             redactor=invocation_redactor,
             output_redactor=provisional_output_redactor,
@@ -3245,6 +3285,7 @@ class ToolRoundExecutor:
                 },
                 task_id=task_id,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
@@ -3281,6 +3322,7 @@ class ToolRoundExecutor:
                 },
                 task_id=task_id,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
@@ -3352,6 +3394,7 @@ class ToolRoundExecutor:
                     },
                     task_id=task_id,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                     tool_round_identity=tool_round_identity,
                     approval_id=approval_id,
                     input_id=input_id,
@@ -4610,6 +4653,7 @@ class ToolRoundExecutor:
                     },
                     task_id=task_id,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                     tool_round_identity=tool_round_identity,
                     approval_id=approval_id,
                     input_id=input_id,
@@ -4672,6 +4716,7 @@ class ToolRoundExecutor:
                     result=result,
                     task_id=task_id,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                     redactor=redactor,
                     output_redactor=output_redactor,
                     allow_modification=False,
@@ -4713,6 +4758,7 @@ class ToolRoundExecutor:
                 result=result,
                 task_id=task_id,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 redactor=redactor,
                 output_redactor=output_redactor,
                 argument_projection=argument_projection,
@@ -4771,7 +4817,19 @@ class ToolRoundExecutor:
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncIterator[Event]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or environment_name
+            != (
+                None
+                if invocation_context.registered_environment is None
+                else invocation_context.registered_environment.spec.name
+            )
+        ):
+            raise RuntimeError("MCP manifest validation lost frozen invocation authority.")
         candidates = _mcp_manifest_candidates_for_agent(
             registered_agent,
             environment_name=environment_name,
@@ -5205,6 +5263,7 @@ class ToolRoundExecutor:
         extra_payload: dict[str, Any],
         task_id: str | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
         tool_round_identity: ToolRoundIdentity,
         approval_id: str | None,
         input_id: str | None,
@@ -5241,6 +5300,7 @@ class ToolRoundExecutor:
             result=result,
             task_id=task_id,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             redactor=redactor,
             output_redactor=output_redactor,
             argument_projection=argument_projection,
@@ -5263,10 +5323,21 @@ class ToolRoundExecutor:
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None = None,
         quarantine_output: bool = False,
     ) -> AsyncIterator[Event]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise RuntimeError("Before-tool hooks lost frozen invocation authority.")
+        runtime_hooks = (
+            self._runtime_hooks if invocation_context is None else invocation_context.runtime_hooks
+        )
         for hooks, scope in (
-            (self._runtime_hooks, "app"),
+            (runtime_hooks, "app"),
             (registered_agent.runtime_hooks, "agent"),
         ):
             for registered_hook in hooks:
@@ -5419,8 +5490,16 @@ class ToolRoundExecutor:
         hooks_already_completed: bool = False,
         publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         executed_runtime_tool: object | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise RuntimeError("Tool-result publication lost frozen invocation authority.")
         if publish_before_hooks and allow_modification:
             raise ValueError("Pre-hook tool-result publication cannot allow hook modification.")
         if hooks_already_completed and (publish_before_hooks or allow_modification):
@@ -5567,6 +5646,7 @@ class ToolRoundExecutor:
                 result=result,
                 task_id=task_id,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 redactor=resolved_redactor,
                 output_redactor=resolved_output_redactor,
                 allow_modification=False,
@@ -5590,6 +5670,7 @@ class ToolRoundExecutor:
             result=final_result,
             task_id=task_id,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             redactor=resolved_redactor,
             output_redactor=resolved_output_redactor,
             allow_modification=allow_modification,
@@ -5749,12 +5830,23 @@ class ToolRoundExecutor:
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         allow_modification: bool = False,
         quarantine_output: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise RuntimeError("After-tool hooks lost frozen invocation authority.")
         current_result = result
+        runtime_hooks = (
+            self._runtime_hooks if invocation_context is None else invocation_context.runtime_hooks
+        )
         for hooks, scope in (
-            (self._runtime_hooks, "app"),
+            (runtime_hooks, "app"),
             (registered_agent.runtime_hooks, "agent"),
         ):
             async for hook_event, modified in self._run_scoped_tool_call_hooks(
@@ -5976,6 +6068,7 @@ class ToolRoundRun:
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
     ) -> None:
         self._executor = executor
         self._session = session
@@ -5995,6 +6088,14 @@ class ToolRoundRun:
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
         self._execution_profile = execution_profile
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise ValueError("Tool-round execution lost frozen invocation authority.")
+        self._invocation_context = invocation_context
         self.stopped_for_limit = False
 
     @property
@@ -6043,6 +6144,7 @@ class ToolRoundRun:
             registered_agent=self._registered_agent,
             registered_environment=self._registered_environment,
             pending_round=source_pending_round,
+            invocation_context=self._invocation_context,
         )
         for targeted_resolution_event in targeted_resolution_events:
             yield targeted_resolution_event
@@ -6062,6 +6164,7 @@ class ToolRoundRun:
                 tool_calls=tool_calls,
                 request_metadata=self._request_metadata,
                 tool_exposure=tool_exposure,
+                invocation_context=self._invocation_context,
             )
             await executor._session_control.raise_if_interrupted(session.id)
         except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
@@ -6434,6 +6537,7 @@ class ToolRoundRun:
                     result=result,
                     task_id=self._task_id,
                     execution_profile=self._execution_profile,
+                    invocation_context=self._invocation_context,
                     redactor=publication_coordinator.redactor,
                     output_redactor=publication_coordinator.redactor,
                     argument_projection=argument_projection,
@@ -6763,6 +6867,7 @@ class ToolRoundRun:
             turn_usage_tracker=self._turn_usage_tracker,
             active_run=self._active_run,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         async for event in self._executor._apply_limit_evaluation(request):
             yield event
@@ -6842,6 +6947,7 @@ class ToolRoundRun:
             cancellation_artifacts_by_id=cancellation_artifacts_by_id,
             cancellation_redactors_by_id=cancellation_redactors_by_id,
             execution_profile=self._execution_profile,
+            invocation_context=self._invocation_context,
         )
         async for event in self._executor._close_interrupted_round(request):
             yield event
@@ -6928,6 +7034,7 @@ class ToolRoundRun:
                 task_id=self._task_id,
                 model_step=model_step,
                 execution_profile=self._execution_profile,
+                invocation_context=self._invocation_context,
                 policy_result=policy_results_by_id.get(tool_call.id),
                 policy_evidence=policy_evidence_by_id.get(
                     tool_call.id,
@@ -6991,6 +7098,7 @@ class ToolRoundRun:
                         task_id=self._task_id,
                         model_step=model_step,
                         execution_profile=self._execution_profile,
+                        invocation_context=self._invocation_context,
                         policy_result=policy_results_by_id.get(tool_call.id),
                         policy_evidence=policy_evidence_by_id.get(
                             tool_call.id,

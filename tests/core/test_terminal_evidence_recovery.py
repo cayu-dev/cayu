@@ -154,6 +154,8 @@ def test_cayu_app_terminal_evidence_repair_is_status_consistent_and_idempotent(
 
 def test_cayu_app_terminal_evidence_repair_reconciles_lost_append_acknowledgement() -> None:
     class LostTerminalRepairAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -199,6 +201,8 @@ def test_cayu_app_terminal_evidence_repair_reconciles_lost_append_acknowledgemen
 
 def test_terminal_evidence_repair_reconciles_redacted_lost_append_acknowledgement() -> None:
     class LostRedactedTerminalRepairAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -755,6 +759,8 @@ def test_cayu_app_terminal_evidence_repair_scopes_evidence_to_latest_run() -> No
 
 def test_cayu_app_terminal_evidence_repair_serializes_concurrent_workers() -> None:
     class BlockingTerminalClaimStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.claimed = asyncio.Event()

@@ -58,6 +58,8 @@ from cayu.workspaces.revisions import WorkspaceIdentity, observe_deterministic_w
 class _TemporarySQLiteSessionStore(SQLiteSessionStore):
     """Disk-backed durable session store for fault-injection tests."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         self._temporary_directory = TemporaryDirectory(prefix="cayu-branch-tests-")
         super().__init__(Path(self._temporary_directory.name) / "sessions.sqlite3")
@@ -73,6 +75,7 @@ def _replace_owned_commit_guard(
 
 
 class _LoseGuardedAcknowledgementStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -88,6 +91,8 @@ class _LoseGuardedAcknowledgementStore(_TemporarySQLiteSessionStore):
 
 
 class _FailPublicationBeforeCommitStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.successes_before_failure: int | None = None
@@ -103,6 +108,8 @@ class _FailPublicationBeforeCommitStore(_TemporarySQLiteSessionStore):
 
 
 class _BlockAfterTerminalCommitStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.block_terminal_commit = False
@@ -131,6 +138,8 @@ class _BlockAfterTerminalCommitStore(_TemporarySQLiteSessionStore):
 
 
 class _CorruptLoadedBranchRecordStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.corrupt_branch_record = False
@@ -174,6 +183,8 @@ class _ConcurrentInitialLoadProxy:
 
 
 class _RewriteRetainedEvidenceStore(_FailPublicationBeforeCommitStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.rewrite_retained_evidence: str | None = None
@@ -239,6 +250,8 @@ class _RewriteRetainedEvidenceStore(_FailPublicationBeforeCommitStore):
 
 
 class _RewriteDurableExpiryStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.rewrite_mode: str | None = None
@@ -273,6 +286,7 @@ class _RewriteDurableExpiryStore(_TemporarySQLiteSessionStore):
 
 
 class _FailReconciliationLoadStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -296,6 +310,8 @@ class _FailReconciliationLoadStore(_TemporarySQLiteSessionStore):
 
 
 class _RedirectLoadedPrivateRootStore(_FailPublicationBeforeCommitStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.redirect_private_root: Path | None = None
@@ -322,6 +338,7 @@ class _RedirectLoadedPrivateRootStore(_FailPublicationBeforeCommitStore):
 class _DelayedCreatingGuardStore(_RedirectLoadedPrivateRootStore):
     """Hold two stale CREATING workers on independently released guards."""
 
+    invocation_lifecycle_command_version = 1
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -344,6 +361,8 @@ class _DelayedCreatingGuardStore(_RedirectLoadedPrivateRootStore):
 
 
 class _MissingTerminalEvidenceStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.terminal_state: str | None = None
@@ -364,6 +383,8 @@ class _MissingTerminalEvidenceStore(_TemporarySQLiteSessionStore):
 
 
 class _ContradictoryTerminalEvidenceStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.inject_rollback = False
@@ -384,6 +405,8 @@ class _ContradictoryTerminalEvidenceStore(_TemporarySQLiteSessionStore):
 
 
 class _RewritePublicationAuthorityStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.rewrite_publication_authority = False
@@ -412,6 +435,7 @@ class _RewritePublicationAuthorityStore(_TemporarySQLiteSessionStore):
 
 
 class _DriftGuardedCurrentRecordStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -442,6 +466,7 @@ class _DriftGuardedCurrentRecordStore(_TemporarySQLiteSessionStore):
 
 
 class _CrashInsideGuardStore(_TemporarySQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -1499,6 +1524,8 @@ def test_recovery_repeats_capture_after_process_loss_before_guard_dispatch(
         try:
 
             class StopAfterCreatingStore(SQLiteSessionStore):
+                invocation_lifecycle_command_version = 1
+
                 async def publish_session_operation(self, session_id: str, **kwargs):
                     await super().publish_session_operation(session_id, **kwargs)
                     creating_committed.write_text("ready")
@@ -2172,12 +2199,15 @@ def test_session_workspace_branch_store_rejects_missing_owned_guard_capability()
     assert store.calls == 0
 
     class UnsupportedInMemoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_owned_off_thread_session_commit_guards = False
 
     with pytest.raises(TypeError, match="owned off-thread session commit guards"):
         SessionWorkspaceBranchStore(runtime_checkpoint_session_store(UnsupportedInMemoryStore()))
 
     class UnsafeGuardOverride(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def publish_session_operation_guarded(self, session_id: str, **kwargs):
             return await super().publish_session_operation_guarded(session_id, **kwargs)
 
@@ -2188,6 +2218,7 @@ def test_session_workspace_branch_store_rejects_missing_owned_guard_capability()
         SessionWorkspaceBranchStore(runtime_checkpoint_session_store(unsafe))
 
     class ConformingGuardOverride(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_owned_off_thread_session_commit_guards = True
 
         async def publish_session_operation_guarded(self, session_id: str, **kwargs):

@@ -1883,7 +1883,6 @@ from cayu import (
     ScriptedModelProvider,
     SecretRedactor,
     SessionIdentity,
-    SessionInvocationAdmission,
     SessionInvocationBinding,
     SessionStatus,
     SQLiteSessionStore,
@@ -1894,7 +1893,10 @@ from cayu import (
     TaskStatus,
     ToolCapabilityCeiling,
 )
+from cayu.runtime import ActiveInvocationExecutionProfile, AdmitInvocationCommand
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
+from cayu.runtime._invocation_lifecycle import invocation_checkpoint_state_sha256
 from cayu.runtime.sessions import run_request_with_task_invocation
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.server import (
@@ -2732,6 +2734,13 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 ),
             ),
             identity=session_identity,
+            checkpoint_transform=lambda _session, checkpoint: (
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                }
+                if checkpoint is None
+                else checkpoint
+            ),
         )
         await first_service.cayu_app.task_store.start_task(
             reservation.operation.task_id,
@@ -2744,6 +2753,10 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
         )
         execution_profile = session_identity.execution_profile
         assert execution_profile is not None
+        runtime_session_store = runtime_checkpoint_session_store(
+            first_service.cayu_app.session_store
+        )
+        created_checkpoint = await runtime_session_store.load_checkpoint(created_session.id)
         interaction_id = "interaction_replacement_continuation"
         interaction_started_at = datetime.now(UTC)
         interaction_started_event_id = "interaction_start_replacement_continuation"
@@ -2760,21 +2773,26 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 started_at=interaction_started_at,
             ).model_dump(mode="json"),
         )
-        await first_service.cayu_app.session_store.admit_session_invocation(
-            reservation.operation.session_id,
-            admission=SessionInvocationAdmission(
-                from_statuses=frozenset({SessionStatus.PENDING}),
-                checkpoint_transform=lambda _session, checkpoint: (
-                    {
-                        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-                    }
-                    if checkpoint is None
-                    else checkpoint
+        await runtime_session_store.apply_invocation_lifecycle_command(
+            AdmitInvocationCommand(
+                session_id=reservation.operation.session_id,
+                expected_session_instance_id=created_session.instance_id,
+                expected_statuses=(SessionStatus.PENDING,),
+                expected_run_epoch=created_session.run_epoch,
+                expected_checkpoint_sha256=invocation_checkpoint_state_sha256(
+                    created_checkpoint
                 ),
-                execution_profile=execution_profile,
+                target_active_profile=ActiveInvocationExecutionProfile(
+                    session_id=reservation.operation.session_id,
+                    interaction_id=interaction_id,
+                    run_epoch=created_session.run_epoch + 1,
+                    profile=execution_profile,
+                ),
                 tool_capability_ceiling=tool_capability_ceiling,
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=(original_message,),
+                defer_interaction_source=True,
+                allow_pending_initial_interaction=True,
             ),
         )
 

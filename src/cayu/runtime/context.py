@@ -90,6 +90,7 @@ from cayu.runtime._model_errors import (
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY,
     RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION,
 )
@@ -1331,6 +1332,10 @@ def _copy_secret_free_context_checkpoint_evidence(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Copy the two checkpoint representations through one validation seam."""
 
+    if checkpoint is not None and INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in checkpoint:
+        raise ValueError(
+            f"{checkpoint_field_name} cannot contain private invocation lifecycle authority."
+        )
     safe_checkpoint = (
         None
         if checkpoint is None
@@ -6380,15 +6385,33 @@ def project_compaction_invocation_checkpoint(
 
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
-    if checkpoint is None:
+    projected = project_runtime_managed_context_checkpoint(checkpoint)
+    if projected is None:
         return None
-    projected = copy_json_value(checkpoint, "checkpoint")
     compaction = projected.get(_COMPACTION_CHECKPOINT_KEY)
     if type(compaction) is not dict:
         return projected
     summary = compaction.get("summary")
     if type(summary) is str:
         compaction["summary"] = redactor.redact_text(summary)
+    return projected
+
+
+def project_runtime_managed_context_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Project checkpoint state visible to checkpoint-aware context policies.
+
+    Invocation lifecycle receipts are private store/runtime authority. A
+    generic context policy may carry ordinary checkpoint state forward, but it
+    must neither observe that receipt ledger nor acquire its provenance by
+    returning an identically named object.
+    """
+
+    if checkpoint is None:
+        return None
+    projected = copy_json_value(checkpoint, "checkpoint")
+    projected.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     return projected
 
 

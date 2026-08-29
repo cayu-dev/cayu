@@ -301,6 +301,8 @@ class _FakeRemoteFactory(EnvironmentFactory):
 
 
 class _AcknowledgementLossStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, fail_after_transform: int) -> None:
         super().__init__()
         self._fail_after_transform = fail_after_transform
@@ -323,6 +325,8 @@ class _AcknowledgementLossStore(InMemorySessionStore):
 
 
 class _PublicationReadbackLossStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._armed = False
@@ -351,6 +355,8 @@ class _PublicationReadbackLossStore(InMemorySessionStore):
 
 
 class _FatalSignalAfterTransformStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, fail_after_transform: int) -> None:
         super().__init__()
         self._fail_after_transform = fail_after_transform

@@ -36,6 +36,7 @@ from cayu import (
     ExecutionProfileAuthorityDecision,
     ExecutionProfileBehaviorIdentity,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
     ExecutionProfileMismatchError,
     ExecutionProfilePolicy,
@@ -70,7 +71,6 @@ from cayu import (
     RuntimeHookContext,
     ScriptedModelProvider,
     SessionIdentity,
-    SessionInvocationAdmission,
     SessionQuery,
     SessionRunFenced,
     SessionStatus,
@@ -93,6 +93,7 @@ from cayu import (
     session_fork_profile_relationship,
     session_prompt_anatomy_transition,
 )
+from cayu.core.events import event_with_runtime_envelope_authority
 from cayu.environments.factory import register_environment_factory_cleanup_retry
 from cayu.providers import (
     ModelProvider,
@@ -106,7 +107,16 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
 )
-from cayu.runtime import SessionStore, _approval_support, _tool_round_recovery
+from cayu.runtime import (
+    AdmitInvocationCommand,
+    InteractionTransitionSpec,
+    InvocationContext,
+    SessionStore,
+    SettleInvocationCommand,
+    _approval_support,
+    _tool_round_recovery,
+)
+from cayu.runtime._invocation_lifecycle import invocation_checkpoint_state_sha256
 from cayu.runtime._model_step_executor import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_coordinator import RecoverySessionRunRequest
 from cayu.runtime.checkpoints import (
@@ -119,9 +129,13 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
     build_execution_profile_identity,
+    changed_execution_profile_components,
     checkpoint_with_active_invocation_execution_profile,
+    execution_profile_baseline_from_session_metadata,
+    execution_profile_decision_payload,
     execution_profile_from_session_metadata,
 )
+from cayu.runtime.sessions import _invocation_lifecycle_authority_mutation_scope
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor
@@ -292,15 +306,17 @@ class RecordingAdoptionPolicy(ExecutionProfilePolicy):
 
 
 class FailFirstRunFenceReleaseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.release_calls = 0
 
-    async def release_run_fence(self, session_id: str) -> None:
+    async def release_session_invocation(self, command: Any) -> Any:
         self.release_calls += 1
         if self.release_calls == 1:
             raise ConnectionError("simulated deferred run-fence release failure")
-        await super().release_run_fence(session_id)
+        return await super().release_session_invocation(command)
 
 
 class MutatingRetryProvider(ModelProvider):
@@ -503,7 +519,11 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
         )
         if checkpoint_variant == "future-schema":
             checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
-        await store.checkpoint(session_id, checkpoint)
+            # Corrupt the raw durable row so this recovery-boundary test does
+            # not ask the now fail-closed public checkpoint API to accept it.
+            store._checkpoints[session_id] = checkpoint
+        else:
+            await store.checkpoint(session_id, checkpoint)
 
         async def unexpected_run_session(**_kwargs):
             raise AssertionError("Invalid recovery authority reached session execution.")
@@ -793,6 +813,8 @@ def test_profiled_fork_reconciles_ambiguous_custom_store_results(
     store_outcome: str,
 ) -> None:
     class AmbiguousForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create_profiled_fork(self, *args, **kwargs):
             result = await super().create_profiled_fork(*args, **kwargs)
             if store_outcome == "lost_acknowledgement":
@@ -870,6 +892,8 @@ def test_profiled_fork_store_rejects_controls_that_conflict_with_relationship(
     tampered_control: str,
 ) -> None:
     class TamperingForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create_profiled_fork(self, *args, **kwargs):
             if tampered_control == "transcript_cursor":
                 kwargs["transcript_cursor"] = 0
@@ -924,6 +948,8 @@ def test_profiled_fork_store_rejects_controls_that_conflict_with_relationship(
 
 def test_profiled_fork_store_child_cancellation_is_not_caller_cancellation() -> None:
     class ChildCancelledForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create_profiled_fork(self, *args, **kwargs):
             raise asyncio.CancelledError("store child cancelled itself")
 
@@ -967,6 +993,8 @@ def test_profiled_fork_store_child_cancellation_is_not_caller_cancellation() -> 
 
 def test_profiled_fork_cancellation_waits_for_dispatched_store_mutation() -> None:
     class CommitThenBlockForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.committed = asyncio.Event()
@@ -1042,6 +1070,8 @@ def test_profiled_fork_supervisory_exit_waits_for_store_settlement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class CommitThenBlockForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.committed = asyncio.Event()
@@ -2248,6 +2278,7 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
             else SQLiteSessionStore(tmp_path / "fork-active-parent-profile.sqlite")
         )
         tool = RecordingExternalTool(description="Active invocation tool")
+        app = CayuApp(session_store=store, enable_logging=False)
         baseline_identity = profiled_session_identity(
             provider_name="fake",
             model="fake-model",
@@ -2273,23 +2304,78 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
             ),
             identity=baseline_identity,
         )
-        source = await store.transition_status(
-            source.id,
-            from_statuses={SessionStatus.PENDING},
-            to_status=SessionStatus.RUNNING,
+        interaction_id = f"active-parent-interaction-{store_kind}"
+        changed = changed_execution_profile_components(baseline, active)
+        actor = ResolutionActor(
+            subject="active-parent-fork-fixture",
+            source=ResolutionActorSource.REQUEST,
         )
-        checkpoint = checkpoint_with_active_invocation_execution_profile(
-            {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION},
-            session_id=source.id,
-            interaction_id=f"active-parent-interaction-{store_kind}",
-            run_epoch=source.run_epoch,
-            profile=active,
+        decision_fields = {
+            "kind": ExecutionProfileDecisionKind.ADOPTED,
+            "expected_profile": baseline,
+            "candidate_profile": active,
+            "changed_component_classes": changed,
+            "policy_identity": "tests:active-parent-fork-adoption:v1",
+            "policy_reason": "Construct the adopted active-parent fixture.",
+            "authority_decision": ExecutionProfileAuthorityDecision.AUTHORIZED,
+            "idempotency_identity": f"active-parent-fork-{store_kind}",
+            "adoption_request_fingerprint": "a" * 64,
+            "actor": actor,
+            "reason": "Exercise fork selection from adopted active authority.",
+        }
+        decision = ExecutionProfileDecision(
+            **decision_fields,
+            event=event_with_runtime_envelope_authority(
+                Event(
+                    type=EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+                    session_id=source.id,
+                    agent_name="assistant",
+                    payload=execution_profile_decision_payload(**decision_fields),
+                ),
+                "session_id",
+            ),
         )
-        await store.checkpoint(source.id, checkpoint)
+        started_event = event_with_runtime_envelope_authority(
+            Event(
+                type=EventType.INTERACTION_STARTED,
+                session_id=source.id,
+                interaction_id=interaction_id,
+                agent_name="assistant",
+            ),
+            "session_id",
+            "interaction_id",
+        )
+        admitted = await app._runtime_session_store.apply_invocation_lifecycle_command(
+            AdmitInvocationCommand(
+                session_id=source.id,
+                expected_session_instance_id=source.instance_id,
+                expected_statuses=(SessionStatus.PENDING,),
+                expected_run_epoch=source.run_epoch,
+                expected_checkpoint_sha256=invocation_checkpoint_state_sha256(
+                    await store.load_checkpoint(source.id)
+                ),
+                target_active_profile=ActiveInvocationExecutionProfile(
+                    session_id=source.id,
+                    interaction_id=interaction_id,
+                    run_epoch=source.run_epoch + 1,
+                    profile=active,
+                ),
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=(tool.spec.name,)),
+                interaction_started_event=started_event,
+                execution_profile_decision=decision,
+            )
+        )
+        source = admitted.session
         source = await store.transition_status(
             source.id,
             from_statuses={SessionStatus.RUNNING},
             to_status=SessionStatus.COMPLETED,
+        )
+        assert (
+            active_invocation_execution_profile_from_checkpoint(
+                await store.load_checkpoint(source.id)
+            )
+            == admitted.active_profile
         )
 
         provider = ScriptedModelProvider(
@@ -2299,7 +2385,6 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
             ],
             name="fake",
         )
-        app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -2319,16 +2404,18 @@ def test_fork_inherits_active_parent_invocation_as_independent_child_baseline(
         child = await store.load(child_id)
         assert unchanged_parent is not None
         assert child is not None
-        assert execution_profile_from_session_metadata(unchanged_parent.metadata) == baseline
+        assert (
+            execution_profile_baseline_from_session_metadata(unchanged_parent.metadata) == baseline
+        )
+        assert execution_profile_from_session_metadata(unchanged_parent.metadata) == active
         assert execution_profile_from_session_metadata(child.metadata) == active
+        assert execution_profile_baseline_from_session_metadata(child.metadata) == active
         relationship = session_fork_profile_relationship(child)
         assert relationship is not None
         assert relationship.source_profile_source.value == "active_invocation"
         assert relationship.source_profile == active
         assert relationship.selected_profile == active
-        assert relationship.source_active_interaction_id == (
-            f"active-parent-interaction-{store_kind}"
-        )
+        assert relationship.source_active_interaction_id == (interaction_id)
 
         resumed = await collect(
             app.resume(
@@ -3449,6 +3536,97 @@ def test_repaired_failed_deferred_release_does_not_poison_next_invocation() -> N
     asyncio.run(scenario())
 
 
+def test_cleanup_does_not_release_successor_from_prior_terminal_event() -> None:
+    async def scenario() -> None:
+        session_id = "active-profile-stale-terminal-cleanup"
+        store = InMemorySessionStore()
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("first invocation complete"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            name="fake",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        first_events = await collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "finish the first invocation")],
+                )
+            )
+        )
+        prior_terminal = first_events[-1]
+        assert prior_terminal.type is EventType.SESSION_COMPLETED
+
+        released = await store.load(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        prior_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        assert released is not None
+        assert prior_profile is not None
+        successor_interaction_id = "successor-without-terminal-evidence"
+        successor_started = app._session_engine._interaction_started_event(
+            session=released,
+            registered_agent=app._agents["assistant"],
+            environment_name=None,
+            interaction_id=successor_interaction_id,
+        )
+        successor = await app._runtime_session_store.apply_invocation_lifecycle_command(
+            AdmitInvocationCommand(
+                session_id=session_id,
+                expected_session_instance_id=released.instance_id,
+                expected_statuses=(SessionStatus.COMPLETED,),
+                expected_run_epoch=released.run_epoch,
+                expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
+                target_active_profile=ActiveInvocationExecutionProfile(
+                    session_id=session_id,
+                    interaction_id=successor_interaction_id,
+                    run_epoch=released.run_epoch + 1,
+                    profile=prior_profile.profile,
+                ),
+                tool_capability_ceiling=released.tool_capability_ceiling,
+                interaction_started_event=successor_started,
+                interaction_source_messages=(Message.text("user", "start successor"),),
+                expected_active_profile=prior_profile,
+            )
+        )
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+        terminal_records_before = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_COMPLETED,
+            )
+        )
+        assert len(terminal_records_before) == 1
+
+        await app._environment_lifecycle._release_quiescent_invocation_fence(
+            session_id,
+            invocation_context=None,
+            terminal_event=None,
+        )
+
+        retained = await store.load(session_id)
+        retained_checkpoint = await store.load_checkpoint(session_id)
+        assert retained is not None
+        assert retained.run_epoch == successor.session.run_epoch
+        assert (
+            active_invocation_execution_profile_from_checkpoint(retained_checkpoint)
+            == successor.active_profile
+        )
+        terminal_records = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_COMPLETED,
+            )
+        )
+        assert terminal_records == terminal_records_before
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 def test_profile_adoption_waits_for_terminal_hook_release_in_local_stores(
     store_kind: str,
@@ -3549,25 +3727,46 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     model_profiles: list[ExecutionProfileIdentity | None] = []
     tool_profiles: list[ExecutionProfileIdentity | None] = []
     cleanup_profiles: list[ExecutionProfileIdentity | None] = []
+    model_contexts: list[InvocationContext | None] = []
+    tool_contexts: list[InvocationContext | None] = []
+    cleanup_contexts: list[InvocationContext | None] = []
+    terminal_hook_contexts: list[InvocationContext | None] = []
+    turn_completion_contexts: list[InvocationContext | None] = []
     original_model_run_factory = app._model_step_executor.create_run
     original_tool_run_factory = app._tool_round_executor.create_run
     original_terminal_cleanup = app._environment_lifecycle.finalize_terminal_event
+    original_runtime_hook_runner = app._session_engine._run_runtime_hooks
+    original_turn_completion = app._session_engine._emit_turn_completed
 
     def capture_model_run(**kwargs):
         model_profiles.append(kwargs["execution_profile"])
+        model_contexts.append(kwargs["invocation_context"])
         return original_model_run_factory(**kwargs)
 
     def capture_tool_run(**kwargs):
         tool_profiles.append(kwargs["execution_profile"])
+        tool_contexts.append(kwargs["invocation_context"])
         return original_tool_run_factory(**kwargs)
 
     async def capture_terminal_cleanup(**kwargs):
         cleanup_profiles.append(kwargs["execution_profile"])
+        cleanup_contexts.append(kwargs["invocation_context"])
         return await original_terminal_cleanup(**kwargs)
+
+    async def capture_runtime_hooks(**kwargs):
+        terminal_hook_contexts.append(kwargs["invocation_context"])
+        async for event in original_runtime_hook_runner(**kwargs):
+            yield event
+
+    async def capture_turn_completion(**kwargs):
+        turn_completion_contexts.append(kwargs["invocation_context"])
+        return await original_turn_completion(**kwargs)
 
     app._model_step_executor.create_run = capture_model_run
     app._tool_round_executor.create_run = capture_tool_run
     app._environment_lifecycle.finalize_terminal_event = capture_terminal_cleanup
+    app._session_engine._run_runtime_hooks = capture_runtime_hooks
+    app._session_engine._emit_turn_completed = capture_turn_completion
     replacement_app = CayuApp(enable_logging=False)
     replacement_app.register_provider(replacement_provider, default=True)
     replacement_app.register_agent(
@@ -3605,6 +3804,14 @@ async def _assert_provider_retry_keeps_process_local_resolution_after_mutation(
     assert len(model_profiles) == len(tool_profiles) == len(cleanup_profiles) == 1
     assert model_profiles[0] is tool_profiles[0]
     assert cleanup_profiles[0] is model_profiles[0]
+    assert len(model_contexts) == len(tool_contexts) == len(cleanup_contexts) == 1
+    assert model_contexts[0] is not None
+    assert tool_contexts[0] is model_contexts[0]
+    assert cleanup_contexts[0] is model_contexts[0]
+    assert terminal_hook_contexts
+    assert all(context is model_contexts[0] for context in terminal_hook_contexts)
+    assert turn_completion_contexts == [model_contexts[0]]
+    assert model_contexts[0].profile is model_profiles[0]
     assert original_hook.before_tool_execution_profiles == [model_profiles[0]]
     assert original_hook.before_tool_execution_profiles[0] is model_profiles[0]
     assert original_hook.after_tool_execution_profiles == [model_profiles[0]]
@@ -4125,7 +4332,24 @@ def test_cancelled_continuation_claim_keeps_prevalidated_runtime_after_registrat
 ):
     async def scenario() -> None:
         session_id = "active-profile-cancelled-continuation-claim"
-        store = InMemorySessionStore()
+
+        class MutateAfterContinuationClaimStore(InMemorySessionStore):
+            invocation_lifecycle_command_version = 1
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.after_claim: Callable[[], None] | None = None
+
+            async def transition_status_and_checkpoint(self, *args, **kwargs):
+                result = await super().transition_status_and_checkpoint(*args, **kwargs)
+                if (
+                    kwargs.get("to_status") is SessionStatus.RUNNING
+                    and self.after_claim is not None
+                ):
+                    self.after_claim()
+                return result
+
+        store = MutateAfterContinuationClaimStore()
         hook = RecordingCompletionHook("continuation-claim-hook")
         replacement_hook = RecordingCompletionHook("continuation-claim-hook")
         app = CayuApp(session_store=store, enable_logging=False)
@@ -4169,19 +4393,15 @@ def test_cancelled_continuation_claim_keeps_prevalidated_runtime_after_registrat
         )
         hook.interrupted_execution_profiles.clear()
 
-        original_transition = store.transition_status_and_checkpoint
         continuation_task: asyncio.Task[list[Event]] | None = None
 
-        async def mutate_after_claim(*args, **kwargs):
-            result = await original_transition(*args, **kwargs)
-            if kwargs.get("to_status") is SessionStatus.RUNNING:
-                app._agents["assistant"] = replacement_app._agents["assistant"]
-                if continuation_task is None:
-                    raise AssertionError("Continuation task was not registered.")
-                continuation_task.cancel("cancel after continuation claim")
-            return result
+        def mutate_after_claim() -> None:
+            app._agents["assistant"] = replacement_app._agents["assistant"]
+            if continuation_task is None:
+                raise AssertionError("Continuation task was not registered.")
+            continuation_task.cancel("cancel after continuation claim")
 
-        store.transition_status_and_checkpoint = mutate_after_claim
+        store.after_claim = mutate_after_claim
         continuation_task = asyncio.create_task(
             collect(
                 app.resolve_user_input(
@@ -4264,13 +4484,20 @@ def test_failed_continuation_resume_cleanup_keeps_prevalidated_profile_object(
 
         finalized_profiles: list[ExecutionProfileIdentity | None] = []
         released_profiles: list[ExecutionProfileIdentity | None] = []
+        released_contexts: list[InvocationContext | None] = []
 
         async def record_finalization(_session_id: str, **kwargs) -> None:
             finalized_profiles.append(kwargs.get("execution_profile"))
 
-        async def record_release(*, session_id: str, execution_profile=None) -> None:
+        async def record_release(
+            *,
+            session_id: str,
+            execution_profile=None,
+            invocation_context=None,
+        ) -> None:
             assert session_id == active_profile.session_id
             released_profiles.append(execution_profile)
+            released_contexts.append(invocation_context)
 
         coordinator = app._recovery_coordinator
         monkeypatch.setattr(
@@ -4305,6 +4532,9 @@ def test_failed_continuation_resume_cleanup_keeps_prevalidated_profile_object(
         assert finalized_profiles[0] is active_profile.profile
         assert released_profiles == [active_profile.profile]
         assert released_profiles[0] is active_profile.profile
+        assert len(released_contexts) == 1
+        assert released_contexts[0] is not None
+        assert released_contexts[0].profile is active_profile.profile
 
     asyncio.run(scenario())
 
@@ -4726,19 +4956,28 @@ async def _assert_snapshot_only_restart_profile_boundary(
     )
 
     async def admit_without_releasing() -> None:
-        running = await store.admit_session_invocation(
-            session_id,
-            admission=SessionInvocationAdmission(
-                from_statuses=frozenset({SessionStatus.COMPLETED}),
-                checkpoint_transform=lambda _session, current: current,
-                execution_profile=prior_profile.profile,
+        admitted = await original_app._runtime_session_store.apply_invocation_lifecycle_command(
+            AdmitInvocationCommand(
+                session_id=session_id,
+                expected_session_instance_id=released.instance_id,
+                expected_statuses=(SessionStatus.COMPLETED,),
+                expected_run_epoch=released.run_epoch,
+                expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
+                target_active_profile=ActiveInvocationExecutionProfile(
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                    run_epoch=released.run_epoch + 1,
+                    profile=prior_profile.profile,
+                ),
                 tool_capability_ceiling=released.tool_capability_ceiling,
                 interaction_started_event=interaction_started,
                 interaction_source_messages=(
                     Message.text("user", "crash before the next durable stage"),
                 ),
-            ),
+                expected_active_profile=prior_profile,
+            )
         )
+        running = admitted.session
         assert running.status is SessionStatus.RUNNING
         if restart_state == "missing":
             await store.transform_checkpoint(
@@ -4757,6 +4996,10 @@ async def _assert_snapshot_only_restart_profile_boundary(
                     "active_invocation_execution_profile": {"record_type": "invalid"},
                 },
             )
+        current_active = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert current_active == admitted.active_profile
 
     # A child task models process-local fence authority disappearing without
     # advancing the durable epoch, as it would after worker loss.
@@ -4786,7 +5029,20 @@ async def _assert_snapshot_only_restart_profile_boundary(
         tools=[RecordingExternalTool(description=replacement_description)],
         runtime_hooks=[recovery_hook],
     )
-    if restart_state == "unchanged":
+    recovery_settlement_contexts: list[InvocationContext] = []
+    original_recovery_interruption = (
+        replacement_app._recovery_coordinator._interrupt_session_for_recovery
+    )
+
+    async def capture_recovery_interruption(request: Any):
+        recovery_settlement_contexts.append(request.invocation_context)
+        async for event in original_recovery_interruption(request):
+            yield event
+
+    replacement_app._recovery_coordinator._interrupt_session_for_recovery = (
+        capture_recovery_interruption
+    )
+    if restart_state != "changed":
         result = await replacement_app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
@@ -4794,6 +5050,11 @@ async def _assert_snapshot_only_restart_profile_boundary(
         assert result.status is SessionStatus.INTERRUPTED
         assert len(recovery_hook.interrupted_execution_profiles) == 1
         assert recovery_hook.interrupted_execution_profiles[0] == prior_profile.profile
+        assert len(recovery_settlement_contexts) == 1
+        recovery_context = recovery_settlement_contexts[0]
+        assert recovery_context.registered_agent is replacement_app._agents["assistant"]
+        assert recovery_context.registered_provider is replacement_app._providers["fake"]
+        assert recovery_hook.interrupted_execution_profiles[0] is recovery_context.profile
         recovered = await store.load(session_id)
         recovered_checkpoint = await store.load_checkpoint(session_id)
         recovered_profile = active_invocation_execution_profile_from_checkpoint(
@@ -4803,18 +5064,12 @@ async def _assert_snapshot_only_restart_profile_boundary(
         assert recovered_profile is not None
         assert recovered_profile.run_epoch == recovered.run_epoch - 1
     else:
-        expected_error: type[Exception] = (
-            ExecutionProfileMismatchError
-            if restart_state == "changed"
-            else RuntimeError
-            if restart_state == "missing"
-            else ValueError
-        )
-        with pytest.raises(expected_error):
+        with pytest.raises(ExecutionProfileMismatchError):
             await replacement_app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(session_id=session_id)
             )
         assert recovery_hook.interrupted_execution_profiles == []
+        assert recovery_settlement_contexts == []
         after = await store.load(session_id)
         assert after is not None
         assert after.run_epoch == crashed.run_epoch
@@ -4931,6 +5186,7 @@ def test_worker_recovery_accepts_never_admitted_profiled_pending_session(
 
 def test_worker_recovery_rejects_malformed_never_admitted_profile_baseline() -> None:
     class MalformedBaselineStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         corrupt_reads = False
 
         async def load(self, session_id: str):
@@ -5025,7 +5281,7 @@ def test_worker_recovery_releases_terminal_invocation_owner(
                     messages=[Message.text("user", "create a recovery target")],
                     tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
                 ),
-                identity=SessionIdentity(
+                identity=profiled_session_identity(
                     provider_name="fake",
                     model="fake-model",
                     execution_profile=prior_profile.profile,
@@ -5040,23 +5296,35 @@ def test_worker_recovery_releases_terminal_invocation_owner(
             )
 
             async def publish_terminal_without_releasing() -> None:
-                await original_app._runtime_session_store.admit_session_invocation(
-                    session_id,
-                    admission=SessionInvocationAdmission(
-                        from_statuses=frozenset({SessionStatus.PENDING}),
-                        checkpoint_transform=lambda _session, current: current,
-                        execution_profile=prior_profile.profile,
-                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
-                        interaction_started_event=interaction_started,
-                        interaction_source_messages=(
-                            Message.text("user", "finish before worker loss"),
-                        ),
-                    ),
+                admitted = (
+                    await original_app._runtime_session_store.apply_invocation_lifecycle_command(
+                        AdmitInvocationCommand(
+                            session_id=session_id,
+                            expected_session_instance_id=pending.instance_id,
+                            expected_statuses=(SessionStatus.PENDING,),
+                            expected_run_epoch=pending.run_epoch,
+                            expected_checkpoint_sha256=invocation_checkpoint_state_sha256(
+                                await store.load_checkpoint(session_id)
+                            ),
+                            target_active_profile=ActiveInvocationExecutionProfile(
+                                session_id=session_id,
+                                interaction_id=interaction_id,
+                                run_epoch=pending.run_epoch + 1,
+                                profile=prior_profile.profile,
+                            ),
+                            tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                            interaction_started_event=interaction_started,
+                            interaction_source_messages=(
+                                Message.text("user", "finish before worker loss"),
+                            ),
+                        )
+                    )
                 )
                 completed_at = interaction_started.timestamp
-                await store.publish_interaction_transition(
-                    session_id,
-                    event=Event(
+                active_profile = admitted.active_profile
+                assert active_profile is not None
+                terminal_event = event_with_runtime_envelope_authority(
+                    Event(
                         type=EventType.INTERACTION_COMPLETED,
                         session_id=session_id,
                         interaction_id=interaction_id,
@@ -5069,8 +5337,21 @@ def test_worker_recovery_releases_terminal_invocation_owner(
                             completed_at=completed_at,
                         ).model_dump(mode="json"),
                     ),
-                    from_statuses={SessionStatus.RUNNING},
-                    to_status=SessionStatus.COMPLETED,
+                    "session_id",
+                    "interaction_id",
+                )
+                await original_app._runtime_session_store.apply_invocation_lifecycle_command(
+                    SettleInvocationCommand(
+                        session_id=session_id,
+                        expected_session_instance_id=pending.instance_id,
+                        expected_run_epoch=active_profile.run_epoch,
+                        expected_active_profile=active_profile,
+                        transition=InteractionTransitionSpec(
+                            event=terminal_event,
+                            from_statuses=(SessionStatus.RUNNING,),
+                            to_status=SessionStatus.COMPLETED,
+                        ),
+                    )
                 )
                 await store.append_event(
                     session_id,
@@ -5181,7 +5462,9 @@ async def _assert_crashed_model_operation_rejects_invalid_restart_before_recover
             )
         )
     )
-    await asyncio.wait_for(adapter.start_entered.wait(), timeout=1.0)
+    # This is a test synchronization bound, not a runtime deadline. PostgreSQL
+    # schema/bootstrap work can legitimately precede provider dispatch.
+    await asyncio.wait_for(adapter.start_entered.wait(), timeout=10.0)
 
     replacement_description = "Replacement tool."
     expected_error: type[Exception] = ExecutionProfileMismatchError
@@ -5190,17 +5473,18 @@ async def _assert_crashed_model_operation_rejects_invalid_restart_before_recover
         checkpoint = await store.load_checkpoint(session_id)
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         assert active_profile is not None
-        await store.transform_checkpoint(
-            session_id,
-            lambda _session, current: checkpoint_with_active_invocation_execution_profile(
-                current,
-                session_id=session_id,
-                interaction_id="different-open-interaction",
-                run_epoch=active_profile.run_epoch,
-                profile=active_profile.profile,
-                expected=active_profile,
-            ),
-        )
+        with _invocation_lifecycle_authority_mutation_scope():
+            await store.transform_checkpoint(
+                session_id,
+                lambda _session, current: checkpoint_with_active_invocation_execution_profile(
+                    current,
+                    session_id=session_id,
+                    interaction_id="different-open-interaction",
+                    run_epoch=active_profile.run_epoch,
+                    profile=active_profile.profile,
+                    expected=active_profile,
+                ),
+            )
         await store.release_run_fence(session_id)
         replacement_description = "Original tool."
         expected_error = RuntimeError

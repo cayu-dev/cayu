@@ -78,6 +78,7 @@ from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.runtime.sessions import (
     _mcp_authoritative_manifest_hash,
@@ -165,6 +166,8 @@ class FakeMcpClient(McpClient):
 
 
 class RacingManifestSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._publication_arrivals = 0
@@ -183,6 +186,8 @@ class RacingManifestSessionStore(InMemorySessionStore):
 
 
 class ManifestMutationSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.on_manifest_load: Callable[[], None] | None = None
@@ -661,6 +666,7 @@ def test_runtime_composes_mcp_session_secrets_before_durable_tool_checkpoint() -
         checkpoint_without_active_profile.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
         is not None
     )
+    checkpoint_without_active_profile.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
     assert checkpoint_without_active_profile == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }
@@ -1082,6 +1088,8 @@ def test_runtime_fails_closed_on_invalid_loaded_manifest_baseline(corruption: st
     secret = "sensitive-corrupt-baseline"
 
     class InvalidBaselineStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_mcp_manifest_baselines(self, history_keys):
             event = Event(
                 type=EventType.MCP_MANIFEST_CHECKED,
@@ -1155,6 +1163,7 @@ def test_runtime_recovers_after_malformed_authoritative_baseline_is_removed(
     alternate_hash = "sha256:" + "f" * 64
 
     class ToggleMalformedBaselineStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         return_malformed_baseline = False
 
         async def load_stored_baselines(self, history_keys):
@@ -2245,6 +2254,7 @@ def test_runtime_fails_closed_on_duplicate_mcp_connection_identities() -> None:
 
 def test_runtime_fails_closed_when_session_store_lacks_manifest_history() -> None:
     class UnsupportedManifestHistoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_mcp_manifest_history = False
 
     async def run():
@@ -2370,6 +2380,8 @@ def test_runtime_audits_explicit_sibling_when_identity_is_missing() -> None:
 
 def test_runtime_classifies_internal_manifest_store_cancellation_as_failure() -> None:
     class InternallyCancelledManifestStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_mcp_manifest_baselines(self, history_keys):
             del history_keys
             child = asyncio.create_task(asyncio.sleep(60))
@@ -2414,6 +2426,8 @@ def test_runtime_classifies_internal_manifest_store_cancellation_as_failure() ->
 
 def test_runtime_does_not_reclassify_internal_manifest_cancellation_from_history() -> None:
     class InternallyCancelledManifestStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_mcp_manifest_baselines(self, history_keys):
             del history_keys
             child = asyncio.create_task(asyncio.sleep(60))
@@ -2471,6 +2485,8 @@ def test_runtime_does_not_reclassify_internal_manifest_cancellation_from_history
 
 def test_runtime_preserves_real_cancellation_during_manifest_load() -> None:
     class BlockingManifestStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self):
             super().__init__()
             self.load_started = asyncio.Event()
@@ -2517,6 +2533,8 @@ def test_runtime_preserves_real_cancellation_during_manifest_load() -> None:
 
 def test_runtime_preserves_caller_cancellation_swallowed_during_manifest_load() -> None:
     class SwallowingManifestStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self):
             super().__init__()
             self.load_started = asyncio.Event()
@@ -2566,6 +2584,8 @@ def test_runtime_preserves_caller_cancellation_swallowed_during_manifest_load() 
 
 def test_runtime_preserves_cancellation_swallowed_after_manifest_commit() -> None:
     class CommitThenSwallowCancellationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self):
             super().__init__()
             self.pause_next_publication = True
@@ -3205,6 +3225,7 @@ def test_sqlite_runtime_sanitizes_corrupt_manifest_baseline(
     path = tmp_path / f"manifest-{corruption_stage}-{corruption}.sqlite3"
 
     class CorruptAfterLoadStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
         corrupt_after_load = False
 
         def corrupt_baseline(self, history_key: str) -> None:
@@ -3475,6 +3496,8 @@ def test_concurrent_manifest_checks_serialize_different_first_baselines() -> Non
 
 def test_manifest_publication_lost_ack_is_fail_closed_and_retry_safe() -> None:
     class CommitThenRaiseManifestStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self):
             super().__init__()
             self.lose_next_ack = True
@@ -3563,6 +3586,8 @@ def test_manifest_publication_lost_ack_is_fail_closed_and_retry_safe() -> None:
 
 def test_manifest_publication_rejects_incomplete_success_ack_and_retries_safely() -> None:
     class IncompleteSuccessManifestStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self):
             super().__init__()
             self.return_incomplete_success = True

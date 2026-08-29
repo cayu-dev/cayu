@@ -75,6 +75,7 @@ from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.tools import ExecCommandTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
@@ -5219,6 +5220,7 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
     assert set(checkpoint) == {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION

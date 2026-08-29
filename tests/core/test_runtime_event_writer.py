@@ -106,6 +106,8 @@ class _FlakySink(EventSink):
 
 
 class _ConcurrentClaimSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def append_event(self, session_id: str, event: Event) -> None:
         await super().append_event(session_id, event)
         claim = await self.claim_persisted_event_side_effect(
@@ -116,6 +118,8 @@ class _ConcurrentClaimSessionStore(InMemorySessionStore):
 
 
 class _PendingSnapshotSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._decline_next_exact_claim = True
@@ -138,11 +142,15 @@ class _PendingSnapshotSessionStore(InMemorySessionStore):
 
 
 class _LostAcknowledgementSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def mark_persisted_event_side_effect_delivered(self, claim):
         raise PersistedEventSideEffectClaimLost("replacement worker owns the claim")
 
 
 class _BrokenAcknowledgementSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._ack_failures_remaining = 1
@@ -168,6 +176,8 @@ class _BrokenAcknowledgementSessionStore(InMemorySessionStore):
 
 
 class _LostFailureAcknowledgementSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def mark_persisted_event_side_effect_failed(
         self,
         claim,
@@ -180,6 +190,8 @@ class _LostFailureAcknowledgementSessionStore(InMemorySessionStore):
 
 
 class _BrokenFailureBookkeepingSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def mark_persisted_event_side_effect_failed(
         self,
         claim,
@@ -192,6 +204,8 @@ class _BrokenFailureBookkeepingSessionStore(InMemorySessionStore):
 
 
 class _BrokenSinkDiagnosticSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def append_event(self, session_id: str, event: Event) -> None:
         if event.type == EventType.RUNTIME_SINK_FAILED:
             raise RuntimeError("diagnostic store unavailable")
@@ -244,6 +258,7 @@ def test_event_writer_requires_the_session_store_alias_codec() -> None:
         )
 
     class StoreWithoutCodec(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_public_authority_aliases = False
 
         @property
@@ -612,6 +627,8 @@ def test_persist_leaves_side_effect_delivery_for_recovery() -> None:
 
 def test_is_persisted_uses_bounded_event_id_query() -> None:
     class _QueryTrackingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.queries: list[EventQuery | None] = []

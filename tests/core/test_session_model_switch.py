@@ -229,6 +229,8 @@ class _RecordingOpenAIProvider(OpenAIProvider):
 
 
 class _PendingRoundRaceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.inject_pending_round = False
@@ -248,6 +250,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
         execution_profile=None,
         execution_profile_decision=None,
         tool_capability_ceiling=None,
+        result_checkpoint_transform=None,
     ):
         if self.inject_pending_round and model_transition is not None:
             self.inject_pending_round = False
@@ -283,10 +286,13 @@ class _PendingRoundRaceStore(InMemorySessionStore):
             execution_profile=execution_profile,
             execution_profile_decision=execution_profile_decision,
             tool_capability_ceiling=tool_capability_ceiling,
+            result_checkpoint_transform=result_checkpoint_transform,
         )
 
 
 class _SnapshotTrackingStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.snapshot_refs: list[weakref.ReferenceType] = []
@@ -298,6 +304,8 @@ class _SnapshotTrackingStore(InMemorySessionStore):
 
 
 class _CorruptingProjectionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.corrupt_projection_cursor = False
@@ -314,6 +322,8 @@ class _CorruptingProjectionStore(InMemorySessionStore):
 
 
 class _FailingToolRoundPublicationSQLiteStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.failed_tool_round_close_once = False
@@ -1553,7 +1563,10 @@ def test_model_switch_atomically_rejects_a_concurrent_pending_tool_round() -> No
         transcript_before = await store.load_transcript("switch-pending-round-race")
         store.inject_pending_round = True
 
-        with pytest.raises(RuntimeError, match="tool-round recovery is pending"):
+        with pytest.raises(
+            RuntimeError,
+            match="Invocation admission source checkpoint changed after command preparation",
+        ):
             await _collect(
                 app.resume(
                     ResumeRequest(

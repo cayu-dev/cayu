@@ -2247,6 +2247,8 @@ def test_external_invalid_tool_output_survives_swallowed_interruption_without_re
 
 def test_external_invalid_tool_output_precedes_proxy_telemetry_failure_and_replays_once():
     class FailProxyTelemetryOnceStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False

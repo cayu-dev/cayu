@@ -57,10 +57,12 @@ class _PromotionProvider(ModelProvider):
 
 
 class _NoTerminalEvidenceSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_terminal_session_evidence = False
 
 
 class _NoSessionLineageStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_session_lineage = False
 
 

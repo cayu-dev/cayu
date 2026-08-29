@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
-from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
@@ -13,6 +12,7 @@ from cayu.core.events import Event
 from cayu.core.tools import ToolContext, ToolResult, _runtime_tool_invocation_authority
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
 from cayu.runtime._durable_subagents import (
     DurableSubagentSubmissionIntent,
     DurableSubagentSubmissionReceipt,
@@ -72,6 +72,7 @@ from cayu.runtime.sessions import (
     SessionRunFenced,
     SessionStatus,
     SessionStore,
+    _invocation_lifecycle_authority_read_scope,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     copy_run_request,
@@ -196,23 +197,10 @@ class DurableSubagentCoordinator:
         self,
         session_id: str,
     ) -> tuple[Session, dict[str, Any] | None]:
-        snapshot: tuple[Session, dict[str, Any] | None] | None = None
-
-        def capture_snapshot(
-            session: Session,
-            checkpoint: dict[str, Any] | None,
-        ) -> None:
-            nonlocal snapshot
-            snapshot = (
-                session.model_copy(deep=True),
-                None if checkpoint is None else deepcopy(checkpoint),
-            )
-            return None
-
-        await self.session_store.transform_checkpoint(session_id, capture_snapshot)
-        if snapshot is None:
-            raise RuntimeError("Durable subagent session snapshot was not produced.")
-        return snapshot
+        return await load_runtime_session_checkpoint_snapshot(
+            self._runtime_session_store,
+            session_id,
+        )
 
     async def submit(
         self,
@@ -413,10 +401,11 @@ class DurableSubagentCoordinator:
             )
 
         try:
-            await self._runtime_session_store.transform_checkpoint(
-                parent.id,
-                persist_parent_seed,
-            )
+            with _invocation_lifecycle_authority_read_scope():
+                await self._runtime_session_store.transform_checkpoint(
+                    parent.id,
+                    persist_parent_seed,
+                )
         except Exception as publication_failure:
             try:
                 parent_checkpoint = await self._runtime_session_store.load_checkpoint(parent.id)
@@ -533,10 +522,11 @@ class DurableSubagentCoordinator:
             )
 
         try:
-            await self._runtime_session_store.transform_checkpoint(
-                seed.parent_session_id,
-                persist_rejection,
-            )
+            with _invocation_lifecycle_authority_read_scope():
+                await self._runtime_session_store.transform_checkpoint(
+                    seed.parent_session_id,
+                    persist_rejection,
+                )
         except Exception as publication_failure:
             try:
                 checkpoint = await self._runtime_session_store.load_checkpoint(
@@ -599,10 +589,11 @@ class DurableSubagentCoordinator:
             )
 
         try:
-            await self._runtime_session_store.transform_checkpoint(
-                intent.parent_session_id,
-                persist_receipt,
-            )
+            with _invocation_lifecycle_authority_read_scope():
+                await self._runtime_session_store.transform_checkpoint(
+                    intent.parent_session_id,
+                    persist_receipt,
+                )
         except Exception as publication_failure:
             try:
                 checkpoint = await self._runtime_session_store.load_checkpoint(
@@ -828,10 +819,11 @@ class DurableSubagentCoordinator:
             return checkpoint_with_durable_subagent_submission(checkpoint, intent=intent)
 
         try:
-            await self._runtime_session_store.transform_checkpoint(
-                parent.id,
-                persist_parent_intent,
-            )
+            with _invocation_lifecycle_authority_read_scope():
+                await self._runtime_session_store.transform_checkpoint(
+                    parent.id,
+                    persist_parent_intent,
+                )
         except Exception as publication_failure:
             try:
                 reconciled_checkpoint = await self._runtime_session_store.load_checkpoint(parent.id)

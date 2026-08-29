@@ -1190,20 +1190,8 @@ def build_execution_profile_identity(
             ExecutionProfileIdentityStrength.STRUCTURAL,
             {"system_prompt": durable_system_prompt},
         ),
-        _available_component(
-            ExecutionProfileComponentClass.PROVIDER_TARGET,
-            ExecutionProfileIdentityStrength.STRUCTURAL,
-            {"provider_name": provider_name, "model": model},
-        ),
-        (
-            _available_component(
-                ExecutionProfileComponentClass.RUNTIME,
-                ExecutionProfileIdentityStrength.STRUCTURAL,
-                {"runtime_name": runtime_name, "runtime_version": runtime_version},
-            )
-            if runtime_version is not None
-            else _unavailable_component(ExecutionProfileComponentClass.RUNTIME)
-        ),
+        execution_profile_provider_target_component(provider_name, model),
+        execution_profile_runtime_component(runtime_name, runtime_version),
     )
     sorted_components = tuple(sorted(components, key=lambda component: component.component_class))
     return ExecutionProfileIdentity(
@@ -1213,6 +1201,44 @@ def build_execution_profile_identity(
         ),
         components=sorted_components,
         egress_authority=egress_authority,
+    )
+
+
+def execution_profile_provider_target_component(
+    provider_name: str,
+    model: str,
+) -> ExecutionProfileComponentIdentity:
+    """Return the canonical provider/model component used by profile construction."""
+
+    return _available_component(
+        ExecutionProfileComponentClass.PROVIDER_TARGET,
+        ExecutionProfileIdentityStrength.STRUCTURAL,
+        {
+            "provider_name": require_durable_clean_nonblank(provider_name, "provider_name"),
+            "model": require_durable_clean_nonblank(model, "model"),
+        },
+    )
+
+
+def execution_profile_runtime_component(
+    runtime_name: str,
+    runtime_version: str | None,
+) -> ExecutionProfileComponentIdentity:
+    """Return the canonical runtime component used by profile construction."""
+
+    runtime_name = require_durable_clean_nonblank(runtime_name, "runtime_name")
+    if runtime_version is None:
+        return _unavailable_component(ExecutionProfileComponentClass.RUNTIME)
+    return _available_component(
+        ExecutionProfileComponentClass.RUNTIME,
+        ExecutionProfileIdentityStrength.STRUCTURAL,
+        {
+            "runtime_name": runtime_name,
+            "runtime_version": require_durable_clean_nonblank(
+                runtime_version,
+                "runtime_version",
+            ),
+        },
     )
 
 

@@ -10,9 +10,20 @@ from cayu.runtime.checkpoints import (
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE,
+)
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ExecutionProfileIdentity,
+    execution_profile_from_session_metadata,
 )
 from cayu.runtime.structured_output import json_schema_contains_secret
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_exposure import (
+    TOOL_CAPABILITY_CEILING_METADATA_KEY,
+    tool_capability_ceiling_from_session_metadata,
+)
 from cayu.runtime.tool_grants import ResolvedTargetedToolInvocation, validate_targeted_tool_digest
 from cayu.vaults import SecretRedactor
 
@@ -114,6 +125,8 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
         "receipt_manifest_binding_hmac_sha256",
         "resolution_request_digest",
         "situation_sha256",
+        "source_root_digest",
+        "target_root_digest",
         "user_message_sha256",
         "user_text_sha256",
         "fingerprint",
@@ -128,6 +141,7 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
     "approval_close_intent",
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     "components",
     "assistant_publication",
     "approval_resolution_intent",
@@ -450,6 +464,7 @@ _QUARANTINED_ASSISTANT_MESSAGE_UNTRUSTED_CONTAINERS = frozenset(
 _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         AUTOMATIC_RECALL_CHECKPOINT_KEY,
         COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
@@ -555,13 +570,23 @@ def durable_value_contains_secret(
     path: tuple[str, ...] = (),
     _trusted_web_control_paths: frozenset[tuple[str, ...]] = frozenset(),
     _trusted_targeted_tool_references: frozenset[tuple[tuple[str, ...], str]] | None = None,
+    _trusted_lifecycle_receipt_values: frozenset[tuple[tuple[str, ...], str]] | None = None,
+    _trusted_lifecycle_receipt_keys: frozenset[tuple[tuple[str, ...], str]] | None = None,
 ) -> bool:
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
     if _trusted_targeted_tool_references is None:
         _trusted_targeted_tool_references = _targeted_tool_reference_authority(value, path=path)
+    if _trusted_lifecycle_receipt_values is None or _trusted_lifecycle_receipt_keys is None:
+        (
+            _trusted_lifecycle_receipt_values,
+            _trusted_lifecycle_receipt_keys,
+        ) = _invocation_lifecycle_receipt_metadata_authority(value, path=path)
     if type(value) is str:
-        if (path, value) in _trusted_targeted_tool_references:
+        if (path, value) in _trusted_targeted_tool_references or (
+            path,
+            value,
+        ) in _trusted_lifecycle_receipt_values:
             return False
         if path in _trusted_web_control_paths:
             # Exact closed controls are runtime protocol, not copied workload
@@ -614,6 +639,8 @@ def durable_value_contains_secret(
                 path=path,
                 _trusted_web_control_paths=_trusted_web_control_paths,
                 _trusted_targeted_tool_references=_trusted_targeted_tool_references,
+                _trusted_lifecycle_receipt_values=_trusted_lifecycle_receipt_values,
+                _trusted_lifecycle_receipt_keys=_trusted_lifecycle_receipt_keys,
             )
             for item in value
         )
@@ -642,6 +669,8 @@ def durable_value_contains_secret(
                     key in (_DURABLE_ROOT_STRUCTURE_KEYS if not path else _DURABLE_STRUCTURE_KEYS)
                     or _is_durable_subagent_structural_key(path, key)
                     or _is_completion_result_event_publication_structural_key(path, key)
+                    or _is_invocation_lifecycle_receipt_structural_key(path, key)
+                    or (path, key) in _trusted_lifecycle_receipt_keys
                     or _is_quarantined_assistant_message_structural_key(path, key)
                     or _is_staged_terminal_event_payload(path)
                 )
@@ -665,6 +694,8 @@ def durable_value_contains_secret(
                 path=(*path, key),
                 _trusted_web_control_paths=trusted_web_control_paths,
                 _trusted_targeted_tool_references=_trusted_targeted_tool_references,
+                _trusted_lifecycle_receipt_values=_trusted_lifecycle_receipt_values,
+                _trusted_lifecycle_receipt_keys=_trusted_lifecycle_receipt_keys,
             ):
                 return True
         return False
@@ -750,6 +781,116 @@ def _targeted_tool_reference_authority(
     return frozenset(trusted)
 
 
+def _invocation_lifecycle_receipt_metadata_authority(
+    value: Any,
+    *,
+    path: tuple[str, ...],
+) -> tuple[
+    frozenset[tuple[tuple[str, ...], str]],
+    frozenset[tuple[tuple[str, ...], str]],
+]:
+    """Authenticate duplicated runtime metadata inside command receipts."""
+
+    if path or type(value) is not dict:
+        return frozenset(), frozenset()
+    raw_ledger = value.get(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    if type(raw_ledger) is not dict or raw_ledger.get("record_type") != (
+        INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE
+    ):
+        return frozenset(), frozenset()
+    try:
+        from cayu.runtime._invocation_lifecycle import (
+            _invocation_lifecycle_receipt_ledger_from_checkpoint,
+        )
+
+        ledger = _invocation_lifecycle_receipt_ledger_from_checkpoint(
+            {INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY: raw_ledger}
+        )
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        return frozenset(), frozenset()
+
+    trusted_values: set[tuple[tuple[str, ...], str]] = set()
+    trusted_keys: set[tuple[tuple[str, ...], str]] = set()
+
+    def retain_projection(projected: Any, projected_path: tuple[str, ...]) -> None:
+        if type(projected) is str:
+            trusted_values.add((projected_path, projected))
+            return
+        if type(projected) is list:
+            for item in projected:
+                retain_projection(item, projected_path)
+            return
+        if type(projected) is dict:
+            for key, item in projected.items():
+                trusted_keys.add((projected_path, key))
+                retain_projection(item, (*projected_path, key))
+
+    def retain_authenticated_receipt_identities(
+        projected: Any,
+        projected_path: tuple[str, ...],
+    ) -> None:
+        if type(projected) is str:
+            if _is_invocation_lifecycle_receipt_identity_path(projected_path):
+                trusted_values.add((projected_path, projected))
+            return
+        if type(projected) is list:
+            for item in projected:
+                retain_authenticated_receipt_identities(item, projected_path)
+            return
+        if type(projected) is dict:
+            for key, item in projected.items():
+                retain_authenticated_receipt_identities(item, (*projected_path, key))
+
+    # Identity-shaped text is trusted only after the complete ledger, every
+    # receipt, and their content digests have authenticated it. A malformed
+    # ledger therefore contributes no path exemptions at all.
+    retain_authenticated_receipt_identities(
+        ledger.model_dump(mode="json"),
+        (INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,),
+    )
+
+    for receipt in ledger.receipts:
+        raw_metadata = receipt.result_session.metadata
+        if EXECUTION_PROFILE_METADATA_KEY not in raw_metadata:
+            continue
+        raw_profile_record = raw_metadata[EXECUTION_PROFILE_METADATA_KEY]
+        if type(raw_profile_record) is not dict:
+            return frozenset(), frozenset()
+        try:
+            if set(raw_profile_record) != {"record_type", "schema_version", "baseline", "expected"}:
+                return frozenset(), frozenset()
+            execution_profile_from_session_metadata(raw_metadata)
+            baseline = ExecutionProfileIdentity.model_validate(raw_profile_record["baseline"])
+            expected = ExecutionProfileIdentity.model_validate(raw_profile_record["expected"])
+        except (TypeError, ValueError):
+            return frozenset(), frozenset()
+        profile_path = (
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            "receipts",
+            "result_session",
+            "metadata",
+        )
+        trusted_keys.add((profile_path, EXECUTION_PROFILE_METADATA_KEY))
+        record_path = (*profile_path, EXECUTION_PROFILE_METADATA_KEY)
+        for key in ("record_type", "schema_version", "baseline", "expected"):
+            trusted_keys.add((record_path, key))
+        retain_projection(raw_profile_record["record_type"], (*record_path, "record_type"))
+        retain_projection(baseline.model_dump(mode="json"), (*record_path, "baseline"))
+        retain_projection(expected.model_dump(mode="json"), (*record_path, "expected"))
+
+        raw_ceiling = raw_metadata.get(TOOL_CAPABILITY_CEILING_METADATA_KEY)
+        if raw_ceiling is not None:
+            try:
+                tool_capability_ceiling_from_session_metadata(raw_metadata)
+            except (TypeError, ValueError):
+                return frozenset(), frozenset()
+            # The key is runtime-owned and its value was fingerprint-validated.
+            # Tool names remain subject to redaction: unlike the profile's closed
+            # enum identities, they can carry caller-selected text.
+            trusted_keys.add((profile_path, TOOL_CAPABILITY_CEILING_METADATA_KEY))
+    return frozenset(trusted_values), frozenset(trusted_keys)
+
+
 def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:
     if path in _ACTIVE_INVOCATION_PROFILE_ROOT_IDENTITY_PATHS:
         return True
@@ -763,6 +904,102 @@ def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:
         )
         and path[-1] in _ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS
     )
+
+
+def _is_invocation_lifecycle_receipt_identity_path(path: tuple[str, ...]) -> bool:
+    if len(path) == 2 and path[0] == INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY:
+        return path[1] in {
+            "record_type",
+            "release_capacity_command_identity",
+            "record_sha256",
+        }
+    if len(path) == 3 and path[:2] == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+    ):
+        return path[2] in {
+            "record_type",
+            "kind",
+            "command_identity",
+            "command_sha256",
+            "session_id",
+            "session_instance_id",
+            "record_sha256",
+        }
+    if len(path) == 4 and path[:3] == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+        "result_session",
+    ):
+        return path[3] in {
+            "id",
+            "instance_id",
+            "agent_name",
+            "environment_name",
+            "workflow_name",
+            "provider_name",
+            "model",
+            "parent_session_id",
+            "causal_budget_id",
+            "runtime_name",
+            "runtime_version",
+            "status",
+            "created_at",
+            "updated_at",
+            "last_activity_at",
+        }
+    if len(path) == 5 and path[:4] == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+        "result_session",
+        "invocation",
+    ):
+        return path[4] in {
+            "root_invocation_id",
+            "root_session_id",
+            "source",
+        }
+    return (
+        len(path) >= 4
+        and path[:3]
+        == (
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            "receipts",
+            "active_profile",
+        )
+        and _is_active_invocation_profile_identity_path(
+            (ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, *path[3:])
+        )
+    )
+
+
+def _is_invocation_lifecycle_receipt_structural_key(
+    path: tuple[str, ...],
+    key: str,
+) -> bool:
+    if path == (INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,):
+        return key in {
+            "record_type",
+            "schema_version",
+            "receipts",
+            "release_capacity_command_identity",
+            "record_sha256",
+        }
+    return path == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+    ) and key in {
+        "record_type",
+        "schema_version",
+        "kind",
+        "command_identity",
+        "command_sha256",
+        "session_id",
+        "session_instance_id",
+        "result_session",
+        "active_profile",
+        "record_sha256",
+    }
 
 
 def _is_workspace_observation_identity_path(path: tuple[str, ...]) -> bool:
@@ -805,6 +1042,8 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
     """Return whether `path` remains inside a known runtime-owned checkpoint shape."""
 
     if _is_completion_result_event_publication_schema_path(path):
+        return True
+    if path and path[0] == INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY:
         return True
     if path and path[0] not in _DURABLE_ROOT_STRUCTURE_KEYS:
         return False

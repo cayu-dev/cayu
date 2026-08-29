@@ -3876,6 +3876,8 @@ async def _resume_public(app: CayuApp, *, session_id: str) -> list[Any]:
 
 
 class _FailingFirstCompletedToolEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_terminal_once = False
@@ -3902,6 +3904,8 @@ class _FingerprintedEnvironmentFactory(EnvironmentFactory):
 
 
 class _ConflictingDispatchEvidenceStore(_FailingFirstCompletedToolEventStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, field_name: str) -> None:
         super().__init__()
         self.field_name = field_name
@@ -3928,6 +3932,7 @@ class _ConflictingDispatchEvidenceStore(_FailingFirstCompletedToolEventStore):
 
 
 class _FenceAfterDispatchAndFailFirstFailureStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_atomic_model_completion_stage_release = True
 
     def __init__(self) -> None:
@@ -3985,6 +3990,7 @@ class _FenceAfterDispatchAndFailFirstFailureStore(InMemorySessionStore):
 
 
 class _BlockAfterIsolatedDispatchPublicationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_atomic_model_completion_stage_release = True
 
     def __init__(self) -> None:

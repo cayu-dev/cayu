@@ -397,6 +397,8 @@ def test_session_inspection_summary_conforms_to_native_event_and_usage_aggregate
     path = tmp_path / "data" / "cayu.db"
 
     class BoundedInspectionStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load(self, session_id: str) -> Session | None:
             raise AssertionError("inspect_summary must not materialize session metadata")
 

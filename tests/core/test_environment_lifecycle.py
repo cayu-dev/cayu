@@ -35,6 +35,7 @@ from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
     InMemorySessionStore,
+    InvocationContext,
     ResumeRequest,
     RunRequest,
     SessionIdentity,
@@ -499,6 +500,8 @@ def test_checkpoint_preservation_rejects_deleting_transform() -> None:
 
 def test_cancellation_during_factory_resolution_finalizes_before_fence_release() -> None:
     class OrderingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lifecycle_order: list[str] = []
@@ -511,6 +514,10 @@ def test_cancellation_during_factory_resolution_finalizes_before_fence_release()
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             only_if_no_queued_messages: bool = False,
+            model_completion_stage_settlement=None,
+            expected_session_instance_id: str | None = None,
+            expected_active_invocation_profile=None,
+            expected_invocation_authority_state="active",
         ):
             result = await super().publish_interaction_transition(
                 session_id,
@@ -518,14 +525,18 @@ def test_cancellation_during_factory_resolution_finalizes_before_fence_release()
                 from_statuses=from_statuses,
                 to_status=to_status,
                 only_if_no_queued_messages=only_if_no_queued_messages,
+                model_completion_stage_settlement=model_completion_stage_settlement,
+                expected_session_instance_id=expected_session_instance_id,
+                expected_active_invocation_profile=expected_active_invocation_profile,
+                expected_invocation_authority_state=expected_invocation_authority_state,
             )
             if to_status == SessionStatus.INTERRUPTED:
                 self.lifecycle_order.append("finalized")
             return result
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             self.lifecycle_order.append("released")
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     class BlockingFactory(EnvironmentFactory):
         def __init__(self) -> None:
@@ -769,6 +780,8 @@ def test_lazy_environment_cleanup_sweep_rotates_failed_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -792,6 +805,7 @@ def test_lazy_environment_cleanup_sweep_rotates_failed_prefix(
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
             execution_profile: Any = None,
+            invocation_context: Any = None,
         ) -> None:
             del original_error
             assert allow_deferred_settlement
@@ -819,6 +833,8 @@ def test_lazy_environment_cleanup_does_not_await_unresolved_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -838,8 +854,10 @@ def test_lazy_environment_cleanup_does_not_await_unresolved_owner(
             session_id: str,
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
+            execution_profile: Any = None,
+            invocation_context: Any = None,
         ) -> None:
-            del original_error
+            del original_error, execution_profile, invocation_context
             assert allow_deferred_settlement
             attempts.append(session_id)
             if session_id == "blocked":
@@ -876,6 +894,8 @@ def test_lazy_environment_cleanup_bounds_unresolved_settlement_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -894,8 +914,10 @@ def test_lazy_environment_cleanup_bounds_unresolved_settlement_tasks(
             session_id: str,
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
+            execution_profile: Any = None,
+            invocation_context: Any = None,
         ) -> None:
-            del original_error
+            del original_error, execution_profile, invocation_context
             assert allow_deferred_settlement
             attempts.append(session_id)
             await release.wait()
@@ -925,6 +947,8 @@ def test_lazy_environment_cleanup_bounds_unresolved_settlement_tasks(
 
 def test_lazy_cleanup_retries_internal_cancellation_from_prior_event_loop() -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -940,9 +964,11 @@ def test_lazy_cleanup_retries_internal_cancellation_from_prior_event_loop() -> N
         session_id: str,
         original_error: BaseException | None,
         allow_deferred_settlement: bool = False,
+        execution_profile: Any = None,
+        invocation_context: Any = None,
     ) -> None:
         nonlocal attempts
-        del original_error
+        del original_error, execution_profile, invocation_context
         assert session_id == "prior-loop"
         assert allow_deferred_settlement
         attempts += 1
@@ -967,6 +993,8 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -1001,6 +1029,7 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
             execution_profile: Any = None,
+            invocation_context: Any = None,
         ) -> None:
             nonlocal attempts, settlement_task
             if session_id != "cancelled-cleanup-owner":
@@ -1009,6 +1038,7 @@ def test_lazy_cleanup_child_cancellation_does_not_cancel_unrelated_admission(
                     original_error=original_error,
                     allow_deferred_settlement=allow_deferred_settlement,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 )
                 return
             assert allow_deferred_settlement
@@ -1079,6 +1109,8 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -1107,6 +1139,7 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
             original_error: BaseException | None,
             allow_deferred_settlement: bool = False,
             execution_profile: Any = None,
+            invocation_context: Any = None,
         ) -> None:
             nonlocal attempts
             if session_id != "blocked-owner":
@@ -1115,6 +1148,7 @@ def test_unresolved_lazy_cleanup_does_not_block_unrelated_environment_setup(
                     original_error=original_error,
                     allow_deferred_settlement=allow_deferred_settlement,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 )
                 return
             assert allow_deferred_settlement
@@ -2546,6 +2580,8 @@ def test_environment_cleanup_drain_timeout_keeps_mutation_task_owned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -2605,6 +2641,8 @@ def test_environment_cleanup_drain_cancellation_keeps_mutation_task_owned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class RetainedCleanup:
+        execution_profile = None
+        invocation_context = None
         cleanup_started = True
         cleanup_finished = True
         cleanup_settlement_task = None
@@ -2766,7 +2804,9 @@ def test_binding_settlement_error_is_not_misclassified_as_runtime_quarantine() -
     assert "collision-session" in lifecycle._active_environment_setups
 
 
-def test_lazy_environment_cleanup_retries_fatal_only_finalization() -> None:
+def test_lazy_environment_cleanup_retries_fatal_only_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fatal_signal = GeneratorExit("binding finalization interrupted")
 
     class FatalOnceBinding(_RecordingWorkspaceBinding):
@@ -2790,7 +2830,7 @@ def test_lazy_environment_cleanup_retries_fatal_only_finalization() -> None:
             self.abandon_calls.append(bound)
             return True
 
-    async def run() -> FatalOnceBinding:
+    async def run() -> tuple[FatalOnceBinding, InvocationContext]:
         binding = FatalOnceBinding()
         app = CayuApp(enable_logging=False)
         app.register_provider(
@@ -2808,6 +2848,19 @@ def test_lazy_environment_cleanup_retries_fatal_only_finalization() -> None:
         )
         app.register_environment(Environment(EnvironmentSpec(name="cleanup-trigger")))
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        retry_contexts: list[InvocationContext | None] = []
+        original_abort = app._environment_lifecycle.abort_environment_setup
+
+        async def capture_cleanup_retry(**kwargs: Any) -> None:
+            if kwargs.get("allow_deferred_settlement"):
+                retry_contexts.append(kwargs.get("invocation_context"))
+            await original_abort(**kwargs)
+
+        monkeypatch.setattr(
+            app._environment_lifecycle,
+            "abort_environment_setup",
+            capture_cleanup_retry,
+        )
 
         with pytest.raises(GeneratorExit, match="binding finalization interrupted"):
             await _collect_events(
@@ -2821,6 +2874,12 @@ def test_lazy_environment_cleanup_retries_fatal_only_finalization() -> None:
         assert "sess_fatal_binding_cleanup" in (
             app._environment_lifecycle._active_environment_setups
         )
+        retained_owner = app._environment_lifecycle._active_environment_setups[
+            "sess_fatal_binding_cleanup"
+        ]
+        retained_context = retained_owner.invocation_context
+        assert retained_context is not None
+        assert retained_context.registered_environment is retained_owner.registered_environment
         assert binding.abandon_calls == []
 
         events = await _collect_events(
@@ -2836,9 +2895,11 @@ def test_lazy_environment_cleanup_retries_fatal_only_finalization() -> None:
         assert "sess_fatal_binding_cleanup" not in (
             app._environment_lifecycle._active_environment_setups
         )
-        return binding
+        assert retry_contexts == [retained_context]
+        return binding, retained_context
 
-    binding = asyncio.run(run())
+    binding, retained_context = asyncio.run(run())
     assert len(binding.finalize_calls) == 2
     assert len(binding.abandon_calls) == 1
     assert binding.abandon_calls[0] is binding.finalize_calls[0]["bound"]
+    assert repr(retained_context) == "InvocationContext(<authenticated>)"

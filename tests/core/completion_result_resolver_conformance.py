@@ -89,6 +89,8 @@ class _TwoOwnerBarrierResolver(CompletionResultResolver):
 
 
 class _FailResultEventOnceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._fail_result_event_once = True

@@ -33,7 +33,7 @@ Hardening guarantees the smoke/behavioral suites did not reach:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -158,10 +158,39 @@ def _scripted_assistant_app(
     batches,
     *,
     provider_name: str = "scripted",
+    session_store: InMemorySessionStore | None = None,
 ) -> tuple[CayuApp, ScriptedModelProvider]:
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(session_store=session_store, enable_logging=False)
     provider = _register_scripted_assistant(app, batches, provider_name=provider_name)
     return app, provider
+
+
+class _WorkflowCreateOutcomeStore(InMemorySessionStore):
+    """Inject one post-commit workflow-child outcome without method shadowing."""
+
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.before_create: Callable[[RunRequest, dict[str, Any]], Awaitable[None]] | None = None
+        self.after_create: Callable[[RunRequest], None] | None = None
+        self.after_create_async: Callable[[RunRequest], Awaitable[None]] | None = None
+        self.before_load: Callable[[str], None] | None = None
+
+    async def create(self, request: RunRequest, **kwargs: Any):
+        if self.before_create is not None:
+            await self.before_create(request, kwargs)
+        created = await super().create(request, **kwargs)
+        if self.after_create is not None:
+            self.after_create(request)
+        if self.after_create_async is not None:
+            await self.after_create_async(request)
+        return created
+
+    async def load(self, session_id: str):
+        if self.before_load is not None:
+            self.before_load(session_id)
+        return await super().load(session_id)
 
 
 class SideEffectTool(Tool):
@@ -1121,6 +1150,7 @@ def test_gated_loop_replays_unversioned_legacy_identity_that_looks_like_v2(
 
 def test_step_replay_ids_returns_a_bounded_number_of_records_for_many_steps() -> None:
     class CountingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         returned_event_records = 0
         candidate_event_records = 0
 
@@ -3102,6 +3132,7 @@ def test_concurrent_first_step_is_durably_reserved_before_child_run():
 
 def test_step_reservation_cannot_commit_after_attempt_takeover() -> None:
     class DelayedReservationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         stale_entered = asyncio.Event()
         release_stale = asyncio.Event()
 
@@ -3346,20 +3377,23 @@ def test_caller_cannot_forge_workflow_session_create_claim() -> None:
 def test_generated_workflow_child_collision_during_create_never_attaches_or_reads_foreign(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    original_create = store.create
-    original_load = store.load
     foreign_created = False
     foreign_reads = 0
 
-    async def create_with_foreign_winner(request: RunRequest, **kwargs: Any):
+    async def create_with_foreign_winner(
+        request: RunRequest,
+        kwargs: dict[str, Any],
+    ) -> None:
         nonlocal foreign_created
         if request.session_id == "collision" and not foreign_created:
             foreign_created = True
-            await original_create(
+            await InMemorySessionStore.create(
+                store,
                 request.model_copy(
                     update={
                         "parent_session_id": None,
@@ -3371,17 +3405,15 @@ def test_generated_workflow_child_collision_during_create_never_attaches_or_read
                 ),
                 identity=kwargs["identity"],
             )
-        return await original_create(request, **kwargs)
 
-    async def load_with_foreign_read_probe(session_id: str):
+    def load_with_foreign_read_probe(session_id: str) -> None:
         nonlocal foreign_reads
         if foreign_created and session_id == "collision":
             foreign_reads += 1
-        return await original_load(session_id)
 
     async def run() -> tuple[object, list[Event]]:
-        monkeypatch.setattr(store, "create", create_with_foreign_winner)
-        monkeypatch.setattr(store, "load", load_with_foreign_read_probe)
+        store.before_create = create_with_foreign_winner
+        store.before_load = load_with_foreign_read_probe
         monkeypatch.setattr(
             "cayu.workflows.workflow.generate_child_session_id",
             lambda **_kwargs: "collision",
@@ -3395,7 +3427,7 @@ def test_generated_workflow_child_collision_during_create_never_attaches_or_read
                 prompt="go",
             )
 
-        foreign = await original_load("collision")
+        foreign = await InMemorySessionStore.load(store, "collision")
         records = await store.query_events(EventQuery(session_id="different-parent", limit=20))
         return foreign, [record.event for record in records]
 
@@ -3405,7 +3437,10 @@ def test_generated_workflow_child_collision_during_create_never_attaches_or_read
     assert foreign.metadata["owner"] == "foreign"
     assert foreign.parent_session_id is None
     assert foreign.causal_budget_id == "foreign-budget"
-    assert foreign_reads == 1
+    # The typed lifecycle command first reconciles its exact receipt, then the
+    # workflow boundary independently verifies that the foreign winner cannot
+    # be adopted. Neither lookup reads or attaches its transcript.
+    assert foreign_reads == 2
     assert provider.requests == []
     assert all(
         event.type not in {EventType.WORKFLOW_STEP_STARTED, EventType.WORKFLOW_STEP_COMPLETED}
@@ -3416,25 +3451,23 @@ def test_generated_workflow_child_collision_during_create_never_attaches_or_read
 def test_generated_workflow_child_cancelled_after_create_is_attached_and_recovered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    original_create = store.create
     create_committed = asyncio.Event()
     release_create = asyncio.Event()
 
-    async def create_then_lose_acknowledgement(request: RunRequest, **kwargs: Any):
-        created = await original_create(request, **kwargs)
+    async def create_then_lose_acknowledgement(request: RunRequest) -> None:
         if request.session_id == "generated-after-create-cancellation":
             await store.update_metadata(request.session_id, {"observer": "legitimate"})
             await store.update_labels(request.session_id, {"phase": "created"})
             create_committed.set()
             await release_create.wait()
-        return created
 
     async def run() -> tuple[object, list[Event], list[Event], str | None]:
-        monkeypatch.setattr(store, "create", create_then_lose_acknowledgement)
+        store.after_create_async = create_then_lose_acknowledgement
         monkeypatch.setattr(
             "cayu.workflows.workflow.generate_child_session_id",
             lambda **_kwargs: "generated-after-create-cancellation",
@@ -3490,82 +3523,77 @@ def test_generated_workflow_child_cancelled_after_create_is_attached_and_recover
     assert len(interrupted) == 1
 
 
-def test_generated_workflow_child_create_acknowledgement_loss_reuses_owned_identity() -> None:
+def test_generated_workflow_child_create_acknowledgement_loss_reconciles_owned_identity() -> None:
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    original_create = store.create
     created_child_id: str | None = None
 
-    async def create_then_lose_acknowledgement(request: RunRequest, **kwargs: Any):
+    def create_then_lose_acknowledgement(request: RunRequest) -> None:
         nonlocal created_child_id
-        created = await original_create(request, **kwargs)
         if request.session_id is not None and request.session_id.startswith(
             "cayu-child:v1:workflow-step:"
         ):
             created_child_id = request.session_id
             raise OSError("ack lost after durable workflow child create")
-        return created
 
-    async def run() -> tuple[str, object, list[Event]]:
-        store.create = create_then_lose_acknowledgement  # type: ignore[method-assign]
+    async def run() -> tuple[StepResult, StepResult, object, list[Event]]:
+        store.after_create = create_then_lose_acknowledgement
         workflow = TinyWorkflow(app)
-        with pytest.raises(StepError, match="ack lost after durable workflow child create"):
-            await step(
-                workflow.context("workflow-parent"),
-                agent="assistant",
-                step_id="durable-step",
-                prompt="go",
-            )
-        store.create = original_create  # type: ignore[method-assign]
+        first = await step(
+            workflow.context("workflow-parent"),
+            agent="assistant",
+            step_id="durable-step",
+            prompt="go",
+        )
+        store.after_create = None
         assert created_child_id is not None
-        with pytest.raises(StepError) as replay:
-            await step(
-                workflow.context("workflow-parent"),
-                agent="assistant",
-                step_id="durable-step",
-                prompt="go",
-            )
+        replay = await step(
+            workflow.context("workflow-parent"),
+            agent="assistant",
+            step_id="durable-step",
+            prompt="go",
+        )
         child = await store.load(created_child_id)
         records = await store.query_events(EventQuery(session_id="workflow-parent", limit=20))
-        assert replay.value.session_id == created_child_id
-        return created_child_id, child, [record.event for record in records]
+        return first, replay, child, [record.event for record in records]
 
-    child_session_id, child, workflow_events = asyncio.run(run())
+    first, replay, child, workflow_events = asyncio.run(run())
 
     assert child is not None
-    assert child.id == child_session_id
-    assert child.status == SessionStatus.INTERRUPTED
-    assert provider.requests == []
+    assert child.id == first.session_id
+    assert child.status == SessionStatus.COMPLETED
+    assert replay == first
+    assert first.text == "unexpected"
+    assert len(provider.requests) == 1
     started_ids = [
         event.payload["child_session_id"]
         for event in workflow_events
         if event.type == EventType.WORKFLOW_STEP_STARTED
     ]
-    assert started_ids == [child_session_id]
+    assert started_ids == [first.session_id]
 
 
-def test_stale_workflow_attempt_does_not_recover_exact_create_winner() -> None:
+def test_stale_workflow_attempt_settles_exact_reconciled_create_winner() -> None:
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    original_create = store.create
     created_child_id: str | None = None
 
-    async def create_then_lose_acknowledgement(request: RunRequest, **kwargs: Any):
+    def create_then_lose_acknowledgement(request: RunRequest) -> None:
         nonlocal created_child_id
-        created = await original_create(request, **kwargs)
         if request.session_id is not None and request.session_id.startswith(
             "cayu-child:v1:workflow-step:"
         ):
             created_child_id = request.session_id
             raise OSError("ack lost after durable workflow child create")
-        return created
 
     async def run() -> tuple[object, list[Event]]:
-        store.create = create_then_lose_acknowledgement  # type: ignore[method-assign]
+        store.after_create = create_then_lose_acknowledgement
         ctx = TinyWorkflow(app).context("workflow-parent")
 
         async def lose_reservation(_event: Event, *, attempt_id: str) -> bool:
@@ -3573,17 +3601,13 @@ def test_stale_workflow_attempt_does_not_recover_exact_create_winner() -> None:
             return False
 
         ctx.journal.append_step_started = lose_reservation  # type: ignore[method-assign]
-        with pytest.raises(StepError) as failed:
+        with pytest.raises(WorkflowSupersededError):
             await step(
                 ctx,
                 agent="assistant",
                 step_id="durable-step",
                 prompt="go",
             )
-        assert any(
-            "WorkflowSupersededError" in note
-            for note in getattr(failed.value.__cause__, "__notes__", ())
-        )
         assert created_child_id is not None
         child = await store.load(created_child_id)
         events = await store.load_events(created_child_id)
@@ -3592,8 +3616,8 @@ def test_stale_workflow_attempt_does_not_recover_exact_create_winner() -> None:
     child, child_events = asyncio.run(run())
 
     assert child is not None
-    assert child.status == SessionStatus.RUNNING
-    assert all(event.type != EventType.SESSION_INTERRUPTED for event in child_events)
+    assert child.status == SessionStatus.INTERRUPTED
+    assert sum(event.type == EventType.SESSION_INTERRUPTED for event in child_events) == 1
     assert provider.requests == []
 
 
@@ -3601,25 +3625,23 @@ def test_generated_workflow_child_identity_survives_process_reconstruction() -> 
     class SimulatedProcessLoss(BaseException):
         pass
 
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    original_create = store.create
     created_child_id: str | None = None
 
-    async def create_then_process_exits(request: RunRequest, **kwargs: Any):
+    def create_then_process_exits(request: RunRequest) -> None:
         nonlocal created_child_id
-        created = await original_create(request, **kwargs)
         if request.session_id is not None and request.session_id.startswith(
             "cayu-child:v1:workflow-step:"
         ):
             created_child_id = request.session_id
             raise SimulatedProcessLoss
-        return created
 
     async def run() -> tuple[str, object, list[Event]]:
-        store.create = create_then_process_exits  # type: ignore[method-assign]
+        store.after_create = create_then_process_exits
         with pytest.raises(SimulatedProcessLoss):
             await step(
                 TinyWorkflow(app).context("workflow-parent"),
@@ -3627,7 +3649,7 @@ def test_generated_workflow_child_identity_survives_process_reconstruction() -> 
                 step_id="durable-step",
                 prompt="go",
             )
-        store.create = original_create  # type: ignore[method-assign]
+        store.after_create = None
         assert created_child_id is not None
         unacknowledged = await store.load(created_child_id)
         assert unacknowledged is not None
@@ -3672,26 +3694,23 @@ def test_generated_workflow_child_reconstruction_rejects_contradictory_invocatio
     class SimulatedProcessLoss(BaseException):
         pass
 
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    assert isinstance(store, InMemorySessionStore)
-    original_create = store.create
     created_child_id: str | None = None
 
-    async def create_then_process_exits(request: RunRequest, **kwargs: Any):
+    def create_then_process_exits(request: RunRequest) -> None:
         nonlocal created_child_id
-        created = await original_create(request, **kwargs)
         if request.session_id is not None and request.session_id.startswith(
             "cayu-child:v1:workflow-step:"
         ):
             created_child_id = request.session_id
             raise SimulatedProcessLoss
-        return created
 
     async def run() -> object:
-        store.create = create_then_process_exits  # type: ignore[method-assign]
+        store.after_create = create_then_process_exits
         with pytest.raises(SimulatedProcessLoss):
             await step(
                 TinyWorkflow(app).context("workflow-parent"),
@@ -3699,7 +3718,7 @@ def test_generated_workflow_child_reconstruction_rejects_contradictory_invocatio
                 step_id="durable-step",
                 prompt="go",
             )
-        store.create = original_create  # type: ignore[method-assign]
+        store.after_create = None
         assert created_child_id is not None
         child = await store.load(created_child_id)
         assert child is not None
@@ -3740,18 +3759,22 @@ def test_generated_workflow_child_reconstruction_rejects_contradictory_invocatio
 def test_generated_workflow_child_cancellation_does_not_settle_foreign_create_winner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    store = _WorkflowCreateOutcomeStore()
     app, provider = _scripted_assistant_app(
-        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})]
+        [ModelStreamEvent.text_delta("unexpected"), ModelStreamEvent.completed({})],
+        session_store=store,
     )
-    store = app.session_store
-    original_create = store.create
     foreign_create_committed = asyncio.Event()
     release_create = asyncio.Event()
 
-    async def create_with_foreign_winner_then_block(request: RunRequest, **kwargs: Any):
+    async def create_with_foreign_winner_then_block(
+        request: RunRequest,
+        kwargs: dict[str, Any],
+    ) -> None:
         if request.session_id == "foreign-create-winner":
             foreign_messages = [Message.text("user", "foreign")]
-            await original_create(
+            await InMemorySessionStore.create(
+                store,
                 request.model_copy(
                     update={
                         "messages": foreign_messages,
@@ -3764,10 +3787,9 @@ def test_generated_workflow_child_cancellation_does_not_settle_foreign_create_wi
             )
             foreign_create_committed.set()
             await release_create.wait()
-        return await original_create(request, **kwargs)
 
     async def run() -> tuple[object, list[Event], list[Event]]:
-        monkeypatch.setattr(store, "create", create_with_foreign_winner_then_block)
+        store.before_create = create_with_foreign_winner_then_block
         monkeypatch.setattr(
             "cayu.workflows.workflow.generate_child_session_id",
             lambda **_kwargs: "foreign-create-winner",
@@ -3785,7 +3807,7 @@ def test_generated_workflow_child_cancellation_does_not_settle_foreign_create_wi
         with pytest.raises(asyncio.CancelledError, match="cancel after foreign child create"):
             await task
         release_create.set()
-        foreign = await original_create.__self__.load("foreign-create-winner")
+        foreign = await InMemorySessionStore.load(store, "foreign-create-winner")
         foreign_events = await store.load_events("foreign-create-winner")
         workflow_records = await store.query_events(
             EventQuery(session_id="workflow-parent", limit=20)

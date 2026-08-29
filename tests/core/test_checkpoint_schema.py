@@ -25,9 +25,13 @@ from cayu.runtime import InMemorySessionStore
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _session_engine as session_engine
+from cayu.runtime._invocation_lifecycle import (
+    invocation_lifecycle_receipt_history_present,
+)
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     CheckpointMigration,
     CheckpointMigrationDefinitionError,
     CheckpointMigrator,
@@ -293,12 +297,47 @@ def test_v3_root_checkpoint_discards_reserved_workspace_observation_collision() 
 
     decoded = decode_runtime_checkpoint(source, session_id="sess-v3-workspace-collision")
 
-    assert decoded == {
+    assert decoded is not None
+    assert invocation_lifecycle_receipt_history_present(decoded)
+    decoded_without_tombstone = dict(decoded)
+    decoded_without_tombstone.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    assert decoded_without_tombstone == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "future_additive_field": {"kept": True},
     }
     assert "workspace_observations" in source
     assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 3
+
+
+def test_v4_root_checkpoint_discards_invocation_lifecycle_receipt_collision() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 4,
+        "invocation_lifecycle_receipt": {
+            "record_type": "cayu.invocation-lifecycle-command-receipt-ledger",
+            "schema_version": 1,
+            "receipts": [
+                {
+                    "record_type": "cayu.invocation-lifecycle-command-receipt",
+                    "schema_version": 1,
+                    "command_identity": "caller-owned-collision",
+                }
+            ],
+        },
+        "future_additive_field": {"kept": True},
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v4-receipt-collision")
+
+    assert decoded is not None
+    assert invocation_lifecycle_receipt_history_present(decoded)
+    decoded_without_tombstone = dict(decoded)
+    decoded_without_tombstone.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    assert decoded_without_tombstone == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "future_additive_field": {"kept": True},
+    }
+    assert "invocation_lifecycle_receipt" in source
+    assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == 4
 
 
 @pytest.mark.parametrize(

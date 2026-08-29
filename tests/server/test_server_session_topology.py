@@ -164,6 +164,7 @@ def test_session_topology_endpoint_reports_missing_depth_and_cursor_failures() -
 
 def test_session_topology_endpoint_fails_closed_for_unsupported_store() -> None:
     class UnsupportedTopologyStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_session_topology = False
 
         async def query_session_topology(self, query: SessionTopologyQuery):
@@ -440,6 +441,8 @@ def test_causal_budget_summary_rejects_event_bytes_before_processing(monkeypatch
 
 def test_causal_budget_summary_fails_closed_without_bounded_event_reads() -> None:
     class UnboundedEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events_bounded(self, query, *, max_bytes):
             del query, max_bytes
             raise NotImplementedError

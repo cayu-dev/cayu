@@ -45,6 +45,8 @@ class FailOnceWriteWorkspace(LocalWorkspace):
 
 
 class FailingFinalizeEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_finalize_evidence = True

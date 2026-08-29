@@ -20,6 +20,8 @@ from unittest.mock import patch
 import pytest
 from pydantic import SecretStr, ValidationError
 
+import cayu.runtime.sessions as sessions_module
+
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 httpx = pytest.importorskip("httpx")
@@ -3638,6 +3640,7 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
 
 def test_server_rejects_response_amplifying_usage_currency_before_store_work() -> None:
     class StoreWorkMustNotStart(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         aggregate_called = False
 
         async def aggregate_usage(self, query):
@@ -3988,6 +3991,7 @@ def test_server_rejects_price_books_and_resolution_work_without_reflecting_input
 
 def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores() -> None:
     class UnsupportedAggregateStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_usage_aggregates = False
 
         async def aggregate_operational_snapshot(self, filters=None):
@@ -4065,6 +4069,8 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
     }
 
     class InvalidAggregateResultStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def aggregate_usage(self, query):
             from cayu.runtime.aggregates import UsageRollupStoreResult
 
@@ -4092,6 +4098,8 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
 
 def test_server_rejects_custom_usage_store_results_that_ignore_query_bounds() -> None:
     class IgnoringUsageQueryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def aggregate_usage(self, query):
             return await super().aggregate_usage(
                 query.model_copy(update={"session_group_limit": 2})
@@ -4127,6 +4135,8 @@ def test_server_rejects_custom_usage_store_results_that_ignore_query_bounds() ->
 
 def test_server_rejects_custom_usage_store_with_inconsistent_session_totals() -> None:
     class InconsistentSessionTotalsStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def aggregate_usage(self, query):
             result = await super().aggregate_usage(query)
             assert result.session_breakdown is not None
@@ -4197,6 +4207,8 @@ def test_server_rejects_custom_usage_store_with_inconsistent_session_totals() ->
 
 def test_server_canonically_revalidates_custom_usage_store_results() -> None:
     class InvalidNestedUsageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def aggregate_usage(self, query):
             result = await super().aggregate_usage(query)
             provider_group = result.provider_breakdown.groups[0]
@@ -4262,6 +4274,8 @@ def test_server_canonically_revalidates_custom_usage_store_results() -> None:
 
 def test_server_classifies_nonserializable_custom_usage_result_as_inconsistent() -> None:
     class NonserializableUsageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def aggregate_usage(self, query):
             result = await super().aggregate_usage(query)
             return result.model_copy(update={"provider_breakdown": object()})
@@ -4291,6 +4305,7 @@ def test_server_classifies_custom_retained_usage_identity_byte_overflow_as_413()
     oversized_session_id = "s" * 1025
 
     class OversizedRetainedIdentityStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         include_invalid_counter = False
 
         async def aggregate_usage(self, query):
@@ -4363,6 +4378,8 @@ def test_server_classifies_custom_retained_usage_identity_byte_overflow_as_413()
 
 def test_server_rejects_custom_usage_store_with_misattributed_session_pricing() -> None:
     class MisattributedSessionPricingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def aggregate_usage(self, query):
             result = await super().aggregate_usage(query)
             session_items = result.session_pricing_inputs
@@ -5483,6 +5500,8 @@ def test_control_plane_rejects_secret_bearing_session_cursor_authority() -> None
 
 def test_control_plane_preserves_secret_free_opaque_custom_store_cursor() -> None:
     class OpaqueCursorStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def list_sessions(self, query=None):
             del query
             return SessionListResult(
@@ -5644,6 +5663,8 @@ def test_pending_action_issue_preserves_typed_timestamp_for_short_secret() -> No
     observed_at = datetime(2026, 7, 27, tzinfo=UTC)
 
     class IssueStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
             del query
             del checkpoint_root_guard
@@ -5746,6 +5767,8 @@ def test_control_plane_preserves_runtime_timestamps_for_short_secret() -> None:
 
 def test_server_pending_actions_uses_one_store_native_query() -> None:
     class PendingActionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.pending_query_count = 0
@@ -5783,6 +5806,8 @@ def test_server_pending_actions_uses_one_store_native_query() -> None:
 
 def test_server_pending_actions_returns_413_for_oversized_page() -> None:
     class OversizedPendingActionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
             del checkpoint_root_guard
             from cayu.runtime.sessions import PendingActionResultTooLarge
@@ -5815,13 +5840,14 @@ def test_server_pending_actions_reports_future_checkpoint_without_exposing_conte
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
         await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
-        await app.session_store.checkpoint(
-            session_id,
-            {
-                "checkpoint_schema_version": CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
-                "pending_user_input": {"secret": "must-not-escape"},
-            },
-        )
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await app.session_store.checkpoint(
+                session_id,
+                {
+                    "checkpoint_schema_version": CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
+                    "pending_user_input": {"secret": "must-not-escape"},
+                },
+            )
 
     asyncio.run(seed())
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
@@ -5857,6 +5883,8 @@ def test_server_pending_actions_rejects_invalid_cursor_as_400() -> None:
 
 def test_server_pending_actions_does_not_misclassify_store_failure_as_400() -> None:
     class FailingPendingActionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
             del checkpoint_root_guard
             raise ValueError("persisted pending-action projection is corrupt")
@@ -8184,6 +8212,8 @@ def test_dispatch_projects_a_private_session_id_returned_by_a_dispatcher() -> No
 
 def test_public_session_alias_resolution_uses_the_store_index_without_a_scan() -> None:
     class EndlessSessionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.list_calls = 0
@@ -9801,6 +9831,8 @@ def test_interrupt_session_endpoint_rejects_completed_session_before_streaming()
 
 def test_interrupt_session_endpoint_rejects_completion_race_before_streaming() -> None:
     class CompletingRaceStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.loads = 0
@@ -10732,6 +10764,8 @@ def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
 
 def test_run_route_interrupt_during_acceptance_state_read_keeps_task_linked() -> None:
     class BlockingAcceptanceStateStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.block_next_state_read = True
@@ -11013,6 +11047,8 @@ def test_interrupt_accepts_before_first_frame_terminal_publication_uncertainty(
     terminal_append_committed: bool,
 ) -> None:
     class AmbiguousInterruptTerminalStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.armed = False
@@ -11120,6 +11156,8 @@ def test_interrupt_accepts_before_first_frame_terminal_publication_uncertainty(
 
 def test_request_cancellation_does_not_cancel_uncertain_acceptance_marker() -> None:
     class BlockingUncertainAcceptanceStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.armed = False
@@ -12385,6 +12423,8 @@ def test_existing_session_reconnect_cannot_race_accepted_mutation_transition() -
 
 def test_concurrent_client_run_identity_creates_one_session_and_one_task() -> None:
     class CoordinatedRunStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.claims = 0
@@ -12458,6 +12498,8 @@ def test_run_replay_missing_session_does_not_expose_resolved_private_identity() 
     private_session_id = "private-session-secret"
 
     class VanishingSessionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_state(self, session_id: str):
             if session_id == private_session_id:
                 return None
@@ -12649,6 +12691,8 @@ def test_replay_of_active_session_times_out_with_structured_error() -> None:
 
 def test_replay_waits_for_terminal_event_after_terminal_status() -> None:
     class DelayedTerminalEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.injected_terminal_race = False
@@ -12809,6 +12853,8 @@ def test_replay_does_not_attach_stale_hook_marker_across_operation_start(
     hook_event_type: EventType,
 ) -> None:
     class DelayedTerminalStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.terminal_append_task: asyncio.Task[None] | None = None
@@ -13123,6 +13169,8 @@ def test_replay_cascade_marker_uses_latest_completed_operation_boundary() -> Non
 
 def test_replay_does_not_attach_stale_cascade_marker_across_operation_start() -> None:
     class DelayedTerminalStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.terminal_append_task: asyncio.Task[None] | None = None

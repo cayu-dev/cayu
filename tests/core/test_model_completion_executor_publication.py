@@ -444,6 +444,8 @@ class _CompletedThenAcloseLookupFailureProvider(ModelProvider):
 class _PrepareAcknowledgementLostStore(InMemorySessionStore):
     """Commit preparation, then return the exact replay as an ambiguous acknowledgement."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.preparations = 0

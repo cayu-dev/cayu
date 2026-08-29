@@ -1045,6 +1045,8 @@ def test_concurrent_reservation_collision_does_not_release_the_winner(
 
 def test_stale_run_cannot_claim_or_release_a_reserved_identity() -> None:
     class TakeoverBeforeClaimStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.replacement_epoch: int | None = None
@@ -1099,7 +1101,10 @@ def test_stale_run_cannot_claim_or_release_a_reserved_identity() -> None:
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="identity-model"))
 
-        with pytest.raises(SessionRunFenced, match="Session run epoch no longer owns"):
+        with pytest.raises(
+            SessionRunFenced,
+            match="(?:Session run epoch no longer owns|Invocation command lost its run epoch)",
+        ):
             await _collect_app_events(
                 app,
                 RunRequest(
@@ -1121,6 +1126,8 @@ def test_stale_run_cannot_claim_or_release_a_reserved_identity() -> None:
 
 def test_runtime_uses_registry_without_scanning_reservation_history() -> None:
     class NoReservationHistoryScanStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events(self, query=None):
             if (
                 query is not None

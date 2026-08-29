@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import rebind_test_invocation
 from tests.core._workload_secret_support import (
     FakeProvider,
     RequireApprovalPolicy,
@@ -76,7 +77,6 @@ from cayu.runtime import (
 )
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_support
-from cayu.runtime import execution_profiles as execution_profiles_module
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage.jsonl_export import export_sessions
@@ -190,6 +190,8 @@ class _ResolveNamedSecretTool(Tool):
 
 
 class _FailFirstTerminalEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_terminal = False
@@ -210,6 +212,8 @@ class _FailFirstTerminalEventStore(InMemorySessionStore):
 
 
 class _CommitFirstStagedTerminalThenRaiseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.lost_stage_acknowledgement = False
@@ -237,6 +241,8 @@ class _CommitFirstStagedTerminalThenRaiseStore(InMemorySessionStore):
 
 
 class _CommitFirstTerminalEventThenRaiseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.lost_terminal_acknowledgement = False
@@ -258,6 +264,8 @@ class _CommitFirstTerminalEventThenRaiseStore(InMemorySessionStore):
 
 
 class _FailFirstBlockedAssistantProjectionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_projection = False
@@ -280,6 +288,8 @@ class _FailFirstBlockedAssistantProjectionStore(InMemorySessionStore):
 
 
 class _RejectBlockedAssistantProjectionSQLiteStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.failed_projections = 0
@@ -1575,27 +1585,7 @@ async def _run_user_input_resolution_scenario() -> None:
     assert private_checkpoint["pending_user_input"]["question"] == secret
     assert private_checkpoint["pending_user_input"]["options"] == ["yes", secret]
 
-    session = await store.load("late-secret-user-input")
-    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
-        private_checkpoint
-    )
-    assert session is not None
-    assert active_profile is not None
-    await store.transition_status_and_checkpoint(
-        "late-secret-user-input",
-        from_statuses={session.status},
-        to_status=SessionStatus.RUNNING,
-        checkpoint_transform=lambda current_session, current_checkpoint: (
-            execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
-                current_checkpoint,
-                session_id=current_session.id,
-                interaction_id=active_profile.interaction_id,
-                run_epoch=current_session.run_epoch + 1,
-                profile=active_profile.profile,
-                expected=active_profile,
-            )
-        ),
-    )
+    await rebind_test_invocation(store, "late-secret-user-input")
     restarted_app = CayuApp(
         session_store=store,
         event_sinks=[sink],

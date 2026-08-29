@@ -34,6 +34,11 @@ from cayu._validation import (
 )
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, copy_event
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
+)
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     public_authority_alias_is_reserved,
@@ -56,7 +61,6 @@ from cayu.vaults import SecretRedactor
 if TYPE_CHECKING:
     from cayu.runtime._event_writer import RuntimeEventWriter
 
-WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY = "workspace_observations"
 WORKSPACE_OBSERVATION_RECORD_TYPE = "cayu.workspace-observation"
 WORKSPACE_OBSERVATION_SCHEMA_VERSION = 1
 WORKSPACE_OBSERVATION_MAX_ACTIVE = 256
@@ -1555,6 +1559,14 @@ async def publish_workspace_observation_transition(
         lambda: session_store.load_checkpoint(session.id),
         operation="Workspace observation checkpoint read",
     )
+    raw_schema_version = (
+        None if checkpoint is None else checkpoint.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+    )
+    if raw_schema_version is not None and (
+        type(raw_schema_version) is not int
+        or not 1 <= raw_schema_version <= CURRENT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ValueError("Workspace observation checkpoint schema is unsupported.")
     active = workspace_observations_from_checkpoint(checkpoint)
     durable_previous = active.get(owner.window_id)
     already_applied = False
@@ -1620,25 +1632,26 @@ async def publish_workspace_observation_transition(
             action="delete",
         )
 
+    schema_operation = RuntimePublicationCheckpointOperation(
+        key=CHECKPOINT_SCHEMA_VERSION_KEY,
+        expected_value_digest=(
+            None
+            if raw_schema_version is None
+            else runtime_publication_checkpoint_value_digest(raw_schema_version)
+        ),
+        action="set",
+        value=CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    )
     request = RuntimePublicationRequest(
         publication_id=_phase_publication_id(owner.window_id, phase),
         kind="workspace-observation",
         interaction_id=owner.interaction_id,
         intent=intent,
-        mutation=RuntimePublicationMutation(operations=(operation,)),
+        mutation=RuntimePublicationMutation(operations=(schema_operation, operation)),
         transcript_messages=(),
         events=prepared_events,
     )
-    expected_request_digests = frozenset(
-        {
-            runtime_publication_request_digest(session.id, request),
-            runtime_publication_request_digest(
-                session.id,
-                request,
-                include_checkpoint_schema=True,
-            ),
-        }
-    )
+    expected_request_digests = frozenset({runtime_publication_request_digest(session.id, request)})
     expected_statuses = {
         SessionStatus.PENDING,
         SessionStatus.RUNNING,

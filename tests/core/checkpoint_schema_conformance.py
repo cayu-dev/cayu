@@ -23,11 +23,13 @@ from cayu.runtime import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime import sessions as sessions_module
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     CheckpointCompatibilityError,
 )
 from cayu.runtime.execution_profiles import (
@@ -179,7 +181,11 @@ async def assert_reserved_checkpoint_key_migration_conformance(
         CHECKPOINT_SCHEMA_VERSION_KEY: _PRE_ACTIVE_INVOCATION_SCHEMA_VERSION,
         "future_additive_field": {"preserved": True},
     }
-    await store.checkpoint(session_id, legacy)
+    # Model durable legacy state directly. The public generic checkpoint
+    # entrance is intentionally unable to downgrade or replace current private
+    # lifecycle authority.
+    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        await store.checkpoint(session_id, legacy)
 
     migrated = await runtime_checkpoint_session_store(store).load_checkpoint(session_id)
     assert migrated == {
@@ -341,7 +347,10 @@ async def assert_versionless_pending_continuation_fails_closed_conformance(
     assert versionless is not None
     versionless.pop(CHECKPOINT_SCHEMA_VERSION_KEY)
     versionless["future_additive_field"] = {"kept": True}
-    await store.checkpoint(session_id, versionless)
+    # Model a pre-upgrade durable checkpoint rather than a generic mutation:
+    # current generic writes preserve both lifecycle roots and their schema.
+    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        await store.checkpoint(session_id, versionless)
     pending = await _app(
         store,
         _CompleteProvider(),
@@ -397,12 +406,32 @@ async def assert_versionless_noop_transform_stamps_conformance(
     ]
     await store.checkpoint(session_id, {"preserved": {"value": True}})
 
+    replaced_checkpoint = await store.load_checkpoint(session_id)
+    assert replaced_checkpoint is not None
+    assert replaced_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == (CURRENT_CHECKPOINT_SCHEMA_VERSION)
+    replaced_active_profile = active_invocation_execution_profile_from_checkpoint(
+        replaced_checkpoint
+    )
+    assert replaced_active_profile is not None
+    assert replaced_active_profile.session_id == session_id
+    assert INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in replaced_checkpoint
+
     await app._runtime_session_store.transform_checkpoint(
         session_id,
         lambda _session, _checkpoint: None,
     )
 
     checkpoint = await store.load_checkpoint(session_id)
+    assert checkpoint is not None
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    assert active_profile is not None
+    assert active_profile.session_id == session_id
+    session = await store.load(session_id)
+    assert session is not None
+    assert active_profile.run_epoch + 1 == session.run_epoch
+    checkpoint.pop(ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    receipt_ledger = checkpoint.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+    assert receipt_ledger["record_type"] == ("cayu.invocation-lifecycle-command-receipt-ledger")
     assert checkpoint == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "preserved": {"value": True},
@@ -418,7 +447,10 @@ async def assert_future_checkpoint_rejection_conformance(
     future = await store.load_checkpoint(session_id)
     assert future is not None
     future[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
-    await store.checkpoint(session_id, future)
+    # Model durable state written by a future runtime. Generic checkpoint
+    # replacement cannot overwrite current lifecycle schema provenance.
+    with sessions_module._invocation_lifecycle_authority_mutation_scope():
+        await store.checkpoint(session_id, future)
 
     provider = _CompleteProvider()
     with pytest.raises(CheckpointCompatibilityError) as pending_error:

@@ -124,6 +124,8 @@ def _direct_context_memory_evidence_key():
 
 
 class _CountingSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.transcript_search_count = 0
@@ -134,6 +136,8 @@ class _CountingSessionStore(InMemorySessionStore):
 
 
 class _DispatchEvidenceFailingSessionStore(_CountingSessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def transition_context_exposure(self, session_id, exposure_id, request):
         if request.state is ContextExposureState.DISPATCH_STARTED:
             raise RuntimeError("context exposure dispatch persistence failed")
@@ -141,6 +145,8 @@ class _DispatchEvidenceFailingSessionStore(_CountingSessionStore):
 
 
 class _StageDispatchReceiptFailingSessionStore(_CountingSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._terminal_transition_failures_remaining = 2
@@ -160,6 +166,8 @@ class _StageDispatchReceiptFailingSessionStore(_CountingSessionStore):
 
 
 class _ExposureCreationReconciliationFailingSessionStore(_CountingSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._creation_ack_failures_remaining = 2
@@ -180,6 +188,8 @@ class _ExposureCreationReconciliationFailingSessionStore(_CountingSessionStore):
 
 
 class _EvidenceAcknowledgementLosingSessionStore(_CountingSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._lose_receipt_ack = True

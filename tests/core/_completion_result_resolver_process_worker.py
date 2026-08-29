@@ -23,6 +23,7 @@ _PROCESS_LOSS_EXIT_CODE = 86
 
 
 class _CrashBeforeResultEventStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
     supports_completion_result_event_publication_reservations = True
 
     async def _publish_completion_result_event_publication(

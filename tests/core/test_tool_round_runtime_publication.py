@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 from tests.core._execution_profile_fixtures import (
-    checkpoint_with_rebound_test_invocation_profile,
+    rebind_test_invocation,
 )
 from tests.core._workload_secret_support import (
     FakeProvider,
@@ -48,6 +48,7 @@ from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.runtime.context import ContextPolicy, ContextRequest, validate_context_messages
 from cayu.runtime.execution_profiles import (
@@ -58,6 +59,8 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class _FailingTerminalToolEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_terminal_once = False
@@ -111,6 +114,7 @@ def _assert_only_model_step_publication_checkpoint(
     assert set(checkpoint) == {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
@@ -218,6 +222,8 @@ def test_interrupt_close_rejects_missing_marker_before_terminal_publication() ->
 
 def test_pending_tool_round_recovery_replays_commit_after_acknowledgement_loss() -> None:
     class CommitThenRaiseStore(_FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_publication_ack = False
@@ -290,6 +296,8 @@ def test_pending_tool_round_recovery_replays_commit_after_acknowledgement_loss()
 
 def test_pending_tool_round_recovery_does_not_retry_precommit_rejection() -> None:
     class RejectFirstStore(_FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.publication_attempts = 0
@@ -376,6 +384,8 @@ def test_pending_tool_round_recovery_does_not_retry_precommit_rejection() -> Non
 
 def test_pending_tool_round_recovery_preserves_cancellation_after_exact_replay() -> None:
     class BlockingStore(_FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.publication_committed = asyncio.Event()
@@ -608,12 +618,7 @@ def test_model_boundary_rejects_corrupted_pending_tool_approval(
             return updated
 
         await store.transform_checkpoint(session_id, corrupt_checkpoint)
-        await store.transition_status_and_checkpoint(
-            session_id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=checkpoint_with_rebound_test_invocation_profile,
-        )
+        await rebind_test_invocation(store, session_id)
         checkpoint_before = await store.load_checkpoint(session_id)
         transcript_before = await store.load_transcript(session_id)
         events_before = await store.load_events(session_id)
@@ -649,6 +654,8 @@ def test_model_boundary_rejects_corrupted_pending_tool_approval(
 
 def test_cross_worker_interrupt_racing_tool_round_publication_finishes_interrupted() -> None:
     class BlockingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.publication_started: asyncio.Event | None = None
@@ -810,6 +817,8 @@ def test_cross_worker_interrupt_racing_tool_round_publication_finishes_interrupt
 
 def test_closing_run_after_first_recovered_tool_event_cannot_strand_interrupting() -> None:
     class BlockingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.completion_promoted: asyncio.Event | None = None

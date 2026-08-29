@@ -177,6 +177,8 @@ class _SelfCancellingProjectionPolicy(ToolResultProjectionPolicy):
 
 
 class _RejectFirstToolRoundPublicationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.tool_round_publications = 0
@@ -1659,6 +1661,8 @@ def test_hook_result_is_sanitized_before_secondary_publication_failure(
     from cayu import AfterToolCallDecision, BeforeToolCallDecision, RuntimeHook
 
     class FailingHookPublicationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False

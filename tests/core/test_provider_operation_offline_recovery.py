@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    create_admitted_session,
+    profiled_session_identity,
+)
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import SQLiteBudgetLedger, SQLiteSessionStore
@@ -99,7 +102,6 @@ from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     active_invocation_execution_profile_from_checkpoint,
-    checkpoint_with_active_invocation_execution_profile,
     direct_tool_capability_ceiling_component,
     execution_profile_with_component,
 )
@@ -703,6 +705,8 @@ class _LostCancellationAcknowledgementProvider(_OfflineOperationProvider):
 
 
 class _FenceOnCancellationRequestStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fenced = False
@@ -724,6 +728,8 @@ class _FenceOnCancellationRequestStore(InMemorySessionStore):
 
 
 class _CommitThenRaiseInterruptionClaimStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.interruption_claim_committed = False
@@ -739,6 +745,8 @@ class _CommitThenRaiseInterruptionClaimStore(InMemorySessionStore):
 
 
 class _CrashAfterCancellationEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, crash_after: EventType) -> None:
         super().__init__()
         self.crash_after = crash_after
@@ -753,6 +761,8 @@ class _CrashAfterCancellationEventStore(InMemorySessionStore):
 
 
 class _FailCancellationClaimHeartbeatStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_heartbeat = False
@@ -770,6 +780,8 @@ class _FailCancellationClaimHeartbeatStore(InMemorySessionStore):
 
 
 class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
         result = await super().publish_checkpoint_and_events(session_id, **kwargs)
         if any(
@@ -780,6 +792,8 @@ class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
 
 
 class _CorruptResolutionProfileEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.corrupt_resolution_profile = False
@@ -805,6 +819,8 @@ class _CorruptResolutionProfileEventStore(InMemorySessionStore):
 
 class _LegacyResolutionProfileStore(InMemorySessionStore):
     """Persist provider-resolution evidence in the pre-attribution shape."""
+
+    invocation_lifecycle_command_version = 1
 
     # This shim changes only the persisted resolution representation while
     # delegating the atomic checkpoint/stage-release transaction to the
@@ -849,6 +865,8 @@ class _LegacyResolutionProfileStore(InMemorySessionStore):
 
 
 class _BlockingInterruptionTransitionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.transition_entered = asyncio.Event()
@@ -1060,32 +1078,21 @@ async def _stage_offline_operation(
         session_identity = session_identity.model_copy(
             update={"execution_profile": execution_profile}
         )
-    session = await store.create(
-        RunRequest(
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
             tool_capability_ceiling=effective_tool_capability_ceiling,
         ),
-        identity=session_identity,
-        interaction_started_event=started_event,
-        interaction_source_messages=[user_message],
-        checkpoint_transform=lambda current_session, checkpoint: (
-            checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
-                session_id=current_session.id,
-                interaction_id=interaction_id,
-                run_epoch=current_session.run_epoch,
-                profile=execution_profile,
-            )
-        ),
-    )
-    await store.replace_initial_transcript_messages(
-        session_id,
-        [user_message],
-        [user_message],
+        provider_name=provider.name,
+        model="fake-model",
+        execution_profile=execution_profile,
         interaction_id=interaction_id,
+        interaction_started_event=started_event,
     )
+    session = admitted.session
     if prior_events:
         await store.append_events(session_id, list(prior_events))
     identity = ModelAttemptIdentity(
@@ -4711,6 +4718,8 @@ def test_provider_resolution_rejects_secret_bearing_audit_keys_before_persistenc
 
 def test_provider_resolution_rejects_legacy_store_before_any_publication() -> None:
     class LegacyOperationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.publication_calls = 0
@@ -4926,6 +4935,7 @@ def test_legacy_resolution_replay_rejects_an_unreleased_source_stage(
     capability_after_upgrade: bool,
 ) -> None:
     class UnsafeLegacyOperationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_atomic_model_completion_stage_release = True
 
         def __init__(self) -> None:
@@ -6078,7 +6088,7 @@ def test_worker_loss_interruption_reports_unsupported_provider_cancellation() ->
     asyncio.run(scenario())
 
 
-def test_interruption_claim_acknowledgement_loss_releases_committed_epoch() -> None:
+def test_interruption_claim_acknowledgement_loss_reconciles_committed_epoch() -> None:
     async def scenario() -> None:
         session_id = "offline-provider-interruption-claim-ack-loss"
         store = _CommitThenRaiseInterruptionClaimStore()
@@ -6092,35 +6102,26 @@ def test_interruption_claim_acknowledgement_loss_releases_committed_epoch() -> N
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        with pytest.raises(
-            ConnectionError,
-            match="interruption claim acknowledgement lost after commit",
-        ):
-            async for _event in app.interrupt_session(
+        events = [
+            event
+            async for event in app.interrupt_session(
                 InterruptSessionRequest(
                     session_id=session_id,
                     reason="lose the interruption claim acknowledgement",
                 )
-            ):
-                pass
+            )
+        ]
 
         assert store.interruption_claim_committed is True
+        assert [event.type for event in events] == [EventType.SESSION_INTERRUPTED]
         interrupted = await store.load(session_id)
         interrupted_profile = active_invocation_execution_profile_from_checkpoint(
             await store.load_checkpoint(session_id)
         )
         assert interrupted is not None
-        assert interrupted.status is SessionStatus.INTERRUPTING
+        assert interrupted.status is SessionStatus.INTERRUPTED
         assert interrupted_profile is not None
         assert interrupted_profile.run_epoch == interrupted.run_epoch - 1
-
-        replacement = await store.fence_stalled_run(
-            session_id,
-            statuses={SessionStatus.INTERRUPTING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
-        )
-        assert replacement is not None
-        await store.release_run_fence(session_id)
 
     asyncio.run(scenario())
 
@@ -6251,7 +6252,9 @@ def test_stale_worker_loss_owner_cannot_cancel_or_resolve_provider_operation() -
     asyncio.run(scenario())
 
 
-def test_offline_interruption_keeps_provider_frozen_across_status_transition() -> None:
+def test_offline_interruption_keeps_provider_frozen_across_status_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def scenario() -> None:
         store = _BlockingInterruptionTransitionStore()
         provider = _CancellableOfflineOperationProvider()
@@ -6274,6 +6277,23 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition() -
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             runtime_hooks=[hook],
+        )
+        admitted_registered_provider = app._providers[provider.name]
+        captured_contexts: list[Any] = []
+        cancel_provider_operation = (
+            app._recovery_coordinator.cancel_provider_operation_for_interruption
+        )
+
+        async def capture_context(*args: Any, **kwargs: Any):
+            authority = await cancel_provider_operation(*args, **kwargs)
+            assert authority is not None
+            captured_contexts.append(authority.invocation_context)
+            return authority
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "cancel_provider_operation_for_interruption",
+            capture_context,
         )
         replacement_app = CayuApp(enable_logging=False)
         replacement_app.register_provider(replacement_provider, default=True)
@@ -6301,8 +6321,10 @@ def test_offline_interruption_keeps_provider_frozen_across_status_transition() -
         ]
         assert provider.adapter.cancel_calls == [provider.adapter.state]
         assert replacement_provider.adapter.cancel_calls == []
+        assert len(captured_contexts) == 1
+        assert captured_contexts[0].registered_provider is admitted_registered_provider
         assert hook.execution_profiles == [active_profile.profile]
-        assert hook.execution_profiles[0] is not None
+        assert hook.execution_profiles[0] is captured_contexts[0].profile
 
     asyncio.run(scenario())
 

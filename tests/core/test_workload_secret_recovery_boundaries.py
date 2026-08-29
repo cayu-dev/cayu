@@ -30,7 +30,10 @@ from cayu.runtime import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
+from cayu.runtime.checkpoints import (
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+)
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
@@ -135,6 +138,7 @@ def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:
     checkpoint_without_active_profile.pop(
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
     )
+    checkpoint_without_active_profile.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
     assert checkpoint_without_active_profile == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }
@@ -192,6 +196,7 @@ def test_cayu_app_rejects_workload_secret_before_approval_checkpoint() -> None:
     checkpoint_without_active_profile.pop(
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
     )
+    checkpoint_without_active_profile.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
     assert checkpoint_without_active_profile == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
     }

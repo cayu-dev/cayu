@@ -48,6 +48,7 @@ from cayu.runtime import (
     Session,
     SessionIdentity,
     SessionInvocationAdmission,
+    SessionRunFenced,
     SessionStatus,
     StaticToolExposurePolicy,
     StructuredOutputSpec,
@@ -60,6 +61,8 @@ from cayu.runtime import (
     ToolExposurePolicyRequest,
     UserInputResponse,
 )
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._invocation_lifecycle import prepare_rebind_invocation_command
 from cayu.runtime.hooks import (
     BeforeToolCallHookContext,
     RuntimeHook,
@@ -126,6 +129,8 @@ class _ScriptedProvider(ModelProvider):
 class _CrashAfterPendingToolRoundStore(InMemorySessionStore):
     """Lose one acknowledgement after the model step committed its tool round."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crashed = False
@@ -140,6 +145,8 @@ class _CrashAfterPendingToolRoundStore(InMemorySessionStore):
 
 class _CrashAfterStagedTerminalStore(InMemorySessionStore):
     """Lose one acknowledgement after the first private terminal is staged."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -159,6 +166,8 @@ class _CrashAfterStagedTerminalStore(InMemorySessionStore):
 
 class _InterleavedCompletedExposureStore(InMemorySessionStore):
     """Complete one competing invocation immediately before resume admission."""
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()
@@ -357,10 +366,11 @@ async def _reopen_failed_session_for_recovery(
         checkpoint
     )
     assert active_profile is not None
-    await store.transition_status_and_checkpoint(
-        session_id,
-        from_statuses={session.status},
-        to_status=SessionStatus.RUNNING,
+    command = prepare_rebind_invocation_command(
+        session,
+        checkpoint,
+        expected_statuses={session.status},
+        target_status=SessionStatus.RUNNING,
         checkpoint_transform=lambda current_session, current_checkpoint: (
             execution_profiles.checkpoint_with_active_invocation_execution_profile(
                 current_checkpoint,
@@ -372,6 +382,7 @@ async def _reopen_failed_session_for_recovery(
             )
         ),
     )
+    await runtime_checkpoint_session_store(store).apply_invocation_lifecycle_command(command)
 
 
 def test_static_exposure_drives_counting_and_provider_request_in_registered_order() -> None:
@@ -473,7 +484,7 @@ def test_exposure_evidence_is_independent_of_request_footprint_observation() -> 
     assert EventType.REQUEST_FOOTPRINT_RECORDED not in {event.type for event in events}
 
 
-def test_resume_refreshes_previous_profile_after_competing_completed_invocation() -> None:
+def test_resume_retry_refreshes_profile_after_competing_completed_invocation() -> None:
     async def exercise() -> tuple[list[Event], _PreviousProfileRecordingPolicy]:
         completed = [
             ModelStreamEvent.text_delta("done"),
@@ -497,15 +508,13 @@ def test_resume_refreshes_previous_profile_after_competing_completed_invocation(
                 messages=[Message.text("user", "start")],
             ),
         )
-        resumed = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id="interleaved-exposure-resume",
-                    messages=[Message.text("user", "continue")],
-                )
-            )
-        ]
+        resume_request = ResumeRequest(
+            session_id="interleaved-exposure-resume",
+            messages=[Message.text("user", "continue")],
+        )
+        with pytest.raises(SessionRunFenced):
+            _ = [event async for event in app.resume(resume_request)]
+        resumed = [event async for event in app.resume(resume_request)]
         return resumed, policy
 
     resumed, policy = asyncio.run(exercise())

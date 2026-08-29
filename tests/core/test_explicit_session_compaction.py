@@ -138,6 +138,8 @@ async def _private_events_for_public_events(
 
 
 class NoFullHistoryReplayStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def load_events(self, session_id: str):
         raise AssertionError("compaction replay must use indexed event lookup")
 
@@ -367,6 +369,8 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
 
 def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -> None:
     class LostTerminalAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -443,6 +447,8 @@ def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -
 
 def test_compact_session_cancellation_during_terminal_reconciliation_propagates() -> None:
     class LostTerminalAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def publish_session_operation_guarded(self, session_id: str, **kwargs):
             result = await super().publish_session_operation_guarded(session_id, **kwargs)
             if any(
@@ -535,6 +541,8 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StalledPublicationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.blocked = asyncio.Event()
@@ -846,6 +854,8 @@ def test_compact_session_late_completion_commit_is_not_republished(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DelayedCompletionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.blocked = asyncio.Event()
@@ -1015,6 +1025,8 @@ def test_compact_session_late_completion_commit_is_not_republished(
 
 def test_compact_session_lost_budget_event_ack_releases_without_duplicate() -> None:
     class LostBudgetAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -1137,6 +1149,8 @@ def test_compact_session_lost_budget_event_ack_releases_without_duplicate() -> N
 @pytest.mark.parametrize("action", ["interrupt", "notify"])
 def test_compact_session_lost_limit_event_ack_is_not_duplicated(action: str) -> None:
     class LostLimitAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -1256,6 +1270,8 @@ def test_compact_session_attempt_ack_expiry_blocks_first_provider_dispatch() -> 
     now = {"value": accepted_at}
 
     class ExpiringAttemptAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def publish_session_operation_guarded(self, session_id: str, **kwargs):
             result = await super().publish_session_operation_guarded(session_id, **kwargs)
             if any(event.type == EventType.BUDGET_RESERVED for event in kwargs.get("events", [])):
@@ -1363,6 +1379,7 @@ def test_compact_session_completion_ack_expiry_blocks_next_hierarchy_dispatch() 
     now = {"value": accepted_at}
 
     class ExpiringCompletionAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         expired = False
 
         async def publish_session_operation_guarded(self, session_id: str, **kwargs):
@@ -1646,6 +1663,8 @@ def test_explicit_compaction_retry_rejects_live_provider_drift_before_dispatch(
 
 def test_explicit_compaction_lost_completion_ack_is_restart_safe() -> None:
     class LostCompletionAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -1963,6 +1982,8 @@ def test_unfinished_explicit_compaction_fails_closed_after_restart() -> None:
 
 
 class FailingCompletionPublishStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed = False
@@ -3469,6 +3490,8 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
         session_id = "sess_compact_expired_recovery_owner"
 
         class InterleavedTakeoverStore(InMemorySessionStore):
+            invocation_lifecycle_command_version = 1
+
             def __init__(self) -> None:
                 super().__init__()
                 self.takeover_started = asyncio.Event()
@@ -4003,6 +4026,8 @@ def test_compact_session_generator_exit_preserves_completed_hierarchy_usage() ->
 
 def test_compact_session_generator_exit_propagates_abandonment_accounting_failure() -> None:
     class FailingAbandonmentPublishStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def publish_session_operation_guarded(self, session_id: str, **kwargs):
             events = kwargs.get("events", [])
             if any(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events):
@@ -4109,6 +4134,8 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
     monkeypatch,
 ) -> None:
     class FailingHeartbeatAndAbandonmentStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_heartbeat_reconciliation = False
@@ -4219,6 +4246,8 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
 
 def test_compact_session_cancellation_preserves_completed_hierarchy_usage() -> None:
     class CancellationBoundaryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failure_publish_started = asyncio.Event()
@@ -4483,6 +4512,8 @@ def test_compact_session_expired_initial_claim_never_enters_compactor(
         now = {"value": accepted_at}
 
         class ExpiringInitialClaimStore(InMemorySessionStore):
+            invocation_lifecycle_command_version = 1
+
             async def publish_session_operation_guarded(self, session_id: str, **kwargs):
                 events = kwargs.get("events", [])
                 if [event.type for event in events] != [EventType.CONTEXT_COMPACTION_STARTED]:
@@ -4655,6 +4686,8 @@ def test_compact_session_claim_heartbeat_loss_cancels_provider_and_fences_public
     monkeypatch,
 ) -> None:
     class ClaimStealingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.stolen = False
@@ -4740,6 +4773,8 @@ def test_compact_session_claim_heartbeat_loss_cancels_provider_and_fences_public
 
 def test_compact_session_claim_heartbeat_retries_transient_store_failure(monkeypatch) -> None:
     class TransientHeartbeatStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_calls = 0
@@ -4828,6 +4863,8 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
     now = {"value": accepted_at}
 
     class LostRenewalAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.acknowledgement_lost = asyncio.Event()
@@ -4935,6 +4972,8 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
     now = {"value": accepted_at}
 
     class DelayedRenewalAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.renewal_committed = asyncio.Event()
@@ -5367,6 +5406,8 @@ def test_compact_session_caller_cancellation_does_not_wait_for_uncertain_claim_c
     monkeypatch,
 ) -> None:
     class PostGuardStalledStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.guard_passed = asyncio.Event()
@@ -5548,6 +5589,8 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
                 raise
 
     class StalledHeartbeatStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_started = asyncio.Event()
@@ -5636,6 +5679,8 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
     monkeypatch,
 ) -> None:
     class StalledReconciliationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.block_reconciliation = False
@@ -5764,6 +5809,8 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                 raise
 
     class StalledCommitGuardSQLiteStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self, work_started: asyncio.Event) -> None:
             super().__init__(tmp_path / "stalled-renewal.sqlite")
             self.work_started = work_started
@@ -5922,6 +5969,8 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
                 raise
 
     class StalledClaimWriteSQLiteStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self, work_started: asyncio.Event) -> None:
             super().__init__(tmp_path / "cancel-stalled-renewal.sqlite")
             self.work_started = work_started
@@ -6039,6 +6088,8 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
 
 def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkeypatch) -> None:
     class StalledHeartbeatStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_started = asyncio.Event()
@@ -6154,6 +6205,8 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
             )
 
     class DelayedFailureStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failure_publication_started = asyncio.Event()
@@ -6236,6 +6289,8 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
 
 def test_compact_session_terminal_publication_wins_blocked_heartbeat_race(monkeypatch) -> None:
     class BlockingHeartbeatStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_started = asyncio.Event()
@@ -6333,6 +6388,8 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
             return await super().reconcile(**kwargs)
 
     class ClaimLossDuringReconcileStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self, ledger: BlockingReconcileLedger) -> None:
             super().__init__()
             self.ledger = ledger
@@ -6504,6 +6561,8 @@ def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypa
             ).compact(request)
 
     class ConcurrentClaimLossStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self, compactor: CompletionReportingCompactor) -> None:
             super().__init__()
             self.compactor = compactor
@@ -6593,6 +6652,8 @@ def test_compact_session_caller_cancellation_interrupts_blocked_claim_heartbeat(
     monkeypatch,
 ) -> None:
     class BlockingHeartbeatStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_started = asyncio.Event()
@@ -6810,6 +6871,8 @@ def test_compact_session_renews_operation_claim_between_provider_dispatches(monk
         )
 
         class DelayedAttemptPublicationStore(InMemorySessionStore):
+            invocation_lifecycle_command_version = 1
+
             def __init__(self) -> None:
                 super().__init__()
                 self.delayed = False
@@ -6940,6 +7003,8 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
     monkeypatch,
 ) -> None:
     class StalledFirstHeartbeatStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_started = asyncio.Event()

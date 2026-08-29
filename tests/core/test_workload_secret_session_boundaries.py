@@ -717,6 +717,8 @@ def test_runtime_hook_fork_survives_terminal_acknowledgement_loss(
     tmp_path: Path,
 ) -> None:
     class CommitThenLoseTerminalAcknowledgementStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             encoded_key = base64.urlsafe_b64encode(bytes([31]) * 32).decode("ascii").rstrip("=")
             super().__init__(

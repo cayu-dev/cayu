@@ -29,6 +29,7 @@ from cayu.runtime import (
     SessionRunFenced,
     SessionStatus,
 )
+from cayu.runtime._invocation_lifecycle import SettleInvocationCommand
 
 
 class FakeProvider(ModelProvider):
@@ -48,16 +49,21 @@ class FakeProvider(ModelProvider):
 
 
 class RecordingReleaseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.release_calls: dict[str, int] = {}
 
-    async def release_run_fence(self, session_id: str) -> None:
+    async def release_session_invocation(self, command):
+        session_id = command.session_id
         self.release_calls[session_id] = self.release_calls.get(session_id, 0) + 1
-        await super().release_run_fence(session_id)
+        return await super().release_session_invocation(command)
 
 
 class BlockingReleaseStore(RecordingReleaseStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, fail_release: bool = False) -> None:
         super().__init__()
         self.fail_release = fail_release
@@ -65,7 +71,7 @@ class BlockingReleaseStore(RecordingReleaseStore):
         self.allow_release = asyncio.Event()
         self.release_finished = asyncio.Event()
 
-    async def release_run_fence(self, session_id: str) -> None:
+    async def release_session_invocation(self, command):
         self.release_started.set()
         await self.allow_release.wait()
         try:
@@ -74,7 +80,7 @@ class BlockingReleaseStore(RecordingReleaseStore):
                     raise OSError("run fence database connection lost")
                 except OSError as cause:
                     raise RuntimeError("run fence release failed") from cause
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
         finally:
             self.release_finished.set()
 
@@ -340,38 +346,28 @@ def test_cancellation_requested_before_cleanup_starts_remains_authoritative() ->
 
 def test_repeated_cancellation_during_run_initialization_waits_for_finalization() -> None:
     class BlockingFinalizationStore(RecordingReleaseStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.finalization_started = asyncio.Event()
             self.allow_finalization = asyncio.Event()
             self.lifecycle_order: list[str] = []
 
-        async def publish_interaction_transition(
-            self,
-            session_id: str,
-            *,
-            event: Event,
-            from_statuses: set[SessionStatus],
-            to_status: SessionStatus,
-            only_if_no_queued_messages: bool = False,
-        ):
-            if to_status == SessionStatus.INTERRUPTED:
+        async def settle_session_invocation(self, command):
+            assert isinstance(command, SettleInvocationCommand)
+            is_interrupted_settlement = command.transition.to_status is SessionStatus.INTERRUPTED
+            if is_interrupted_settlement:
                 self.finalization_started.set()
                 await self.allow_finalization.wait()
-            result = await super().publish_interaction_transition(
-                session_id,
-                event=event,
-                from_statuses=from_statuses,
-                to_status=to_status,
-                only_if_no_queued_messages=only_if_no_queued_messages,
-            )
-            if to_status == SessionStatus.INTERRUPTED:
+            result = await super().settle_session_invocation(command)
+            if is_interrupted_settlement:
                 self.lifecycle_order.append("finalized")
             return result
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             self.lifecycle_order.append("released")
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     class BlockingUsageTracker:
         def __init__(self) -> None:

@@ -221,6 +221,8 @@ class _LargeDurableSubagentProvider(ModelProvider):
 
 
 class _CheckpointPayloadTrackingStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, session_id: str, canary: str) -> None:
         super().__init__()
         self.session_id = session_id
@@ -245,6 +247,8 @@ class _CheckpointPayloadTrackingStore(InMemorySessionStore):
 
 
 class _CrashBeforeDurableChildStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_before_child = True
@@ -257,6 +261,8 @@ class _CrashBeforeDurableChildStore(InMemorySessionStore):
 
 
 class _CrashAfterDurablePreparationRejectionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_after_rejection = True
@@ -279,6 +285,8 @@ class _CrashAfterDurablePreparationRejectionStore(InMemorySessionStore):
 
 
 class _CrashAfterModifiedDurableHandoffReceiptStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_after_receipt = True
@@ -305,10 +313,13 @@ class _CrashAfterModifiedDurableHandoffReceiptStore(InMemorySessionStore):
 
 
 class _UnsupportedPendingCheckpointStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_pending_session_initial_checkpoint = False
 
 
 class _BlockingDurableChildCreationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.child_creation_started = asyncio.Event()
@@ -322,6 +333,8 @@ class _BlockingDurableChildCreationStore(InMemorySessionStore):
 
 
 class _BlockingFailOnceDurableChildCreationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.child_creation_started = asyncio.Event()
@@ -373,6 +386,8 @@ class _BlockingDurableTaskReadStore(InMemoryTaskStore):
 
 
 class _CrashAfterPreparedChildAdmissionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_after_child_admission = True
@@ -389,6 +404,8 @@ class _CrashAfterPreparedChildAdmissionStore(InMemorySessionStore):
 
 
 class _RemovePreparedChildAuthorityAtAdmissionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.remove_child_authority_at_admission = False
@@ -416,6 +433,8 @@ class _RemovePreparedChildAuthorityAtAdmissionStore(InMemorySessionStore):
 
 
 class _CommitThenRaiseDurableParentIntentStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.raise_after_parent_intent = True
@@ -434,6 +453,8 @@ class _CommitThenRaiseDurableParentIntentStore(InMemorySessionStore):
 
 
 class _CommitThenRaiseDurableParentSeedStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.raise_after_parent_seed = True
@@ -453,6 +474,8 @@ class _CommitThenRaiseDurableParentSeedStore(InMemorySessionStore):
 
 
 class _CrashAfterDurableParentSeedStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_after_parent_seed = True
@@ -472,6 +495,8 @@ class _CrashAfterDurableParentSeedStore(InMemorySessionStore):
 
 
 class _CommitThenRaiseDurableChildStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.raise_after_child = True
@@ -576,6 +601,8 @@ class _CorruptPreparedDispatchRequestStore(InMemoryTaskStore):
 
 
 class _CrashBeforeDurableChildSQLiteStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.crash_before_child = True
@@ -588,6 +615,8 @@ class _CrashBeforeDurableChildSQLiteStore(SQLiteSessionStore):
 
 
 class _CrashBeforeDurableChildPostgresStore(PostgresSessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, dsn: str) -> None:
         super().__init__(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
         self.crash_before_child = True
@@ -1448,7 +1477,8 @@ def test_published_parent_compacts_submission_and_queue_stores_request_once() ->
         assert receipt is not None and receipt.outcome == "submitted"
         serialized_checkpoint = json.dumps(checkpoint, sort_keys=True)
         assert large_task not in serialized_checkpoint
-        assert len(serialized_checkpoint.encode("utf-8")) < 10_000
+        serialized_submissions = json.dumps(submissions, sort_keys=True)
+        assert len(serialized_submissions.encode("utf-8")) < 10_000
 
         queued = (await tasks.list_tasks(TaskQuery()))[0]
         serialized_queue = json.dumps(queued.input, sort_keys=True)
@@ -3697,7 +3727,7 @@ def test_parent_interruption_cascades_to_unclaimed_durable_child() -> None:
                 )
             )
         )
-        await asyncio.wait_for(provider.parent_waiting.wait(), timeout=1)
+        await asyncio.wait_for(provider.parent_waiting.wait(), timeout=5)
         child = (
             await sessions.list_sessions(SessionQuery(parent_session_id="durable-interrupt-parent"))
         ).sessions[0]

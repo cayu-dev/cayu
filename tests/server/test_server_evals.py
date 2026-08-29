@@ -2366,7 +2366,11 @@ def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) 
                 store,
                 lease_seconds=1,
                 poll_interval_seconds=0.02,
-                shutdown_grace_seconds=0.1,
+                # Invocation cancellation now proves provider and lifecycle
+                # quiescence before the eval lease can be released. Leave
+                # enough room for that bounded ownership handoff, then stall
+                # the release itself to exercise the shutdown deadline.
+                shutdown_grace_seconds=0.5,
             )
         )
         recovery_lease = None
@@ -2374,10 +2378,10 @@ def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) 
         try:
             assert await asyncio.to_thread(provider.started.wait, 2)
             started_at = asyncio.get_running_loop().time()
-            await asyncio.wait_for(coordinator.stop(), timeout=0.5)
+            await asyncio.wait_for(coordinator.stop(), timeout=0.9)
             elapsed = asyncio.get_running_loop().time() - started_at
             assert release_started.is_set()
-            assert elapsed < 0.4
+            assert elapsed < 0.8
             assert provider.cancelled.is_set()
 
             await asyncio.sleep(1.05)

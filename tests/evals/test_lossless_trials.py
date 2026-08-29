@@ -497,6 +497,8 @@ def test_case_model_rejects_forged_aggregate_fields():
 
 
 class _OversizedEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
         raise TerminalSessionEvidenceError(
             TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
@@ -506,6 +508,7 @@ class _OversizedEvidenceStore(InMemorySessionStore):
 
 
 class _UnsupportedEvidenceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_terminal_session_evidence = False
 
 

@@ -28,6 +28,8 @@ from cayu.runtime import (
 
 def test_committed_recovery_survives_bounded_public_linkage_lookup_miss() -> None:
     class BoundedHistoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.linkage_queries: list[EventQuery] = []
@@ -81,6 +83,8 @@ def test_committed_recovery_survives_bounded_public_linkage_lookup_miss() -> Non
 
 def test_committed_recovery_survives_public_linkage_lookup_failure() -> None:
     class FailingHistoryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events(self, query: EventQuery) -> list[EventRecord]:
             if query.order_by is EventOrder.SEQUENCE_DESC and query.limit == 5000:
                 raise OSError("history unavailable")
@@ -368,6 +372,8 @@ def test_incomplete_session_recovery_preserves_opaque_store_cursor() -> None:
         opaque_cursor = '\\"' * (sessions_module.MAX_SESSION_LIST_CURSOR_BYTES // 2)
 
         class OpaqueCursorRecoveryStore(InMemorySessionStore):
+            invocation_lifecycle_command_version = 1
+
             def __init__(self) -> None:
                 super().__init__()
                 self.session_ids: list[str] = []

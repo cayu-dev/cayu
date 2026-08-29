@@ -12,6 +12,7 @@ from cayu._task_wait import (
     restore_task_cancellation_requests,
 )
 from cayu._validation import copy_json_value
+from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._diagnostics import (
     credential_safe_runtime_exception,
     credential_safe_runtime_exception_group,
@@ -71,7 +72,7 @@ def capture_work_attempt_checkpoint_result(
         copied = copy_json_value(value, "checkpoint")
         if type(copied) is not dict:
             raise TypeError("Work-attempt checkpoint must be a JSON object or None.")
-        if redactor.redact_json(copied) != copied:
+        if durable_value_contains_secret(copied, redactor=redactor):
             raise RuntimeError(f"{operation_name} returned a secret-bearing checkpoint.")
         return copied
 

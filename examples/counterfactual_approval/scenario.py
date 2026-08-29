@@ -159,6 +159,8 @@ class DeployServiceTool(Tool):
 class CrashAfterPrimaryMutationStore(InMemorySessionStore):
     """Inject one durable-write failure after the protected external effect."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, primary_session_id: str) -> None:
         super().__init__()
         self.primary_session_id = primary_session_id

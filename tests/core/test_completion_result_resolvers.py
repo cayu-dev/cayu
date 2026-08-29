@@ -952,6 +952,7 @@ def test_foreground_event_publication_renews_publication_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class BlockingResultEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_completion_result_event_publication_reservations = True
 
         def __init__(self) -> None:
@@ -1014,6 +1015,8 @@ def test_foreground_event_publication_renews_publication_ownership(
 
 def test_custom_store_reservation_overrides_fail_before_resolver_dispatch() -> None:
     class IncompleteCreateStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create(
             self,
             request: RunRequest,
@@ -1032,10 +1035,14 @@ def test_custom_store_reservation_overrides_fail_before_resolver_dispatch() -> N
             )
 
     class IncompleteCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
             await super().checkpoint(session_id, state)
 
     class IncompleteTransformStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def transform_checkpoint(
             self,
             session_id: str,
@@ -1074,6 +1081,7 @@ def test_custom_store_reservation_overrides_fail_before_resolver_dispatch() -> N
 
 def test_cancellation_during_publication_reservation_release_remains_authoritative() -> None:
     class BlockingReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_completion_result_event_publication_reservations = True
 
         def __init__(self) -> None:
@@ -1157,6 +1165,7 @@ def test_primary_and_publication_release_failure_are_both_preserved() -> None:
     secret = "publication-release-ordinary-failure-secret-canary"
 
     class FailingReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_completion_result_event_publication_reservations = True
 
         def __init__(self) -> None:
@@ -1218,6 +1227,7 @@ def test_cancellation_preserves_primary_and_publication_release_failure() -> Non
     secret = "publication-release-combined-failure-secret-canary"
 
     class BlockingFailingReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_completion_result_event_publication_reservations = True
 
         def __init__(self) -> None:
@@ -1303,6 +1313,7 @@ def test_process_control_during_publication_reservation_release_is_authoritative
     secret = "publication-release-process-control-secret-canary"
 
     class ProcessControlReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_completion_result_event_publication_reservations = True
 
         def __init__(self) -> None:
@@ -1568,6 +1579,8 @@ def test_sqlite_result_resolution_recovers_after_real_process_loss(tmp_path) -> 
 
 def test_event_publication_failure_replays_from_application_receipt() -> None:
     class FailResultEventOnceStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_result_event_once = True
@@ -1622,6 +1635,8 @@ def test_event_publication_failure_replays_from_application_receipt() -> None:
 
 def test_receipt_replay_rejects_forged_session_incarnation_before_event_publication() -> None:
     class FailResultEventOnceStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_result_event_once = True
@@ -1700,6 +1715,8 @@ def test_receipt_replay_rejects_forged_session_incarnation_before_event_publicat
 
 def test_receipt_replay_reacquires_publication_ownership_before_event_readback() -> None:
     class FailThenBlockResultEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_result_event_once = True
@@ -1793,6 +1810,8 @@ def test_caller_cancellation_during_publication_readback_preserves_failure() -> 
     secret = "result-event-publication-readback-secret-canary"
 
     class FailAndBlockResultEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_result_event_once = True
@@ -1881,6 +1900,8 @@ def test_child_only_event_publication_cancellation_replays_from_receipt() -> Non
     secret = "result-event-child-cancellation-secret-canary"
 
     class CancelResultEventOnceStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.cancel_result_event_once = True

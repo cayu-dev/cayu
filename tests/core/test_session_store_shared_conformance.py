@@ -16,7 +16,10 @@ from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr, ValidationError
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    interrupt_and_release_test_invocation,
+    profiled_session_identity,
+)
 from tests.core._workload_secret_support import FakeProvider
 from tests.core.completion_result_resolver_conformance import (
     assert_completion_result_resolver_session_publication_conformance,
@@ -746,10 +749,12 @@ def _new_postgres_store(
     *,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     schema_mode: SchemaMode = SchemaMode.VALIDATE,
+    store_type: type[Any] | None = None,
 ) -> SessionStore:
     from cayu import PostgresSessionStore
 
-    return PostgresSessionStore(
+    selected_store_type = PostgresSessionStore if store_type is None else store_type
+    return selected_store_type(
         dsn,
         min_size=1,
         max_size=4,
@@ -1440,6 +1445,75 @@ def _approval_recovery_environment_spec() -> EnvironmentSpec:
 
 class _SimulatedProcessLoss(BaseException):
     pass
+
+
+class _WorkspaceObservationProcessLossStoreMixin:
+    """Class-declared fault injection that preserves lifecycle capability attestation."""
+
+    invocation_lifecycle_command_version = 1
+    _workspace_observation_crash_phase: str | None = None
+    _workspace_observation_process_lost = False
+
+    def arm_workspace_observation_process_loss(self, crash_phase: str) -> None:
+        self._workspace_observation_crash_phase = crash_phase
+        self._workspace_observation_process_lost = False
+
+    def disarm_workspace_observation_process_loss(self) -> bool:
+        process_lost = self._workspace_observation_process_lost
+        self._workspace_observation_crash_phase = None
+        return process_lost
+
+    async def publish_runtime_publication(self, session_id: str, **kwargs):
+        result = await cast("Any", super()).publish_runtime_publication(
+            session_id,
+            **kwargs,
+        )
+        request = kwargs["request"]
+        if (
+            not self._workspace_observation_process_lost
+            and request.kind == "workspace-observation"
+            and request.intent.get("phase") == self._workspace_observation_crash_phase
+        ):
+            self._workspace_observation_process_lost = True
+            raise _SimulatedProcessLoss(self._workspace_observation_crash_phase)
+        return result
+
+    async def transform_checkpoint(self, session_id: str, checkpoint_transform):
+        result = await cast("Any", super()).transform_checkpoint(
+            session_id,
+            checkpoint_transform,
+        )
+        if (
+            self._workspace_observation_crash_phase == "terminal-stage"
+            and not self._workspace_observation_process_lost
+        ):
+            checkpoint = await cast("Any", self).load_checkpoint(session_id)
+            observations = None if checkpoint is None else checkpoint.get("workspace_observations")
+            pending_round = None if checkpoint is None else checkpoint.get("pending_tool_round")
+            if (
+                type(observations) is dict
+                and len(observations) == 1
+                and next(iter(observations.values())).get("phase") == "before_captured"
+                and type(pending_round) is dict
+                and pending_round.get("staged_terminals")
+            ):
+                self._workspace_observation_process_lost = True
+                raise _SimulatedProcessLoss(self._workspace_observation_crash_phase)
+        return result
+
+
+class _WorkspaceObservationProcessLossInMemorySessionStore(
+    _WorkspaceObservationProcessLossStoreMixin,
+    InMemorySessionStore,
+):
+    invocation_lifecycle_command_version = 1
+
+
+class _WorkspaceObservationProcessLossSQLiteSessionStore(
+    _WorkspaceObservationProcessLossStoreMixin,
+    SQLiteSessionStore,
+):
+    invocation_lifecycle_command_version = 1
 
 
 @pytest.fixture(params=["memory", "sqlite", "postgres"])
@@ -4211,24 +4285,52 @@ async def _open_store(
     case,
     *,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+    workspace_observation_crash_phase: str | None = None,
 ) -> SessionStore:
     if public_authority_alias_codec is None:
         public_authority_alias_codec = _public_authority_alias_codec()
     store_kind, tmp_path, postgres_dsn = case
     if store_kind == "memory":
-        return InMemorySessionStore(
+        store_type = (
+            InMemorySessionStore
+            if workspace_observation_crash_phase is None
+            else _WorkspaceObservationProcessLossInMemorySessionStore
+        )
+        store = store_type(
             public_authority_alias_codec=public_authority_alias_codec,
         )
-    if store_kind == "sqlite":
-        return SQLiteSessionStore(
+    elif store_kind == "sqlite":
+        store_type = (
+            SQLiteSessionStore
+            if workspace_observation_crash_phase is None
+            else _WorkspaceObservationProcessLossSQLiteSessionStore
+        )
+        store = store_type(
             tmp_path / "sessions.sqlite",
             public_authority_alias_codec=public_authority_alias_codec,
         )
-    await _reset_postgres_data(postgres_dsn)
-    return _new_postgres_store(
-        postgres_dsn,
-        public_authority_alias_codec=public_authority_alias_codec,
-    )
+    else:
+        await _reset_postgres_data(postgres_dsn)
+        postgres_store_type = None
+        if workspace_observation_crash_phase is not None:
+            from cayu import PostgresSessionStore
+
+            class _WorkspaceObservationProcessLossPostgresSessionStore(
+                _WorkspaceObservationProcessLossStoreMixin,
+                PostgresSessionStore,
+            ):
+                invocation_lifecycle_command_version = 1
+
+            postgres_store_type = _WorkspaceObservationProcessLossPostgresSessionStore
+        store = _new_postgres_store(
+            postgres_dsn,
+            public_authority_alias_codec=public_authority_alias_codec,
+            store_type=postgres_store_type,
+        )
+    if workspace_observation_crash_phase is not None:
+        assert isinstance(store, _WorkspaceObservationProcessLossStoreMixin)
+        store.arm_workspace_observation_process_loss(workspace_observation_crash_phase)
+    return store
 
 
 async def _reopen_store(case, store: SessionStore) -> SessionStore:
@@ -5423,6 +5525,28 @@ def test_session_store_conformance_workspace_observation_lifecycle_is_exact_and_
                 await store.load_checkpoint(session_id)
             ) == {intent.window_id: intent}
 
+            await store.checkpoint(session_id, {"generic_checkpoint_marker": "retained"})
+            checkpoint_after_generic_write = await store.load_checkpoint(session_id)
+            assert checkpoint_after_generic_write is not None
+            assert checkpoint_after_generic_write["generic_checkpoint_marker"] == "retained"
+            assert workspace_observations_from_checkpoint(checkpoint_after_generic_write) == {
+                intent.window_id: intent
+            }
+
+            def replace_ordinary_checkpoint(_session, current):
+                assert current is not None
+                current.pop("workspace_observations", None)
+                current["generic_transform_marker"] = "retained"
+                return current
+
+            await store.transform_checkpoint(session_id, replace_ordinary_checkpoint)
+            checkpoint_after_generic_transform = await store.load_checkpoint(session_id)
+            assert checkpoint_after_generic_transform is not None
+            assert checkpoint_after_generic_transform["generic_transform_marker"] == "retained"
+            assert workspace_observations_from_checkpoint(checkpoint_after_generic_transform) == {
+                intent.window_id: intent
+            }
+
             before_captured = WorkspaceObservationLifecycle.model_validate(
                 {
                     **intent.model_dump(mode="json"),
@@ -5825,7 +5949,10 @@ def test_session_store_conformance_recovers_workspace_observation_through_public
     recovery_repairs_observation: bool,
 ) -> None:
     async def run() -> None:
-        store = await _open_store(session_store_case)
+        store = await _open_store(
+            session_store_case,
+            workspace_observation_crash_phase=crash_phase,
+        )
         workspace_root = session_store_case[1] / f"workspace-observation-runtime-{crash_phase}"
         workspace_root.mkdir(exist_ok=True)
         artifact_root = session_store_case[1] / f"workspace-observation-artifacts-{crash_phase}"
@@ -5855,68 +5982,27 @@ def test_session_store_conformance_recovers_workspace_observation_through_public
                 tools=[first_tool],
             )
 
-            original_publish = store.publish_runtime_publication
-            original_transform = store.transform_checkpoint
-            lost_process = False
-
-            async def publish_then_lose_process(session_id: str, **kwargs):
-                nonlocal lost_process
-                result = await original_publish(session_id, **kwargs)
-                if (
-                    not lost_process
-                    and kwargs["request"].kind == "workspace-observation"
-                    and kwargs["request"].intent.get("phase") == crash_phase
-                ):
-                    lost_process = True
-                    raise _SimulatedProcessLoss(crash_phase)
-                return result
-
-            async def transform_then_lose_process(session_id: str, transform):
-                nonlocal lost_process
-                result = await original_transform(session_id, transform)
-                if crash_phase == "terminal-stage" and not lost_process:
-                    checkpoint = await store.load_checkpoint(session_id)
-                    observations = (
-                        None if checkpoint is None else checkpoint.get("workspace_observations")
-                    )
-                    pending_round = (
-                        None if checkpoint is None else checkpoint.get("pending_tool_round")
-                    )
-                    if (
-                        type(observations) is dict
-                        and len(observations) == 1
-                        and next(iter(observations.values())).get("phase") == "before_captured"
-                        and type(pending_round) is dict
-                        and pending_round.get("staged_terminals")
-                    ):
-                        lost_process = True
-                        raise _SimulatedProcessLoss(crash_phase)
-                return result
-
-            store.publish_runtime_publication = (  # type: ignore[method-assign]
-                publish_then_lose_process
-            )
-            store.transform_checkpoint = transform_then_lose_process  # type: ignore[method-assign]
-            with pytest.raises(_SimulatedProcessLoss, match=crash_phase):
-                _ = [
-                    event
-                    async for event in first_app.run(
-                        RunRequest(
-                            agent_name="assistant",
-                            session_id=session_id,
-                            messages=[Message.text("user", "write once")],
+            assert isinstance(store, _WorkspaceObservationProcessLossStoreMixin)
+            try:
+                with pytest.raises(_SimulatedProcessLoss, match=crash_phase):
+                    _ = [
+                        event
+                        async for event in first_app.run(
+                            RunRequest(
+                                agent_name="assistant",
+                                session_id=session_id,
+                                messages=[Message.text("user", "write once")],
+                            )
                         )
-                    )
-                ]
+                    ]
+            finally:
+                lost_process = store.disarm_workspace_observation_process_loss()
             assert lost_process is True
             assert first_provider.requests == 1
             assert first_tool.calls == (1 if tool_ran else 0)
             assert (workspace_root / "recovered.txt").exists() is tool_ran
 
-            store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
-            store.transform_checkpoint = original_transform  # type: ignore[method-assign]
-            await store.release_run_fence(session_id)
-            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            await interrupt_and_release_test_invocation(store, session_id)
             store = await _reopen_store(session_store_case, store)
 
             recovery_provider = _WorkspaceObservationRecoveryProvider()
@@ -7547,8 +7633,7 @@ def test_session_store_conformance_ambiguous_policy_recovery_remains_gated(
                 raw_checkpoint = dict(raw_checkpoint)
                 raw_checkpoint["pending_tool_round"] = raw_round
                 await store.checkpoint(session_id, raw_checkpoint)
-            await store.release_run_fence(session_id)
-            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            await interrupt_and_release_test_invocation(store, session_id)
 
             store = await _reopen_store(session_store_case, store)
             recovery_app = CayuApp(session_store=store, enable_logging=False)
@@ -7732,8 +7817,7 @@ def test_session_store_conformance_lost_policy_authority_never_becomes_executabl
                         )
                     ):
                         pass
-                await store.release_run_fence(session_id)
-                await store.update_status(session_id, SessionStatus.INTERRUPTED)
+                await interrupt_and_release_test_invocation(store, session_id)
             else:
                 events = [
                     event
@@ -17443,13 +17527,14 @@ def test_session_store_conformance_rejects_future_checkpoint_before_operation_lo
                 operation_transform=transform,
                 events=[],
             )
-            await store.checkpoint(
-                created.id,
-                {
-                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
-                    "private_checkpoint_detail": "must-not-be-reported",
-                },
-            )
+            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+                await store.checkpoint(
+                    created.id,
+                    {
+                        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
+                        "private_checkpoint_detail": "must-not-be-reported",
+                    },
+                )
 
             runtime_store = CayuApp(
                 session_store=store,
@@ -17472,6 +17557,8 @@ def test_session_store_conformance_rejects_future_checkpoint_before_operation_lo
 
 def test_guarded_operation_publication_requires_native_commit_boundary() -> None:
     class LegacyOverrideStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.publication_calls = 0
@@ -18838,15 +18925,16 @@ def test_session_store_conformance_rejects_future_checkpoint_before_marker_proje
                 ),
                 identity=_identity(),
             )
-            await store.checkpoint(
-                session_id,
-                {
-                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
-                    "pending_interruption_cascade": {
-                        "attempt_id": "must-not-be-interpreted",
+            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+                await store.checkpoint(
+                    session_id,
+                    {
+                        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
+                        "pending_interruption_cascade": {
+                            "attempt_id": "must-not-be-interpreted",
+                        },
                     },
-                },
-            )
+                )
 
             with pytest.raises(CheckpointCompatibilityError) as caught:
                 await CayuApp(
@@ -19527,7 +19615,8 @@ def test_session_store_conformance_rejects_future_checkpoint_before_initial_tran
             assert checkpoint is not None
             checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
             checkpoint["private_checkpoint_detail"] = "must-not-be-reported"
-            await store.checkpoint(session.id, checkpoint)
+            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+                await store.checkpoint(session.id, checkpoint)
 
             runtime_store = CayuApp(
                 session_store=store,
@@ -20052,29 +20141,35 @@ def test_session_store_conformance_receipt_lookup_rejects_non_event_transition_c
 def test_runtime_conformance_replays_exact_interaction_transition_after_ack_loss(
     session_store_case,
     lost_acknowledgements: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)
         session_id = (
             f"interaction-transition-ack-loss-{lost_acknowledgements}-{session_store_case[0]}"
         )
-        original_publish = store.publish_interaction_transition
+        store_type = type(store)
+        original_publish = store_type.publish_interaction_transition
         attempted_events: list[Event] = []
         remaining = lost_acknowledgements
         try:
 
-            async def publish_then_lose_ack(session_id: str, **kwargs):
+            async def publish_then_lose_ack(self, session_id: str, **kwargs):
                 nonlocal remaining
                 event = kwargs["event"]
                 if event.type == EventType.INTERACTION_COMPLETED:
                     attempted_events.append(event.model_copy(deep=True))
-                result = await original_publish(session_id, **kwargs)
+                result = await original_publish(self, session_id, **kwargs)
                 if event.type == EventType.INTERACTION_COMPLETED and remaining > 0:
                     remaining -= 1
                     raise ConnectionError("interaction transition acknowledgement lost")
                 return result
 
-            store.publish_interaction_transition = publish_then_lose_ack  # type: ignore[method-assign]
+            monkeypatch.setattr(
+                store_type,
+                "publish_interaction_transition",
+                publish_then_lose_ack,
+            )
             provider = _TransitionReplayConformanceProvider()
             app = CayuApp(session_store=store, enable_logging=False)
             app.register_provider(provider, default=True)
@@ -20097,7 +20192,11 @@ def test_runtime_conformance_replays_exact_interaction_transition_after_ack_loss
             assert all(event == attempted_events[0] for event in attempted_events)
             assert len(provider.requests) == 1
 
-            store.publish_interaction_transition = original_publish  # type: ignore[method-assign]
+            monkeypatch.setattr(
+                store_type,
+                "publish_interaction_transition",
+                original_publish,
+            )
             store = await _reopen_store(session_store_case, store)
             session = await store.load(session_id)
             durable = await store.load_events(session_id)

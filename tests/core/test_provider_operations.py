@@ -651,6 +651,8 @@ class _ContextualReconnectableProvider(_ReconnectableProvider):
 
 
 class _CaptureStageStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.stage_requests: list[ModelCompletionStageRequest] = []
@@ -2709,6 +2711,8 @@ def test_operator_inspection_uses_latest_reconnect_transition() -> None:
 
 
 class _FenceOnEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, fence_on: EventType) -> None:
         super().__init__()
         self.fence_on = fence_on
@@ -2729,6 +2733,8 @@ class _FenceOnEventStore(InMemorySessionStore):
 
 
 class _CancelOnEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, cancel_on: EventType) -> None:
         super().__init__()
         self.cancel_on = cancel_on
@@ -2740,6 +2746,8 @@ class _CancelOnEventStore(InMemorySessionStore):
 
 
 class _FailBeforeCommitOnEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, fail_on: EventType, failure: Exception) -> None:
         super().__init__()
         self.fail_on = fail_on
@@ -2764,6 +2772,8 @@ class _HostileCauseError(Exception):
 
 
 class _FailClaimAfterStartedCommitStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.started_event_id: str | None = None
@@ -2792,6 +2802,8 @@ class _FailClaimAfterStartedCommitStore(InMemorySessionStore):
 
 
 class _UnverifiableStartedCommitStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.started_event_id: str | None = None
@@ -2813,6 +2825,8 @@ class _UnverifiableStartedCommitStore(InMemorySessionStore):
 
 
 class _CancelOuterStartedReadbackStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.started_event_id: str | None = None

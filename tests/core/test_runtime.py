@@ -22,7 +22,11 @@ from hypothesis import strategies as st
 from pydantic import SecretStr, ValidationError
 from tests._session_provenance import fixture_session_invocation
 from tests.core._execution_profile_fixtures import (
+    checkpoint_with_rebound_test_invocation_profile,
+    create_admitted_session,
+    interrupt_and_release_test_invocation,
     profiled_session_identity,
+    rebind_test_invocation,
     run_request_with_registered_tool_ceiling,
     tool_capability_ceiling_for_app,
 )
@@ -270,6 +274,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.runtime.context import (
     ContextBuildError,
@@ -694,6 +699,8 @@ class FailingCompactor(ContextCompactor):
 
 
 class FailingApprovalCloseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_close_once = False
@@ -707,6 +714,8 @@ class FailingApprovalCloseStore(InMemorySessionStore):
 
 
 class FailingTerminalToolEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_terminal_once = False
@@ -715,6 +724,10 @@ class FailingTerminalToolEventStore(InMemorySessionStore):
     async def release_run_fence(self, session_id: str) -> None:
         self.release_calls += 1
         await super().release_run_fence(session_id)
+
+    async def release_session_invocation(self, command):
+        self.release_calls += 1
+        return await super().release_session_invocation(command)
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         if not self.failed_terminal_once and any(
@@ -726,6 +739,8 @@ class FailingTerminalToolEventStore(InMemorySessionStore):
 
 
 class FailNextRunFenceReleaseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_next_release = False
@@ -739,8 +754,19 @@ class FailNextRunFenceReleaseStore(InMemorySessionStore):
                 raise RuntimeError("run fence release failed") from cause
         await super().release_run_fence(session_id)
 
+    async def release_session_invocation(self, command):
+        if self.fail_next_release:
+            self.fail_next_release = False
+            try:
+                raise OSError("run fence database connection lost")
+            except OSError as cause:
+                raise RuntimeError("run fence release failed") from cause
+        return await super().release_session_invocation(command)
+
 
 class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_tool_round_close_once = False
@@ -767,6 +793,8 @@ class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
 
 
 class FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_pending_tool_round_once = False
@@ -835,6 +863,8 @@ class BarrierSideEffectTool(Tool):
 
 
 class FailingAllTerminalToolEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failing = True
@@ -849,6 +879,8 @@ class FailingAllTerminalToolEventStore(InMemorySessionStore):
 
 
 class FailingPostPersistEventsLoadStore(FailingTerminalToolEventStore):
+    invocation_lifecycle_command_version = 1
+
     """Crash the round like the base store, then fail the first event load that
     happens after a manual-recovery terminal event was persisted (the
     remaining-unknown recheck inside recover_tool_round)."""
@@ -868,6 +900,8 @@ class FailingPostPersistEventsLoadStore(FailingTerminalToolEventStore):
 
 
 class BlockingPostPersistEventsLoadStore(FailingTerminalToolEventStore):
+    invocation_lifecycle_command_version = 1
+
     """Pause the first recovery after its manual terminal outcome is durable."""
 
     def __init__(self) -> None:
@@ -888,6 +922,8 @@ class BlockingPostPersistEventsLoadStore(FailingTerminalToolEventStore):
 
 
 class FailingSecondTerminalToolEventStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.completed_tool_events = 0
@@ -1623,6 +1659,7 @@ def assert_only_model_step_publication_checkpoint(
     assert set(checkpoint) == {
         CHECKPOINT_SCHEMA_VERSION_KEY,
         execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
@@ -1647,6 +1684,7 @@ def checkpoint_without_model_step_publication(
     copied = dict(checkpoint)
     copied.pop(model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -1660,6 +1698,7 @@ def checkpoint_without_active_invocation_profile(
     )
     copied = dict(checkpoint)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -1667,28 +1706,7 @@ async def transition_runtime_session_to_running(
     store: SessionStore,
     session_id: str,
 ) -> Session:
-    session = await store.load(session_id)
-    checkpoint = await store.load_checkpoint(session_id)
-    assert session is not None
-    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
-        checkpoint
-    )
-    assert active_profile is not None
-    return await store.transition_status_and_checkpoint(
-        session_id,
-        from_statuses={session.status},
-        to_status=SessionStatus.RUNNING,
-        checkpoint_transform=lambda current_session, current_checkpoint: (
-            execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
-                current_checkpoint,
-                session_id=current_session.id,
-                interaction_id=active_profile.interaction_id,
-                run_epoch=current_session.run_epoch + 1,
-                profile=active_profile.profile,
-                expected=active_profile,
-            )
-        ),
-    )
+    return await rebind_test_invocation(store, session_id)
 
 
 def interruption_payload_without_request_id(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4883,6 +4901,8 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
 
 def test_cayu_app_preserves_falsey_session_store_instance():
     class FalseySessionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __bool__(self):
             return False
 
@@ -5607,6 +5627,8 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_fails()
             await super().close()
 
     class FailingReconnectCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
             def fail_reconnect(session, checkpoint):
                 state = checkpoint_transform(session, checkpoint)
@@ -5688,6 +5710,8 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_is_canc
             await super().close()
 
     class CancellingReconnectCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
             def cancel_reconnect(session, checkpoint):
                 state = checkpoint_transform(session, checkpoint)
@@ -5743,6 +5767,8 @@ def test_cayu_app_closes_factory_environment_when_post_create_checkpoint_is_canc
 
 def test_cayu_app_releases_run_fence_when_pre_run_failure_recording_fails(tmp_path):
     class FailingSessionFailedEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_events(self, session_id: str, events: list[Event]) -> None:
             if any(event.type == EventType.SESSION_FAILED for event in events):
                 raise RuntimeError("terminal event unavailable")
@@ -6451,6 +6477,8 @@ def test_cancelled_factory_checkpoint_reports_fallback_cleanup_failure(
 
 def test_cancelled_factory_checkpoint_read_discards_uncommitted_allocation(tmp_path):
     class BlockingCheckpointReadStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.block_next_checkpoint_read = False
@@ -6575,6 +6603,8 @@ def test_factory_checkpoint_write_failure_reconciles_allocation_ownership(
             raise RuntimeError("workload-secret-from-release-mutation")
 
     class FailingFactoryCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.checkpoint_failure_armed = False
@@ -6687,9 +6717,9 @@ def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
         transform_started = threading.Event()
         allow_transform_return = threading.Event()
         original_transform_checkpoint = store.transform_checkpoint
-        run_fence_release_started = asyncio.Event()
-        run_fence_release_completed = asyncio.Event()
-        original_release_run_fence = store.release_run_fence
+        invocation_release_started = asyncio.Event()
+        invocation_release_completed = asyncio.Event()
+        original_release_session_invocation = store.release_session_invocation
 
         async def delayed_transform_checkpoint(session_id, checkpoint_transform) -> None:
             def delayed_transform(session, checkpoint):
@@ -6701,13 +6731,18 @@ def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
 
             await original_transform_checkpoint(session_id, delayed_transform)
 
-        async def observed_release_run_fence(session_id: str) -> None:
-            run_fence_release_started.set()
-            await original_release_run_fence(session_id)
-            run_fence_release_completed.set()
+        async def observed_release_session_invocation(self, command):
+            invocation_release_started.set()
+            result = await original_release_session_invocation(command)
+            invocation_release_completed.set()
+            return result
 
         monkeypatch.setattr(store, "transform_checkpoint", delayed_transform_checkpoint)
-        monkeypatch.setattr(store, "release_run_fence", observed_release_run_fence)
+        monkeypatch.setattr(
+            type(store),
+            "release_session_invocation",
+            observed_release_session_invocation,
+        )
         release_actions: list[EnvironmentFactoryReleaseAction] = []
 
         async def release(action: EnvironmentFactoryReleaseAction) -> None:
@@ -6752,14 +6787,14 @@ def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
         assert store._lock.locked()
         assert not run_task.done()
         assert release_actions == []
-        assert not run_fence_release_started.is_set()
+        assert not invocation_release_started.is_set()
 
         allow_transform_return.set()
         with pytest.raises(asyncio.CancelledError):
             await run_task
 
-        assert run_fence_release_started.is_set()
-        assert run_fence_release_completed.is_set()
+        assert invocation_release_started.is_set()
+        assert invocation_release_completed.is_set()
         checkpoint = await store.load_checkpoint("sess_cancelled_sqlite_factory_checkpoint")
         await store.close()
         assert checkpoint is not None
@@ -8081,6 +8116,8 @@ def test_cayu_app_preserves_bind_signals_when_failure_publication_fails():
             raise AssertionError("finalize should not run")
 
     class FailingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type is EventType.ENVIRONMENT_BINDING_FAILED:
                 raise publication_error
@@ -8128,6 +8165,8 @@ def test_cayu_app_does_not_publish_fatal_only_bind_group_as_ordinary_failure():
             raise AssertionError("finalize should not run")
 
     class RecordingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             nonlocal failure_event_attempted
             if event.type is EventType.ENVIRONMENT_BINDING_FAILED:
@@ -10831,6 +10870,8 @@ def test_cayu_app_validates_budget_lease_immediately_before_provider_dispatch(
     pause_at: EventType,
 ) -> None:
     class AbandonmentAcknowledgementLostStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.abandonment_calls = 0
@@ -15630,6 +15671,7 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
 
 def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -> None:
     class CrashAfterForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         crash_after_commit = True
 
         async def create_profiled_fork(self, *args, **kwargs):
@@ -15715,6 +15757,8 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
     tmp_path: Path,
 ) -> None:
     class CrashAfterForkStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create_profiled_fork(self, *args, **kwargs):
             await super().create_profiled_fork(*args, **kwargs)
             raise SystemExit("process died after descendant commit")
@@ -15836,6 +15880,7 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
     tmp_path: Path,
 ) -> None:
     class CrashBeforeForkStore(SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
         crash_before_commit = True
 
         async def create_profiled_fork(self, *args, **kwargs):
@@ -15934,6 +15979,8 @@ def test_prompt_anatomy_fork_recovers_durable_intent_after_process_death(
 
 def test_prompt_anatomy_fork_requires_exact_intent_inside_atomic_create() -> None:
     class IntentErasingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create_profiled_fork(self, *args, **kwargs):
             await self.checkpoint(kwargs["source_session_id"], {})
             return await super().create_profiled_fork(*args, **kwargs)
@@ -16242,6 +16289,8 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
     now = datetime(2026, 1, 1, 1, tzinfo=UTC)
 
     class InterleavedTakeoverStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.takeover_started = asyncio.Event()
@@ -16373,6 +16422,8 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
     now = datetime(2026, 1, 1, 1, tzinfo=UTC)
 
     class LostTakeoverAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_next_takeover_acknowledgement = False
@@ -16463,6 +16514,8 @@ def test_cayu_app_does_not_reconcile_an_ambiguous_takeover_as_a_replacement_owne
     current_time = {"value": datetime(2026, 1, 1, 1, tzinfo=UTC)}
 
     class ReplacementDuringReconciliationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_next_takeover_acknowledgement = False
@@ -19651,6 +19704,8 @@ def test_pending_interruption_cascade_resumes_from_durable_checkpoint():
 
 def test_pending_interruption_recovery_discovers_only_indexed_markers(monkeypatch):
     class RecoveryDiscoveryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.discovery_queries: list[SessionQuery] = []
@@ -20933,6 +20988,8 @@ def test_subagent_tool_interrupts_child_session_when_parent_is_interrupted():
 
 def test_subagent_tool_interrupts_child_session_during_startup_window():
     class DelayedChildStartupStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.child_running = asyncio.Event()
@@ -23319,6 +23376,7 @@ def test_cayu_app_resume_model_updates_session_active_model():
 
 def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
     class CancellingTranscriptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         cancel_load = False
 
         async def load_transcript(self, session_id: str) -> list[Message]:
@@ -23445,6 +23503,8 @@ def test_cayu_app_resume_rejects_active_sessions():
 
 def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
     class BrokenTranscriptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def load_transcript(self, session_id: str) -> list[Message]:
             raise RuntimeError("transcript unavailable")
 
@@ -25296,36 +25356,18 @@ async def _seed_crashed_spawn_parent(
     parent_interaction_id = "interaction-parent-crashed-spawn"
     parent_messages = [Message.text("user", "spawn a reviewer")]
 
-    def freeze_parent_invocation_profile(current_session, current_checkpoint):
-        assert parent_identity.execution_profile is not None
-        return execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
-            current_checkpoint,
-            session_id=current_session.id,
-            interaction_id=parent_interaction_id,
-            run_epoch=current_session.run_epoch,
-            profile=parent_identity.execution_profile,
-        )
-
-    await store.create(
-        RunRequest(
+    assert parent_identity.execution_profile is not None
+    await create_admitted_session(
+        store,
+        request=RunRequest(
             agent_name="parent",
             session_id="parent",
             messages=parent_messages,
             tool_capability_ceiling=parent_tool_capability_ceiling,
         ),
-        identity=parent_identity,
-        interaction_started_event=_interaction_started_event(
-            "parent",
-            interaction_id=parent_interaction_id,
-            agent_name="parent",
-        ),
-        interaction_source_messages=parent_messages,
-        checkpoint_transform=freeze_parent_invocation_profile,
-    )
-    await store.replace_initial_transcript_messages(
-        "parent",
-        parent_messages,
-        parent_messages,
+        provider_name=parent_identity.provider_name,
+        model=parent_identity.model,
+        execution_profile=parent_identity.execution_profile,
         interaction_id=parent_interaction_id,
     )
     # Build the pending round first so the child can stamp the round-scoped idempotency_key.
@@ -25736,6 +25778,8 @@ def test_interrupt_close_ignores_child_from_a_different_round():
 
 
 class _CountSplitInterruptionCheckpointReadsStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self._children_queried = False
@@ -26614,10 +26658,10 @@ def test_manual_tool_round_recovery_rebases_stale_running_operation() -> None:
                 expected=active_profile,
             )
 
-        await store.transition_status_and_checkpoint(
+        await rebind_test_invocation(
+            store,
             session_id,
-            from_statuses={SessionStatus.FAILED},
-            to_status=SessionStatus.RUNNING,
+            target_status=SessionStatus.RUNNING,
             checkpoint_transform=claim_crashed_continuation,
         )
         await store.release_run_fence(session_id)
@@ -26759,6 +26803,8 @@ def test_manual_tool_round_recovery_repairs_missing_prior_terminal_evidence(
 
 def test_tool_round_recovery_reconciles_ambiguous_append_acknowledgement() -> None:
     class AmbiguousRecoveryAppendStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_recovery_ack = False
@@ -26818,6 +26864,8 @@ def test_tool_round_recovery_reconciles_ambiguous_append_acknowledgement() -> No
 
 def test_tool_round_recovery_interrupts_when_append_reconciliation_is_unavailable() -> None:
     class UnreconcilableRecoveryAppendStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_recovery_ack = False
@@ -26883,6 +26931,8 @@ def test_tool_round_recovery_interrupts_when_append_reconciliation_is_unavailabl
 
 def test_tool_round_recovery_restores_status_when_append_did_not_commit() -> None:
     class PreCommitRecoveryAppendFailureStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_events(self, session_id: str, events: list[Event]) -> None:
             if any(event.payload.get("manual_recovery") is True for event in events):
                 raise RuntimeError("manual recovery append rejected before commit")
@@ -27037,6 +27087,8 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class OperatorInterruptStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.operator_interrupt_committed: asyncio.Event | None = None
@@ -27048,12 +27100,14 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt(
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             if (
                 to_status == SessionStatus.INTERRUPTING
@@ -27341,9 +27395,11 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
     cleanup_order: list[str] = []
 
     class OrderedReleaseStore(FailingTerminalToolEventStore):
-        async def release_run_fence(self, session_id: str) -> None:
+        invocation_lifecycle_command_version = 1
+
+        async def release_session_invocation(self, command):
             cleanup_order.append("run_fence_release")
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     class BlockingRecoveryProvider(ModelProvider):
         name = "fake"
@@ -27404,7 +27460,9 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             session_id: str,
             original_error,
             execution_profile=None,
+            invocation_context=None,
         ) -> None:
+            del execution_profile, invocation_context
             assert isinstance(original_error, RuntimeError)
             checkpoint_during_abort = await store.load_checkpoint(session_id)
             assert checkpoint_during_abort is not None
@@ -27420,6 +27478,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             registered_agent=None,
             registered_environment=None,
             execution_profile=None,
+            invocation_context=None,
         ) -> None:
             cleanup_order.append("abandoned_finalization")
             await original_finalize(
@@ -27430,6 +27489,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
 
         monkeypatch.setattr(
@@ -27492,17 +27552,20 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
     cleanup_order: list[str] = []
 
     class ObservableReleaseStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.observe_release = False
             self.release_finished = asyncio.Event()
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             if self.observe_release:
                 cleanup_order.append("run_fence_release")
-            await super().release_run_fence(session_id)
+            result = await super().release_session_invocation(command)
             if self.observe_release:
                 self.release_finished.set()
+            return result
 
     session_id = "sess_tool_round_manual_heartbeat_lost_while_yielded"
     store = ObservableReleaseStore()
@@ -27528,7 +27591,9 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             session_id: str,
             original_error,
             execution_profile=None,
+            invocation_context=None,
         ) -> None:
+            del execution_profile, invocation_context
             assert isinstance(original_error, RuntimeError)
             checkpoint_during_abort = await store.load_checkpoint(session_id)
             assert checkpoint_during_abort is not None
@@ -27544,6 +27609,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             registered_agent=None,
             registered_environment=None,
             execution_profile=None,
+            invocation_context=None,
         ) -> None:
             cleanup_order.append("abandoned_finalization")
             await original_finalize(
@@ -27554,6 +27620,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
 
         monkeypatch.setattr(
@@ -27754,6 +27821,8 @@ def test_cayu_app_recover_tool_round_preserves_cross_worker_interrupt_during_res
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FailAfterClaimStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.arm_recovery_load_failure = False
@@ -27857,15 +27926,17 @@ def test_cayu_app_recover_tool_round_preserves_cross_worker_interrupt_during_res
 
 def test_cayu_app_recover_tool_round_aclose_reports_cleanup_failure() -> None:
     class FailingRecoveryReleaseStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_release = False
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             if self.fail_release:
                 self.fail_release = False
                 raise RuntimeError("manual recovery run fence release unavailable")
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     session_id = "sess_tool_round_manual_aclose_cleanup_failure"
     store = FailingRecoveryReleaseStore()
@@ -27947,11 +28018,13 @@ def test_cayu_app_recover_tool_round_athrow_finalizes_before_return() -> None:
 
 def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
     class FailingRecoveryReleaseStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_release = False
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             if self.fail_release:
                 self.fail_release = False
                 try:
@@ -27960,7 +28033,7 @@ def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
                     raise RuntimeError(
                         "manual recovery run fence release unavailable"
                     ) from database_failure
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     session_id = "sess_tool_round_manual_athrow_cleanup_failure"
     store = FailingRecoveryReleaseStore()
@@ -28011,6 +28084,8 @@ def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
 
 def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fence():
     class BlockingRecoveryTransitionStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.recovery_transition_committed = asyncio.Event()
@@ -28023,12 +28098,14 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             if to_status == SessionStatus.RUNNING and SessionStatus.FAILED in from_statuses:
                 self.recovery_transition_committed.set()
@@ -28110,6 +28187,8 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
 
 def test_cayu_app_recover_tool_round_reconciles_ambiguous_claim_commit() -> None:
     class CommitThenRaiseRecoveryClaimStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_manual_claim_ack = False
@@ -28121,12 +28200,14 @@ def test_cayu_app_recover_tool_round_reconciles_ambiguous_claim_commit() -> None
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             transitioned = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             checkpoint = await self.load_checkpoint(session_id)
             marker = (
@@ -28152,31 +28233,19 @@ def test_cayu_app_recover_tool_round_reconciles_ambiguous_claim_commit() -> None
         message="verified externally",
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="manual recovery claim commit acknowledgement lost",
-    ):
-        asyncio.run(collect_tool_round_recovery_events(app, request))
-
-    interrupted = asyncio.run(store.load(session_id))
-    assert interrupted is not None
-    assert interrupted.status == SessionStatus.INTERRUPTED
-    checkpoint_after_failure = asyncio.run(store.load_checkpoint(session_id))
-    assert checkpoint_after_failure is not None
-    assert "pending_tool_round" in checkpoint_after_failure
-    assert "incomplete_session_recovery_claim" not in checkpoint_after_failure
-    assert not any(
-        event.payload.get("manual_recovery") is True
-        for event in asyncio.run(store.load_events(session_id))
-    )
-
     recovered = asyncio.run(collect_tool_round_recovery_events(app, request))
+    assert store.failed_manual_claim_ack is True
     assert recovered[-1].type == EventType.SESSION_COMPLETED
+    checkpoint_after_recovery = asyncio.run(store.load_checkpoint(session_id))
+    assert checkpoint_after_recovery is not None
+    assert "incomplete_session_recovery_claim" not in checkpoint_after_recovery
     assert tool.calls == [{}]
 
 
 def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconciliation() -> None:
     class BlockingClaimReconciliationStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_manual_claim_ack = False
@@ -28190,12 +28259,14 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             transitioned = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             checkpoint = await super().load_checkpoint(session_id)
             marker = (
@@ -28520,6 +28591,8 @@ def test_cayu_app_recover_tool_round_serializes_across_apps(
 
 def test_cayu_app_recover_tool_round_claims_before_status_transition():
     class PausingFirstRecoveryTransitionStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.pause_recovery_transition = False
@@ -28534,6 +28607,7 @@ def test_cayu_app_recover_tool_round_claims_before_status_transition():
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             if self.pause_recovery_transition and to_status == SessionStatus.RUNNING:
                 self.recovery_transition_count += 1
@@ -28545,6 +28619,7 @@ def test_cayu_app_recover_tool_round_claims_before_status_transition():
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
 
     session_id = "sess_tool_round_manual_claim_race"
@@ -28609,12 +28684,16 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
     lose_fence_ack: bool,
 ):
     class PausingManualRecoveryClaimStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.pause_manual_claim = False
             self.manual_claim_started = asyncio.Event()
             self.allow_manual_claim = asyncio.Event()
             self.operator_interrupt_committed = asyncio.Event()
+            self.hold_operator_interrupt_return = False
+            self.allow_operator_interrupt_return = asyncio.Event()
             self.lose_fence_ack = False
             self.fence_ack_lost = False
 
@@ -28625,6 +28704,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             if self.pause_manual_claim and to_status == SessionStatus.RUNNING:
                 self.manual_claim_started.set()
@@ -28634,9 +28714,13 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             if to_status == SessionStatus.INTERRUPTING:
                 self.operator_interrupt_committed.set()
+                if self.hold_operator_interrupt_return:
+                    self.hold_operator_interrupt_return = False
+                    await self.allow_operator_interrupt_return.wait()
             return session
 
         async def fence_run_and_transform_checkpoint(self, *args, **kwargs) -> Session:
@@ -28680,10 +28764,10 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         # then pause recovery exactly before its atomic storage claim.
         current = await store.load(session_id)
         assert current is not None
-        await store.transition_status_and_checkpoint(
+        await rebind_test_invocation(
+            store,
             session_id,
-            from_statuses={current.status},
-            to_status=SessionStatus.RUNNING,
+            target_status=SessionStatus.RUNNING,
             checkpoint_transform=lambda session, current_checkpoint: (
                 execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
                     current_checkpoint,
@@ -28697,6 +28781,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
         )
         await store.release_run_fence(session_id)
         store.pause_manual_claim = True
+        store.hold_operator_interrupt_return = lose_fence_ack
         recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
         await asyncio.wait_for(store.manual_claim_started.wait(), timeout=5)
 
@@ -28723,12 +28808,11 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(recovery_task, timeout=5)
         elif lose_fence_ack:
-            with pytest.raises(
-                RuntimeError,
-                match="interrupted manual recovery fence acknowledgement lost",
-            ):
-                await asyncio.wait_for(recovery_task, timeout=5)
+            recovery_events = await asyncio.wait_for(recovery_task, timeout=5)
+            store.allow_operator_interrupt_return.set()
             interruption_events = await asyncio.wait_for(interrupt_task, timeout=5)
+            assert store.fence_ack_lost is True
+            assert recovery_events[-1].id == interruption_events[-1].id
         else:
             recovery_events = await asyncio.wait_for(recovery_task, timeout=5)
             if not finalize_before_claim:
@@ -28785,14 +28869,18 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
     lose_fence_ack: bool,
 ):
     class PendingOperatorInterruptionStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_fence_ack = False
+            self.fence_ack_lost = False
 
         async def fence_run_and_transform_checkpoint(self, *args, **kwargs) -> Session:
             fenced = await super().fence_run_and_transform_checkpoint(*args, **kwargs)
             if self.lose_fence_ack:
                 self.lose_fence_ack = False
+                self.fence_ack_lost = True
                 raise RuntimeError("interrupted manual recovery fence acknowledgement lost")
             return fenced
 
@@ -28824,10 +28912,10 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
         # its checkpoint marker, but crashed before its terminal event append.
         current = await store.load(session_id)
         assert current is not None
-        await store.transition_status_and_checkpoint(
+        await rebind_test_invocation(
+            store,
             session_id,
-            from_statuses={current.status},
-            to_status=SessionStatus.RUNNING,
+            target_status=SessionStatus.RUNNING,
             checkpoint_transform=lambda session, current_checkpoint: (
                 execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
                     current_checkpoint,
@@ -28851,22 +28939,13 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
         await store.update_status(session_id, SessionStatus.INTERRUPTED)
 
         store.lose_fence_ack = lose_fence_ack
-        if lose_fence_ack:
-            with pytest.raises(
-                RuntimeError,
-                match="interrupted manual recovery fence acknowledgement lost",
-            ):
-                await collect_tool_round_recovery_events(app, request)
-        else:
-            interruption_events = await collect_tool_round_recovery_events(app, request)
-            assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
-            assert interruption_events[-1].payload["interruption_type"] == "operator_requested"
-            assert (
-                interruption_events[-1].payload["interruption_request_id"]
-                == PRIVATE_EVENT_AUTHORITY
-            )
-            assert interruption_events[-1].payload["reason"] == interrupt_payload["reason"]
-            assert interruption_events[-1].payload["metadata"] == interrupt_payload["metadata"]
+        interruption_events = await collect_tool_round_recovery_events(app, request)
+        assert store.fence_ack_lost is lose_fence_ack
+        assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
+        assert interruption_events[-1].payload["interruption_type"] == "operator_requested"
+        assert interruption_events[-1].payload["interruption_request_id"] == PRIVATE_EVENT_AUTHORITY
+        assert interruption_events[-1].payload["reason"] == interrupt_payload["reason"]
+        assert interruption_events[-1].payload["metadata"] == interrupt_payload["metadata"]
         assert await app.drain_background_interruptions(timeout_s=1) is True
 
         interrupted = await store.load(session_id)
@@ -29107,10 +29186,10 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
             return updated
 
         async def stale_owner() -> None:
-            await store.transition_status_and_checkpoint(
+            await rebind_test_invocation(
+                store,
                 session_id,
-                from_statuses={SessionStatus.FAILED},
-                to_status=SessionStatus.RUNNING,
+                target_status=SessionStatus.RUNNING,
                 checkpoint_transform=install_expired_claim,
             )
             if stale_status == SessionStatus.INTERRUPTING:
@@ -29891,6 +29970,76 @@ def test_cayu_app_repairs_terminal_evidence_without_registered_agent():
     assert str(UUID(terminal_records[0].event.id)) == terminal_records[0].event.id
 
 
+def test_terminal_recovery_rejects_receipt_history_without_active_profile() -> None:
+    async def scenario() -> None:
+        session_id = "sess_terminal_recovery_missing_active_profile"
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        admitted = await create_admitted_session(
+            store,
+            request=RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "finish without terminal evidence")],
+            ),
+            provider_name="fake",
+            model="fake-model",
+            app=app,
+        )
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in checkpoint
+        corrupted = dict(checkpoint)
+        corrupted.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await store.checkpoint(session_id, corrupted)
+        before = await store.load_events(session_id)
+
+        with pytest.raises(
+            RuntimeError,
+            match="lost durable invocation profile authority",
+        ):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+        with pytest.raises(
+            RuntimeError,
+            match="lost durable invocation profile authority",
+        ):
+            await app._environment_lifecycle._release_quiescent_invocation_fence(
+                session_id,
+                invocation_context=None,
+                terminal_event=None,
+            )
+
+        assert await store.load_events(session_id) == before
+        current = await store.load(session_id)
+        assert current is not None
+        assert current.id == admitted.session.id
+        assert current.instance_id == admitted.session.instance_id
+        assert current.run_epoch == admitted.session.run_epoch
+        assert current.status is SessionStatus.COMPLETED
+        with pytest.raises(
+            SessionRunFenced,
+            match="resume lost its durable predecessor invocation authority",
+        ):
+            await collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "must remain fenced")],
+                ),
+            )
+        after_resume_rejection = await store.load(session_id)
+        assert after_resume_rejection == current
+        assert await store.load_events(session_id) == before
+
+    asyncio.run(scenario())
+
+
 def test_cayu_app_resume_repairs_missing_initial_run_terminal_evidence() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -30058,6 +30207,8 @@ def test_cayu_app_recovery_repairs_missing_pending_approval_terminal_evidence() 
             )
 
     class CrashBeforeApprovalPauseEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_pause_event = True
@@ -30153,6 +30304,8 @@ def test_cayu_app_recovery_repairs_missing_pending_approval_terminal_evidence() 
 
 def test_cayu_app_recovery_repairs_missing_user_input_terminal_evidence() -> None:
     class CrashBeforeUserInputPauseEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_pause_event = True
@@ -30242,6 +30395,8 @@ def test_cayu_app_recovery_repairs_missing_user_input_terminal_evidence() -> Non
 
 def test_cayu_app_recovery_repairs_missing_interrupted_tool_round_terminal_evidence() -> None:
     class CrashAfterPendingToolRoundStore(FailingAfterPendingToolRoundCheckpointStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_terminal_event = True
@@ -30336,6 +30491,8 @@ def test_cayu_app_recovery_repairs_missing_interrupted_tool_round_terminal_evide
 
 def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
     class CrashBeforeResumeFailureEventStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_transcript_load = True
@@ -30431,6 +30588,8 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
 
 def test_cayu_app_resume_reconciles_terminal_event_before_replacing_run_marker() -> None:
     class LostRunMarkerCleanupAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_cleanup = False
@@ -30537,6 +30696,8 @@ def test_cayu_app_resume_reconciles_terminal_event_before_replacing_run_marker()
 
 def test_cayu_app_resume_reconciles_terminal_event_after_side_effect_claim_ack_loss() -> None:
     class LostTerminalSideEffectClaimAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.armed = False
@@ -30878,10 +31039,10 @@ def test_cayu_app_recover_incomplete_session_gates_round_without_policy_outcome(
     )
     assert active_profile is not None
     asyncio.run(
-        store.transition_status_and_checkpoint(
+        rebind_test_invocation(
+            store,
             "sess_recover_incomplete_tool_round",
-            from_statuses={SessionStatus.FAILED},
-            to_status=SessionStatus.RUNNING,
+            target_status=SessionStatus.RUNNING,
             checkpoint_transform=lambda session, current_checkpoint: (
                 execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
                     current_checkpoint,
@@ -31218,6 +31379,8 @@ def test_legacy_mixed_policy_recovery_prefers_authoritative_approval_gate():
 
 def test_ambiguous_policy_acknowledgement_is_retried_without_execution_or_decision_flip():
     class FailingAmbiguousApprovalCloseStore(FailingAfterPendingToolRoundCheckpointStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_close_once = False
@@ -31499,6 +31662,8 @@ def test_planned_unregistered_call_rejects_registration_drift_before_recovery():
 
 def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
     class BlockingRecoveryClaimStore(FailingAfterPendingToolRoundCheckpointStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.claim_fenced = asyncio.Event()
@@ -31642,6 +31807,8 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
 
 def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> None:
     class TransientHeartbeatFailureStore(FailingAfterPendingToolRoundCheckpointStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_next_transform = False
@@ -32893,6 +33060,8 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
     from cayu.runtime.execution_units import new_model_step_identity
 
     class BlockingApprovalClaimStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.block_next_approval_claim = False
@@ -32961,12 +33130,6 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
                 "tool_calls": [replacement_call.model_dump(mode="json")],
             }
         )
-        checkpoint_b = {
-            **checkpoint_a,
-            "pending_tool_round": round_b.model_dump(mode="json"),
-            "pending_tool_approval": approval_b.model_dump(mode="json"),
-        }
-
         store.block_next_approval_claim = True
         stale_resolution = asyncio.create_task(
             collect_tool_approval_events(
@@ -32982,24 +33145,25 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
         )
         await asyncio.wait_for(store.claim_started.wait(), timeout=5)
 
-        claimed = await InMemorySessionStore.transition_status_and_checkpoint(
+        def replace_pending_approval(
+            session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            rebound = checkpoint_with_rebound_test_invocation_profile(session, checkpoint)
+            rebound["pending_tool_round"] = round_b.model_dump(mode="json")
+            rebound["pending_tool_approval"] = approval_b.model_dump(mode="json")
+            return rebound
+
+        claimed = await rebind_test_invocation(
             store,
             session_id,
-            from_statuses={SessionStatus.INTERRUPTED},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=lambda _session, checkpoint: checkpoint,
+            checkpoint_transform=replace_pending_approval,
         )
-        await InMemorySessionStore.transition_status_and_checkpoint(
-            store,
-            session_id,
-            from_statuses={SessionStatus.RUNNING},
-            to_status=SessionStatus.INTERRUPTED,
-            checkpoint_transform=lambda _session, _checkpoint: checkpoint_b,
-        )
-        await store.release_run_fence(session_id)
+        await interrupt_and_release_test_invocation(store, session_id)
         repaused = await store.load(session_id)
         assert repaused is not None
         repaused_epoch = repaused.run_epoch
+        repaused_checkpoint = await store.load_checkpoint(session_id)
         store.allow_claim.set()
 
         with pytest.raises(
@@ -33012,7 +33176,7 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
         assert current.status is SessionStatus.INTERRUPTED
         assert repaused_epoch == claimed.run_epoch + 1
         assert current.run_epoch == repaused_epoch
-        assert await store.load_checkpoint(session_id) == checkpoint_b
+        assert await store.load_checkpoint(session_id) == repaused_checkpoint
         assert tool.calls == []
 
     asyncio.run(run())
@@ -33102,6 +33266,8 @@ def test_tool_approval_resolution_rejects_partial_identity_without_mutation():
 
 def test_concurrent_approval_and_denial_have_exactly_one_durable_winner():
     class TwoClaimBarrierStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.block_claims = False
@@ -33180,8 +33346,10 @@ def test_concurrent_approval_and_denial_have_exactly_one_durable_winner():
     asyncio.run(run())
 
 
-def test_tool_approval_claim_acknowledgement_loss_fails_closed_and_recovers():
+def test_tool_approval_claim_acknowledgement_loss_replays_exact_command():
     class LostClaimAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_next_claim_ack = False
@@ -33216,51 +33384,33 @@ def test_tool_approval_claim_acknowledgement_loss_fails_closed_and_recovers():
         approval = await _pending_tool_approval_from_public_event(store, approval_event)
         store.lose_next_claim_ack = True
 
-        with pytest.raises(
-            OSError,
-            match="approval claim acknowledgement lost",
-        ):
-            await collect_tool_approval_events(
-                app,
-                ToolApprovalRequest(
-                    session_id=session_id,
-                    approval_id=approval.approval_id,
-                    tool_round_id=approval.tool_round_id,
-                    tool_call_id=approval.tool_call_id,
-                    decision=ToolApprovalDecision.APPROVE,
-                ),
-            )
-        claimed = await store.load(session_id)
-        assert claimed is not None
-        assert claimed.status is SessionStatus.RUNNING
+        events = await collect_tool_approval_events(
+            app,
+            ToolApprovalRequest(
+                session_id=session_id,
+                approval_id=approval.approval_id,
+                tool_round_id=approval.tool_round_id,
+                tool_call_id=approval.tool_call_id,
+                decision=ToolApprovalDecision.APPROVE,
+            ),
+        )
+        completed = await store.load(session_id)
+        assert completed is not None
+        assert completed.status is SessionStatus.COMPLETED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert checkpoint["pending_tool_approval"]["approval_id"] == approval.approval_id
-        assert tool.calls == []
-
-        recovered = await app.recover_incomplete_session(
-            IncompleteSessionRecoveryRequest(session_id=session_id)
-        )
-        assert recovered.actions == (IncompleteSessionRecoveryAction.PENDING_APPROVAL,)
-        assert recovered.pending_approval_id is not None
-        assert (
-            await app._resolve_public_action_linkage(
-                session_id=session_id,
-                value=recovered.pending_approval_id,
-                field_name="approval_id",
-            )
-            == approval.approval_id
-        )
-        after = await store.load(session_id)
-        assert after is not None
-        assert after.status is SessionStatus.INTERRUPTED
-        assert tool.calls == []
+        assert "pending_tool_approval" not in checkpoint
+        assert sum(event.type is EventType.TOOL_CALL_APPROVED for event in events) == 1
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == [{"value": "secret"}]
 
     asyncio.run(run())
 
 
 def test_tool_approval_publication_acknowledgement_loss_preserves_atomic_pair():
     class LostPublicationAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lost_approval_publication_ack = False
@@ -33679,13 +33829,15 @@ def test_tool_approval_resolution_events_carry_resolved_by_actor():
 
 def test_tool_approval_resolution_closes_continuation_before_aclose_returns():
     class RecordingReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.release_calls = 0
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             self.release_calls += 1
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     async def run() -> tuple[Event, SessionStatus, int, bool]:
         session_id = "sess_approval_resolution_stream_closed"
@@ -33795,13 +33947,15 @@ def test_tool_approval_cleanup_failure_has_one_forwarding_owner() -> None:
 
 def test_tool_approval_resolution_task_cancellation_finalizes_and_preserves_pending_state():
     class RecordingReleaseStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.release_calls = 0
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             self.release_calls += 1
-            await super().release_run_fence(session_id)
+            return await super().release_session_invocation(command)
 
     async def run() -> None:
         session_id = "sess_approval_resolution_task_cancelled"
@@ -34429,6 +34583,8 @@ def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DelayedCompletionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.blocked = asyncio.Event()
@@ -34547,6 +34703,8 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DelayedStartStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.blocked = asyncio.Event()
@@ -34875,6 +35033,8 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
     approval_arrives_during_claim: bool,
 ) -> None:
     class BlockingRecoveryClaimStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.block_manual_recovery_claim = False
@@ -34888,11 +35048,9 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
-            if (
-                self.block_manual_recovery_claim
-                and getattr(checkpoint_transform, "__name__", "") == "claim_checkpoint"
-            ):
+            if self.block_manual_recovery_claim and to_status is SessionStatus.RUNNING:
                 self.manual_recovery_claim_started.set()
                 await self.allow_manual_recovery_claim.wait()
             return await super().transition_status_and_checkpoint(
@@ -34900,6 +35058,7 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
 
     async def run() -> None:
@@ -34968,7 +35127,10 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
                 await collect_tool_round_recovery_events(app, recovery_request)
         else:
             store.allow_manual_recovery_claim.set()
-            with pytest.raises(RuntimeError, match="ToolApprovalRecoveryRequest"):
+            with pytest.raises(
+                RuntimeError,
+                match="Invocation rebind source state changed after command preparation",
+            ):
                 await asyncio.wait_for(recovery_task, timeout=5)
 
         assert await store.load(session_id) == session_before
@@ -34996,6 +35158,8 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
 
 def test_tool_approval_recovery_reconciles_ambiguous_append_acknowledgement() -> None:
     class AmbiguousRecoveryAppendStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed_recovery_ack = False
@@ -35209,16 +35373,18 @@ def test_tool_approval_recovery_post_persist_fanout_failure_stays_resumable(
 
 def test_tool_approval_recovery_post_persist_cleanup_failure_is_not_suppressed() -> None:
     class FailingRecoveryReleaseStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_next_release = False
 
-        async def release_run_fence(self, session_id: str) -> None:
+        async def release_session_invocation(self, command):
             self.release_calls += 1
             if self.fail_next_release:
                 self.fail_next_release = False
                 raise RuntimeError("approval recovery run fence release unavailable")
-            await InMemorySessionStore.release_run_fence(self, session_id)
+            return await InMemorySessionStore.release_session_invocation(self, command)
 
     async def scenario() -> None:
         session_id = "sess_approval_recovery_post_persist_cleanup_failure"
@@ -35437,6 +35603,8 @@ def test_tool_approval_recovery_task_cancellation_finalizes_continuation():
 
 def test_tool_approval_recovery_releases_run_fence_once_when_setup_fails():
     class CountingRecoveryStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_recovery_event_load = False
@@ -36356,6 +36524,8 @@ def test_cayu_app_retries_approval_close_without_rerunning_completed_tool():
 
 def test_tool_approval_close_acknowledgement_loss_replays_exact_receipt():
     class LostCloseAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.lost_close_ack = False
@@ -37338,6 +37508,10 @@ def test_cayu_app_rejects_fork_with_pending_approval_checkpoint():
             )
         )
 
+    source_checkpoint = asyncio.run(store.load_checkpoint("sess_interrupted_fork_source"))
+    assert source_checkpoint is not None
+    source_checkpoint["pending_tool_approval"].pop("task_id", None)
+    asyncio.run(store.checkpoint("sess_interrupted_fork_source", source_checkpoint))
     asyncio.run(
         collect_tool_approval_events(
             app,
@@ -41153,6 +41327,7 @@ def test_register_agent_rejects_invalid_targeted_tool_mode():
 
 def test_register_agent_rejects_targeted_tools_without_store_authority():
     class UnsupportedTargetedStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_public_authority_aliases = False
         supports_targeted_tool_grants = False
 
@@ -41340,6 +41515,8 @@ def test_cayu_app_reconstructs_gemini_thinking_usage() -> None:
 
 def test_cayu_app_get_session_usage_queries_only_usage_relevant_events():
     class TrackingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.load_events_called = False
@@ -43850,6 +44027,8 @@ def test_automatic_compaction_ignores_handled_historical_task_cancellation():
 
 def test_automatic_compaction_real_cancellation_during_start_publication_propagates():
     class BlockingCompactionStartStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.start_publication_started = asyncio.Event()
@@ -43918,6 +44097,8 @@ def test_automatic_compaction_real_cancellation_during_start_publication_propaga
 
 def test_automatic_compaction_cancellation_during_outcome_persistence_is_lossless():
     class BlockingContextBatchStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.context_batch_started = asyncio.Event()
@@ -44006,6 +44187,8 @@ def test_automatic_compaction_checkpoint_and_evidence_publish_atomically(
     failure_point: str,
 ) -> None:
     class FailingAtomicCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -44096,6 +44279,8 @@ def test_automatic_compaction_checkpoint_and_evidence_publish_atomically(
 
 def test_automatic_compaction_lost_checkpoint_ack_reconciles_effective_transform() -> None:
     class RuntimeStateChangingLostAckStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -44200,6 +44385,8 @@ def test_automatic_compaction_lost_checkpoint_ack_reconciles_effective_transform
 
 def test_automatic_compaction_internal_persistence_cancellation_is_not_caller_cancel() -> None:
     class InternallyCancelledCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
             del session_id, kwargs
             raise asyncio.CancelledError("storage pool cancelled its write")
@@ -44250,6 +44437,8 @@ def test_automatic_compaction_internal_persistence_cancellation_is_not_caller_ca
 
 def test_automatic_compaction_lost_completion_ack_fails_closed_without_retry() -> None:
     class LostCompletionAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False
@@ -49955,6 +50144,8 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
 
 def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
     class BrokenCheckpointStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def publish_checkpoint_and_events(self, session_id, **kwargs):
             del session_id, kwargs
             raise RuntimeError("checkpoint unavailable")
@@ -55183,6 +55374,8 @@ def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
 
 def test_interrupt_session_race_returns_existing_interrupt_event_without_duplicate():
     class PausingInterruptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.transition_started: asyncio.Event | None = None
@@ -55195,12 +55388,14 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             if (
                 session_id == "sess_interrupt_race_idempotent"
@@ -55540,6 +55735,8 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
             yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
     class PausingInterruptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.transition_started: asyncio.Event | None = None
@@ -55552,12 +55749,14 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             if (
                 session_id == "sess_run_interrupt_race"
@@ -55801,7 +56000,18 @@ def test_interrupt_session_payload_is_durable_across_app_instances():
         },
         "interruption_type": "operator_requested",
     }
-    assert_only_model_step_publication_checkpoint(checkpoint)
+    assert checkpoint is not None
+    assert set(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY,
+        execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    }
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+    assert (
+        execution_profiles_module.active_invocation_execution_profile_from_checkpoint(checkpoint)
+        is not None
+    )
 
 
 def test_interrupt_session_clears_payload_before_yielding_direct_terminal_event():
@@ -55908,6 +56118,8 @@ def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
 
 def test_interrupt_session_persists_payload_atomically_with_interrupting_status():
     class AtomicInterruptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.checked_inside_transition = False
@@ -55919,12 +56131,14 @@ def test_interrupt_session_persists_payload_atomically_with_interrupting_status(
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ):
             session = await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
             checkpoint = await self.load_checkpoint(session_id)
             assert session.status == SessionStatus.INTERRUPTING
@@ -55963,6 +56177,8 @@ def test_interrupt_session_persists_payload_atomically_with_interrupting_status(
 
 def test_interrupt_session_checkpoint_failure_does_not_transition_status():
     class FailingAtomicInterruptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def transition_status_and_checkpoint(
             self,
             session_id: str,
@@ -55970,6 +56186,7 @@ def test_interrupt_session_checkpoint_failure_does_not_transition_status():
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ):
             raise RuntimeError("checkpoint unavailable")
 
@@ -56186,6 +56403,8 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
     monkeypatch.setattr(session_control_module, "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S", 0)
 
     class LosingTransitionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def transition_status_and_checkpoint(
             self,
             session_id: str,
@@ -56193,6 +56412,7 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             if session_id == "sess_interrupt_transition_loser_finalizing":
                 await super().transition_status_and_checkpoint(
@@ -56200,6 +56420,7 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
                     from_statuses=from_statuses,
                     to_status=SessionStatus.INTERRUPTING,
                     checkpoint_transform=checkpoint_transform,
+                    result_checkpoint_transform=result_checkpoint_transform,
                 )
                 raise ValueError("lost transition")
             return await super().transition_status_and_checkpoint(
@@ -56207,6 +56428,7 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
 
     store = LosingTransitionStore()
@@ -57109,6 +57331,8 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class RacingInterruptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.transition_waiters = 0
@@ -57121,6 +57345,7 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
             checkpoint_transform,
+            result_checkpoint_transform=None,
         ) -> Session:
             if (
                 session_id == "sess_concurrent_interrupt_transition_loser"
@@ -57136,6 +57361,7 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
             )
 
     store = RacingInterruptStore()
@@ -57364,6 +57590,8 @@ def test_interrupt_session_preserves_tool_result_when_interrupted_after_tool_ret
 
 def test_interrupt_session_closes_tool_round_after_assistant_tool_call_is_quarantined():
     class InterruptingAfterAssistantToolCallQuarantineStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.interrupt_after_next_assistant_tool_call_quarantine = False
@@ -57502,6 +57730,8 @@ def test_interrupt_session_does_not_leave_pending_approval_when_interrupted_afte
 
 def test_remote_interrupt_wins_race_with_policy_plan_publication():
     class BlockingPolicyPublicationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.policy_publication_started = asyncio.Event()
@@ -57587,6 +57817,8 @@ def test_remote_interrupt_wins_race_with_policy_plan_publication():
 
 def test_remote_interrupt_wins_race_with_atomic_approval_publication():
     class BlockingApprovalPublicationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.approval_publication_started = asyncio.Event()
@@ -57668,6 +57900,8 @@ def test_remote_interrupt_wins_race_with_atomic_approval_publication():
 
 def test_local_interrupt_after_atomic_approval_publication_closes_retained_round():
     class BlockingApprovalFanOutStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.approval_event_id: str | None = None
@@ -57776,6 +58010,8 @@ def test_process_loss_after_approval_clear_recovers_exact_interrupt_close_intent
         pass
 
     class BlockingApprovalFanOutStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.approval_event_id: str | None = None
@@ -57985,6 +58221,8 @@ def test_process_loss_after_ambiguous_approval_clear_recovers_exact_interrupt_cl
 
 def test_interrupt_session_preserves_tool_results_when_interrupted_before_append():
     class InterruptingTranscriptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.interrupt_on_next_tool_round_publication = False

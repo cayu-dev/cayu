@@ -8069,6 +8069,8 @@ def test_app_defers_cancellation_until_finalize_failure_is_durable(
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _BlockingFinalizeFailureStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self, *, block: bool) -> None:
             super().__init__()
             self.block = block
@@ -8191,6 +8193,8 @@ def test_app_preserves_finalize_failures_when_durable_evidence_write_fails(
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _FailingFinalizeFailureStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type != EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
                 await super().append_event(session_id, event)
@@ -8292,6 +8296,8 @@ def test_app_reconciles_finalize_evidence_child_task_cancellation(
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _CancellingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type != EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
                 await super().append_event(session_id, event)
@@ -8371,6 +8377,8 @@ def test_app_preserves_caller_cancellation_after_child_persistence_commits() -> 
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _CommitThenCancelStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             await super().append_event(session_id, event)
             if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
@@ -8444,6 +8452,8 @@ def test_app_ignores_stale_causal_cancellation_after_finalize_evidence_commits()
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _CommitThenFailStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             await super().append_event(session_id, event)
             if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
@@ -8503,6 +8513,7 @@ def test_app_preserves_child_cancellation_when_reconciliation_fails() -> None:
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _BrokenReconciliationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         reconcile = False
 
         async def append_event(self, session_id: str, event: Event) -> None:
@@ -8601,6 +8612,8 @@ def test_app_preserves_cancellation_when_finalize_evidence_write_fails() -> None
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _BlockingFailingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type != EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
                 await super().append_event(session_id, event)
@@ -8692,6 +8705,8 @@ def test_app_does_not_duplicate_finalize_cancellation_when_evidence_write_fails(
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _FailingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
                 raise persistence_error
@@ -8775,6 +8790,8 @@ def test_app_preserves_grouped_cancellation_when_finalize_evidence_write_fails()
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _FailingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
                 raise BaseExceptionGroup(
@@ -8858,6 +8875,7 @@ def test_app_propagates_fatal_member_from_finalize_evidence_diagnostic_group(
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
     class _FailingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         reconcile_finalize_failure = False
 
         async def append_event(self, session_id: str, event: Event) -> None:

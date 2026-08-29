@@ -6,6 +6,8 @@ from cayu.runtime import InMemorySessionStore, SessionListResult, SessionQuery
 class RecordingListSessionsStore(InMemorySessionStore):
     """In-memory store that retains defensive copies of session-list queries."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.session_queries: list[SessionQuery] = []

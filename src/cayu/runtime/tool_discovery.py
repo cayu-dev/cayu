@@ -341,6 +341,36 @@ class ToolDiscoveryGrantRecord(BaseModel):
         return _utc_datetime(value, "created_at")
 
 
+class ToolDiscoveryViewInitialization(BaseModel):
+    """Typed authority needed to initialize one session-local discovery view."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    session_id: str
+    agent_name: str
+    catalogue_revision: str
+    ceiling_fingerprint: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+
+    @field_validator("session_id", "agent_name")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        return _bounded_utf8_text(
+            value,
+            info.field_name,
+            max_bytes=TOOL_DISCOVERY_SCOPE_ID_MAX_BYTES,
+        )
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
+
+
 class ToolDiscoveryViewState(BaseModel):
     """Versioned durable tool view for one session branch."""
 
@@ -699,15 +729,58 @@ def initial_tool_discovery_operation_records(
 ) -> dict[str, dict[str, Any]]:
     """Return the typed empty view committed with one new session branch."""
 
-    view = empty_tool_discovery_view(
+    initialization = tool_discovery_view_initialization(
         session_id=session_id,
-        generation_id=tool_discovery_generation_id(
-            session_id=session_id,
-            root_invocation_id=root_invocation_id,
-        ),
         agent_name=agent_name,
         catalogue=catalogue,
         ceiling=ceiling,
+    )
+    return initial_tool_discovery_operation_records_from_initialization(
+        initialization,
+        root_invocation_id=root_invocation_id,
+    )
+
+
+def tool_discovery_view_initialization(
+    *,
+    session_id: str,
+    agent_name: str,
+    catalogue: ToolCatalogSnapshot,
+    ceiling: ToolCapabilityCeiling,
+) -> ToolDiscoveryViewInitialization:
+    """Freeze discovery authority that is independent of session provenance."""
+
+    if type(catalogue) is not ToolCatalogSnapshot:
+        raise TypeError("catalogue must be a ToolCatalogSnapshot.")
+    ceiling = copy_tool_capability_ceiling(ceiling)
+    return ToolDiscoveryViewInitialization(
+        session_id=session_id,
+        agent_name=agent_name,
+        catalogue_revision=catalogue.revision,
+        ceiling_fingerprint=f"sha256:{ceiling.fingerprint}",
+    )
+
+
+def initial_tool_discovery_operation_records_from_initialization(
+    initialization: ToolDiscoveryViewInitialization,
+    *,
+    root_invocation_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Bind frozen discovery authority to the store-created session provenance."""
+
+    initialization = ToolDiscoveryViewInitialization.model_validate(
+        initialization.model_dump(mode="python")
+    )
+    view = ToolDiscoveryViewState(
+        session_id=initialization.session_id,
+        generation_id=tool_discovery_generation_id(
+            session_id=initialization.session_id,
+            root_invocation_id=root_invocation_id,
+        ),
+        agent_name=initialization.agent_name,
+        catalogue_revision=initialization.catalogue_revision,
+        ceiling_fingerprint=initialization.ceiling_fingerprint,
+        revision=0,
     )
     return {TOOL_DISCOVERY_VIEW_OPERATION_KEY: view.model_dump(mode="json")}
 
@@ -1590,6 +1663,7 @@ __all__ = [
     "ToolDiscoverySearchMatch",
     "ToolDiscoverySearchResult",
     "ToolDiscoveryViewInconsistentError",
+    "ToolDiscoveryViewInitialization",
     "ToolDiscoveryViewInspection",
     "ToolDiscoveryViewNotEnabledError",
     "ToolDiscoveryViewState",
@@ -1599,6 +1673,7 @@ __all__ = [
     "empty_tool_discovery_view",
     "hosted_tool_discovery_transition",
     "initial_tool_discovery_operation_records",
+    "initial_tool_discovery_operation_records_from_initialization",
     "minimized_tool_discovery_result",
     "resolve_tool_discovery_projection",
     "resolved_discovered_tool_invocation",
@@ -1611,5 +1686,6 @@ __all__ = [
     "tool_discovery_reference",
     "tool_discovery_reference_rejection_reason",
     "tool_discovery_search_match_matches_descriptor",
+    "tool_discovery_view_initialization",
     "tool_discovery_view_inspection",
 ]

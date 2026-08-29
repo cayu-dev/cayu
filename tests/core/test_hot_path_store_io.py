@@ -32,6 +32,8 @@ class _FakeProvider(ModelProvider):
 
 
 class _CountingSessionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.load_calls = 0
@@ -224,6 +226,8 @@ class _MidRefreshAppendingStore(InMemorySessionStore):
     ``event_types`` query sees nothing mid-refresh, so the next refresh picks
     both events up.
     """
+
+    invocation_lifecycle_command_version = 1
 
     def __init__(self) -> None:
         super().__init__()

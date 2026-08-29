@@ -195,6 +195,8 @@ async def _run_binding_finalize_failure(
 
 def _run_linked_task_failure(error: Exception) -> tuple[list[Event], object, object]:
     class FailingSessionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.failed = False

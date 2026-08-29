@@ -33,6 +33,7 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
     SessionStore,
+    _mark_session_invocation_terminal_event,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
     portable_persisted_event_side_effect_error,
@@ -107,6 +108,7 @@ class RuntimeEventWriter:
     async def emit(self, event: Event) -> Event:
         event = self.prepare(attribute_event_to_current_interaction(event))
         await self._session_store.append_event(event.session_id, event)
+        self._retain_terminal_event_authority(event)
         claim = await self._session_store.claim_persisted_event_side_effect(
             session_id=event.session_id,
             event_id=event.id,
@@ -128,6 +130,7 @@ class RuntimeEventWriter:
 
         event = self.prepare(attribute_event_to_current_interaction(event))
         await self._session_store.append_event(event.session_id, event)
+        self._retain_terminal_event_authority(event)
         return event.model_copy(deep=True)
 
     async def persist_exact_replay(self, event: Event) -> Event:
@@ -153,6 +156,7 @@ class RuntimeEventWriter:
                 raise append_error from verification_error
             if len(records) != 1 or records[0].event != prepared:
                 raise append_error
+        self._retain_terminal_event_authority(prepared)
         return prepared.model_copy(deep=True)
 
     async def is_persisted(self, event: Event) -> bool:
@@ -228,7 +232,18 @@ class RuntimeEventWriter:
             copied_events.append(self.prepare(event))
 
         await self._session_store.append_events(session_id, copied_events)
+        for event in copied_events:
+            self._retain_terminal_event_authority(event)
         return copied_events
+
+    @staticmethod
+    def _retain_terminal_event_authority(event: Event) -> None:
+        if event.type in {
+            EventType.SESSION_COMPLETED,
+            EventType.SESSION_FAILED,
+            EventType.SESSION_INTERRUPTED,
+        }:
+            _mark_session_invocation_terminal_event(event)
 
     async def fan_out_persisted(self, events: list[Event]) -> list[Event]:
         """Apply budget/sink side effects after a store-owned atomic publication."""

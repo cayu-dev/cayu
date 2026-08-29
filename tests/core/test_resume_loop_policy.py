@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from tests.core._execution_profile_fixtures import (
-    checkpoint_with_rebound_test_invocation_profile,
+    admit_test_invocation,
     profiled_session_identity,
     runtime_interaction_started_event,
 )
@@ -74,17 +74,9 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
             ),
         )
         interaction_id = "interaction_stateful_policy_resume"
-        await store.transition_status_and_checkpoint(
+        await admit_test_invocation(
+            store,
             "stateful-policy-resume",
-            from_statuses={SessionStatus.PENDING},
-            to_status=SessionStatus.RUNNING,
-            checkpoint_transform=lambda session, checkpoint: (
-                checkpoint_with_rebound_test_invocation_profile(
-                    session,
-                    checkpoint,
-                    interaction_id=interaction_id,
-                )
-            ),
             interaction_started_event=runtime_interaction_started_event(
                 app,
                 session_id="stateful-policy-resume",

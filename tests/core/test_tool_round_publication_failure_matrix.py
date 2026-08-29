@@ -74,6 +74,8 @@ class _SideEffectTool(Tool):
 
 
 class _PublicationBarrierStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, boundary: Literal["before-commit", "after-commit"]) -> None:
         super().__init__()
         self.boundary = boundary
@@ -114,6 +116,8 @@ class _SimulatedProcessLoss(BaseException):
 
 
 class _ProcessLossStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_before_tool_publication = True
@@ -141,6 +145,8 @@ class _ProcessLossStore(InMemorySessionStore):
 
 
 class _ConcurrentProcessLossStore(_ProcessLossStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.block_recovery_claim = False

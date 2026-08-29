@@ -296,6 +296,60 @@ configured/resolved delivery, and the loaded-definition projection are bound
 into execution-profile or keyed request identity at their respective authority
 boundaries.
 
+### Invocations use one frozen authority context and typed store commands
+
+Invocation admission, continuation, settlement, and cleanup now carry one
+frozen in-process context containing the exact validated execution profile and
+the live registered collaborators selected for that invocation. Restarted work
+must reconstruct and validate that context before provider, tool, hook,
+environment, verifier, or effect execution. Durable lifecycle mutations use a
+closed versioned command family with exact compare-and-swap authority and
+per-command replay receipts across the in-memory, SQLite, and PostgreSQL
+stores. Custom session stores must explicitly implement and opt into command
+version 1; inherited or legacy behavior fails closed before dispatch.
+Invocation release requires runtime-owned cleanup authority and one exact
+durable terminal proof: the interaction settlement, a same-invocation terminal
+session event when no matching interaction settlement exists, or a completed
+recovery owner's exact claim. Public recovery keeps an open interaction fenced
+until its terminal transition is durably published; an older paused receipt
+cannot release the replacement epoch.
+The private command ledger is capped at 128 receipts and 8 MiB of canonical
+JSON. It rolls off the oldest superseded run-epoch receipt groups before admitting
+new authority, while retaining the command being committed and the current
+active release reservation. Each active create, admission, or rebind reserves
+one item and the worst-case encoded capacity for its mandatory release receipt,
+so an individual command that still cannot fit fails before mutation without
+permanently exhausting a long-lived session. Exact replay remains available
+within the retained window; an older replay fails closed against independently
+advanced session state. Receipt replay also authenticates the embedded result
+against independently loaded session and execution-profile authority.
+
+Workspace-observation transitions now atomically stamp the current root
+checkpoint schema even when a raw built-in store begins without a checkpoint.
+Generic checkpoint replacements preserve that observation root, so an ordinary
+state write cannot reinterpret or delete active recovery authority.
+
+The root checkpoint schema advances from version 4 to version 5 and reserves
+`invocation_lifecycle_receipt` as private runtime authority. Upgrading a
+supported older checkpoint preserves unrelated fields but deliberately drops
+any older caller-authored value colliding with that newly reserved name. Source
+schemas 3 and 4 could have carried active-invocation authority, while historical
+generic checkpoint writers could replace or delete that root. Migration removes
+any profile and never interprets its absence as proof that the session was
+ungoverned. It retains only an authenticated, empty receipt-history tombstone:
+the tombstone proves that authority history may have existed but cannot authorize
+admission, recovery, settlement, cleanup, or replay. Such sessions remain fenced
+and must start a new session rather than resume in place. Generic checkpoint and
+metadata publication cannot observe or mutate the receipt ledger. This is a
+prerelease authority migration; applications must not depend on private root
+names.
+
+Custom session stores opting into lifecycle command version 1 must also own an
+atomic `transform_checkpoint(...)` boundary. The runtime adapter now filters
+private lifecycle roots before every generic checkpoint/operation callback and
+reattaches authenticated authority afterward, independent of whether the raw
+store itself performs that filtering.
+
 ### Local attempts retain complete-tree cleanup ownership across worker loss
 
 `LocalExecutionAttemptCoordinator` adds a task-backed Linux containment boundary

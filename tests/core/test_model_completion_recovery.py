@@ -8,7 +8,10 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from tests.core._execution_profile_fixtures import versioned_test_provider_identity
+from tests.core._execution_profile_fixtures import (
+    create_admitted_session,
+    versioned_test_provider_identity,
+)
 
 from cayu import SQLiteBudgetLedger, SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
@@ -20,12 +23,11 @@ from cayu.runtime import (
     BudgetReservation,
     CayuApp,
     EventQuery,
+    ExecutionProfileMismatchError,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemoryBudgetLedger,
     InMemorySessionStore,
-    InteractionStatus,
-    InteractionSummaryEvidence,
     ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryRequired,
     ModelCompletionStageDisposition,
@@ -35,7 +37,6 @@ from cayu.runtime import (
     RunLimits,
     RunRequest,
     Session,
-    SessionIdentity,
     SessionStatus,
     ToolCapabilityCeiling,
 )
@@ -67,10 +68,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
-from cayu.runtime.execution_profiles import (
-    ExecutionProfileIdentity,
-    checkpoint_with_active_invocation_execution_profile,
-)
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
     ModelCompletionStage,
@@ -105,6 +103,10 @@ class _RecordingProvider(ModelProvider):
             raise AssertionError("Recovery must not redispatch the staged model completion.")
         for event in self._responses[call_index]:
             yield event
+
+
+class _ChangedRecordingProvider(_RecordingProvider):
+    """Same registration name with deliberately different behavior identity."""
 
 
 class _LegacyTerminalModelCompletionMixin:
@@ -152,6 +154,7 @@ class _LegacyTerminalModelCompletionStore(
     _LegacyTerminalModelCompletionMixin,
     InMemorySessionStore,
 ):
+    invocation_lifecycle_command_version = 1
     pass
 
 
@@ -159,6 +162,7 @@ class _LegacyTerminalSQLiteModelCompletionStore(
     _LegacyTerminalModelCompletionMixin,
     SQLiteSessionStore,
 ):
+    invocation_lifecycle_command_version = 1
     pass
 
 
@@ -248,6 +252,8 @@ def _test_tool_exposure_authority(tool_name: str) -> ResolvedToolExposureAuthori
 
 
 class _PromotionAcknowledgementLostStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.promotion_calls = 0
@@ -263,6 +269,8 @@ class _PromotionAcknowledgementLostStore(InMemorySessionStore):
 
 
 class _FailMaterializationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, failures: int) -> None:
         super().__init__()
         self.remaining_materialization_failures = failures
@@ -275,6 +283,8 @@ class _FailMaterializationStore(InMemorySessionStore):
 
 
 class _FailApprovalCloseBeforeCommitStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.failed_close = False
@@ -287,6 +297,8 @@ class _FailApprovalCloseBeforeCommitStore(InMemorySessionStore):
 
 
 class _PauseCommittedApprovalCloseStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.close_committed = asyncio.Event()
@@ -303,6 +315,8 @@ class _PauseCommittedApprovalCloseStore(InMemorySessionStore):
 
 
 class _FailResumeSetupTranscriptStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.fail_after_deferred_admission = False
@@ -323,6 +337,8 @@ class _FailResumeSetupTranscriptStore(InMemorySessionStore):
 
 
 class _FailResumePromotionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.promotion_failures = 0
@@ -335,6 +351,8 @@ class _FailResumePromotionStore(InMemorySessionStore):
 
 
 class _FailResumeCheckpointInspectionStore(_FailResumeSetupTranscriptStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, *, failure_mode: str) -> None:
         super().__init__()
         self.failure_mode = failure_mode
@@ -413,45 +431,14 @@ async def _stage_completed_model_boundary(
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
     interaction_id = f"interaction-{session_id}"
-    started_event_id = f"{session_id}:interaction-started"
-    started_at = datetime.now(UTC)
-    started_event = Event(
-        id=started_event_id,
-        type=EventType.INTERACTION_STARTED,
-        session_id=session_id,
-        interaction_id=interaction_id,
-        timestamp=started_at,
-        agent_name="assistant",
-        payload=InteractionSummaryEvidence(
-            status=InteractionStatus.ACTIVE,
-            start_event_id=started_event_id,
-            started_at=started_at,
-        ).model_dump(mode="json"),
-    )
     execution_profile = _test_execution_profile(
         provider_name=provider_name,
         tool_name=tool_name if with_tool_call else None,
         limits=limits,
     )
-
-    def freeze_initial_invocation_profile(
-        current_session: Session,
-        checkpoint: dict | None,
-    ) -> dict:
-        return checkpoint_with_active_invocation_execution_profile(
-            (
-                {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
-                if checkpoint is None
-                else checkpoint
-            ),
-            session_id=current_session.id,
-            interaction_id=interaction_id,
-            run_epoch=current_session.run_epoch,
-            profile=execution_profile,
-        )
-
-    created = await store.create(
-        RunRequest(
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
@@ -460,22 +447,13 @@ async def _stage_completed_model_boundary(
                 tool_names=((tool_name,) if with_tool_call else ())
             ),
         ),
-        identity=SessionIdentity(
-            provider_name=provider_name,
-            model="fake-model",
-            execution_profile=execution_profile,
-        ),
-        interaction_started_event=started_event,
-        interaction_source_messages=[user_message],
-        checkpoint_transform=freeze_initial_invocation_profile,
-    )
-    await store.replace_initial_transcript_messages(
-        created.id,
-        [user_message],
-        [user_message],
+        provider_name=provider_name,
+        model="fake-model",
+        execution_profile=execution_profile,
         interaction_id=interaction_id,
     )
-    running = created
+    running = admitted.session
+    started_event = admitted.interaction_started_event
 
     source_cursor = 1
     model_attempt_identity = ModelAttemptIdentity(
@@ -729,57 +707,21 @@ async def _stage_in_flight_model_boundary(
 ) -> tuple[Session, Message, ModelCompletionStage]:
     user_message = Message.text("user", "do not dispatch twice")
     interaction_id = f"interaction-{session_id}"
-    started_event_id = f"{session_id}:interaction-started"
-    started_at = datetime.now(UTC)
-    started_event = Event(
-        id=started_event_id,
-        type=EventType.INTERACTION_STARTED,
-        session_id=session_id,
-        interaction_id=interaction_id,
-        timestamp=started_at,
-        agent_name="assistant",
-        payload=InteractionSummaryEvidence(
-            status=InteractionStatus.ACTIVE,
-            start_event_id=started_event_id,
-            started_at=started_at,
-        ).model_dump(mode="json"),
-    )
     execution_profile = _test_execution_profile(provider_name=provider_name)
-
-    def freeze_active_invocation_profile(
-        current_session: Session,
-        checkpoint: dict | None,
-    ) -> dict:
-        return checkpoint_with_active_invocation_execution_profile(
-            checkpoint,
-            session_id=current_session.id,
-            interaction_id=interaction_id,
-            run_epoch=current_session.run_epoch,
-            profile=execution_profile,
-        )
-
-    running = await store.create(
-        RunRequest(
+    admitted = await create_admitted_session(
+        store,
+        request=RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
             tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
         ),
-        identity=SessionIdentity(
-            provider_name=provider_name,
-            model="fake-model",
-            execution_profile=execution_profile,
-        ),
-        interaction_started_event=started_event,
-        interaction_source_messages=[user_message],
-        checkpoint_transform=freeze_active_invocation_profile,
-    )
-    await store.replace_initial_transcript_messages(
-        running.id,
-        [user_message],
-        [user_message],
+        provider_name=provider_name,
+        model="fake-model",
+        execution_profile=execution_profile,
         interaction_id=interaction_id,
     )
+    running = admitted.session
     logical_step_id = f"mstep_{'4' * 32}"
     model_attempt_id = f"matt_{'5' * 32}"
     prepared = await store.prepare_model_completion_stage(
@@ -816,6 +758,54 @@ async def _stage_in_flight_model_boundary(
             stage=prepared.stage,
         )
     return running, user_message, prepared.stage
+
+
+def test_manual_model_recovery_validates_context_before_budget_mutation() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _RecordingProvider()
+        running, _message, stage = await _stage_in_flight_model_boundary(
+            store,
+            session_id="model-recovery-validates-context-before-budget",
+            provider_name=provider.name,
+        )
+        app = _register_runtime(store, provider)
+        replacement = _ChangedRecordingProvider()
+        replacement_app = CayuApp(enable_logging=False)
+        replacement_app.register_provider(replacement, default=True)
+        replacement_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        app._providers[provider.name] = replacement_app._providers[provider.name]
+
+        budget_mutations = 0
+
+        async def reject_budget_mutation(**_kwargs):
+            nonlocal budget_mutations
+            budget_mutations += 1
+            raise AssertionError("budget mutation must follow context validation")
+
+        app._run_limit_controller.reconcile_manual_model_completion_reservations = (
+            reject_budget_mutation
+        )
+        with pytest.raises(ExecutionProfileMismatchError):
+            await app.recover_model_completion_stage(
+                ModelCompletionManualRecoveryRequest(
+                    session_id=running.id,
+                    stage_id=stage.stage_id,
+                    expected_run_epoch=running.run_epoch,
+                    terminal_status=SessionStatus.FAILED,
+                )
+            )
+
+        assert budget_mutations == 0
+        retained = await store.load_active_model_completion_stage(running.id)
+        assert retained is not None and retained.stage == stage
+        current = await store.load(running.id)
+        assert current is not None and current.status is SessionStatus.RUNNING
+        assert (
+            await store.load_model_completion_stage_settlement(running.id, stage.stage_id) is None
+        )
+
+    asyncio.run(scenario())
 
 
 @dataclass(frozen=True)

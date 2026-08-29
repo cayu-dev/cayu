@@ -83,6 +83,7 @@ from cayu.runtime import (
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAuthorityAliasKeyring
 from cayu.storage import SQLiteSessionStore
@@ -105,6 +106,7 @@ def checkpoint_without_active_invocation_profile(
     )
     copied = dict(checkpoint)
     copied.pop(execution_profiles_module.ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY)
+    copied.pop(INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY, None)
     return copied
 
 
@@ -130,6 +132,11 @@ def _assert_cayu_traceback_does_not_retain_text(error: BaseException, text: str)
     [
         {"custom": {"value": "context-checkpoint-secret-canary"}},
         {"context-checkpoint-secret-canary": {"value": "safe"}},
+        {
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY: {
+                "payload": "context-checkpoint-secret-canary"
+            }
+        },
     ],
 )
 def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
@@ -207,6 +214,57 @@ def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
     assert policy.result.messages == []
     assert policy.result.checkpoint == {}
     assert policy.result.checkpoint_event_payload == {}
+
+
+def test_runtime_managed_context_cannot_observe_private_lifecycle_receipts() -> None:
+    from cayu.runtime.context import (
+        ContextBuildResult,
+        ContextRequest,
+        RuntimeManagedContextPolicy,
+    )
+
+    class InspectingCheckpointPolicy(RuntimeManagedContextPolicy):
+        def __init__(self) -> None:
+            self.observed_checkpoint: dict[str, Any] | None = None
+
+        async def build_with_checkpoint(
+            self,
+            request: ContextRequest,
+            *,
+            checkpoint: dict[str, Any] | None,
+        ) -> ContextBuildResult:
+            self.observed_checkpoint = copy.deepcopy(checkpoint)
+            return ContextBuildResult(messages=request.messages)
+
+    store = InMemorySessionStore()
+    provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    policy = InspectingCheckpointPolicy()
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=policy,
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="private_lifecycle_receipt_context_projection",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert policy.observed_checkpoint is not None
+    assert INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY not in policy.observed_checkpoint
+    durable_checkpoint = asyncio.run(
+        store.load_checkpoint("private_lifecycle_receipt_context_projection")
+    )
+    assert durable_checkpoint is not None
+    assert INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in durable_checkpoint
 
 
 @pytest.mark.parametrize("secret_location", ["key", "value", "nested_typed_key"])
@@ -295,7 +353,20 @@ def test_runtime_managed_context_rejects_secret_checkpoint_event_payload_before_
     assert policy.result.checkpoint_event_payload == {}
 
 
-def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure() -> None:
+@pytest.mark.parametrize(
+    "failure_checkpoint",
+    [
+        {"custom": {"value": "context-failure-checkpoint-secret-canary"}},
+        {
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY: {
+                "kind": "context-failure-checkpoint-secret-canary"
+            }
+        },
+    ],
+)
+def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure(
+    failure_checkpoint: dict[str, Any],
+) -> None:
     from cayu.runtime.context import (
         ContextBuildError,
         ContextRequest,
@@ -315,7 +386,7 @@ def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure()
             raise ContextBuildError(
                 "context build failed",
                 compaction_telemetry=[],
-                checkpoint={"custom": {"value": secret}},
+                checkpoint=failure_checkpoint,
                 checkpoint_event_payload={"checkpoint": "custom"},
                 cause=RuntimeError("context policy failed"),
             )
@@ -1962,6 +2033,8 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
     session_id = "sess_legacy_resume_post_claim_authority"
 
     class PostPreflightTranscriptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.preflight_loaded = False
@@ -3599,15 +3672,19 @@ def test_fork_profile_resolution_does_not_retain_rejected_checkpoint() -> None:
                 model="fake-model",
             ),
         )
-        await store.checkpoint(
-            source_id,
-            {
-                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-                "private_state": secret,
-                "active_invocation_execution_profile": {"malformed": True},
-            },
-        )
         await store.update_status(source_id, SessionStatus.COMPLETED)
+        # Simulate a malformed value returned by a defective/custom store.
+        # Generic checkpoint writers intentionally cannot mutate this private
+        # authority root.
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await store.checkpoint(
+                source_id,
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                    "private_state": secret,
+                    "active_invocation_execution_profile": {"malformed": True},
+                },
+            )
         with pytest.raises(ValueError, match="durable execution-profile identity") as exc_info:
             await collect_fork_events(
                 app,
@@ -3635,20 +3712,26 @@ def test_atomic_fork_profile_recheck_does_not_retain_changed_checkpoint(
 
     class ConcurrentCheckpointMixin:
         async def create_profiled_fork(self, *args, **kwargs):
-            await self.checkpoint(
-                source_id,
-                {
-                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-                    "private_state": secret,
-                    "active_invocation_execution_profile": {"malformed": True},
-                },
-            )
+            # Inject corruption after the runtime preflight while preserving
+            # the production rule that generic checkpoint writers cannot
+            # mutate lifecycle authority.
+            with sessions_module._invocation_lifecycle_authority_mutation_scope():
+                await self.checkpoint(
+                    source_id,
+                    {
+                        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                        "private_state": secret,
+                        "active_invocation_execution_profile": {"malformed": True},
+                    },
+                )
             return await super().create_profiled_fork(*args, **kwargs)
 
     class ConcurrentMemoryStore(ConcurrentCheckpointMixin, InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         pass
 
     class ConcurrentSQLiteStore(ConcurrentCheckpointMixin, SQLiteSessionStore):
+        invocation_lifecycle_command_version = 1
         pass
 
     alias_keyring = PublicAuthorityAliasKeyring(
@@ -3832,6 +3915,8 @@ def test_fork_validates_concurrently_added_transcript_inside_atomic_store_copy()
     child_id = "sess_legacy_concurrent_transcript_child"
 
     class ConcurrentAppendBeforeForkStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def create_profiled_fork(self, *args, **kwargs):
             await self.append_transcript_messages(
                 source_id,

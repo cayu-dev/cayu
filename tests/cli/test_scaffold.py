@@ -104,6 +104,8 @@ def _install_hermetic_coding_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> None:
     class FalsySessionStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __bool__(self) -> bool:
             return False
 
@@ -1052,8 +1054,8 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
         "background",
         "oversized",
         "profiled_session_identity",
-        "SessionInvocationAdmission",
-        "admit_session_invocation",
+        "AdmitInvocationCommand",
+        "apply_invocation_lifecycle_command",
     ):
         assert phrase in security_test
 

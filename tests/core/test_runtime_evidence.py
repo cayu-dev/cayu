@@ -146,6 +146,8 @@ def test_runtime_evidence_fails_with_a_typed_error_when_scopes_exceed_report_cap
 
 def test_runtime_evidence_allows_a_session_to_change_while_causal_scope_is_listed() -> None:
     class ConcurrentCausalStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         def __init__(self) -> None:
             super().__init__()
             self.updated = False
@@ -2310,6 +2312,8 @@ def test_runtime_evidence_fails_closed_on_each_scope_bound(
 
 def test_runtime_evidence_reports_typed_missing_root_and_cycle_errors() -> None:
     class CyclicLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             if query.parent_session_id != "child":
                 return await super().query_session_lineage(query)
@@ -2327,6 +2331,8 @@ def test_runtime_evidence_reports_typed_missing_root_and_cycle_errors() -> None:
             )
 
     class ContradictoryLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_session_lineage(self, query):
             if query.parent_session_id != "root":
                 return await super().query_session_lineage(query)
@@ -2389,17 +2395,24 @@ def test_runtime_evidence_reports_each_typed_store_read_failure(
     expected_code: RuntimeEvidenceErrorCode,
 ) -> None:
     class UnsupportedLineageStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
         supports_session_lineage = False
 
     class UnsupportedEventReadStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events_bounded(self, query, *, max_bytes):
             raise NotImplementedError
 
     class EventSourceBytesStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events_bounded(self, query, *, max_bytes):
             raise EventQueryResultTooLarge(max_bytes)
 
     class EventReadFailureStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
         async def query_events_bounded(self, query, *, max_bytes):
             raise RuntimeError("read failed")
 

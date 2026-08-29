@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import cayu.runtime.sessions as sessions_module
 import cayu.storage.jsonl_export as jsonl_export_module
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -458,13 +459,14 @@ def test_session_export_and_import_reject_future_root_checkpoint_versions() -> N
             ),
             identity=_identity(),
         )
-        await store.checkpoint(
-            "sess_future_export",
-            {
-                CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
-                "private": "must-not-appear",
-            },
-        )
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await store.checkpoint(
+                "sess_future_export",
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
+                    "private": "must-not-appear",
+                },
+            )
         stream = io.StringIO()
         with pytest.raises(CheckpointCompatibilityError) as caught:
             await export_sessions(store, stream=stream)
@@ -472,8 +474,17 @@ def test_session_export_and_import_reject_future_root_checkpoint_versions() -> N
         assert "must-not-appear" not in str(caught.value)
         assert stream.getvalue() == ""
 
-        await store.checkpoint("sess_future_export", {"portable": True})
-        await export_sessions(store, stream=stream)
+        portable_store = InMemorySessionStore()
+        await portable_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_future_export",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await portable_store.checkpoint("sess_future_export", {"portable": True})
+        await export_sessions(portable_store, stream=stream)
         return stream.getvalue()
 
     record = _lines(io.StringIO(asyncio.run(build_export())))[0]

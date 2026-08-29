@@ -35,7 +35,10 @@ from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._diagnostics import exception_diagnostic
-from cayu.runtime._fork_source_snapshot import fork_source_checkpoint_sha256
+from cayu.runtime._fork_source_snapshot import (
+    fork_source_checkpoint_projection,
+    fork_source_checkpoint_sha256,
+)
 from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
 from cayu.runtime.budgets import BudgetLimit
 from cayu.runtime.dispatch import (
@@ -4194,7 +4197,7 @@ async def _create_record(
             "Fork-group source transcript contains a workload secret and cannot be copied."
         )
     if not session_request_boundary.fork_checkpoint_is_secret_free(
-        effective_checkpoint,
+        fork_source_checkpoint_projection(effective_checkpoint),
         redactor=coordinator.secret_redactor,
     ):
         raise ValueError(

@@ -160,6 +160,20 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
+from cayu.runtime._invocation_lifecycle import (
+    AdmitInvocationCommand,
+    AdmittedInvocationBinding,
+    CreateInvocationCommand,
+    InvocationCheckpointPatch,
+    InvocationContext,
+    InvocationMutationResult,
+    PreparedInvocationBinding,
+    RejectInvocationCommand,
+    SettleInvocationCommand,
+    _authenticated_invocation_context,
+    invocation_checkpoint_state_sha256,
+    invocation_lifecycle_receipt_history_present,
+)
 from cayu.runtime._memory_evidence import (
     close_context_exposure_without_provider_effect,
     close_unrecoverable_context_exposure,
@@ -291,6 +305,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
 from cayu.runtime.context import (
     _COMPACTION_ATTEMPT_ID_KEY,
@@ -457,7 +472,6 @@ from cayu.runtime.sessions import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-    CheckpointTransform,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -493,7 +507,6 @@ from cayu.runtime.sessions import (
     SessionForkProfileRelationship,
     SessionForkSourceNotFound,
     SessionIdentity,
-    SessionInvocationAdmission,
     SessionMessageDeliveryBatch,
     SessionModelCompletionStageConflict,
     SessionModelTransition,
@@ -509,6 +522,7 @@ from cayu.runtime.sessions import (
     TranscriptSnapshot,
     _activate_session_interaction,
     _activate_session_run_fence,
+    _authenticated_session_instance_id_for_run_request,
     _checkpoint_after_session_run_operation_cleanup,
     _checkpoint_with_session_run_operation,
     _clear_session_interaction_recovered_active_through,
@@ -526,6 +540,7 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
+    _mark_session_invocation_terminal_event,
     _queued_dispatch_session_instance_fingerprint,
     _runtime_resume_transport_metadata,
     _session_metadata_with_model_projection,
@@ -606,9 +621,11 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryViewInitialization,
     current_tool_discovery_view,
     initial_tool_discovery_operation_records,
     tool_discovery_generation_id,
+    tool_discovery_view_initialization,
 )
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
@@ -1636,6 +1653,29 @@ def _is_interaction_transition_run_fence(error: BaseException) -> bool:
     except (AttributeError, TypeError):
         return False
     return authority is _INTERACTION_TRANSITION_RUN_FENCE_AUTHORITY
+
+
+def _consume_authenticated_interaction_transition_run_fence(
+    error: BaseException,
+) -> bool:
+    """Consume current transition fence markers without discarding evidence.
+
+    A sibling transition boundary removes the marker from caller cancellation,
+    but the exact store failure in its cause remains independently marked.  The
+    enclosing run owner must recognize that authenticated child marker before
+    deciding whether stale-epoch cleanup is legal.
+    """
+
+    authenticated = False
+    for candidate in iter_exception_tree(error):
+        if not _is_interaction_transition_run_fence(candidate):
+            continue
+        authenticated = True
+        pop_exception_state(
+            candidate,
+            _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
+        )
+    return authenticated
 
 
 def _interaction_transition_replay_failure(
@@ -3666,6 +3706,10 @@ def _replace_checkpoint_preserving_runtime_state(
                 "active_invocation_execution_profile",
             ),
             (
+                INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+                "invocation_lifecycle_receipt",
+            ),
+            (
                 INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
                 "initial_transcript_pending",
             ),
@@ -4694,14 +4738,18 @@ class SessionEngine:
             fallback_reason="The active invocation profile changed before continuation.",
             clock=self._clock,
         )
-        rejection = await self.session_store.reject_active_invocation_execution_profile(
-            session.id,
-            expected_statuses={session.status},
-            expected_run_epoch=session.run_epoch,
-            expected_active_invocation_profile=snapshot,
-            candidate_profile=candidate,
-            event=decision.event,
-            decision=decision,
+        rejection = await self.session_store.apply_invocation_lifecycle_command(
+            RejectInvocationCommand(
+                session_id=session.id,
+                expected_session_instance_id=session.instance_id,
+                expected_statuses=(session.status,),
+                expected_run_epoch=session.run_epoch,
+                expected_profile=snapshot.profile,
+                candidate_profile=candidate,
+                event=decision.event,
+                decision=decision,
+                expected_active_profile=snapshot,
+            )
         )
         if not rejection.replayed:
             await self._event_writer.fan_out_persisted([rejection.event])
@@ -5516,16 +5564,81 @@ class SessionEngine:
         active_through: datetime | None,
         before_mutation: Callable[[], Awaitable[None]],
     ) -> IncompleteSessionRecoveryResult:
+        retained_invocation_context: InvocationContext | None = None
+
+        def retain_invocation_context(context: InvocationContext) -> None:
+            nonlocal retained_invocation_context
+            if (
+                retained_invocation_context is not None
+                and retained_invocation_context is not context
+            ):
+                raise RuntimeError(
+                    "Incomplete-session recovery produced conflicting live authority."
+                )
+            retained_invocation_context = context
+
         result = await self._recovery_coordinator.recover_incomplete_session(
             request,
             before_mutation=before_mutation,
+            retain_open_interaction_invocation=(interaction_id is not None),
+            retain_invocation_context=(
+                retain_invocation_context if interaction_id is not None else None
+            ),
         )
         if interaction_id is not None:
             _activate_session_interaction(request.session_id, interaction_id)
         await before_mutation()
-        return await self._reconcile_recovered_interaction(
+        reconciled = await self._reconcile_recovered_interaction(
             result,
             recovered_active_through=active_through,
+            invocation_context=retained_invocation_context,
+        )
+        if interaction_id is not None and retained_invocation_context is not None:
+            await self._release_reconciled_recovery_invocation(
+                request.session_id,
+                invocation_context=retained_invocation_context,
+            )
+        return reconciled
+
+    async def _release_reconciled_recovery_invocation(
+        self,
+        session_id: str,
+        *,
+        invocation_context: InvocationContext | None,
+    ) -> None:
+        """Release a public recovery epoch after exact interaction settlement."""
+
+        session = await self.session_store.load(session_id)
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            session is None
+            or active_profile is None
+            or active_profile.run_epoch != session.run_epoch
+        ):
+            return
+        settlement = await self.session_store.load_invocation_settlement_transition(
+            session_id,
+            expected_session_instance_id=session.instance_id,
+            expected_active_invocation_profile=active_profile,
+        )
+        if settlement is None:
+            return
+        if (
+            invocation_context is None
+            or invocation_context.binding.session_id != session.id
+            or invocation_context.binding.session_instance_id != session.instance_id
+            or invocation_context.binding.run_epoch != session.run_epoch
+            or invocation_context.active_profile != active_profile
+        ):
+            raise RuntimeError(
+                "Reconciled recovery release lacks its authenticated invocation context."
+            )
+        _activate_session_run_fence(session)
+        await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+            session_id=session_id,
+            execution_profile=invocation_context.profile,
+            invocation_context=invocation_context,
         )
 
     async def recover_model_completion_stage(
@@ -5596,6 +5709,51 @@ class SessionEngine:
         prior = await self.session_store.load_model_completion_stage_settlement(
             request.session_id,
             request.stage_id,
+        )
+        checkpoint = await self.session_store.load_checkpoint(request.session_id)
+        try:
+            registered_agent = self._get_registered_agent(session.agent_name)
+            registered_provider = self._get_registered_provider(provider_name)
+            registered_environment = self._get_registered_environment_for_session(
+                session.environment_name
+            )
+        except (KeyError, RuntimeError) as registration_error:
+            raise ModelCompletionManualRecoveryRequired(
+                "Manual model recovery requires the original agent, provider, and "
+                "environment registrations."
+            ) from registration_error
+        budget_policy = self._get_budget_policy()
+        active_profile = await self.validate_execution_profile_continuation(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            budget_policy=budget_policy,
+            require_open_interaction=prior is None,
+        )
+        invocation_context = _authenticated_invocation_context(
+            active_profile=active_profile,
+            binding=AdmittedInvocationBinding(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                interaction_id=active_profile.interaction_id,
+                run_epoch=session.run_epoch,
+                agent_name=session.agent_name,
+                provider_name=session.provider_name,
+                model=session.model,
+                runtime_name=session.runtime_name,
+                runtime_version=session.runtime_version,
+                environment_name=session.environment_name,
+            ),
+            validated_profile=active_profile.profile,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            request_loop_policies=(),
+            budget_policy=budget_policy,
+            tool_capability_ceiling=_session_tool_capability_ceiling(session),
         )
         if prior is not None:
             budget_events = await self._run_limit_controller.recover_pending_budget_settlements(
@@ -5682,33 +5840,47 @@ class SessionEngine:
                 "Manual model recovery lost its active stage after budget settlement."
             )
 
-        recovery_event = Event(
-            id="evt_model_completion_manual_"
-            + hashlib.sha256(
-                canonical_durable_json_bytes(
-                    request.model_dump(mode="json"),
-                    "model_completion_manual_recovery",
-                )
-            ).hexdigest(),
-            type=(
-                EventType.INTERACTION_FAILED
-                if request.terminal_status is SessionStatus.FAILED
-                else EventType.INTERACTION_INTERRUPTED
+        recovery_event = event_with_runtime_envelope_authority(
+            Event(
+                id="evt_model_completion_manual_"
+                + hashlib.sha256(
+                    canonical_durable_json_bytes(
+                        request.model_dump(mode="json"),
+                        "model_completion_manual_recovery",
+                    )
+                ).hexdigest(),
+                type=(
+                    EventType.INTERACTION_FAILED
+                    if request.terminal_status is SessionStatus.FAILED
+                    else EventType.INTERACTION_INTERRUPTED
+                ),
+                session_id=request.session_id,
+                interaction_id=interaction_id,
+                agent_name=current.agent_name,
+                environment_name=current.environment_name,
             ),
-            session_id=request.session_id,
-            interaction_id=interaction_id,
-            agent_name=current.agent_name,
-            environment_name=current.environment_name,
+            "session_id",
+            "interaction_id",
         )
         recovery_event = self._event_writer.prepare(recovery_event)
         try:
-            transition = await self.session_store.publish_interaction_transition(
-                request.session_id,
-                event=recovery_event,
-                from_statuses={current.status},
-                to_status=request.terminal_status,
-                model_completion_stage_settlement=expected_settlement,
+            transition_result = await self.session_store.apply_invocation_lifecycle_command(
+                SettleInvocationCommand(
+                    session_id=request.session_id,
+                    expected_session_instance_id=current.instance_id,
+                    expected_run_epoch=current.run_epoch,
+                    expected_active_profile=invocation_context.active_profile,
+                    transition=InteractionTransitionSpec(
+                        event=recovery_event,
+                        from_statuses=(current.status,),
+                        to_status=request.terminal_status,
+                        model_completion_stage_settlement=expected_settlement,
+                    ),
+                )
             )
+            if type(transition_result) is not InteractionTransitionResult:
+                raise RuntimeError("Manual recovery settlement returned an invalid result.")
+            transition = transition_result
         except Exception:
             reconciled = await self.session_store.load_model_completion_stage_settlement(
                 request.session_id,
@@ -5802,15 +5974,23 @@ class SessionEngine:
 
         async def reconcile_result(
             result: IncompleteSessionRecoveryResult,
+            invocation_context: InvocationContext | None,
         ) -> IncompleteSessionRecoveryResult:
             # Recovery cleanup can clear task-local interaction ownership. Restore
             # the still-open durable interaction before publishing its terminal
             # transition; the coordinator's after hook releases this ownership.
             await self._activate_latest_open_interaction(result.session_id)
-            return await self._reconcile_recovered_interaction(
+            reconciled = await self._reconcile_recovered_interaction(
                 result,
                 recovered_active_through=active_through_by_session.get(result.session_id),
+                invocation_context=invocation_context,
             )
+            if invocation_context is not None:
+                await self._release_reconciled_recovery_invocation(
+                    result.session_id,
+                    invocation_context=invocation_context,
+                )
+            return reconciled
 
         recovery = self._recovery_coordinator.recover_incomplete_sessions(
             request,
@@ -5861,17 +6041,43 @@ class SessionEngine:
         *,
         session: Session,
         recovered_active_through: datetime | None,
+        invocation_context: InvocationContext | None,
     ) -> tuple[Session, Event | None, bool]:
-        """Publish terminal recovery evidence without mutable runtime registrations."""
+        """Publish terminal recovery evidence under the applicable authority.
+
+        A context is mandatory once the session has ever acquired invocation
+        authority.  The context-free branch is retained only for a terminal
+        session that was created and disposed before invocation admission.
+        """
+
+        if invocation_context is None:
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if active_profile is None and invocation_lifecycle_receipt_history_present(checkpoint):
+                raise RuntimeError(
+                    "Recovery interaction settlement lost durable invocation authority."
+                )
+            if active_profile is not None and not active_invocation_execution_profile_is_released(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            ):
+                raise RuntimeError("Recovery interaction settlement lost its invocation context.")
+            execution_profile = None
+        else:
+            execution_profile = invocation_context.profile
 
         try:
             return await self._publish_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
+                allow_released_invocation_authority=(invocation_context is None),
                 agent_name=session.agent_name,
                 environment_name=session.environment_name,
                 to_status=session.status,
                 from_statuses={session.status},
                 recovered_active_through=recovered_active_through,
+                execution_profile=execution_profile,
             )
         except asyncio.CancelledError as cancellation:
             if _is_interaction_transition_run_fence(cancellation):
@@ -5916,11 +6122,14 @@ class SessionEngine:
                     return
                 await self._publish_interaction_transition(
                     session=session,
+                    invocation_context=invocation_context,
+                    allow_released_invocation_authority=(invocation_context is None),
                     agent_name=session.agent_name,
                     environment_name=session.environment_name,
                     to_status=session.status,
                     from_statuses={session.status},
                     recovered_active_through=recovered_active_through,
+                    execution_profile=execution_profile,
                 )
 
             await _run_interaction_transition_cancellation_cleanup_steps(
@@ -5939,8 +6148,15 @@ class SessionEngine:
         result: IncompleteSessionRecoveryResult,
         *,
         recovered_active_through: datetime | None,
+        invocation_context: InvocationContext | None,
     ) -> IncompleteSessionRecoveryResult:
-        if IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT in result.actions:
+        if any(
+            action in result.actions
+            for action in (
+                IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,
+                IncompleteSessionRecoveryAction.SKIPPED_UNREGISTERED_AGENT,
+            )
+        ):
             return result
         if any(
             event.type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in result.events
@@ -5960,13 +6176,39 @@ class SessionEngine:
             SessionStatus.INTERRUPTED,
         }:
             return result
-        # Recovery already owns a terminal durable session. Interaction summary
-        # publication needs only that session's durable authority; consulting the
-        # mutable application registry here could silently switch runtime profiles
-        # after recovery admission.
+        interaction_id = _current_session_interaction_id(result.session_id)
+        latest_records = await self.session_store.query_events(
+            EventQuery(
+                session_id=result.session_id,
+                interaction_id=interaction_id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if latest_records and latest_records[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES:
+            expected_terminal_type = {
+                SessionStatus.COMPLETED: EventType.INTERACTION_COMPLETED,
+                SessionStatus.FAILED: EventType.INTERACTION_FAILED,
+                SessionStatus.INTERRUPTED: EventType.INTERACTION_INTERRUPTED,
+            }[result.status]
+            if latest_records[0].event.type is not expected_terminal_type:
+                raise RuntimeError(
+                    "Recovered interaction terminal evidence conflicts with session status."
+                )
+            # The real transition already committed under the live context in
+            # the inner recovery path.  Do not reuse that now-released context
+            # merely to replay a read-only acknowledgement.
+            return result
+        # Recovery already reconstructed and validated the exact live context.
+        # Retain that lineage through terminal publication instead of consulting
+        # mutable registrations or treating an equal durable profile as live authority.
+        # A context-free transition is allowed only for a pre-admission session;
+        # the publication helper positively proves that no invocation profile exists.
         _, interaction_event, _ = await self._publish_durable_recovery_interaction_transition(
             session=session,
             recovered_active_through=recovered_active_through,
+            invocation_context=invocation_context,
         )
         if interaction_event is None:
             return result
@@ -6261,25 +6503,29 @@ class SessionEngine:
             raise
         event_payload = evidence.model_dump(mode="json")
         event = event_with_runtime_payload_authority(
-            Event(
-                type=event_type,
-                session_id=session.id,
-                interaction_id=interaction_id,
-                timestamp=observed_at,
-                agent_name=agent_name,
-                environment_name=environment_name,
-                payload=event_payload,
-            )
-            if event_id is None
-            else Event(
-                id=event_id,
-                type=event_type,
-                session_id=session.id,
-                interaction_id=interaction_id,
-                timestamp=observed_at,
-                agent_name=agent_name,
-                environment_name=environment_name,
-                payload=event_payload,
+            event_with_runtime_envelope_authority(
+                Event(
+                    type=event_type,
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    timestamp=observed_at,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    payload=event_payload,
+                )
+                if event_id is None
+                else Event(
+                    id=event_id,
+                    type=event_type,
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    timestamp=observed_at,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    payload=event_payload,
+                ),
+                "session_id",
+                "interaction_id",
             ),
             "start_event_id",
         )
@@ -6346,6 +6592,8 @@ class SessionEngine:
         self,
         *,
         session: Session,
+        invocation_context: InvocationContext | None = None,
+        allow_released_invocation_authority: bool = False,
         agent_name: str,
         environment_name: str | None,
         to_status: SessionStatus,
@@ -6357,6 +6605,31 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None = None,
         model_completion_failure: BaseException | None = None,
     ) -> tuple[Session, Event | None, bool]:
+        if invocation_context is not None:
+            if type(invocation_context) is not InvocationContext or not isinstance(
+                invocation_context.binding,
+                AdmittedInvocationBinding,
+            ):
+                raise TypeError(
+                    "Interaction transition requires an authenticated admitted context."
+                )
+            binding = invocation_context.binding
+            if (
+                binding.session_id != session.id
+                or binding.session_instance_id != session.instance_id
+                or binding.run_epoch != session.run_epoch
+                or binding.agent_name != agent_name
+                or binding.environment_name != environment_name
+            ):
+                raise SessionRunFenced("Interaction transition lost its frozen invocation binding.")
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise RuntimeError(
+                    "Interaction transition substituted its validated execution profile."
+                )
+            execution_profile = invocation_context.profile
         interaction_id = _current_session_interaction_id(session.id)
         active_model_completion = await self.session_store.load_active_model_completion_stage(
             session.id
@@ -6564,13 +6837,67 @@ class SessionEngine:
             only_if_no_queued_messages=only_if_no_queued_messages,
             model_completion_stage_settlement=model_completion_settlement,
         )
+        active_invocation_profile = (
+            invocation_context.active_profile
+            if invocation_context is not None
+            else active_invocation_execution_profile_from_checkpoint(
+                await self.session_store.load_checkpoint(session.id)
+            )
+        )
+        settlement_command: SettleInvocationCommand | None = None
+        if active_invocation_profile is not None:
+            released_invocation_authority = (
+                invocation_context is None
+                and allow_released_invocation_authority
+                and active_invocation_execution_profile_is_released(
+                    active_invocation_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+            )
+            if released_invocation_authority:
+                # The predecessor epoch already completed its typed release.
+                # Terminal recovery may repair the interaction event only
+                # while the exact released profile and successor epoch remain
+                # authoritative at the store's atomic publication boundary.
+                settlement_command = SettleInvocationCommand(
+                    session_id=session.id,
+                    expected_session_instance_id=session.instance_id,
+                    expected_run_epoch=session.run_epoch,
+                    expected_active_profile=active_invocation_profile,
+                    expected_authority_state="released",
+                    transition=replay_transition,
+                )
+            elif (
+                active_invocation_profile.session_id != session.id
+                or active_invocation_profile.run_epoch != session.run_epoch
+                or (
+                    execution_profile is not None
+                    and active_invocation_profile.profile != execution_profile
+                )
+            ):
+                raise SessionRunFenced(
+                    "Interaction settlement lost its active invocation authority."
+                )
+            if not released_invocation_authority:
+                settlement_command = SettleInvocationCommand(
+                    session_id=session.id,
+                    expected_session_instance_id=session.instance_id,
+                    expected_run_epoch=session.run_epoch,
+                    expected_active_profile=active_invocation_profile,
+                    transition=replay_transition,
+                )
         result: InteractionTransitionResult | None = None
         pending_cancellation: asyncio.CancelledError | None = None
         replay_failures: list[Exception] = []
         replay_deadline: float | None = None
         loop = asyncio.get_running_loop()
         for attempt in range(_INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS):
-            if replay_transition.model_completion_stage_settlement is None:
+            if settlement_command is not None:
+                transition_awaitable = self.session_store.apply_invocation_lifecycle_command(
+                    settlement_command
+                )
+            elif replay_transition.model_completion_stage_settlement is None:
                 transition_awaitable = self.session_store.publish_interaction_transition(
                     session.id,
                     event=copy_event(replay_transition.event),
@@ -6689,6 +7016,7 @@ class SessionEngine:
         _mark_session_interaction_settled(
             session.id,
             result.event.interaction_id,
+            replay_transition,
         )
         if result.event.type in INTERACTION_TERMINAL_EVENT_TYPES:
             _close_session_interaction(session.id)
@@ -6718,6 +7046,7 @@ class SessionEngine:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
         finalize_unsettled: bool,
     ) -> None:
         """Consume transition handoff evidence outside the main run loop."""
@@ -6762,6 +7091,7 @@ class SessionEngine:
             interaction_transition_failures=tuple(interaction_transition_failures),
             interaction_transition=interaction_transition,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         )
         if interaction_transition_failures and interaction_transition is not None:
             committed_transition_recorded = False
@@ -6787,10 +7117,14 @@ class SessionEngine:
             return
         if not finalize_unsettled:
             return
+
+        async def finalize_unsettled_interaction() -> None:
+            await self._recovery_coordinator.finalize_abandoned_session_run(recovery_request)
+
         cancellation_cleanup_steps = (
             (
                 "cancelled sibling interaction-transition finalization",
-                lambda: self._recovery_coordinator.finalize_abandoned_session_run(recovery_request),
+                finalize_unsettled_interaction,
             ),
         )
         if interaction_transition_failures:
@@ -6808,6 +7142,7 @@ class SessionEngine:
         self,
         *,
         session: Session,
+        invocation_context: InvocationContext | None = None,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
@@ -6823,9 +7158,15 @@ class SessionEngine:
     ) -> tuple[Session, Event | None, bool]:
         """Publish from a caller not enclosed by ``_run_session`` cleanup."""
 
+        if invocation_context is not None and (
+            registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+        ):
+            raise RuntimeError("Sibling interaction transition substituted a frozen collaborator.")
         try:
             return await self._publish_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=to_status,
@@ -6845,6 +7186,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 finalize_unsettled=finalize_unsettled_cancellation,
             )
             raise
@@ -6872,9 +7214,19 @@ class SessionEngine:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity,
         legacy_resolution_without_profile: bool = False,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncIterator[Event]:
         """Terminalize one explicit provider failure through normal lifecycle hooks."""
 
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError(
+                "Provider-operation failure substituted frozen invocation authority."
+            )
         if resolution_event.type is not EventType.PROVIDER_OPERATION_RESOLVED:
             raise TypeError("Provider-operation failure requires a resolution event.")
         if resolution_event.session_id != session.id:
@@ -7003,6 +7355,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=transitioned_session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
@@ -7062,6 +7415,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield terminal_event
         finally:
@@ -8434,39 +8788,49 @@ class SessionEngine:
             discovery_agent,
             discovery_ceiling,
         )
-
-        def freeze_initial_invocation_profile(
-            current_session: Session,
-            checkpoint: dict[str, Any] | None,
-            *,
-            expected_interaction_id: str = interaction_id,
-            expected_profile: ExecutionProfileIdentity = execution_profile,
-        ) -> dict[str, Any]:
-            return checkpoint_with_active_invocation_execution_profile(
-                checkpoint,
-                session_id=current_session.id,
-                interaction_id=expected_interaction_id,
-                run_epoch=current_session.run_epoch,
-                profile=expected_profile,
+        tool_discovery_initialization = (
+            None
+            if tool_discovery_initializer is None
+            else tool_discovery_view_initialization(
+                session_id=session_id,
+                agent_name=discovery_agent.spec.name,
+                catalogue=discovery_agent.tool_catalogue,
+                ceiling=discovery_ceiling,
             )
+        )
+        initial_active_profile = ActiveInvocationExecutionProfile(
+            session_id=session_id,
+            interaction_id=interaction_id,
+            run_epoch=1,
+            profile=execution_profile,
+        )
 
-        def create_session(
+        async def create_session(
             request_to_create: RunRequest = prepared_request,
             *,
             identity: SessionIdentity = prepared.session_identity,
             started_event: Event = interaction_started_event,
-            source_messages: list[Message] = prepared_request.messages,
-            checkpoint_transform: CheckpointTransform = freeze_initial_invocation_profile,
-            operation_initializer: SessionOperationInitializer | None = tool_discovery_initializer,
-        ) -> Awaitable[Session]:
-            return self.session_store.create(
-                request_to_create,
-                identity=identity,
-                interaction_started_event=started_event,
-                interaction_source_messages=source_messages,
-                checkpoint_transform=checkpoint_transform,
-                operation_initializer=operation_initializer,
+            source_messages: tuple[Message, ...] = tuple(prepared_request.messages),
+            discovery_initialization: ToolDiscoveryViewInitialization | None = (
+                tool_discovery_initialization
+            ),
+            active_profile: ActiveInvocationExecutionProfile = initial_active_profile,
+        ) -> Session:
+            result = await self.session_store.apply_invocation_lifecycle_command(
+                CreateInvocationCommand(
+                    session_id=request_to_create.session_id or "",
+                    expected_session_instance_id=session_instance_id,
+                    request=request_to_create,
+                    identity=identity,
+                    active_profile=active_profile,
+                    interaction_started_event=started_event,
+                    interaction_source_messages=source_messages,
+                    tool_discovery_initialization=discovery_initialization,
+                )
             )
+            if type(result) is not InvocationMutationResult:
+                raise RuntimeError("Work-attempt create returned an invalid result.")
+            return result.session
 
         mutation = settle_work_attempt_session_mutation(
             create_session,
@@ -8488,7 +8852,6 @@ class SessionEngine:
             interaction_id,
             interaction_started_event,
             session_binding,
-            freeze_initial_invocation_profile,
             tool_discovery_initializer,
             create_session,
         )
@@ -8670,6 +9033,10 @@ class SessionEngine:
             redactor=self._secret_redactor,
         )
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_profile is None and invocation_lifecycle_receipt_history_present(checkpoint):
+            raise SessionRunFenced(
+                "Continuation lost its durable predecessor invocation authority."
+            )
         if active_profile is not None and not active_invocation_execution_profile_is_released(
             active_profile,
             session_id=session.id,
@@ -8757,24 +9124,42 @@ class SessionEngine:
             updated.pop(WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY, None)
             return updated or None
 
-        invocation_admission = SessionInvocationAdmission(
-            from_statuses=frozenset(_RESUMABLE_SESSION_STATUSES),
-            checkpoint_transform=validate_continuation_checkpoint,
-            execution_profile=profile,
+        claimed_continuation_checkpoint = validate_continuation_checkpoint(
+            session,
+            checkpoint,
+        )
+        continuation_active_profile = ActiveInvocationExecutionProfile(
+            session_id=expected_session_id,
+            interaction_id=authority.request.interaction_id,
+            run_epoch=expected_run_epoch + 1,
+            profile=profile,
+        )
+        continuation_command = AdmitInvocationCommand(
+            session_id=expected_session_id,
+            expected_session_instance_id=session.instance_id,
+            expected_statuses=tuple(_RESUMABLE_SESSION_STATUSES),
+            expected_run_epoch=expected_run_epoch,
+            expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
+            target_active_profile=continuation_active_profile,
+            checkpoint_patch=InvocationCheckpointPatch(
+                mutation=runtime_publication_checkpoint_mutation(
+                    checkpoint,
+                    claimed_continuation_checkpoint,
+                )
+            ),
             tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
             interaction_started_event=interaction_started_event,
             interaction_source_messages=tuple(request.messages),
+            expected_active_profile=active_profile,
         )
 
-        def admit_session_invocation(
-            session_id: str = expected_session_id,
-            *,
-            exact_admission: SessionInvocationAdmission = invocation_admission,
-        ) -> Awaitable[Session]:
-            return self.session_store.admit_session_invocation(
-                session_id,
-                admission=exact_admission,
-            )
+        async def admit_session_invocation(
+            command: AdmitInvocationCommand = continuation_command,
+        ) -> Session:
+            result = await self.session_store.apply_invocation_lifecycle_command(command)
+            if type(result) is not InvocationMutationResult:
+                raise RuntimeError("Work-attempt admission returned an invalid result.")
+            return result.session
 
         mutation = settle_work_attempt_session_mutation(
             admit_session_invocation,
@@ -8801,7 +9186,7 @@ class SessionEngine:
             expected_session_id,
             expected_run_epoch,
             validate_continuation_checkpoint,
-            invocation_admission,
+            continuation_command,
             admit_session_invocation,
         )
         try:
@@ -9082,33 +9467,82 @@ class SessionEngine:
             ),
             targeted_tool_grants=targeted_tool_grants,
         )
+        invocation_context: InvocationContext | None = None
         if prepared_session_authority is None:
+            request = run_request_with_runtime_session_instance_authority(
+                request,
+                session_instance_id=str(uuid4()),
+            )
             bind_runtime_session_create_claim(
                 request,
                 identity=session_identity,
                 interaction_started_event=interaction_started_event,
             )
-
-            def freeze_initial_invocation_profile(
-                current_session: Session,
-                checkpoint: dict[str, Any] | None,
-            ) -> dict[str, Any]:
-                return checkpoint_with_active_invocation_execution_profile(
-                    checkpoint,
-                    session_id=current_session.id,
-                    interaction_id=interaction_id,
-                    run_epoch=current_session.run_epoch,
-                    profile=execution_profile,
-                )
-
-            session = await self.session_store.create(
+            session_instance_id = _authenticated_session_instance_id_for_run_request(
                 request,
-                identity=session_identity,
-                interaction_started_event=interaction_started_event,
-                interaction_source_messages=request.messages,
-                checkpoint_transform=freeze_initial_invocation_profile,
-                operation_initializer=tool_discovery_initializer,
+                session_id=session_id,
             )
+            if session_instance_id is None:
+                raise AssertionError("Run preparation lost session-incarnation authority.")
+            active_profile = ActiveInvocationExecutionProfile(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                run_epoch=1,
+                profile=execution_profile,
+            )
+            # Pydantic defensively reconstructs nested profile models. From
+            # this point the active wrapper's profile is the one live object
+            # carried by the invocation context and every runtime phase.
+            execution_profile = active_profile.profile
+            invocation_context = _authenticated_invocation_context(
+                active_profile=active_profile,
+                binding=PreparedInvocationBinding(
+                    session_id=session_id,
+                    session_instance_id=session_instance_id,
+                    interaction_id=interaction_id,
+                    run_epoch=1,
+                    agent_name=registered_agent.spec.name,
+                    provider_name=registered_provider.name,
+                    model=session_identity.model,
+                    runtime_name=session_identity.runtime_name,
+                    runtime_version=session_identity.runtime_version,
+                    environment_name=_environment_name(registered_environment),
+                ),
+                validated_profile=execution_profile,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                request_loop_policies=request.loop_policies,
+                budget_policy=budget_policy,
+                tool_capability_ceiling=tool_capability_ceiling,
+                targeted_tool_grants=targeted_tool_grants,
+            )
+            tool_discovery_initialization = None
+            if tool_discovery_initializer is not None:
+                tool_discovery_initialization = tool_discovery_view_initialization(
+                    session_id=session_id,
+                    agent_name=registered_agent.spec.name,
+                    catalogue=registered_agent.tool_catalogue,
+                    ceiling=tool_capability_ceiling,
+                )
+            created = await self.session_store.apply_invocation_lifecycle_command(
+                CreateInvocationCommand(
+                    session_id=session_id,
+                    expected_session_instance_id=session_instance_id,
+                    request=request,
+                    identity=session_identity,
+                    active_profile=active_profile,
+                    interaction_started_event=interaction_started_event,
+                    interaction_source_messages=tuple(request.messages),
+                    tool_discovery_initialization=tool_discovery_initialization,
+                )
+            )
+            if type(created) is not InvocationMutationResult:
+                raise RuntimeError("Invocation create returned an invalid result.")
+            session = created.session
+            invocation_context = invocation_context.with_admitted_session(session)
         else:
 
             def validate_prepared_submission(
@@ -9143,19 +9577,94 @@ class SessionEngine:
                     queue_task_id=prepared_session_authority.queue_task_id,
                 )
 
-            session = await self.session_store.admit_session_invocation(
-                session_id,
-                admission=SessionInvocationAdmission(
-                    from_statuses=frozenset({SessionStatus.PENDING}),
-                    checkpoint_transform=validate_prepared_submission,
-                    execution_profile=execution_profile,
-                    tool_capability_ceiling=tool_capability_ceiling,
-                    interaction_source_messages=tuple(request.messages),
-                    interaction_started_event=interaction_started_event,
-                    defer_interaction_source=True,
-                    allow_pending_initial_interaction=True,
-                ),
+            pending_session = await self.session_store.load(session_id)
+            if pending_session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            pending_checkpoint = await self.session_store.load_checkpoint(session_id)
+            claimed_checkpoint = validate_prepared_submission(
+                pending_session,
+                pending_checkpoint,
             )
+            prepared_active_profile = ActiveInvocationExecutionProfile(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                run_epoch=pending_session.run_epoch + 1,
+                profile=execution_profile,
+            )
+            execution_profile = prepared_active_profile.profile
+            prepared_invocation_context = _authenticated_invocation_context(
+                active_profile=prepared_active_profile,
+                binding=PreparedInvocationBinding(
+                    session_id=pending_session.id,
+                    session_instance_id=pending_session.instance_id,
+                    interaction_id=interaction_id,
+                    run_epoch=pending_session.run_epoch + 1,
+                    agent_name=pending_session.agent_name,
+                    provider_name=pending_session.provider_name,
+                    model=pending_session.model,
+                    runtime_name=pending_session.runtime_name,
+                    runtime_version=pending_session.runtime_version,
+                    environment_name=pending_session.environment_name,
+                ),
+                validated_profile=execution_profile,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                request_loop_policies=request.loop_policies,
+                budget_policy=budget_policy,
+                tool_capability_ceiling=tool_capability_ceiling,
+                targeted_tool_grants=targeted_tool_grants,
+            )
+            admission_command = AdmitInvocationCommand(
+                session_id=session_id,
+                expected_session_instance_id=pending_session.instance_id,
+                expected_statuses=(SessionStatus.PENDING,),
+                expected_run_epoch=pending_session.run_epoch,
+                expected_checkpoint_sha256=(invocation_checkpoint_state_sha256(pending_checkpoint)),
+                target_active_profile=prepared_active_profile,
+                checkpoint_patch=InvocationCheckpointPatch(
+                    mutation=runtime_publication_checkpoint_mutation(
+                        pending_checkpoint,
+                        claimed_checkpoint,
+                    )
+                ),
+                tool_capability_ceiling=tool_capability_ceiling,
+                interaction_source_messages=tuple(request.messages),
+                interaction_started_event=interaction_started_event,
+                defer_interaction_source=True,
+                allow_pending_initial_interaction=True,
+            )
+            try:
+                admission_result = await self.session_store.apply_invocation_lifecycle_command(
+                    admission_command
+                )
+            except SessionRunFenced as admission_fence:
+                # A CAS race is normally retryable. If the current store state
+                # positively proves that the prepared child's durable parent
+                # authority was removed or replaced, preserve that permanent
+                # classification so the dispatcher terminally rejects it.
+                try:
+                    current_session = await self.session_store.load(session_id)
+                    current_checkpoint = await self.session_store.load_checkpoint(session_id)
+                except Exception:
+                    raise admission_fence from None
+                try:
+                    if current_session is None:
+                        raise durable_subagent_authority_rejected()
+                    validate_prepared_submission(current_session, current_checkpoint)
+                finally:
+                    if type(current_checkpoint) is dict:
+                        current_checkpoint.clear()
+                    current_checkpoint = None
+                raise admission_fence
+            if type(admission_result) is not InvocationMutationResult:
+                raise RuntimeError("Invocation admission returned an invalid result.")
+            session = admission_result.session
+            invocation_context = prepared_invocation_context.with_admitted_session(session)
+        if invocation_context is None:
+            raise AssertionError("Invocation admission produced no frozen context.")
         _activate_session_interaction(session.id, interaction_id)
         targeted_tool_projection = resolve_targeted_tool_projection(
             registered_agent.targeted_tool_mode,
@@ -9209,6 +9718,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -9241,8 +9751,14 @@ class SessionEngine:
                 started_event=factory_started_event,
                 operation=EnvironmentFactoryOperation.CREATE,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             registered_environment = resolution.registered_environment
+            if registered_environment is not None:
+                invocation_context = invocation_context.with_registered_environment(
+                    registered_environment,
+                    validated_profile=execution_profile,
+                )
             for event in resolution.events:
                 yield event
                 async for queued_event in self._session_control.drain_out_of_band_events(
@@ -9326,6 +9842,7 @@ class SessionEngine:
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
                 return
@@ -9340,6 +9857,7 @@ class SessionEngine:
                             registered_agent=registered_agent,
                             registered_environment=registered_environment,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                         ),
                     ),
                 ),
@@ -9394,6 +9912,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=_environment_name(registered_environment),
@@ -9428,6 +9947,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield event
                 async for queued_event in self._session_control.drain_out_of_band_events(
@@ -9452,6 +9972,7 @@ class SessionEngine:
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                     prepare_interruption=prepare_interruption,
                 )
                 if propagated_failure is exc:
@@ -9472,6 +9993,7 @@ class SessionEngine:
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     ):
                         pass
                 except Exception as finalization_failure:
@@ -9498,6 +10020,7 @@ class SessionEngine:
                                 session_id=session.id,
                                 original_error=finalizer_failure,
                                 execution_profile=execution_profile,
+                                invocation_context=invocation_context,
                             ),
                         ),
                         (
@@ -9506,6 +10029,7 @@ class SessionEngine:
                                 self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                     session_id=session.id,
                                     execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
                                 )
                             ),
                         ),
@@ -9538,6 +10062,7 @@ class SessionEngine:
                             session_id=session.id,
                             original_error=finalizer_failure,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                         )
                 finally:
                     try:
@@ -9545,6 +10070,7 @@ class SessionEngine:
                             await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                 session_id=session.id,
                                 execution_profile=execution_profile,
+                                invocation_context=invocation_context,
                             )
                     finally:
                         try:
@@ -9562,20 +10088,15 @@ class SessionEngine:
                 raise RuntimeError("Initial transcript was not finalized during setup.")
             session_stream = self._run_session(
                 session=session,
-                registered_agent=registered_agent,
-                registered_provider=registered_provider,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 messages=messages,
                 messages_to_append=[],
                 max_steps=request.max_steps,
                 limits=request.limits,
                 budget_limits=request.budget_limits,
-                budget_policy=budget_policy,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 structured_output=request.structured_output,
                 thinking=request.thinking,
-                request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 request_trace_metadata=request.metadata,
                 targeted_tool_grants=targeted_tool_grant_footprint(
@@ -9622,12 +10143,14 @@ class SessionEngine:
                     session_id=session.id,
                     original_error=exc,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 )
             finally:
                 try:
                     await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                         session_id=session.id,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     )
                 finally:
                     _deactivate_session_interaction(session.id)
@@ -9683,6 +10206,7 @@ class SessionEngine:
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     ):
                         yield event
                 except Exception:
@@ -9717,6 +10241,7 @@ class SessionEngine:
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     ):
                         yield event
                 except Exception:
@@ -9737,6 +10262,7 @@ class SessionEngine:
                     registered_environment=registered_environment,
                     environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
                 return
@@ -12676,12 +13202,14 @@ class SessionEngine:
         self,
         *,
         session: Session,
+        invocation_context: InvocationContext,
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
     ) -> tuple[Session, Event | None, bool]:
         try:
             return await self._publish_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=SessionStatus.COMPLETED,
@@ -12709,6 +13237,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None = None,
     ) -> tuple[bool, list[Event]]:
         if step < max_steps:
             return True, await self._deliver_queued_session_messages(
@@ -12733,6 +13262,7 @@ class SessionEngine:
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
         ]
         return False, events
@@ -13753,9 +14283,20 @@ class SessionEngine:
             if provider_operation_profile is not None:
                 session = await self._recovery_coordinator.claim_provider_operation_interruption(
                     session,
-                    provider_operation_profile,
+                    provider_operation_profile.active_profile,
                     interruption_request_id=interrupt_payload["interruption_request_id"],
+                    invocation_context=provider_operation_profile.invocation_context,
                 )
+                invocation_context = (
+                    provider_operation_profile.invocation_context.with_rebound_session(
+                        session,
+                        active_profile=provider_operation_profile.active_profile.model_copy(
+                            update={"run_epoch": session.run_epoch}
+                        ),
+                    )
+                )
+            else:
+                invocation_context = None
         except ValueError:
             reloaded_session = await self.session_store.load(loaded_session.id)
             if reloaded_session is None:
@@ -13819,7 +14360,8 @@ class SessionEngine:
                         lambda: (
                             self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                 session_id=session.id,
-                                execution_profile=provider_operation_profile.profile,
+                                execution_profile=provider_operation_profile.active_profile.profile,
+                                invocation_context=invocation_context,
                             )
                         ),
                     ),
@@ -13834,6 +14376,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=_environment_name(registered_environment),
@@ -13841,7 +14384,7 @@ class SessionEngine:
                 execution_profile=(
                     None
                     if provider_operation_profile is None
-                    else provider_operation_profile.profile
+                    else provider_operation_profile.active_profile.profile
                 ),
             )
         except BaseException as transition_failure:
@@ -13895,6 +14438,7 @@ class SessionEngine:
             await self._emit_active_turn_completed_if_needed(
                 session=session,
                 status=SessionStatus.INTERRUPTED,
+                invocation_context=invocation_context,
             )
             terminal_event_stream = self._emit_terminal_event_with_hooks(
                 event=_runtime_interruption_event(
@@ -13913,8 +14457,9 @@ class SessionEngine:
                 execution_profile=(
                     None
                     if provider_operation_profile is None
-                    else provider_operation_profile.profile
+                    else provider_operation_profile.active_profile.profile
                 ),
+                invocation_context=invocation_context,
             )
             terminal_prefix, interrupted_event = await _collect_through_event_type(
                 terminal_event_stream,
@@ -14371,6 +14916,12 @@ class SessionEngine:
         )
         validate_resumable_checkpoint(loaded_session, checkpoint)
         active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_invocation_profile is None and invocation_lifecycle_receipt_history_present(
+            checkpoint
+        ):
+            raise SessionRunFenced(
+                "Session resume lost its durable predecessor invocation authority."
+            )
         if active_invocation_profile is not None and not (
             active_invocation_execution_profile_is_released(
                 active_invocation_profile,
@@ -14645,14 +15196,17 @@ class SessionEngine:
                 ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
                 ExecutionProfileDecisionKind.REJECTED,
             }:
-                rejection = await self.session_store.reject_execution_profile_resume(
-                    loaded_session.id,
-                    expected_statuses=_RESUMABLE_SESSION_STATUSES,
-                    expected_run_epoch=loaded_session.run_epoch,
-                    expected_profile=expected_execution_profile,
-                    candidate_profile=candidate_execution_profile,
-                    event=execution_profile_decision.event,
-                    decision=execution_profile_decision,
+                rejection = await self.session_store.apply_invocation_lifecycle_command(
+                    RejectInvocationCommand(
+                        session_id=loaded_session.id,
+                        expected_session_instance_id=loaded_session.instance_id,
+                        expected_statuses=tuple(_RESUMABLE_SESSION_STATUSES),
+                        expected_run_epoch=loaded_session.run_epoch,
+                        expected_profile=expected_execution_profile,
+                        candidate_profile=candidate_execution_profile,
+                        event=execution_profile_decision.event,
+                        decision=execution_profile_decision,
+                    )
                 )
                 if not rejection.replayed:
                     await self._event_writer.fan_out_persisted([rejection.event])
@@ -14961,13 +15515,75 @@ class SessionEngine:
         egress_profile_activation = (
             None if egress_environment_handoff is None else egress_environment_handoff.transition
         )
+        # Egress cutover is a durable mutation that may advance the checkpoint
+        # before invocation admission.  Admission must bind the resulting
+        # state, rather than the snapshot loaded before that mutation.  A
+        # competing write after this reload is still rejected by the atomic
+        # command's expected checkpoint digest.
+        checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+        checkpoint = await _reconcile_committed_prompt_transition_intents(
+            session_store=self.session_store,
+            source_session_id=loaded_session.id,
+            checkpoint=checkpoint,
+            clock=self._clock,
+            persist=False,
+        )
+        admission_source_active_profile = active_invocation_execution_profile_from_checkpoint(
+            checkpoint
+        )
+        claimed_checkpoint = claim_resumable_checkpoint(loaded_session, checkpoint)
+        target_active_profile = ActiveInvocationExecutionProfile(
+            session_id=loaded_session.id,
+            interaction_id=interaction_id,
+            run_epoch=loaded_session.run_epoch + 1,
+            profile=invocation_profile,
+        )
+        invocation_profile = target_active_profile.profile
+        target_model = (
+            requested_target.model
+            if target_changed and requested_target is not None
+            else loaded_session.model
+        )
+        prepared_invocation_context = _authenticated_invocation_context(
+            active_profile=target_active_profile,
+            binding=PreparedInvocationBinding(
+                session_id=loaded_session.id,
+                session_instance_id=loaded_session.instance_id,
+                interaction_id=interaction_id,
+                run_epoch=loaded_session.run_epoch + 1,
+                agent_name=loaded_session.agent_name,
+                provider_name=registered_provider.name,
+                model=target_model,
+                runtime_name=loaded_session.runtime_name,
+                runtime_version=loaded_session.runtime_version,
+                environment_name=_environment_name(registered_environment),
+            ),
+            validated_profile=invocation_profile,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            request_loop_policies=request.loop_policies,
+            budget_policy=budget_policy,
+            tool_capability_ceiling=effective_tool_capability_ceiling,
+            targeted_tool_grants=prepared_targeted_tool_grants,
+        )
         try:
-            session = await self.session_store.admit_session_invocation(
-                loaded_session.id,
-                admission=SessionInvocationAdmission(
-                    from_statuses=frozenset(_RESUMABLE_SESSION_STATUSES),
-                    checkpoint_transform=claim_resumable_checkpoint,
-                    execution_profile=invocation_profile,
+            admission_result = await self.session_store.apply_invocation_lifecycle_command(
+                AdmitInvocationCommand(
+                    session_id=loaded_session.id,
+                    expected_session_instance_id=loaded_session.instance_id,
+                    expected_statuses=tuple(_RESUMABLE_SESSION_STATUSES),
+                    expected_run_epoch=loaded_session.run_epoch,
+                    expected_checkpoint_sha256=invocation_checkpoint_state_sha256(checkpoint),
+                    target_active_profile=target_active_profile,
+                    checkpoint_patch=InvocationCheckpointPatch(
+                        mutation=runtime_publication_checkpoint_mutation(
+                            checkpoint,
+                            claimed_checkpoint,
+                        )
+                    ),
                     tool_capability_ceiling=effective_tool_capability_ceiling,
                     interaction_started_event=interaction_started_event,
                     continued_interaction_id=(
@@ -14977,10 +15593,23 @@ class SessionEngine:
                     defer_interaction_source=continuing_recovery_boundary,
                     model_transition=model_transition,
                     execution_profile_decision=execution_profile_decision,
-                    expected_active_invocation_profile=(continuing_execution_profile_snapshot),
-                ),
+                    expected_active_profile=admission_source_active_profile,
+                )
             )
-        except (SessionStatusConflict, ValueError):
+            if type(admission_result) is not InvocationMutationResult:
+                raise RuntimeError("Invocation admission returned an invalid result.")
+            session = admission_result.session
+        except (SessionRunFenced, SessionStatusConflict, ValueError) as admission_error:
+            if egress_profile_activation is not None:
+                current_egress_transition = await SessionCheckpointEgressAuthorityTransitionStore(
+                    self.session_store
+                ).load(loaded_session.id)
+                if current_egress_transition != egress_profile_activation:
+                    if continuing_recovery_boundary:
+                        _deactivate_session_interaction(loaded_session.id)
+                    raise EgressAuthorityTransitionConflict(
+                        "The exact egress authority transition changed before invocation admission."
+                    ) from admission_error
             if request.profile_adoption is not None and candidate_execution_profile is not None:
                 current_session = await self.session_store.load(loaded_session.id)
                 if current_session is not None:
@@ -15000,6 +15629,7 @@ class SessionEngine:
             if continuing_recovery_boundary:
                 _deactivate_session_interaction(loaded_session.id)
             raise
+        invocation_context = prepared_invocation_context.with_admitted_session(session)
         if not continuing_recovery_boundary:
             if interaction_id is None:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
@@ -15086,6 +15716,7 @@ class SessionEngine:
                 yield reconstructed_event
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
@@ -15113,13 +15744,25 @@ class SessionEngine:
                         session_id=session.id,
                         operation_id=run_operation_id,
                     )
-                await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
+                (
+                    session,
+                    pending_interaction_event,
+                    _,
+                ) = await self._publish_sibling_interaction_transition(
+                    session=session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                    to_status=SessionStatus.INTERRUPTED,
+                    execution_profile=invocation_profile,
                 )
+                if pending_interaction_event is not None:
+                    yield pending_interaction_event
                 await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                     session_id=session.id,
                     execution_profile=invocation_profile,
+                    invocation_context=invocation_context,
                 )
                 _deactivate_session_interaction(session.id)
                 return
@@ -15159,6 +15802,7 @@ class SessionEngine:
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
                                 execution_profile=invocation_profile,
+                                invocation_context=invocation_context,
                             ),
                         ),
                         (
@@ -15167,6 +15811,7 @@ class SessionEngine:
                                 self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                     session_id=session.id,
                                     execution_profile=invocation_profile,
+                                    invocation_context=invocation_context,
                                 )
                             ),
                         ),
@@ -15237,6 +15882,7 @@ class SessionEngine:
                         _,
                     ) = await self._publish_sibling_interaction_transition(
                         session=session,
+                        invocation_context=invocation_context,
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
@@ -15279,6 +15925,7 @@ class SessionEngine:
                     await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                         session_id=session.id,
                         execution_profile=invocation_profile,
+                        invocation_context=invocation_context,
                     )
                 finally:
                     _deactivate_session_interaction(session.id)
@@ -15288,6 +15935,7 @@ class SessionEngine:
                 await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                     session_id=session.id,
                     execution_profile=invocation_profile,
+                    invocation_context=invocation_context,
                 )
             finally:
                 _deactivate_session_interaction(session.id)
@@ -15296,17 +15944,9 @@ class SessionEngine:
         messages = (
             transcript + interaction_source_messages if continuing_recovery_boundary else transcript
         )
-
         session_stream = self._run_session(
             session=session,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            execution_profile=(
-                continuing_execution_profile_snapshot.profile
-                if continuing_execution_profile_snapshot is not None
-                else candidate_execution_profile
-            ),
+            invocation_context=invocation_context,
             messages=messages,
             messages_to_append=(
                 interaction_source_messages if continuing_recovery_boundary else request.messages
@@ -15314,11 +15954,9 @@ class SessionEngine:
             max_steps=request.max_steps,
             limits=request.limits,
             budget_limits=request.budget_limits,
-            budget_policy=budget_policy,
             retry_policy=self._effective_retry_policy(request.retry_policy),
             structured_output=request.structured_output,
             thinking=request.thinking,
-            request_loop_policies=request.loop_policies,
             request_metadata=request.metadata,
             request_trace_metadata=(
                 _runtime_resume_transport_metadata(request) or request.metadata
@@ -16035,13 +16673,13 @@ class SessionEngine:
             *,
             require_prepared_intent: bool,
         ) -> dict[str, Any] | None:
-            if expected_source_snapshot is not None:
-                _, live_source_profile, _ = (
-                    session_request_boundary.prepare_fork_source_execution_profile(
-                        current_source,
-                        source_checkpoint,
-                    )
+            _, live_source_profile, _ = (
+                session_request_boundary.prepare_fork_source_execution_profile(
+                    current_source,
+                    source_checkpoint,
                 )
+            )
+            if expected_source_snapshot is not None:
                 if live_source_profile.fingerprint != expected_source_snapshot.profile_fingerprint:
                     raise SessionRunFenced(
                         "Fork source execution profile changed after its coordinator "
@@ -16080,6 +16718,13 @@ class SessionEngine:
                 # interaction and run epoch, never to the derived child.
                 fork_checkpoint.pop(
                     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+                    None,
+                )
+                # Lifecycle command receipts authenticate mutations of the
+                # source incarnation. A child cannot replay them and must not
+                # inherit their source-bound session snapshots.
+                fork_checkpoint.pop(
+                    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
                     None,
                 )
                 # A model-step publication receipt belongs to the source session.
@@ -17013,20 +17658,15 @@ class SessionEngine:
         self,
         *,
         session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_provider: runtime_records.RegisteredProvider,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext,
         messages: list[Message],
         messages_to_append: list[Message],
         max_steps: int,
         limits: RunLimits,
         budget_limits: tuple[BudgetLimit, ...],
-        budget_policy: BudgetPolicy | None,
         retry_policy: RetryPolicy,
         structured_output: StructuredOutputSpec | None,
         thinking: ThinkingConfig | None,
-        request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
         request_trace_metadata: dict[str, Any],
         targeted_tool_grants: TargetedToolGrantFootprint | None,
@@ -17049,6 +17689,16 @@ class SessionEngine:
         egress_environment_handoff: EgressAuthorityAdoptionResult | None = None,
         parked_egress_factory_result: EnvironmentFactoryResult | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if type(invocation_context) is not InvocationContext:
+            raise TypeError("invocation_context must be an authenticated InvocationContext.")
+        if not isinstance(invocation_context.binding, AdmittedInvocationBinding):
+            raise ValueError("Invocation execution requires an admitted context.")
+        registered_agent = invocation_context.registered_agent
+        registered_provider = invocation_context.registered_provider
+        registered_environment = invocation_context.registered_environment
+        execution_profile = invocation_context.profile
+        budget_policy = invocation_context.budget_policy
+        request_loop_policies = invocation_context.request_loop_policies
         # Deep defense for internal recovery callers. Public entry points
         # validate before claiming mutable session ownership.
         require_secret_free_structured_output_spec(
@@ -17221,7 +17871,7 @@ class SessionEngine:
         hosted_search_budget_limits = (
             *budget_limits,
             *budget_limits_for_session(
-                policy=self._get_budget_policy(),
+                policy=budget_policy,
                 agent_name=registered_agent.spec.name,
                 causal_budget_id=session.causal_budget_id,
             ),
@@ -17314,6 +17964,7 @@ class SessionEngine:
 
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
@@ -17331,6 +17982,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             if factory_started_event is not None:
                 yield factory_started_event
@@ -17407,9 +18059,15 @@ class SessionEngine:
                     else EnvironmentFactoryOperation.RECONNECT
                 ),
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 adopted_factory_result=adopted_factory_result,
             )
             registered_environment = factory_resolution.registered_environment
+            if registered_environment is not None:
+                invocation_context = invocation_context.with_registered_environment(
+                    registered_environment,
+                    validated_profile=execution_profile,
+                )
             environment_name = _environment_name(registered_environment)
             if active_run is not None:
                 active_run.turn_environment_name = environment_name
@@ -17455,6 +18113,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             if binding_started_event is not None:
                 yield binding_started_event
@@ -17467,8 +18126,14 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 started_event=binding_started_event,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             registered_environment = binding_result.registered_environment
+            if registered_environment is not None:
+                invocation_context = invocation_context.with_registered_environment(
+                    registered_environment,
+                    validated_profile=execution_profile,
+                )
             environment_name = _environment_name(registered_environment)
             if active_run is not None:
                 active_run.turn_environment_name = environment_name
@@ -17480,6 +18145,7 @@ class SessionEngine:
                 session=session,
                 registered_agent=registered_agent,
                 environment_name=environment_name,
+                invocation_context=invocation_context,
             ):
                 yield event
             if start_event_type is not None:
@@ -17582,6 +18248,7 @@ class SessionEngine:
                 recovery_tail_message_count = len(messages) - pending_result_position
             async for event in self._recovery_coordinator.recover_pending_tool_round(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 messages=messages,
@@ -17646,6 +18313,7 @@ class SessionEngine:
                     session_completed,
                 ) = await self._complete_session_if_no_queued_messages(
                     session=session,
+                    invocation_context=invocation_context,
                     registered_agent=registered_agent,
                     environment_name=environment_name,
                 )
@@ -17672,6 +18340,7 @@ class SessionEngine:
                         turn_usage_tracker=turn_usage_tracker,
                         active_run=active_run,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     )
                     for event in queued_events:
                         yield event
@@ -17731,6 +18400,7 @@ class SessionEngine:
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
 
             def model_completion_recovery_context(
@@ -17915,6 +18585,7 @@ class SessionEngine:
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 validate_live_model_semantics=validate_live_model_semantics,
                 initial_tool_exposure=initial_model_step_tool_exposure,
                 previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
@@ -17973,6 +18644,7 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
                 if budget_evaluation.check is not None:
@@ -17991,6 +18663,7 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
                 if limit_evaluation.decision is not None:
@@ -18136,6 +18809,7 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
                 if limit_evaluation.decision is not None:
@@ -18158,6 +18832,7 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
                 if budget_evaluation.check is not None:
@@ -18365,6 +19040,7 @@ class SessionEngine:
                             session_completed,
                         ) = await self._complete_session_if_no_queued_messages(
                             session=session,
+                            invocation_context=invocation_context,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
                         )
@@ -18386,6 +19062,7 @@ class SessionEngine:
                                 turn_usage_tracker=turn_usage_tracker,
                                 active_run=active_run,
                                 execution_profile=execution_profile,
+                                invocation_context=invocation_context,
                             )
                             for event in queued_events:
                                 yield event
@@ -18462,6 +19139,7 @@ class SessionEngine:
                                     session_completed,
                                 ) = await self._complete_session_if_no_queued_messages(
                                     session=session,
+                                    invocation_context=invocation_context,
                                     registered_agent=registered_agent,
                                     environment_name=environment_name,
                                 )
@@ -18483,6 +19161,7 @@ class SessionEngine:
                                         turn_usage_tracker=turn_usage_tracker,
                                         active_run=active_run,
                                         execution_profile=execution_profile,
+                                        invocation_context=invocation_context,
                                     )
                                     for event in queued_events:
                                         yield event
@@ -18576,6 +19255,7 @@ class SessionEngine:
                         max_steps=max_steps,
                         request_metadata=request_metadata,
                         request_loop_policies=request_loop_policies,
+                        invocation_context=invocation_context,
                     ):
                         yield event
                         if policy_decision is not None:
@@ -18595,6 +19275,7 @@ class SessionEngine:
                                     turn_usage_tracker=turn_usage_tracker,
                                     active_run=active_run,
                                     execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
                                 ):
                                     yield event
                                 return
@@ -18623,6 +19304,7 @@ class SessionEngine:
                                 _,
                             ) = await self._publish_interaction_transition(
                                 session=session,
+                                invocation_context=invocation_context,
                                 agent_name=registered_agent.spec.name,
                                 environment_name=environment_name,
                                 to_status=SessionStatus.INTERRUPTED,
@@ -18638,6 +19320,7 @@ class SessionEngine:
                                 run_started_at=run_started_at,
                                 usage_tracker=turn_usage_tracker,
                                 active_run=active_run,
+                                invocation_context=invocation_context,
                             ):
                                 yield event
                             async for event in self._emit_terminal_event_with_hooks(
@@ -18662,6 +19345,7 @@ class SessionEngine:
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
                                 execution_profile=execution_profile,
+                                invocation_context=invocation_context,
                             ):
                                 yield event
                             return
@@ -18675,6 +19359,7 @@ class SessionEngine:
                         session_completed,
                     ) = await self._complete_session_if_no_queued_messages(
                         session=session,
+                        invocation_context=invocation_context,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
                     )
@@ -18696,6 +19381,7 @@ class SessionEngine:
                             turn_usage_tracker=turn_usage_tracker,
                             active_run=active_run,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                         )
                         for event in queued_events:
                             yield event
@@ -18730,6 +19416,7 @@ class SessionEngine:
                         turn_usage_tracker=turn_usage_tracker,
                         active_run=active_run,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     ):
                         yield event
                     return
@@ -18763,6 +19450,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                invocation_context=invocation_context,
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
@@ -18777,6 +19465,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield event
         except ToolApprovalRequired as exc:
@@ -18787,6 +19476,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
@@ -18803,6 +19493,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                invocation_context=invocation_context,
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
@@ -18830,6 +19521,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield event
         except UserInputRequired as exc:
@@ -18840,6 +19532,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
@@ -18856,6 +19549,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                invocation_context=invocation_context,
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
@@ -18880,6 +19574,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield event
         except SessionInterruptedByRequest:
@@ -18891,6 +19586,7 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     interruption_events.append(event)
             async for event in self._handle_session_interrupted(
@@ -18899,6 +19595,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
@@ -18908,7 +19605,7 @@ class SessionEngine:
                 yield event
             return
         except asyncio.CancelledError as cancellation:
-            if _is_interaction_transition_run_fence(cancellation):
+            if _consume_authenticated_interaction_transition_run_fence(cancellation):
                 # The owned transition attempt proved that this worker lost
                 # authority. Preserve caller cancellation without attempting
                 # abandoned-run writes under the stale epoch. The transition
@@ -18917,10 +19614,6 @@ class SessionEngine:
                 pop_exception_state(
                     cancellation,
                     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
-                )
-                pop_exception_state(
-                    cancellation,
-                    _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
                 )
                 raise
             transition_cancellation_outcome = _pop_interaction_transition_cancellation_outcome(
@@ -18953,6 +19646,7 @@ class SessionEngine:
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                         )
                     )
 
@@ -19006,6 +19700,7 @@ class SessionEngine:
                                 registered_agent=registered_agent,
                                 registered_environment=registered_environment,
                                 execution_profile=execution_profile,
+                                invocation_context=invocation_context,
                             ):
                                 interruption_events.append(event)
                         async for event in self._handle_session_interrupted(
@@ -19014,6 +19709,7 @@ class SessionEngine:
                             registered_environment=registered_environment,
                             environment_name=environment_name,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                             run_started_at=run_started_at,
                             turn_usage_tracker=turn_usage_tracker,
                             active_run=active_run,
@@ -19039,6 +19735,7 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     ):
                         interruption_events.append(event)
                 async for event in self._handle_session_interrupted(
@@ -19047,6 +19744,7 @@ class SessionEngine:
                     registered_environment=registered_environment,
                     environment_name=environment_name,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
@@ -19073,17 +19771,16 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     pass
 
-            cancellation_cleanup_steps = (
-                (
-                    "cancelled tool-round finalization",
-                    close_cancelled_tool_round,
-                ),
-                (
-                    "cancelled session finalization",
-                    lambda: self._recovery_coordinator.finalize_abandoned_session_run(
+            cancellation_terminal_event: Event | None = None
+
+            async def finalize_cancelled_session() -> None:
+                nonlocal cancellation_terminal_event
+                cancellation_terminal_event = (
+                    await self._recovery_coordinator.finalize_abandoned_session_run(
                         RecoveryAbandonedSessionRequest(
                             session=session,
                             registered_agent=registered_agent,
@@ -19095,8 +19792,19 @@ class SessionEngine:
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                         )
-                    ),
+                    )
+                )
+
+            cancellation_cleanup_steps = (
+                (
+                    "cancelled tool-round finalization",
+                    close_cancelled_tool_round,
+                ),
+                (
+                    "cancelled session finalization",
+                    finalize_cancelled_session,
                 ),
             )
             if interaction_transition_failures:
@@ -19109,6 +19817,8 @@ class SessionEngine:
                     authoritative_failure=cancellation,
                     steps=cancellation_cleanup_steps,
                 )
+            if cancellation_terminal_event is not None:
+                _mark_session_invocation_terminal_event(cancellation_terminal_event)
             raise
         except GeneratorExit as abandonment:
             if (
@@ -19139,6 +19849,7 @@ class SessionEngine:
                         turn_usage_tracker=turn_usage_tracker,
                         active_run=active_run,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     )
                 )
             except Exception as finalization_failure:
@@ -19172,11 +19883,25 @@ class SessionEngine:
                     is ProviderOperationInspectionStatus.AMBIGUOUS_SUBMISSION
                 )
             if ambiguous_provider_start:
-                interrupted_session = await self.session_store.transition_status(
-                    session.id,
-                    from_statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                (
+                    interrupted_session,
+                    interaction_interrupted_event,
+                    _,
+                ) = await self._publish_sibling_interaction_transition(
+                    session=session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
                     to_status=SessionStatus.INTERRUPTED,
+                    execution_profile=execution_profile,
+                    from_statuses={
+                        SessionStatus.RUNNING,
+                        SessionStatus.INTERRUPTING,
+                    },
                 )
+                if interaction_interrupted_event is not None:
+                    yield interaction_interrupted_event
                 async for event in self._emit_terminal_event_with_hooks(
                     event=Event(
                         type=EventType.SESSION_INTERRUPTED,
@@ -19194,11 +19919,9 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 ):
                     yield event
-                interaction_id = _current_session_interaction_id(session.id)
-                if interaction_id is not None:
-                    _mark_session_interaction_settled(session.id, interaction_id)
                 return
             if is_durable_subagent_submission_unsettled(
                 exc,
@@ -19285,6 +20008,7 @@ class SessionEngine:
                     _,
                 ) = await self._publish_sibling_interaction_transition(
                     session=session,
+                    invocation_context=invocation_context,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=environment_name,
@@ -19341,6 +20065,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                invocation_context=invocation_context,
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
@@ -19356,6 +20081,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield event
         except BaseExceptionGroup as failure:
@@ -19406,6 +20132,7 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     ):
                         prepared_events.append(event)
                 return prepared_events
@@ -19420,6 +20147,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 prepare_interruption=prepare_group_interruption,
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
@@ -19445,6 +20173,7 @@ class SessionEngine:
                             session_id=session.id,
                             original_error=finalizer_failure,
                             execution_profile=execution_profile,
+                            invocation_context=invocation_context,
                         ),
                     ),
                     (
@@ -19460,6 +20189,7 @@ class SessionEngine:
                                 self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                     session_id=session.id,
                                     execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
                                 )
                             ),
                         )
@@ -19491,6 +20221,7 @@ class SessionEngine:
                         session_id=session.id,
                         original_error=finalizer_failure,
                         execution_profile=execution_profile,
+                        invocation_context=invocation_context,
                     )
                 finally:
                     self._session_control.discard_interrupt_signal(session.id)
@@ -19499,6 +20230,7 @@ class SessionEngine:
                             await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                 session_id=session.id,
                                 execution_profile=execution_profile,
+                                invocation_context=invocation_context,
                             )
                     finally:
                         try:
@@ -19520,16 +20252,30 @@ class SessionEngine:
         status: SessionStatus,
         run_started_at: float,
         usage_tracker: SessionUsageTracker,
+        invocation_context: InvocationContext | None = None,
     ) -> tuple[Event, ...]:
+        registered_environment = None
+        execution_profile = None
+        if invocation_context is not None:
+            if (
+                invocation_context.binding.session_id != session.id
+                or invocation_context.registered_agent is not registered_agent
+                or invocation_context.binding.environment_name != environment_name
+            ):
+                raise RuntimeError("Turn completion substituted frozen invocation authority.")
+            registered_environment = invocation_context.registered_environment
+            execution_profile = invocation_context.profile
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is not None and status != SessionStatus.COMPLETED:
             _, interaction_event, _ = await self._publish_sibling_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
-                registered_environment=None,
+                registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=status,
                 from_statuses={status},
+                execution_profile=execution_profile,
                 finalize_unsettled_cancellation=False,
             )
         else:
@@ -19573,6 +20319,7 @@ class SessionEngine:
         run_started_at: float,
         usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        invocation_context: InvocationContext | None = None,
     ) -> tuple[Event, ...]:
         if active_run is None:
             return await self._emit_turn_completed(
@@ -19582,6 +20329,7 @@ class SessionEngine:
                 status=status,
                 run_started_at=run_started_at,
                 usage_tracker=usage_tracker,
+                invocation_context=invocation_context,
             )
         async with active_run.turn_completed_lock:
             if active_run.turn_completed_event is not None:
@@ -19593,6 +20341,7 @@ class SessionEngine:
                 status=status,
                 run_started_at=run_started_at,
                 usage_tracker=usage_tracker,
+                invocation_context=invocation_context,
             )
             active_run.turn_completed_event = events[-1]
             return events
@@ -19602,6 +20351,7 @@ class SessionEngine:
         *,
         session: Session,
         status: SessionStatus,
+        invocation_context: InvocationContext | None = None,
     ) -> Event | None:
         for active_run in self._session_control.active_runs(session.id):
             if (
@@ -19618,6 +20368,7 @@ class SessionEngine:
                 run_started_at=active_run.turn_started_at,
                 usage_tracker=active_run.turn_usage_tracker,
                 active_run=active_run,
+                invocation_context=invocation_context,
             )
             return events[-1]
         return None
@@ -19830,6 +20581,7 @@ class SessionEngine:
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         )
         try:
             async for event in events:
@@ -19852,6 +20604,7 @@ class SessionEngine:
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         )
         try:
             async for event in events:
@@ -19874,6 +20627,7 @@ class SessionEngine:
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         )
         try:
             async for event in events:
@@ -19899,6 +20653,7 @@ class SessionEngine:
             turn_usage_tracker=request.turn_usage_tracker,
             active_run=request.active_run,
             execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
         ):
             yield event
 
@@ -19918,6 +20673,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         for event in evaluation.events:
             yield event
@@ -19941,6 +20697,7 @@ class SessionEngine:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -19960,6 +20717,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         for event in evaluation.events:
             yield event
@@ -19979,6 +20737,7 @@ class SessionEngine:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         ):
             yield event
 
@@ -20004,10 +20763,17 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None = None,
         reconcile_transition_cancellation: bool,
     ) -> AsyncGenerator[Event, None]:
         if type(reconcile_transition_cancellation) is not bool:
             raise TypeError("reconcile_transition_cancellation must be a bool.")
+        if invocation_context is not None and (
+            registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or execution_profile is not invocation_context.profile
+        ):
+            raise RuntimeError("Limit terminalization substituted frozen invocation authority.")
         if tool_round_identity is None and pending_approval_to_clear is not None:
             tool_round_identity = ToolRoundIdentity(
                 tool_round_id=pending_approval_to_clear.tool_round_id,
@@ -20053,6 +20819,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_sibling_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 environment_name=environment_name,
@@ -20066,6 +20833,7 @@ class SessionEngine:
                 _,
             ) = await self._publish_interaction_transition(
                 session=session,
+                invocation_context=invocation_context,
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
@@ -20088,6 +20856,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                invocation_context=invocation_context,
             ):
                 yield event
         async for event in self._emit_terminal_event_with_hooks(
@@ -20103,6 +20872,7 @@ class SessionEngine:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         ):
             yield event
 
@@ -20120,6 +20890,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         usage_summary = session_usage_summary(
             session.id,
@@ -20149,6 +20920,7 @@ class SessionEngine:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -20166,6 +20938,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         payload = budget_reservation_payload(result)
         yield await self._event_writer.emit(
@@ -20203,6 +20976,7 @@ class SessionEngine:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -20223,6 +20997,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         payload = budget_limit_reached_payload(check)
         yield await self._event_writer.emit(
@@ -20261,6 +21036,7 @@ class SessionEngine:
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
             reconcile_transition_cancellation=False,
         ):
             yield event
@@ -20970,6 +21746,7 @@ class SessionEngine:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         prepare_interruption: Callable[[], Awaitable[Iterable[Event] | None]] | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
@@ -21021,6 +21798,7 @@ class SessionEngine:
                 registered_environment=registered_environment,
                 environment_name=environment_name,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
@@ -21054,6 +21832,13 @@ class SessionEngine:
                 concurrent_controls.append(control)
 
         captured = cleanup_task.result()
+        for event in events:
+            if event.type in {
+                EventType.SESSION_COMPLETED,
+                EventType.SESSION_FAILED,
+                EventType.SESSION_INTERRUPTED,
+            }:
+                _mark_session_invocation_terminal_event(event)
         classified_cleanup_failures: list[BaseException] = []
         for cleanup_failure in (*owned_cleanup_failures, captured.error):
             cleanup_error = _session_interruption_cleanup_child_error(
@@ -21190,6 +21975,7 @@ class SessionEngine:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         environment_name: str | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -21212,6 +21998,7 @@ class SessionEngine:
                     _,
                 ) = await self._publish_sibling_interaction_transition(
                     session=loaded_interrupted,
+                    invocation_context=invocation_context,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=environment_name,
@@ -21236,6 +22023,7 @@ class SessionEngine:
             ):
                 _, interaction_event, _ = await self._publish_sibling_interaction_transition(
                     session=loaded_interrupted,
+                    invocation_context=invocation_context,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     environment_name=environment_name,
@@ -21279,6 +22067,7 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     usage_tracker=turn_usage_tracker,
                     active_run=active_run,
+                    invocation_context=invocation_context,
                 ):
                     yield event
             terminal_event_stream = self._emit_terminal_event_with_hooks(
@@ -21297,6 +22086,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             )
             terminal_prefix, interrupted_event = await _collect_through_event_type(
                 terminal_event_stream,
@@ -21325,6 +22115,7 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Close a round when interruption precedes creation of its live runner."""
         checkpoint = await self.session_store.load_checkpoint(session.id)
@@ -21343,6 +22134,7 @@ class SessionEngine:
             cancellation_artifacts=None,
             cancellation_artifacts_by_id=None,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         )
         async for event in self._recovery_coordinator.close_interrupted_tool_round(request):
             yield event
@@ -21443,7 +22235,21 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if invocation_context is not None:
+            if (
+                invocation_context.binding.session_id != session.id
+                or registered_agent is not invocation_context.registered_agent
+                or registered_environment is not invocation_context.registered_environment
+            ):
+                raise RuntimeError("Terminal publication substituted frozen invocation authority.")
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise RuntimeError("Terminal publication substituted its execution profile.")
+            execution_profile = invocation_context.profile
         event = await self._bind_event_to_session_run_operation(
             event,
             session=session,
@@ -21453,12 +22259,18 @@ class SessionEngine:
             session=session,
             registered_environment=registered_environment,
             execution_profile=execution_profile,
+            invocation_context=invocation_context,
         )
 
         async def emit_finalized_terminal_boundary() -> AsyncGenerator[Event, None]:
             for binding_event in finalize_result.events:
                 yield binding_event
-            prepared_terminal_event = self._event_writer.prepare(finalize_result.event)
+            prepared_terminal_event = self._event_writer.prepare(
+                event_with_runtime_envelope_authority(
+                    finalize_result.event,
+                    "session_id",
+                )
+            )
             try:
                 terminal_event = await self._event_writer.emit(prepared_terminal_event)
             except Exception as publication_failure:
@@ -21491,6 +22303,7 @@ class SessionEngine:
                 )
             if event_id_is_runtime_generated(prepared_terminal_event):
                 terminal_event = event_with_runtime_generated_id(terminal_event)
+            _mark_session_invocation_terminal_event(terminal_event)
             run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
             if run_operation_id is not None:
                 try:
@@ -21517,9 +22330,14 @@ class SessionEngine:
                 terminal_event=terminal_event,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                hooks=self._runtime_hooks,
+                hooks=(
+                    self._runtime_hooks
+                    if invocation_context is None
+                    else invocation_context.runtime_hooks
+                ),
                 scope="app",
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield hook_event
             async for hook_event in self._run_runtime_hooks(
@@ -21531,6 +22349,7 @@ class SessionEngine:
                 hooks=registered_agent.runtime_hooks,
                 scope="agent",
                 execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield hook_event
 
@@ -21581,7 +22400,15 @@ class SessionEngine:
         hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         scope: str,
         execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or invocation_context.registered_agent is not registered_agent
+            or invocation_context.registered_environment is not registered_environment
+            or invocation_context.profile is not execution_profile
+        ):
+            raise RuntimeError("Runtime hook execution substituted frozen invocation authority.")
         for registered_hook in hooks:
             hook = registered_hook.hook
             if not _runtime_hook_supports_phase(
@@ -21665,15 +22492,38 @@ class SessionEngine:
         max_steps: int,
         request_metadata: dict[str, Any],
         request_loop_policies: tuple[LoopPolicy, ...],
+        invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[tuple[Event, BeforeStopDecision | None], None]:
+        if invocation_context is not None and (
+            invocation_context.binding.session_id != session.id
+            or registered_agent is not invocation_context.registered_agent
+            or registered_environment is not invocation_context.registered_environment
+            or len(invocation_context.request_loop_policies) != len(request_loop_policies)
+            or any(
+                frozen is not supplied
+                for frozen, supplied in zip(
+                    invocation_context.request_loop_policies,
+                    request_loop_policies,
+                    strict=True,
+                )
+            )
+        ):
+            raise RuntimeError("Loop policy substituted frozen invocation authority.")
         classification = classify_assistant_step(step_result)
         policy_groups = (
-            ("app", self._loop_policies),
+            (
+                "app",
+                self._loop_policies
+                if invocation_context is None
+                else invocation_context.loop_policies,
+            ),
             ("agent", registered_agent.loop_policies),
             (
                 "request",
                 validate_loop_policies(
-                    request_loop_policies,
+                    request_loop_policies
+                    if invocation_context is None
+                    else invocation_context.request_loop_policies,
                     field_name="request_loop_policies",
                 ),
             ),

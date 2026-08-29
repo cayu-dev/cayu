@@ -1088,6 +1088,8 @@ class _RecordingHook(RuntimeHook):
 
 
 class _DiscoveryConflictOnceStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
     def __init__(self) -> None:
         super().__init__()
         self.discovery_conflicts = 0
@@ -1103,6 +1105,7 @@ class _DiscoveryConflictOnceStore(InMemorySessionStore):
 
 
 class _NoAtomicOperationInitializationStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
     supports_atomic_session_operation_initialization = False
 
 

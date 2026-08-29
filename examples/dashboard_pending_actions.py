@@ -321,6 +321,8 @@ class ExternalSideEffectTool(Tool):
 class ManualRecoveryDemoSessionStore(SQLiteSessionStore):
     """Drop one terminal event to leave a real pending tool-round recovery case."""
 
+    invocation_lifecycle_command_version = 1
+
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self._dropped_terminal_once = False
