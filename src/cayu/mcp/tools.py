@@ -30,6 +30,7 @@ from cayu.mcp.base import (
     _attach_mcp_session_cleanup_failure,
     _close_mcp_session_after_primary_failure,
     _credential_safe_mcp_cancellation,
+    _mcp_server_advertises_tools_list_changed,
     _mcp_tool_private_contract_hash,
     _McpCallerCancellationBoundary,
     _McpToolDiscovery,
@@ -49,12 +50,14 @@ _MAX_MCP_DISCOVERY_ERROR_BYTES = 4096
 _MCP_SESSION_SOURCE_ATTRIBUTE = "_cayu_internal_mcp_tool_source_v1"
 _MCP_SESSION_SOURCE_BIND_LOCK = Lock()
 _MISSING_MCP_SESSION_SOURCE = object()
+_MCP_LIST_CHANGED_COALESCE_DELAY_S = 0.05
 
 
 class McpToolsetRefreshState(StrEnum):
     """Live dispatch state for one refreshable MCP source."""
 
     READY = "ready"
+    DIRTY = "dirty"
     REFRESHING = "refreshing"
     QUARANTINED = "quarantined"
     CLOSED = "closed"
@@ -168,19 +171,176 @@ class _McpToolSource:
         self.state = McpToolsetRefreshState.READY
         self.refresh_owner: object | None = None
         self.static_owners: set[object] = set()
+        self._dirty_epoch = 0
+        self._admitted_dirty_epoch = 0
+        self._failed_dirty_epoch = 0
+        self._refresh_idle = asyncio.Event()
+        self._refresh_idle.set()
+        self._notification_refresh: Callable[[], Awaitable[None]] | None = None
+        self._notification_refresh_task: asyncio.Task[None] | None = None
+        self._notification_handler_installed = False
+        self._notification_continuity_handler_installed = False
+        self._notification_refresh_ready = True
+        self._notification_activation_dirty_epoch: int | None = None
 
-    def claim_refresh_owner(self, owner: object) -> None:
+    def claim_refresh_owner(
+        self,
+        owner: object,
+        *,
+        notification_refresh: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         if self.static_owners:
             raise ValueError(
                 "An MCP toolset with static registrations cannot acquire refresh ownership."
             )
         if self.refresh_owner is not None and self.refresh_owner is not owner:
             raise ValueError("An MCP toolset can be refresh-owned by only one CayuApp.")
+        if self.refresh_owner is owner:
+            return
         self.refresh_owner = owner
+        if notification_refresh is None or not _mcp_server_advertises_tools_list_changed(
+            self.session.initialize_result
+        ):
+            return
+        self._notification_refresh = notification_refresh
+        try:
+            continuity_installed = self.session._set_tools_list_changed_continuity_handler(
+                self._observe_tools_list_changed_continuity
+            )
+            self._notification_continuity_handler_installed = continuity_installed
+            self._notification_refresh_ready = True
+            installed = self.session._set_tools_list_changed_handler(
+                self._observe_tools_list_changed
+            )
+        except BaseException:
+            self._clear_notification_refresh_owner()
+            self.refresh_owner = None
+            raise
+        if installed:
+            self._notification_handler_installed = True
+            return
+        self._clear_notification_refresh_owner()
 
     def release_refresh_owner(self, owner: object) -> None:
         if self.refresh_owner is owner:
+            self._clear_notification_refresh_owner()
             self.refresh_owner = None
+
+    def _clear_notification_refresh_owner(self) -> None:
+        if self._notification_handler_installed:
+            self.session._set_tools_list_changed_handler(None)
+            self._notification_handler_installed = False
+        if self._notification_continuity_handler_installed:
+            self.session._set_tools_list_changed_continuity_handler(None)
+            self._notification_continuity_handler_installed = False
+        activation_dirty_epoch = self._notification_activation_dirty_epoch
+        self._notification_activation_dirty_epoch = None
+        if (
+            activation_dirty_epoch is not None
+            and self.state is McpToolsetRefreshState.DIRTY
+            and self._dirty_epoch == activation_dirty_epoch
+        ):
+            self._dirty_epoch -= 1
+            self.state = McpToolsetRefreshState.READY
+        self._notification_refresh_ready = True
+        self._notification_refresh = None
+        task = self._notification_refresh_task
+        self._notification_refresh_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _observe_tools_list_changed(self) -> None:
+        """Fence the source synchronously, then coalesce refresh ownership."""
+
+        if (
+            self.refresh_owner is None
+            or self._notification_refresh is None
+            or self.state is McpToolsetRefreshState.CLOSED
+        ):
+            return
+        self._dirty_epoch += 1
+        if self.state is not McpToolsetRefreshState.REFRESHING:
+            self.state = McpToolsetRefreshState.DIRTY
+        if not self._notification_refresh_ready:
+            return
+        self._ensure_notification_refresh_task()
+
+    def _observe_tools_list_changed_continuity(self, ready: bool) -> None:
+        """Fence listener gaps and reconcile once continuity is re-established."""
+
+        if type(ready) is not bool:
+            raise TypeError("ready must be a bool.")
+        if (
+            self.refresh_owner is None
+            or self._notification_refresh is None
+            or self.state is McpToolsetRefreshState.CLOSED
+        ):
+            return
+        if not ready:
+            if self._notification_refresh_ready:
+                self._dirty_epoch += 1
+                if (
+                    not self._notification_handler_installed
+                    and self.state is McpToolsetRefreshState.READY
+                ):
+                    self._notification_activation_dirty_epoch = self._dirty_epoch
+            self._notification_refresh_ready = False
+            if self.state is not McpToolsetRefreshState.REFRESHING:
+                self.state = McpToolsetRefreshState.DIRTY
+            return
+        if self._notification_refresh_ready:
+            return
+        self._notification_activation_dirty_epoch = None
+        self._dirty_epoch += 1
+        self._notification_refresh_ready = True
+        if self.state is not McpToolsetRefreshState.REFRESHING:
+            self.state = McpToolsetRefreshState.DIRTY
+        self._ensure_notification_refresh_task()
+
+    def _ensure_notification_refresh_task(self) -> None:
+        task = self._notification_refresh_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._run_notification_refresh())
+            self._notification_refresh_task = task
+            task.add_done_callback(self._notification_refresh_completed)
+
+    def _notification_refresh_completed(self, task: asyncio.Task[None]) -> None:
+        if self._notification_refresh_task is task:
+            self._notification_refresh_task = None
+        with suppress(BaseException):
+            task.result()
+
+    def _automatic_refresh_is_needed(self) -> bool:
+        return (
+            self.refresh_owner is not None
+            and self._notification_refresh is not None
+            and self._notification_refresh_ready
+            and self.state is not McpToolsetRefreshState.CLOSED
+            and self._dirty_epoch > self._admitted_dirty_epoch
+            and self._dirty_epoch > self._failed_dirty_epoch
+        )
+
+    async def _run_notification_refresh(self) -> None:
+        try:
+            await asyncio.sleep(_MCP_LIST_CHANGED_COALESCE_DELAY_S)
+            while self._automatic_refresh_is_needed():
+                await self._refresh_idle.wait()
+                if not self._automatic_refresh_is_needed():
+                    return
+                refresh = self._notification_refresh
+                if refresh is None:
+                    return
+                attempted_epoch = self._dirty_epoch
+                try:
+                    await refresh()
+                except asyncio.CancelledError:
+                    return
+                except BaseException:
+                    if self._dirty_epoch > attempted_epoch:
+                        continue
+                    return
+        finally:
+            refresh = None
 
     def claim_static_owner(self, owner: object) -> bool:
         if self.refresh_owner is not None:
@@ -202,47 +362,128 @@ class _McpToolSource:
     def dispatch_authority_is_current(self, generation: int) -> bool:
         """Return whether one immutable snapshot can still enter governed work."""
 
-        return self.state is McpToolsetRefreshState.READY and self.generation == generation
+        return (
+            self.state is McpToolsetRefreshState.READY
+            and self._notification_refresh_ready
+            and self.generation == generation
+        )
 
-    async def begin_refresh(self, *, owner: object, expected_generation: int) -> None:
+    def registration_authority_is_current(self, generation: int) -> bool:
+        """Allow configuration to finish while first-listener activation is fenced."""
+
+        return self.generation == generation and (
+            self.state is McpToolsetRefreshState.READY
+            or (
+                self.state is McpToolsetRefreshState.DIRTY
+                and self._notification_activation_dirty_epoch is not None
+                and not self._notification_refresh_ready
+            )
+        )
+
+    async def begin_refresh(self, *, owner: object, expected_generation: int) -> int:
         async with self.lock:
             self.require_refresh_owner(owner)
             if self.state is McpToolsetRefreshState.CLOSED:
                 raise McpToolsetUnavailable("MCP toolset is closed.")
+            listener_failure = self.session._tools_list_changed_listener_failure_message()
+            if listener_failure is not None:
+                if type(listener_failure) is not str:
+                    raise RuntimeError("MCP notification listener failure evidence is invalid.")
+                safe_listener_failure = self.session.secret_redactor.redact_text_bounded(
+                    listener_failure,
+                    max_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                )
+                listener_failure = ""
+                raise McpProtocolError(safe_listener_failure)
+            if self._notification_handler_installed and not self._notification_refresh_ready:
+                raise McpToolsetUnavailable(
+                    "MCP toolset notification continuity is not established."
+                )
             if self.generation != expected_generation:
                 raise McpToolsetUnavailable("MCP toolset refresh authority is stale.")
             if self.state is McpToolsetRefreshState.REFRESHING:
                 raise McpToolsetUnavailable("MCP toolset refresh is already in progress.")
+            dirty_epoch = self._dirty_epoch
             self.state = McpToolsetRefreshState.REFRESHING
+            self._refresh_idle.clear()
+            return dirty_epoch
 
-    def quarantine_refresh(self, *, owner: object, expected_generation: int) -> None:
+    def quarantine_refresh(
+        self,
+        *,
+        owner: object,
+        expected_generation: int,
+        expected_dirty_epoch: int,
+    ) -> None:
         self.require_refresh_owner(owner)
         if (
             self.state is McpToolsetRefreshState.REFRESHING
             and self.generation == expected_generation
         ):
-            self.state = McpToolsetRefreshState.QUARANTINED
+            if self._dirty_epoch != expected_dirty_epoch:
+                self.state = McpToolsetRefreshState.DIRTY
+            else:
+                self.state = McpToolsetRefreshState.QUARANTINED
+                self._failed_dirty_epoch = max(
+                    self._failed_dirty_epoch,
+                    expected_dirty_epoch,
+                )
+            self._refresh_idle.set()
+
+    def require_refresh_current(
+        self,
+        *,
+        owner: object,
+        expected_generation: int,
+        expected_dirty_epoch: int,
+    ) -> None:
+        self.require_refresh_owner(owner)
+        if (
+            self.state is not McpToolsetRefreshState.REFRESHING
+            or self.generation != expected_generation
+        ):
+            raise McpToolsetUnavailable("MCP toolset refresh authority changed.")
+        if self._dirty_epoch != expected_dirty_epoch:
+            self.state = McpToolsetRefreshState.DIRTY
+            self._refresh_idle.set()
+            raise McpToolsetUnavailable("MCP toolset refresh was superseded by a newer signal.")
 
     async def finish_unchanged(
         self,
         *,
         owner: object,
         expected_generation: int,
+        expected_dirty_epoch: int,
         publish: Callable[[], Awaitable[None]],
     ) -> None:
         async with self.lock:
-            self.require_refresh_owner(owner)
-            if (
-                self.state is not McpToolsetRefreshState.REFRESHING
-                or self.generation != expected_generation
-            ):
-                raise McpToolsetUnavailable("MCP toolset refresh authority changed.")
+            self.require_refresh_current(
+                owner=owner,
+                expected_generation=expected_generation,
+                expected_dirty_epoch=expected_dirty_epoch,
+            )
             try:
                 await publish()
             except BaseException:
-                self.state = McpToolsetRefreshState.QUARANTINED
+                if self.state is McpToolsetRefreshState.REFRESHING:
+                    self.state = McpToolsetRefreshState.QUARANTINED
+                    self._failed_dirty_epoch = max(
+                        self._failed_dirty_epoch,
+                        expected_dirty_epoch,
+                    )
+                    self._refresh_idle.set()
                 raise
+            self.require_refresh_current(
+                owner=owner,
+                expected_generation=expected_generation,
+                expected_dirty_epoch=expected_dirty_epoch,
+            )
+            self._admitted_dirty_epoch = max(
+                self._admitted_dirty_epoch,
+                expected_dirty_epoch,
+            )
             self.state = McpToolsetRefreshState.READY
+            self._refresh_idle.set()
 
     async def publish_refresh(
         self,
@@ -250,23 +491,40 @@ class _McpToolSource:
         owner: object,
         expected_generation: int,
         generation: int,
+        expected_dirty_epoch: int,
         publish: Callable[[], Awaitable[None]],
     ) -> None:
         async with self.lock:
-            self.require_refresh_owner(owner)
-            if (
-                self.state is not McpToolsetRefreshState.REFRESHING
-                or self.generation != expected_generation
-                or generation != expected_generation + 1
-            ):
+            self.require_refresh_current(
+                owner=owner,
+                expected_generation=expected_generation,
+                expected_dirty_epoch=expected_dirty_epoch,
+            )
+            if generation != expected_generation + 1:
                 raise McpToolsetUnavailable("MCP toolset refresh authority changed.")
             try:
                 await publish()
             except BaseException:
-                self.state = McpToolsetRefreshState.QUARANTINED
+                if self.state is McpToolsetRefreshState.REFRESHING:
+                    self.state = McpToolsetRefreshState.QUARANTINED
+                    self._failed_dirty_epoch = max(
+                        self._failed_dirty_epoch,
+                        expected_dirty_epoch,
+                    )
+                    self._refresh_idle.set()
                 raise
+            self.require_refresh_current(
+                owner=owner,
+                expected_generation=expected_generation,
+                expected_dirty_epoch=expected_dirty_epoch,
+            )
             self.generation = generation
+            self._admitted_dirty_epoch = max(
+                self._admitted_dirty_epoch,
+                expected_dirty_epoch,
+            )
             self.state = McpToolsetRefreshState.READY
+            self._refresh_idle.set()
 
     async def call_tool(
         self,
@@ -283,7 +541,10 @@ class _McpToolSource:
         dispatch_signal: _McpToolDispatchSignal | None = None
         try:
             async with self.lock:
-                if self.state is not McpToolsetRefreshState.READY:
+                if (
+                    self.state is not McpToolsetRefreshState.READY
+                    or not self._notification_refresh_ready
+                ):
                     raise McpToolsetUnavailable("MCP toolset is not ready for dispatch.")
                 if self.generation != generation:
                     raise McpToolsetUnavailable("MCP toolset snapshot is stale.")
@@ -359,8 +620,30 @@ class _McpToolSource:
             call_arguments = {}
 
     async def close(self) -> None:
+        if self._notification_handler_installed:
+            self.session._set_tools_list_changed_handler(None)
+            self._notification_handler_installed = False
+        if self._notification_continuity_handler_installed:
+            self.session._set_tools_list_changed_continuity_handler(None)
+        self._notification_continuity_handler_installed = False
+        self._notification_activation_dirty_epoch = None
+        self._notification_refresh_ready = True
+        self._notification_refresh = None
+        notification_task = self._notification_refresh_task
+        self._notification_refresh_task = None
+        if (
+            notification_task is not None
+            and notification_task is not asyncio.current_task()
+            and not notification_task.done()
+        ):
+            notification_task.cancel()
         async with self.lock:
             self.state = McpToolsetRefreshState.CLOSED
+            self._refresh_idle.set()
+        if notification_task is not None and notification_task is not asyncio.current_task():
+            with suppress(BaseException):
+                await notification_task
+        notification_task = None
         await self.session.close()
 
 

@@ -26,6 +26,8 @@ from cayu.mcp._exception_handoffs import (
 )
 from cayu.vaults import SecretRedactor, SecretRef, copy_secret_ref
 
+_MCP_TOOLS_LIST_CHANGED_NOTIFICATION = "notifications/tools/list_changed"
+
 
 class McpServerSpec(BaseModel):
     """Configuration for an external MCP server."""
@@ -213,7 +215,7 @@ class _McpToolDiscovery:
         definitions: tuple[McpToolDefinition, ...],
         *,
         private_contract_hashes: tuple[str, ...] | None = None,
-        commit: Callable[[], Awaitable[None]] | None = None,
+        commit: Callable[[Callable[[], None]], Awaitable[None]] | None = None,
         discard: Callable[[], None] | None = None,
     ) -> None:
         if type(definitions) is not tuple or any(
@@ -248,15 +250,26 @@ class _McpToolDiscovery:
         self._discard_callback = discard
         self._settled = False
 
-    async def commit(self) -> None:
-        """Publish staged transport authority exactly once."""
+    async def commit(self, *, validate: Callable[[], None] | None = None) -> None:
+        """Publish staged transport authority exactly once.
+
+        Built-in transports invoke ``validate`` while holding their private
+        authority lock, immediately before publication. The callback therefore
+        closes the last race between an external freshness signal and the
+        transport/app catalogue commit.
+        """
 
         if self._settled:
             raise RuntimeError("MCP tool discovery authority is already settled.")
+        if validate is not None and not callable(validate):
+            raise TypeError("validate must be callable.")
+        validator = validate if validate is not None else _accept_mcp_discovery_commit
         callback = self._commit_callback
         try:
             if callback is not None:
-                await callback()
+                await callback(validator)
+            else:
+                validator()
         except BaseException:
             self.discard()
             raise
@@ -275,6 +288,10 @@ class _McpToolDiscovery:
         self._discard_callback = None
         if callback is not None:
             callback()
+
+
+def _accept_mcp_discovery_commit() -> None:
+    """Accept an unconditional staged-discovery commit."""
 
 
 class McpToolResult(BaseModel):
@@ -411,6 +428,62 @@ class McpSession(ABC):
         default so a discovery failure is not returned until their close completes.
         """
         return False
+
+    def _set_tools_list_changed_handler(
+        self,
+        handler: Callable[[], None] | None,
+    ) -> bool:
+        """Install one internal, payload-free tool-list freshness signal.
+
+        Third-party sessions keep the safe default: no automatic notification
+        ownership and no new abstract-method requirement. Built-in transports
+        override this only when they can join their listener lifecycle during
+        ``close()``.
+        """
+
+        del handler
+        return False
+
+    def _set_tools_list_changed_continuity_handler(
+        self,
+        handler: Callable[[bool], None] | None,
+    ) -> bool:
+        """Install internal continuous-listener readiness observation.
+
+        Transports without a separately reconnecting server-message stream keep
+        the safe default. A transport returning ``True`` must report ``False``
+        before a possible notification gap and ``True`` only after the gap has
+        been reconciled or the transport has selected an explicit manual-only
+        fallback.
+        """
+
+        del handler
+        return False
+
+    def _tools_list_changed_listener_failure_message(self) -> str | None:
+        """Return one detached failure from internal notification ownership."""
+
+        return None
+
+
+def _mcp_server_advertises_tools_list_changed(
+    initialize_result: McpInitializeResult,
+) -> bool:
+    """Return exact legacy ``tools.listChanged`` capability authority."""
+
+    capabilities = initialize_result.capabilities
+    tools = capabilities.get("tools")
+    return type(tools) is dict and tools.get("listChanged") is True
+
+
+def _is_mcp_tools_list_changed_notification(message: dict[str, Any]) -> bool:
+    """Recognize the exact payload-free legacy freshness signal envelope."""
+
+    return (
+        message.get("method") == _MCP_TOOLS_LIST_CHANGED_NOTIFICATION
+        and "id" not in message
+        and ("params" not in message or type(message.get("params")) is dict)
+    )
 
 
 class McpClient(ABC):

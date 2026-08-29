@@ -82,7 +82,6 @@ from cayu.mcp.tools import (
     McpToolset,
     McpToolsetRefreshBlocked,
     McpToolsetRefreshResult,
-    McpToolsetRefreshState,
     McpToolsetUnavailable,
     mcp_toolset_manifest_diff,
 )
@@ -2135,7 +2134,7 @@ class CayuApp:
             seen_mcp_sources.add(source_key)
             current = self._refreshable_mcp_toolsets.get(source_key)
             resolved = toolset if current is None else current
-            if resolved.refresh_state is not McpToolsetRefreshState.READY:
+            if not resolved._refresh_source.registration_authority_is_current(resolved.generation):
                 raise ValueError("A refreshable MCP source must be ready during registration.")
             if not resolved.manifest_identity_is_explicit:
                 raise ValueError(
@@ -2322,7 +2321,14 @@ class CayuApp:
                 source_key = _mcp_refresh_source_key(toolset)
                 if source_key in self._refreshable_mcp_toolsets:
                     continue
-                toolset._refresh_source.claim_refresh_owner(self._mcp_refresh_owner)
+                toolset._refresh_source.claim_refresh_owner(
+                    self._mcp_refresh_owner,
+                    notification_refresh=(
+                        lambda source_key=source_key: self._refresh_mcp_toolset_after_notification(
+                            source_key
+                        )
+                    ),
+                )
                 newly_claimed_refreshable.append(toolset)
             if self._knowledge_publications_sealed:
                 for registered_tool in tools_by_name.values():
@@ -2344,6 +2350,12 @@ class CayuApp:
             self._refreshable_mcp_toolsets[_mcp_refresh_source_key(toolset)] = toolset
         return spec
 
+    async def _refresh_mcp_toolset_after_notification(self, source_key: int) -> None:
+        current = self._refreshable_mcp_toolsets.get(source_key)
+        if current is None:
+            return
+        await self.refresh_mcp_toolset(current)
+
     async def refresh_mcp_toolset(
         self,
         toolset: McpToolset,
@@ -2359,9 +2371,10 @@ class CayuApp:
         source = current._refresh_source
         previous_generation = current.generation
         refresh_started = False
+        refresh_dirty_epoch = 0
         discovery = None
         try:
-            await source.begin_refresh(
+            refresh_dirty_epoch = await source.begin_refresh(
                 owner=self._mcp_refresh_owner,
                 expected_generation=previous_generation,
             )
@@ -2379,13 +2392,25 @@ class CayuApp:
                     source.quarantine_refresh(
                         owner=self._mcp_refresh_owner,
                         expected_generation=previous_generation,
+                        expected_dirty_epoch=refresh_dirty_epoch,
                     )
                     raise McpToolsetRefreshBlocked(decision.reason)
             if not diff.changed:
+
+                def require_unchanged_refresh_current() -> None:
+                    source.require_refresh_current(
+                        owner=self._mcp_refresh_owner,
+                        expected_generation=previous_generation,
+                        expected_dirty_epoch=refresh_dirty_epoch,
+                    )
+
                 await source.finish_unchanged(
                     owner=self._mcp_refresh_owner,
                     expected_generation=previous_generation,
-                    publish=discovery.commit,
+                    expected_dirty_epoch=refresh_dirty_epoch,
+                    publish=lambda: staged_discovery.commit(
+                        validate=require_unchanged_refresh_current
+                    ),
                 )
                 discovery = None
                 return McpToolsetRefreshResult(
@@ -2426,7 +2451,13 @@ class CayuApp:
                     next_agents = {**self._agents, **replacements}
                     next_toolsets = dict(self._refreshable_mcp_toolsets)
                     next_toolsets[source_key] = candidate
-                    await staged_discovery.commit()
+                    await staged_discovery.commit(
+                        validate=lambda: source.require_refresh_current(
+                            owner=self._mcp_refresh_owner,
+                            expected_generation=previous_generation,
+                            expected_dirty_epoch=refresh_dirty_epoch,
+                        )
+                    )
                     self._agents = next_agents
                     self._refreshable_mcp_toolsets = next_toolsets
 
@@ -2434,6 +2465,7 @@ class CayuApp:
                 owner=self._mcp_refresh_owner,
                 expected_generation=previous_generation,
                 generation=candidate.generation,
+                expected_dirty_epoch=refresh_dirty_epoch,
                 publish=publish,
             )
             discovery = None
@@ -2454,6 +2486,7 @@ class CayuApp:
                 source.quarantine_refresh(
                     owner=self._mcp_refresh_owner,
                     expected_generation=previous_generation,
+                    expected_dirty_epoch=refresh_dirty_epoch,
                 )
             raise
 

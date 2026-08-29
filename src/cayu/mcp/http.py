@@ -562,13 +562,14 @@ class HttpMcpSession(McpSession):
         private_hashes = tuple(private_contract_hashes)
         private_contract_hashes.clear()
 
-        async def commit_transport_names() -> None:
+        async def commit_transport_names(validate: Callable[[], None]) -> None:
             async with self._authority_mapping_lock:
                 if self._closed:
                     transport_names.clear()
                     raise McpProtocolError(
                         "MCP HTTP session closed before tool discovery was published."
                     )
+                validate()
                 self._tool_transport_names = {
                     public: raw for public, raw in transport_names.items() if public != raw
                 }

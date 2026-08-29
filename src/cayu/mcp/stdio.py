@@ -87,6 +87,7 @@ from cayu.mcp.base import (
     _await_mcp_session_cleanup_task,
     _close_mcp_session_after_primary_failure,
     _credential_safe_mcp_cancellation,
+    _is_mcp_tools_list_changed_notification,
     _mcp_session_close_task,
     _McpCallerCancellationBoundary,
     _McpToolDiscovery,
@@ -549,12 +550,99 @@ class StdioMcpSession(McpSession):
         self._tool_transport_names: dict[str, str] = {}
         self._resource_transport_uris: dict[str, str] = {}
         self._authority_mapping_lock = asyncio.Lock()
+        self._tools_list_changed_handler: Callable[[], None] | None = None
+        self._tools_list_changed_continuity_handler: Callable[[bool], None] | None = None
+        self._tools_list_changed_pending_before_owner = False
+        self._tools_list_changed_activation_handle: asyncio.Handle | None = None
 
     @property
     def initialize_result(self) -> McpInitializeResult:
         if self._initialize_result is None:
             raise McpProtocolError("MCP session has not been initialized.")
         return self._initialize_result
+
+    def _set_tools_list_changed_handler(
+        self,
+        handler: Callable[[], None] | None,
+    ) -> bool:
+        if handler is not None and self._closed:
+            return False
+        if handler is None:
+            activation_handle = self._tools_list_changed_activation_handle
+            self._tools_list_changed_activation_handle = None
+            if activation_handle is not None:
+                activation_handle.cancel()
+            self._tools_list_changed_handler = None
+            return True
+        if self._tools_list_changed_pending_before_owner:
+            continuity_handler = self._tools_list_changed_continuity_handler
+            if continuity_handler is None:
+                return False
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+            if loop is not self._reader_task.get_loop():
+                return False
+            self._tools_list_changed_handler = handler
+            try:
+                # The reader was continuous, but no application owner existed to
+                # consume this already-observed freshness signal. Fence before
+                # registration returns, then reconcile after its synchronous
+                # ownership transaction has either committed or rolled back.
+                continuity_handler(False)
+                self._tools_list_changed_activation_handle = loop.call_soon(
+                    self._complete_tools_list_changed_activation,
+                    handler,
+                    continuity_handler,
+                )
+            except BaseException:
+                self._tools_list_changed_handler = None
+                raise
+            return True
+        self._tools_list_changed_handler = handler
+        return True
+
+    def _set_tools_list_changed_continuity_handler(
+        self,
+        handler: Callable[[bool], None] | None,
+    ) -> bool:
+        if handler is not None and self._closed:
+            return False
+        self._tools_list_changed_continuity_handler = handler
+        return True
+
+    def _complete_tools_list_changed_activation(
+        self,
+        handler: Callable[[], None],
+        continuity_handler: Callable[[bool], None],
+    ) -> None:
+        self._tools_list_changed_activation_handle = None
+        if (
+            self._closed
+            or self._tools_list_changed_handler is not handler
+            or self._tools_list_changed_continuity_handler is not continuity_handler
+            or not self._tools_list_changed_pending_before_owner
+        ):
+            return
+        continuity_handler(True)
+        self._tools_list_changed_pending_before_owner = False
+
+    def _disable_tools_list_changed_notifications(self) -> None:
+        activation_handle = self._tools_list_changed_activation_handle
+        self._tools_list_changed_activation_handle = None
+        if activation_handle is not None:
+            activation_handle.cancel()
+        self._tools_list_changed_handler = None
+        self._tools_list_changed_continuity_handler = None
+        self._tools_list_changed_pending_before_owner = False
+
+    def _mark_tools_list_changed_continuity_lost(self) -> None:
+        """Fence refresh-owned catalogue authority before stdio can go silent."""
+
+        handler = self._tools_list_changed_continuity_handler
+        if handler is not None:
+            handler(False)
 
     @property
     def request_timeout_s(self) -> float:
@@ -679,13 +767,14 @@ class StdioMcpSession(McpSession):
         private_hashes = tuple(private_contract_hashes)
         private_contract_hashes.clear()
 
-        async def commit_transport_names() -> None:
+        async def commit_transport_names(validate: Callable[[], None]) -> None:
             async with self._authority_mapping_lock:
                 if self._closed:
                     transport_names.clear()
                     raise McpProtocolError(
                         "MCP stdio session closed before tool discovery was published."
                     )
+                validate()
                 self._tool_transport_names = {
                     public: raw for public, raw in transport_names.items() if public != raw
                 }
@@ -885,13 +974,17 @@ class StdioMcpSession(McpSession):
         # Even when a subclass must finish its own close synchronously, the
         # inherited stdio request entrances can be fenced immediately.
         self._closed = True
+        self._mark_tools_list_changed_continuity_lost()
+        self._disable_tools_list_changed_notifications()
         # Subclasses can own additional dispatch paths or pending work. They must
         # opt in with their own positive fencing proof rather than inheriting
         # authority established only for this implementation.
         return type(self) is StdioMcpSession
 
     def _schedule_close(self) -> None:
+        self._mark_tools_list_changed_continuity_lost()
         self._closed = True
+        self._disable_tools_list_changed_notifications()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_impl_with_safe_failure())
             self._close_task.add_done_callback(_consume_task_result)
@@ -1828,6 +1921,10 @@ class StdioMcpSession(McpSession):
         cleanup_task.add_done_callback(completed)
 
     def _fence_uncertain_request(self) -> None:
+        # Cleanup may send a bounded cancellation notification before it closes
+        # the process. Revoke catalogue authority now rather than leaving a dead
+        # or outcome-uncertain session dispatchable during that interval.
+        self._mark_tools_list_changed_continuity_lost()
         self._closed = True
         self._fail_pending(
             McpProtocolError("MCP stdio session closed after an uncertain request outcome.")
@@ -1866,6 +1963,7 @@ class StdioMcpSession(McpSession):
             self._fail_pending(
                 error if error is not None else McpProtocolError("MCP stdio reader stopped."),
             )
+            self._mark_tools_list_changed_continuity_lost()
             self._closed = True
             if error is not None:
                 self._schedule_close()
@@ -1875,6 +1973,12 @@ class StdioMcpSession(McpSession):
         if "method" in message:
             if message_id is not None:
                 await self._write_server_request_error(message)
+            elif _is_mcp_tools_list_changed_notification(message):
+                handler = self._tools_list_changed_handler
+                if handler is None:
+                    self._tools_list_changed_pending_before_owner = True
+                else:
+                    handler()
             return
         if message_id is None:
             raise McpProtocolError("MCP JSON-RPC response is missing an id.")

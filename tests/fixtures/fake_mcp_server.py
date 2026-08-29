@@ -9,9 +9,24 @@ from pathlib import Path
 
 def main() -> None:
     deferred_tool_response = None
+    emitted_post_discovery_list_changed = False
     for line in sys.stdin:
         message = json.loads(line)
         method = message.get("method")
+        if method == os.environ.get("CAYU_FAKE_MCP_LIST_CHANGED_ON_METHOD"):
+            count = int(os.environ.get("CAYU_FAKE_MCP_LIST_CHANGED_COUNT", "1"))
+            for _ in range(count):
+                notification = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                }
+                notification_params = os.environ.get("CAYU_FAKE_MCP_LIST_CHANGED_PARAMS")
+                if notification_params is not None:
+                    notification["params"] = json.loads(notification_params)
+                _write(notification)
+            response_delay_s = os.environ.get("CAYU_FAKE_MCP_LIST_CHANGED_RESPONSE_DELAY_S")
+            if response_delay_s is not None:
+                time.sleep(float(response_delay_s))
         if "id" not in message:
             continue
         request_id = message["id"]
@@ -190,7 +205,11 @@ def main() -> None:
                     "result": {
                         "protocolVersion": protocol_version,
                         "capabilities": {
-                            "tools": {},
+                            "tools": (
+                                {"listChanged": True}
+                                if os.environ.get("CAYU_FAKE_MCP_LIST_CHANGED") == "1"
+                                else {}
+                            ),
                             "resources": {},
                         },
                         "serverInfo": {
@@ -212,6 +231,10 @@ def main() -> None:
                         "result": {"tools": tools},
                     }
                 )
+                if not emitted_post_discovery_list_changed:
+                    emitted_post_discovery_list_changed = (
+                        _emit_post_discovery_list_changed_if_configured()
+                    )
                 continue
             echo_tool = {
                 "name": "echo",
@@ -233,6 +256,10 @@ def main() -> None:
             else:
                 result = {"tools": [echo_tool]}
             _write({"jsonrpc": "2.0", "id": request_id, "result": result})
+            if not emitted_post_discovery_list_changed:
+                emitted_post_discovery_list_changed = (
+                    _emit_post_discovery_list_changed_if_configured()
+                )
         elif method == "tools/call":
             params = message.get("params", {})
             name = params.get("name")
@@ -356,6 +383,15 @@ def main() -> None:
 def _write(message: object) -> None:
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+def _emit_post_discovery_list_changed_if_configured() -> bool:
+    delay_s = os.environ.get("CAYU_FAKE_MCP_POST_DISCOVERY_LIST_CHANGED_DELAY_S")
+    if delay_s is None:
+        return False
+    time.sleep(float(delay_s))
+    _write({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    return True
 
 
 def _write_slow(message: object, delay_s: float) -> None:
