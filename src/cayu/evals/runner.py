@@ -18,8 +18,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._exception_groups import exception_tree_contains
 from cayu._task_wait import capture_awaitable_outcome
-from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
-from cayu.artifacts import ArtifactMetadata, ArtifactScope
+from cayu._validation import (
+    MAX_PORTABLE_JSON_INTEGER,
+    copy_durable_json_object,
+    require_durable_clean_nonblank,
+    require_durable_text,
+)
+from cayu.artifacts import (
+    ArtifactListResult,
+    ArtifactMetadata,
+    ArtifactScope,
+    copy_artifact_read_result,
+)
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
@@ -27,6 +37,7 @@ from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
 from cayu.evals.assertions import EvalAssertion
+from cayu.evals.corpus import EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
     EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES,
@@ -38,7 +49,11 @@ from cayu.evals.memory_attribution import (
     standard_eval_memory_attribution_bounds,
 )
 from cayu.evals.models import (
+    ARTIFACT_PROBE_MAX_BYTES,
+    ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
     WORKSPACE_PROBE_MAX_BYTES,
+    ArtifactContentProbe,
+    ArtifactProbeRequirement,
     EvalAssertionResult,
     EvalCaseResult,
     EvalContext,
@@ -50,6 +65,8 @@ from cayu.evals.models import (
     Trajectory,
     TrajectoryProbes,
     WorkspaceFileProbe,
+    WorkspaceStructuralProbe,
+    _artifact_text_media_type_supported,
     _model_instance_python_input,
     _validate_trajectory_record_contract,
     aggregate_eval_score,
@@ -109,6 +126,7 @@ from cayu.tools._operation_boundary import (
     await_invocation_operation,
     retained_invocation_operation_outcome_if_done,
 )
+from cayu.workspaces import WorkspaceReadResult
 
 TrialRequestTransform = Callable[[str, str, int, RunRequest], RunRequest]
 
@@ -1960,6 +1978,31 @@ def _collect_probe_requirements(assertions: Sequence[EvalAssertion]) -> ProbeReq
     return requirements
 
 
+def _artifact_matches_probe_requirement(
+    artifact: ArtifactMetadata,
+    requirement: ArtifactProbeRequirement,
+    session: Session,
+) -> bool:
+    if artifact.scope != requirement.scope:
+        return False
+    if artifact.scope == ArtifactScope.SESSION and artifact.session_id != session.id:
+        return False
+    if (
+        artifact.scope == ArtifactScope.ENVIRONMENT
+        and artifact.environment_name != session.environment_name
+    ):
+        return False
+    if requirement.filename is not None and artifact.filename != requirement.filename:
+        return False
+    if requirement.content_type is not None and artifact.content_type != requirement.content_type:
+        return False
+    if requirement.minimum_bytes is not None and artifact.size_bytes < requirement.minimum_bytes:
+        return False
+    return not (
+        requirement.maximum_bytes is not None and artifact.size_bytes > requirement.maximum_bytes
+    )
+
+
 async def _capture_probes(
     app: CayuApp,
     session: Session | None,
@@ -1967,7 +2010,12 @@ async def _capture_probes(
 ) -> TrajectoryProbes:
     # Snapshot exactly what the case's assertions declared, while the environment is still
     # live, so assertions evaluate against the serializable trajectory instead of the app.
-    if session is None or not (requirements.workspace_paths or requirements.artifact_scopes):
+    if session is None or not (
+        requirements.workspace_paths
+        or requirements.workspace_structure_paths
+        or requirements.artifact_scopes
+        or requirements.artifact_requirements
+    ):
         return TrajectoryProbes()
     try:
         environment = app.get_environment(session.environment_name)
@@ -1981,43 +2029,130 @@ async def _capture_probes(
     workspace_files: dict[str, bytes | None] = {}
     workspace_file_stats: dict[str, WorkspaceFileProbe] = {}
     workspace_unavailable_paths: list[str] = []
+    workspace_structures: dict[str, WorkspaceStructuralProbe] = {}
     workspace = getattr(env, "workspace", None)
-    if requirements.workspace_paths and workspace is not None:
+    workspace_paths = requirements.workspace_paths | requirements.workspace_structure_paths
+    if workspace_paths and workspace is not None:
         workspace_available = True
-        for path in sorted(requirements.workspace_paths):
+        for path in sorted(workspace_paths):
             try:
                 # Cap the read so an oversized workspace file can't balloon the trajectory JSON
                 # (bytes are base64-encoded there). The full size + a content hash are recorded
                 # alongside so a truncated capture is still identifiable and stat-able.
-                result = await workspace.read_bytes(path, max_bytes=WORKSPACE_PROBE_MAX_BYTES)
-                content = result.content
-                workspace_files[path] = content
-                total_bytes = getattr(result, "total_bytes", len(content))
-                truncated = getattr(result, "truncated", len(content) < total_bytes)
-                workspace_file_stats[path] = WorkspaceFileProbe(
-                    total_bytes=total_bytes,
-                    truncated=truncated,
-                    sha256=hashlib.sha256(content).hexdigest(),
+                read_result = await workspace.read_bytes(
+                    path,
+                    max_bytes=WORKSPACE_PROBE_MAX_BYTES,
                 )
+                if type(read_result) is not WorkspaceReadResult:
+                    raise TypeError("Workspace reads must return WorkspaceReadResult.")
+                result = WorkspaceReadResult(
+                    content=read_result.content,
+                    total_bytes=read_result.total_bytes,
+                    truncated=read_result.truncated,
+                    offset=read_result.offset,
+                    revision=read_result.revision,
+                    sha256=read_result.sha256,
+                    source_bytes_read=read_result.source_bytes_read,
+                    redaction_truncated=read_result.redaction_truncated,
+                )
+                if (
+                    result.offset != 0
+                    or len(result.content) > WORKSPACE_PROBE_MAX_BYTES
+                    or result.source_bytes_read != len(result.content)
+                    or result.redaction_truncated
+                ):
+                    raise ValueError("Workspace returned data outside the requested read window.")
+                content = result.content
+                total_bytes = result.total_bytes
+                truncated = result.truncated
+                captured_sha256 = hashlib.sha256(content).hexdigest()
+                if path in requirements.workspace_paths:
+                    workspace_files[path] = content
+                    workspace_file_stats[path] = WorkspaceFileProbe(
+                        total_bytes=total_bytes,
+                        truncated=truncated,
+                        sha256=captured_sha256,
+                    )
+                if path in requirements.workspace_structure_paths:
+                    if total_bytes > MAX_PORTABLE_JSON_INTEGER:
+                        workspace_structures[path] = WorkspaceStructuralProbe(
+                            state="unavailable",
+                            digest_state="unavailable",
+                        )
+                    else:
+                        workspace_structures[path] = WorkspaceStructuralProbe(
+                            state="present",
+                            total_bytes=total_bytes,
+                            digest_state="limit_exceeded" if truncated else "complete",
+                            sha256=None if truncated else captured_sha256,
+                        )
             except FileNotFoundError:
                 # Confirmed absence is negative evidence. Other failures are retained
                 # separately because they did not observe whether the file exists.
-                workspace_files[path] = None
+                if path in requirements.workspace_paths:
+                    workspace_files[path] = None
+                if path in requirements.workspace_structure_paths:
+                    workspace_structures[path] = WorkspaceStructuralProbe(
+                        state="missing",
+                        digest_state="unavailable",
+                    )
             except Exception:
-                workspace_unavailable_paths.append(path)
+                if path in requirements.workspace_paths:
+                    workspace_unavailable_paths.append(path)
+                if path in requirements.workspace_structure_paths:
+                    workspace_structures[path] = WorkspaceStructuralProbe(
+                        state="unavailable",
+                        digest_state="unavailable",
+                    )
 
     artifacts_available = False
     artifacts: list[ArtifactMetadata] = []
     artifact_scopes_captured: list[ArtifactScope] = []
     artifact_scopes_truncated: list[ArtifactScope] = []
     artifact_scopes_unavailable: list[ArtifactScope] = []
+    artifact_content_probes: list[ArtifactContentProbe] = []
     artifact_store = getattr(env, "artifact_store", None)
-    if requirements.artifact_scopes and artifact_store is not None:
+    requested_artifact_scopes = requirements.artifact_scopes | frozenset(
+        requirement.scope for requirement in requirements.artifact_requirements
+    )
+    if requested_artifact_scopes and artifact_store is not None:
         artifacts_available = True
         seen_ids: set[str] = set()
-        for scope in sorted(requirements.artifact_scopes, key=str):
+        for scope in sorted(requested_artifact_scopes, key=str):
             try:
-                listed = await artifact_store.list(scope=scope)
+                listed_result = await artifact_store.list(
+                    scope=scope,
+                    session_id=(session.id if scope == ArtifactScope.SESSION else None),
+                    environment_name=(
+                        session.environment_name if scope == ArtifactScope.ENVIRONMENT else None
+                    ),
+                    limit=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
+                )
+                if type(listed_result) is not ArtifactListResult:
+                    raise TypeError("Artifact store lists must return ArtifactListResult.")
+                listed = ArtifactListResult(
+                    artifacts=listed_result.artifacts,
+                    total_count=listed_result.total_count,
+                    truncated=listed_result.truncated,
+                )
+                listed_ids = tuple(artifact.id for artifact in listed.artifacts)
+                valid_owner_scope = all(
+                    artifact.scope == scope
+                    and (scope != ArtifactScope.SESSION or artifact.session_id == session.id)
+                    and (
+                        scope != ArtifactScope.ENVIRONMENT
+                        or artifact.environment_name == session.environment_name
+                    )
+                    for artifact in listed.artifacts
+                )
+                if (
+                    not valid_owner_scope
+                    or len(listed.artifacts) > EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
+                    or len(listed_ids) != len(set(listed_ids))
+                    or any(artifact_id in seen_ids for artifact_id in listed_ids)
+                ):
+                    artifact_scopes_unavailable.append(scope)
+                    continue
             except Exception:
                 artifact_scopes_unavailable.append(scope)
                 continue
@@ -2026,20 +2161,131 @@ async def _capture_probes(
             else:
                 artifact_scopes_captured.append(scope)
             for artifact in listed.artifacts:
-                if artifact.id not in seen_ids:
+                matches_requirement = any(
+                    _artifact_matches_probe_requirement(artifact, requirement, session)
+                    for requirement in requirements.artifact_requirements
+                )
+                owned_scope_probe = scope in requirements.artifact_scopes and (
+                    (scope == ArtifactScope.SESSION and artifact.session_id == session.id)
+                    or (
+                        scope == ArtifactScope.ENVIRONMENT
+                        and artifact.environment_name == session.environment_name
+                    )
+                )
+                if (matches_requirement or owned_scope_probe) and artifact.id not in seen_ids:
                     seen_ids.add(artifact.id)
                     artifacts.append(artifact)
+
+        requested_reads: dict[str, tuple[bool, bool]] = {}
+        for artifact in artifacts:
+            for requirement in requirements.artifact_requirements:
+                if not _artifact_matches_probe_requirement(artifact, requirement, session):
+                    continue
+                previous = requested_reads.get(artifact.id, (False, False))
+                requested_reads[artifact.id] = (
+                    previous[0] or requirement.capture_digest,
+                    previous[1] or requirement.capture_text,
+                )
+
+        artifacts_by_id = {artifact.id: artifact for artifact in artifacts}
+        for artifact_id in sorted(requested_reads):
+            capture_digest, capture_text = requested_reads[artifact_id]
+            if not capture_digest and not capture_text:
+                continue
+            artifact = artifacts_by_id[artifact_id]
+            try:
+                read = copy_artifact_read_result(
+                    await artifact_store.read_bytes(
+                        artifact_id,
+                        max_bytes=ARTIFACT_PROBE_MAX_BYTES,
+                    ),
+                    expected_artifact_id=artifact_id,
+                    max_content_bytes=ARTIFACT_PROBE_MAX_BYTES,
+                )
+                if read.metadata != artifact:
+                    raise ValueError(
+                        "Artifact store read metadata does not match its scoped listing."
+                    )
+                if read.source_bytes_read != len(read.content) or read.redaction_truncated:
+                    raise ValueError("Artifact store returned an incomplete content projection.")
+            except Exception:
+                artifact_content_probes.append(
+                    ArtifactContentProbe(
+                        artifact_id=artifact_id,
+                        digest_state="unavailable",
+                        text_state="unavailable",
+                    )
+                )
+                continue
+
+            digest_state = "limit_exceeded" if read.truncated else "complete"
+            sha256 = None if read.truncated else hashlib.sha256(read.content).hexdigest()
+            text_state = "unavailable"
+            text = None
+            text_supported = _artifact_text_media_type_supported(artifact.content_type)
+            if capture_text:
+                if not text_supported:
+                    text_state = "unsupported"
+                elif read.truncated:
+                    text_state = "truncated"
+                else:
+                    try:
+                        original = read.content.decode("utf-8")
+                    except UnicodeError:
+                        text_state = "malformed"
+                    else:
+                        try:
+                            redaction = app.redact_utf8_head(
+                                read.content,
+                                max_bytes=ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
+                                source_complete=True,
+                            )
+                            if type(redaction) is not tuple or len(redaction) != 2:
+                                raise TypeError("Artifact redaction must return a two-item tuple.")
+                            redacted, redaction_truncated = redaction
+                            if type(redacted) is not str or type(redaction_truncated) is not bool:
+                                raise TypeError(
+                                    "Artifact redaction must return text and a boolean."
+                                )
+                            if len(redacted.encode("utf-8")) > ARTIFACT_PUBLIC_TEXT_MAX_BYTES:
+                                raise ValueError("Artifact redaction exceeded its byte boundary.")
+                        except Exception:
+                            text_state = "unavailable"
+                        else:
+                            if redaction_truncated:
+                                text_state = "truncated"
+                            elif redacted != original:
+                                text_state = "redacted"
+                            else:
+                                try:
+                                    text = require_durable_text(redacted, "artifact text")
+                                except ValueError:
+                                    text_state = "malformed"
+                                    text = None
+                                else:
+                                    text_state = "available"
+            artifact_content_probes.append(
+                ArtifactContentProbe(
+                    artifact_id=artifact_id,
+                    digest_state=digest_state,
+                    sha256=sha256,
+                    text_state=text_state,
+                    text=text,
+                )
+            )
 
     return TrajectoryProbes(
         workspace_available=workspace_available,
         workspace_files=workspace_files,
         workspace_file_stats=workspace_file_stats,
         workspace_unavailable_paths=tuple(workspace_unavailable_paths),
+        workspace_structures=workspace_structures,
         artifacts_available=artifacts_available,
         artifact_scopes_captured=tuple(artifact_scopes_captured),
         artifact_scopes_truncated=tuple(artifact_scopes_truncated),
         artifact_scopes_unavailable=tuple(artifact_scopes_unavailable),
         artifacts=tuple(artifacts),
+        artifact_content_probes=tuple(artifact_content_probes),
     )
 
 

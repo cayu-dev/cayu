@@ -25,6 +25,7 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    MAX_PORTABLE_JSON_INTEGER,
     copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
@@ -34,6 +35,7 @@ from cayu._validation import (
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
+from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.memory_attribution import (
     EvalMemoryAttributionEvidenceV1,
     EvalMemoryEvidenceLimitation,
@@ -54,21 +56,42 @@ from cayu.runtime.usage import (
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
 # saved structure changes incompatibly so load_eval_run can reject a baseline
-# written for a different contract instead of silently misreading it. Version 7
-# binds portable runs to the corpus contract present before provider dispatch;
-# earlier prerelease formats are intentionally not migrated.
-EVAL_SCHEMA_VERSION = 8
+# written for a different contract instead of silently misreading it. Version 9
+# binds the portable workspace/artifact assertion result contract; earlier
+# prerelease formats are intentionally not migrated.
+EVAL_SCHEMA_VERSION = 9
 
 # Version of the standalone trajectory JSON document written by
-# write_trajectory_json. Version 4 adds bounded memory attribution;
+# write_trajectory_json. Version 5 adds bounded structural workspace/artifact probes;
 # load_trajectory intentionally does not guess or migrate older shapes.
-TRAJECTORY_SCHEMA_VERSION = 4
+TRAJECTORY_SCHEMA_VERSION = 5
 
 # Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
 # larger than this is captured truncated — with its true size and a content hash still recorded —
 # so a multi-GB workspace file can never balloon the trajectory JSON (which base64-encodes bytes)
 # or the in-memory result. Assertions still see the leading window of the file.
 WORKSPACE_PROBE_MAX_BYTES = 1 << 20  # 1 MiB
+ARTIFACT_PROBE_MAX_BYTES = 1 << 20  # 1 MiB
+ARTIFACT_PUBLIC_TEXT_MAX_BYTES = 1 << 16  # 64 KiB
+
+
+def _artifact_text_media_type_supported(content_type: str) -> bool:
+    media_type = content_type.partition(";")[0].strip().lower()
+    return (
+        media_type.startswith("text/")
+        or media_type
+        in {
+            "application/json",
+            "application/ld+json",
+            "application/xml",
+            "application/xhtml+xml",
+            "application/yaml",
+            "application/x-yaml",
+        }
+        or media_type.endswith("+json")
+        or media_type.endswith("+xml")
+    )
+
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _EVAL_CONTENT_REVISION_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
@@ -773,7 +796,7 @@ class EvalRun(BaseModel):
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
-    schema_version: Literal[8] = EVAL_SCHEMA_VERSION
+    schema_version: Literal[9] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus
@@ -790,7 +813,7 @@ class EvalRun(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def require_versioned_memory_evidence(cls, value: object) -> object:
-        """Reject schema-v8 mappings that silently omit the required section.
+        """Reject schema-v9 mappings that silently omit the required section.
 
         Standalone Python ``EvalTrialResult`` construction retains its explicit
         typed-unavailable default for extension boundaries.  A durable EvalRun
@@ -816,7 +839,7 @@ class EvalRun(BaseModel):
                     "dict[str, object]", trial
                 ):
                     raise ValueError(
-                        "EvalRun schema-v8 trial memory_attribution is required "
+                        "EvalRun schema-v9 trial memory_attribution is required "
                         f"at cases[{case_index}].trials[{trial_index}]."
                     )
         return value
@@ -1077,6 +1100,30 @@ def aggregate_trial_unavailable_reason(
 
 
 @dataclass(frozen=True)
+class ArtifactProbeRequirement:
+    """One structurally prefiltered artifact read requested by a compiled assertion."""
+
+    scope: ArtifactScope
+    filename: str | None = None
+    content_type: str | None = None
+    minimum_bytes: int | None = None
+    maximum_bytes: int | None = None
+    capture_digest: bool = False
+    capture_text: bool = False
+
+    def sort_key(self) -> tuple[str, str, str, int, int, bool, bool]:
+        return (
+            self.scope.value,
+            "" if self.filename is None else self.filename,
+            "" if self.content_type is None else self.content_type,
+            -1 if self.minimum_bytes is None else self.minimum_bytes,
+            -1 if self.maximum_bytes is None else self.maximum_bytes,
+            self.capture_digest,
+            self.capture_text,
+        )
+
+
+@dataclass(frozen=True)
 class ProbeRequirements:
     """What an assertion needs captured from the live environment to evaluate offline.
 
@@ -1085,12 +1132,23 @@ class ProbeRequirements:
     """
 
     workspace_paths: frozenset[str] = frozenset()
+    workspace_structure_paths: frozenset[str] = frozenset()
     artifact_scopes: frozenset[ArtifactScope] = frozenset()
+    artifact_requirements: tuple[ArtifactProbeRequirement, ...] = ()
 
     def merged_with(self, other: ProbeRequirements) -> ProbeRequirements:
         return ProbeRequirements(
             workspace_paths=self.workspace_paths | other.workspace_paths,
+            workspace_structure_paths=(
+                self.workspace_structure_paths | other.workspace_structure_paths
+            ),
             artifact_scopes=self.artifact_scopes | other.artifact_scopes,
+            artifact_requirements=tuple(
+                sorted(
+                    set(self.artifact_requirements) | set(other.artifact_requirements),
+                    key=ArtifactProbeRequirement.sort_key,
+                )
+            ),
         )
 
 
@@ -1099,8 +1157,9 @@ class WorkspaceFileProbe(BaseModel):
 
     Companion to ``TrajectoryProbes.workspace_files`` (the captured, possibly-truncated bytes):
     records the file's true size on disk, whether the captured window was truncated at
-    ``WORKSPACE_PROBE_MAX_BYTES``, and a sha256 of the captured bytes. This lets a large file's
-    size and identity survive in the trajectory without base64-ing its whole content into JSON.
+    ``WORKSPACE_PROBE_MAX_BYTES``, and a sha256 of the captured bytes. Direct Python assertions
+    may use that prefix identity; portable structural assertions use ``WorkspaceStructuralProbe``
+    and never expose a truncated prefix digest as whole-file identity.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1113,6 +1172,87 @@ class WorkspaceFileProbe(BaseModel):
     @classmethod
     def validate_sha256(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+
+class WorkspaceStructuralProbe(BaseModel):
+    """Content-free observation for one explicitly declared workspace path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["present", "missing", "unavailable"]
+    total_bytes: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_PORTABLE_JSON_INTEGER,
+    )
+    digest_state: Literal["complete", "limit_exceeded", "unavailable"]
+    sha256: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> WorkspaceStructuralProbe:
+        if self.state == "present":
+            if self.total_bytes is None:
+                raise ValueError("Present workspace structure requires total_bytes.")
+            if (self.digest_state == "complete") != (self.sha256 is not None):
+                raise ValueError("Complete workspace digest evidence requires exactly one digest.")
+            if self.digest_state == "unavailable":
+                raise ValueError("Present workspace structure has bounded digest evidence.")
+            if self.digest_state == "complete" and self.total_bytes > WORKSPACE_PROBE_MAX_BYTES:
+                raise ValueError("Complete workspace digests cannot exceed the fixed read limit.")
+        elif self.total_bytes is not None or self.sha256 is not None:
+            raise ValueError("Missing or unavailable workspace structure cannot carry metadata.")
+        elif self.digest_state != "unavailable":
+            raise ValueError("Missing or unavailable workspace structure has no digest evidence.")
+        if self.sha256 is not None and (
+            len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("Workspace structural sha256 must be a lowercase SHA-256 digest.")
+        return self
+
+
+class ArtifactContentProbe(BaseModel):
+    """Private artifact identity plus bounded digest and redacted-text observations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: StrictStr
+    digest_state: Literal["complete", "limit_exceeded", "unavailable"]
+    sha256: StrictStr | None = None
+    text_state: Literal[
+        "available",
+        "unavailable",
+        "unsupported",
+        "truncated",
+        "redacted",
+        "malformed",
+    ] = "unavailable"
+    text: StrictStr | None = None
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        text = require_durable_text(value, info.field_name)
+        if len(text.encode("utf-8")) > ARTIFACT_PUBLIC_TEXT_MAX_BYTES:
+            raise ValueError(
+                f"{info.field_name} must be at most {ARTIFACT_PUBLIC_TEXT_MAX_BYTES} UTF-8 bytes."
+            )
+        return text
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> ArtifactContentProbe:
+        if (self.digest_state == "complete") != (self.sha256 is not None):
+            raise ValueError("Complete artifact digest evidence requires exactly one digest.")
+        if self.sha256 is not None and (
+            len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("Artifact sha256 must be a lowercase SHA-256 digest.")
+        if (self.text_state == "available") != (self.text is not None):
+            raise ValueError("Available artifact text evidence requires exactly one text value.")
+        return self
 
 
 class TrajectoryProbes(BaseModel):
@@ -1140,11 +1280,16 @@ class TrajectoryProbes(BaseModel):
     # truncated to tell a fully-captured file from one whose bytes were truncated to the cap.
     workspace_file_stats: dict[str, WorkspaceFileProbe] = Field(default_factory=dict)
     workspace_unavailable_paths: tuple[str, ...] = Field(default_factory=tuple)
+    workspace_structures: dict[str, WorkspaceStructuralProbe] = Field(
+        default_factory=dict,
+        max_length=64,
+    )
     artifacts_available: StrictBool = False
     artifact_scopes_captured: tuple[ArtifactScope, ...] = Field(default_factory=tuple)
     artifact_scopes_truncated: tuple[ArtifactScope, ...] = Field(default_factory=tuple)
     artifact_scopes_unavailable: tuple[ArtifactScope, ...] = Field(default_factory=tuple)
     artifacts: tuple[ArtifactMetadata, ...] = Field(default_factory=tuple)
+    artifact_content_probes: tuple[ArtifactContentProbe, ...] = Field(default_factory=tuple)
 
     @field_validator("workspace_unavailable_paths", mode="before")
     @classmethod
@@ -1204,15 +1349,35 @@ class TrajectoryProbes(BaseModel):
             for path, stat in value.items()
         }
 
+    @field_validator("workspace_structures", mode="before")
+    @classmethod
+    def revalidate_workspace_structures(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        structures: dict[str, WorkspaceStructuralProbe] = {}
+        for path, probe in value.items():
+            path = require_durable_text(path, "workspace_structures path")
+            _validate_portable_structural_workspace_path(path)
+            structures[path] = _revalidate_model_instance(probe, WorkspaceStructuralProbe)
+        return structures
+
     @field_validator("artifacts", mode="before")
     @classmethod
     def revalidate_artifacts(cls, value):
         return _revalidate_model_iterable(value, ArtifactMetadata)
 
+    @field_validator("artifact_content_probes", mode="before")
+    @classmethod
+    def revalidate_artifact_content_probes(cls, value):
+        return _revalidate_model_iterable(value, ArtifactContentProbe)
+
     @model_validator(mode="after")
     def validate_capture_provenance(self) -> TrajectoryProbes:
         if not self.workspace_available and (
-            self.workspace_files or self.workspace_file_stats or self.workspace_unavailable_paths
+            self.workspace_files
+            or self.workspace_file_stats
+            or self.workspace_unavailable_paths
+            or self.workspace_structures
         ):
             raise ValueError("Unavailable workspace probes cannot carry captured path evidence.")
         overlap = set(self.workspace_files).intersection(self.workspace_unavailable_paths)
@@ -1240,6 +1405,7 @@ class TrajectoryProbes(BaseModel):
             or self.artifact_scopes_truncated
             or self.artifact_scopes_unavailable
             or self.artifacts
+            or self.artifact_content_probes
         ):
             raise ValueError("Unavailable artifact probes cannot carry captured scope evidence.")
         captured_scopes = set(self.artifact_scopes_captured)
@@ -1257,6 +1423,31 @@ class TrajectoryProbes(BaseModel):
         artifact_ids = tuple(artifact.id for artifact in self.artifacts)
         if len(artifact_ids) != len(set(artifact_ids)):
             raise ValueError("Captured artifact identities must be unique.")
+        content_probe_ids = tuple(probe.artifact_id for probe in self.artifact_content_probes)
+        if len(content_probe_ids) != len(set(content_probe_ids)):
+            raise ValueError("Artifact content probes must have unique artifact identities.")
+        if not set(content_probe_ids).issubset(artifact_ids):
+            raise ValueError("Artifact content probes require retained artifact metadata.")
+        artifacts_by_id = {artifact.id: artifact for artifact in self.artifacts}
+        for probe in self.artifact_content_probes:
+            artifact = artifacts_by_id[probe.artifact_id]
+            if probe.digest_state == "complete" and artifact.size_bytes > ARTIFACT_PROBE_MAX_BYTES:
+                raise ValueError("Complete artifact digests cannot exceed the fixed read limit.")
+            if probe.text_state == "available" and (
+                artifact.size_bytes > ARTIFACT_PUBLIC_TEXT_MAX_BYTES
+                or not _artifact_text_media_type_supported(artifact.content_type)
+            ):
+                raise ValueError(
+                    "Available artifact text must be bounded supported textual content."
+                )
+            if probe.text_state == "available" and len((probe.text or "").encode("utf-8")) != (
+                artifact.size_bytes
+            ):
+                raise ValueError("Available artifact text must represent the complete bytes.")
+            if probe.text_state == "unsupported" and _artifact_text_media_type_supported(
+                artifact.content_type
+            ):
+                raise ValueError("Supported artifact text cannot be marked unsupported.")
         return self
 
 

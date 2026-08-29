@@ -315,7 +315,8 @@ runtime event payload.
 
 Portable corpus schema version 2 covers root and child terminal
 status, final-output equality/containment, tool presence/order/count, bounded
-tool-argument/result JSON subsets, model-step
+tool-argument/result JSON subsets, workspace-file structure, artifact structure
+and explicitly retained public artifact text, model-step
 and token limits, recorded usage, estimated-cost limits, and trusted model
 judgments. Cost assertions require a `PricingProfileIdentityV1`; the identity
 fingerprints trusted pricing used elsewhere and never embeds or authorizes a
@@ -413,6 +414,75 @@ an expected path are distinct `unavailable` observation states. Redaction on an
 unselected extra field does not prevent a safe comparison. These states and the
 bounded safe actual value are the same in SDK/HTTP results, Control Plane
 drill-down, CLI, and JSON/HTML reports.
+
+### Portable workspace and artifact assertions
+
+`WorkspaceFileAssertionSpec` checks one canonical relative POSIX path for
+presence or absence. A present-file expectation may also require minimum and
+maximum byte size and an exact lowercase SHA-256 digest. The portable path has
+no glob, directory walk, absolute root, parent traversal, platform alias, file
+permission, owner, timestamp, or executable predicate.
+
+`ArtifactAssertionSpec` selects artifacts owned by the current session or
+current environment. It can filter by exact filename, content type, and byte
+range; optionally require a whole-artifact SHA-256 digest or bounded text; and
+enforce a minimum and optional maximum matching count.
+
+```python
+from cayu import ArtifactAssertionSpec, WorkspaceFileAssertionSpec
+
+workspace_output = WorkspaceFileAssertionSpec(
+    id="workspace-report",
+    path="output/report.json",
+    minimum_bytes=1,
+)
+artifact_output = ArtifactAssertionSpec(
+    id="published-report",
+    scope="session",
+    filename="report.json",
+    content_type="application/json",
+    min_count=1,
+    max_count=1,
+)
+```
+
+Both kinds are available in **Evals → New evaluation**, saved-suite editing and
+duplication, imported/exported corpus JSON, and captured-session promotion. No
+Python assertion class is required. Control Plane supplies expectation values;
+the trusted target continues to own the app, environment, stores, redactor, and
+evidence policy.
+
+Workspace evidence is always structural. Cayu reads only the declared paths
+under a fixed 1 MiB ceiling and retains presence, exact total size, and a digest
+only when the complete object was read. Raw workspace bytes never enter the
+portable evidence, result, store, API, report, or browser. A partial read cannot
+stand in for a whole-file digest. Application-owned Python code may still use
+`WorkspaceFileContains` when a private content predicate is appropriate; that
+assertion is deliberately not portable or browser-authored.
+
+Artifact listing is restricted at the store to the current session or
+environment and only structurally matching candidates are retained. Cayu reads
+artifact bytes only when a declared digest or text check needs them. Reads are
+bounded to 1 MiB. Unsupported media, invalid UTF-8, truncation, redaction,
+malformed store output, or an unavailable read produces an unavailable
+observation rather than a candidate mismatch. Portable details omit artifact
+IDs, store/session/environment identities, timestamps, arbitrary metadata, and
+binary content.
+
+Artifact text is off by default. A trusted application owner may enable it on
+the execution profile with
+`EvaluationEvidencePolicySpec.create(include_artifact_text=True)`; HTTP and
+browser input cannot grant that authority. Only supported textual media are
+decoded, only a complete bounded object is eligible, and the application
+redactor runs before at most 64 KiB of text becomes portable. A suite containing
+`text_contains` is rejected during compilation and reported not ready in
+Control Plane when the selected profile does not publish that exact policy.
+
+Captured-session quick-adds use only complete retained observations and label
+them as observed drafts, not truth. When a production trajectory did not retain
+a path/scope, or retained it incompletely, Control Plane creates an explicit
+editable expectation instead of inventing an observation. Fresh execution then
+captures exactly the probes required by that reviewed assertion.
 
 ### Portable lifecycle, approval, and child assertions
 
@@ -799,10 +869,10 @@ Successful judgments retain bounded observed judge model-step and token usage.
 Profiles with trusted pricing also retain the exact currency-local estimated
 cost and priced/unpriced step partition; profiles without pricing publish an
 explicit unavailable cost state rather than an invented zero.
-Suite-authoring schema V1 deliberately remains closed over its existing kinds;
-schema V2 carries the separately versioned revision-free rubric/reference draft
-and immutable structured-judge document contracts rather than silently widening
-V1.
+Suite-authoring schema V1 remains closed to deterministic kinds, including the
+workspace and artifact structural contracts. Schema V2 carries the separately
+versioned revision-free rubric/reference draft and immutable structured-judge
+document contracts rather than admitting judge authority through V1.
 
 `run_corpus_suite(...)` and corpus-mode
 `run_eval_plan(...)` execute that compiled suite through `run_eval_suite(...)`,
@@ -940,7 +1010,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-7 `PublishedEvalRun` containing
+produces a content-addressed schema-version-8 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
@@ -1064,8 +1134,9 @@ Current assertions cover:
 - tool result text
 - model step and token ceilings
 - estimated-cost ceilings with a supplied price book
-- workspace file existence/content
-- artifact creation
+- portable workspace file presence/absence, size, and whole-file digest
+- portable artifact metadata, size, count, whole-object digest, and opt-in public text
+- application-owned workspace content and artifact creation assertions
 
 `MaxEstimatedCost` fails closed: if even one observed model step has no matching
 price, its outcome is `unavailable` and the retained cost summary reports both
@@ -1078,11 +1149,13 @@ shares the app's workspace unless you register the environment with an **environ
 (`register_environment_factory(...)`), which provisions a fresh environment — and a fresh
 workspace — per session.
 
-Because of this, `WorkspaceFileExists` / `WorkspaceFileContains` assert *"the file is present in
-the workspace when the case finished"*, **not** *"this case created it"*. With a single shared
-environment, a file written by an earlier case will satisfy a later case's workspace assertion.
-To isolate per case, register an environment factory (or clean up the workspace yourself between
-cases).
+Because of this, `WorkspaceFileAssertionSpec`, `WorkspaceFileExists`, and
+`WorkspaceFileContains` assert *"the file has this state in the workspace when
+the case finished"*, **not** *"this case created it"*. With a single shared
+environment, a file written by an earlier case can satisfy a later case's
+workspace assertion. To make creation itself meaningful, register an
+environment factory or use a trusted reset/fixture profile. The portable
+assertion does not infer provenance from file presence.
 
 ## Eval modes
 
@@ -1429,8 +1502,9 @@ evidence, and returns a side-effect-free preview. Preview never calls a provider
 tool, environment, hook, or application workload and never writes a corpus or
 result.
 
-The review sheet shows retained status, output, tool, step, usage, and cost
-evidence. Assertion quick-adds begin from those observed facts; operators can
+The review sheet shows retained status, output, tool, structural, step, usage,
+and cost evidence when each area was captured. Assertion quick-adds begin only
+from complete observed facts; operators can
 edit suite/case identity and any portable non-judge assertion before rescoring.
 The initial root assertion always expects `completed`, so a captured failure is
 saved as a regression to fix rather than silently approved as correct behavior.
@@ -2304,25 +2378,26 @@ payloads after each trial result is built. When enabled, every trial retains its
 trajectory. Trajectories are **excluded from saved `EvalRun` JSON** and remain separate,
 opt-in exports.
 
-Saved `EvalRun` baselines use schema version `8`. Version 8 preserves the complete
+Saved `EvalRun` baselines use schema version `9`. Version 9 preserves the complete
 ordered trial graph, explicit outcome/null-score contract, conclusive-evidence
 state, the exact portable assertion revision behind each result, and the optional
 portable execution contract a trusted executor fixes before dispatch. It retains
 identity-free aggregate usage for every complete trial, canonical large counters,
-and durable-JSON validation. A contracted run must retain exactly the requested
-number of trials for every case.
-`load_eval_run(...)` rejects missing versions and versions 1–7;
+durable-JSON validation, and the structural workspace/artifact assertion result
+contract. A contracted run must retain exactly the requested number of trials for
+every case.
+`load_eval_run(...)` rejects missing versions and versions 1–8;
 regenerate those baselines with the current Cayu version. No compatibility loader
 or migration is used.
 
 Standalone exports use a versioned document envelope. The current trajectory
-schema version is `4`; `load_trajectory(...)` rejects files without that version
+schema version is `5`; `load_trajectory(...)` rejects files without that version
 or with an unsupported version before validating the trajectory payload. This is an
 intentional clean break from Cayu's earlier unversioned preview exports: they
 are not migrated and must be regenerated. The trajectory schema version is
-independent from `EvalRun.schema_version`. Version 4 retains immutable session
-invocation provenance and typed memory attribution in session-backed trajectories
-while preserving Cayu's
+independent from `EvalRun.schema_version`. Version 5 retains immutable session
+invocation provenance, typed memory attribution, and bounded structural workspace
+and artifact probes in session-backed trajectories while preserving Cayu's
 durable-JSON contract: nonportable text or numbers, duplicate object keys, and
 excessive nesting are rejected before an existing export can be overwritten or
 an imported trajectory can be replayed. Earlier exports must be regenerated;

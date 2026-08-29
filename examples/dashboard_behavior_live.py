@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -32,11 +33,15 @@ from cayu import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     CorpusTarget,
+    Environment,
+    EnvironmentSpec,
     EvalPlan,
     EvaluationEvidencePolicySpec,
     Event,
     EventType,
     InMemoryTaskStore,
+    LocalArtifactStore,
+    LocalWorkspace,
     Message,
     MessageRole,
     ModelJudgeTarget,
@@ -305,11 +310,28 @@ class DashboardEvalSearchTool(Tool):
             },
             "required": ["query", "limit"],
         },
-        effect=ToolEffect.NONE,
+        parallel_safe=False,
+        effect=ToolEffect.IDEMPOTENT,
+        workspace_mutation=True,
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        del ctx
+        if ctx.workspace is None or ctx.artifact_store is None:
+            return ToolResult(
+                content="The dashboard eval fixture requires workspace and artifact storage.",
+                is_error=True,
+            )
+        output = b'{"source":"dashboard_eval_search","status":"ready"}\n'
+        await ctx.workspace.write_bytes("dashboard-eval-output.json", output)
+        await ctx.artifact_store.put_bytes(
+            output,
+            artifact_id=("art_" + hashlib.sha256(ctx.session_id.encode("utf-8")).hexdigest()[:32]),
+            filename="dashboard-eval-report.json",
+            content_type="application/json",
+            session_id=ctx.session_id,
+            agent_name=ctx.agent_name,
+            environment_name=ctx.environment_name,
+        )
         return ToolResult(
             content=f"Found public results for {args['query']}.",
             structured={"status": "ok", "count": min(args["limit"], 2)},
@@ -456,7 +478,7 @@ async def main() -> None:
         ToolEffect.NONE,
         "dashboard contract tool must remain mutation-free",
     )
-    app, provider, store, task_store = await _seed_app()
+    app, provider, store, task_store, runtime_directory = await _seed_app()
     price_book = _dashboard_price_book()
     judge_app = CayuApp(enable_logging=False)
     judge_app.register_provider(provider, default=True)
@@ -488,7 +510,10 @@ async def main() -> None:
                     target_key="dashboard.regressions",
                     source_agent_name=AGENT_NAME,
                     application_release_id="dashboard-browser-contract",
-                    evidence_policy=EvaluationEvidencePolicySpec.create(include_tool_results=True),
+                    evidence_policy=EvaluationEvidencePolicySpec.create(
+                        include_tool_results=True,
+                        include_artifact_text=True,
+                    ),
                 ),
                 evals=EvalsConfig(
                     target=CorpusTarget(
@@ -499,7 +524,8 @@ async def main() -> None:
                         price_book=price_book,
                         model_judges=(judge,),
                         evidence_policy=EvaluationEvidencePolicySpec.create(
-                            include_tool_results=True
+                            include_tool_results=True,
+                            include_artifact_text=True,
                         ),
                     ),
                     store=eval_store,
@@ -622,6 +648,7 @@ async def main() -> None:
             await asyncio.gather(server_task, return_exceptions=True)
         await eval_store.close()
         evals_directory.cleanup()
+        runtime_directory.cleanup()
 
 
 async def _seed_app() -> tuple[
@@ -629,10 +656,26 @@ async def _seed_app() -> tuple[
     DashboardContractProvider,
     InMemorySessionStore,
     InMemoryTaskStore,
+    tempfile.TemporaryDirectory[str],
 ]:
     store = InMemorySessionStore()
     task_store = InMemoryTaskStore()
     app = CayuApp(session_store=store, task_store=task_store, enable_logging=False)
+    runtime_directory = tempfile.TemporaryDirectory(prefix="cayu-dashboard-runtime-")
+    runtime_root = Path(runtime_directory.name)
+    workspace_root = runtime_root / "workspace"
+    workspace_root.mkdir()
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=LocalWorkspace(workspace_root, workspace_id="dashboard-workspace"),
+            artifact_store=LocalArtifactStore(
+                runtime_root / "artifacts",
+                store_id="dashboard-artifacts",
+            ),
+        ),
+        default=True,
+    )
     provider = DashboardContractProvider()
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model=MODEL_NAME))
@@ -1057,7 +1100,7 @@ async def _seed_app() -> tuple[
         else:
             await task_store.complete_task(task_id, {"verified": True})
 
-    return app, provider, store, task_store
+    return app, provider, store, task_store, runtime_directory
 
 
 def _dashboard_price_book() -> PriceBook:
@@ -1106,6 +1149,20 @@ def build_release_acceptance_eval_plan() -> EvalPlan:
     """Build the local side of the dashboard-to-CI installed-package proof."""
 
     app = CayuApp(enable_logging=False)
+    runtime_root = Path(tempfile.mkdtemp(prefix="cayu-dashboard-local-evals-"))
+    workspace_root = runtime_root / "workspace"
+    workspace_root.mkdir()
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=LocalWorkspace(workspace_root, workspace_id="dashboard-workspace"),
+            artifact_store=LocalArtifactStore(
+                runtime_root / "artifacts",
+                store_id="dashboard-artifacts",
+            ),
+        ),
+        default=True,
+    )
     app.register_provider(DashboardContractProvider(), default=True)
     app.register_agent(
         AgentSpec(name=AGENT_NAME, model=MODEL_NAME),
@@ -1119,7 +1176,10 @@ def build_release_acceptance_eval_plan() -> EvalPlan:
             request_base=RunRequest(agent_name=AGENT_NAME, messages=[]),
             application_release_id="dashboard-local-ci-contract",
             price_book=_dashboard_price_book(),
-            evidence_policy=EvaluationEvidencePolicySpec.create(include_tool_results=True),
+            evidence_policy=EvaluationEvidencePolicySpec.create(
+                include_tool_results=True,
+                include_artifact_text=True,
+            ),
         )
     )
 
@@ -1720,6 +1780,26 @@ async def _exercise_captured_evaluation(
         "Expected process event 4",
         exact=True,
     ).select_option("session_completed")
+    await assertion_kind.select_option("workspace_file")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    workspace_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await workspace_assertion.get_by_label("Relative workspace path", exact=True).fill(
+        "dashboard-eval-output.json"
+    )
+    await workspace_assertion.get_by_label("Minimum bytes", exact=True).fill("1")
+    await assertion_kind.select_option("artifact")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    artifact_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await artifact_assertion.get_by_label("Filename (optional)", exact=True).fill(
+        "dashboard-eval-report.json"
+    )
+    await artifact_assertion.get_by_label("Content type (optional)", exact=True).fill(
+        "application/json"
+    )
+    await artifact_assertion.get_by_label(
+        "Public artifact text contains (optional)",
+        exact=True,
+    ).fill('"status":"ready"')
     await authoring.get_by_role("button", name="Add case", exact=True).click()
     case_list = authoring.get_by_test_id("authored-suite-cases")
     case_id_input = authoring.get_by_test_id("authored-case-id")
@@ -1896,6 +1976,8 @@ async def _exercise_captured_evaluation(
     await expect(page.get_by_text("tool_result_contains", exact=True)).to_be_visible()
     await expect(page.get_by_text("process_event", exact=True)).to_be_visible()
     await expect(page.get_by_text("process_events_in_order", exact=True)).to_be_visible()
+    await expect(page.get_by_text("workspace_file", exact=True)).to_be_visible()
+    await expect(page.get_by_title("artifact", exact=True)).to_be_visible()
     await expect(page.get_by_text("Dashboard quality judge", exact=False)).to_be_visible()
     await expect(page.get_by_text("same model · explicitly allowed", exact=True)).to_be_visible()
     await expect(page.get_by_text("correctness", exact=True)).to_be_visible()
@@ -1954,6 +2036,26 @@ async def _exercise_captured_evaluation(
         ],
         "published process order must retain the exact closed-vocabulary expectation",
     )
+    authored_structural_assertions = {
+        item["detail"]["kind"]: item
+        for item in authored_assertions
+        if item["detail"]["kind"] in {"workspace_file", "artifact"}
+    }
+    require_equal(
+        sorted(authored_structural_assertions),
+        ["artifact", "workspace_file"],
+        "fresh authoring must publish both structural assertion details",
+    )
+    require_equal(
+        [item["outcome"] for item in authored_structural_assertions.values()],
+        ["passed", "passed"],
+        "fresh structural assertions must pass through the canonical evaluator",
+    )
+    structural_result_json = json.dumps(authored_structural_assertions, sort_keys=True)
+    require(
+        '"artifact_id"' not in structural_result_json,
+        "published structural details must omit private artifact identities",
+    )
     authored_presentation = authored_result_body["presentation"]
     authored_tool_presentations = [
         item["tool_json"]
@@ -1970,6 +2072,22 @@ async def _exercise_captured_evaluation(
     await expect(page.get_by_test_id("eval-process-detail")).to_have_count(2)
     await expect(page.get_by_test_id("eval-process-expected-order")).to_contain_text(
         "Session started → Tool call started → Tool call completed → Session completed"
+    )
+    await expect(page.get_by_test_id("eval-structure-detail")).to_have_count(2)
+    authored_structural_presentations = [
+        item["structure"]
+        for item in authored_presentation["cases"][0]["trials"][0]["assertions"]
+        if item.get("structure") is not None
+    ]
+    require_equal(
+        sorted(item["kind"] for item in authored_structural_presentations),
+        ["artifact", "workspace_file"],
+        "the canonical presentation must retain both safe structural details",
+    )
+    require_equal(
+        [item["observation_state"] for item in authored_structural_presentations],
+        ["available", "available"],
+        "the canonical presentation must distinguish available structural evidence",
     )
     require_equal(
         authored_presentation["dimensions"]["evaluator_health"],
@@ -3259,10 +3377,21 @@ async def _serve_dashboard_without_pricebook(route) -> None:
 async def _exercise_capability_contract(page: Page, base_url: str) -> None:
     observed_requests: list[str] = []
 
-    async def serve_without_task_surface(route) -> None:
+    async def serve_without_task_or_artifact_surface(route) -> None:
         response = await route.fetch()
         body = await response.json()
         body["capabilities"]["surfaces"]["tasks"] = {
+            "configured": False,
+            "read": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+            "mutate": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+        }
+        body["capabilities"]["surfaces"]["artifacts"] = {
             "configured": False,
             "read": {
                 "enabled": False,
@@ -3280,7 +3409,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         if path.startswith("/api/"):
             observed_requests.append(f"{request.method} {path}")
 
-    await page.route("**/api/contract", serve_without_task_surface)
+    await page.route("**/api/contract", serve_without_task_or_artifact_surface)
     page.on("request", record_api_request)
     try:
         await page.goto(f"{base_url}/cayu/tasks", wait_until="networkidle")
@@ -3315,7 +3444,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         )
     finally:
         page.remove_listener("request", record_api_request)
-        await page.unroute("**/api/contract", serve_without_task_surface)
+        await page.unroute("**/api/contract", serve_without_task_or_artifact_surface)
 
     async def serve_without_evals_configuration(route) -> None:
         response = await route.fetch()

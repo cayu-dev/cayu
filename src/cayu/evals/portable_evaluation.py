@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import cast
 
 from cayu.evals.corpus import (
+    ArtifactAssertionSpec,
     AssertionSpec,
     ChildStatusAssertionSpec,
     FinalOutputContainsAssertionSpec,
@@ -23,15 +24,19 @@ from cayu.evals.corpus import (
     ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     UsageRecordedAssertionSpec,
+    WorkspaceFileAssertionSpec,
     _validated_assertion_spec,
     assertion_spec_revision,
 )
 from cayu.evals.evidence import (
+    ArtifactStructuralEvidenceV1,
+    ArtifactTextEvidenceState,
     AssertionCostEvidenceV1,
     AssertionEvidenceView,
     EvidenceState,
     ToolCallEvidenceState,
     ToolCallEvidenceV1,
+    WorkspaceStructuralEvidenceV1,
     _canonical_decimal,
 )
 from cayu.evals.json_subset import JsonSubsetOutcome, compare_json_subset
@@ -57,7 +62,7 @@ def _result(
 def _unavailable(
     name: str,
     evidence_area: str,
-    state: EvidenceState | ToolCallEvidenceState,
+    state: EvidenceState | ToolCallEvidenceState | ArtifactTextEvidenceState,
 ) -> EvalAssertionResult:
     message = (
         "Usage evidence is unavailable because no usage summary was recorded."
@@ -342,6 +347,152 @@ def _evaluate_process_events_in_order(
     )
 
 
+def _evaluate_workspace_file(
+    *,
+    spec: WorkspaceFileAssertionSpec,
+    files: Sequence[WorkspaceStructuralEvidenceV1],
+    state: EvidenceState,
+) -> EvalAssertionResult:
+    if state != "complete":
+        return _unavailable(spec.id, "workspace", state)
+    observed = next((item for item in files if item.path == spec.path), None)
+    if observed is None or observed.state == "unavailable":
+        return _unavailable(spec.id, "workspace path", "unavailable")
+    actual_present = observed.state == "present"
+    if actual_present != spec.present:
+        return _result(
+            spec.id,
+            EvalOutcome.FAILED,
+            (
+                f"Workspace file {spec.path} was present but expected absent."
+                if actual_present
+                else f"Workspace file {spec.path} was absent but expected present."
+            ),
+            metadata={"path": spec.path, "present": actual_present},
+        )
+    if not actual_present:
+        return _result(
+            spec.id,
+            EvalOutcome.PASSED,
+            f"Workspace file {spec.path} was absent as expected.",
+            metadata={"path": spec.path, "present": False},
+        )
+    assert observed.total_bytes is not None
+    size_matches = (spec.minimum_bytes is None or observed.total_bytes >= spec.minimum_bytes) and (
+        spec.maximum_bytes is None or observed.total_bytes <= spec.maximum_bytes
+    )
+    if not size_matches:
+        return _result(
+            spec.id,
+            EvalOutcome.FAILED,
+            f"Workspace file {spec.path} size was outside the required range.",
+            metadata={
+                "path": spec.path,
+                "present": True,
+                "size_bytes": observed.total_bytes,
+                "minimum_bytes": spec.minimum_bytes,
+                "maximum_bytes": spec.maximum_bytes,
+            },
+        )
+    if spec.sha256 is not None:
+        if observed.digest_state != "complete" or observed.sha256 is None:
+            return _unavailable(spec.id, "workspace digest", observed.digest_state)
+        if observed.sha256 != spec.sha256:
+            return _result(
+                spec.id,
+                EvalOutcome.FAILED,
+                f"Workspace file {spec.path} digest did not match.",
+                metadata={
+                    "path": spec.path,
+                    "present": True,
+                    "size_bytes": observed.total_bytes,
+                    "digest_matched": False,
+                },
+            )
+    return _result(
+        spec.id,
+        EvalOutcome.PASSED,
+        f"Workspace file {spec.path} matched the required structure.",
+        metadata={
+            "path": spec.path,
+            "present": True,
+            "size_bytes": observed.total_bytes,
+            "digest_matched": None if spec.sha256 is None else True,
+        },
+    )
+
+
+def _artifact_candidate_matches(
+    spec: ArtifactAssertionSpec,
+    artifact: ArtifactStructuralEvidenceV1,
+) -> tuple[bool, str | None]:
+    if spec.filename is not None and artifact.filename != spec.filename:
+        return False, None
+    if spec.content_type is not None and artifact.content_type != spec.content_type:
+        return False, None
+    if spec.minimum_bytes is not None and artifact.size_bytes < spec.minimum_bytes:
+        return False, None
+    if spec.maximum_bytes is not None and artifact.size_bytes > spec.maximum_bytes:
+        return False, None
+    if spec.sha256 is not None:
+        if artifact.digest_state != "complete" or artifact.sha256 is None:
+            return False, f"digest:{artifact.digest_state}"
+        if artifact.sha256 != spec.sha256:
+            return False, None
+    if spec.text_contains is not None:
+        if artifact.text_state != "available" or artifact.text is None:
+            return False, f"text:{artifact.text_state}"
+        if spec.text_contains not in artifact.text:
+            return False, None
+    return True, None
+
+
+def _evaluate_artifact(
+    *,
+    spec: ArtifactAssertionSpec,
+    artifacts: Sequence[ArtifactStructuralEvidenceV1],
+    scope_states: dict[str, EvidenceState],
+) -> EvalAssertionResult:
+    scope_state = scope_states.get(spec.scope, "unavailable")
+    if scope_state != "complete":
+        return _unavailable(spec.id, f"artifact {spec.scope} scope", scope_state)
+    matches = 0
+    unavailable_reason = None
+    for artifact in artifacts:
+        if artifact.scope != spec.scope:
+            continue
+        matched, reason = _artifact_candidate_matches(spec, artifact)
+        if matched:
+            matches += 1
+        elif reason is not None:
+            unavailable_reason = reason
+    if unavailable_reason is not None:
+        area, evidence_state = unavailable_reason.split(":", 1)
+        return _unavailable(
+            spec.id,
+            f"artifact {area}",
+            cast("EvidenceState | ArtifactTextEvidenceState", evidence_state),
+        )
+    within_range = matches >= spec.min_count and (
+        spec.max_count is None or matches <= spec.max_count
+    )
+    return _result(
+        spec.id,
+        EvalOutcome.PASSED if within_range else EvalOutcome.FAILED,
+        (
+            f"Observed {matches} matching {spec.scope} artifact(s)."
+            if within_range
+            else f"Artifact count {matches} is outside the required range."
+        ),
+        metadata={
+            "scope": spec.scope,
+            "matching_count": matches,
+            "minimum": spec.min_count,
+            "maximum": spec.max_count,
+        },
+    )
+
+
 def _evaluate_maximum(
     *,
     name: str,
@@ -526,6 +677,18 @@ def _evaluate_validated_assertion_outcome(
             expected=validated_spec.events,
             observed=evidence.process_events,
             state=evidence.process_event_evidence_state,
+        )
+    if type(validated_spec) is WorkspaceFileAssertionSpec:
+        return _evaluate_workspace_file(
+            spec=validated_spec,
+            files=evidence.workspace_files,
+            state=evidence.workspace_evidence_state,
+        )
+    if type(validated_spec) is ArtifactAssertionSpec:
+        return _evaluate_artifact(
+            spec=validated_spec,
+            artifacts=evidence.artifacts,
+            scope_states={item.scope: item.state for item in evidence.artifact_scopes},
         )
     if type(validated_spec) is MaxToolCallsAssertionSpec:
         return _evaluate_maximum(

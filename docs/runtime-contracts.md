@@ -10136,6 +10136,48 @@ separate body-policy and recall-policy mutations in private overlays; runs two
 identical hidden-case schedules; starts a fresh interpreter for recovery; and
 emits machine-readable lineage plus a review-only recommendation.
 
+## Portable Evals structural evidence
+
+Portable Evals admit `WorkspaceFileAssertionSpec` and `ArtifactAssertionSpec`
+as closed data contracts. A workspace assertion names one canonical relative
+POSIX path and may select presence/absence, a safe-integer byte range, and a
+lowercase whole-object SHA-256. An artifact assertion selects the current
+session or environment scope and may select exact filename/content type, a
+safe-integer byte range, whole-object digest, bounded public-text containment,
+and a 0–256 count range. The contracts contain no glob, tree walk, callback,
+regex, JSONPath, arbitrary metadata predicate, private artifact identity, or
+filesystem authority.
+
+`ProbeRequirements.workspace_structure_paths` is separate from the existing
+private `workspace_paths` content capture. The fresh runner reads the union once
+but stores bytes only for a direct Python content assertion; the portable path
+stores `WorkspaceStructuralProbe` only. Complete offset-zero reads produce
+exact total size and SHA-256. A read beyond the 1 MiB ceiling stores
+`digest_state="limit_exceeded"` with no prefix digest. Missing and failed reads
+remain distinct.
+
+`ArtifactProbeRequirement` binds scope and structural prefilters plus whether a
+digest or text read is needed. The store list call is owner-filtered by current
+session/environment, unrelated metadata is discarded, and only prefiltered
+candidates are read. Content reads are capped at 1 MiB. Digest publication
+requires a complete read. Text additionally requires a supported textual media
+type, complete UTF-8, the execution profile's exact
+`include_artifact_text=True` policy, and successful application redaction
+inside the fixed 64 KiB public-text ceiling. Binary, truncated, malformed,
+redacted, unsupported, and unavailable content never becomes a mismatch or a
+portable byte field.
+
+`AssertionEvidenceView.schema_version == 5` publishes sorted content-free
+workspace observations, at most 256 content-minimized artifact observations,
+and per-scope completeness. It omits workspace bytes, artifact/store/session/
+environment identities, timestamps, arbitrary artifact metadata, and binary
+content. `EvalRun.schema_version == 9`, trajectory schema version 5, and
+`PublishedEvalRun.schema_version == 8` bind the new evidence and typed result
+details. Result compatibility continues to use exact assertion revisions and
+the admitted evidence-policy revision, so digest/text changes or policy changes
+cannot compare as the same contract. Server/dashboard contract version 37
+carries the authoring, readiness, promotion, and drill-down shapes.
+
 ## Portable memory intervention evidence
 
 `MemoryInterventionSpec` is Cayu's memory-specific bridge between an immutable
@@ -10297,8 +10339,8 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 `unavailable`, `redacted`, or `contradictory` attribution.
 
 Runtime-native Evals carry that attribution across both fresh and captured
-publication. `AssertionEvidenceView.schema_version == 4`,
-`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 7`, and
+publication. `AssertionEvidenceView.schema_version == 5`,
+`EvalRun.schema_version == 9`, `PublishedEvalRun.schema_version == 8`, and
 `CorpusExecutionResult.schema_version == 3` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,

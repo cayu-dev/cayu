@@ -69,6 +69,7 @@ from cayu import (
     Trajectory,
     TrajectoryProbes,
     WorkspaceFileContains,
+    WorkspaceReadResult,
     compare_eval_runs,
     comparison_to_json,
     eval_run_to_json,
@@ -106,7 +107,7 @@ from cayu.evals.memory_attribution import (
     eval_memory_source_alias,
     standard_eval_memory_attribution_bounds,
 )
-from cayu.evals.models import WorkspaceFileProbe
+from cayu.evals.models import ArtifactContentProbe, WorkspaceFileProbe, WorkspaceStructuralProbe
 from cayu.evals.runner import _blocked_assertion_results, _build_child_trajectories
 from cayu.memory_attribution import (
     MemoryAttribution,
@@ -2025,7 +2026,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 8
+    assert EVAL_SCHEMA_VERSION == 9
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
     usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {
@@ -2581,10 +2582,33 @@ def test_trajectory_json_round_trip(tmp_path):
             workspace_available=True,
             workspace_files={"a.txt": b"hello", "missing.txt": None},
             workspace_file_stats={"a.txt": _workspace_stat(b"hello")},
+            workspace_structures={
+                "structural.txt": WorkspaceStructuralProbe(
+                    state="present",
+                    total_bytes=10,
+                    digest_state="complete",
+                    sha256=hashlib.sha256(b"structural").hexdigest(),
+                )
+            },
             artifacts_available=True,
             artifact_scopes_captured=(ArtifactScope.SESSION,),
             artifacts=(
-                ArtifactMetadata(id="art_1", filename="o.txt", size_bytes=5, session_id="root"),
+                ArtifactMetadata(
+                    id="art_1",
+                    filename="o.txt",
+                    content_type="text/plain",
+                    size_bytes=5,
+                    session_id="root",
+                ),
+            ),
+            artifact_content_probes=(
+                ArtifactContentProbe(
+                    artifact_id="art_1",
+                    digest_state="complete",
+                    sha256=hashlib.sha256(b"hello").hexdigest(),
+                    text_state="available",
+                    text="hello",
+                ),
             ),
         ),
         children=(Trajectory(final_output="child output"),),
@@ -2603,7 +2627,9 @@ def test_trajectory_json_round_trip(tmp_path):
     assert restored.final_output == "root output"
     assert restored.session is not None and restored.session.id == "root"
     assert restored.probes.workspace_files == {"a.txt": b"hello", "missing.txt": None}
+    assert restored.probes.workspace_structures == trajectory.probes.workspace_structures
     assert restored.probes.artifacts[0].id == "art_1"
+    assert restored.probes.artifact_content_probes == trajectory.probes.artifact_content_probes
     assert restored.children[0].final_output == "child output"
     assert restored.metadata == trajectory.metadata
 
@@ -3401,7 +3427,7 @@ def test_load_trajectory_rejects_unversioned_preview_export(tmp_path):
         load_trajectory(path)
 
 
-@pytest.mark.parametrize("schema_version", [0, 1, 2, 3, 5, "4", True])
+@pytest.mark.parametrize("schema_version", [0, 1, 2, 3, 4, 6, "5", True])
 def test_load_trajectory_rejects_unsupported_schema_version(tmp_path, schema_version):
     path = tmp_path / "unsupported-trajectory.json"
     path.write_text(
@@ -4248,7 +4274,8 @@ def test_capture_probes_survives_artifact_store_error():
     from cayu.evals.runner import _capture_probes
 
     class _RaisingStore:
-        async def list(self, *, scope=None):
+        async def list(self, *, scope=None, session_id=None, environment_name=None, limit=None):
+            del scope, session_id, environment_name, limit
             raise RuntimeError("artifact backend down")
 
     class _FakeApp:
@@ -4278,7 +4305,8 @@ def test_capture_probes_preserves_truncated_artifact_listing_as_partial_evidence
     from cayu.evals.runner import _capture_probes
 
     class _TruncatedStore:
-        async def list(self, *, scope=None):
+        async def list(self, *, scope=None, session_id=None, environment_name=None, limit=None):
+            del scope, session_id, environment_name, limit
             return ArtifactListResult(artifacts=(), total_count=2, truncated=True)
 
     class _FakeApp:
@@ -4317,7 +4345,8 @@ def test_truncated_artifact_listing_can_prove_a_positive_assertion():
     )
 
     class _TruncatedStore:
-        async def list(self, *, scope=None):
+        async def list(self, *, scope=None, session_id=None, environment_name=None, limit=None):
+            del scope, session_id, environment_name, limit
             return ArtifactListResult(
                 artifacts=(retained,),
                 total_count=2,
@@ -5334,7 +5363,7 @@ class _FakeProbeWorkspace:
             raise FileNotFoundError(path)
         full = self._data[path]
         content = full if max_bytes is None else full[:max_bytes]
-        return SimpleNamespace(
+        return WorkspaceReadResult(
             content=content, total_bytes=len(full), truncated=len(content) < len(full)
         )
 

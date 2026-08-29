@@ -20,10 +20,12 @@ from cayu._validation import (
     compact_json_utf8_size,
     json_utf8_size_within_limit,
 )
+from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
+    EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_JUDGE_CRITERIA,
@@ -34,12 +36,14 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_TOOL_NAMES,
     EVAL_CORPUS_MAX_TRIALS,
+    EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS,
     EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
     EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
     EVIDENCE_MAX_CHILD_SESSIONS,
     EVIDENCE_MAX_MODEL_STEPS,
     EVIDENCE_MAX_TOOL_CALLS,
     EVIDENCE_MAX_TOTAL_TOKENS,
+    ArtifactAssertionSpec,
     AssertionSpec,
     ChildStatusAssertionSpec,
     EvalCaseSpec,
@@ -65,6 +69,7 @@ from cayu.evals.corpus import (
     ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     UsageRecordedAssertionSpec,
+    WorkspaceFileAssertionSpec,
     _bounded_durable_text,
     _canonical_decimal_text,
     _content_revision,
@@ -104,12 +109,21 @@ from cayu.evals.result_contract import (
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 7
+PUBLISHED_EVAL_SCHEMA_VERSION = 8
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
 PublishedStatus = Literal["passed", "failed", "unavailable", "error"]
 PublishedOutcome = Literal["passed", "failed", "unavailable", "error"]
+PublishedStructuralObservationState = Literal[
+    "available",
+    "unavailable",
+    "limit_exceeded",
+    "unsupported",
+    "truncated",
+    "redacted",
+    "malformed",
+]
 PublishedModelJudgeDiagnostic = Literal[
     "judgment_recorded",
     "evaluator_error",
@@ -407,6 +421,121 @@ class PublishedProcessEventsInOrderDetail(_PublishedAssertionDetail):
             raise ValueError("Published process-order observations must be present together.")
         if self.matched and self.actual_count != len(self.expected):
             raise ValueError("A matching process order must have the expected event count.")
+        return self
+
+
+class PublishedWorkspaceFileDetail(_PublishedAssertionDetail):
+    kind: Literal["workspace_file"] = "workspace_file"
+    path: StrictStr
+    expected_present: StrictBool
+    minimum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    maximum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    digest_required: StrictBool
+    observation_state: PublishedStructuralObservationState
+    actual_present: StrictBool | None = None
+    actual_size_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    digest_matched: StrictBool | None = None
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str, info) -> str:
+        path = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS,
+            nonblank=True,
+            clean=True,
+        )
+        return _validate_portable_structural_workspace_path(path)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> PublishedWorkspaceFileDetail:
+        if self.maximum_bytes is not None and (
+            self.minimum_bytes is not None and self.maximum_bytes < self.minimum_bytes
+        ):
+            raise ValueError("maximum_bytes must be greater than or equal to minimum_bytes.")
+        if not self.expected_present and any(
+            value is not None for value in (self.minimum_bytes, self.maximum_bytes)
+        ):
+            raise ValueError("Absent workspace expectations cannot carry size bounds.")
+        if not self.expected_present and self.digest_required:
+            raise ValueError("Absent workspace expectations cannot require a digest.")
+        if self.actual_present is not True and (
+            self.actual_size_bytes is not None or self.digest_matched is not None
+        ):
+            raise ValueError("Only present workspace observations can carry structure details.")
+        if not self.digest_required and self.digest_matched is not None:
+            raise ValueError("Digest comparison requires a digest expectation.")
+        if (self.observation_state == "available") != (self.actual_present is not None):
+            raise ValueError(
+                "Available workspace observations require exactly one presence observation."
+            )
+        if self.observation_state in {"unsupported", "truncated", "redacted", "malformed"}:
+            raise ValueError("Workspace observations cannot use artifact-content states.")
+        return self
+
+
+class PublishedArtifactDetail(_PublishedAssertionDetail):
+    kind: Literal["artifact"] = "artifact"
+    scope: Literal["session", "environment"]
+    filename: StrictStr | None = None
+    content_type: StrictStr | None = None
+    minimum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    maximum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    digest_required: StrictBool
+    text_required: StrictBool
+    observation_state: PublishedStructuralObservationState
+    min_count: StrictInt = Field(ge=0, le=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS)
+    max_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
+    )
+    matching_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
+    )
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=1_024,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("content_type")
+    @classmethod
+    def validate_content_type(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        content_type = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=1_024,
+            nonblank=True,
+            clean=True,
+        )
+        if any(ord(character) < 0x20 or ord(character) > 0x7E for character in content_type):
+            raise ValueError("content_type must contain printable ASCII characters only.")
+        return content_type
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> PublishedArtifactDetail:
+        if self.maximum_bytes is not None and (
+            self.minimum_bytes is not None and self.maximum_bytes < self.minimum_bytes
+        ):
+            raise ValueError("maximum_bytes must be greater than or equal to minimum_bytes.")
+        if self.max_count is not None and self.max_count < self.min_count:
+            raise ValueError("max_count must be greater than or equal to min_count.")
+        if (self.observation_state == "available") != (self.matching_count is not None):
+            raise ValueError("Available artifact observations require exactly one matching count.")
         return self
 
 
@@ -810,6 +939,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedToolsCalledInOrderDetail
     | PublishedProcessEventDetail
     | PublishedProcessEventsInOrderDetail
+    | PublishedWorkspaceFileDetail
+    | PublishedArtifactDetail
     | PublishedMaxToolCallsDetail
     | PublishedMaxModelStepsDetail
     | PublishedUsageRecordedDetail
@@ -1030,7 +1161,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1267,6 +1398,10 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.matching_count is not None
     if isinstance(detail, PublishedProcessEventsInOrderDetail):
         return detail.actual_count is not None and detail.matched is not None
+    if isinstance(detail, PublishedWorkspaceFileDetail):
+        return detail.observation_state == "available"
+    if isinstance(detail, PublishedArtifactDetail):
+        return detail.observation_state == "available"
     if isinstance(
         detail,
         (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
@@ -1334,6 +1469,26 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         )
     if isinstance(detail, PublishedProcessEventsInOrderDetail):
         return detail.matched
+    if isinstance(detail, PublishedWorkspaceFileDetail):
+        if detail.actual_present is None:
+            return None
+        if detail.actual_present != detail.expected_present:
+            return False
+        if not detail.actual_present:
+            return True
+        if detail.actual_size_bytes is None:
+            return None
+        if (
+            detail.minimum_bytes is not None and detail.actual_size_bytes < detail.minimum_bytes
+        ) or (detail.maximum_bytes is not None and detail.actual_size_bytes > detail.maximum_bytes):
+            return False
+        return detail.digest_matched if detail.digest_required else True
+    if isinstance(detail, PublishedArtifactDetail):
+        if detail.matching_count is None:
+            return None
+        return detail.matching_count >= detail.min_count and (
+            detail.max_count is None or detail.matching_count <= detail.max_count
+        )
     return None
 
 
@@ -1362,6 +1517,15 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         (PublishedProcessEventDetail, PublishedProcessEventsInOrderDetail),
     ):
         return "process-event"
+    if isinstance(detail, PublishedWorkspaceFileDetail):
+        return f"workspace:{detail.path}:digest={detail.digest_required}"
+    if isinstance(detail, PublishedArtifactDetail):
+        return (
+            f"artifact:{detail.scope}:{detail.filename!r}:{detail.content_type!r}:"
+            f"{detail.minimum_bytes}:{detail.maximum_bytes}:"
+            f"digest={detail.digest_required}:text={detail.text_required}:"
+            f"{detail.min_count}:{detail.max_count}"
+        )
     if isinstance(detail, PublishedMaxModelStepsDetail):
         return "model-step"
     if isinstance(detail, (PublishedUsageRecordedDetail, PublishedMaxTotalTokensDetail)):
@@ -1431,6 +1595,28 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
         static_detail = (detail.kind, detail.event, detail.min_count, detail.max_count)
     elif isinstance(detail, PublishedProcessEventsInOrderDetail):
         static_detail = (detail.kind, *detail.expected)
+    elif isinstance(detail, PublishedWorkspaceFileDetail):
+        static_detail = (
+            detail.kind,
+            detail.path,
+            detail.expected_present,
+            detail.minimum_bytes,
+            detail.maximum_bytes,
+            detail.digest_required,
+        )
+    elif isinstance(detail, PublishedArtifactDetail):
+        static_detail = (
+            detail.kind,
+            detail.scope,
+            detail.filename,
+            detail.content_type,
+            detail.minimum_bytes,
+            detail.maximum_bytes,
+            detail.digest_required,
+            detail.text_required,
+            detail.min_count,
+            detail.max_count,
+        )
     elif isinstance(detail, (PublishedMaxToolCallsDetail, PublishedMaxModelStepsDetail)):
         static_detail = (detail.kind, detail.maximum)
     elif isinstance(detail, PublishedUsageRecordedDetail):
@@ -1498,6 +1684,28 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
         return (*base, spec.event, spec.min_count, spec.max_count)
     if type(spec) is ProcessEventsInOrderAssertionSpec:
         return (*base, *spec.events)
+    if type(spec) is WorkspaceFileAssertionSpec:
+        return (
+            *base,
+            spec.path,
+            spec.present,
+            spec.minimum_bytes,
+            spec.maximum_bytes,
+            spec.sha256 is not None,
+        )
+    if type(spec) is ArtifactAssertionSpec:
+        return (
+            *base,
+            spec.scope,
+            spec.filename,
+            spec.content_type,
+            spec.minimum_bytes,
+            spec.maximum_bytes,
+            spec.sha256 is not None,
+            spec.text_contains is not None,
+            spec.min_count,
+            spec.max_count,
+        )
     if isinstance(spec, (MaxToolCallsAssertionSpec, MaxModelStepsAssertionSpec)):
         return (*base, spec.maximum)
     if type(spec) is UsageRecordedAssertionSpec:
@@ -1811,6 +2019,26 @@ def _safe_metadata_json_object(result: EvalAssertionResult, key: str) -> dict[st
         return None
 
 
+def _structural_observation_state(
+    result: EvalAssertionResult,
+    *,
+    observed: bool,
+) -> PublishedStructuralObservationState:
+    if observed:
+        return "available"
+    value = result.metadata.get("evidence_state")
+    if value in {
+        "unavailable",
+        "limit_exceeded",
+        "unsupported",
+        "truncated",
+        "redacted",
+        "malformed",
+    }:
+        return cast("PublishedStructuralObservationState", value)
+    return "unavailable"
+
+
 def _published_detail(
     spec: AssertionSpec,
     result: EvalAssertionResult,
@@ -1915,6 +2143,40 @@ def _published_detail(
             expected=spec.events,
             actual_count=len(actual) if valid_actual else None,
             matched=(actual == list(spec.events) if valid_actual else None),
+        )
+    if type(spec) is WorkspaceFileAssertionSpec:
+        actual_present = _safe_metadata_bool(result, "present")
+        return PublishedWorkspaceFileDetail(
+            path=spec.path,
+            expected_present=spec.present,
+            minimum_bytes=spec.minimum_bytes,
+            maximum_bytes=spec.maximum_bytes,
+            digest_required=spec.sha256 is not None,
+            observation_state=_structural_observation_state(
+                result,
+                observed=actual_present is not None,
+            ),
+            actual_present=actual_present,
+            actual_size_bytes=_safe_metadata_int(result, "size_bytes"),
+            digest_matched=_safe_metadata_bool(result, "digest_matched"),
+        )
+    if type(spec) is ArtifactAssertionSpec:
+        matching_count = _safe_metadata_int(result, "matching_count")
+        return PublishedArtifactDetail(
+            scope=spec.scope,
+            filename=spec.filename,
+            content_type=spec.content_type,
+            minimum_bytes=spec.minimum_bytes,
+            maximum_bytes=spec.maximum_bytes,
+            digest_required=spec.sha256 is not None,
+            text_required=spec.text_contains is not None,
+            observation_state=_structural_observation_state(
+                result,
+                observed=matching_count is not None,
+            ),
+            min_count=spec.min_count,
+            max_count=spec.max_count,
+            matching_count=matching_count,
         )
     if type(spec) is MaxToolCallsAssertionSpec:
         return PublishedMaxToolCallsDetail(

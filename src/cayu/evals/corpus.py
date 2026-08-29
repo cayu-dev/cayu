@@ -27,6 +27,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_PORTABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
@@ -38,9 +39,14 @@ from cayu._validation import (
     require_durable_nonblank,
     require_durable_text,
 )
+from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.external import OpaqueExternalCaseRefV1
 from cayu.evals.json_subset import copy_eval_tool_json_object
-from cayu.evals.models import EvalCaseContractV1, EvalRunContractV1
+from cayu.evals.models import (
+    ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
+    EvalCaseContractV1,
+    EvalRunContractV1,
+)
 from cayu.runtime.costs import PriceBook
 
 EVAL_CORPUS_SCHEMA_VERSION = 2
@@ -82,7 +88,10 @@ EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACT_CHARS = 2_048
 EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS = 2 << 20
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
 EVAL_CORPUS_MAX_PROCESS_EVENTS = 256
+EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS = 1_024
+EVAL_CORPUS_MAX_ARTIFACT_TEXT_ASSERTION_CHARS = 32_768
 EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS = 4_096
+EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS = 256
 EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS = 256
 EVAL_CORPUS_MAX_TRIALS = 100
 EVAL_CORPUS_MAX_TIMEOUT_SECONDS = 3_600
@@ -95,7 +104,7 @@ EVIDENCE_MAX_MODEL_STEPS = 4_096
 # Eval corpora cross browser and other IEEE-754 JSON boundaries. Keep every
 # numeric token counter exactly representable; larger durable usage is reported
 # as limit-exceeded evidence instead of being silently rounded in transit.
-EVIDENCE_MAX_TOTAL_TOKENS = 2**53 - 1
+EVIDENCE_MAX_TOTAL_TOKENS = MAX_PORTABLE_JSON_INTEGER
 
 _PORTABLE_ID_PATTERN = re.compile(r"[a-z][a-z0-9._-]{0,127}\Z", re.ASCII)
 _SHA256_REVISION_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
@@ -602,6 +611,131 @@ class ProcessEventsInOrderAssertionSpec(_AssertionSpecBase):
     @classmethod
     def validate_events_are_ordered(cls, value: object, info) -> object:
         return _ordered_sequence_input(value, info.field_name)
+
+
+class WorkspaceFileAssertionSpec(_AssertionSpecBase):
+    """Require one declared workspace path to have bounded structural properties."""
+
+    kind: Literal["workspace_file"] = "workspace_file"
+    path: StrictStr
+    present: StrictBool = True
+    minimum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    maximum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    sha256: StrictStr | None = None
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str, info) -> str:
+        path = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS,
+            nonblank=True,
+            clean=True,
+        )
+        return _validate_portable_structural_workspace_path(path)
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_hex(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> WorkspaceFileAssertionSpec:
+        if self.maximum_bytes is not None and (
+            self.minimum_bytes is not None and self.maximum_bytes < self.minimum_bytes
+        ):
+            raise ValueError("maximum_bytes must be greater than or equal to minimum_bytes.")
+        if not self.present and any(
+            value is not None for value in (self.minimum_bytes, self.maximum_bytes, self.sha256)
+        ):
+            raise ValueError("Absent workspace assertions cannot require size or digest values.")
+        return self
+
+
+class ArtifactAssertionSpec(_AssertionSpecBase):
+    """Require bounded structural or explicitly retained public-text artifact evidence."""
+
+    kind: Literal["artifact"] = "artifact"
+    scope: Literal["session", "environment"] = "session"
+    filename: StrictStr | None = None
+    content_type: StrictStr | None = None
+    minimum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    maximum_bytes: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    sha256: StrictStr | None = None
+    text_contains: StrictStr | None = None
+    min_count: StrictInt = Field(default=1, ge=0, le=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS)
+    max_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
+    )
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=1_024,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("content_type")
+    @classmethod
+    def validate_content_type(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        content_type = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=1_024,
+            nonblank=True,
+            clean=True,
+        )
+        if any(ord(character) < 0x20 or ord(character) > 0x7E for character in content_type):
+            raise ValueError("content_type must contain printable ASCII characters only.")
+        return content_type
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_hex(value, info.field_name)
+
+    @field_validator("text_contains")
+    @classmethod
+    def validate_text_contains(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        text = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_ARTIFACT_TEXT_ASSERTION_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+        if len(text.encode("utf-8")) > ARTIFACT_PUBLIC_TEXT_MAX_BYTES:
+            raise ValueError(
+                f"{info.field_name} must be at most {ARTIFACT_PUBLIC_TEXT_MAX_BYTES} UTF-8 bytes."
+            )
+        return text
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> ArtifactAssertionSpec:
+        if self.maximum_bytes is not None and (
+            self.minimum_bytes is not None and self.maximum_bytes < self.minimum_bytes
+        ):
+            raise ValueError("maximum_bytes must be greater than or equal to minimum_bytes.")
+        if self.max_count is not None and self.max_count < self.min_count:
+            raise ValueError("max_count must be greater than or equal to min_count.")
+        return self
 
 
 class MaxToolCallsAssertionSpec(_AssertionSpecBase):
@@ -1122,6 +1256,8 @@ AssertionSpec: TypeAlias = Annotated[
     | ToolsCalledInOrderAssertionSpec
     | ProcessEventAssertionSpec
     | ProcessEventsInOrderAssertionSpec
+    | WorkspaceFileAssertionSpec
+    | ArtifactAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -1143,6 +1279,8 @@ _ASSERTION_SPEC_TYPES = (
     ToolsCalledInOrderAssertionSpec,
     ProcessEventAssertionSpec,
     ProcessEventsInOrderAssertionSpec,
+    WorkspaceFileAssertionSpec,
+    ArtifactAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxModelStepsAssertionSpec,
     UsageRecordedAssertionSpec,
@@ -1355,6 +1493,7 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
     include_transcript_text: Literal[False] = False
     include_tool_arguments: StrictBool = True
     include_tool_results: StrictBool = False
+    include_artifact_text: StrictBool = False
     max_final_output_chars: Literal[65536] = EVIDENCE_MAX_FINAL_OUTPUT_CHARS
     max_child_sessions: Literal[500] = EVIDENCE_MAX_CHILD_SESSIONS
     max_tool_calls: Literal[4096] = EVIDENCE_MAX_TOOL_CALLS
@@ -1372,7 +1511,12 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
             raise ValueError(f"{info.field_name} must be false.")
         return value
 
-    @field_validator("include_tool_arguments", "include_tool_results", mode="before")
+    @field_validator(
+        "include_tool_arguments",
+        "include_tool_results",
+        "include_artifact_text",
+        mode="before",
+    )
     @classmethod
     def validate_tool_evidence_flag_types(cls, value: object, info) -> object:
         if type(value) is not bool:
@@ -1397,11 +1541,14 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
         *,
         include_tool_arguments: bool = True,
         include_tool_results: bool = False,
+        include_artifact_text: bool = False,
     ) -> EvaluationEvidencePolicySpec:
         if type(include_tool_arguments) is not bool:
             raise TypeError("include_tool_arguments must be a bool.")
         if type(include_tool_results) is not bool:
             raise TypeError("include_tool_results must be a bool.")
+        if type(include_artifact_text) is not bool:
+            raise TypeError("include_artifact_text must be a bool.")
         document = {
             "schema_version": EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION,
             "event_projection": "runtime_public_alias_free_v1",
@@ -1409,6 +1556,7 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
             "include_transcript_text": False,
             "include_tool_arguments": include_tool_arguments,
             "include_tool_results": include_tool_results,
+            "include_artifact_text": include_artifact_text,
             "max_final_output_chars": EVIDENCE_MAX_FINAL_OUTPUT_CHARS,
             "max_child_sessions": EVIDENCE_MAX_CHILD_SESSIONS,
             "max_tool_calls": EVIDENCE_MAX_TOOL_CALLS,
@@ -1435,9 +1583,11 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
             cls.create(
                 include_tool_arguments=include_arguments,
                 include_tool_results=include_results,
+                include_artifact_text=include_artifact_text,
             )
             for include_arguments in (False, True)
             for include_results in (False, True)
+            for include_artifact_text in (False, True)
         )
 
     @classmethod
@@ -1743,6 +1893,11 @@ class EvalCorpusDocument(_SchemaV2PortableModel):
             for case in self.cases
             for assertion in case.assertions
         )
+        requires_artifact_text = any(
+            type(assertion) is ArtifactAssertionSpec and assertion.text_contains is not None
+            for case in self.cases
+            for assertion in case.assertions
+        )
         if requires_tool_arguments and not self.evidence_policy.include_tool_arguments:
             raise ValueError(
                 "Tool-argument assertions require a target evidence policy that publishes "
@@ -1752,6 +1907,11 @@ class EvalCorpusDocument(_SchemaV2PortableModel):
             raise ValueError(
                 "Tool-result assertions require a target evidence policy that explicitly "
                 "retains public-safe tool results."
+            )
+        if requires_artifact_text and not self.evidence_policy.include_artifact_text:
+            raise ValueError(
+                "Artifact-text assertions require a target evidence policy that explicitly "
+                "retains public-safe artifact text."
             )
         if cost_currencies and self.pricing_profile is None:
             raise ValueError("Cost assertions require a pricing profile identity.")

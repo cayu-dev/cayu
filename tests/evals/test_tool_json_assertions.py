@@ -537,17 +537,19 @@ def test_compiler_rejects_assertions_incompatible_with_the_selected_policy():
         )
 
 
-def test_tool_evidence_policy_revisions_cover_every_supported_flag_combination():
+def test_evidence_policy_revisions_cover_every_supported_flag_combination():
     policies = tuple(
         EvaluationEvidencePolicySpec.create(
             include_tool_arguments=include_arguments,
             include_tool_results=include_results,
+            include_artifact_text=include_artifact_text,
         )
         for include_arguments in (False, True)
         for include_results in (False, True)
+        for include_artifact_text in (False, True)
     )
 
-    assert len({policy.revision for policy in policies}) == 4
+    assert len({policy.revision for policy in policies}) == 8
     assert EvaluationEvidencePolicySpec.supported_revisions() == frozenset(
         policy.revision for policy in policies
     )

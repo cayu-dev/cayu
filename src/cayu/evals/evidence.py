@@ -14,14 +14,19 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     json_utf8_size_within_limit,
 )
+from cayu.artifacts import ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import ToolCallPart
 from cayu.core.tools import ToolResult
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
+from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
+    EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
+    EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS,
     EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
     EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
     EVIDENCE_MAX_CHILD_SESSIONS,
@@ -48,7 +53,12 @@ from cayu.evals.memory_attribution import (
     EvalMemoryAttributionEvidenceV1,
 )
 from cayu.evals.models import (
+    ARTIFACT_PROBE_MAX_BYTES,
+    ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
+    ArtifactContentProbe,
     Trajectory,
+    WorkspaceStructuralProbe,
+    _artifact_text_media_type_supported,
     _model_instance_python_input,
     _validate_trajectory_record_contract,
 )
@@ -57,7 +67,7 @@ from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, _estimate_session_cost
 from cayu.runtime.usage import AggregateCount
 
-ASSERTION_EVIDENCE_SCHEMA_VERSION = 4
+ASSERTION_EVIDENCE_SCHEMA_VERSION = 5
 ASSERTION_EVIDENCE_MAX_BYTES = 10 << 20
 ASSERTION_EVIDENCE_MAX_TOOL_NAME_CHARS = 256
 ASSERTION_EVIDENCE_MAX_COST_CURRENCIES = 32
@@ -71,6 +81,14 @@ ToolValueEvidenceState = Literal[
     "malformed",
     "truncated",
     "incompatible",
+]
+ArtifactTextEvidenceState = Literal[
+    "available",
+    "unavailable",
+    "unsupported",
+    "truncated",
+    "redacted",
+    "malformed",
 ]
 TerminalEvidenceStatus = Literal["completed", "failed", "interrupted"]
 
@@ -217,10 +235,126 @@ class ToolCallEvidenceV1(_PortableModel):
         )
 
 
+class WorkspaceStructuralEvidenceV1(_PortableModel):
+    """One declared workspace path without retained content bytes."""
+
+    path: StrictStr
+    state: Literal["present", "missing", "unavailable"]
+    total_bytes: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVIDENCE_MAX_TOTAL_TOKENS,
+    )
+    digest_state: Literal["complete", "limit_exceeded", "unavailable"]
+    sha256: StrictStr | None = None
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str, info) -> str:
+        path = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS,
+            nonblank=True,
+            clean=True,
+        )
+        return _validate_portable_structural_workspace_path(path)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> WorkspaceStructuralEvidenceV1:
+        WorkspaceStructuralProbe.model_validate(self.model_dump(mode="python", exclude={"path"}))
+        return self
+
+
+class ArtifactStructuralEvidenceV1(_PortableModel):
+    """One content-minimized artifact observation with no private store identity."""
+
+    observation_index: StrictInt = Field(ge=1, le=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS)
+    scope: Literal["session", "environment"]
+    filename: StrictStr
+    content_type: StrictStr
+    size_bytes: StrictInt = Field(ge=0, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    digest_state: Literal["complete", "limit_exceeded", "unavailable"]
+    sha256: StrictStr | None = None
+    text_state: ArtifactTextEvidenceState
+    text: StrictStr | None = None
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=1_024,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("content_type")
+    @classmethod
+    def validate_content_type(cls, value: str, info) -> str:
+        content_type = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=1_024,
+            nonblank=True,
+            clean=True,
+        )
+        if any(ord(character) < 0x20 or ord(character) > 0x7E for character in content_type):
+            raise ValueError("content_type must contain printable ASCII characters only.")
+        return content_type
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        text = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
+            nonblank=False,
+            clean=False,
+        )
+        if len(text.encode("utf-8")) > ARTIFACT_PUBLIC_TEXT_MAX_BYTES:
+            raise ValueError(
+                f"{info.field_name} must be at most {ARTIFACT_PUBLIC_TEXT_MAX_BYTES} UTF-8 bytes."
+            )
+        return text
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> ArtifactStructuralEvidenceV1:
+        ArtifactContentProbe(
+            artifact_id="portable-observation",
+            digest_state=self.digest_state,
+            sha256=self.sha256,
+            text_state=self.text_state,
+            text=self.text,
+        )
+        if self.digest_state == "complete" and self.size_bytes > ARTIFACT_PROBE_MAX_BYTES:
+            raise ValueError("Complete artifact digests cannot exceed the fixed read limit.")
+        supported_text = _artifact_text_media_type_supported(self.content_type)
+        if self.text_state == "available" and (
+            self.size_bytes > ARTIFACT_PUBLIC_TEXT_MAX_BYTES or not supported_text
+        ):
+            raise ValueError("Available artifact text must be bounded supported textual content.")
+        if (
+            self.text_state == "available"
+            and len((self.text or "").encode("utf-8")) != self.size_bytes
+        ):
+            raise ValueError("Available artifact text must represent the complete artifact bytes.")
+        return self
+
+
+class ArtifactScopeEvidenceV1(_PortableModel):
+    scope: Literal["session", "environment"]
+    state: EvidenceState
+
+
 class AssertionEvidenceView(_PortableModel):
     """The bounded, content-minimized data consumed by every portable assertion."""
 
-    schema_version: Literal[4] = ASSERTION_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[5] = ASSERTION_EVIDENCE_SCHEMA_VERSION
     revision: StrictStr
     policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
@@ -246,6 +380,17 @@ class AssertionEvidenceView(_PortableModel):
         max_length=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS
     )
     process_event_evidence_state: EvidenceState
+    workspace_files: tuple[WorkspaceStructuralEvidenceV1, ...] = Field(
+        default_factory=tuple, max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE
+    )
+    workspace_evidence_state: EvidenceState = "unavailable"
+    artifacts: tuple[ArtifactStructuralEvidenceV1, ...] = Field(
+        default_factory=tuple, max_length=EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
+    )
+    artifact_scopes: tuple[ArtifactScopeEvidenceV1, ...] = Field(
+        default_factory=tuple,
+        max_length=2,
+    )
     model_steps: StrictInt | None = Field(
         default=None,
         ge=0,
@@ -265,6 +410,9 @@ class AssertionEvidenceView(_PortableModel):
         "started_tool_names",
         "tool_calls",
         "process_events",
+        "workspace_files",
+        "artifacts",
+        "artifact_scopes",
         "costs",
         mode="before",
     )
@@ -281,7 +429,7 @@ class AssertionEvidenceView(_PortableModel):
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 4.")
+            raise ValueError("schema_version must be the integer 5.")
         return value
 
     @field_validator("pricing_profile_fingerprint")
@@ -331,10 +479,17 @@ class AssertionEvidenceView(_PortableModel):
                 self.tool_evidence_state,
                 self.tool_call_evidence_state,
                 self.process_event_evidence_state,
+                self.workspace_evidence_state,
                 self.model_step_evidence_state,
                 self.usage_evidence_state,
             )
-            if any(state != "unavailable" for state in derived_states) or self.costs:
+            if (
+                any(state != "unavailable" for state in derived_states)
+                or self.costs
+                or self.workspace_files
+                or self.artifacts
+                or self.artifact_scopes
+            ):
                 raise ValueError(
                     "Unavailable root evidence cannot carry conclusive derived evidence."
                 )
@@ -430,6 +585,30 @@ class AssertionEvidenceView(_PortableModel):
             raise ValueError(
                 "Limited process-event evidence must retain exactly its bounded prefix."
             )
+        if self.workspace_evidence_state == "unavailable" and self.workspace_files:
+            raise ValueError("Unavailable workspace evidence cannot carry observations.")
+        workspace_paths = tuple(item.path for item in self.workspace_files)
+        if workspace_paths != tuple(sorted(set(workspace_paths))):
+            raise ValueError("Workspace structural evidence paths must be unique and sorted.")
+        scope_names = tuple(item.scope for item in self.artifact_scopes)
+        if scope_names != tuple(sorted(set(scope_names))):
+            raise ValueError("Artifact scope evidence must be unique and sorted.")
+        scope_states = {item.scope: item.state for item in self.artifact_scopes}
+        if tuple(item.observation_index for item in self.artifacts) != tuple(
+            range(1, len(self.artifacts) + 1)
+        ):
+            raise ValueError("Artifact observations must have canonical contiguous indexes.")
+        for artifact in self.artifacts:
+            state = scope_states.get(artifact.scope)
+            if state is None or state == "unavailable":
+                raise ValueError("Artifact observations require available scope evidence.")
+            if evidence_policy.include_artifact_text:
+                if artifact.text_state == "unsupported" and (
+                    _artifact_text_media_type_supported(artifact.content_type)
+                ):
+                    raise ValueError("Supported artifact text cannot be marked unsupported.")
+            elif artifact.text_state != "unsupported":
+                raise ValueError("Disabled artifact text evidence must be unsupported.")
         if self.model_step_evidence_state == "unavailable":
             if self.model_steps is not None:
                 raise ValueError("Unavailable model-step evidence cannot carry a count.")
@@ -905,6 +1084,119 @@ def _project_tool_call_evidence(
     return tuple(projected), state
 
 
+def _project_structural_evidence(
+    trajectory: Trajectory,
+    *,
+    evidence_policy: EvaluationEvidencePolicySpec,
+    app: CayuApp | None,
+    root_evidence_available: bool,
+) -> tuple[
+    tuple[WorkspaceStructuralEvidenceV1, ...],
+    EvidenceState,
+    tuple[ArtifactStructuralEvidenceV1, ...],
+    tuple[ArtifactScopeEvidenceV1, ...],
+]:
+    probes = trajectory.probes
+    if not root_evidence_available:
+        return (), "unavailable", (), ()
+
+    workspace_state: EvidenceState = "complete" if probes.workspace_available else "unavailable"
+    workspace_files = tuple(
+        WorkspaceStructuralEvidenceV1(
+            path=path,
+            **probe.model_dump(mode="python"),
+        )
+        for path, probe in sorted(probes.workspace_structures.items())
+    )
+    if not probes.artifacts_available:
+        return workspace_files, workspace_state, (), ()
+
+    captured = set(probes.artifact_scopes_captured)
+    truncated = set(probes.artifact_scopes_truncated)
+    unavailable = set(probes.artifact_scopes_unavailable)
+    requested_scopes = sorted(captured | truncated | unavailable, key=lambda item: item.value)
+    content_probes = {probe.artifact_id: probe for probe in probes.artifact_content_probes}
+    projected_artifacts: list[ArtifactStructuralEvidenceV1] = []
+    scope_evidence: list[ArtifactScopeEvidenceV1] = []
+
+    session = trajectory.session
+    for scope in requested_scopes:
+        scope_state: EvidenceState = (
+            "unavailable"
+            if scope in unavailable
+            else ("limit_exceeded" if scope in truncated else "complete")
+        )
+        candidates = [
+            artifact
+            for artifact in probes.artifacts
+            if artifact.scope == scope
+            and (
+                scope != ArtifactScope.SESSION
+                or session is None
+                or artifact.session_id == session.id
+            )
+            and (
+                scope != ArtifactScope.ENVIRONMENT
+                or session is None
+                or artifact.environment_name == session.environment_name
+            )
+        ]
+        if len(candidates) > EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS - len(projected_artifacts):
+            candidates = candidates[
+                : EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS - len(projected_artifacts)
+            ]
+            scope_state = "limit_exceeded"
+
+        projected_scope: list[ArtifactStructuralEvidenceV1] = []
+        metadata_redacted = False
+        for artifact in candidates:
+            try:
+                filename = _redacted_text(app, artifact.filename, "artifact filename")
+                content_type = _redacted_text(app, artifact.content_type, "artifact content type")
+                if filename != artifact.filename or content_type != artifact.content_type:
+                    raise ValueError("Artifact structural metadata was redacted.")
+                content_probe = content_probes.get(artifact.id)
+                digest_state = (
+                    "unavailable" if content_probe is None else content_probe.digest_state
+                )
+                sha256 = None if content_probe is None else content_probe.sha256
+                if evidence_policy.include_artifact_text:
+                    text_state: ArtifactTextEvidenceState = (
+                        "unavailable" if content_probe is None else content_probe.text_state
+                    )
+                    text = None if content_probe is None else content_probe.text
+                else:
+                    text_state = "unsupported"
+                    text = None
+                projected = ArtifactStructuralEvidenceV1(
+                    observation_index=len(projected_artifacts) + len(projected_scope) + 1,
+                    scope=scope.value,
+                    filename=filename,
+                    content_type=content_type,
+                    size_bytes=artifact.size_bytes,
+                    digest_state=digest_state,
+                    sha256=sha256,
+                    text_state=text_state,
+                    text=text,
+                )
+            except (TypeError, ValueError):
+                metadata_redacted = True
+                break
+            projected_scope.append(projected)
+        if metadata_redacted:
+            scope_state = "unavailable"
+            projected_scope = []
+        projected_artifacts.extend(projected_scope)
+        scope_evidence.append(ArtifactScopeEvidenceV1(scope=scope.value, state=scope_state))
+
+    return (
+        workspace_files,
+        workspace_state,
+        tuple(projected_artifacts),
+        tuple(scope_evidence),
+    )
+
+
 def _build_assertion_evidence_view(
     trajectory: Trajectory,
     *,
@@ -985,6 +1277,18 @@ def _build_assertion_evidence_view(
             retained_process_events.append(process_event)
         process_events = tuple(retained_process_events)
         process_event_state = "limit_exceeded" if process_events_overflow else "complete"
+
+    (
+        workspace_files,
+        workspace_evidence_state,
+        artifacts,
+        artifact_scopes,
+    ) = _project_structural_evidence(
+        trajectory,
+        evidence_policy=evidence_policy,
+        app=app,
+        root_evidence_available=root_available,
+    )
 
     # Public projection derives completeness from the durable root. The compiled
     # EvalAssertion adapter may instead receive an explicitly complete synthetic
@@ -1092,6 +1396,10 @@ def _build_assertion_evidence_view(
         "tool_call_evidence_state": tool_call_state,
         "process_events": list(process_events),
         "process_event_evidence_state": process_event_state,
+        "workspace_files": [item.model_dump(mode="json") for item in workspace_files],
+        "workspace_evidence_state": workspace_evidence_state,
+        "artifacts": [item.model_dump(mode="json") for item in artifacts],
+        "artifact_scopes": [item.model_dump(mode="json") for item in artifact_scopes],
         "model_steps": model_steps,
         "model_step_evidence_state": model_step_state,
         "total_tokens": total_tokens,

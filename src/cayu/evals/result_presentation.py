@@ -40,6 +40,7 @@ from cayu.evals.corpus import (
 from cayu.evals.evidence import _canonical_decimal
 from cayu.evals.execution import CorpusExecutionResult
 from cayu.evals.published import (
+    PublishedArtifactDetail,
     PublishedAssertionResult,
     PublishedChildStatusDetail,
     PublishedEvalTrialResult,
@@ -51,6 +52,7 @@ from cayu.evals.published import (
     PublishedStructuredModelJudgeDetail,
     PublishedToolArgumentsContainDetail,
     PublishedToolResultContainsDetail,
+    PublishedWorkspaceFileDetail,
     _published_score,
     _published_status_from_outcomes,
     _published_status_from_statuses,
@@ -201,6 +203,7 @@ class EvalAssertionPresentationV1(_PortableModel):
         | PublishedProcessEventsInOrderDetail
         | None
     ) = None
+    structure: PublishedWorkspaceFileDetail | PublishedArtifactDetail | None = None
 
     @field_validator("tool_json", mode="before")
     @classmethod
@@ -233,6 +236,16 @@ class EvalAssertionPresentationV1(_PortableModel):
             return detail.model_dump(mode="python", round_trip=True, warnings="none")
         if isinstance(value, BaseModel):
             raise TypeError("process must be an exact published process detail or JSON object.")
+        return value
+
+    @field_validator("structure", mode="before")
+    @classmethod
+    def copy_structure(cls, value: object) -> object:
+        if type(value) in {PublishedWorkspaceFileDetail, PublishedArtifactDetail}:
+            detail = cast("PublishedWorkspaceFileDetail | PublishedArtifactDetail", value)
+            return detail.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError("structure must be an exact published structure detail or JSON object.")
         return value
 
     @field_validator("assertion_id")
@@ -277,6 +290,11 @@ class EvalAssertionPresentationV1(_PortableModel):
             raise ValueError("Only process assertions carry safe process detail.")
         if self.process is not None and self.process.kind != self.kind:
             raise ValueError("Process presentation kind contradicts its retained detail.")
+        structure_kind = self.kind in {"workspace_file", "artifact"}
+        if structure_kind != (self.structure is not None):
+            raise ValueError("Only structural assertions carry safe structure detail.")
+        if self.structure is not None and self.structure.kind != self.kind:
+            raise ValueError("Structure presentation kind contradicts its retained detail.")
         if self.structured_judge is None:
             return self
         detail = self.structured_judge.detail
@@ -706,6 +724,11 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
         }
         else None
     )
+    structure = (
+        cast("PublishedWorkspaceFileDetail | PublishedArtifactDetail", detail)
+        if type(detail) in {PublishedWorkspaceFileDetail, PublishedArtifactDetail}
+        else None
+    )
     return EvalAssertionPresentationV1(
         assertion_id=validated.assertion_id,
         assertion_revision=validated.assertion_revision,
@@ -720,6 +743,7 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
         ),
         tool_json=tool_json,
         process=process,
+        structure=structure,
     )
 
 

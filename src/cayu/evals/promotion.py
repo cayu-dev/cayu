@@ -22,6 +22,7 @@ from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
+    ArtifactAssertionSpec,
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
@@ -179,7 +180,7 @@ def _corpus_case(case: PromotionCaseV1) -> EvalCaseSpec:
     return EvalCaseSpec.model_validate(_model_python_input(case))
 
 
-def _validate_tool_assertion_evidence_policy(
+def _validate_assertion_evidence_policy(
     case: PromotionCaseV1,
     policy: EvaluationEvidencePolicySpec,
 ) -> None:
@@ -193,6 +194,14 @@ def _validate_tool_assertion_evidence_policy(
         and not policy.include_tool_results
     ):
         raise ValueError("Tool-result assertions require explicitly retained result evidence.")
+    if (
+        any(
+            type(assertion) is ArtifactAssertionSpec and assertion.text_contains is not None
+            for assertion in case.assertions
+        )
+        and not policy.include_artifact_text
+    ):
+        raise ValueError("Artifact-text assertions require explicitly retained artifact text.")
 
 
 class PromotionSourceV1(_SchemaV1PortableModel):
@@ -336,7 +345,7 @@ class PromotionCandidateV1(_SchemaV1PortableModel):
             raise ValueError("Promotion case source does not match candidate provenance.")
         if self.case.suite_id != self.suite.id:
             raise ValueError("Promotion case must reference the candidate suite.")
-        _validate_tool_assertion_evidence_policy(self.case, self.evidence_policy)
+        _validate_assertion_evidence_policy(self.case, self.evidence_policy)
         expected_warnings = _promotion_warnings(self.source, self.evidence)
         if self.warnings != expected_warnings:
             raise ValueError("Promotion warnings do not match captured source facts.")
@@ -538,7 +547,7 @@ class CapturedEvaluationCandidateV1(_SchemaV1PortableModel):
             raise ValueError("Captured case source does not match candidate provenance.")
         if self.case.suite_id != self.suite.id:
             raise ValueError("Captured case must reference the candidate suite.")
-        _validate_tool_assertion_evidence_policy(self.case, self.evidence_policy)
+        _validate_assertion_evidence_policy(self.case, self.evidence_policy)
         if self.case.input is not None:
             raise ValueError("A captured-only evaluation candidate cannot carry runnable input.")
         expected_warnings = (

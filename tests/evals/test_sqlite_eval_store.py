@@ -15,6 +15,7 @@ from tests.evals.eval_store_conformance import (
     assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
+from tests.evals.test_artifact_assertions import structural_corpus, structural_target
 from tests.evals.test_corpus_execution import (
     _corpus,
     _provider,
@@ -108,6 +109,15 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
             tool_corpus,
             tool_corpus.suites[0].id,
         )
+        structure_corpus = structural_corpus(target_key="structural-store-agent")
+        structure_result = await run_corpus_suite(
+            structural_target(
+                tmp_path / "structural-runtime",
+                target_key=structure_corpus.target_key,
+            ),
+            structure_corpus,
+            structure_corpus.suites[0].id,
+        )
         try:
             await assert_eval_store_conformance(store, corpus=corpus, result=result)
             await assert_captured_eval_store_conformance(
@@ -130,6 +140,16 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
             tool_lease = await store.claim_run(target_key=tool_corpus.target_key)
             assert tool_lease is not None
             await _publish_result(store, tool_lease.claim, tool_result)
+            await _save_corpus(store, structure_corpus)
+            structure_request = _request(
+                structure_corpus,
+                run_id="structural-restart",
+                idempotency_digit="2",
+            )
+            await _admit_run(store, structure_request)
+            structure_lease = await store.claim_run(target_key=structure_corpus.target_key)
+            assert structure_lease is not None
+            await _publish_result(store, structure_lease.claim, structure_result)
         finally:
             await store.close()
 
@@ -137,6 +157,8 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
         try:
             assert await restarted.load_corpus(tool_corpus.revision) == tool_corpus
             assert await restarted.load_result("tool-json-restart") == tool_result
+            assert await restarted.load_corpus(structure_corpus.revision) == structure_corpus
+            assert await restarted.load_result("structural-restart") == structure_result
         finally:
             await restarted.close()
 

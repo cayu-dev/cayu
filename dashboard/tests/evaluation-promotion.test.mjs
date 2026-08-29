@@ -94,6 +94,30 @@ function capturedCandidate() {
       "tool_approved",
       "session_completed",
     ],
+    workspace_evidence_state: "complete",
+    workspace_files: [
+      {
+        path: "output/report.txt",
+        state: "present",
+        total_bytes: 42,
+        digest_state: "complete",
+        sha256: "a".repeat(64),
+      },
+    ],
+    artifact_scopes: [{ scope: "session", state: "complete" }],
+    artifacts: [
+      {
+        observation_index: 1,
+        scope: "session",
+        filename: "report.txt",
+        content_type: "text/plain",
+        size_bytes: 42,
+        digest_state: "complete",
+        sha256: "b".repeat(64),
+        text_state: "unsupported",
+        text: null,
+      },
+    ],
     model_step_evidence_state: "complete",
     model_steps: 3,
     usage_evidence_state: "complete",
@@ -233,6 +257,187 @@ test("captured drafts omit replay input and quick-add assertions use observed fa
       events: ["session_started", "tool_approval_requested", "tool_approved", "session_completed"],
     },
   )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "workspace_file"),
+    {
+      id: "workspace_file",
+      kind: "workspace_file",
+      path: "output/report.txt",
+      present: true,
+      minimum_bytes: 42,
+      maximum_bytes: 42,
+      sha256: "a".repeat(64),
+    },
+  )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "artifact"),
+    {
+      id: "artifact",
+      kind: "artifact",
+      scope: "session",
+      filename: "report.txt",
+      content_type: "text/plain",
+      minimum_bytes: 42,
+      maximum_bytes: 42,
+      sha256: "b".repeat(64),
+      text_contains: null,
+      min_count: 1,
+      max_count: 1,
+    },
+  )
+})
+
+test("structural assertions validate canonical paths, bounds, digests, and text", () => {
+  const valid = draftFromCandidate()
+  valid.case.assertions = [
+    {
+      id: "workspace",
+      kind: "workspace_file",
+      path: "output/report.txt",
+      present: true,
+      minimum_bytes: 1,
+      maximum_bytes: 100,
+      sha256: "a".repeat(64),
+    },
+    {
+      id: "artifact",
+      kind: "artifact",
+      scope: "session",
+      filename: "report.txt",
+      content_type: "text/plain",
+      minimum_bytes: 1,
+      maximum_bytes: 100,
+      sha256: "b".repeat(64),
+      text_contains: "ready",
+      min_count: 1,
+      max_count: 1,
+    },
+  ]
+  assert.deepEqual(validatePromotionDraft(valid), { ok: true, draft: valid })
+
+  const traversal = structuredClone(valid)
+  traversal.case.assertions[0].path = "../secret"
+  assert.match(validatePromotionDraft(traversal).error, /canonical relative POSIX path/)
+
+  const paddedPath = structuredClone(valid)
+  paddedPath.case.assertions[0].path = " output/report.txt"
+  assert.match(validatePromotionDraft(paddedPath).error, /canonical relative POSIX path/)
+
+  for (const path of ["C:/secret", "report:stream", "CON.txt", "output./report.txt", "café.txt"]) {
+    const nonportablePath = structuredClone(valid)
+    nonportablePath.case.assertions[0].path = path
+    assert.match(validatePromotionDraft(nonportablePath).error, /canonical relative POSIX path/)
+  }
+
+  const absentWithSize = structuredClone(valid)
+  absentWithSize.case.assertions[0].present = false
+  assert.match(validatePromotionDraft(absentWithSize).error, /absent workspace file/)
+
+  const badDigest = structuredClone(valid)
+  badDigest.case.assertions[1].sha256 = "ABC"
+  assert.match(validatePromotionDraft(badDigest).error, /lowercase SHA-256/)
+
+  const reversedSize = structuredClone(valid)
+  reversedSize.case.assertions[1].minimum_bytes = 101
+  assert.match(validatePromotionDraft(reversedSize).error, /cannot be below its minimum/)
+
+  const oversizedText = structuredClone(valid)
+  oversizedText.case.assertions[1].text_contains = "x".repeat(32_769)
+  assert.match(validatePromotionDraft(oversizedText).error, /32,768/)
+
+  const oversizedUtf8Text = structuredClone(valid)
+  oversizedUtf8Text.case.assertions[1].text_contains = "😀".repeat(17_000)
+  assert.match(validatePromotionDraft(oversizedUtf8Text).error, /65,536 UTF-8 bytes/)
+})
+
+test("captured structural suggestions require complete observations", () => {
+  const evidence = capturedCandidate().evidence
+  assert.equal(capturedAssertionSuggestionUnavailable("workspace_file", evidence), false)
+  assert.equal(capturedAssertionSuggestionUnavailable("artifact", evidence), false)
+
+  const incomplete = structuredClone(evidence)
+  incomplete.workspace_evidence_state = "limit_exceeded"
+  incomplete.artifact_scopes[0].state = "limit_exceeded"
+  assert.equal(capturedAssertionSuggestionUnavailable("workspace_file", incomplete), true)
+  assert.equal(capturedAssertionSuggestionUnavailable("artifact", incomplete), true)
+  assert.equal(
+    createCapturedEvaluationAssertionDraft("workspace_file", [], incomplete).source,
+    "expectation",
+  )
+  assert.equal(
+    createCapturedEvaluationAssertionDraft("artifact", [], incomplete).source,
+    "expectation",
+  )
+
+  const nonportableWorkspaceSize = structuredClone(evidence)
+  nonportableWorkspaceSize.workspace_files[0].total_bytes = Number.MAX_SAFE_INTEGER + 1
+  assert.equal(
+    capturedAssertionSuggestionUnavailable("workspace_file", nonportableWorkspaceSize),
+    true,
+  )
+  assert.equal(
+    createCapturedEvaluationAssertionDraft("workspace_file", [], nonportableWorkspaceSize).source,
+    "expectation",
+  )
+
+  const nonportableArtifactSize = structuredClone(evidence)
+  nonportableArtifactSize.artifacts[0].size_bytes = Number.MAX_SAFE_INTEGER + 1
+  assert.equal(capturedAssertionSuggestionUnavailable("artifact", nonportableArtifactSize), true)
+  assert.equal(
+    createCapturedEvaluationAssertionDraft("artifact", [], nonportableArtifactSize).source,
+    "expectation",
+  )
+})
+
+test("captured artifact suggestions retain only complete bounded public text", () => {
+  const evidence = capturedCandidate().evidence
+  evidence.artifacts[0].text_state = "available"
+  evidence.artifacts[0].text = "public report ready"
+  evidence.artifacts.push({
+    ...structuredClone(evidence.artifacts[0]),
+    observation_index: 2,
+    text: "different public report",
+  })
+
+  assert.deepEqual(createCapturedEvaluationAssertion("artifact", [], evidence), {
+    id: "artifact",
+    kind: "artifact",
+    scope: "session",
+    filename: "report.txt",
+    content_type: "text/plain",
+    minimum_bytes: 42,
+    maximum_bytes: 42,
+    sha256: "b".repeat(64),
+    text_contains: "public report ready",
+    min_count: 1,
+    max_count: 1,
+  })
+
+  evidence.artifacts[0].text = "x".repeat(32_769)
+  const structuralOnly = createCapturedEvaluationAssertion("artifact", [], evidence)
+  assert.equal(structuralOnly.text_contains, null)
+  assert.equal(structuralOnly.min_count, 2)
+  assert.equal(structuralOnly.max_count, 2)
+})
+
+test("captured artifact suggestions count only constraints retained in the assertion", () => {
+  const evidence = capturedCandidate().evidence
+  evidence.artifacts[0].text_state = "available"
+  evidence.artifacts[0].text = "public report"
+  evidence.artifacts.push({
+    ...structuredClone(evidence.artifacts[0]),
+    observation_index: 2,
+    digest_state: "limit_exceeded",
+    sha256: null,
+    text_state: "unavailable",
+    text: null,
+  })
+
+  const assertion = createCapturedEvaluationAssertion("artifact", [], evidence)
+  assert.equal(assertion.sha256, null)
+  assert.equal(assertion.text_contains, null)
+  assert.equal(assertion.min_count, 2)
+  assert.equal(assertion.max_count, 2)
 })
 
 test("process assertions use a closed vocabulary and bounded exact order", () => {

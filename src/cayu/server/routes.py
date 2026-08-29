@@ -81,6 +81,7 @@ from cayu.evals.calibration import (
     run_eval_judge_calibration_trial,
 )
 from cayu.evals.corpus import (
+    ArtifactAssertionSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
     EvalSuiteSpec,
@@ -6395,6 +6396,25 @@ def create_router(
                                 "This case requires public tool arguments, but the selected target "
                                 "does not publish argument evidence. Choose a compatible target "
                                 "profile or remove the argument assertion."
+                            ),
+                        )
+                    )
+                if (
+                    any(
+                        type(assertion) is ArtifactAssertionSpec
+                        and assertion.text_contains is not None
+                        for assertion in case.assertions
+                    )
+                    and not execution_target.evidence_policy.include_artifact_text
+                ):
+                    diagnostics.append(
+                        EvalAuthoredSuiteLaunchDiagnostic(
+                            code="artifact_text_evidence_unavailable",
+                            case_id=case.id,
+                            message=(
+                                "This case requires retained public-safe artifact text, but the "
+                                "selected target does not publish artifact text evidence. Choose "
+                                "a compatible target profile or remove the text expectation."
                             ),
                         )
                     )

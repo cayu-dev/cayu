@@ -49,7 +49,7 @@ class _TrajectoryDocument(BaseModel):
 
     # Type checkers require the literal token here rather than the exported
     # TRAJECTORY_SCHEMA_VERSION constant.
-    schema_version: Literal[4] = TRAJECTORY_SCHEMA_VERSION
+    schema_version: Literal[5] = TRAJECTORY_SCHEMA_VERSION
     trajectory: Trajectory
 
 

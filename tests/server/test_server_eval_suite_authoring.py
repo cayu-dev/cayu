@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from cayu import ModelStreamEvent, ScriptedModelProvider
 from cayu.evals.corpus import (
+    ArtifactAssertionSpec,
     CorpusUserMessageSpec,
     EvaluationEvidencePolicySpec,
     FinalOutputContainsAssertionSpec,
@@ -142,6 +143,65 @@ def test_authored_suite_run_preview_explains_missing_tool_evidence_authority(tmp
                         "remove the argument assertion."
                     ),
                 },
+            ]
+    finally:
+        asyncio.run(store.close())
+
+
+def test_authored_suite_run_preview_explains_missing_artifact_text_authority(tmp_path) -> None:
+    target, _, _ = _target(tmp_path)
+    target = target.model_copy(update={"evidence_policy": EvaluationEvidencePolicySpec.standard()})
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    artifact_case = _simple_case().model_copy(
+        update={
+            "assertions": (
+                RootStatusAssertionSpec(id="completed", expected="completed"),
+                ArtifactAssertionSpec(
+                    id="artifact-text",
+                    filename="report.json",
+                    content_type="application/json",
+                    text_contains='"status":"ready"',
+                ),
+            )
+        }
+    )
+    try:
+        with TestClient(_server(target, store)) as client:
+            preview = client.post(
+                "/api/evals/suites/preview",
+                headers=_AUTH_HEADERS,
+                json={"draft": _draft(artifact_case).model_dump(mode="json")},
+            )
+            assert preview.status_code == 200
+            suite = EvalSuiteDocumentV1.model_validate(preview.json()["suite"])
+            saved = client.post(
+                "/api/evals/suites",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_suite_revision": suite.revision,
+                    "suite": suite.model_dump(mode="json"),
+                },
+            )
+            assert saved.status_code == 201
+
+            launch_preview = client.post(
+                f"/api/evals/suites/{suite.revision}/runs/preview",
+                headers=_AUTH_HEADERS,
+                json={},
+            )
+
+            assert launch_preview.status_code == 200
+            assert launch_preview.json()["ready"] is False
+            assert launch_preview.json()["diagnostics"] == [
+                {
+                    "code": "artifact_text_evidence_unavailable",
+                    "case_id": artifact_case.id,
+                    "message": (
+                        "This case requires retained public-safe artifact text, but the selected "
+                        "target does not publish artifact text evidence. Choose a compatible "
+                        "target profile or remove the text expectation."
+                    ),
+                }
             ]
     finally:
         asyncio.run(store.close())

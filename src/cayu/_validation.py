@@ -27,6 +27,10 @@ _EXECUTION_UNIT_ID_PATTERNS = {
 
 MIN_DURABLE_JSON_INTEGER = -(2**63)
 MAX_DURABLE_JSON_INTEGER = 2**63 - 1
+# Public JSON contracts cross runtimes that represent numbers with IEEE-754
+# doubles. Integers outside this range cannot make that trip exactly even
+# though Cayu's durable stores can retain the wider signed-64-bit domain.
+MAX_PORTABLE_JSON_INTEGER = 2**53 - 1
 MAX_DURABLE_JSON_NESTING = 128
 
 

@@ -24,6 +24,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS,
+    ArtifactAssertionSpec,
     ChildStatusAssertionSpec,
     EvalJudgeEvidenceSelectionV1,
     EvalSuiteSpec,
@@ -50,6 +51,7 @@ from cayu.evals.corpus import (
     ToolsCalledInOrderAssertionSpec,
     TrialRequestSpec,
     UsageRecordedAssertionSpec,
+    WorkspaceFileAssertionSpec,
     _bounded_durable_text,
     _content_revision,
     _exact_decimal_sum,
@@ -86,6 +88,8 @@ EvalSuiteAuthoringAssertionSpecV1: TypeAlias = Annotated[
     | ToolsCalledInOrderAssertionSpec
     | ProcessEventAssertionSpec
     | ProcessEventsInOrderAssertionSpec
+    | WorkspaceFileAssertionSpec
+    | ArtifactAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -106,6 +110,8 @@ EvalSuiteAuthoringAssertionSpecV2: TypeAlias = Annotated[
     | ToolsCalledInOrderAssertionSpec
     | ProcessEventAssertionSpec
     | ProcessEventsInOrderAssertionSpec
+    | WorkspaceFileAssertionSpec
+    | ArtifactAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -331,6 +337,8 @@ EvalSuiteAuthoringAssertionDraftSpecV2: TypeAlias = Annotated[
     | ToolsCalledInOrderAssertionSpec
     | ProcessEventAssertionSpec
     | ProcessEventsInOrderAssertionSpec
+    | WorkspaceFileAssertionSpec
+    | ArtifactAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec

@@ -2242,6 +2242,62 @@ export type ApplicationDefaultsManifest = {
 };
 
 /**
+ * ArtifactAssertionSpec
+ *
+ * Require bounded structural or explicitly retained public-text artifact evidence.
+ */
+export type ArtifactAssertionSpec = {
+    /**
+     * Content Type
+     */
+    content_type?: string | null;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Filename
+     */
+    filename?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'artifact';
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Maximum Bytes
+     */
+    maximum_bytes?: number | null;
+    /**
+     * Min Count
+     */
+    min_count?: number;
+    /**
+     * Minimum Bytes
+     */
+    minimum_bytes?: number | null;
+    /**
+     * Scope
+     */
+    scope?: 'session' | 'environment';
+    /**
+     * Sha256
+     */
+    sha256?: string | null;
+    /**
+     * Text Contains
+     */
+    text_contains?: string | null;
+};
+
+/**
  * ArtifactReadResponse
  */
 export type ArtifactReadResponse = {
@@ -2268,6 +2324,20 @@ export type ArtifactReadResponse = {
  * ArtifactScope
  */
 export type ArtifactScope = 'session' | 'environment';
+
+/**
+ * ArtifactScopeEvidenceV1
+ */
+export type ArtifactScopeEvidenceV1 = {
+    /**
+     * Scope
+     */
+    scope: 'session' | 'environment';
+    /**
+     * State
+     */
+    state: 'complete' | 'unavailable' | 'limit_exceeded';
+};
 
 /**
  * ArtifactStoreDiagnostic
@@ -2306,6 +2376,50 @@ export type ArtifactStoreDiagnostics = {
      * Truncated
      */
     truncated: boolean;
+};
+
+/**
+ * ArtifactStructuralEvidenceV1
+ *
+ * One content-minimized artifact observation with no private store identity.
+ */
+export type ArtifactStructuralEvidenceV1 = {
+    /**
+     * Content Type
+     */
+    content_type: string;
+    /**
+     * Digest State
+     */
+    digest_state: 'complete' | 'limit_exceeded' | 'unavailable';
+    /**
+     * Filename
+     */
+    filename: string;
+    /**
+     * Observation Index
+     */
+    observation_index: number;
+    /**
+     * Scope
+     */
+    scope: 'session' | 'environment';
+    /**
+     * Sha256
+     */
+    sha256?: string | null;
+    /**
+     * Size Bytes
+     */
+    size_bytes: number;
+    /**
+     * Text
+     */
+    text?: string | null;
+    /**
+     * Text State
+     */
+    text_state: 'available' | 'unavailable' | 'unsupported' | 'truncated' | 'redacted' | 'malformed';
 };
 
 /**
@@ -2373,6 +2487,14 @@ export type AssertionCostEvidenceV1 = {
  */
 export type AssertionEvidenceView = {
     /**
+     * Artifact Scopes
+     */
+    artifact_scopes?: Array<ArtifactScopeEvidenceV1>;
+    /**
+     * Artifacts
+     */
+    artifacts?: Array<ArtifactStructuralEvidenceV1>;
+    /**
      * Child Evidence State
      */
     child_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
@@ -2436,7 +2558,7 @@ export type AssertionEvidenceView = {
     /**
      * Schema Version
      */
-    schema_version?: 4;
+    schema_version?: 5;
     /**
      * Started Tool Names
      */
@@ -2465,6 +2587,14 @@ export type AssertionEvidenceView = {
      * Usage Evidence State
      */
     usage_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Workspace Evidence State
+     */
+    workspace_evidence_state?: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Workspace Files
+     */
+    workspace_files?: Array<WorkspaceStructuralEvidenceV1>;
 };
 
 /**
@@ -2672,7 +2802,7 @@ export type CapturedEvaluationCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4542,6 +4672,10 @@ export type EvalAssertionPresentationV1 = {
      * Score
      */
     score?: number | null;
+    /**
+     * Structure
+     */
+    structure?: PublishedWorkspaceFileDetail | PublishedArtifactDetail | null;
     structured_judge?: EvalStructuredJudgePresentationV1 | null;
     /**
      * Tool Json
@@ -4671,7 +4805,7 @@ export type EvalAuthoredSuiteLaunchDiagnostic = {
     /**
      * Code
      */
-    code: 'one_trial_required' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'tool_argument_evidence_unavailable' | 'tool_result_evidence_unavailable' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
+    code: 'one_trial_required' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'tool_argument_evidence_unavailable' | 'tool_result_evidence_unavailable' | 'artifact_text_evidence_unavailable' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
     /**
      * Message
      */
@@ -4931,7 +5065,7 @@ export type EvalCaseDefinitionV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4968,7 +5102,7 @@ export type EvalCaseDefinitionV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5005,7 +5139,7 @@ export type EvalCaseDraftV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5038,7 +5172,7 @@ export type EvalCaseDraftV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
     /**
      * Description
      */
@@ -5103,7 +5237,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -7675,6 +7809,10 @@ export type EvaluationEvidencePolicySpec = {
      */
     event_projection?: 'runtime_public_alias_free_v1';
     /**
+     * Include Artifact Text
+     */
+    include_artifact_text?: boolean;
+    /**
      * Include Event Payloads
      */
     include_event_payloads?: false;
@@ -7729,7 +7867,7 @@ export type EvaluationPromotionCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -11366,7 +11504,7 @@ export type PromotionCaseV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -11622,6 +11760,60 @@ export type PublicJudgeReferenceV1 = {
 };
 
 /**
+ * PublishedArtifactDetail
+ */
+export type PublishedArtifactDetail = {
+    /**
+     * Content Type
+     */
+    content_type?: string | null;
+    /**
+     * Digest Required
+     */
+    digest_required: boolean;
+    /**
+     * Filename
+     */
+    filename?: string | null;
+    /**
+     * Kind
+     */
+    kind?: 'artifact';
+    /**
+     * Matching Count
+     */
+    matching_count?: number | null;
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Maximum Bytes
+     */
+    maximum_bytes?: number | null;
+    /**
+     * Min Count
+     */
+    min_count: number;
+    /**
+     * Minimum Bytes
+     */
+    minimum_bytes?: number | null;
+    /**
+     * Observation State
+     */
+    observation_state: 'available' | 'unavailable' | 'limit_exceeded' | 'unsupported' | 'truncated' | 'redacted' | 'malformed';
+    /**
+     * Scope
+     */
+    scope: 'session' | 'environment';
+    /**
+     * Text Required
+     */
+    text_required: boolean;
+};
+
+/**
  * PublishedAssertionResult
  */
 export type PublishedAssertionResult = {
@@ -11661,6 +11853,10 @@ export type PublishedAssertionResult = {
     } & PublishedProcessEventDetail) | ({
         kind: 'process_events_in_order';
     } & PublishedProcessEventsInOrderDetail) | ({
+        kind: 'workspace_file';
+    } & PublishedWorkspaceFileDetail) | ({
+        kind: 'artifact';
+    } & PublishedArtifactDetail) | ({
         kind: 'max_tool_calls';
     } & PublishedMaxToolCallsDetail) | ({
         kind: 'max_model_steps';
@@ -11776,7 +11972,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 7;
+    schema_version: 8;
     /**
      * Score
      */
@@ -12384,6 +12580,52 @@ export type PublishedUsageSummaryV1 = {
      * Total Tokens
      */
     total_tokens: string;
+};
+
+/**
+ * PublishedWorkspaceFileDetail
+ */
+export type PublishedWorkspaceFileDetail = {
+    /**
+     * Actual Present
+     */
+    actual_present?: boolean | null;
+    /**
+     * Actual Size Bytes
+     */
+    actual_size_bytes?: number | null;
+    /**
+     * Digest Matched
+     */
+    digest_matched?: boolean | null;
+    /**
+     * Digest Required
+     */
+    digest_required: boolean;
+    /**
+     * Expected Present
+     */
+    expected_present: boolean;
+    /**
+     * Kind
+     */
+    kind?: 'workspace_file';
+    /**
+     * Maximum Bytes
+     */
+    maximum_bytes?: number | null;
+    /**
+     * Minimum Bytes
+     */
+    minimum_bytes?: number | null;
+    /**
+     * Observation State
+     */
+    observation_state: 'available' | 'unavailable' | 'limit_exceeded' | 'unsupported' | 'truncated' | 'redacted' | 'malformed';
+    /**
+     * Path
+     */
+    path: string;
 };
 
 /**
@@ -15824,6 +16066,74 @@ export type WebSearchSource = {
      * Url
      */
     url: string;
+};
+
+/**
+ * WorkspaceFileAssertionSpec
+ *
+ * Require one declared workspace path to have bounded structural properties.
+ */
+export type WorkspaceFileAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'workspace_file';
+    /**
+     * Maximum Bytes
+     */
+    maximum_bytes?: number | null;
+    /**
+     * Minimum Bytes
+     */
+    minimum_bytes?: number | null;
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Present
+     */
+    present?: boolean;
+    /**
+     * Sha256
+     */
+    sha256?: string | null;
+};
+
+/**
+ * WorkspaceStructuralEvidenceV1
+ *
+ * One declared workspace path without retained content bytes.
+ */
+export type WorkspaceStructuralEvidenceV1 = {
+    /**
+     * Digest State
+     */
+    digest_state: 'complete' | 'limit_exceeded' | 'unavailable';
+    /**
+     * Path
+     */
+    path: string;
+    /**
+     * Sha256
+     */
+    sha256?: string | null;
+    /**
+     * State
+     */
+    state: 'present' | 'missing' | 'unavailable';
+    /**
+     * Total Bytes
+     */
+    total_bytes?: number | null;
 };
 
 export type ListAgentsApiAgentsGetData = {

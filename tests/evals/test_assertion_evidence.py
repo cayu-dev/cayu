@@ -472,7 +472,7 @@ def test_evidence_rejects_stale_revision_and_numeric_schema_version():
 
     wrong_version = view.model_dump(mode="python")
     wrong_version["schema_version"] = True
-    with pytest.raises(ValidationError, match="integer 4"):
+    with pytest.raises(ValidationError, match="integer 5"):
         type(view).model_validate(wrong_version)
 
     unknown_policy = view.model_dump(mode="python")

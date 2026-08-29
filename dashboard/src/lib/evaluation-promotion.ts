@@ -24,6 +24,8 @@ export const PROMOTION_ASSERTION_KINDS = [
   "tools_called_in_order",
   "process_event",
   "process_events_in_order",
+  "workspace_file",
+  "artifact",
   "max_tool_calls",
   "max_model_steps",
   "usage_recorded",
@@ -62,13 +64,10 @@ export type ProcessEventKind = (typeof PROCESS_EVENT_OPTIONS)[number][0]
 
 const PROCESS_EVENT_KINDS = new Set<string>(PROCESS_EVENT_OPTIONS.map(([kind]) => kind))
 
-type CapturedProcessEvidence = Pick<
-  CapturedEvaluationCandidateV1["evidence"],
-  "process_event_evidence_state" | "process_events"
->
+type CapturedAssertionEvidence = CapturedEvaluationCandidateV1["evidence"]
 
 function observedProcessOrder(
-  evidence: CapturedProcessEvidence,
+  evidence: CapturedAssertionEvidence,
 ): readonly ProcessEventKind[] | null {
   if (evidence.process_event_evidence_state !== "complete") return null
 
@@ -93,9 +92,13 @@ function observedProcessOrder(
   return evidence.process_events.filter((event) => selected.has(event))
 }
 
+function isPortableObservedByteCount(value: number | null | undefined): value is number {
+  return value != null && Number.isSafeInteger(value) && value >= 0 && value <= MAX_SAFE_COUNTER
+}
+
 export function capturedAssertionSuggestionUnavailable(
   kind: PromotionAssertionKind,
-  evidence: CapturedProcessEvidence,
+  evidence: CapturedAssertionEvidence,
 ): boolean {
   if (kind === "process_event") {
     return (
@@ -103,6 +106,26 @@ export function capturedAssertionSuggestionUnavailable(
     )
   }
   if (kind === "process_events_in_order") return observedProcessOrder(evidence) === null
+  if (kind === "workspace_file") {
+    return (
+      evidence.workspace_evidence_state !== "complete" ||
+      !(evidence.workspace_files ?? []).some(
+        (item) =>
+          item.state === "missing" ||
+          (item.state === "present" && isPortableObservedByteCount(item.total_bytes)),
+      )
+    )
+  }
+  if (kind === "artifact") {
+    const completeScopes = new Set(
+      (evidence.artifact_scopes ?? [])
+        .filter((item) => item.state === "complete")
+        .map((item) => item.scope),
+    )
+    return !(evidence.artifacts ?? []).some(
+      (item) => completeScopes.has(item.scope) && isPortableObservedByteCount(item.size_bytes),
+    )
+  }
   return false
 }
 
@@ -122,6 +145,8 @@ export const PROMOTION_ASSERTION_LABELS: Record<PromotionAssertionKind, string> 
   tools_called_in_order: "Tools called in order",
   process_event: "Process event count",
   process_events_in_order: "Process events in order",
+  workspace_file: "Workspace file structure",
+  artifact: "Artifact structure or text",
   max_tool_calls: "Maximum tool calls",
   max_model_steps: "Maximum model steps",
   usage_recorded: "Usage recorded",
@@ -375,6 +400,40 @@ function validateAssertion(assertion: PromotionAssertion): void {
       }
       for (const event of assertion.events) requireProcessEvent(event)
       return
+    case "workspace_file":
+      requireWorkspacePath(assertion.path)
+      requireOptionalByteRange(assertion.minimum_bytes, assertion.maximum_bytes, "Workspace size")
+      requireOptionalSha256(assertion.sha256, "Workspace digest")
+      if (
+        assertion.present === false &&
+        (assertion.minimum_bytes != null ||
+          assertion.maximum_bytes != null ||
+          assertion.sha256 != null)
+      ) {
+        throw new Error("An absent workspace file cannot require size or digest values.")
+      }
+      return
+    case "artifact":
+      if (
+        assertion.scope !== undefined &&
+        assertion.scope !== "session" &&
+        assertion.scope !== "environment"
+      ) {
+        throw new Error("Artifact scope must be session or environment.")
+      }
+      requireOptionalBoundedText(assertion.filename, "Artifact filename", 1_024, true)
+      requireOptionalPrintableAscii(assertion.content_type, "Artifact content type", 1_024)
+      requireOptionalByteRange(assertion.minimum_bytes, assertion.maximum_bytes, "Artifact size")
+      requireOptionalSha256(assertion.sha256, "Artifact digest")
+      requireOptionalBoundedText(assertion.text_contains, "Artifact text", 32_768, true)
+      if (
+        assertion.text_contains != null &&
+        new TextEncoder().encode(assertion.text_contains).byteLength > 65_536
+      ) {
+        throw new Error("Artifact text cannot exceed 65,536 UTF-8 bytes.")
+      }
+      requireRange(assertion.min_count ?? 1, assertion.max_count, "Artifact count", 256)
+      return
     case "max_tool_calls":
       requireInteger(assertion.maximum, "Maximum tool calls", 0, 4_096)
       return
@@ -435,6 +494,30 @@ export function createPromotionAssertion(
       return { id, kind, event: "tool_approval_requested", min_count: 1, max_count: null }
     case "process_events_in_order":
       return { id, kind, events: ["tool_approval_requested", "tool_approved"] }
+    case "workspace_file":
+      return {
+        id,
+        kind,
+        path: "output.txt",
+        present: true,
+        minimum_bytes: null,
+        maximum_bytes: null,
+        sha256: null,
+      }
+    case "artifact":
+      return {
+        id,
+        kind,
+        scope: "session",
+        filename: "report.txt",
+        content_type: null,
+        minimum_bytes: null,
+        maximum_bytes: null,
+        sha256: null,
+        text_contains: null,
+        min_count: 1,
+        max_count: null,
+      }
     case "max_tool_calls":
       return { id, kind, maximum: 1 }
     case "max_model_steps":
@@ -523,6 +606,78 @@ export function createCapturedEvaluationAssertion(
         )
       }
       return { ...assertion, events: [...events] }
+    }
+    case "workspace_file": {
+      const observed = (evidence.workspace_files ?? []).find(
+        (item) =>
+          item.state === "missing" ||
+          (item.state === "present" && isPortableObservedByteCount(item.total_bytes)),
+      )
+      if (evidence.workspace_evidence_state !== "complete" || observed === undefined) {
+        throw new Error("Complete captured workspace structure is required for this assertion.")
+      }
+      if (observed.state === "missing") {
+        return { ...assertion, path: observed.path, present: false }
+      }
+      return {
+        ...assertion,
+        path: observed.path,
+        present: true,
+        minimum_bytes: observed.total_bytes,
+        maximum_bytes: observed.total_bytes,
+        sha256: observed.digest_state === "complete" ? observed.sha256 : null,
+      }
+    }
+    case "artifact": {
+      const completeScopes = new Set(
+        (evidence.artifact_scopes ?? [])
+          .filter((item) => item.state === "complete")
+          .map((item) => item.scope),
+      )
+      const observed = (evidence.artifacts ?? []).find(
+        (item) => completeScopes.has(item.scope) && isPortableObservedByteCount(item.size_bytes),
+      )
+      if (observed === undefined) {
+        throw new Error("Complete captured artifact structure is required for this assertion.")
+      }
+      const structuralMatches = (evidence.artifacts ?? []).filter(
+        (item) =>
+          item.scope === observed.scope &&
+          item.filename === observed.filename &&
+          item.content_type === observed.content_type &&
+          item.size_bytes === observed.size_bytes,
+      )
+      const retainedDigest =
+        observed.digest_state === "complete" &&
+        observed.sha256 != null &&
+        structuralMatches.every((item) => item.digest_state === "complete")
+          ? observed.sha256
+          : null
+      const retainedText =
+        observed.text_state === "available" &&
+        observed.text != null &&
+        !isPythonBlank(observed.text) &&
+        durableTextLength(observed.text, "Observed artifact text") <= 32_768 &&
+        structuralMatches.every((item) => item.text_state === "available" && item.text != null)
+          ? observed.text
+          : null
+      const exactMatches = structuralMatches.filter(
+        (item) =>
+          (retainedDigest == null || item.sha256 === retainedDigest) &&
+          (retainedText == null || item.text?.includes(retainedText) === true),
+      ).length
+      return {
+        ...assertion,
+        scope: observed.scope,
+        filename: observed.filename,
+        content_type: observed.content_type,
+        minimum_bytes: observed.size_bytes,
+        maximum_bytes: observed.size_bytes,
+        sha256: retainedDigest,
+        text_contains: retainedText,
+        min_count: exactMatches,
+        max_count: exactMatches,
+      }
     }
     case "max_tool_calls":
       return evidence.tool_calls_started == null
@@ -616,6 +771,79 @@ function requireRange(
   if (maximum === null || maximum === undefined) return
   requireInteger(maximum, `${label} maximum`, 0, limit)
   if (maximum < minimum) throw new Error(`${label} maximum cannot be below its minimum.`)
+}
+
+function requireWorkspacePath(value: string): void {
+  const length = durableTextLength(value, "Workspace path")
+  const components = value.split("/")
+  if (
+    length < 1 ||
+    length > 1_024 ||
+    hasPythonOuterWhitespace(value) ||
+    value.startsWith("/") ||
+    value.normalize("NFC") !== value ||
+    hasNonportableWorkspaceCharacter(value) ||
+    components.some(
+      (component) =>
+        component.endsWith(" ") ||
+        component.endsWith(".") ||
+        /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu.test(component),
+    )
+  ) {
+    throw new Error("Workspace path must be a canonical relative POSIX path.")
+  }
+  if (components.some((component) => component === "" || component === "." || component === "..")) {
+    throw new Error("Workspace path must be a canonical relative POSIX path.")
+  }
+}
+
+function hasNonportableWorkspaceCharacter(value: string): boolean {
+  for (const character of value) {
+    if ((character.codePointAt(0) ?? 0) < 0x20 || '<>:"\\|?*'.includes(character)) return true
+  }
+  return false
+}
+
+function requireOptionalByteRange(
+  minimum: number | null | undefined,
+  maximum: number | null | undefined,
+  label: string,
+): void {
+  if (minimum != null) requireInteger(minimum, `${label} minimum`, 0, MAX_SAFE_COUNTER)
+  if (maximum != null) requireInteger(maximum, `${label} maximum`, 0, MAX_SAFE_COUNTER)
+  if (minimum != null && maximum != null && maximum < minimum) {
+    throw new Error(`${label} maximum cannot be below its minimum.`)
+  }
+}
+
+function requireOptionalSha256(value: string | null | undefined, label: string): void {
+  if (value != null && !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest.`)
+  }
+}
+
+function requireOptionalBoundedText(
+  value: string | null | undefined,
+  label: string,
+  maximum: number,
+  rejectBlank: boolean,
+): void {
+  if (value == null) return
+  const length = durableTextLength(value, label)
+  if (length < 1 || length > maximum || (rejectBlank && isPythonBlank(value))) {
+    throw new Error(`${label} must contain 1 to ${maximum.toLocaleString("en-US")} characters.`)
+  }
+}
+
+function requireOptionalPrintableAscii(
+  value: string | null | undefined,
+  label: string,
+  maximum: number,
+): void {
+  requireOptionalBoundedText(value, label, maximum, true)
+  if (value != null && !/^[\x20-\x7e]+$/.test(value)) {
+    throw new Error(`${label} must contain printable ASCII characters only.`)
+  }
 }
 
 function requireInteger(value: number, label: string, minimum: number, maximum: number): void {

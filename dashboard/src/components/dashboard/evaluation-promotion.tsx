@@ -1279,7 +1279,12 @@ function AssertionEditor({
         </Button>
       </div>
       <div className="mt-3">
-        <AssertionFields assertion={assertion} update={update} index={index} />
+        <AssertionFields
+          assertion={assertion}
+          update={update}
+          index={index}
+          evidencePolicy={evidencePolicy}
+        />
       </div>
       <div className="mt-3">
         <label className={LABEL_CLASS} htmlFor={`promotion-assertion-${index}-description`}>
@@ -1299,10 +1304,12 @@ function AssertionFields({
   assertion,
   update,
   index,
+  evidencePolicy,
 }: {
   assertion: PromotionAssertion
   update: (assertion: PromotionAssertion) => void
   index: number
+  evidencePolicy?: EvaluationEvidencePolicySpec
 }) {
   const id = (name: string) => `promotion-assertion-${index}-${name}`
   switch (assertion.kind) {
@@ -1571,6 +1578,167 @@ function AssertionFields({
           </p>
         </div>
       )
+    case "workspace_file":
+      return (
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <PromotionField label="Relative workspace path" id={id("path")}>
+              <Input
+                id={id("path")}
+                className="font-mono"
+                value={assertion.path}
+                onChange={(event) => update({ ...assertion, path: event.target.value })}
+              />
+            </PromotionField>
+            <label className="mt-5 flex h-8 items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={assertion.present ?? true}
+                onChange={(event) =>
+                  update({
+                    ...assertion,
+                    present: event.target.checked,
+                    minimum_bytes: event.target.checked ? assertion.minimum_bytes : null,
+                    maximum_bytes: event.target.checked ? assertion.maximum_bytes : null,
+                    sha256: event.target.checked ? assertion.sha256 : null,
+                  })
+                }
+              />
+              File must be present
+            </label>
+          </div>
+          {(assertion.present ?? true) && (
+            <>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <NullableIntegerField
+                  label="Minimum bytes"
+                  id={id("minimum-bytes")}
+                  placeholder="No minimum"
+                  value={assertion.minimum_bytes}
+                  onChange={(minimum_bytes) => update({ ...assertion, minimum_bytes })}
+                />
+                <NullableIntegerField
+                  label="Maximum bytes"
+                  id={id("maximum-bytes")}
+                  value={assertion.maximum_bytes}
+                  onChange={(maximum_bytes) => update({ ...assertion, maximum_bytes })}
+                />
+              </div>
+              <PromotionField label="Whole-file SHA-256 (optional)" id={id("sha256")}>
+                <Input
+                  id={id("sha256")}
+                  className="font-mono"
+                  value={assertion.sha256 ?? ""}
+                  onChange={(event) => update({ ...assertion, sha256: event.target.value || null })}
+                />
+              </PromotionField>
+            </>
+          )}
+          <p className="text-xs text-muted-foreground">
+            Cayu retains only presence, byte size, and an optional whole-file digest. Workspace
+            contents never enter portable eval evidence.
+          </p>
+        </div>
+      )
+    case "artifact": {
+      const artifactTextEnabled = evidencePolicy?.include_artifact_text === true
+      const artifactTextLocked = !artifactTextEnabled && assertion.text_contains == null
+      return (
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <PromotionField label="Artifact scope" id={id("scope")}>
+              <select
+                id={id("scope")}
+                className={SELECT_CLASS}
+                value={assertion.scope ?? "session"}
+                onChange={(event) =>
+                  update({
+                    ...assertion,
+                    scope: event.target.value as "session" | "environment",
+                  })
+                }
+              >
+                <option value="session">Current session</option>
+                <option value="environment">Current environment</option>
+              </select>
+            </PromotionField>
+            <PromotionField label="Filename (optional)" id={id("filename")}>
+              <Input
+                id={id("filename")}
+                value={assertion.filename ?? ""}
+                onChange={(event) => update({ ...assertion, filename: event.target.value || null })}
+              />
+            </PromotionField>
+            <PromotionField label="Content type (optional)" id={id("content-type")}>
+              <Input
+                id={id("content-type")}
+                className="font-mono"
+                placeholder="text/plain"
+                value={assertion.content_type ?? ""}
+                onChange={(event) =>
+                  update({ ...assertion, content_type: event.target.value || null })
+                }
+              />
+            </PromotionField>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <NullableIntegerField
+              label="Minimum bytes"
+              id={id("minimum-bytes")}
+              placeholder="No minimum"
+              value={assertion.minimum_bytes}
+              onChange={(minimum_bytes) => update({ ...assertion, minimum_bytes })}
+            />
+            <NullableIntegerField
+              label="Maximum bytes"
+              id={id("maximum-bytes")}
+              value={assertion.maximum_bytes}
+              onChange={(maximum_bytes) => update({ ...assertion, maximum_bytes })}
+            />
+            <IntegerField
+              label="Minimum count"
+              id={id("minimum-count")}
+              value={assertion.min_count ?? 1}
+              onChange={(min_count) => update({ ...assertion, min_count })}
+            />
+            <NullableIntegerField
+              label="Maximum count"
+              id={id("maximum-count")}
+              value={assertion.max_count}
+              onChange={(max_count) => update({ ...assertion, max_count })}
+            />
+          </div>
+          <PromotionField label="Whole-artifact SHA-256 (optional)" id={id("sha256")}>
+            <Input
+              id={id("sha256")}
+              className="font-mono"
+              value={assertion.sha256 ?? ""}
+              onChange={(event) => update({ ...assertion, sha256: event.target.value || null })}
+            />
+          </PromotionField>
+          <PromotionField label="Public artifact text contains (optional)" id={id("text")}>
+            <Textarea
+              id={id("text")}
+              className="min-h-20 font-mono"
+              disabled={artifactTextLocked}
+              placeholder={
+                artifactTextEnabled
+                  ? "Expected bounded text"
+                  : "The selected target does not retain public artifact text"
+              }
+              value={assertion.text_contains ?? ""}
+              onChange={(event) =>
+                update({ ...assertion, text_contains: event.target.value || null })
+              }
+            />
+          </PromotionField>
+          <p className="text-xs text-muted-foreground">
+            Metadata is structural. Text matching is available only when the trusted target profile
+            explicitly retains bounded, application-redacted public artifact text.
+          </p>
+        </div>
+      )
+    }
     case "max_tool_calls":
       return (
         <IntegerField
@@ -1757,11 +1925,13 @@ function NullableIntegerField({
   id,
   value,
   onChange,
+  placeholder = "No maximum",
 }: {
   label: string
   id: string
   value: number | null | undefined
   onChange: (value: number | null) => void
+  placeholder?: string
 }) {
   return (
     <PromotionField label={label} id={id}>
@@ -1770,7 +1940,7 @@ function NullableIntegerField({
         type="number"
         min={0}
         step={1}
-        placeholder="No maximum"
+        placeholder={placeholder}
         value={value ?? ""}
         onChange={(event) =>
           onChange(event.target.value === "" ? null : Number(event.target.value))

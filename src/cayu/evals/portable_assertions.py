@@ -4,11 +4,13 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from cayu.artifacts import ArtifactScope
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
     _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
+    ArtifactAssertionSpec,
     AssertionSpec,
     EvaluationEvidencePolicySpec,
     JudgePrivacyPolicyV1,
@@ -24,6 +26,7 @@ from cayu.evals.corpus import (
     StructuredModelJudgeAssertionSpec,
     ToolArgumentsContainAssertionSpec,
     ToolResultContainsAssertionSpec,
+    WorkspaceFileAssertionSpec,
     _bounded_durable_text,
     _content_revision,
     _model_python_input,
@@ -49,7 +52,12 @@ from cayu.evals.judges import (
     _render_transcript,
 )
 from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
-from cayu.evals.models import EvalAssertionResult, EvalContext
+from cayu.evals.models import (
+    ArtifactProbeRequirement,
+    EvalAssertionResult,
+    EvalContext,
+    ProbeRequirements,
+)
 from cayu.evals.portable_evaluation import _evaluate_validated_assertion_spec
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
@@ -321,6 +329,23 @@ class _CompiledPortableAssertion(EvalAssertion):
         if type(spec) is ProcessEventsInOrderAssertionSpec:
             return not _ROOT_TERMINAL_PROCESS_EVENTS.isdisjoint(spec.events)
         return False
+
+    def required_probes(self) -> ProbeRequirements:
+        spec = self._spec
+        if type(spec) is WorkspaceFileAssertionSpec:
+            return ProbeRequirements(workspace_structure_paths=frozenset({spec.path}))
+        if type(spec) is ArtifactAssertionSpec:
+            requirement = ArtifactProbeRequirement(
+                scope=ArtifactScope(spec.scope),
+                filename=spec.filename,
+                content_type=spec.content_type,
+                minimum_bytes=spec.minimum_bytes,
+                maximum_bytes=spec.maximum_bytes,
+                capture_digest=spec.sha256 is not None,
+                capture_text=spec.text_contains is not None,
+            )
+            return ProbeRequirements(artifact_requirements=(requirement,))
+        return ProbeRequirements()
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         currencies = (
@@ -957,6 +982,12 @@ def compile_assertion_spec(
         and not validated_policy.include_tool_results
     ):
         raise ValueError("Tool-result assertions require explicitly retained result evidence.")
+    if (
+        type(validated_spec) is ArtifactAssertionSpec
+        and validated_spec.text_contains is not None
+        and not validated_policy.include_artifact_text
+    ):
+        raise ValueError("Artifact-text assertions require explicitly retained artifact text.")
     if type(validated_spec) in {
         ModelJudgeAssertionSpec,
         StructuredModelJudgeAssertionSpec,
@@ -1014,6 +1045,14 @@ def _compile_corpus_assertion_specs(
         validated_policy.include_tool_results
     ):
         raise ValueError("Tool-result assertions require explicitly retained result evidence.")
+    if (
+        any(
+            type(spec) is ArtifactAssertionSpec and spec.text_contains is not None
+            for spec in validated_specs
+        )
+        and not validated_policy.include_artifact_text
+    ):
+        raise ValueError("Artifact-text assertions require explicitly retained artifact text.")
     model_judge_bindings: dict[str, _TrustedModelJudgeBinding] = {}
     for binding in trusted_model_judges:
         if type(binding) is not _TrustedModelJudgeBinding:

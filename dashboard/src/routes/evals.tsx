@@ -2429,6 +2429,11 @@ function ResultInspector({
                             className="mt-3"
                             detail={presentedAssertion.process}
                           />
+                        ) : presentedAssertion?.structure ? (
+                          <StructureAssertionDetails
+                            className="mt-3"
+                            detail={presentedAssertion.structure}
+                          />
                         ) : (
                           <details className="mt-2 text-xs">
                             <summary className="cursor-pointer text-primary">
@@ -2601,6 +2606,9 @@ function PresentedAssertions({ assertions }: { assertions: Array<EvalAssertionPr
           {assertion.process && (
             <ProcessAssertionDetails className="mt-3" detail={assertion.process} />
           )}
+          {assertion.structure && (
+            <StructureAssertionDetails className="mt-3" detail={assertion.structure} />
+          )}
         </div>
       ))}
     </div>
@@ -2722,6 +2730,87 @@ function formatCountRange(minimum: number, maximum: number | null | undefined): 
   if (maximum === minimum) return String(minimum)
   if (maximum == null) return `at least ${minimum}`
   return `${minimum} to ${maximum}`
+}
+
+function StructureAssertionDetails({
+  detail,
+  className,
+}: {
+  detail: NonNullable<EvalAssertionPresentationV1["structure"]>
+  className?: string
+}) {
+  const workspaceDetail = "path" in detail
+  const facts: Array<[string, string]> = workspaceDetail
+    ? [
+        ["Path", detail.path],
+        ["Evidence", detail.observation_state.replaceAll("_", " ")],
+        ["Expected", detail.expected_present ? "present" : "absent"],
+        [
+          "Observed",
+          detail.actual_present == null
+            ? "unavailable"
+            : detail.actual_present
+              ? "present"
+              : "absent",
+        ],
+        ["Required size", formatOptionalByteRange(detail.minimum_bytes, detail.maximum_bytes)],
+        [
+          "Observed size",
+          detail.actual_size_bytes == null ? "unavailable" : formatBytes(detail.actual_size_bytes),
+        ],
+        [
+          "Digest",
+          !detail.digest_required
+            ? "not required"
+            : detail.digest_matched == null
+              ? "unavailable"
+              : detail.digest_matched
+                ? "matched"
+                : "mismatch",
+        ],
+      ]
+    : [
+        ["Scope", detail.scope],
+        ["Evidence", detail.observation_state.replaceAll("_", " ")],
+        ["Filename", detail.filename ?? "any"],
+        ["Content type", detail.content_type ?? "any"],
+        ["Required size", formatOptionalByteRange(detail.minimum_bytes, detail.maximum_bytes)],
+        ["Required count", formatCountRange(detail.min_count, detail.max_count)],
+        [
+          "Matching artifacts",
+          detail.matching_count == null ? "unavailable" : String(detail.matching_count),
+        ],
+        ["Digest", detail.digest_required ? "required" : "not required"],
+        ["Public text", detail.text_required ? "required" : "not required"],
+      ]
+  return (
+    <div
+      className={`rounded-lg border border-border bg-muted/20 p-3 ${className ?? ""}`}
+      data-testid="eval-structure-detail"
+    >
+      <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+        {facts.map(([label, value]) => (
+          <RunFact key={label} label={label} value={value} />
+        ))}
+      </div>
+      <p className="mt-3 text-xs text-muted-foreground">
+        {workspaceDetail
+          ? "Portable workspace evidence contains structure only; file bytes are never retained."
+          : "Published artifact detail excludes artifact IDs, store identity, arbitrary metadata, and content."}
+      </p>
+    </div>
+  )
+}
+
+function formatOptionalByteRange(
+  minimum: number | null | undefined,
+  maximum: number | null | undefined,
+): string {
+  if (minimum == null && maximum == null) return "any"
+  if (minimum != null && maximum === minimum) return formatBytes(minimum)
+  if (minimum == null) return `at most ${formatBytes(maximum ?? 0)}`
+  if (maximum == null) return `at least ${formatBytes(minimum)}`
+  return `${formatBytes(minimum)} to ${formatBytes(maximum)}`
 }
 
 function StructuredJudgeDetails({

@@ -89,6 +89,30 @@ guard.
 
 ## Unreleased
 
+### Evals can verify workspace and artifact outputs without Python assertions
+
+Portable suites and Control Plane now author workspace-file presence/absence,
+byte-range, and whole-file SHA-256 expectations plus session/environment
+artifact filename, content-type, byte-range, digest, count, and optional public
+text expectations. Fresh execution, captured-session drafts, stores, SDK/CLI,
+JSON/HTML reports, result presentation, baselines, and comparison retain one
+exact assertion and evidence-policy identity.
+
+Workspace bytes never enter portable evidence. Cayu reads only declared paths
+and retains structural facts; incomplete reads never publish prefix hashes as
+whole-object identity. Artifact listing is owner-filtered, unrelated metadata
+is discarded, and only structurally prefiltered candidates are read under fixed
+item and byte ceilings. Artifact text is disabled by default and requires a
+trusted target profile with `include_artifact_text=True`; supported UTF-8 text
+crosses the application redactor before bounded retention. Missing, unavailable,
+unsupported, redacted, malformed, truncated, and limit-exceeded observations
+remain distinct.
+
+Assertion evidence advances to schema version 5, trajectories to version 5,
+eval runs to version 9, published results to version 8, and the
+server/dashboard contract from version 36 to 37. Upgrade servers, generated
+clients, and dashboards together. No storage migration is required.
+
 ### Classified transient provider failures retry by default
 
 `RetryPolicy()` now permits five total attempts instead of disabling retries.

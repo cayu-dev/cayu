@@ -4503,6 +4503,137 @@
         "title": "ApplicationDefaultsManifest",
         "type": "object"
       },
+      "ArtifactAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require bounded structural or explicitly retained public-text artifact evidence.",
+        "properties": {
+          "content_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Type"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "artifact",
+            "default": "artifact",
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_count": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Count"
+          },
+          "maximum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Bytes"
+          },
+          "min_count": {
+            "default": 1,
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Min Count",
+            "type": "integer"
+          },
+          "minimum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Bytes"
+          },
+          "scope": {
+            "default": "session",
+            "enum": [
+              "session",
+              "environment"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "text_contains": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text Contains"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ArtifactAssertionSpec",
+        "type": "object"
+      },
       "ArtifactReadResponse": {
         "additionalProperties": false,
         "properties": {
@@ -4551,6 +4682,34 @@
         ],
         "title": "ArtifactScope",
         "type": "string"
+      },
+      "ArtifactScopeEvidenceV1": {
+        "additionalProperties": false,
+        "properties": {
+          "scope": {
+            "enum": [
+              "session",
+              "environment"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "complete",
+              "unavailable",
+              "limit_exceeded"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "state"
+        ],
+        "title": "ArtifactScopeEvidenceV1",
+        "type": "object"
       },
       "ArtifactStoreDiagnostic": {
         "additionalProperties": false,
@@ -4626,6 +4785,94 @@
           "truncated"
         ],
         "title": "ArtifactStoreDiagnostics",
+        "type": "object"
+      },
+      "ArtifactStructuralEvidenceV1": {
+        "additionalProperties": false,
+        "description": "One content-minimized artifact observation with no private store identity.",
+        "properties": {
+          "content_type": {
+            "title": "Content Type",
+            "type": "string"
+          },
+          "digest_state": {
+            "enum": [
+              "complete",
+              "limit_exceeded",
+              "unavailable"
+            ],
+            "title": "Digest State",
+            "type": "string"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "observation_index": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Observation Index",
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "session",
+              "environment"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "size_bytes": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "text_state": {
+            "enum": [
+              "available",
+              "unavailable",
+              "unsupported",
+              "truncated",
+              "redacted",
+              "malformed"
+            ],
+            "title": "Text State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation_index",
+          "scope",
+          "filename",
+          "content_type",
+          "size_bytes",
+          "digest_state",
+          "text_state"
+        ],
+        "title": "ArtifactStructuralEvidenceV1",
         "type": "object"
       },
       "ArtifactsResponse": {
@@ -4731,6 +4978,22 @@
         "additionalProperties": false,
         "description": "The bounded, content-minimized data consumed by every portable assertion.",
         "properties": {
+          "artifact_scopes": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactScopeEvidenceV1"
+            },
+            "maxItems": 2,
+            "title": "Artifact Scopes",
+            "type": "array"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactStructuralEvidenceV1"
+            },
+            "maxItems": 256,
+            "title": "Artifacts",
+            "type": "array"
+          },
           "child_evidence_state": {
             "enum": [
               "complete",
@@ -4884,8 +5147,8 @@
             "title": "Root Status"
           },
           "schema_version": {
-            "const": 4,
-            "default": 4,
+            "const": 5,
+            "default": 5,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -4958,6 +5221,24 @@
             ],
             "title": "Usage Evidence State",
             "type": "string"
+          },
+          "workspace_evidence_state": {
+            "default": "unavailable",
+            "enum": [
+              "complete",
+              "unavailable",
+              "limit_exceeded"
+            ],
+            "title": "Workspace Evidence State",
+            "type": "string"
+          },
+          "workspace_files": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceStructuralEvidenceV1"
+            },
+            "maxItems": 64,
+            "title": "Workspace Files",
+            "type": "array"
           }
         },
         "required": [
@@ -5349,6 +5630,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -5364,7 +5646,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -5398,6 +5681,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -9102,6 +9391,20 @@
             ],
             "title": "Score"
           },
+          "structure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedWorkspaceFileDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedArtifactDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Structure"
+          },
           "structured_judge": {
             "anyOf": [
               {
@@ -9361,6 +9664,7 @@
               "execution_profile_changed",
               "tool_argument_evidence_unavailable",
               "tool_result_evidence_unavailable",
+              "artifact_text_evidence_unavailable",
               "simple_launch_not_ready",
               "scenario_execution_unavailable",
               "scenario_launch_not_ready"
@@ -9838,6 +10142,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -9853,7 +10158,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -9887,6 +10193,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -9983,6 +10295,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -9999,7 +10312,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -10033,6 +10347,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10132,6 +10452,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -10147,7 +10468,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -10181,6 +10503,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10272,6 +10600,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -10288,7 +10617,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -10322,6 +10652,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10473,6 +10809,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -10489,7 +10826,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -10523,6 +10861,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -15440,6 +15784,11 @@
             "title": "Event Projection",
             "type": "string"
           },
+          "include_artifact_text": {
+            "default": false,
+            "title": "Include Artifact Text",
+            "type": "boolean"
+          },
           "include_event_payloads": {
             "const": false,
             "default": false,
@@ -15517,6 +15866,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -15532,7 +15882,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -15566,6 +15917,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -22478,6 +22835,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "artifact": "#/components/schemas/ArtifactAssertionSpec",
                   "child_status": "#/components/schemas/ChildStatusAssertionSpec",
                   "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
                   "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
@@ -22493,7 +22851,8 @@
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
-                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec",
+                  "workspace_file": "#/components/schemas/WorkspaceFileAssertionSpec"
                 },
                 "propertyName": "kind"
               },
@@ -22527,6 +22886,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/WorkspaceFileAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ArtifactAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -22962,6 +23327,135 @@
         "title": "PublicJudgeReferenceV1",
         "type": "object"
       },
+      "PublishedArtifactDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "content_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Type"
+          },
+          "digest_required": {
+            "title": "Digest Required",
+            "type": "boolean"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "kind": {
+            "const": "artifact",
+            "default": "artifact",
+            "title": "Kind",
+            "type": "string"
+          },
+          "matching_count": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matching Count"
+          },
+          "max_count": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Count"
+          },
+          "maximum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Bytes"
+          },
+          "min_count": {
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Min Count",
+            "type": "integer"
+          },
+          "minimum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Bytes"
+          },
+          "observation_state": {
+            "enum": [
+              "available",
+              "unavailable",
+              "limit_exceeded",
+              "unsupported",
+              "truncated",
+              "redacted",
+              "malformed"
+            ],
+            "title": "Observation State",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "session",
+              "environment"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "text_required": {
+            "title": "Text Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "scope",
+          "digest_required",
+          "text_required",
+          "observation_state",
+          "min_count"
+        ],
+        "title": "PublishedArtifactDetail",
+        "type": "object"
+      },
       "PublishedAssertionResult": {
         "additionalProperties": false,
         "properties": {
@@ -22986,6 +23480,7 @@
           "detail": {
             "discriminator": {
               "mapping": {
+                "artifact": "#/components/schemas/PublishedArtifactDetail",
                 "child_status": "#/components/schemas/PublishedChildStatusDetail",
                 "final_output_contains": "#/components/schemas/PublishedFinalOutputContainsDetail",
                 "final_output_equals": "#/components/schemas/PublishedFinalOutputEqualsDetail",
@@ -23002,7 +23497,8 @@
                 "tool_called": "#/components/schemas/PublishedToolCalledDetail",
                 "tool_result_contains": "#/components/schemas/PublishedToolResultContainsDetail",
                 "tools_called_in_order": "#/components/schemas/PublishedToolsCalledInOrderDetail",
-                "usage_recorded": "#/components/schemas/PublishedUsageRecordedDetail"
+                "usage_recorded": "#/components/schemas/PublishedUsageRecordedDetail",
+                "workspace_file": "#/components/schemas/PublishedWorkspaceFileDetail"
               },
               "propertyName": "kind"
             },
@@ -23036,6 +23532,12 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedProcessEventsInOrderDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedWorkspaceFileDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedArtifactDetail"
               },
               {
                 "$ref": "#/components/schemas/PublishedMaxToolCallsDetail"
@@ -23260,7 +23762,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 7,
+            "const": 8,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -24528,6 +25030,111 @@
           "total_tokens"
         ],
         "title": "PublishedUsageSummaryV1",
+        "type": "object"
+      },
+      "PublishedWorkspaceFileDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "actual_present": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Present"
+          },
+          "actual_size_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Size Bytes"
+          },
+          "digest_matched": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest Matched"
+          },
+          "digest_required": {
+            "title": "Digest Required",
+            "type": "boolean"
+          },
+          "expected_present": {
+            "title": "Expected Present",
+            "type": "boolean"
+          },
+          "kind": {
+            "const": "workspace_file",
+            "default": "workspace_file",
+            "title": "Kind",
+            "type": "string"
+          },
+          "maximum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Bytes"
+          },
+          "minimum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Bytes"
+          },
+          "observation_state": {
+            "enum": [
+              "available",
+              "unavailable",
+              "limit_exceeded",
+              "unsupported",
+              "truncated",
+              "redacted",
+              "malformed"
+            ],
+            "title": "Observation State",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "expected_present",
+          "digest_required",
+          "observation_state"
+        ],
+        "title": "PublishedWorkspaceFileDetail",
         "type": "object"
       },
       "QualityEvidenceReference": {
@@ -26214,7 +26821,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "36",
+            "default": "37",
             "title": "Contract Version",
             "type": "string"
           },
@@ -30713,7 +31320,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "36",
+            "default": "37",
             "title": "Contract Version",
             "type": "string"
           }
@@ -30827,6 +31434,144 @@
           "url"
         ],
         "title": "WebSearchSource",
+        "type": "object"
+      },
+      "WorkspaceFileAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require one declared workspace path to have bounded structural properties.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "workspace_file",
+            "default": "workspace_file",
+            "title": "Kind",
+            "type": "string"
+          },
+          "maximum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Bytes"
+          },
+          "minimum_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Bytes"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "present": {
+            "default": true,
+            "title": "Present",
+            "type": "boolean"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "title": "WorkspaceFileAssertionSpec",
+        "type": "object"
+      },
+      "WorkspaceStructuralEvidenceV1": {
+        "additionalProperties": false,
+        "description": "One declared workspace path without retained content bytes.",
+        "properties": {
+          "digest_state": {
+            "enum": [
+              "complete",
+              "limit_exceeded",
+              "unavailable"
+            ],
+            "title": "Digest State",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "state": {
+            "enum": [
+              "present",
+              "missing",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "total_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Bytes"
+          }
+        },
+        "required": [
+          "path",
+          "state",
+          "digest_state"
+        ],
+        "title": "WorkspaceStructuralEvidenceV1",
         "type": "object"
       }
     }
