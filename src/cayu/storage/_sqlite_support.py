@@ -495,6 +495,16 @@ _BASELINE_DDL = """
         PRIMARY KEY (task_id, idempotency_key)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_task_interrupted_handoff_receipts (
+        task_id TEXT NOT NULL,
+        handoff_id TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        request_json TEXT NOT NULL CHECK (json_valid(request_json)),
+        task_json TEXT NOT NULL CHECK (json_valid(task_json)),
+        committed_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, handoff_id)
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_task_retry_settlements (
         task_id TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
@@ -3249,6 +3259,20 @@ _MIGRATION_STEPS: dict[int, str] = {
             ) ON DELETE RESTRICT
         );
     """,
+    70: """
+        CREATE TABLE IF NOT EXISTS cayu_task_interrupted_handoff_receipts (
+            task_id TEXT NOT NULL,
+            handoff_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            request_json TEXT NOT NULL CHECK (json_valid(request_json)),
+            task_json TEXT NOT NULL CHECK (json_valid(task_json)),
+            committed_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, handoff_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_interrupted_handoff_recovery
+            ON cayu_tasks(status, lease_expires_at, id);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -4817,6 +4841,8 @@ def reconcile_schema(
         _validate_revision_69_work_context_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
+    if app_min_supported >= 70:
+        _validate_interrupted_task_handoff_schema(connection)
     if app_min_supported >= 39:
         _validate_task_invocation_column(connection)
     if app_min_supported >= 41:
@@ -6342,6 +6368,37 @@ def _validate_task_terminalization_receipt_table(
         raise RuntimeError(
             "SQLite task terminalization receipt table conflicts with Cayu's "
             "revision-38 durability contract. Run `cayu storage migrate` or restore "
+            "the database from a known-good backup."
+        )
+
+
+def _validate_interrupted_task_handoff_schema(connection: sqlite3.Connection) -> None:
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_task_interrupted_handoff_receipts)")
+    )
+    expected = (
+        ("task_id", "TEXT", 1, 1),
+        ("handoff_id", "TEXT", 1, 2),
+        ("request_sha256", "TEXT", 1, 0),
+        ("request_json", "TEXT", 1, 0),
+        ("task_json", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+    )
+    index_columns = tuple(
+        str(row[2])
+        for row in connection.execute(
+            "PRAGMA index_info(idx_cayu_tasks_interrupted_handoff_recovery)"
+        )
+    )
+    if columns != expected or index_columns != (
+        "status",
+        "lease_expires_at",
+        "id",
+    ):
+        raise RuntimeError(
+            "SQLite interrupted-task handoff storage conflicts with Cayu's "
+            "revision-70 durability contract. Run `cayu storage migrate` or restore "
             "the database from a known-good backup."
         )
 
@@ -7970,6 +8027,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_judge_calibration_schema(connection)
         if rev.revision == 69:
             _validate_revision_69_work_context_schema(connection)
+        if rev.revision == 70:
+            _validate_interrupted_task_handoff_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -418,6 +418,9 @@ from cayu.runtime.tasks import (
     TaskCancellationReconciliationResult,
     TaskClaimLost,
     TaskCreate,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
     TaskInvocationSnapshot,
     TaskOperationalSnapshot,
     TaskOrder,
@@ -459,12 +462,14 @@ from cayu.runtime.tasks import (
     _reconciled_task_retry_cancellation,
     _rejected_task_cancellation_reconciliation,
     _rejected_task_retry_cancellation_reconciliation,
+    _replay_interrupted_task_handoff_receipt,
     _replay_task_cancellation_reconciliation,
     _replay_task_cancellation_reconciliation_rejection,
     _replay_task_retry_cancellation_reconciliation,
     _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
+    _require_interrupted_task_handoff_authority,
     _running_task_from_create,
     _settled_task_retry_attempt,
     _task_cancellation_reconciliation_conflict,
@@ -493,6 +498,9 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_interrupted_task_handoff,
+    prepare_interrupted_task_handoff_candidate_page,
+    prepare_interrupted_task_handoff_receipt_lookup,
     prepare_task_cancellation_reconciliation,
     prepare_task_retry_cancellation_reconciliation,
     prepare_task_retry_settlement,
@@ -597,7 +605,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 62
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 66
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 70
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -12526,6 +12534,7 @@ class SQLiteTaskStore(TaskStore):
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -15643,6 +15652,183 @@ class SQLiteTaskStore(TaskStore):
                 row=row,
             )
 
+    async def release_interrupted_task_worker(
+        self,
+        request: TaskInterruptedHandoffRequest,
+    ) -> TaskInterruptedHandoffReceipt:
+        return await self._settle_interrupted_task_handoff(
+            request,
+            recover_expired=False,
+        )
+
+    async def recover_interrupted_task_worker(
+        self,
+        request: TaskInterruptedHandoffRequest,
+    ) -> TaskInterruptedHandoffReceipt:
+        return await self._settle_interrupted_task_handoff(
+            request,
+            recover_expired=True,
+        )
+
+    async def _settle_interrupted_task_handoff(
+        self,
+        request: TaskInterruptedHandoffRequest,
+        *,
+        recover_expired: bool,
+    ) -> TaskInterruptedHandoffReceipt:
+        request, request_sha256 = prepare_interrupted_task_handoff(request)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                receipt_row = self._connection.execute(
+                    "SELECT request_sha256, request_json, task_json, committed_at "
+                    "FROM cayu_task_interrupted_handoff_receipts "
+                    "WHERE task_id = ? AND handoff_id = ?",
+                    (request.task_id, request.handoff_id),
+                ).fetchone()
+                if receipt_row is not None:
+                    receipt = _sqlite_interrupted_task_handoff_receipt(
+                        task_id=request.task_id,
+                        handoff_id=request.handoff_id,
+                        row=receipt_row,
+                    )
+                    replayed = _replay_interrupted_task_handoff_receipt(
+                        request=request,
+                        request_sha256=request_sha256,
+                        receipt=receipt,
+                    )
+                    self._connection.commit()
+                    return replayed
+
+                task = self._require_task_unlocked(request.task_id)
+                self._raise_if_governed_work_attempt_admission(
+                    request.task_id,
+                    "Admitted work attempts do not use interrupted-task handoff release.",
+                )
+                now = datetime.now(UTC)
+                _require_interrupted_task_handoff_authority(
+                    task,
+                    request,
+                    now=now,
+                    recover_expired=recover_expired,
+                )
+                lease_comparison = "<=" if recover_expired else ">"
+                cursor = self._connection.execute(
+                    f"""
+                    UPDATE cayu_tasks
+                    SET worker_id = NULL, lease_expires_at = NULL, updated_at = ?
+                    WHERE id = ?
+                      AND status = ?
+                      AND session_id = ?
+                      AND session_instance_id = ?
+                      AND worker_id = ?
+                      AND lease_expires_at = ?
+                      AND lease_expires_at {lease_comparison} ?
+                    """,
+                    (
+                        sqlite_support.format_datetime(now),
+                        request.task_id,
+                        str(TaskStatus.RUNNING),
+                        request.session_id,
+                        request.session_instance_id,
+                        request.worker_id,
+                        sqlite_support.format_datetime(request.lease_expires_at),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise TaskInterruptedHandoffConflict(
+                        "Interrupted-task handoff lost its exact durable authority."
+                    )
+                released = self._require_task_unlocked(request.task_id)
+                receipt = TaskInterruptedHandoffReceipt(
+                    request=request,
+                    request_sha256=request_sha256,
+                    task=released,
+                    committed_at=now,
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_task_interrupted_handoff_receipts "
+                    "(task_id, handoff_id, request_sha256, request_json, "
+                    "task_json, committed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        request.task_id,
+                        request.handoff_id,
+                        request_sha256,
+                        sqlite_support.json_dumps(request.model_dump(mode="json")),
+                        sqlite_support.json_dumps(released.model_dump(mode="json")),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+                self._connection.commit()
+                return receipt
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def load_interrupted_task_handoff_receipt(
+        self,
+        task_id: str,
+        handoff_id: str,
+    ) -> TaskInterruptedHandoffReceipt | None:
+        task_id, handoff_id = prepare_interrupted_task_handoff_receipt_lookup(
+            task_id,
+            handoff_id,
+        )
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT request_sha256, request_json, task_json, committed_at "
+                "FROM cayu_task_interrupted_handoff_receipts "
+                "WHERE task_id = ? AND handoff_id = ?",
+                (task_id, handoff_id),
+            ).fetchone()
+            return (
+                None
+                if row is None
+                else _sqlite_interrupted_task_handoff_receipt(
+                    task_id=task_id,
+                    handoff_id=handoff_id,
+                    row=row,
+                )
+            )
+
+    async def list_expired_interrupted_task_handoff_candidates(
+        self,
+        *,
+        after: tuple[datetime, str] | None = None,
+        limit: int = 100,
+    ) -> list[Task]:
+        after, limit = prepare_interrupted_task_handoff_candidate_page(
+            after=after,
+            limit=limit,
+        )
+        after_clause = ""
+        after_params: tuple[str, ...] = ()
+        if after is not None:
+            after_timestamp = sqlite_support.format_datetime(after[0])
+            after_clause = "AND (lease_expires_at > ? OR (lease_expires_at = ? AND id > ?)) "
+            after_params = (after_timestamp, after_timestamp, after[1])
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM cayu_tasks WHERE status = ? "
+                "AND session_id IS NOT NULL AND session_instance_id IS NOT NULL "
+                "AND worker_id IS NOT NULL AND lease_expires_at IS NOT NULL "
+                "AND lease_expires_at <= ? AND status_reason IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM cayu_work_attempt_admissions "
+                "WHERE cayu_work_attempt_admissions.task_id = cayu_tasks.id"
+                ") "
+                f"{after_clause}"
+                "ORDER BY lease_expires_at ASC, id ASC LIMIT ?",
+                (
+                    str(TaskStatus.RUNNING),
+                    sqlite_support.format_datetime(datetime.now(UTC)),
+                    *after_params,
+                    limit,
+                ),
+            ).fetchall()
+            return [sqlite_support.task_from_row(row) for row in rows]
+
     async def reconcile_task_cancellation(
         self,
         request: TaskCancellationReconciliationRequest,
@@ -17169,6 +17355,28 @@ def _sqlite_task_terminalization_receipt(
         )
     except Exception as exc:
         raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
+
+
+def _sqlite_interrupted_task_handoff_receipt(
+    *,
+    task_id: str,
+    handoff_id: str,
+    row: sqlite3.Row,
+) -> TaskInterruptedHandoffReceipt:
+    try:
+        receipt = TaskInterruptedHandoffReceipt(
+            request=TaskInterruptedHandoffRequest.model_validate(json.loads(row["request_json"])),
+            request_sha256=row["request_sha256"],
+            task=Task.model_validate(json.loads(row["task_json"])),
+            committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+        )
+        if receipt.request.task_id != task_id or receipt.request.handoff_id != handoff_id:
+            raise ValueError("Interrupted-task handoff receipt conflicts with its storage key.")
+        return receipt
+    except Exception as exc:
+        raise TaskInterruptedHandoffConflict(
+            "Interrupted-task handoff receipt is malformed."
+        ) from exc
 
 
 def _validate_task_positive_int(value: int, field_name: str) -> int:

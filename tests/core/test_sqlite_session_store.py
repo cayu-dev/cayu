@@ -3315,6 +3315,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (67, 67),
         (68, 67),
         (69, 67),
+        (70, 67),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3397,21 +3398,21 @@ def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(
     assert version == (58,)
 
 
-def test_sqlite_task_store_validation_requires_revision_sixty_six(tmp_path) -> None:
-    db_path = tmp_path / "pre-local-execution-fence-task-store.sqlite"
+def test_sqlite_task_store_validation_requires_revision_seventy(tmp_path) -> None:
+    db_path = tmp_path / "pre-interrupted-handoff-task-store.sqlite"
     store = SQLiteTaskStore(db_path)
     asyncio.run(store.close())
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DROP TABLE cayu_local_execution_attempts")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 66")
-        connection.execute("PRAGMA user_version = 65")
+        connection.execute("DROP TABLE cayu_task_interrupted_handoff_receipts")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 70")
+        connection.execute("PRAGMA user_version = 69")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 66"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 70"):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,

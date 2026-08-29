@@ -81,6 +81,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    restore_persisted_event_authority,
 )
 from cayu.runtime.structured_output import StructuredOutputSpec, StructuredOutputValidation
 from cayu.runtime.user_input import PendingUserInput
@@ -517,6 +518,60 @@ def test_targeted_tool_invocation_linkage_requires_runtime_provenance() -> None:
         redactor=SecretRedactor(),
     )
     assert "model_tool_name" not in prepared_mismatch.payload
+
+
+def test_interrupted_task_handoff_projection_restores_exact_persisted_authority() -> None:
+    private = Event(
+        type=EventType.TASK_INTERRUPTED_HANDOFF,
+        session_id="session-7",
+        payload={
+            "task_id": "task-projection",
+            "handoff_id": "handoff-projection",
+            "handoff_status": "pending",
+            "attempt": 1,
+            "session_run_epoch": 3,
+        },
+    )
+    attested = event_with_runtime_payload_authority(private, "handoff_id")
+    redactor = SecretRedactor(["handoff-projection", "pending"])
+    prepared = prepare_new_runtime_event(attested, redactor=redactor)
+
+    assert prepared.payload == private.payload
+    reloaded = Event.model_validate(prepared.model_dump(mode="python"))
+    untrusted = project_runtime_event(reloaded, sequence=7, redactor=redactor)
+    assert untrusted.payload["task_id"] == PRIVATE_EVENT_AUTHORITY
+    assert untrusted.payload["handoff_id"] == PRIVATE_EVENT_AUTHORITY
+
+    restored = restore_persisted_event_authority(reloaded)
+    assert event_payload_authority_is_runtime_generated(
+        restored,
+        field_name="task_id",
+        value="task-projection",
+    )
+    assert event_payload_authority_is_runtime_generated(
+        restored,
+        field_name="handoff_id",
+        value="handoff-projection",
+    )
+    public = project_persisted_runtime_event(
+        restored,
+        sequence=7,
+        redactor=redactor,
+    )
+    assert public.payload["task_id"] == PRIVATE_EVENT_AUTHORITY
+    assert public.payload["handoff_id"] == PRIVATE_EVENT_AUTHORITY
+    assert public.payload["handoff_status"] == "pending"
+    assert public.payload["attempt"] == 1
+    assert public.payload["session_run_epoch"] == 3
+
+    secret_task = private.model_copy(
+        update={"payload": {**private.payload, "task_id": "task-secret-value"}}
+    )
+    with pytest.raises(ValueError, match="task_id contains a workload secret"):
+        prepare_new_runtime_event(
+            event_with_runtime_payload_authority(secret_task, "handoff_id"),
+            redactor=SecretRedactor("secret"),
+        )
 
 
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:

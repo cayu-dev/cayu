@@ -7,8 +7,12 @@ Dockerized Postgres. They skip automatically when Docker is unavailable.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import MethodType
 from typing import Literal
 from uuid import uuid4
@@ -87,6 +91,7 @@ from cayu import (
     LocalExecutionEffectPolicy,
     LocalExecutionProcessIdentity,
     Message,
+    PostgresTaskStore,
     ResolutionActor,
     ResolutionActorSource,
     RunRequest,
@@ -96,6 +101,9 @@ from cayu import (
     TaskCompletionDecisionRequired,
     TaskCreate,
     TaskExecutionSource,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
     TaskInvocation,
     TaskOrder,
     TaskQuery,
@@ -148,6 +156,7 @@ _TABLES = (
     "cayu_task_retry_reconciliation_rejections",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
+    "cayu_task_interrupted_handoff_receipts",
     "cayu_completion_decision_application_receipts",
     "cayu_completion_decisions",
     "cayu_completion_verification_claims",
@@ -4216,6 +4225,363 @@ def test_postgres_task_store_releases_attached_worker_without_requeueing(postgre
         assert await store.reclaim_expired(query=TaskQuery(type="review")) == []
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
+    async def ops(store):
+        await store.create_task(TaskCreate(task_id="task_exact_interrupted_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_exact_interrupted_handoff",
+            session_id="session_exact_interrupted_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_exact_interrupted_handoff",
+                "session_exact_interrupted_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        assert attached.lease_expires_at is not None
+        assert attached.session_instance_id is not None
+        request = TaskInterruptedHandoffRequest(
+            task_id=attached.id,
+            worker_id="worker_a",
+            lease_expires_at=attached.lease_expires_at,
+            session_id="session_exact_interrupted_handoff",
+            session_instance_id=attached.session_instance_id,
+            session_run_epoch=1,
+            handoff_id="postgres-interrupted-handoff",
+        )
+        second = _new_store(postgres_dsn)
+        try:
+            first_receipt, second_receipt = await asyncio.gather(
+                store.release_interrupted_task_worker(request),
+                second.release_interrupted_task_worker(request),
+            )
+            assert type(first_receipt) is TaskInterruptedHandoffReceipt
+            assert second_receipt == first_receipt
+            assert first_receipt.task.status is TaskStatus.RUNNING
+            assert first_receipt.task.worker_id is None
+            assert first_receipt.task.lease_expires_at is None
+            assert await second.release_interrupted_task_worker(request) == first_receipt
+            with pytest.raises(TaskInterruptedHandoffConflict):
+                await second.release_interrupted_task_worker(
+                    request.model_copy(update={"session_run_epoch": 2})
+                )
+
+            await store.create_task(
+                TaskCreate(task_id="task_interrupted_terminal_race", type="review")
+            )
+            await store.claim_task("worker_b", lease_seconds=300)
+            race_task = await store.attach_task(
+                "task_interrupted_terminal_race",
+                session_id="session_interrupted_terminal_race",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "task_interrupted_terminal_race",
+                    "session_interrupted_terminal_race",
+                ),
+                worker_id="worker_b",
+            )
+            assert race_task.lease_expires_at is not None
+            assert race_task.session_instance_id is not None
+            race_handoff = TaskInterruptedHandoffRequest(
+                task_id=race_task.id,
+                worker_id="worker_b",
+                lease_expires_at=race_task.lease_expires_at,
+                session_id="session_interrupted_terminal_race",
+                session_instance_id=race_task.session_instance_id,
+                session_run_epoch=1,
+                handoff_id="postgres-terminal-race",
+            )
+            race_terminal = TaskTerminalizationRequest(
+                task_id=race_task.id,
+                worker_id="worker_b",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"winner": "terminal"},
+                idempotency_key="postgres-terminal-race",
+            )
+            outcomes = await asyncio.gather(
+                store.release_interrupted_task_worker(race_handoff),
+                second.terminalize_task(race_terminal),
+                return_exceptions=True,
+            )
+            assert (
+                sum(type(outcome) in {Task, TaskInterruptedHandoffReceipt} for outcome in outcomes)
+                == 1
+            )
+            assert sum(isinstance(outcome, Exception) for outcome in outcomes) == 1
+        finally:
+            await second.close()
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_interrupted_task_handoff_candidates_page_stably(postgres_dsn):
+    async def ops(store):
+        for task_id in ("task_postgres_handoff_page_a", "task_postgres_handoff_page_b"):
+            await store.create_task(TaskCreate(task_id=task_id, type="review"))
+            claimed = await store.claim_task("worker_a", lease_seconds=1)
+            assert claimed is not None
+            assert claimed.id == task_id
+            await store.attach_task(
+                task_id,
+                session_id=f"session_{task_id}",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task_id,
+                    f"session_{task_id}",
+                ),
+                worker_id="worker_a",
+            )
+        await asyncio.sleep(1.05)
+
+        first_page = await store.list_expired_interrupted_task_handoff_candidates(limit=1)
+        assert len(first_page) == 1
+        first = first_page[0]
+        assert first.lease_expires_at is not None
+        second_page = await store.list_expired_interrupted_task_handoff_candidates(
+            after=(first.lease_expires_at, first.id),
+            limit=1,
+        )
+        assert [first.id, second_page[0].id] == [
+            "task_postgres_handoff_page_a",
+            "task_postgres_handoff_page_b",
+        ]
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_interrupted_task_handoff_survives_real_process_loss(postgres_dsn):
+    async def ops(store):
+        await store.create_task(TaskCreate(task_id="task_postgres_process_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_postgres_process_handoff",
+            session_id="session_postgres_process_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_postgres_process_handoff",
+                "session_postgres_process_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        assert attached.lease_expires_at is not None
+        assert attached.session_instance_id is not None
+        request = TaskInterruptedHandoffRequest(
+            task_id=attached.id,
+            worker_id="worker_a",
+            lease_expires_at=attached.lease_expires_at,
+            session_id="session_postgres_process_handoff",
+            session_instance_id=attached.session_instance_id,
+            session_run_epoch=1,
+            handoff_id="postgres-process-loss-handoff",
+        )
+        repository_root = Path(__file__).parents[2]
+        python_path = str(repository_root / "src")
+        inherited_python_path = os.environ.get("PYTHONPATH")
+        if inherited_python_path:
+            python_path = os.pathsep.join((python_path, inherited_python_path))
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                "-m",
+                "tests.core._interrupted_handoff_process_worker",
+                "postgres",
+                "-",
+                request.model_dump_json(),
+            ],
+            check=False,
+            capture_output=True,
+            cwd=repository_root,
+            env={
+                **os.environ,
+                "PYTHONPATH": python_path,
+                "CAYU_TEST_INTERRUPTED_HANDOFF_POSTGRES_DSN": postgres_dsn,
+            },
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode == 23, completed.stderr
+
+        receipt = await store.load_interrupted_task_handoff_receipt(
+            request.task_id,
+            request.handoff_id,
+        )
+        assert receipt is not None
+        assert await store.release_interrupted_task_worker(request) == receipt
+        assert await store.load_task(request.task_id) == receipt.task
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_interrupted_task_handoff_rejects_receipt_from_another_storage_key(
+    postgres_dsn: str,
+) -> None:
+    import psycopg
+
+    async def ops(store) -> None:
+        async def publish(
+            task_id: str,
+            session_id: str,
+            handoff_id: str,
+        ) -> TaskInterruptedHandoffRequest:
+            await store.create_task(TaskCreate(task_id=task_id, type="review"))
+            await store.claim_task("worker_a", lease_seconds=300)
+            attached = await store.attach_task(
+                task_id,
+                session_id=session_id,
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task_id,
+                    session_id,
+                ),
+                worker_id="worker_a",
+            )
+            assert attached.lease_expires_at is not None
+            assert attached.session_instance_id is not None
+            request = TaskInterruptedHandoffRequest(
+                task_id=task_id,
+                worker_id="worker_a",
+                lease_expires_at=attached.lease_expires_at,
+                session_id=session_id,
+                session_instance_id=attached.session_instance_id,
+                session_run_epoch=1,
+                handoff_id=handoff_id,
+            )
+            await store.release_interrupted_task_worker(request)
+            return request
+
+        first = await publish(
+            "task_postgres_key_first",
+            "session_postgres_key_first",
+            "handoff-postgres-key-first",
+        )
+        second = await publish(
+            "task_postgres_key_second",
+            "session_postgres_key_second",
+            "handoff-postgres-key-second",
+        )
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_task_interrupted_handoff_receipts AS target "
+                    "SET request_sha256 = source.request_sha256, "
+                    "request_json = source.request_json, task_json = source.task_json, "
+                    "committed_at = source.committed_at "
+                    "FROM cayu_task_interrupted_handoff_receipts AS source "
+                    "WHERE target.task_id = %s AND target.handoff_id = %s "
+                    "AND source.task_id = %s AND source.handoff_id = %s",
+                    (
+                        first.task_id,
+                        first.handoff_id,
+                        second.task_id,
+                        second.handoff_id,
+                    ),
+                )
+            await conn.commit()
+
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed"):
+            await store.load_interrupted_task_handoff_receipt(
+                first.task_id,
+                first.handoff_id,
+            )
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed"):
+            await store.release_interrupted_task_worker(first)
+
+    _run(postgres_dsn, ops)
+
+
+@pytest.mark.parametrize("failure_point", ["before_commit", "after_commit"])
+def test_postgres_interrupted_task_handoff_faults_reconcile_exactly(
+    postgres_dsn: str,
+    failure_point: str,
+) -> None:
+    from cayu.storage.migrations import SchemaMode
+
+    class FaultingStore(PostgresTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self, dsn: str) -> None:
+            super().__init__(
+                dsn,
+                min_size=1,
+                max_size=4,
+                schema_mode=SchemaMode.CREATE,
+            )
+            self.calls = 0
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            self.calls += 1
+            if failure_point == "before_commit" and self.calls == 1:
+                raise RuntimeError("fail before interrupted handoff commit")
+            receipt = await super().release_interrupted_task_worker(request)
+            if failure_point == "after_commit" and self.calls == 1:
+                raise RuntimeError("fail after interrupted handoff commit")
+            return receipt
+
+    async def scenario() -> None:
+        await _truncate(postgres_dsn)
+        store = FaultingStore(postgres_dsn)
+        try:
+            await store.create_task(
+                TaskCreate(task_id="task_postgres_fault_handoff", type="review")
+            )
+            await store.claim_task("worker_a", lease_seconds=300)
+            attached = await store.attach_task(
+                "task_postgres_fault_handoff",
+                session_id="session_postgres_fault_handoff",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "task_postgres_fault_handoff",
+                    "session_postgres_fault_handoff",
+                ),
+                worker_id="worker_a",
+            )
+            assert attached.lease_expires_at is not None
+            assert attached.session_instance_id is not None
+            request = TaskInterruptedHandoffRequest(
+                task_id=attached.id,
+                worker_id="worker_a",
+                lease_expires_at=attached.lease_expires_at,
+                session_id="session_postgres_fault_handoff",
+                session_instance_id=attached.session_instance_id,
+                session_run_epoch=1,
+                handoff_id=f"postgres-{failure_point}",
+            )
+            with pytest.raises(RuntimeError, match=f"{failure_point.split('_')[0]}.*commit"):
+                await store.release_interrupted_task_worker(request)
+
+            receipt = await store.load_interrupted_task_handoff_receipt(
+                request.task_id,
+                request.handoff_id,
+            )
+            if failure_point == "before_commit":
+                assert receipt is None
+                unchanged = await store.load_task(request.task_id)
+                assert unchanged is not None
+                assert unchanged.worker_id == request.worker_id
+                assert unchanged.lease_expires_at == request.lease_expires_at
+            else:
+                assert receipt is not None
+                assert receipt.task.worker_id is None
+
+            replayed = await store.release_interrupted_task_worker(request)
+            assert replayed == await store.load_interrupted_task_handoff_receipt(
+                request.task_id,
+                request.handoff_id,
+            )
+            assert replayed.task.worker_id is None
+            assert replayed.task.session_id == request.session_id
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_dsn):

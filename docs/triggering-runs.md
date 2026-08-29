@@ -107,12 +107,15 @@ marks that task failed). Pass a `stop: asyncio.Event` for graceful shutdown and
 
 The explicit `SESSION_INTERRUPTED` outcome is the exception to terminal handler
 completion. The helper verifies that the task is attached and its durable
-session state is actually `interrupted`, then clears only the worker identity
-and lease. The task stays `running`, attached, and ineligible for fresh-task
-claim/reclaim while an approval, user-input response, operator resume, or
-recovery process continues the session. Returning `None` preserves the original
-terminal-or-fail behavior; do not return the handoff outcome merely to abandon
-unfinished work.
+session state is actually `interrupted`, then uses an exact durable receipt to
+clear only the worker identity and lease. Transient and ambiguous publication
+failures are retried and reconciled by receipt readback. If those bounded
+attempts are exhausted, the task remains `running`, attached, and eligible for
+expired-owner handoff recovery instead of being rewritten as failed. It stays
+ineligible for fresh-task claim/reclaim while an approval, user-input response,
+operator resume, or recovery process continues the session. Returning `None`
+preserves the original terminal-or-fail behavior; do not return the handoff
+outcome merely to abandon unfinished work.
 
 ## What does *not* trigger a run
 

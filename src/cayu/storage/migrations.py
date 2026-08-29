@@ -380,6 +380,9 @@ REVISIONS: tuple[Revision, ...] = (
     # these tables, so the transition is additive and needs no inferred data or
     # compatibility path.
     Revision(revision=69, kind=RevisionKind.ADDITIVE, compatible_from=67),
+    # Interrupted-task worker release receipts are independent exact-operation
+    # evidence. Older writers do not touch the table, so this remains additive.
+    Revision(revision=70, kind=RevisionKind.ADDITIVE, compatible_from=67),
 )
 
 #: The revision an empty database is initialized to.

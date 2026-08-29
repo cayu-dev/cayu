@@ -213,8 +213,6 @@ async def _recover_existing_daily_check(
             )
             return True, None
         raise RuntimeError("Attached daily check session is not ready for worker recovery.")
-    if settlement_worker_id is not None and task.worker_id == settlement_worker_id:
-        await app.task_store.release_attached_task_worker(task.id, settlement_worker_id)
     stream = app.resume(
         ResumeRequest(
             session_id=session_id,

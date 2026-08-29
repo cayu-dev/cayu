@@ -166,6 +166,18 @@ def test_revision_forty_six_builds_transcript_search_index_concurrently() -> Non
     assert postgres_storage._required_concurrent_indexes(46)[-1] == index
 
 
+def test_revision_seventy_builds_handoff_recovery_index_concurrently() -> None:
+    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[70]
+
+    assert len(indexes) == 1
+    index = indexes[0]
+    assert index.index_name == "idx_cayu_tasks_interrupted_handoff_recovery"
+    assert index.table_name == "cayu_tasks"
+    assert index.key_definitions == ("status", "lease_expires_at", "id")
+    assert "CREATE INDEX CONCURRENTLY" in index.create_statement
+    assert postgres_storage._required_concurrent_indexes(70)[-1] == index
+
+
 def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg
@@ -443,7 +455,7 @@ def test_revision_fifty_nine_rejects_a_populated_verified_work_registry(
     asyncio.run(runner())
 
 
-def test_postgres_task_store_validation_requires_revision_sixty_six(
+def test_postgres_task_store_validation_requires_revision_seventy(
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
@@ -458,12 +470,12 @@ def test_postgres_task_store_validation_requires_revision_sixty_six(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 66")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 70")
             await conn.commit()
 
         validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 66"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 70"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -883,6 +895,7 @@ _TABLES = (
     "cayu_task_retry_reconciliation_rejections",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
+    "cayu_task_interrupted_handoff_receipts",
     "cayu_completion_decision_application_receipts",
     "cayu_completion_decisions",
     "cayu_completion_verification_claims",
@@ -1636,6 +1649,38 @@ def test_task_store_rejects_recorded_revision_thirty_eight_without_receipt_table
         validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
             with pytest.raises(RuntimeError, match="terminalization receipt table"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize("schema_mode", [SchemaMode.VALIDATE, SchemaMode.MIGRATE])
+def test_task_store_rejects_recorded_revision_seventy_without_handoff_table(
+    postgres_dsn: str,
+    schema_mode: SchemaMode,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_task_interrupted_handoff_receipts")
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=schema_mode)
+        try:
+            with pytest.raises(RuntimeError, match="interrupted-task handoff receipt table"):
                 await validator.ensure_schema()
         finally:
             await validator.close()

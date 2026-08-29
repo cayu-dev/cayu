@@ -487,6 +487,9 @@ from cayu.runtime.tasks import (
     TaskCancellationReconciliationRequest,
     TaskCancellationReconciliationResult,
     TaskCreate,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
     TaskInvocationSnapshot,
     TaskOperationalSnapshot,
     TaskOrder,
@@ -528,12 +531,14 @@ from cayu.runtime.tasks import (
     _reconciled_task_retry_cancellation,
     _rejected_task_cancellation_reconciliation,
     _rejected_task_retry_cancellation_reconciliation,
+    _replay_interrupted_task_handoff_receipt,
     _replay_task_cancellation_reconciliation,
     _replay_task_cancellation_reconciliation_rejection,
     _replay_task_retry_cancellation_reconciliation,
     _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
+    _require_interrupted_task_handoff_authority,
     _running_task_from_create,
     _settled_task_retry_attempt,
     _task_cancellation_reconciliation_conflict,
@@ -561,6 +566,9 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_interrupted_task_handoff,
+    prepare_interrupted_task_handoff_candidate_page,
+    prepare_interrupted_task_handoff_receipt_lookup,
     prepare_task_cancellation_reconciliation,
     prepare_task_retry_cancellation_reconciliation,
     prepare_task_retry_settlement,
@@ -823,7 +831,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
 )
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 62
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 66
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 70
 
 
 async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
@@ -3360,6 +3368,19 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    70: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_task_interrupted_handoff_receipts (
+            task_id TEXT NOT NULL,
+            handoff_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            request_json JSONB NOT NULL,
+            task_json JSONB NOT NULL,
+            committed_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (task_id, handoff_id)
+        )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4287,6 +4308,22 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             ),
         ),
     ),
+    70: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_tasks_interrupted_handoff_recovery",
+            table_name="cayu_tasks",
+            key_definitions=("status", "lease_expires_at", "id"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_tasks_interrupted_handoff_recovery "
+                "ON cayu_tasks(status, lease_expires_at, id)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_tasks_interrupted_handoff_recovery"
+            ),
+        ),
+    ),
 }
 
 
@@ -4965,6 +5002,8 @@ class _PostgresStoreBase:
                             await self._validate_eval_authored_suite_schema(cur)
                         if self._min_required_revision >= 66:
                             await self._validate_local_execution_attempt_schema(cur)
+                        if self._min_required_revision >= 70:
+                            await self._validate_interrupted_task_handoff_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -5173,6 +5212,8 @@ class _PostgresStoreBase:
             await self._validate_eval_authored_suite_schema(cur)
         if self._min_required_revision >= 68:
             await self._validate_eval_judge_calibration_schema(cur)
+        if self._min_required_revision >= 70:
+            await self._validate_interrupted_task_handoff_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -5305,6 +5346,8 @@ class _PostgresStoreBase:
             await self._validate_eval_judge_calibration_schema(cur)
         if revision.revision == 69:
             await self._validate_agent_work_context_schema(cur)
+        if revision.revision == 70:
+            await self._validate_interrupted_task_handoff_schema(cur)
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -8914,6 +8957,68 @@ class _PostgresStoreBase:
                 "Postgres task terminalization receipt table conflicts with Cayu's "
                 "revision-38 durability contract. Run `cayu storage migrate` or restore "
                 "the database from a known-good backup."
+            )
+
+    async def _validate_interrupted_task_handoff_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_task_interrupted_handoff_receipts'
+            ORDER BY ordinal_position
+            """
+        )
+        columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_task_interrupted_handoff_receipts'
+              AND constraint_record.contype = 'p'
+            """
+        )
+        primary_keys = tuple(row[0] for row in await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT ARRAY(
+                SELECT pg_get_indexdef(index_record.indexrelid, key_position, FALSE)
+                FROM generate_series(1, index_record.indnkeyatts) AS key_position
+                ORDER BY key_position
+            )
+            FROM pg_catalog.pg_index AS index_record
+            JOIN pg_catalog.pg_class AS index_class
+              ON index_class.oid = index_record.indexrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = index_class.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND index_class.relname = 'idx_cayu_tasks_interrupted_handoff_recovery'
+              AND index_record.indisvalid
+            """
+        )
+        recovery_indexes = tuple(tuple(row[0]) for row in await cur.fetchall())
+        expected = (
+            ("task_id", "text", "NO"),
+            ("handoff_id", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("request_json", "jsonb", "NO"),
+            ("task_json", "jsonb", "NO"),
+            ("committed_at", "timestamp with time zone", "NO"),
+        )
+        if (
+            columns != expected
+            or primary_keys != ("PRIMARY KEY (task_id, handoff_id)",)
+            or recovery_indexes != (("status", "lease_expires_at", "id"),)
+        ):
+            raise RuntimeError(
+                "Postgres interrupted-task handoff receipt table conflicts with "
+                "Cayu's revision-70 durability contract. Run `cayu storage migrate` "
+                "or restore the database from a known-good backup."
             )
 
     async def _validate_budget_reservation_identity_registry(
@@ -29669,6 +29774,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_interrupted_task_handoffs: ClassVar[bool] = True
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
@@ -30910,6 +31016,224 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             idempotency_key=idempotency_key,
             row=row,
         )
+
+    async def release_interrupted_task_worker(
+        self,
+        request: TaskInterruptedHandoffRequest,
+    ) -> TaskInterruptedHandoffReceipt:
+        return await self._settle_interrupted_task_handoff(
+            request,
+            recover_expired=False,
+        )
+
+    async def recover_interrupted_task_worker(
+        self,
+        request: TaskInterruptedHandoffRequest,
+    ) -> TaskInterruptedHandoffReceipt:
+        return await self._settle_interrupted_task_handoff(
+            request,
+            recover_expired=True,
+        )
+
+    async def _settle_interrupted_task_handoff(
+        self,
+        request: TaskInterruptedHandoffRequest,
+        *,
+        recover_expired: bool,
+    ) -> TaskInterruptedHandoffReceipt:
+        request, request_sha256 = prepare_interrupted_task_handoff(request)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT request_sha256, request_json, task_json, committed_at "
+                        "FROM cayu_task_interrupted_handoff_receipts "
+                        "WHERE task_id = %s AND handoff_id = %s",
+                        (request.task_id, request.handoff_id),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is not None:
+                        receipt = _postgres_interrupted_task_handoff_receipt(
+                            task_id=request.task_id,
+                            handoff_id=request.handoff_id,
+                            row=receipt_row,
+                        )
+                        replayed = _replay_interrupted_task_handoff_receipt(
+                            request=request,
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                        )
+                        await conn.commit()
+                        return replayed
+
+                    task = await self._load_task_locked(cur, request.task_id)
+                    # A concurrent exact publisher can commit while this caller
+                    # waits for the task row. Re-read after acquiring that lock
+                    # so acknowledgement-loss replay converges instead of
+                    # misclassifying the released task as conflicting authority.
+                    await cur.execute(
+                        "SELECT request_sha256, request_json, task_json, committed_at "
+                        "FROM cayu_task_interrupted_handoff_receipts "
+                        "WHERE task_id = %s AND handoff_id = %s",
+                        (request.task_id, request.handoff_id),
+                    )
+                    receipt_row = await cur.fetchone()
+                    if receipt_row is not None:
+                        receipt = _postgres_interrupted_task_handoff_receipt(
+                            task_id=request.task_id,
+                            handoff_id=request.handoff_id,
+                            row=receipt_row,
+                        )
+                        replayed = _replay_interrupted_task_handoff_receipt(
+                            request=request,
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                        )
+                        await conn.commit()
+                        return replayed
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                        (request.task_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise TaskInterruptedHandoffConflict(
+                            "Admitted work attempts do not use interrupted-task handoff release."
+                        )
+                    now = await self._database_now(cur)
+                    _require_interrupted_task_handoff_authority(
+                        task,
+                        request,
+                        now=now,
+                        recover_expired=recover_expired,
+                    )
+                    lease_comparison = "<=" if recover_expired else ">"
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET worker_id = NULL,
+                            lease_expires_at = NULL,
+                            updated_at = %s
+                        WHERE id = %s
+                          AND status = %s
+                          AND session_id = %s
+                          AND session_instance_id = %s
+                          AND worker_id = %s
+                          AND lease_expires_at = %s
+                          AND lease_expires_at {lease_comparison} %s
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            now,
+                            request.task_id,
+                            str(TaskStatus.RUNNING),
+                            request.session_id,
+                            request.session_instance_id,
+                            request.worker_id,
+                            request.lease_expires_at,
+                            now,
+                        ),
+                    )
+                    released_row = await cur.fetchone()
+                    if released_row is None:
+                        raise TaskInterruptedHandoffConflict(
+                            "Interrupted-task handoff lost its exact durable authority."
+                        )
+                    released = pg_support.task_from_row(released_row)
+                    receipt = TaskInterruptedHandoffReceipt(
+                        request=request,
+                        request_sha256=request_sha256,
+                        task=released,
+                        committed_at=now,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_task_interrupted_handoff_receipts "
+                        "(task_id, handoff_id, request_sha256, request_json, "
+                        "task_json, committed_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (
+                            request.task_id,
+                            request.handoff_id,
+                            request_sha256,
+                            _dumps(request.model_dump(mode="json")),
+                            _dumps(released.model_dump(mode="json")),
+                            now,
+                        ),
+                    )
+                await conn.commit()
+                return receipt
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_interrupted_task_handoff_receipt(
+        self,
+        task_id: str,
+        handoff_id: str,
+    ) -> TaskInterruptedHandoffReceipt | None:
+        task_id, handoff_id = prepare_interrupted_task_handoff_receipt_lookup(
+            task_id,
+            handoff_id,
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT request_sha256, request_json, task_json, committed_at "
+                "FROM cayu_task_interrupted_handoff_receipts "
+                "WHERE task_id = %s AND handoff_id = %s",
+                (task_id, handoff_id),
+            )
+            row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else _postgres_interrupted_task_handoff_receipt(
+                task_id=task_id,
+                handoff_id=handoff_id,
+                row=row,
+            )
+        )
+
+    async def list_expired_interrupted_task_handoff_candidates(
+        self,
+        *,
+        after: tuple[datetime, str] | None = None,
+        limit: int = 100,
+    ) -> list[Task]:
+        after, limit = prepare_interrupted_task_handoff_candidate_page(
+            after=after,
+            limit=limit,
+        )
+        after_clause = ""
+        after_params: tuple[datetime, str] | tuple[()] = ()
+        if after is not None:
+            after_clause = "AND (lease_expires_at, id) > (%s, %s)"
+            after_params = after
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            now = await self._database_now(cur)
+            await cur.execute(
+                f"""
+                SELECT {pg_support.TASK_COLUMNS}
+                FROM cayu_tasks
+                WHERE status = %s
+                  AND session_id IS NOT NULL
+                  AND session_instance_id IS NOT NULL
+                  AND worker_id IS NOT NULL
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= %s
+                  AND status_reason IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cayu_work_attempt_admissions
+                      WHERE cayu_work_attempt_admissions.task_id = cayu_tasks.id
+                  )
+                  {after_clause}
+                ORDER BY lease_expires_at ASC, id ASC
+                LIMIT %s
+                """,
+                (str(TaskStatus.RUNNING), now, *after_params, limit),
+            )
+            rows = await cur.fetchall()
+        return [pg_support.task_from_row(row) for row in rows]
 
     async def reconcile_task_cancellation(
         self,
@@ -32563,6 +32887,28 @@ def _postgres_task_terminalization_receipt(
         )
     except Exception as exc:
         raise TaskTerminalizationConflict("Task terminalization receipt is malformed.") from exc
+
+
+def _postgres_interrupted_task_handoff_receipt(
+    *,
+    task_id: str,
+    handoff_id: str,
+    row: Any,
+) -> TaskInterruptedHandoffReceipt:
+    try:
+        receipt = TaskInterruptedHandoffReceipt(
+            request=TaskInterruptedHandoffRequest.model_validate(_json_obj(row[1])),
+            request_sha256=row[0],
+            task=Task.model_validate(_json_obj(row[2])),
+            committed_at=pg_support.to_utc(row[3]),
+        )
+        if receipt.request.task_id != task_id or receipt.request.handoff_id != handoff_id:
+            raise ValueError("Interrupted-task handoff receipt conflicts with its storage key.")
+        return receipt
+    except Exception as exc:
+        raise TaskInterruptedHandoffConflict(
+            "Interrupted-task handoff receipt is malformed."
+        ) from exc
 
 
 def _json_list(value: Any) -> list[Any]:

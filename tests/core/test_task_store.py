@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -27,6 +32,9 @@ from cayu import (
     Task,
     TaskClaimLost,
     TaskCreate,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
     TaskOrder,
     TaskQuery,
     TaskStatus,
@@ -41,9 +49,32 @@ from cayu._validation import (
     DurableValueError,
     extract_durable_value_error,
 )
+from cayu.runtime.tasks import _require_interrupted_task_handoff_authority
 from cayu.storage import migrations as schema_migrations
 
 StoreFactory = Callable[[object], TaskStore]
+
+
+def _interrupted_handoff_request(
+    task: Task,
+    *,
+    handoff_id: str,
+    session_run_epoch: int = 1,
+    worker_id: str | None = None,
+) -> TaskInterruptedHandoffRequest:
+    assert task.worker_id is not None
+    assert task.lease_expires_at is not None
+    assert task.session_id is not None
+    assert task.session_instance_id is not None
+    return TaskInterruptedHandoffRequest(
+        task_id=task.id,
+        worker_id=task.worker_id if worker_id is None else worker_id,
+        lease_expires_at=task.lease_expires_at,
+        session_id=task.session_id,
+        session_instance_id=task.session_instance_id,
+        session_run_epoch=session_run_epoch,
+        handoff_id=handoff_id,
+    )
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
@@ -1040,6 +1071,677 @@ def test_task_stores_release_attached_task_worker_without_requeueing(
         await _close_store(store)
 
     asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_interrupted_task_handoff_is_exact_and_replay_safe(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_exact_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_exact_handoff",
+            session_id="session_exact_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_exact_handoff",
+                "session_exact_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-exact",
+        )
+
+        receipt = await store.release_interrupted_task_worker(request)
+        replayed = await store.release_interrupted_task_worker(request)
+
+        assert type(receipt) is TaskInterruptedHandoffReceipt
+        assert replayed == receipt
+        assert receipt.request == request
+        assert receipt.task.status is TaskStatus.RUNNING
+        assert receipt.task.session_id == "session_exact_handoff"
+        assert receipt.task.session_instance_id == attached.session_instance_id
+        assert receipt.task.worker_id is None
+        assert receipt.task.lease_expires_at is None
+        assert (
+            await store.load_interrupted_task_handoff_receipt(
+                request.task_id,
+                request.handoff_id,
+            )
+            == receipt
+        )
+        changed_fields = (
+            {"worker_id": "worker_b"},
+            {"lease_expires_at": request.lease_expires_at + timedelta(seconds=1)},
+            {"session_id": "session_other_handoff"},
+            {"session_instance_id": "11111111-1111-4111-8111-111111111111"},
+            {"session_run_epoch": 2},
+            {"handoff_id": "handoff-other"},
+        )
+        for changed in changed_fields:
+            with pytest.raises(TaskInterruptedHandoffConflict):
+                await store.release_interrupted_task_worker(request.model_copy(update=changed))
+        assert await store.claim_task("worker_b", TaskQuery(type="review")) is None
+        assert await store.reclaim_expired(query=TaskQuery(type="review")) == []
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("failure_point", ["before_commit", "after_commit"])
+def test_in_memory_interrupted_task_handoff_faults_reconcile_exactly(
+    failure_point: str,
+) -> None:
+    class FaultingStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            self.calls += 1
+            if failure_point == "before_commit" and self.calls == 1:
+                raise RuntimeError("fail before interrupted handoff commit")
+            receipt = await super().release_interrupted_task_worker(request)
+            if failure_point == "after_commit" and self.calls == 1:
+                raise RuntimeError("fail after interrupted handoff commit")
+            return receipt
+
+    store = FaultingStore()
+
+    async def scenario() -> None:
+        await store.create_task(TaskCreate(task_id="task_memory_fault_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_memory_fault_handoff",
+            session_id="session_memory_fault_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_memory_fault_handoff",
+                "session_memory_fault_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id=f"handoff-{failure_point}",
+        )
+        with pytest.raises(RuntimeError, match=f"{failure_point.split('_')[0]}.*commit"):
+            await store.release_interrupted_task_worker(request)
+
+        receipt = await store.load_interrupted_task_handoff_receipt(
+            request.task_id,
+            request.handoff_id,
+        )
+        if failure_point == "before_commit":
+            assert receipt is None
+            unchanged = await store.load_task(request.task_id)
+            assert unchanged is not None
+            assert unchanged.worker_id == request.worker_id
+            assert unchanged.lease_expires_at == request.lease_expires_at
+        else:
+            assert receipt is not None
+            assert receipt.task.worker_id is None
+
+        replayed = await store.release_interrupted_task_worker(request)
+        assert replayed == await store.load_interrupted_task_handoff_receipt(
+            request.task_id,
+            request.handoff_id,
+        )
+        assert replayed.task.worker_id is None
+        assert replayed.task.session_id == request.session_id
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_task_handoff_revalidates_mutated_request_before_serialization(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "mutated-handoff-request-secret"
+
+    class SecretBearingValue:
+        def __repr__(self) -> str:
+            return secret
+
+        def __str__(self) -> str:
+            return secret
+
+    store = InMemoryTaskStore()
+
+    async def scenario() -> BaseException:
+        await store.create_task(TaskCreate(task_id="task_mutated_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_mutated_handoff",
+            session_id="session_mutated_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_mutated_handoff",
+                "session_mutated_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-mutated-request",
+        )
+        object.__setattr__(request, "task_id", SecretBearingValue())
+        with pytest.raises(ValidationError) as raised:
+            await store.release_interrupted_task_worker(request)
+        return raised.value
+
+    failure = asyncio.run(scenario())
+    captured = capsys.readouterr()
+    diagnostic = "\n".join(
+        [
+            str(failure),
+            repr(failure),
+            captured.out,
+            captured.err,
+            "\n".join(record.getMessage() for record in caplog.records),
+            "\n".join(str(record.message) for record in recwarn),
+        ]
+    )
+    assert secret not in diagnostic
+
+
+def test_interrupted_task_handoff_receipt_copies_mutated_task_without_serializer_warning(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "mutated-handoff-receipt-task-secret"
+
+    class SecretBearingValue:
+        def __repr__(self) -> str:
+            return secret
+
+        def __str__(self) -> str:
+            return secret
+
+    store = InMemoryTaskStore()
+
+    async def scenario() -> BaseException:
+        await store.create_task(TaskCreate(task_id="task_mutated_receipt", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_mutated_receipt",
+            session_id="session_mutated_receipt",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_mutated_receipt",
+                "session_mutated_receipt",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-mutated-receipt-task",
+        )
+        object.__setattr__(attached, "status", SecretBearingValue())
+        with pytest.raises(ValidationError) as raised:
+            TaskInterruptedHandoffReceipt(
+                request=request,
+                request_sha256="0" * 64,
+                task=attached,
+                committed_at=attached.updated_at,
+            )
+        return raised.value
+
+    failure = asyncio.run(scenario())
+    captured = capsys.readouterr()
+    diagnostic = "\n".join(
+        [
+            str(failure),
+            repr(failure),
+            captured.out,
+            captured.err,
+            "\n".join(record.getMessage() for record in caplog.records),
+            "\n".join(str(record.message) for record in recwarn),
+        ]
+    )
+    assert secret not in diagnostic
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_interrupted_task_handoff_rejects_wrong_owner_and_recovers_expired_owner(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_expired_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=1)
+        attached = await store.attach_task(
+            "task_expired_handoff",
+            session_id="session_expired_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_expired_handoff",
+                "session_expired_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-expired",
+        )
+        with pytest.raises(TaskInterruptedHandoffConflict):
+            await store.release_interrupted_task_worker(
+                _interrupted_handoff_request(
+                    attached,
+                    handoff_id="handoff-wrong-worker",
+                    worker_id="worker_b",
+                )
+            )
+
+        await asyncio.sleep(1.05)
+        with pytest.raises(TaskInterruptedHandoffConflict, match="live worker lease"):
+            await store.release_interrupted_task_worker(request)
+        candidates = await store.list_expired_interrupted_task_handoff_candidates()
+        assert [candidate.id for candidate in candidates] == ["task_expired_handoff"]
+
+        receipt = await store.recover_interrupted_task_worker(request)
+        assert receipt.task.status is TaskStatus.RUNNING
+        assert receipt.task.session_id == "session_expired_handoff"
+        assert receipt.task.worker_id is None
+        assert receipt.task.lease_expires_at is None
+        assert await store.list_expired_interrupted_task_handoff_candidates() == []
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_interrupted_task_handoff_rejects_retry_cancellation_marker() -> None:
+    store = InMemoryTaskStore()
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_retry_cancel_marker", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_retry_cancel_marker",
+            session_id="session_retry_cancel_marker",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_retry_cancel_marker",
+                "session_retry_cancel_marker",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-retry-cancel-marker",
+        )
+
+        # Retry-series attempts cannot attach to sessions through supported public
+        # APIs. Still fail closed if corrupted/custom-store evidence presents that
+        # cancellation marker at the shared built-in-store authority boundary.
+        malformed = attached.model_copy(update={"status_reason": "retry_cancellation_requested"})
+        with pytest.raises(TaskInterruptedHandoffConflict, match="cancellation is still draining"):
+            _require_interrupted_task_handoff_authority(
+                malformed,
+                request,
+                now=attached.updated_at,
+                recover_expired=False,
+            )
+
+        unchanged = await store.load_task(attached.id)
+        assert unchanged == attached
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_interrupted_task_handoff_candidate_pages_have_stable_store_order(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        with pytest.raises(ValueError, match="limit must be <= 100"):
+            await store.list_expired_interrupted_task_handoff_candidates(limit=101)
+        for task_id in ("task_handoff_page_a", "task_handoff_page_b"):
+            await store.create_task(TaskCreate(task_id=task_id, type="review"))
+            claimed = await store.claim_task("worker_a", lease_seconds=1)
+            assert claimed is not None
+            assert claimed.id == task_id
+            await store.attach_task(
+                task_id,
+                session_id=f"session_{task_id}",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task_id,
+                    f"session_{task_id}",
+                ),
+                worker_id="worker_a",
+            )
+        await asyncio.sleep(1.05)
+
+        first_page = await store.list_expired_interrupted_task_handoff_candidates(limit=1)
+        assert len(first_page) == 1
+        first = first_page[0]
+        assert first.lease_expires_at is not None
+        second_page = await store.list_expired_interrupted_task_handoff_candidates(
+            after=(first.lease_expires_at, first.id),
+            limit=1,
+        )
+        assert [first.id, second_page[0].id] == [
+            "task_handoff_page_a",
+            "task_handoff_page_b",
+        ]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_interrupted_task_handoff_converges_with_concurrent_terminalization(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create_task(TaskCreate(task_id="task_handoff_terminal_race", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_handoff_terminal_race",
+            session_id="session_handoff_terminal_race",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_handoff_terminal_race",
+                "session_handoff_terminal_race",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-terminal-race",
+        )
+        terminal_request = TaskTerminalizationRequest(
+            task_id=attached.id,
+            worker_id="worker_a",
+            kind=TaskTerminalKind.COMPLETED,
+            result={"winner": "terminal"},
+            idempotency_key="terminal-handoff-race",
+        )
+        outcomes = await asyncio.gather(
+            store.release_interrupted_task_worker(request),
+            store.terminalize_task(terminal_request),
+            return_exceptions=True,
+        )
+        assert (
+            sum(type(outcome) is TaskInterruptedHandoffReceipt for outcome in outcomes)
+            + sum(type(outcome) is Task for outcome in outcomes)
+            == 1
+        )
+        assert sum(isinstance(outcome, Exception) for outcome in outcomes) == 1
+
+        durable = await store.load_task(attached.id)
+        handoff_receipt = await store.load_interrupted_task_handoff_receipt(
+            request.task_id,
+            request.handoff_id,
+        )
+        assert durable is not None
+        if handoff_receipt is None:
+            assert durable.status is TaskStatus.COMPLETED
+            assert durable.result == {"winner": "terminal"}
+        else:
+            assert durable == handoff_receipt.task
+            assert durable.status is TaskStatus.RUNNING
+            assert durable.session_id == request.session_id
+            assert durable.worker_id is None
+            assert durable.lease_expires_at is None
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_sqlite_interrupted_task_handoff_receipt_survives_restart(tmp_path) -> None:
+    db_path = tmp_path / "interrupted-handoff.sqlite"
+    first = SQLiteTaskStore(db_path)
+
+    async def first_process() -> tuple[
+        TaskInterruptedHandoffRequest, TaskInterruptedHandoffReceipt
+    ]:
+        await first.create_task(TaskCreate(task_id="task_restart_handoff", type="review"))
+        await first.claim_task("worker_a", lease_seconds=300)
+        attached = await first.attach_task(
+            "task_restart_handoff",
+            session_id="session_restart_handoff",
+            session_invocation=await task_backed_session_invocation(
+                first,
+                "task_restart_handoff",
+                "session_restart_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-restart",
+        )
+        receipt = await first.release_interrupted_task_worker(request)
+        await first.close()
+        return request, receipt
+
+    request, receipt = asyncio.run(first_process())
+    reopened = SQLiteTaskStore(db_path)
+
+    async def second_process() -> None:
+        assert await reopened.release_interrupted_task_worker(request) == receipt
+        assert (
+            await reopened.load_interrupted_task_handoff_receipt(
+                request.task_id,
+                request.handoff_id,
+            )
+            == receipt
+        )
+        await reopened.close()
+
+    asyncio.run(second_process())
+
+
+def test_sqlite_interrupted_task_handoff_rejects_rewritten_receipt_authority(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "interrupted-handoff-corrupt.sqlite"
+    store = SQLiteTaskStore(db_path)
+
+    async def publish() -> TaskInterruptedHandoffRequest:
+        await store.create_task(TaskCreate(task_id="task_corrupt_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_corrupt_handoff",
+            session_id="session_corrupt_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_corrupt_handoff",
+                "session_corrupt_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-corrupt",
+        )
+        await store.release_interrupted_task_worker(request)
+        await store.close()
+        return request
+
+    request = asyncio.run(publish())
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "UPDATE cayu_task_interrupted_handoff_receipts "
+        "SET request_json = json_set(request_json, '$.session_run_epoch', 2) "
+        "WHERE task_id = ? AND handoff_id = ?",
+        (request.task_id, request.handoff_id),
+    )
+    connection.commit()
+    connection.close()
+    reopened = SQLiteTaskStore(db_path)
+
+    async def reject() -> None:
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed"):
+            await reopened.load_interrupted_task_handoff_receipt(
+                request.task_id,
+                request.handoff_id,
+            )
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed"):
+            await reopened.release_interrupted_task_worker(request)
+        await reopened.close()
+
+    asyncio.run(reject())
+
+
+def test_sqlite_interrupted_task_handoff_rejects_receipt_from_another_storage_key(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "interrupted-handoff-key-conflict.sqlite"
+    store = SQLiteTaskStore(db_path)
+
+    async def publish(
+        task_id: str,
+        session_id: str,
+        handoff_id: str,
+    ) -> TaskInterruptedHandoffRequest:
+        await store.create_task(TaskCreate(task_id=task_id, type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task_id,
+                session_id,
+            ),
+            worker_id="worker_a",
+        )
+        request = _interrupted_handoff_request(attached, handoff_id=handoff_id)
+        await store.release_interrupted_task_worker(request)
+        return request
+
+    async def publish_both() -> tuple[
+        TaskInterruptedHandoffRequest,
+        TaskInterruptedHandoffRequest,
+    ]:
+        first = await publish("task_key_first", "session_key_first", "handoff-key-first")
+        second = await publish("task_key_second", "session_key_second", "handoff-key-second")
+        await store.close()
+        return first, second
+
+    first, second = asyncio.run(publish_both())
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "UPDATE cayu_task_interrupted_handoff_receipts AS target "
+        "SET request_sha256 = source.request_sha256, "
+        "request_json = source.request_json, task_json = source.task_json, "
+        "committed_at = source.committed_at "
+        "FROM cayu_task_interrupted_handoff_receipts AS source "
+        "WHERE target.task_id = ? AND target.handoff_id = ? "
+        "AND source.task_id = ? AND source.handoff_id = ?",
+        (
+            first.task_id,
+            first.handoff_id,
+            second.task_id,
+            second.handoff_id,
+        ),
+    )
+    connection.commit()
+    connection.close()
+    reopened = SQLiteTaskStore(db_path)
+
+    async def reject() -> None:
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed"):
+            await reopened.load_interrupted_task_handoff_receipt(
+                first.task_id,
+                first.handoff_id,
+            )
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed"):
+            await reopened.release_interrupted_task_worker(first)
+        await reopened.close()
+
+    asyncio.run(reject())
+
+
+def test_sqlite_interrupted_task_handoff_survives_real_process_loss(tmp_path) -> None:
+    db_path = tmp_path / "interrupted-handoff-process-loss.sqlite"
+    store = SQLiteTaskStore(db_path)
+
+    async def prepare() -> TaskInterruptedHandoffRequest:
+        await store.create_task(TaskCreate(task_id="task_process_handoff", type="review"))
+        await store.claim_task("worker_a", lease_seconds=300)
+        attached = await store.attach_task(
+            "task_process_handoff",
+            session_id="session_process_handoff",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "task_process_handoff",
+                "session_process_handoff",
+            ),
+            worker_id="worker_a",
+        )
+        await store.close()
+        return _interrupted_handoff_request(
+            attached,
+            handoff_id="handoff-process-loss",
+        )
+
+    request = asyncio.run(prepare())
+    repository_root = Path(__file__).parents[2]
+    python_path = str(repository_root / "src")
+    inherited_python_path = os.environ.get("PYTHONPATH")
+    if inherited_python_path:
+        python_path = os.pathsep.join((python_path, inherited_python_path))
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tests.core._interrupted_handoff_process_worker",
+            "sqlite",
+            str(db_path),
+            request.model_dump_json(),
+        ],
+        check=False,
+        capture_output=True,
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": python_path},
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 23, completed.stderr
+
+    reopened = SQLiteTaskStore(db_path)
+
+    async def reconcile() -> None:
+        receipt = await reopened.load_interrupted_task_handoff_receipt(
+            request.task_id,
+            request.handoff_id,
+        )
+        assert receipt is not None
+        assert await reopened.release_interrupted_task_worker(request) == receipt
+        task = await reopened.load_task(request.task_id)
+        assert task == receipt.task
+        assert task is not None
+        assert task.status is TaskStatus.RUNNING
+        assert task.session_id == request.session_id
+        assert task.worker_id is None
+        assert task.lease_expires_at is None
+        await reopened.close()
+
+    asyncio.run(reconcile())
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])

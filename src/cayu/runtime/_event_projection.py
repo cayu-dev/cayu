@@ -791,6 +791,11 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("accepted_event_publication_uncertain",): frozenset({True, False}),
     },
     EventType.TURN_COMPLETED: {("status",): _SESSION_STATUS_VALUES},
+    EventType.TASK_INTERRUPTED_HANDOFF: {
+        ("handoff_status",): frozenset(
+            {"pending", "retrying", "released", "recovered", "recovery_required"}
+        ),
+    },
     EventType.SESSION_CHECKPOINTED: {("checkpoint",): _SESSION_CHECKPOINT_VALUES},
     EventType.SESSION_MESSAGE_QUEUED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
     EventType.SESSION_MESSAGE_DELIVERED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
@@ -3153,6 +3158,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "task_id",
         },
     )
+    policies[EventType.TASK_INTERRUPTED_HANDOFF] = _observed_policy(
+        "attempt handoff_id handoff_status session_run_epoch task_id",
+        authority_keys={"handoff_id", "task_id"},
+    )
 
     structured_policy = _observed_policy(
         "attempt errors execution_profile_fingerprint max_retries model_attempt_id model_step_id "
@@ -4440,6 +4449,7 @@ def _reject_secret_authority_values(
             "catalogue_revision",
             "execution_profile_fingerprint",
             "exposure_fingerprint",
+            "handoff_id",
             *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
         } and (
             event_payload_authority_is_runtime_generated(

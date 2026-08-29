@@ -25,11 +25,12 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from cayu._exception_groups import (
     exception_cause,
@@ -38,15 +39,26 @@ from cayu._exception_groups import (
     set_exception_cause,
 )
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
+    task_store_interrupted_handoff_capability_is_complete,
     task_store_mutation_is_cancellation_quiescent,
 )
 from cayu.runtime.sessions import SessionStatus
 from cayu.runtime.tasks import (
     Task,
     TaskClaimLost,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
     TaskQuery,
     TaskRetryAttemptDisposition,
     TaskRetryAttemptReport,
@@ -65,6 +77,8 @@ from cayu.runtime.tasks import (
     _task_retry_runtime_terminal_request,
     _terminalize_claimed_task_or_detect_peer_winner,
     copy_task,
+    interrupted_task_handoff_request,
+    prepare_interrupted_task_handoff,
     settle_task_retry_attempt_with_retry,
 )
 
@@ -91,6 +105,11 @@ TaskHandler = Callable[
 ]
 _MAX_TASK_FAILURE_MESSAGE_BYTES = 500
 _TASK_RETRY_HANDLER_CANCELLATION_GRACE_SECONDS = 1.0
+_INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
+_INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
+_INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
+_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 100
+_INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS = 30.0
 
 
 class _TaskRetryElapsed(Exception):
@@ -104,6 +123,14 @@ class _TaskRetryElapsed(Exception):
         super().__init__("Task retry deadline elapsed.")
         self.owner_cancellation = owner_cancellation
         self.report = report
+
+
+class _TaskInterruptedHandoffRecoveryRequired(RuntimeError):
+    """The task/session link is intact but ownership release needs recovery."""
+
+
+class _TaskInterruptedHandoffReceiptConflict(TaskInterruptedHandoffConflict):
+    """Returned receipt evidence conflicts independently of lease expiry."""
 
 
 class _TaskRetryCancellationRequested(Exception):
@@ -193,8 +220,33 @@ async def run_task_worker(
                 "verified-work mutations are cancellation-quiescent."
             )
 
+    task_store_declarations = type.__getattribute__(type(task_store), "__dict__")
+    interrupted_handoff_advertised = (
+        task_store_declarations.get("supports_interrupted_task_handoffs") is True
+    )
+    interrupted_handoff_supported = (
+        interrupted_handoff_advertised
+        and task_store_interrupted_handoff_capability_is_complete(task_store)
+    )
+    if interrupted_handoff_advertised and not interrupted_handoff_supported:
+        raise NotImplementedError(
+            "The interrupted-task handoff capability requires stable receipt/recovery "
+            "methods and cancellation-quiescent ownership mutations."
+        )
+
     handled = 0
+    next_interrupted_handoff_recovery_at = 0.0
     while (max_tasks is None or handled < max_tasks) and not _is_stopped(stop):
+        loop = asyncio.get_running_loop()
+        if interrupted_handoff_supported and loop.time() >= next_interrupted_handoff_recovery_at:
+            await _recover_expired_interrupted_task_handoffs(
+                app,
+                task_store,
+                limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
+            )
+            next_interrupted_handoff_recovery_at = (
+                loop.time() + _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS
+            )
         if reclaim:
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
@@ -1055,8 +1107,20 @@ async def _handoff_interrupted_session(
             ),
         )
         return
+    if (
+        task.worker_id != worker_id
+        or task.lease_expires_at is None
+        or task.session_instance_id is None
+    ):
+        raise TaskInterruptedHandoffConflict(
+            "Interrupted-session handoff no longer has exact task ownership."
+        )
 
-    session = await app.session_store.load_state(task.session_id)
+    if not task_store_interrupted_handoff_capability_is_complete(task_store):
+        raise NotImplementedError(
+            "Interrupted-session handoff requires complete idempotent store support."
+        )
+    session = await app.session_store.load(task.session_id)
     if session is None:
         await _safe_fail(
             app,
@@ -1078,19 +1142,463 @@ async def _handoff_interrupted_session(
             ),
         )
         return
-
-    release_failure_payload: dict[str, str] | None = None
-    try:
-        await task_store.release_attached_task_worker(task_id, worker_id)
-    except Exception as exc:
-        release_failure_payload = _task_failure_payload(app, exc)
-    if release_failure_payload is not None:
-        await _safe_fail_payload(
+    if session.instance_id != task.session_instance_id:
+        await _safe_fail(
+            app,
             task_store,
             task_id,
             worker_id,
-            release_failure_payload,
+            RuntimeError(
+                "Task handler requested an interrupted-session handoff for a "
+                "different session incarnation."
+            ),
         )
+        return
+    request = interrupted_task_handoff_request(
+        task,
+        session_run_epoch=session.run_epoch,
+    )
+    try:
+        await _settle_interrupted_task_handoff_with_retry(
+            app,
+            task_store,
+            request,
+            recover_expired=False,
+        )
+    except _TaskInterruptedHandoffReceiptConflict:
+        raise
+    except TaskInterruptedHandoffConflict:
+        # Another exact owner may terminalize the task after the session/task
+        # preflight but before the handoff mutation acquires store authority.
+        # That durable peer winner has already settled this worker's ownership;
+        # it must not abort the worker loop.  Non-terminal conflicts remain
+        # authoritative and fail closed.
+        current = await task_store.load_task(task.id)
+        if current is None or current.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            return
+        cancellation = _task_cancellation_terminalization_request(
+            current,
+            worker_id=worker_id,
+        )
+        if cancellation is not None:
+            await _terminalize_claimed_task_or_detect_peer_winner(
+                task_store,
+                cancellation,
+            )
+            return
+        raise
+
+
+async def _settle_interrupted_task_handoff_once(
+    app: CayuApp,
+    task_store: TaskStore,
+    request: TaskInterruptedHandoffRequest,
+    *,
+    recover_expired: bool,
+) -> TaskInterruptedHandoffReceipt:
+    owner_task = asyncio.current_task()
+    if owner_task is None:  # pragma: no cover - coroutine execution invariant
+        raise RuntimeError("Interrupted-task handoff requires an owning task.")
+    cancellation_baseline = owner_task.cancelling()
+    operation = (
+        task_store.recover_interrupted_task_worker(request)
+        if recover_expired
+        else task_store.release_interrupted_task_worker(request)
+    )
+    operation_task = asyncio.create_task(operation)
+    owner_cancellation: asyncio.CancelledError | None = None
+    # A cancellation request can already be pending when this helper starts.
+    # The store operation is now dispatched, so use a real checkpoint to take
+    # ownership of that signal and continue supervising the mutation until it
+    # reaches a definite result.  Comparing only against the entry count would
+    # misclassify this delivery as historical and orphan ``operation_task``.
+    try:
+        await asyncio.sleep(0)
+    except asyncio.CancelledError as exc:
+        owner_cancellation = exc
+        cancellation_baseline = owner_task.cancelling()
+    while True:
+        owner_secondary_failure: RuntimeError | None = None
+        child_cancellation_failure: RuntimeError | None = None
+        try:
+            receipt = await asyncio.shield(operation_task)
+        except asyncio.CancelledError as exc:
+            if owner_task.cancelling() > cancellation_baseline:
+                cancellation_baseline = owner_task.cancelling()
+                if owner_cancellation is None:
+                    owner_cancellation = exc
+                continue
+            if operation_task.done() and operation_task.cancelled():
+                failure = RuntimeError(
+                    "Interrupted-task handoff store operation cancelled unexpectedly."
+                )
+                if owner_cancellation is not None:
+                    owner_secondary_failure = failure
+                else:
+                    child_cancellation_failure = failure
+            else:
+                raise
+        except (GeneratorExit, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            if exception_tree_contains(exc, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+                raise
+            if owner_cancellation is not None:
+                diagnostic = app.redact_exception_diagnostic(
+                    exc,
+                    empty_message="interrupted-task handoff cleanup failed",
+                    nonportable_message=(
+                        "Interrupted-task handoff cleanup had a non-portable diagnostic."
+                    ),
+                )
+                owner_secondary_failure = RuntimeError(diagnostic.message)
+            else:
+                raise
+        else:
+            validated_receipt: TaskInterruptedHandoffReceipt | None = None
+            validation_failure: RuntimeError | None = None
+            try:
+                validated_receipt = _validate_interrupted_task_handoff_receipt(receipt, request)
+            except (GeneratorExit, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                if exception_tree_contains(exc, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+                    raise
+                if owner_cancellation is None:
+                    raise
+                diagnostic = app.redact_exception_diagnostic(
+                    exc,
+                    empty_message="interrupted-task handoff receipt validation failed",
+                    nonportable_message=(
+                        "Interrupted-task handoff receipt validation had a non-portable diagnostic."
+                    ),
+                )
+                validation_failure = RuntimeError(diagnostic.message)
+            if owner_cancellation is not None:
+                if validation_failure is not None:
+                    raise owner_cancellation from validation_failure
+                raise owner_cancellation from None
+            assert validated_receipt is not None
+            return validated_receipt
+        if owner_secondary_failure is not None:
+            assert owner_cancellation is not None
+            raise owner_cancellation from owner_secondary_failure
+        if child_cancellation_failure is not None:
+            raise child_cancellation_failure from None
+
+
+async def _settle_interrupted_task_handoff_with_retry(
+    app: CayuApp,
+    task_store: TaskStore,
+    request: TaskInterruptedHandoffRequest,
+    *,
+    recover_expired: bool,
+) -> TaskInterruptedHandoffReceipt:
+    delay = _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS
+    last_failure_diagnostic: str | None = None
+    for attempt in range(1, _INTERRUPTED_HANDOFF_MAX_ATTEMPTS + 1):
+        failed_attempt_status: Literal["pending", "retrying"] | None = None
+        try:
+            receipt, settled_by_recovery = await _settle_interrupted_task_handoff_attempt(
+                app,
+                task_store,
+                request,
+                recover_expired=recover_expired,
+            )
+        except (TaskInterruptedHandoffConflict, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            last_failure_diagnostic = app.redact_exception_diagnostic(
+                exc,
+                empty_message="interrupted-task handoff was not acknowledged",
+                nonportable_message=(
+                    "Interrupted-task handoff failed with a non-portable diagnostic."
+                ),
+            ).message
+            failed_attempt_status = "pending" if attempt == 1 else "retrying"
+        else:
+            await _emit_interrupted_task_handoff_event(
+                app,
+                request,
+                handoff_status=(
+                    "recovered"
+                    if recover_expired or settled_by_recovery or attempt > 1
+                    else "released"
+                ),
+                attempt=attempt,
+                recovery_mode=recover_expired or settled_by_recovery,
+            )
+            return receipt
+        assert failed_attempt_status is not None
+        # Publish after leaving the store exception handler. If cancellation
+        # interrupts event delivery, Python must not retain the unredacted store
+        # failure in the CancelledError context chain.
+        await _emit_interrupted_task_handoff_event(
+            app,
+            request,
+            handoff_status=failed_attempt_status,
+            attempt=attempt,
+            recovery_mode=recover_expired,
+        )
+        try:
+            receipt = await task_store.load_interrupted_task_handoff_receipt(
+                request.task_id,
+                request.handoff_id,
+            )
+        except Exception as exc:
+            last_failure_diagnostic = app.redact_exception_diagnostic(
+                exc,
+                empty_message="interrupted-task handoff was not acknowledged",
+                nonportable_message=(
+                    "Interrupted-task handoff failed with a non-portable diagnostic."
+                ),
+            ).message
+        else:
+            if receipt is not None:
+                receipt = _validate_interrupted_task_handoff_receipt(receipt, request)
+                await _emit_interrupted_task_handoff_event(
+                    app,
+                    request,
+                    handoff_status="recovered",
+                    attempt=attempt,
+                    recovery_mode=recover_expired,
+                )
+                return receipt
+        if attempt < _INTERRUPTED_HANDOFF_MAX_ATTEMPTS:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS)
+
+    await _emit_interrupted_task_handoff_event(
+        app,
+        request,
+        handoff_status="recovery_required",
+        attempt=_INTERRUPTED_HANDOFF_MAX_ATTEMPTS,
+        recovery_mode=recover_expired,
+    )
+    raise _TaskInterruptedHandoffRecoveryRequired(
+        last_failure_diagnostic or "Interrupted-task handoff was not acknowledged."
+    ) from None
+
+
+async def _settle_interrupted_task_handoff_attempt(
+    app: CayuApp,
+    task_store: TaskStore,
+    request: TaskInterruptedHandoffRequest,
+    *,
+    recover_expired: bool,
+) -> tuple[TaskInterruptedHandoffReceipt, bool]:
+    """Settle once, upgrading an unchanged expired live lease to recovery."""
+
+    try:
+        receipt = await _settle_interrupted_task_handoff_once(
+            app,
+            task_store,
+            request,
+            recover_expired=recover_expired,
+        )
+    except _TaskInterruptedHandoffReceiptConflict:
+        raise
+    except TaskInterruptedHandoffConflict:
+        if recover_expired:
+            raise
+        current = await task_store.load_task(request.task_id)
+        if not _task_still_matches_interrupted_handoff_request(current, request):
+            raise
+        receipt = await _settle_interrupted_task_handoff_once(
+            app,
+            task_store,
+            request,
+            recover_expired=True,
+        )
+        return receipt, True
+    return receipt, recover_expired
+
+
+def _task_still_matches_interrupted_handoff_request(
+    task: Task | None,
+    request: TaskInterruptedHandoffRequest,
+) -> bool:
+    """Return whether store state still carries the exact frozen handoff tuple."""
+
+    return bool(
+        task is not None
+        and task.status is TaskStatus.RUNNING
+        and task.id == request.task_id
+        and task.worker_id == request.worker_id
+        and task.lease_expires_at == request.lease_expires_at
+        and task.session_id == request.session_id
+        and task.session_instance_id == request.session_instance_id
+        and not _task_cancellation_requested(task)
+        and not _task_retry_cancellation_requested(task)
+    )
+
+
+def _validate_interrupted_task_handoff_receipt(
+    receipt: object,
+    request: TaskInterruptedHandoffRequest,
+) -> TaskInterruptedHandoffReceipt:
+    if type(receipt) is not TaskInterruptedHandoffReceipt:
+        raise _TaskInterruptedHandoffReceiptConflict(
+            "Interrupted-task handoff store returned malformed receipt evidence."
+        )
+    try:
+        copied_receipt = TaskInterruptedHandoffReceipt(
+            request=receipt.request,
+            request_sha256=receipt.request_sha256,
+            task=receipt.task,
+            committed_at=receipt.committed_at,
+        )
+    except (GeneratorExit, KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:
+        if exception_tree_contains(exc, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+            raise
+        raise _TaskInterruptedHandoffReceiptConflict(
+            "Interrupted-task handoff store returned malformed receipt evidence."
+        ) from None
+    _, request_sha256 = prepare_interrupted_task_handoff(request)
+    task = copied_receipt.task
+    if (
+        copied_receipt.request != request
+        or copied_receipt.request_sha256 != request_sha256
+        or task.id != request.task_id
+        or task.status is not TaskStatus.RUNNING
+        or task.session_id != request.session_id
+        or task.session_instance_id != request.session_instance_id
+        or task.worker_id is not None
+        or task.lease_expires_at is not None
+    ):
+        raise _TaskInterruptedHandoffReceiptConflict(
+            "Interrupted-task handoff receipt conflicts with exact authority."
+        )
+    return copied_receipt
+
+
+async def _emit_interrupted_task_handoff_event(
+    app: CayuApp,
+    request: TaskInterruptedHandoffRequest,
+    *,
+    handoff_status: str,
+    attempt: int,
+    recovery_mode: bool,
+) -> Event | None:
+    """Best-effort exact publication that never owns the task mutation."""
+
+    identity = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-interrupted-handoff-event.v1",
+            "handoff_id": request.handoff_id,
+            "handoff_status": handoff_status,
+            "attempt": attempt,
+            "recovery_mode": recovery_mode,
+        },
+        "task_interrupted_handoff_event",
+    )
+    event = event_with_runtime_generated_id(
+        Event(
+            id=f"task-handoff:v1:{sha256(identity).hexdigest()}",
+            type=EventType.TASK_INTERRUPTED_HANDOFF,
+            session_id=request.session_id,
+            payload={
+                "task_id": request.task_id,
+                "handoff_id": request.handoff_id,
+                "handoff_status": handoff_status,
+                "attempt": attempt,
+                "session_run_epoch": request.session_run_epoch,
+            },
+        )
+    )
+    event = event_with_runtime_envelope_authority(event, "session_id")
+    payload_authority = ["handoff_id"]
+    if app.redact_json(request.task_id) == request.task_id:
+        # The task identity is store-resolved, but its original value remains
+        # application-authored. Preserve it as durable authority only after the
+        # workload-secret boundary proves that exact value safe.
+        payload_authority.append("task_id")
+    event = event_with_runtime_payload_authority(event, *payload_authority)
+    try:
+        persisted = await app._event_writer.persist_exact_replay(event)
+    except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
+    try:
+        delivered = await app._event_writer.fan_out_persisted([persisted])
+    except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        # The event and its side-effect handoff are already durable. Ordinary
+        # sink delivery recovery owns any later retry.
+        return persisted
+    emitted = delivered[0]
+    app._session_control.queue_out_of_band_event(emitted)
+    return emitted
+
+
+async def _recover_expired_interrupted_task_handoffs(
+    app: CayuApp,
+    task_store: TaskStore,
+    *,
+    limit: int,
+) -> int:
+    after: tuple[datetime, str] | None = None
+    recovered = 0
+    while True:
+        candidates = await task_store.list_expired_interrupted_task_handoff_candidates(
+            after=after,
+            limit=limit,
+        )
+        for task in candidates:
+            if type(task) is not Task or task.session_id is None:
+                raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
+            session = await app.session_store.load(task.session_id)
+            if (
+                session is None
+                or task.session_instance_id is None
+                or session.instance_id != task.session_instance_id
+                or session.status is not SessionStatus.INTERRUPTED
+            ):
+                continue
+            request = interrupted_task_handoff_request(
+                task,
+                session_run_epoch=session.run_epoch,
+            )
+            try:
+                await _settle_interrupted_task_handoff_with_retry(
+                    app,
+                    task_store,
+                    request,
+                    recover_expired=True,
+                )
+            except TaskInterruptedHandoffConflict:
+                current = await task_store.load_task(task.id)
+                if (
+                    current is None
+                    or current.status
+                    in {
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    }
+                    or _task_cancellation_requested(current)
+                    or _task_retry_cancellation_requested(current)
+                    or current.worker_id is None
+                    or current.worker_id != request.worker_id
+                    or current.lease_expires_at != request.lease_expires_at
+                ):
+                    continue
+                raise
+            recovered += 1
+        if len(candidates) < limit:
+            return recovered
+        last_candidate = candidates[-1]
+        if type(last_candidate) is not Task or last_candidate.lease_expires_at is None:
+            raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
+        after = (last_candidate.lease_expires_at, last_candidate.id)
 
 
 async def _heartbeat_until(

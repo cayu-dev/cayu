@@ -532,6 +532,7 @@ UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.SESSION_COMPLETED,
         EventType.SESSION_FAILED,
         EventType.SESSION_INTERRUPTED,
+        EventType.TASK_INTERRUPTED_HANDOFF,
         EventType.TASK_COMPLETION_RESULT_RESOLVED,
         EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED,
     }
@@ -24663,6 +24664,8 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
             "result_reference_id",
             "task_id",
         )
+    if event_type == EventType.TASK_INTERRUPTED_HANDOFF:
+        return ("handoff_id", "task_id")
     if event_type == EventType.REQUEST_FOOTPRINT_RECORDED:
         return ("execution_profile_fingerprint",)
     if event_type == EventType.TOOL_EXPOSURE_RECORDED:

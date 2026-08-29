@@ -3543,6 +3543,10 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `heartbeat(task_id, worker_id, extend_seconds=...)`
 - `release_task(task_id, worker_id)`
 - `release_attached_task_worker(task_id, worker_id)`
+- `release_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
+- `recover_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
+- `load_interrupted_task_handoff_receipt(task_id, handoff_id)`
+- `list_expired_interrupted_task_handoff_candidates(after=..., limit=...)`
 - `reclaim_expired(query=..., max_reclaims=...)`
 - `complete_task(task_id, result)`
 - `fail_task(task_id, error)`
@@ -4254,14 +4258,52 @@ task; returning `None` with a claimed or running task fails that task. If the
 handler fully consumes an attached agent run that durably ends with
 `session.interrupted`, it may instead return
 `TaskHandlerOutcome.SESSION_INTERRUPTED`. The helper reloads the public session
-state, requires the linked session to be `interrupted`, and calls
-`release_attached_task_worker(...)`. That store operation atomically clears the
+state, requires the exact linked session incarnation to be `interrupted`, and
+builds a `TaskInterruptedHandoffRequest` with
+`interrupted_task_handoff_request(...)`. The request binds the task, worker,
+lease, session, session incarnation, observed session run epoch, and deterministic
+handoff identity. `release_interrupted_task_worker(...)` atomically clears the
 worker id and lease while preserving the task as `running` and attached to its
-session. The task is not returned to the fresh-work queue. A control-plane
-process may later resolve an approval or user-input request, resume the session,
-or run recovery; the existing session/task link then terminalizes the same task.
-Custom worker loops may call the store operation directly after establishing the
-same durable session boundary.
+session, and inserts an immutable receipt in the same transaction. Exact replay
+returns that receipt; a changed tuple conflicts. The task is not returned to
+the fresh-work queue.
+
+The worker attempts exact `task.interrupted_handoff` operational events with
+`pending`, `retrying`, `released`, `recovered`, or `recovery_required` status.
+These events are an observability projection, not ownership authority: an
+unavailable session-event store cannot prevent or roll back the task-store
+handoff, while an event whose append committed is reconciled by exact readback
+and remains owned by the durable side-effect handoff. The task-store receipt is
+the authoritative recovery evidence.
+An ordinary release failure is retried at most three times with bounded
+backoff. After each ambiguous failure the worker reads the exact receipt before
+dispatching another mutation, so commit-then-acknowledgement loss does not
+double-release ownership. Exhaustion raises a recovery-needed error without
+rewriting the task as failed. The exact worker and lease remain attached until
+their store-authoritative expiry; a later worker startup scans a bounded page of
+expired candidates and calls `recover_interrupted_task_worker(...)`. Startup
+walks stable `(lease_expires_at, task_id)` pages before claiming fresh work, so
+ineligible earlier candidates cannot starve a valid interrupted handoff even for
+a one-shot worker, while each individual store read remains bounded to at most
+100 tasks. Terminal,
+cancel-draining, admitted-work, wrong-owner, different-incarnation, and
+non-interrupted-session states are not released by this recovery path. A
+complete recovery scan is rate-limited, so an unchanged ineligible set is not
+re-read on every idle poll or before every fresh claim. A control-plane process
+may later resolve an approval or user-input request,
+resume the session, or run session recovery; the original session/task link then
+terminalizes the same task.
+
+Custom task stores opt in with `supports_interrupted_task_handoffs = True` only
+when release, receipt readback, expired-candidate discovery, and recovery have
+the same exact-operation and authoritative-time semantics. Additive schema
+revision 70 installs the receipt table and bounded recovery index for SQLite and
+PostgreSQL without inferring historical handoffs. Custom worker loops may use
+the public request builder and store operations after proving the same durable
+interruption boundary; they must preserve the task/session link when release is
+unacknowledged. A concrete subclass must redeclare the capability and the
+cancellation-quiescence proof after reviewing its complete implementation graph;
+inherited declarations alone do not authenticate a changed store implementation.
 
 Cancelling an idle ordinary task terminalizes it immediately. Cancelling an
 ordinary task with a live worker instead records a durable

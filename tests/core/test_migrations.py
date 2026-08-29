@@ -445,6 +445,16 @@ def test_revision_sixty_nine_adds_agent_work_context_without_raising_floor() -> 
     m.validate(state, app_latest=69, app_min_supported=67)
 
 
+def test_revision_seventy_adds_interrupted_task_handoff_receipts() -> None:
+    revision = m.revision(70)
+    state = m.SchemaState(revision=70, compatible_from=67)
+
+    assert revision.kind is m.RevisionKind.ADDITIVE
+    assert revision.compatible_from == 67
+    m.validate(state, app_latest=69, app_min_supported=67)
+    m.validate(state, app_latest=70, app_min_supported=67)
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

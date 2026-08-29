@@ -50,6 +50,14 @@ _WORK_ATTEMPT_ADMISSION_READS = (
     "load_work_attempt_admission",
     "load_work_attempt_execution_claim",
 )
+_INTERRUPTED_TASK_HANDOFF_MUTATIONS = (
+    "release_interrupted_task_worker",
+    "recover_interrupted_task_worker",
+)
+_INTERRUPTED_TASK_HANDOFF_READS = (
+    "load_interrupted_task_handoff_receipt",
+    "list_expired_interrupted_task_handoff_candidates",
+)
 
 
 class _TaskStoreOperationCancellationMarker:
@@ -211,6 +219,31 @@ def task_store_work_attempt_admission_capability_is_complete(
     return all(
         task_store_mutation_is_cancellation_quiescent(task_store, method_name)
         for method_name in _WORK_ATTEMPT_ADMISSION_MUTATIONS
+    )
+
+
+def task_store_interrupted_handoff_capability_is_complete(
+    task_store: TaskStore,
+) -> bool:
+    """Return positive proof for the exact interrupted-task handoff family."""
+
+    try:
+        declarations = type.__getattribute__(type(task_store), "__dict__")
+    except BaseException:
+        return False
+    if declarations.get("supports_interrupted_task_handoffs") is not True:
+        return False
+    if not all(
+        _task_store_method_has_stable_concrete_implementation(task_store, method_name)
+        for method_name in (
+            *_INTERRUPTED_TASK_HANDOFF_MUTATIONS,
+            *_INTERRUPTED_TASK_HANDOFF_READS,
+        )
+    ):
+        return False
+    return all(
+        task_store_mutation_is_cancellation_quiescent(task_store, method_name)
+        for method_name in _INTERRUPTED_TASK_HANDOFF_MUTATIONS
     )
 
 

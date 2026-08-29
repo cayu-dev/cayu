@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,11 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    Event,
+    EventQuery,
     EventType,
     ExecutionProfileBehaviorIdentity,
+    InMemorySessionStore,
     InMemoryTaskStore,
     Message,
     ModelStreamEvent,
@@ -32,11 +36,15 @@ from cayu import (
     Task,
     TaskCreate,
     TaskHandlerOutcome,
+    TaskInterruptedHandoffConflict,
+    TaskInterruptedHandoffReceipt,
+    TaskInterruptedHandoffRequest,
     TaskInvocationSnapshot,
     TaskQuery,
     TaskStatus,
     TaskStore,
     TaskTerminalizationConflict,
+    TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
     TaskTerminalKind,
     Tool,
@@ -80,6 +88,36 @@ def _build(
     return app, store
 
 
+async def _seed_interrupted_worker_handoff(
+    app: CayuApp,
+    task_store: TaskStore,
+    *,
+    task_id: str,
+    session_id: str,
+) -> None:
+    created = await task_store.create_task(TaskCreate(task_id=task_id, type="job"))
+    await app.session_store.create(
+        run_request_with_task_invocation(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id=session_id,
+                task_id=task_id,
+                messages=[Message.text("user", "pause")],
+            ),
+            TaskInvocationSnapshot(
+                id=created.id,
+                session_id=created.session_id,
+                invocation=created.invocation,
+            ),
+        ),
+        identity=SessionIdentity(
+            provider_name="scripted",
+            model="scripted-model",
+        ),
+    )
+    await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+
 def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
     app, store = _build(tmp_path)
 
@@ -95,6 +133,32 @@ def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
                 worker_id="worker-a",
                 poll_interval_s=float("nan"),
                 max_tasks=0,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_run_task_worker_rejects_incomplete_interrupted_handoff_capability() -> None:
+    class IncompleteHandoffStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+        load_interrupted_task_handoff_receipt = TaskStore.load_interrupted_task_handoff_receipt
+
+    store = IncompleteHandoffStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise AssertionError("Capability validation must precede task handling.")
+
+    async def scenario() -> None:
+        with pytest.raises(NotImplementedError, match="complete idempotent|capability requires"):
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="worker-incomplete-handoff",
+                poll_interval_s=0.001,
+                max_tasks=1,
             )
 
     asyncio.run(scenario())
@@ -813,7 +877,13 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
             pass
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
-    async def scenario() -> tuple[Task | None, SessionStatus, Task | None, SessionStatus]:
+    async def scenario() -> tuple[
+        Task | None,
+        SessionStatus,
+        Task | None,
+        SessionStatus,
+        list[tuple[str, str]],
+    ]:
         await first_app.create_task(
             TaskCreate(
                 task_id="task-handoff",
@@ -847,6 +917,12 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
         assert handed_off_session.status == SessionStatus.INTERRUPTED
         assert len(pending.actions) == 1
         assert pending.actions[0].approval_id is not None
+        handoff_events = await first_app.session_store.query_events(
+            EventQuery(
+                session_id="session-handoff",
+                event_types=(EventType.TASK_INTERRUPTED_HANDOFF,),
+            )
+        )
 
         reconstructed = CayuApp(
             session_store=SQLiteSessionStore(session_path),
@@ -891,14 +967,1552 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
             handed_off_session.status,
             completed_task,
             completed_session.status,
+            [
+                (
+                    str(record.event.payload["task_id"]),
+                    str(record.event.payload["handoff_status"]),
+                )
+                for record in handoff_events
+            ],
         )
 
-    handed_off_task, handed_off_status, completed_task, completed_status = asyncio.run(scenario())
+    (
+        handed_off_task,
+        handed_off_status,
+        completed_task,
+        completed_status,
+        handoff_evidence,
+    ) = asyncio.run(scenario())
     assert handed_off_task is not None
     assert handed_off_status == SessionStatus.INTERRUPTED
     assert completed_task is not None
     assert completed_task.status == "completed"
     assert completed_status == SessionStatus.COMPLETED
+    assert handoff_evidence == [
+        ("task-handoff", "released"),
+    ]
+
+
+def test_terminal_peer_winner_during_handoff_does_not_stop_worker() -> None:
+    class TerminalPeerStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            if request.task_id == "task-handoff-peer-winner":
+                await self.terminalize_task(
+                    TaskTerminalizationRequest(
+                        task_id=request.task_id,
+                        worker_id=request.worker_id,
+                        kind=TaskTerminalKind.COMPLETED,
+                        result={"winner": "peer"},
+                        idempotency_key="terminal-peer-winner",
+                    )
+                )
+            return await super().release_interrupted_task_worker(request)
+
+    task_store = TerminalPeerStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome | None:
+        if task.id == "task-handoff-peer-winner":
+            await task_store.attach_task(
+                task.id,
+                session_id="session-handoff-peer-winner",
+                session_invocation=await stored_session_invocation(
+                    app.session_store,
+                    "session-handoff-peer-winner",
+                ),
+                worker_id=worker_id,
+            )
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+        await task_store.complete_task(
+            task.id,
+            {"handled": True},
+            worker_id=worker_id,
+        )
+        return None
+
+    async def scenario() -> tuple[int, Task | None, Task | None]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-handoff-peer-winner",
+            session_id="session-handoff-peer-winner",
+        )
+        await task_store.create_task(TaskCreate(task_id="task-after-peer-winner", type="job"))
+        handled = await run_task_worker(
+            app,
+            task_store,
+            handler,
+            worker_id="worker-a",
+            query=TaskQuery(type="job"),
+            max_tasks=2,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        return (
+            handled,
+            await task_store.load_task("task-handoff-peer-winner"),
+            await task_store.load_task("task-after-peer-winner"),
+        )
+
+    handled, peer_winner, following = asyncio.run(scenario())
+    assert handled == 2
+    assert peer_winner is not None
+    assert peer_winner.status is TaskStatus.COMPLETED
+    assert peer_winner.result == {"winner": "peer"}
+    assert following is not None
+    assert following.status is TaskStatus.COMPLETED
+    assert following.result == {"handled": True}
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "expected_calls", "expected_statuses"),
+    [
+        ("before_commit", 2, ["pending", "recovered"]),
+        ("after_commit", 1, ["pending", "recovered"]),
+    ],
+)
+def test_interrupted_handoff_retries_or_reads_back_without_failing_task(
+    tmp_path: Path,
+    failure_point: str,
+    expected_calls: int,
+    expected_statuses: list[str],
+) -> None:
+    class FaultingHandoffStore(SQLiteTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.release_calls = 0
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            self.release_calls += 1
+            if failure_point == "before_commit" and self.release_calls == 1:
+                raise RuntimeError("transient handoff write failure")
+            receipt = await super().release_interrupted_task_worker(request)
+            if failure_point == "after_commit" and self.release_calls == 1:
+                raise RuntimeError("handoff acknowledgement lost")
+            return receipt
+
+    session_store = SQLiteSessionStore(tmp_path / f"sessions-{failure_point}.sqlite")
+    task_store = FaultingHandoffStore(tmp_path / f"tasks-{failure_point}.sqlite")
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-faulted-handoff",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session-faulted-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, list[str]]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-faulted-handoff",
+            session_id="session-faulted-handoff",
+        )
+        assert (
+            await run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+            == 1
+        )
+        task = await task_store.load_task("task-faulted-handoff")
+        events = await session_store.query_events(
+            EventQuery(
+                session_id="session-faulted-handoff",
+                event_types=(EventType.TASK_INTERRUPTED_HANDOFF,),
+            )
+        )
+        return task, [str(record.event.payload["handoff_status"]) for record in events]
+
+    task, statuses = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.session_id == "session-faulted-handoff"
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert task.error is None
+    assert task_store.release_calls == expected_calls
+    assert statuses == expected_statuses
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "expected_statuses"),
+    [
+        ("before_commit", []),
+        ("after_commit", ["released"]),
+    ],
+)
+def test_interrupted_handoff_event_failure_never_owns_task_release(
+    failure_point: str,
+    expected_statuses: list[str],
+) -> None:
+    class FaultingEventStore(InMemorySessionStore):
+        async def append_event(self, session_id: str, event: Event) -> None:
+            if event.type != EventType.TASK_INTERRUPTED_HANDOFF:
+                await super().append_event(session_id, event)
+                return
+            if failure_point == "before_commit":
+                raise RuntimeError("handoff event unavailable before commit")
+            await super().append_event(session_id, event)
+            raise RuntimeError("handoff event acknowledgement lost")
+
+    session_store = FaultingEventStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-event-failure-handoff",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session-event-failure-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, list[str]]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-event-failure-handoff",
+            session_id="session-event-failure-handoff",
+        )
+        assert (
+            await run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+            == 1
+        )
+        events = await session_store.query_events(
+            EventQuery(
+                session_id="session-event-failure-handoff",
+                event_types=(EventType.TASK_INTERRUPTED_HANDOFF,),
+            )
+        )
+        return (
+            await task_store.load_task("task-event-failure-handoff"),
+            [str(record.event.payload["handoff_status"]) for record in events],
+        )
+
+    task, statuses = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.session_id == "session-event-failure-handoff"
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert task.error is None
+    assert statuses == expected_statuses
+
+
+def test_interrupted_handoff_releases_before_slow_event_publication() -> None:
+    class SlowEventStore(InMemorySessionStore):
+        async def append_event(self, session_id: str, event: Event) -> None:
+            if (
+                event.type is EventType.TASK_INTERRUPTED_HANDOFF
+                and event.payload.get("handoff_status") == "released"
+            ):
+                released = await task_store.load_task("task-slow-event-handoff")
+                assert released is not None
+                assert released.worker_id is None
+                assert released.lease_expires_at is None
+                await asyncio.sleep(1.1)
+            await super().append_event(session_id, event)
+
+    session_store = SlowEventStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-slow-event-handoff",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session-slow-event-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> Task | None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-slow-event-handoff",
+            session_id="session-slow-event-handoff",
+        )
+        assert (
+            await run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                lease_seconds=1,
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+            == 1
+        )
+        return await task_store.load_task("task-slow-event-handoff")
+
+    task = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+
+
+def test_interrupted_handoff_does_not_attest_secret_bearing_task_id() -> None:
+    secret = "handoff-task-id-secret"
+    task_id = f"task-{secret}-value"
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-secret-task-handoff",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-secret-task-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, list[object]]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id=task_id,
+            session_id="session-secret-task-handoff",
+        )
+        assert (
+            await run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+            == 1
+        )
+        events = await app.session_store.query_events(
+            EventQuery(
+                session_id="session-secret-task-handoff",
+                event_types=(EventType.TASK_INTERRUPTED_HANDOFF,),
+            )
+        )
+        return await task_store.load_task(task_id), events
+
+    task, events = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert events == []
+
+
+def test_interrupted_handoff_rejects_malformed_store_receipt_without_retry() -> None:
+    class MalformedReceiptStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_calls = 0
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            del request
+            self.release_calls += 1
+            return object()  # type: ignore[return-value]
+
+    task_store = MalformedReceiptStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-malformed-handoff",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-malformed-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> Task | None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-malformed-handoff",
+            session_id="session-malformed-handoff",
+        )
+        with pytest.raises(TaskInterruptedHandoffConflict, match="malformed receipt"):
+            await run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        return await task_store.load_task("task-malformed-handoff")
+
+    task = asyncio.run(scenario())
+    assert task_store.release_calls == 1
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.worker_id == "worker-a"
+    assert task.error is None
+
+
+def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
+    tmp_path: Path,
+) -> None:
+    class UnavailableHandoffStore(SQLiteTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            del request
+            raise RuntimeError("handoff store unavailable")
+
+    session_path = tmp_path / "sessions-recovery.sqlite"
+    task_path = tmp_path / "tasks-recovery.sqlite"
+    session_store = SQLiteSessionStore(session_path)
+    failing_store = UnavailableHandoffStore(task_path)
+    first_app = CayuApp(
+        session_store=session_store,
+        task_store=failing_store,
+        enable_logging=False,
+    )
+    first_app.register_provider(
+        ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="publish-recovered-change",
+                        name="publish_change",
+                        arguments={"change": "recovered-release"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        ),
+        default=True,
+    )
+    _register_approval_agent(first_app)
+
+    async def handoff_handler(
+        app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        async for _event in app.run(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="session-recovery-handoff",
+                task_id=task.id,
+                task_worker_id=worker_id,
+                messages=[Message.text("user", "Publish after durable recovery.")],
+            )
+        ):
+            pass
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def first_process() -> tuple[Task, str, str, str]:
+        await first_app.create_task(
+            TaskCreate(
+                task_id="task-recovery-handoff",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+        with pytest.raises(RuntimeError, match="handoff store unavailable"):
+            await run_task_worker(
+                first_app,
+                failing_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                lease_seconds=1,
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        task = await failing_store.load_task("task-recovery-handoff")
+        assert task is not None
+        pending = await session_store.query_pending_actions(
+            PendingActionQuery(session_id="session-recovery-handoff")
+        )
+        assert len(pending.actions) == 1
+        approval = pending.actions[0]
+        assert approval.approval_id is not None
+        assert approval.round_id is not None
+        assert approval.tool_call_id is not None
+        await failing_store.close()
+        return (
+            task,
+            approval.approval_id,
+            approval.round_id,
+            approval.tool_call_id,
+        )
+
+    stranded, approval_id, approval_round_id, approval_tool_call_id = asyncio.run(first_process())
+    assert stranded.status is TaskStatus.RUNNING
+    assert stranded.session_id == "session-recovery-handoff"
+    assert stranded.worker_id == "worker-a"
+    assert stranded.lease_expires_at is not None
+    assert stranded.error is None
+
+    async def second_process() -> tuple[
+        Task | None,
+        SessionStatus,
+        list[str],
+    ]:
+        remaining = max(
+            (stranded.lease_expires_at - datetime.now(UTC)).total_seconds(),
+            0,
+        )
+        await asyncio.sleep(remaining + 0.05)
+        recovered_store = SQLiteTaskStore(task_path)
+        recovered_sessions = SQLiteSessionStore(session_path)
+        recovered_app = CayuApp(
+            session_store=recovered_sessions,
+            task_store=recovered_store,
+            enable_logging=False,
+        )
+        recovered_app.register_provider(
+            ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.text_delta("The recovered task is complete."),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ]
+                ]
+            ),
+            default=True,
+        )
+        _register_approval_agent(recovered_app)
+        stop = asyncio.Event()
+
+        async def stop_after_recovery() -> None:
+            await asyncio.sleep(0.05)
+            stop.set()
+
+        async def unexpected_handler(
+            _app: CayuApp,
+            _task: Task,
+            _worker_id: str,
+        ) -> None:
+            raise AssertionError("Recovered attached work must not re-enter the fresh queue.")
+
+        await asyncio.gather(
+            run_task_worker(
+                recovered_app,
+                recovered_store,
+                unexpected_handler,
+                worker_id="worker-b",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                stop=stop,
+                max_tasks=1,
+            ),
+            stop_after_recovery(),
+        )
+        recovered = await recovered_store.load_task("task-recovery-handoff")
+        assert recovered is not None
+        assert recovered.status is TaskStatus.RUNNING
+        assert recovered.session_id == "session-recovery-handoff"
+        assert recovered.worker_id is None
+        assert recovered.lease_expires_at is None
+
+        async for _event in recovered_app.resolve_tool_approval(
+            ToolApprovalRequest(
+                session_id="session-recovery-handoff",
+                approval_id=approval_id,
+                tool_round_id=approval_round_id,
+                tool_call_id=approval_tool_call_id,
+                decision=ToolApprovalDecision.APPROVE,
+            )
+        ):
+            pass
+
+        task = await recovered_store.load_task("task-recovery-handoff")
+        session = await recovered_sessions.load("session-recovery-handoff")
+        assert session is not None
+        events = await recovered_sessions.query_events(
+            EventQuery(
+                session_id="session-recovery-handoff",
+                event_types=(EventType.TASK_INTERRUPTED_HANDOFF,),
+            )
+        )
+        await recovered_store.close()
+        return (
+            task,
+            session.status,
+            [str(record.event.payload["handoff_status"]) for record in events],
+        )
+
+    completed, session_status, statuses = asyncio.run(second_process())
+    assert completed is not None
+    assert completed.status is TaskStatus.COMPLETED
+    assert completed.session_id == "session-recovery-handoff"
+    assert completed.worker_id is None
+    assert completed.lease_expires_at is None
+    assert session_status is SessionStatus.COMPLETED
+    assert statuses == [
+        "pending",
+        "retrying",
+        "retrying",
+        "recovery_required",
+        "recovered",
+    ]
+
+
+def test_interrupted_handoff_recovery_pages_past_ineligible_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(task_worker_module, "_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE", 2)
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def attach_expiring_task(
+        *,
+        task_id: str,
+        session_id: str,
+        interrupted: bool,
+    ) -> None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id=task_id,
+            session_id=session_id,
+        )
+        if not interrupted:
+            await app.session_store.update_status(session_id, SessionStatus.RUNNING)
+        claimed = await task_store.claim_task("expired-worker", lease_seconds=1)
+        assert claimed is not None
+        assert claimed.id == task_id
+        await task_store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                session_id,
+            ),
+            worker_id="expired-worker",
+        )
+
+    async def handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> None:
+        await task_store.complete_task(task.id, worker_id=worker_id, result={"ok": True})
+
+    async def scenario() -> tuple[Task | None, list[Task | None]]:
+        await attach_expiring_task(
+            task_id="stale-ineligible-a",
+            session_id="session-ineligible-a",
+            interrupted=False,
+        )
+        await attach_expiring_task(
+            task_id="stale-ineligible-b",
+            session_id="session-ineligible-b",
+            interrupted=False,
+        )
+        await attach_expiring_task(
+            task_id="stale-interrupted",
+            session_id="session-interrupted",
+            interrupted=True,
+        )
+        await task_store.create_task(TaskCreate(task_id="trigger-a", type="trigger"))
+        await asyncio.sleep(1.05)
+
+        handled = await run_task_worker(
+            app,
+            task_store,
+            handler,
+            worker_id="recovery-worker",
+            query=TaskQuery(type="trigger"),
+            max_tasks=1,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        assert handled == 1
+        return (
+            await task_store.load_task("stale-interrupted"),
+            [
+                await task_store.load_task("stale-ineligible-a"),
+                await task_store.load_task("stale-ineligible-b"),
+            ],
+        )
+
+    recovered, ineligible = asyncio.run(scenario())
+    assert recovered is not None
+    assert recovered.worker_id is None
+    assert recovered.lease_expires_at is None
+    assert all(task is not None and task.worker_id == "expired-worker" for task in ineligible)
+
+
+def test_interrupted_handoff_recovery_skips_new_cancellation_request() -> None:
+    class CancellationWinningStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def recover_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            await self.cancel_task(request.task_id, {"code": "operator_cancelled"})
+            return await super().recover_interrupted_task_worker(request)
+
+    task_store = CancellationWinningStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def scenario() -> tuple[Task | None, Task | None]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-cancellation-winner",
+            session_id="session-cancellation-winner",
+        )
+        claimed = await task_store.claim_task("expired-worker", lease_seconds=1)
+        assert claimed is not None
+        await task_store.attach_task(
+            claimed.id,
+            session_id="session-cancellation-winner",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-cancellation-winner",
+            ),
+            worker_id="expired-worker",
+        )
+        await task_store.create_task(TaskCreate(task_id="fresh-after-cancel", type="fresh"))
+        await asyncio.sleep(1.05)
+
+        async def handler(
+            _app: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> None:
+            await task_store.complete_task(task.id, {"ok": True}, worker_id=worker_id)
+
+        assert (
+            await run_task_worker(
+                app,
+                task_store,
+                handler,
+                worker_id="recovery-worker",
+                query=TaskQuery(type="fresh"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+            == 1
+        )
+        return (
+            await task_store.load_task("task-cancellation-winner"),
+            await task_store.load_task("fresh-after-cancel"),
+        )
+
+    cancelled, fresh = asyncio.run(scenario())
+    assert cancelled is not None
+    assert cancelled.status is TaskStatus.RUNNING
+    assert cancelled.status_reason == "cancellation_requested"
+    assert fresh is not None
+    assert fresh.status is TaskStatus.COMPLETED
+
+
+def test_operator_cancellation_winning_live_handoff_is_terminalized() -> None:
+    class CancellationWinningStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancellation_key: str | None = None
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            cancellation = await self.cancel_task(
+                request.task_id,
+                {"code": "operator_cancelled_during_handoff"},
+            )
+            assert cancellation.status_payload is not None
+            key = cancellation.status_payload["terminalization_idempotency_key"]
+            assert isinstance(key, str)
+            self.cancellation_key = key
+            return await super().release_interrupted_task_worker(request)
+
+    task_store = CancellationWinningStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-live-cancellation-winner",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-live-cancellation-winner",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[int, Task | None, TaskTerminalizationReceipt | None]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-live-cancellation-winner",
+            session_id="session-live-cancellation-winner",
+        )
+        handled = await run_task_worker(
+            app,
+            task_store,
+            handoff_handler,
+            worker_id="worker-a",
+            query=TaskQuery(type="job"),
+            max_tasks=1,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        terminal = await task_store.load_task("task-live-cancellation-winner")
+        assert terminal is not None
+        assert terminal.status_payload is None
+        assert task_store.cancellation_key is not None
+        return (
+            handled,
+            terminal,
+            await task_store.load_task_terminalization_receipt(
+                terminal.id,
+                task_store.cancellation_key,
+            ),
+        )
+
+    handled, task, receipt = asyncio.run(scenario())
+    assert handled == 1
+    assert task is not None
+    assert task.status is TaskStatus.CANCELLED
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert task.error == {"code": "operator_cancelled_during_handoff"}
+    assert receipt is not None
+    assert receipt.kind is TaskTerminalKind.CANCELLED
+    assert receipt.task == task
+
+
+def test_interrupted_handoff_recovery_retains_bounded_cursor_between_idle_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(task_worker_module, "_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE", 2)
+
+    class CountingRecoveryStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.recovery_list_calls = 0
+
+        async def list_expired_interrupted_task_handoff_candidates(
+            self,
+            *,
+            after: tuple[datetime, str] | None = None,
+            limit: int = 100,
+        ) -> list[Task]:
+            self.recovery_list_calls += 1
+            return await super().list_expired_interrupted_task_handoff_candidates(
+                after=after,
+                limit=limit,
+            )
+
+    task_store = CountingRecoveryStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def attach_ineligible(task_id: str) -> None:
+        session_id = f"session-{task_id}"
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id=task_id,
+            session_id=session_id,
+        )
+        await app.session_store.update_status(session_id, SessionStatus.RUNNING)
+        claimed = await task_store.claim_task("expired-worker", lease_seconds=1)
+        assert claimed is not None
+        await task_store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                session_id,
+            ),
+            worker_id="expired-worker",
+        )
+
+    async def scenario() -> None:
+        await attach_ineligible("stale-bounded-a")
+        await attach_ineligible("stale-bounded-b")
+        await asyncio.sleep(1.05)
+        stop = asyncio.Event()
+
+        async def stop_worker() -> None:
+            await asyncio.sleep(0.1)
+            stop.set()
+
+        async def unexpected_handler(
+            _app: CayuApp,
+            _task: Task,
+            _worker_id: str,
+        ) -> None:
+            raise AssertionError("No fresh task should be claimed.")
+
+        await asyncio.gather(
+            run_task_worker(
+                app,
+                task_store,
+                unexpected_handler,
+                worker_id="recovery-worker",
+                query=TaskQuery(type="fresh"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+                stop=stop,
+            ),
+            stop_worker(),
+        )
+
+    asyncio.run(scenario())
+    assert task_store.recovery_list_calls == 2
+
+
+def test_interrupted_handoff_cancellation_waits_for_dispatched_release() -> None:
+    class BlockingHandoffStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            self.release_started.set()
+            await self.allow_release.wait()
+            return await super().release_interrupted_task_worker(request)
+
+    task_store = BlockingHandoffStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-cancelled-handoff",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-cancelled-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, int, bool, tuple[object, ...], list[str]]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-cancelled-handoff",
+            session_id="session-cancelled-handoff",
+        )
+        worker_task = asyncio.create_task(
+            run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await task_store.release_started.wait()
+        worker_task.cancel("stop interrupted handoff")
+        await asyncio.sleep(0)
+        assert not worker_task.done()
+        task_store.allow_release.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await worker_task
+        task = await task_store.load_task("task-cancelled-handoff")
+        events = await app.session_store.query_events(
+            EventQuery(
+                session_id="session-cancelled-handoff",
+                event_types=(EventType.TASK_INTERRUPTED_HANDOFF,),
+            )
+        )
+        return (
+            task,
+            worker_task.cancelling(),
+            worker_task.cancelled(),
+            raised.value.args,
+            [str(record.event.payload["handoff_status"]) for record in events],
+        )
+
+    task, cancelling, cancelled, cancellation_args, statuses = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.session_id == "session-cancelled-handoff"
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert task.error is None
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation_args == ("stop interrupted handoff",)
+    assert statuses == []
+
+
+def test_interrupted_handoff_pending_cancellation_owns_dispatched_release() -> None:
+    class BlockingHandoffStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            self.release_started.set()
+            await self.allow_release.wait()
+            return await super().release_interrupted_task_worker(request)
+
+    task_store = BlockingHandoffStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+
+    async def scenario() -> tuple[Task | None, int, bool, tuple[object, ...]]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-pending-cancelled-handoff",
+            session_id="session-pending-cancelled-handoff",
+        )
+        claimed = await task_store.claim_task("worker-a", TaskQuery(type="job"))
+        assert claimed is not None
+        attached = await task_store.attach_task(
+            claimed.id,
+            session_id="session-pending-cancelled-handoff",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-pending-cancelled-handoff",
+            ),
+            worker_id="worker-a",
+        )
+        request = task_worker_module.interrupted_task_handoff_request(
+            attached,
+            session_run_epoch=1,
+        )
+
+        async def settle_with_pending_cancellation() -> TaskInterruptedHandoffReceipt:
+            owner = asyncio.current_task()
+            assert owner is not None
+            owner.cancel("cancel before interrupted handoff settlement")
+            return await task_worker_module._settle_interrupted_task_handoff_once(
+                app,
+                task_store,
+                request,
+                recover_expired=False,
+            )
+
+        settlement = asyncio.create_task(settle_with_pending_cancellation())
+        await task_store.release_started.wait()
+        await asyncio.sleep(0)
+        assert not settlement.done()
+        task_store.allow_release.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await settlement
+        return (
+            await task_store.load_task(attached.id),
+            settlement.cancelling(),
+            settlement.cancelled(),
+            raised.value.args,
+        )
+
+    task, cancelling, cancelled, cancellation_args = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.session_id == "session-pending-cancelled-handoff"
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation_args == ("cancel before interrupted handoff settlement",)
+
+
+def test_interrupted_handoff_cancellation_sanitizes_concurrent_store_failure(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "handoff-store-secret-canary"
+
+    class BlockingFailureStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.allow_failure = asyncio.Event()
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            del request
+            self.release_started.set()
+            await self.allow_failure.wait()
+            raise RuntimeError(f"store cleanup exposed {secret}")
+
+    task_store = BlockingFailureStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-cancelled-failing-handoff",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-cancelled-failing-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[asyncio.CancelledError, Task | None, int, bool]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-cancelled-failing-handoff",
+            session_id="session-cancelled-failing-handoff",
+        )
+        worker_task = asyncio.create_task(
+            run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await task_store.release_started.wait()
+        worker_task.cancel("cancel handoff with failing cleanup")
+        await asyncio.sleep(0)
+        assert not worker_task.done()
+        task_store.allow_failure.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await worker_task
+        return (
+            raised.value,
+            await task_store.load_task("task-cancelled-failing-handoff"),
+            worker_task.cancelling(),
+            worker_task.cancelled(),
+        )
+
+    with caplog.at_level("DEBUG"):
+        cancellation, task, cancelling, cancelled = asyncio.run(scenario())
+    rendered: list[str] = []
+    pending: list[BaseException] = [cancellation]
+    seen: set[int] = set()
+    while pending:
+        failure = pending.pop()
+        if id(failure) in seen:
+            continue
+        seen.add(id(failure))
+        rendered.extend((str(failure), repr(failure)))
+        if failure.__cause__ is not None:
+            pending.append(failure.__cause__)
+        if failure.__context__ is not None:
+            pending.append(failure.__context__)
+
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.worker_id == "worker-a"
+    assert task.error is None
+    assert cancelling == 1
+    assert cancelled is True
+    assert REDACTED_SECRET in " ".join(rendered)
+    captured = capsys.readouterr()
+    diagnostics = "\n".join(
+        [
+            *rendered,
+            captured.out,
+            captured.err,
+            *[record.getMessage() for record in caplog.records],
+            *[str(warning.message) for warning in recwarn],
+        ]
+    )
+    assert secret not in diagnostics
+
+
+def test_interrupted_handoff_event_cancellation_drops_store_failure_context(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "handoff-event-context-secret-canary"
+
+    class FailingHandoffStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            del request
+            raise RuntimeError(f"store handoff exposed {secret}")
+
+    class BlockingEventStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_started = asyncio.Event()
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            if (
+                event.type is EventType.TASK_INTERRUPTED_HANDOFF
+                and event.payload.get("handoff_status") == "pending"
+            ):
+                self.publication_started.set()
+                await asyncio.Event().wait()
+            await super().append_event(session_id, event)
+
+    task_store = FailingHandoffStore()
+    session_store = BlockingEventStore()
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-event-cancelled-handoff",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session-event-cancelled-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-event-cancelled-handoff",
+            session_id="session-event-cancelled-handoff",
+        )
+        worker_task = asyncio.create_task(
+            run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await session_store.publication_started.wait()
+        worker_task.cancel("cancel pending handoff event")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await worker_task
+        return raised.value, worker_task.cancelling(), worker_task.cancelled()
+
+    with caplog.at_level("DEBUG"):
+        cancellation, cancelling, cancelled = asyncio.run(scenario())
+    rendered: list[str] = []
+    pending: list[BaseException] = [cancellation]
+    seen: set[int] = set()
+    while pending:
+        failure = pending.pop()
+        if id(failure) in seen:
+            continue
+        seen.add(id(failure))
+        rendered.extend((str(failure), repr(failure)))
+        if failure.__cause__ is not None:
+            pending.append(failure.__cause__)
+        if failure.__context__ is not None:
+            pending.append(failure.__context__)
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == ("cancel pending handoff event",)
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(secret not in repr(value) for value in traceback.tb_frame.f_locals.values())
+        traceback = traceback.tb_next
+    captured = capsys.readouterr()
+    diagnostics = "\n".join(
+        [
+            *rendered,
+            captured.out,
+            captured.err,
+            *[record.getMessage() for record in caplog.records],
+            *[str(warning.message) for warning in recwarn],
+        ]
+    )
+    assert secret not in diagnostics
+
+
+def test_interrupted_handoff_cancellation_validates_commit_receipt_before_redelivery(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "handoff-malformed-receipt-secret-canary"
+
+    class SecretBearingValue:
+        def __eq__(self, _other: object) -> bool:
+            raise RuntimeError(secret)
+
+        def __repr__(self) -> str:
+            return secret
+
+    class BlockingMalformedReceiptStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_started = asyncio.Event()
+            self.allow_release = asyncio.Event()
+
+        async def release_interrupted_task_worker(
+            self,
+            request: TaskInterruptedHandoffRequest,
+        ) -> TaskInterruptedHandoffReceipt:
+            self.release_started.set()
+            await self.allow_release.wait()
+            receipt = await super().release_interrupted_task_worker(request)
+            object.__setattr__(receipt, "request", SecretBearingValue())
+            return receipt
+
+    task_store = BlockingMalformedReceiptStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+
+    async def handoff_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        await task_store.attach_task(
+            task.id,
+            session_id="session-cancelled-malformed-handoff",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "session-cancelled-malformed-handoff",
+            ),
+            worker_id=worker_id,
+        )
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[asyncio.CancelledError, Task | None, int, bool]:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="task-cancelled-malformed-handoff",
+            session_id="session-cancelled-malformed-handoff",
+        )
+        worker_task = asyncio.create_task(
+            run_task_worker(
+                app,
+                task_store,
+                handoff_handler,
+                worker_id="worker-a",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await task_store.release_started.wait()
+        worker_task.cancel("cancel handoff with malformed receipt")
+        await asyncio.sleep(0)
+        assert not worker_task.done()
+        task_store.allow_release.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await worker_task
+        return (
+            raised.value,
+            await task_store.load_task("task-cancelled-malformed-handoff"),
+            worker_task.cancelling(),
+            worker_task.cancelled(),
+        )
+
+    with caplog.at_level("DEBUG"):
+        cancellation, task, cancelling, cancelled = asyncio.run(scenario())
+    rendered: list[str] = []
+    pending: list[BaseException] = [cancellation]
+    seen: set[int] = set()
+    while pending:
+        failure = pending.pop()
+        if id(failure) in seen:
+            continue
+        seen.add(id(failure))
+        rendered.extend((str(failure), repr(failure)))
+        if failure.__cause__ is not None:
+            pending.append(failure.__cause__)
+        if failure.__context__ is not None:
+            pending.append(failure.__context__)
+
+    assert task is not None
+    assert task.status is TaskStatus.RUNNING
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert cancelling == 1
+    assert cancelled is True
+    assert "malformed receipt evidence" in " ".join(rendered)
+    captured = capsys.readouterr()
+    diagnostics = "\n".join(
+        [
+            *rendered,
+            captured.out,
+            captured.err,
+            *[record.getMessage() for record in caplog.records],
+            *[str(warning.message) for warning in recwarn],
+        ]
+    )
+    assert secret not in diagnostics
 
 
 @pytest.mark.parametrize(

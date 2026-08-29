@@ -324,6 +324,17 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_task_interrupted_handoff_receipts (
+        task_id TEXT NOT NULL,
+        handoff_id TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        request_json JSONB NOT NULL,
+        task_json JSONB NOT NULL,
+        committed_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (task_id, handoff_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_task_retry_settlements (
         task_id TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
