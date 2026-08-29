@@ -24052,10 +24052,21 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
     assert evidence.models == ["fake-model"]
 
 
-def test_cayu_app_does_not_retry_without_retry_policy():
+def test_cayu_app_retries_transient_provider_failure_by_default():
+    typed_error = ModelProviderError(
+        "provider rate limited",
+        provider="fake",
+        status_code=429,
+        retryable=True,
+        retry_after_s=0.0,
+    )
     provider = FakeProvider(
         [
-            ModelStreamEvent.error("OpenAI API request failed with HTTP 429: rate limit"),
+            [ModelStreamEvent.error("provider rate limited", cause=typed_error)],
+            [
+                ModelStreamEvent.text_delta("recovered"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
         ]
     )
     app = CayuApp()
@@ -24067,7 +24078,7 @@ def test_cayu_app_does_not_retry_without_retry_policy():
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_retry_disabled",
+                session_id="sess_retry_default",
                 messages=[Message.text("user", "hi")],
             ),
         )
@@ -24077,11 +24088,20 @@ def test_cayu_app_does_not_retry_without_retry_policy():
         EventType.SESSION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_ERROR,
+        EventType.MODEL_RETRY,
+        EventType.MODEL_ATTEMPT_DISCARDED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
         EventType.TURN_COMPLETED,
-        EventType.SESSION_FAILED,
+        EventType.SESSION_COMPLETED,
     ]
-    assert len(provider.requests) == 1
-    assert EventType.MODEL_RETRY not in [event.type for event in events]
+    assert len(provider.requests) == 2
+    retry = next(event for event in events if event.type is EventType.MODEL_RETRY)
+    assert retry.payload["attempt"] == 1
+    assert retry.payload["next_attempt"] == 2
+    assert retry.payload["max_attempts"] == 5
+    assert retry.payload["delay_seconds"] == 0.0
 
 
 def test_cayu_app_does_not_retry_non_retryable_model_error():
@@ -38801,7 +38821,7 @@ def test_runtime_compaction_outer_ledger_does_not_duplicate_retry_completions():
     ]
 
 
-def test_model_compactor_does_not_retry_by_default():
+def test_model_compactor_can_disable_retries_explicitly():
     provider = FlakyCompactionProvider(
         failures=1,
         error=ModelProviderError(
@@ -38811,7 +38831,11 @@ def test_model_compactor_does_not_retry_by_default():
             retryable=True,
         ),
     )
-    compactor = ModelCompactor(provider=provider, model="summary-model")
+    compactor = ModelCompactor(
+        provider=provider,
+        model="summary-model",
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
 
     with pytest.raises(ModelProviderError, match="provider overloaded"):
         asyncio.run(
@@ -40415,7 +40439,7 @@ def test_context_overflow_policy_rebuilds_context_and_retries_once():
         "retryable": False,
         "step": 1,
         "attempt": 1,
-        "max_attempts": 1,
+        "max_attempts": 5,
         "model_step_id": first_started.payload["model_step_id"],
         "model_attempt_id": first_started.payload["model_attempt_id"],
         "execution_profile_fingerprint": first_started.payload["execution_profile_fingerprint"],

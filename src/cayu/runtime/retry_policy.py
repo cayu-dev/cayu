@@ -63,8 +63,9 @@ class RetryReason(StrEnum):
 class RetryPolicy(BaseModel):
     """Retry controls for one provider model step.
 
-    `max_attempts` includes the initial attempt. The default of 1 means retries
-    are disabled.
+    `max_attempts` includes the initial attempt. The default permits five total
+    attempts for classified transient provider failures. Unknown provider
+    failures retain the stricter `max_unknown_attempts` ceiling.
 
     Frozen: policies are immutable value objects, so they can be shared across
     attempts and sessions without per-attempt defensive copies.
@@ -72,12 +73,12 @@ class RetryPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    max_attempts: StrictInt = Field(default=1, ge=1, le=10)
+    max_attempts: StrictInt = Field(default=5, ge=1, le=10)
     max_unknown_attempts: StrictInt = Field(default=2, ge=1, le=10)
     initial_delay_s: StrictFloat = Field(default=0.5, ge=0.0, le=60.0)
-    max_delay_s: StrictFloat = Field(default=10.0, ge=0.0, le=300.0)
+    max_delay_s: StrictFloat = Field(default=30.0, ge=0.0, le=300.0)
     backoff_multiplier: StrictFloat = Field(default=2.0, ge=1.0, le=10.0)
-    jitter_s: StrictFloat = Field(default=0.0, ge=0.0, le=60.0)
+    jitter_s: StrictFloat = Field(default=0.5, ge=0.0, le=60.0)
     retry_on_status_codes: tuple[StrictInt, ...] = Field(
         default=DEFAULT_RETRYABLE_STATUS_CODES,
         min_length=0,
@@ -315,6 +316,9 @@ def _retry_delay(
         return float(min(retry_after_s, policy.max_delay_s))
     base_delay = policy.initial_delay_s * (policy.backoff_multiplier ** (attempt - 1))
     delay = min(base_delay, policy.max_delay_s)
-    if policy.jitter_s > 0:
+    # An explicit zero initial delay remains a no-wait policy even when the
+    # default jitter is enabled. This keeps deterministic tests and callers
+    # able to disable backoff without restating both fields.
+    if delay > 0 and policy.jitter_s > 0:
         delay += random.uniform(0, policy.jitter_s)
     return float(min(delay, policy.max_delay_s))

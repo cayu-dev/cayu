@@ -2738,7 +2738,7 @@ class ModelCompactor(ContextCompactor):
         if prompt_builder is not None and not callable(prompt_builder):
             raise TypeError("prompt_builder must be callable.")
         self.prompt_builder = prompt_builder
-        # `None` keeps retries disabled (the default policy is one attempt).
+        # `None` selects the shared default retry policy.
         self.retry_policy = copy_retry_policy(retry_policy)
 
     def provider_budget_identity(self, session: Session) -> tuple[str, str]:

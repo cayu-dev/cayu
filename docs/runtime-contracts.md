@@ -6177,7 +6177,17 @@ notify events are edge-triggered once per matching threshold/window; subsequent
 configured as a `CayuApp(retry_policy=...)` default or attached to
 `RunRequest`, `ResumeRequest`, `DispatchRequest`, `ToolApprovalRequest`, and
 `ToolApprovalRecoveryRequest`. Request-level policy overrides the app default.
-The default policy has `max_attempts=1`, which means retries are disabled.
+The default policy has `max_attempts=5`, which permits the initial request plus
+four retries for classified transient failures. Its exponential backoff starts
+at 0.5 seconds, adds up to 0.5 seconds of jitter, and caps both computed delays
+and provider `Retry-After` instructions at 30 seconds. Setting
+`initial_delay_s=0.0` keeps retries immediate unless the caller also supplies a
+positive delay through `Retry-After`; setting `max_attempts=1` disables retries.
+Retries occur after a provider request has been dispatched, so a timeout can
+produce more than one billed model request even though Cayu never replays a
+tool side effect at this boundary. Workloads that require one provider dispatch
+must set `max_attempts=1`; workloads that only need to exclude ambiguous timeout
+retries can set `retry_on_timeout=False`.
 `max_unknown_attempts` is a stricter nested ceiling for typed provider failures
 that remain unclassified after safe parsing. It defaults to two total attempts
 and never raises the caller's overall `max_attempts` ceiling. Setting it to one

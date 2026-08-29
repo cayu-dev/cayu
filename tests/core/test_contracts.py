@@ -1959,7 +1959,20 @@ def test_run_request_accepts_messages_and_metadata():
 
 
 def test_retry_policy_validates_retry_controls():
-    assert 529 in RetryPolicy().retry_on_status_codes
+    default = RetryPolicy()
+
+    assert default.model_dump(mode="json") == {
+        "max_attempts": 5,
+        "max_unknown_attempts": 2,
+        "initial_delay_s": 0.5,
+        "max_delay_s": 30.0,
+        "backoff_multiplier": 2.0,
+        "jitter_s": 0.5,
+        "retry_on_status_codes": [429, 500, 502, 503, 504, 529],
+        "retry_on_timeout": True,
+        "retry_on_connection_error": True,
+        "retry_on_rate_limit": True,
+    }
 
     policy = RetryPolicy(
         max_attempts=3,
@@ -2180,6 +2193,19 @@ def test_retry_policy_honors_retry_after_directive_capped_by_max_delay():
     assert decision.delay_seconds == 10.0
 
 
+def test_retry_policy_default_caps_retry_after_at_thirty_seconds():
+    decision = retry_decision(
+        policy=RetryPolicy(),
+        attempt=1,
+        error="HTTP 429: rate limited",
+        status_code=429,
+        retry_after_s=45.0,
+    )
+
+    assert decision.retry is True
+    assert decision.delay_seconds == 30.0
+
+
 def test_retry_policy_uses_retry_after_below_max_delay_verbatim():
     decision = retry_decision(
         policy=RetryPolicy(max_attempts=2, max_delay_s=30.0, initial_delay_s=0.5),
@@ -2238,6 +2264,36 @@ def test_retry_policy_jitter_does_not_exceed_max_delay():
         )
         assert decision.retry is True
         assert decision.delay_seconds <= policy.max_delay_s
+
+
+def test_retry_policy_default_adds_bounded_jitter(monkeypatch: pytest.MonkeyPatch):
+    observed_bounds: list[tuple[float, float]] = []
+
+    def maximum_jitter(lower: float, upper: float) -> float:
+        observed_bounds.append((lower, upper))
+        return upper
+
+    monkeypatch.setattr("cayu.runtime.retry_policy.random.uniform", maximum_jitter)
+
+    decision = retry_decision(
+        policy=RetryPolicy(),
+        attempt=1,
+        error="HTTP 503: service unavailable",
+    )
+
+    assert observed_bounds == [(0, 0.5)]
+    assert decision.delay_seconds == 1.0
+
+
+def test_retry_policy_zero_initial_delay_disables_default_jitter():
+    decision = retry_decision(
+        policy=RetryPolicy(initial_delay_s=0.0),
+        attempt=1,
+        error="HTTP 503: service unavailable",
+    )
+
+    assert decision.retry is True
+    assert decision.delay_seconds == 0.0
 
 
 def test_agent_spec_uses_explicit_system_prompt_field():

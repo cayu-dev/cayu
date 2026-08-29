@@ -89,6 +89,20 @@ guard.
 
 ## Unreleased
 
+### Classified transient provider failures retry by default
+
+`RetryPolicy()` now permits five total attempts instead of disabling retries.
+The default continues to reject permanent failures immediately and limits typed
+but otherwise unknown provider failures to two total attempts. Exponential
+backoff now includes up to 0.5 seconds of jitter, and the bounded cap applied to
+computed delays and provider `Retry-After` instructions increases from 10 to 30
+seconds. An explicit `initial_delay_s=0.0` remains a no-wait override, while
+`max_attempts=1` remains the explicit opt-out from retries.
+
+The effective policy remains part of each admitted invocation's durable
+finalization identity. Active sessions and recovered work therefore retain
+their admitted authority instead of silently adopting the new default.
+
 ### Evals can assert bounded public tool arguments and retained results
 
 Control Plane and the portable SDK/HTTP suite contracts now support exact

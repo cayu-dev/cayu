@@ -133,6 +133,7 @@ from cayu.providers import (
 from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.request_footprints import RequestFootprintConfig
+from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     Session,
     SessionLineageNode,
@@ -1538,10 +1539,18 @@ def test_case_timeout_bounds_assertion_evaluation():
 
 
 def test_provider_timeout_is_not_misclassified_as_case_deadline():
+    case = _case("provider-timeout")
+    # Isolate provider-error reporting from the default retry backoff, which is
+    # intentionally allowed to consume this test's one-second case deadline.
+    case = case.model_copy(
+        update={
+            "request": case.request.model_copy(update={"retry_policy": RetryPolicy(max_attempts=1)})
+        }
+    )
     result = asyncio.run(
         run_eval_case(
             _app_with_provider(_ProviderTimeout()),
-            _case("provider-timeout"),
+            case,
             suite_id="timeout",
             timeout_seconds=1.0,
         )

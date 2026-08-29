@@ -7044,7 +7044,7 @@
     },
     "RetryPolicy": {
       "additionalProperties": false,
-      "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default of 1 means retries\nare disabled.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
+      "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default permits five total\nattempts for classified transient provider failures. Unknown provider\nfailures retain the stricter `max_unknown_attempts` ceiling.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
       "properties": {
         "backoff_multiplier": {
           "default": 2.0,
@@ -7061,21 +7061,21 @@
           "type": "number"
         },
         "jitter_s": {
-          "default": 0.0,
+          "default": 0.5,
           "maximum": 60.0,
           "minimum": 0.0,
           "title": "Jitter S",
           "type": "number"
         },
         "max_attempts": {
-          "default": 1,
+          "default": 5,
           "maximum": 10.0,
           "minimum": 1.0,
           "title": "Max Attempts",
           "type": "integer"
         },
         "max_delay_s": {
-          "default": 10.0,
+          "default": 30.0,
           "maximum": 300.0,
           "minimum": 0.0,
           "title": "Max Delay S",

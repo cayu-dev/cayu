@@ -2431,6 +2431,9 @@ def test_runtime_requires_typed_provider_event_before_acknowledgement(provider) 
                     agent_name="assistant",
                     session_id="automatic-recall-timeout",
                     messages=[Message.text("user", "When is Atlas released?")],
+                    # This test proves the state of one ambiguous dispatch, not
+                    # the runtime's independent provider retry behavior.
+                    retry_policy=RetryPolicy(max_attempts=1),
                 )
             )
         ]
