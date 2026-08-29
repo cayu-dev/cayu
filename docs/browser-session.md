@@ -104,7 +104,7 @@ runner declares virtual-egress/output secret values, or the invocation registry
 changes during dispatch; Cayu does not attempt to redact secrets from rendered
 pixels or downloaded bytes. Browser exceptions and stderr are not published;
 callers receive stable bounded codes such as `destination_denied`,
-`stale_observation`, `unknown_element`, `actionability_failed`,
+`fetch_failed`, `stale_observation`, `unknown_element`, `actionability_failed`,
 `navigation_timeout`, `download_failed`, `browser_crash`, `cleanup_failed`, or
 `outcome_ambiguous`.
 

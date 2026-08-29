@@ -28,7 +28,12 @@ from cayu import (
     ToolContext,
     WebFetchTool,
 )
-from cayu.egress import CapturedRequest, CapturedResponse, HttpxUpstream
+from cayu.egress import (
+    CapturedRequest,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
+    HttpxUpstream,
+)
 from cayu.egress.docker_adapter import DockerEgressAdapter
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners.docker import DockerRunner
@@ -354,9 +359,14 @@ class _RecordingUpstream:
         self.inner = inner
         self.requests: list[CapturedRequest] = []
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
         self.requests.append(request.model_copy(deep=True))
-        return await self.inner.send(request)
+        return self.inner.prepare(request, limits=limits)
 
 
 async def _drive_browser_fetch() -> dict[str, Any]:
@@ -1053,7 +1063,7 @@ def test_interactive_browser_preserves_state_and_publishes_artifacts(
     assert browser_fetch_results["interactive_close"].structured["closed"] is True
     denied = browser_fetch_results["interactive_denied"].structured
     assert set(denied) == {"error", "execution", "session_id", "page_id"}
-    assert denied["error"] == "destination_denied"
+    assert denied["error"] == "fetch_failed"
     assert denied["execution"] == {
         "admission": "admitted",
         "dispatch": "completed",
@@ -1106,7 +1116,7 @@ def test_interactive_browser_releases_capacity_after_idle_and_initial_failure(
     assert idle_expired.structured["error"] == "allocation_lost"
     assert browser_fetch_results["idle_replacement"].is_error is False
     assert browser_fetch_results["idle_replacement_close"].structured["closed"] is True
-    assert denied.structured["error"] == "destination_denied"
+    assert denied.structured["error"] == "fetch_failed"
     assert browser_fetch_results["interactive_replacement"].is_error is False
     assert browser_fetch_results["interactive_replacement_close"].structured["closed"] is True
 
@@ -1263,7 +1273,10 @@ def test_browser_fetch_denies_unapproved_redirect_and_direct_network(
     browser_fetch_results: dict[str, Any],
 ) -> None:
     denied = browser_fetch_results["denied"]
-    _assert_destination_access_error(denied, "redirect_denied")
+    assert denied.is_error is True
+    assert denied.structured["error"] == "fetch_failed"
+    assert denied.structured["access"]["outcome"] == "transient_transport_failure"
+    assert denied.structured["access"]["source"] == "transport"
     locally_denied = browser_fetch_results["locally_denied_redirect"]
     _assert_destination_access_error(locally_denied, "redirect_denied")
     assert ("docs.browser.test", "/plain") not in browser_fetch_results["requests"]

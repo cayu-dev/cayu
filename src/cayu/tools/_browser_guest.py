@@ -2459,10 +2459,14 @@ async def _fetch_with_browser(
         primary = exc
         raise
     except PlaywrightError as exc:
-        primary = _page_state_failure(state, redirects=redirects) or _GuestFailure(
-            "browser_crash" if launched else "browser_unavailable",
-            effective_origin=state.effective_origin,
-        )
+        primary = _page_state_failure(state, redirects=redirects)
+        if primary is None and _is_proxy_tunnel_failure(exc):
+            primary = _GuestFailure("fetch_failed", effective_origin=state.effective_origin)
+        if primary is None:
+            primary = _GuestFailure(
+                "browser_crash" if launched else "browser_unavailable",
+                effective_origin=state.effective_origin,
+            )
         raise primary from exc
     except Exception as exc:
         primary = _page_state_failure(state, redirects=redirects) or _GuestFailure(
@@ -3285,14 +3289,17 @@ class _InteractiveDaemon:
             else:
                 try:
                     browser_connected = bool(self.browser.is_connected())
-                    page_open = not state.page.is_closed()
                 except Exception:
                     browser_connected = False
+                try:
+                    page_open = not state.page.is_closed()
+                except Exception:
                     page_open = False
-                failure = (
-                    _GuestFailure("browser_crash")
-                    if not browser_connected or not page_open
-                    else _interactive_playwright_error(request.operation, exc)
+                failure = _interactive_runtime_failure(
+                    request.operation,
+                    exc,
+                    browser_connected=browser_connected,
+                    page_open=page_open,
                 )
             if created_page or state.limit_exceeded:
                 return await self._retire_failed_allocation(failure, request)
@@ -4307,6 +4314,7 @@ def _interactive_error_payload(error: _GuestFailure) -> dict[str, Any]:
         "cleanup_failed",
         "destination_denied",
         "download_failed",
+        "fetch_failed",
         "incompatible_browser",
         "missing_element",
         "navigation_timeout",
@@ -4361,6 +4369,65 @@ def _interactive_playwright_error(operation: str, error: BaseException) -> _Gues
     if operation == "wait" and is_timeout:
         return _GuestFailure("timeout")
     return _GuestFailure("browser_crash")
+
+
+def _interactive_runtime_failure(
+    operation: str,
+    error: BaseException,
+    *,
+    browser_connected: bool,
+    page_open: bool,
+) -> _GuestFailure:
+    if not browser_connected:
+        return _GuestFailure("browser_crash")
+    if _is_playwright_network_failure(error):
+        return _GuestFailure("fetch_failed")
+    if (
+        operation == "navigate"
+        and not page_open
+        and type(error).__module__.startswith("playwright")
+    ):
+        # A failed CONNECT can close only the provisional page while the browser
+        # allocation remains healthy. Chromium does not expose whether the proxy
+        # rejected policy, capacity, or another transport boundary.
+        return _GuestFailure("fetch_failed")
+    if not page_open:
+        return _GuestFailure("browser_crash")
+    return _interactive_playwright_error(operation, error)
+
+
+def _is_proxy_tunnel_failure(error: BaseException) -> bool:
+    """Recognize Chromium's ambiguous signal for a failed CONNECT.
+
+    Chromium does not expose whether the proxy returned a policy 403, capacity
+    503, or another CONNECT failure. Callers may use authenticated broker
+    evidence when it exists; this signal alone is only a generic fetch failure.
+    """
+
+    return _playwright_error_chain_has_signal(error, "ERR_TUNNEL_CONNECTION_FAILED")
+
+
+def _is_playwright_network_failure(error: BaseException) -> bool:
+    return _playwright_error_chain_has_signal(error, "net::ERR_")
+
+
+def _playwright_error_chain_has_signal(error: BaseException, signal: str) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < 32:
+        candidate = pending.pop()
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if type(candidate).__module__.startswith("playwright") and signal in str(candidate):
+            return True
+        if isinstance(candidate, BaseExceptionGroup):
+            pending.extend(candidate.exceptions)
+        if candidate.__cause__ is not None:
+            pending.append(candidate.__cause__)
+        if candidate.__context__ is not None:
+            pending.append(candidate.__context__)
+    return False
 
 
 async def _interactive_daemon_main(session_id: str) -> int:

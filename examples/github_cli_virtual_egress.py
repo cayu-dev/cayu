@@ -24,7 +24,12 @@ from cayu import (
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
 )
-from cayu.egress import CapturedRequest, CapturedResponse
+from cayu.egress import (
+    CapturedRequest,
+    CapturedResponse,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
+)
 from cayu.runners.base import ExecCommand
 
 GH_VERSION = "2.86.0"
@@ -58,13 +63,23 @@ class _FakeGitHub:
     def __init__(self) -> None:
         self.request: CapturedRequest | None = None
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.request = request
-        return CapturedResponse(
-            status_code=200,
-            headers={"Content-Type": "application/json"},
-            body=b'{"login":"cayu-probe"}',
-        )
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            self.request = request
+            return CapturedResponse(
+                status_code=200,
+                headers={"Content-Type": "application/json"},
+                body=b'{"login":"cayu-probe"}',
+            )
+
+        return EgressUpstreamOperation(send)
 
 
 def _docker_running() -> bool:

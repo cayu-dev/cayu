@@ -89,15 +89,20 @@ class _FakeStripe:
     def __init__(self) -> None:
         self.saw_authorization: str | None = None
 
-    async def send(self, request: Any) -> Any:
-        from cayu.egress import CapturedResponse
+    def prepare(self, request: Any, *, limits: Any) -> Any:
+        from cayu.egress import CapturedResponse, EgressUpstreamOperation
 
-        self.saw_authorization = request.headers.get("Authorization")
-        return CapturedResponse(
-            status_code=200,
-            headers={"Request-Id": "req_demo", "Content-Type": "application/json"},
-            body=b'{"id":"cus_demo123","object":"customer","email":"user@example.com"}',
-        )
+        assert limits.max_response_bytes > 0
+
+        async def send() -> Any:
+            self.saw_authorization = request.headers.get("Authorization")
+            return CapturedResponse(
+                status_code=200,
+                headers={"Request-Id": "req_demo", "Content-Type": "application/json"},
+                body=b'{"id":"cus_demo123","object":"customer","email":"user@example.com"}',
+            )
+
+        return EgressUpstreamOperation(send)
 
 
 def _docker_running() -> bool:

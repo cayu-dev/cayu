@@ -60,6 +60,56 @@ Egress sidecar  --->  TransparentEgressProxyServer (per-session CA, TLS MITM)
                       api.stripe.com
 ```
 
+The host proxy applies fixed resource bounds before expensive or long-lived
+work. At most 16 client connections are dispatched by default (the internal
+hard ceiling is 64); excess connections receive a fixed `503` response and are
+never queued in the worker executor. Each request head is limited to 64 KiB,
+with 8 KiB request/header lines, at most 100 headers, and a ten-second absolute
+head deadline. Request bodies remain limited to 8 MiB and a 30-second absolute
+read window. The same stop-aware polling bounds transport authentication, TLS
+handshake, chunk framing, response writes, and proxy shutdown.
+
+CONNECT is admitted in two stages. The normalized HTTPS destination must first
+match a currently active virtual-credential grant or credentialless approved
+destination before Cayu sends success or generates a leaf certificate. The
+broker retains that coarse admission through leaf generation and the CONNECT
+success write. Revocation cancels and drains those admissions before returning,
+so queued certificate work cannot outlive its authority. The normal credential,
+method, path, query, body, and policy checks still run after TLS termination and
+remain the only forwarding authority. Leaf generation is serialized with a
+bounded wait; the per-session cache retains at most 128 contexts for 15 minutes,
+evicts least-recently-used entries, and removes leaf key/certificate files
+immediately after loading them. Built-in upstream reads
+stop at their configured response ceiling while bytes arrive and enforce an
+absolute total deadline across resolution, dispatch, and streaming. Public
+upstream extensions receive the same byte/time limits through a side-effect-free
+prepared operation and must provide positive cancellation settlement. At most
+16 upstream operations are active by default (hard ceiling 64); excess work is
+rejected before dispatch, and cancellation-opaque work remains draining and
+capacity-counted until it actually finishes. Credential resolution is likewise
+limited to 16 active operations per broker. Teardown cancels every reserved but
+undispatched resolution before awaiting any dispatched resolver; disconnected
+callers cannot release that capacity until cancellation-opaque resolver work
+actually finishes.
+Teardown first revokes new
+credentialed and credentialless admission, then settles dispatched upstream
+operations and credential resolutions, and only afterward waits for their
+request leases to drain. The
+built-in HTTPX path replaces `Accept-Encoding` with `identity` and rejects an
+origin that still announces compression before body iteration. Its default DNS
+lookup runs in an owned helper process, so expiry terminates and reaps the
+resolver before returning the timeout. Application-injected HTTPX transports
+or destination resolvers carry no inferred cancellation authority and remain
+capacity-counted until natural completion. The broker also rejects any returned
+response above the 64 MiB hard ceiling. Response scrubbing projects each body
+replacement before allocating it and rejects redaction that would expand the
+body beyond the same ceiling. Proxy
+diagnostics use fixed codes and never reflect request targets, headers, or
+values. Chromium's opaque
+`ERR_TUNNEL_CONNECTION_FAILED` signal is reported as `fetch_failed`; only an
+observed broker response can distinguish policy denial from capacity or proxy
+failure.
+
 In the explicitly selected Docker topology shown above, direct egress is blocked
 by construction: the container joins an `--internal`
 Docker network with no route to the internet, so the only reachable egress is a
@@ -320,11 +370,12 @@ the connection target and prevents DNS rebinding to private networks or cloud
 metadata. Application-owned `HttpxUpstream(routes=...)` mappings are an explicit
 trusted-control-plane override for private service origins; they still reject
 loopback, link-local/metadata, multicast, reserved, and unspecified addresses.
-The default upstream retains at most 8 MiB of decoded response data and rejects
-larger responses; applications that construct `HttpxUpstream` explicitly can
-select a lower limit or raise it as far as the hard 64 MiB ceiling. Browser
-policies additionally require identity encoding, so compressed expansion never
-crosses that browser-facing buffering boundary.
+The default upstream requires identity content encoding, retains at most 8 MiB
+of response data, and rejects larger responses. Applications that construct
+`HttpxUpstream` explicitly can select a lower limit or raise it as far as the
+hard 64 MiB ceiling. An origin that ignores the identity request is rejected
+before body iteration, so compressed expansion cannot cross the buffering
+boundary.
 
 Credentialed and credentialless declarations can be combined in one factory.
 The adapter receives the union of their hostnames for enforcement preflight,

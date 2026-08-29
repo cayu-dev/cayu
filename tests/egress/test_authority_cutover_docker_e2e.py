@@ -24,7 +24,13 @@ from cayu import (
     ResumeRequest,
 )
 from cayu.core.events import Event, EventType
-from cayu.egress import CapturedRequest, CapturedResponse, HttpEgressPolicy
+from cayu.egress import (
+    CapturedRequest,
+    CapturedResponse,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
+    HttpEgressPolicy,
+)
 from cayu.environments import EnvironmentFactoryRequest
 from cayu.runners.base import ExecCommand
 from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
@@ -84,12 +90,22 @@ pytestmark = [
 
 
 class _Backend:
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        return CapturedResponse(
-            status_code=200,
-            headers={"Content-Type": "text/plain"},
-            body=f"allowed:{request.host}".encode(),
-        )
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            return CapturedResponse(
+                status_code=200,
+                headers={"Content-Type": "text/plain"},
+                body=f"allowed:{request.host}".encode(),
+            )
+
+        return EgressUpstreamOperation(send)
 
 
 def _policy(name: str, host: str) -> HttpEgressPolicy:
@@ -378,6 +394,10 @@ async def _drive_real_docker_cutover() -> dict[str, object]:
                 urllib.request.urlopen(request, timeout=20)
             except urllib.error.HTTPError as error:
                 print(error.code)
+            except urllib.error.URLError as error:
+                if "Tunnel connection failed: 403 Forbidden" not in str(error.reason):
+                    raise
+                print(403)
             """
         )
         denied_result = await runner.exec(

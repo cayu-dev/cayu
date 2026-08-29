@@ -44,6 +44,8 @@ from cayu.egress import (
     EgressAuthorityBindingIdentity,
     EgressAuthorityCutoverRequest,
     EgressAuthorityCutoverStrategy,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
     TransparentEgressBroker,
     VirtualCredentialRegistry,
@@ -201,12 +203,22 @@ def test_e2b_shared_real_boundary_security_contract(
 
 
 class _AuthorityBackend:
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        return CapturedResponse(
-            status_code=200,
-            headers={"Content-Type": "text/plain"},
-            body=f"allowed:{request.host}".encode(),
-        )
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            return CapturedResponse(
+                status_code=200,
+                headers={"Content-Type": "text/plain"},
+                body=f"allowed:{request.host}".encode(),
+            )
+
+        return EgressUpstreamOperation(send)
 
 
 def _authority(

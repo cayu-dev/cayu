@@ -19,6 +19,8 @@ from cayu.egress import (
     EgressReconnectConflictError,
     EgressReconnectError,
     EgressReconnectNotFoundError,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
     InvalidEgressReconnectMetadataError,
     TransparentEgressBroker,
@@ -277,9 +279,19 @@ class _FakeMicrosandboxModule:
 class _FakeUpstream:
     requests: list[CapturedRequest] = []
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.requests.append(request)
-        return CapturedResponse(status_code=200, body=b'{"ok":true}')
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            self.requests.append(request)
+            return CapturedResponse(status_code=200, body=b'{"ok":true}')
+
+        return EgressUpstreamOperation(send)
 
 
 def _broker_and_grant() -> tuple[TransparentEgressBroker, Any]:

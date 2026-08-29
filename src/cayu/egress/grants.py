@@ -187,14 +187,13 @@ class VirtualCredentialRegistry:
         """Revoke by presented value and wait for active broker leases to drain."""
         return bool(await self.revoke_values_and_wait((presented_value,)))
 
-    async def revoke_values_and_wait(self, presented_values: Sequence[str]) -> int:
-        """Revoke every presented value, then wait for all active leases to drain.
+    def revoke_values(self, presented_values: Sequence[str]) -> tuple[int, tuple[str, ...]]:
+        """Revoke values synchronously and return the affected grant identities.
 
-        Revocation is intentionally two-phase: first mark every matching grant
-        revoked without awaiting, then wait for in-flight broker leases. That
-        prevents teardown of a multi-credential session from leaving later
-        credentials live while an earlier credential's active request drains.
+        The separate drain identities let an owner revoke every authority before
+        it settles work that is holding the corresponding request leases.
         """
+
         grant_ids: list[str] = []
         count = 0
         seen_values: set[str] = set()
@@ -207,6 +206,17 @@ class VirtualCredentialRegistry:
                 count += 1
                 if grant is not None:
                     grant_ids.append(grant.grant_id)
+        return count, tuple(grant_ids)
+
+    async def revoke_values_and_wait(self, presented_values: Sequence[str]) -> int:
+        """Revoke every presented value, then wait for all active leases to drain.
+
+        Revocation is intentionally two-phase: first mark every matching grant
+        revoked without awaiting, then wait for in-flight broker leases. That
+        prevents teardown of a multi-credential session from leaving later
+        credentials live while an earlier credential's active request drains.
+        """
+        count, grant_ids = self.revoke_values(presented_values)
         await self.wait_for_inactive_grants(grant_ids)
         return count
 

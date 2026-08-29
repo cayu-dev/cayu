@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import gzip
+import threading
+import time
 import warnings
 from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -14,6 +18,8 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+import cayu.egress._resolution as resolution_module
+import cayu.egress.broker as broker_module
 from cayu.egress import (
     ApprovedEgressDestination,
     BrowserEgressPolicy,
@@ -21,6 +27,8 @@ from cayu.egress import (
     CapturedResponse,
     EgressDecision,
     EgressPolicy,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
     HttpxUpstream,
     TransparentEgressBroker,
@@ -62,14 +70,30 @@ class _FakeUpstream:
         self._response = response
         self.sent: CapturedRequest | None = None
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.sent = request
-        return self._response
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        async def send() -> CapturedResponse:
+            self.sent = request
+            return self._response
+
+        return EgressUpstreamOperation(send)
 
 
 class _FailingUpstream:
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        raise RuntimeError(f"boom with {REAL_SECRET}")  # secret in exception must not leak out
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        async def send() -> CapturedResponse:
+            raise RuntimeError(f"boom with {REAL_SECRET}")  # secret in exception must not leak out
+
+        return EgressUpstreamOperation(send)
 
 
 class _Clock:
@@ -88,6 +112,7 @@ def _build(
     upstream: Any,
     clock: _Clock | None = None,
     policies: Mapping[str, EgressPolicy] | None = None,
+    max_active_upstream_operations: int = 16,
 ) -> tuple[
     TransparentEgressBroker, VirtualCredentialRegistry, _RecordingResolver, list[EgressDecision]
 ]:
@@ -109,6 +134,7 @@ def _build(
         policies=policies,
         upstream=upstream,
         audit=decisions.append,
+        max_active_upstream_operations=max_active_upstream_operations,
     )
     return broker, registry, resolver, decisions
 
@@ -135,6 +161,75 @@ def _stripe_example_policy() -> HttpEgressPolicy:
     )
 
 
+def test_connect_destination_requires_current_positive_authority() -> None:
+    clock = _Clock(datetime(2026, 7, 6, tzinfo=UTC))
+    broker, registry, _resolver, _decisions = _build(
+        upstream=_FakeUpstream(CapturedResponse(status_code=200)),
+        clock=clock,
+    )
+    grant = _mint(registry, ttl_seconds=1)
+
+    assert asyncio.run(broker.authorize_connect_destination(host="api.stripe.com", port=443))
+    clock.advance(2)
+    assert not asyncio.run(broker.authorize_connect_destination(host="api.stripe.com", port=443))
+
+    replacement = _mint(registry)
+    assert asyncio.run(broker.authorize_connect_destination(host="api.stripe.com", port=443))
+    registry.revoke(replacement.presented_value)
+    assert not asyncio.run(broker.authorize_connect_destination(host="api.stripe.com", port=443))
+    assert grant.grant_id != replacement.grant_id
+
+
+def test_connect_destination_accepts_only_active_credentialless_authority() -> None:
+    registry = VirtualCredentialRegistry()
+    broker = TransparentEgressBroker(
+        registry=registry,
+        resolver=None,
+        policies={
+            "browser": BrowserEgressPolicy(
+                name="browser",
+                allowed_hosts=["docs.example.com"],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="docs.example.com",
+                policy_name="browser",
+            )
+        ],
+        upstream=_FakeUpstream(CapturedResponse(status_code=200)),
+    )
+
+    assert asyncio.run(broker.authorize_connect_destination(host="docs.example.com", port=443))
+    asyncio.run(broker.revoke_authority_and_wait(()))
+    assert not asyncio.run(broker.authorize_connect_destination(host="docs.example.com", port=443))
+    assert not asyncio.run(
+        broker.authorize_connect_destination(host="untrusted.example.com", port=443)
+    )
+    assert not asyncio.run(broker.authorize_connect_destination(host="docs.example.com", port=8443))
+
+
+def test_broker_revalidates_global_response_limit_for_custom_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b"bounded-upstream-response"
+    upstream = _FakeUpstream(CapturedResponse(status_code=200, body=body))
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+    monkeypatch.setattr(
+        broker_module,
+        "MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES",
+        len(body) - 1,
+    )
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
+    assert upstream.sent is not None
+    assert decisions[-1].allowed is False
+
+
 def _request(grant_value: str, path: str, form: dict[str, str] | None = None) -> CapturedRequest:
     body = urlencode(form).encode() if form else b""
     return CapturedRequest(
@@ -152,6 +247,463 @@ def _request(grant_value: str, path: str, form: dict[str, str] | None = None) ->
 def _no_real_secret(decisions: list[EgressDecision]) -> None:
     for decision in decisions:
         assert REAL_SECRET not in str(asdict(decision))
+
+
+def _exception_graph(error: BaseException) -> list[BaseException]:
+    pending = [error]
+    seen: set[int] = set()
+    observed: list[BaseException] = []
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        observed.append(candidate)
+        if isinstance(candidate, BaseExceptionGroup):
+            pending.extend(candidate.exceptions)
+        if candidate.__cause__ is not None:
+            pending.append(candidate.__cause__)
+        if candidate.__context__ is not None:
+            pending.append(candidate.__context__)
+    return observed
+
+
+def test_revocation_before_prepared_upstream_dispatch_never_starts_operation() -> None:
+    async def run() -> tuple[CapturedResponse, int, list[str | None]]:
+        operation_prepared = asyncio.Event()
+        result_entered = asyncio.Event()
+        allow_result_start = asyncio.Event()
+        prestart_cancelled = asyncio.Event()
+        dispatches: list[str | None] = []
+
+        class _PausedStartOperation(EgressUpstreamOperation):
+            async def result(self) -> CapturedResponse:
+                result_entered.set()
+                await allow_result_start.wait()
+                return await super().result()
+
+            async def cancel_and_wait(self) -> None:
+                await super().cancel_and_wait()
+                prestart_cancelled.set()
+
+        class _PausedStartUpstream:
+            def prepare(
+                self,
+                request: CapturedRequest,
+                *,
+                limits: EgressUpstreamLimits,
+            ) -> EgressUpstreamOperation:
+                assert limits.max_response_bytes > 0
+
+                async def send() -> CapturedResponse:
+                    dispatches.append(request.headers.get("Authorization"))
+                    return CapturedResponse(status_code=200, body=b"late")
+
+                operation = _PausedStartOperation(send)
+                operation_prepared.set()
+                return operation
+
+        broker, registry, _resolver, _decisions = _build(upstream=_PausedStartUpstream())
+        grant = _mint(registry)
+        request_task = asyncio.create_task(
+            broker.handle_request(_request(grant.presented_value, "/v1/customers"))
+        )
+        revocation_task: asyncio.Task[int] | None = None
+        try:
+            await asyncio.wait_for(operation_prepared.wait(), timeout=1.0)
+            await asyncio.wait_for(result_entered.wait(), timeout=1.0)
+            revocation_task = asyncio.create_task(
+                broker.revoke_authority_and_wait((grant.presented_value,))
+            )
+            await asyncio.wait_for(prestart_cancelled.wait(), timeout=1.0)
+            assert dispatches == []
+
+            allow_result_start.set()
+            response = await asyncio.wait_for(request_task, timeout=1.0)
+            revoked = await asyncio.wait_for(revocation_task, timeout=1.0)
+            return response, revoked, dispatches
+        finally:
+            allow_result_start.set()
+            if not request_task.done():
+                request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            if revocation_task is not None:
+                if not revocation_task.done():
+                    revocation_task.cancel()
+                await asyncio.gather(revocation_task, return_exceptions=True)
+
+    response, revoked, dispatches = asyncio.run(run())
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "fetch_failed"
+    assert revoked == 1
+    assert dispatches == []
+
+
+def test_revocation_scheduled_during_resolution_rejects_before_factory_entry() -> None:
+    async def run() -> tuple[CapturedResponse, int, list[str | None]]:
+        dispatches: list[str | None] = []
+
+        class _NoCancellationOwnerUpstream:
+            def prepare(
+                self,
+                request: CapturedRequest,
+                *,
+                limits: EgressUpstreamLimits,
+            ) -> EgressUpstreamOperation:
+                assert limits.max_response_bytes > 0
+
+                async def send() -> CapturedResponse:
+                    dispatches.append(request.headers.get("Authorization"))
+                    return CapturedResponse(status_code=200, body=b"late")
+
+                return EgressUpstreamOperation(send)
+
+        class _RevocationSchedulingResolver:
+            def __init__(self) -> None:
+                self.broker: TransparentEgressBroker | None = None
+                self.presented_value: str | None = None
+                self.revocation_task: asyncio.Task[int] | None = None
+
+            async def resolve(
+                self,
+                ref: SecretRef,
+                *,
+                scope: dict[str, Any] | None = None,
+            ) -> ResolvedSecret:
+                assert scope is not None
+                assert self.broker is not None
+                assert self.presented_value is not None
+                self.revocation_task = asyncio.create_task(
+                    self.broker.revoke_authority_and_wait((self.presented_value,))
+                )
+                return ResolvedSecret(name=ref.name, value=SecretStr(REAL_SECRET))
+
+        registry = VirtualCredentialRegistry()
+        resolver = _RevocationSchedulingResolver()
+        broker = TransparentEgressBroker(
+            registry=registry,
+            resolver=resolver,
+            policies={"stripe-example": _stripe_example_policy()},
+            upstream=_NoCancellationOwnerUpstream(),
+        )
+        grant = _mint(registry)
+        resolver.broker = broker
+        resolver.presented_value = grant.presented_value
+
+        response = await broker.handle_request(_request(grant.presented_value, "/v1/customers"))
+        assert resolver.revocation_task is not None
+        revoked = await resolver.revocation_task
+        return response, revoked, dispatches
+
+    response, revoked, dispatches = asyncio.run(run())
+
+    assert response.status_code == 403
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "request_denied"
+    assert revoked == 1
+    assert dispatches == []
+
+
+def test_revocation_arms_every_upstream_settlement_before_waiting() -> None:
+    async def run() -> tuple[list[CapturedResponse], int, list[bool]]:
+        started = (asyncio.Event(), asyncio.Event())
+        cancellation_requested = (asyncio.Event(), asyncio.Event())
+        release_first_cancellation = asyncio.Event()
+
+        class _TwoOperationUpstream:
+            def __init__(self) -> None:
+                self.prepared = 0
+
+            def prepare(
+                self,
+                request: CapturedRequest,
+                *,
+                limits: EgressUpstreamLimits,
+            ) -> EgressUpstreamOperation:
+                assert isinstance(request, CapturedRequest)
+                assert limits.max_response_bytes > 0
+                index = self.prepared
+                self.prepared += 1
+
+                async def send() -> CapturedResponse:
+                    started[index].set()
+                    await asyncio.Event().wait()
+                    raise AssertionError("Stalled upstream completed unexpectedly.")
+
+                async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                    cancellation_requested[index].set()
+                    if index == 0:
+                        await release_first_cancellation.wait()
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+                return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
+
+        upstream = _TwoOperationUpstream()
+        broker, registry, _resolver, _decisions = _build(upstream=upstream)
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+        requests = [asyncio.create_task(broker.handle_request(request))]
+        revocation_task: asyncio.Task[int] | None = None
+        try:
+            await asyncio.wait_for(started[0].wait(), timeout=1.0)
+            requests.append(asyncio.create_task(broker.handle_request(request)))
+            await asyncio.wait_for(started[1].wait(), timeout=1.0)
+
+            revocation_task = asyncio.create_task(
+                broker.revoke_authority_and_wait((grant.presented_value,))
+            )
+            await asyncio.wait_for(cancellation_requested[0].wait(), timeout=1.0)
+            await asyncio.wait_for(cancellation_requested[1].wait(), timeout=1.0)
+            assert revocation_task.done() is False
+
+            release_first_cancellation.set()
+            responses = await asyncio.wait_for(asyncio.gather(*requests), timeout=1.0)
+            revoked = await asyncio.wait_for(revocation_task, timeout=1.0)
+            return responses, revoked, [event.is_set() for event in cancellation_requested]
+        finally:
+            release_first_cancellation.set()
+            for request_task in requests:
+                if not request_task.done():
+                    request_task.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+            if revocation_task is not None:
+                if not revocation_task.done():
+                    revocation_task.cancel()
+                await asyncio.gather(revocation_task, return_exceptions=True)
+
+    responses, revoked, cancellation_requests = asyncio.run(run())
+
+    assert [response.status_code for response in responses] == [502, 502]
+    assert [response.headers[CAYU_EGRESS_ERROR_HEADER] for response in responses] == [
+        "fetch_failed",
+        "fetch_failed",
+    ]
+    assert revoked == 1
+    assert cancellation_requests == [True, True]
+
+
+@pytest.mark.parametrize("signal_type", [GeneratorExit, KeyboardInterrupt, SystemExit])
+def test_revocation_preserves_upstream_settlement_process_control_signal(
+    signal_type: type[BaseException],
+) -> None:
+    fatal_signal = signal_type("upstream settlement interrupted")
+
+    async def run() -> tuple[BaseExceptionGroup, int]:
+        started = asyncio.Event()
+        cancel_calls = 0
+
+        class _FatalSettlementUpstream:
+            def prepare(
+                self,
+                request: CapturedRequest,
+                *,
+                limits: EgressUpstreamLimits,
+            ) -> EgressUpstreamOperation:
+                assert isinstance(request, CapturedRequest)
+                assert limits.max_response_bytes > 0
+
+                async def send() -> CapturedResponse:
+                    started.set()
+                    await asyncio.Event().wait()
+                    raise AssertionError("Stalled upstream completed unexpectedly.")
+
+                async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                    nonlocal cancel_calls
+                    cancel_calls += 1
+                    if cancel_calls == 1:
+                        raise fatal_signal
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+                return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
+
+        broker, registry, _resolver, _decisions = _build(upstream=_FatalSettlementUpstream())
+        grant = _mint(registry)
+        request_task = asyncio.create_task(
+            broker.handle_request(_request(grant.presented_value, "/v1/customers"))
+        )
+        failure: BaseExceptionGroup | None = None
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            with pytest.raises(BaseExceptionGroup) as exc_info:
+                await broker.revoke_authority_and_wait((grant.presented_value,))
+            failure = exc_info.value
+        finally:
+            if not request_task.done():
+                request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+            await broker.settle_active_upstream_operations()
+        assert failure is not None
+        return failure, cancel_calls
+
+    failure, cancel_calls = asyncio.run(run())
+
+    observed = _exception_graph(failure)
+    assert sum(candidate is fatal_signal for candidate in observed) == 1
+    assert cancel_calls == 2
+
+
+def test_caller_cancellation_preserves_grouped_upstream_process_control_signal() -> None:
+    fatal_signal = GeneratorExit("upstream settlement interrupted")
+    settlement_failure = BaseExceptionGroup(
+        "upstream settlement failed",
+        [
+            RuntimeError("ordinary cleanup failure"),
+            BaseExceptionGroup("nested fatal signal", [fatal_signal]),
+        ],
+    )
+
+    async def run() -> tuple[BaseExceptionGroup, bool, int, int]:
+        started = asyncio.Event()
+        cancel_calls = 0
+
+        class _FatalSettlementUpstream:
+            def prepare(
+                self,
+                request: CapturedRequest,
+                *,
+                limits: EgressUpstreamLimits,
+            ) -> EgressUpstreamOperation:
+                assert isinstance(request, CapturedRequest)
+                assert limits.max_response_bytes > 0
+
+                async def send() -> CapturedResponse:
+                    started.set()
+                    await asyncio.Event().wait()
+                    raise AssertionError("Stalled upstream completed unexpectedly.")
+
+                async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                    nonlocal cancel_calls
+                    cancel_calls += 1
+                    if cancel_calls == 1:
+                        raise settlement_failure
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+                return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
+
+        broker, registry, _resolver, _decisions = _build(upstream=_FatalSettlementUpstream())
+        grant = _mint(registry)
+        request_task = asyncio.create_task(
+            broker.handle_request(_request(grant.presented_value, "/v1/customers"))
+        )
+        failure: BaseExceptionGroup | None = None
+        cancelled = False
+        cancelling = 0
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            request_task.cancel("caller disconnected")
+            with pytest.raises(BaseExceptionGroup) as exc_info:
+                await request_task
+            failure = exc_info.value
+            cancelled = request_task.cancelled()
+            cancelling = request_task.cancelling()
+        finally:
+            await broker.settle_active_upstream_operations()
+        assert failure is not None
+        return failure, cancelled, cancelling, cancel_calls
+
+    failure, cancelled, cancelling, cancel_calls = asyncio.run(run())
+
+    observed = _exception_graph(failure)
+    assert sum(candidate is settlement_failure for candidate in observed) == 1
+    assert sum(candidate is fatal_signal for candidate in observed) == 1
+    cancellations = [
+        candidate for candidate in observed if isinstance(candidate, asyncio.CancelledError)
+    ]
+    assert len(cancellations) == 1
+    assert str(cancellations[0]) == "caller disconnected"
+    assert cancelled is False
+    assert cancelling == 1
+    assert cancel_calls == 2
+
+
+def test_caller_cancellation_releases_quiescent_process_control_capacity() -> None:
+    fatal_signal = GeneratorExit("upstream operation interrupted")
+
+    async def run() -> tuple[GeneratorExit, CapturedResponse, bool, int, int]:
+        started = asyncio.Event()
+        prepared = 0
+
+        class _FatalOperationUpstream:
+            def prepare(
+                self,
+                request: CapturedRequest,
+                *,
+                limits: EgressUpstreamLimits,
+            ) -> EgressUpstreamOperation:
+                nonlocal prepared
+                assert isinstance(request, CapturedRequest)
+                assert limits.max_response_bytes > 0
+                prepared += 1
+                operation_number = prepared
+
+                async def send() -> CapturedResponse:
+                    if operation_number > 1:
+                        return CapturedResponse(status_code=200, body=b"recovered")
+                    started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError as cancellation:
+                        raise fatal_signal from cancellation
+                    raise AssertionError("Stalled upstream completed unexpectedly.")
+
+                async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        # The cancellation owner has positively observed task
+                        # quiescence. The broker must independently preserve
+                        # the operation's authoritative outcome.
+                        return
+
+                return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
+
+        broker, registry, _resolver, _decisions = _build(
+            upstream=_FatalOperationUpstream(),
+            max_active_upstream_operations=1,
+        )
+        first_grant = _mint(registry)
+        request_task = asyncio.create_task(
+            broker.handle_request(_request(first_grant.presented_value, "/v1/customers"))
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        request_task.cancel("caller disconnected")
+        with pytest.raises(GeneratorExit) as exc_info:
+            await request_task
+
+        replacement = _mint(registry)
+        response = await broker.handle_request(
+            _request(replacement.presented_value, "/v1/customers")
+        )
+        await broker.settle_active_operations()
+        return (
+            exc_info.value,
+            response,
+            request_task.cancelled(),
+            request_task.cancelling(),
+            prepared,
+        )
+
+    failure, response, cancelled, cancelling, prepared = asyncio.run(run())
+
+    observed = _exception_graph(failure)
+    assert sum(candidate is fatal_signal for candidate in observed) == 1
+    cancellations = [
+        candidate for candidate in observed if isinstance(candidate, asyncio.CancelledError)
+    ]
+    assert len(cancellations) == 1
+    assert str(cancellations[0]) == "caller disconnected"
+    assert response.status_code == 200
+    assert response.body == b"recovered"
+    assert cancelled is False
+    assert cancelling == 1
+    assert prepared == 2
 
 
 def test_allowed_request_injects_real_secret_upstream_only() -> None:
@@ -316,6 +868,36 @@ def test_allowed_response_redacts_echoed_real_secret() -> None:
     _no_real_secret(decisions)
 
 
+def test_response_redaction_cannot_expand_body_beyond_hard_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    short_secret = "sk_test_x"
+    body = short_secret.encode() * 4
+    monkeypatch.setattr(
+        broker_module,
+        "MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES",
+        len(body),
+    )
+    registry = VirtualCredentialRegistry()
+    decisions: list[EgressDecision] = []
+    broker = TransparentEgressBroker(
+        registry=registry,
+        resolver=StaticVault({"stripe_test_key": short_secret}),
+        policies={"stripe-example": _stripe_example_policy()},
+        upstream=_FakeUpstream(CapturedResponse(status_code=200, body=body)),
+        audit=decisions.append,
+        browser_max_response_bytes=len(body),
+    )
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
+    assert short_secret.encode() not in response.body
+    assert decisions[-1].allowed is False
+
+
 def test_denied_endpoint_never_resolves_secret() -> None:
     upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
     broker, registry, resolver, decisions = _build(upstream=upstream)
@@ -440,10 +1022,15 @@ def test_successful_upstream_cannot_spoof_internal_broker_diagnostic() -> None:
     assert CAYU_EGRESS_ERROR_HEADER not in response.headers
 
 
-def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> None:
-    decoded = b'{"ok":true}'
-    encoded = gzip.compress(decoded)
+def test_httpx_upstream_rejects_compression_before_decoded_body_allocation() -> None:
+    body_started = False
     captured: list[httpx.Request] = []
+
+    class _CompressedBody(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            nonlocal body_started
+            body_started = True
+            yield gzip.compress(b"x" * (8 * 1024 * 1024 + 1))
 
     async def handler(request: httpx.Request) -> httpx.Response:
         captured.append(request)
@@ -451,10 +1038,9 @@ def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> Non
             200,
             headers={
                 "Content-Encoding": "gzip",
-                "Content-Length": str(len(encoded)),
                 "Content-Type": "application/json",
             },
-            content=encoded,
+            stream=_CompressedBody(),
             request=request,
         )
 
@@ -467,14 +1053,13 @@ def test_httpx_upstream_strips_stale_compression_headers_after_decoding() -> Non
             CapturedRequest(method="GET", host="api.stripe.com", path="/v1/customers")
         )
 
-    response = asyncio.run(run())
+    with pytest.raises(RuntimeError, match="ignored the required identity"):
+        asyncio.run(run())
 
-    assert response.body == decoded
-    assert response.headers["content-type"] == "application/json"
-    assert "content-encoding" not in {key.lower() for key in response.headers}
-    assert "content-length" not in {key.lower() for key in response.headers}
+    assert body_started is False
     assert str(captured[0].url) == "https://93.184.216.34/v1/customers"
     assert captured[0].headers["host"] == "api.stripe.com"
+    assert captured[0].headers["accept-encoding"] == "identity"
     assert captured[0].extensions["sni_hostname"] == "api.stripe.com"
 
 
@@ -544,15 +1129,22 @@ def test_httpx_upstream_does_not_forward_reserved_broker_diagnostic() -> None:
     assert CAYU_EGRESS_ERROR_HEADER.lower() not in captured.headers
 
 
-def test_broker_rejects_decoded_upstream_response_over_byte_limit() -> None:
+def test_broker_rejects_encoded_upstream_response_before_body_read() -> None:
     decoded = b"decoded response exceeds the bound"
     encoded = gzip.compress(decoded)
+    body_started = False
+
+    class _Body(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            nonlocal body_started
+            body_started = True
+            yield encoded
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             headers={"Content-Encoding": "gzip"},
-            content=encoded,
+            stream=_Body(),
             request=request,
         )
 
@@ -567,8 +1159,9 @@ def test_broker_rejects_decoded_upstream_response_over_byte_limit() -> None:
     response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
 
     assert response.status_code == 502
-    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "oversized_response"
-    assert decisions[-1].reason == "Upstream response exceeded the configured byte limit."
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "unsupported_content"
+    assert decisions[-1].reason == "Upstream ignored the required identity content encoding."
+    assert body_started is False
 
 
 def test_browser_policy_requires_identity_encoding_before_upstream_body_read() -> None:
@@ -784,6 +1377,562 @@ def test_broker_classifies_upstream_timeout() -> None:
 
     assert response.status_code == 504
     assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "timeout"
+
+
+def test_httpx_upstream_enforces_total_deadline_against_slow_drip_response() -> None:
+    closed = False
+
+    class _SlowDripBody(httpx.AsyncByteStream):
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            for _ in range(10):
+                await asyncio.sleep(0.03)
+                yield b"x"
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_SlowDripBody(), request=request)
+
+    upstream = HttpxUpstream(
+        timeout_s=0.05,
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    started = time.monotonic()
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert time.monotonic() - started < 0.5
+    assert response.status_code == 504
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "timeout"
+    assert closed is True
+    assert registry._active_counts == {}
+
+
+def test_injected_transport_remains_fenced_until_opaque_dispatch_settles() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    dispatches = 0
+
+    def blocking_transport() -> None:
+        entered.set()
+        if not release.wait(5.0):
+            raise TimeoutError("Injected transport test operation was not released.")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatches
+        dispatches += 1
+        await asyncio.to_thread(blocking_transport)
+        return httpx.Response(200, content=b"{}", request=request)
+
+    async def run() -> tuple[CapturedResponse, CapturedResponse, bool, int]:
+        upstream = HttpxUpstream(
+            transport=httpx.MockTransport(handler),
+            routes={"api.stripe.com": "https://93.184.216.34"},
+        )
+        broker, registry, _resolver, _decisions = _build(
+            upstream=upstream,
+            max_active_upstream_operations=1,
+        )
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+        first = asyncio.create_task(broker.handle_request(request))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2.0)
+            first.cancel("caller stopped waiting")
+            await asyncio.sleep(0.05)
+            assert first.done() is False
+
+            exhausted = await broker.handle_request(request)
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="caller stopped waiting"):
+                await first
+            recovered = await broker.handle_request(request)
+            return exhausted, recovered, first.cancelled(), first.cancelling()
+        finally:
+            release.set()
+            if not first.done():
+                with contextlib.suppress(BaseException):
+                    await first
+
+    exhausted, recovered, cancelled, cancelling = asyncio.run(run())
+
+    assert exhausted.status_code == 503
+    assert exhausted.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_capacity_exhausted"
+    assert recovered.status_code == 200
+    assert cancelled is True
+    assert cancelling == 1
+    assert dispatches == 2
+
+
+def test_cancelled_credential_resolution_retains_capacity_until_thread_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _OpaqueResolver:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            del scope
+            self.calls += 1
+            if self.calls == 1:
+
+                def blocking_read() -> None:
+                    entered.set()
+                    if not release.wait(5.0):
+                        raise TimeoutError("Opaque credential resolution was not released.")
+
+                await asyncio.to_thread(blocking_read)
+            return ResolvedSecret(name=ref.name, value=SecretStr(REAL_SECRET))
+
+    async def run() -> tuple[CapturedResponse, CapturedResponse, bool, int, int, int]:
+        resolver = _OpaqueResolver()
+        registry = VirtualCredentialRegistry()
+        broker = TransparentEgressBroker(
+            registry=registry,
+            resolver=resolver,
+            policies={"stripe-example": _stripe_example_policy()},
+            upstream=_FakeUpstream(CapturedResponse(status_code=200, body=b"{}")),
+        )
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+        first = asyncio.create_task(broker.handle_request(request))
+        revocation: asyncio.Task[int] | None = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2.0)
+            first.cancel("caller disconnected")
+            await asyncio.sleep(0.05)
+            assert first.done() is False
+
+            exhausted = await broker.handle_request(request)
+            revocation = asyncio.create_task(
+                broker.revoke_authority_and_wait((grant.presented_value,))
+            )
+            await asyncio.sleep(0.05)
+            assert revocation.done() is False
+
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="caller disconnected"):
+                await first
+            revoked = await asyncio.wait_for(revocation, timeout=1.0)
+            replacement = _mint(registry)
+            recovered = await broker.handle_request(
+                _request(replacement.presented_value, "/v1/customers")
+            )
+            return (
+                exhausted,
+                recovered,
+                first.cancelled(),
+                first.cancelling(),
+                resolver.calls,
+                revoked,
+            )
+        finally:
+            release.set()
+            if not first.done():
+                with contextlib.suppress(BaseException):
+                    await first
+            if revocation is not None and not revocation.done():
+                await revocation
+
+    monkeypatch.setattr(
+        broker_module,
+        "_MAX_ACTIVE_CREDENTIAL_RESOLUTIONS",
+        1,
+    )
+    exhausted, recovered, cancelled, cancelling, calls, revoked = asyncio.run(run())
+
+    assert exhausted.status_code == 503
+    assert exhausted.headers[CAYU_EGRESS_ERROR_HEADER] == "credential_resolution_capacity_exhausted"
+    assert recovered.status_code == 200
+    assert cancelled is True
+    assert cancelling == 1
+    assert calls == 2
+    assert revoked == 1
+
+
+def test_credential_resolution_settlement_cancels_all_queued_work_before_waiting() -> None:
+    async def run() -> tuple[bool, bool]:
+        broker, _registry, _resolver, _decisions = _build(
+            upstream=_FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
+        )
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        allow_second = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first_resolution() -> ResolvedSecret:
+            first_entered.set()
+            await release_first.wait()
+            return ResolvedSecret(name="stripe_test_key", value=SecretStr(REAL_SECRET))
+
+        async def queued_resolution() -> ResolvedSecret:
+            await allow_second.wait()
+            second_entered.set()
+            return ResolvedSecret(name="stripe_test_key", value=SecretStr(REAL_SECRET))
+
+        first_task = asyncio.create_task(first_resolution())
+        await first_entered.wait()
+        second_task = asyncio.create_task(queued_resolution())
+        first_token = object()
+        second_token = object()
+        broker._active_credential_resolutions = {
+            first_token: broker_module._ActiveCredentialResolution(
+                task=first_task,
+                started=True,
+            ),
+            second_token: broker_module._ActiveCredentialResolution(
+                task=second_task,
+                started=False,
+            ),
+        }
+        broker._credential_resolutions_idle.clear()
+        settlement = asyncio.create_task(broker.settle_active_credential_resolutions())
+        try:
+            await asyncio.sleep(0)
+            allow_second.set()
+            await asyncio.sleep(0)
+            queued_was_cancelled = second_task.cancelled()
+            entered_before_first_settled = second_entered.is_set()
+            release_first.set()
+            await settlement
+            return queued_was_cancelled, entered_before_first_settled
+        finally:
+            release_first.set()
+            allow_second.set()
+            if not settlement.done():
+                settlement.cancel()
+            await asyncio.gather(settlement, first_task, second_task, return_exceptions=True)
+
+    queued_was_cancelled, entered_before_first_settled = asyncio.run(run())
+
+    assert queued_was_cancelled is True
+    assert entered_before_first_settled is False
+
+
+def test_child_credential_resolution_cancellation_is_diagnostically_sanitized(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canary = "CREDENTIAL_CANCELLATION_SECRET_CANARY"
+
+    class _CancellingResolver:
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict[str, Any] | None = None,
+        ) -> ResolvedSecret:
+            del ref, scope
+            raise asyncio.CancelledError(canary)
+
+    async def run() -> tuple[RuntimeError, CapturedResponse, list[EgressDecision]]:
+        registry = VirtualCredentialRegistry()
+        decisions: list[EgressDecision] = []
+        broker = TransparentEgressBroker(
+            registry=registry,
+            resolver=_CancellingResolver(),
+            policies={"stripe-example": _stripe_example_policy()},
+            upstream=_FakeUpstream(CapturedResponse(status_code=200, body=b"{}")),
+            audit=decisions.append,
+        )
+        grant = _mint(registry)
+        with pytest.raises(
+            RuntimeError,
+            match="Credential resolution stopped without caller cancellation",
+        ) as excinfo:
+            await broker._resolve_credential(grant.secret, grant_id=grant.grant_id)
+        response = await broker.handle_request(_request(grant.presented_value, "/v1/customers"))
+        return excinfo.value, response, decisions
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        error, response, decisions = asyncio.run(run())
+
+    captured = capsys.readouterr()
+    diagnostics = "\n".join(
+        [
+            repr(error),
+            repr(response),
+            repr(decisions),
+            captured.out,
+            captured.err,
+            *(str(item.message) for item in caught),
+            *(record.getMessage() for record in caplog.records),
+        ]
+    )
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "request_denied"
+    assert caught == []
+    assert canary not in diagnostics
+
+
+def test_injected_transport_timeout_remains_fenced_until_opaque_dispatch_settles() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    dispatches = 0
+
+    def blocking_transport() -> None:
+        entered.set()
+        if not release.wait(5.0):
+            raise TimeoutError("Injected transport test operation was not released.")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatches
+        dispatches += 1
+        if dispatches == 1:
+            await asyncio.to_thread(blocking_transport)
+        return httpx.Response(200, content=b"{}", request=request)
+
+    async def run() -> tuple[CapturedResponse, CapturedResponse, CapturedResponse]:
+        upstream = HttpxUpstream(
+            timeout_s=0.05,
+            transport=httpx.MockTransport(handler),
+            destination_resolver=_destination_resolver("93.184.216.34"),
+        )
+        broker, registry, _resolver, _decisions = _build(
+            upstream=upstream,
+            max_active_upstream_operations=1,
+        )
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+        first = asyncio.create_task(broker.handle_request(request))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2.0)
+            await asyncio.sleep(0.1)
+            assert first.done() is False
+            exhausted = await broker.handle_request(request)
+            release.set()
+            timed_out = await first
+            recovered = await broker.handle_request(request)
+            return exhausted, timed_out, recovered
+        finally:
+            release.set()
+            if not first.done():
+                with contextlib.suppress(BaseException):
+                    await first
+
+    exhausted, timed_out, recovered = asyncio.run(run())
+
+    assert exhausted.status_code == 503
+    assert exhausted.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_capacity_exhausted"
+    assert timed_out.status_code == 504
+    assert timed_out.headers[CAYU_EGRESS_ERROR_HEADER] == "timeout"
+    assert recovered.status_code == 200
+    assert dispatches == 2
+
+
+def test_default_dns_deadline_kills_owned_resolver_before_releasing_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    helper = tmp_path / "blocked_resolver.py"
+    helper.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    spawned: list[asyncio.subprocess.Process] = []
+    original_spawn = asyncio.create_subprocess_exec
+
+    async def recording_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(resolution_module, "_OWNED_RESOLVER_HELPER", helper)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_spawn)
+    transport_called = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_called
+        transport_called = True
+        return httpx.Response(200, content=b"{}", request=request)
+
+    upstream = HttpxUpstream(
+        timeout_s=0.05,
+        transport=httpx.MockTransport(handler),
+        routes={"api.stripe.com": "https://93.184.216.34"},
+    )
+    broker, registry, _resolver, _decisions = _build(
+        upstream=upstream,
+        max_active_upstream_operations=1,
+    )
+    grant = _mint(registry)
+
+    started = time.monotonic()
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert time.monotonic() - started < 1.0
+    assert response.status_code == 504
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "timeout"
+    assert transport_called is False
+    assert len(spawned) == 1
+    assert spawned[0].returncode is not None
+    assert broker._active_upstream_operations == {}
+    assert registry._active_counts == {}
+
+
+def test_dns_cancellation_retains_capacity_when_helper_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entered = tmp_path / "resolver-entered"
+    release = tmp_path / "resolver-release"
+    helper = tmp_path / "blocked_resolver.py"
+    helper.write_text(
+        "from pathlib import Path\n"
+        "import time\n"
+        f"entered = Path({str(entered)!r})\n"
+        f"release = Path({str(release)!r})\n"
+        "entered.touch()\n"
+        "while not release.exists():\n"
+        "    time.sleep(0.01)\n"
+        "print('[\"93.184.216.34\"]')\n",
+        encoding="utf-8",
+    )
+    spawned: list[asyncio.subprocess.Process] = []
+    original_spawn = asyncio.create_subprocess_exec
+    original_kill = asyncio.subprocess.Process.kill
+
+    async def recording_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+        spawned.append(process)
+        return process
+
+    def fail_first_helper_kill(process: asyncio.subprocess.Process) -> None:
+        if spawned and process is spawned[0]:
+            raise PermissionError("resolver termination denied")
+        original_kill(process)
+
+    monkeypatch.setattr(resolution_module, "_OWNED_RESOLVER_HELPER", helper)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_spawn)
+    monkeypatch.setattr(asyncio.subprocess.Process, "kill", fail_first_helper_kill)
+    transport_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return httpx.Response(200, content=b"{}", request=request)
+
+    async def run() -> tuple[CapturedResponse, CapturedResponse, bool, int]:
+        upstream = HttpxUpstream(
+            transport=httpx.MockTransport(handler),
+            routes={"api.stripe.com": "https://93.184.216.34"},
+        )
+        broker, registry, _resolver, _decisions = _build(
+            upstream=upstream,
+            max_active_upstream_operations=1,
+        )
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+        first = asyncio.create_task(broker.handle_request(request))
+        try:
+            for _attempt in range(200):
+                if entered.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.exists()
+            first.cancel("caller stopped waiting")
+            await asyncio.sleep(0.05)
+
+            assert first.done() is False
+            assert spawned[0].returncode is None
+            assert broker._active_upstream_operations
+            exhausted = await broker.handle_request(request)
+
+            release.touch()
+            with pytest.raises(asyncio.CancelledError, match="caller stopped waiting"):
+                await first
+            recovered = await broker.handle_request(request)
+            return exhausted, recovered, first.cancelled(), first.cancelling()
+        finally:
+            release.touch(exist_ok=True)
+            if not first.done():
+                with contextlib.suppress(BaseException):
+                    await first
+
+    exhausted, recovered, cancelled, cancelling = asyncio.run(run())
+
+    assert exhausted.status_code == 503
+    assert exhausted.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_capacity_exhausted"
+    assert recovered.status_code == 200
+    assert cancelled is True
+    assert cancelling == 1
+    assert transport_calls == 1
+    assert spawned[0].returncode is not None
+
+
+def test_dns_cancellation_retains_upstream_capacity_until_opaque_resolution_settles() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    transport_calls = 0
+
+    def blocking_resolution() -> tuple[str, ...]:
+        entered.set()
+        if not release.wait(5.0):
+            raise TimeoutError("DNS test operation was not released.")
+        return ("93.184.216.34",)
+
+    async def resolver(_host: str, _port: int) -> tuple[str, ...]:
+        return await asyncio.to_thread(blocking_resolution)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return httpx.Response(200, content=b"{}", request=request)
+
+    async def run() -> tuple[CapturedResponse, CapturedResponse, bool, int]:
+        upstream = HttpxUpstream(
+            transport=httpx.MockTransport(handler),
+            destination_resolver=resolver,
+        )
+        broker, registry, _resolver, _decisions = _build(
+            upstream=upstream,
+            max_active_upstream_operations=1,
+        )
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+        first = asyncio.create_task(broker.handle_request(request))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2.0)
+            first.cancel("caller stopped waiting")
+            await asyncio.sleep(0.05)
+            assert first.done() is False
+            # The settlement owner temporarily consumes the delivered request;
+            # it is restored immediately before cancellation is re-delivered.
+            assert first.cancelling() == 0
+
+            exhausted = await broker.handle_request(request)
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="caller stopped waiting"):
+                await first
+            recovered = await broker.handle_request(request)
+            return exhausted, recovered, first.cancelled(), first.cancelling()
+        finally:
+            release.set()
+            if not first.done():
+                with contextlib.suppress(BaseException):
+                    await first
+
+    exhausted, recovered, cancelled, cancelling = asyncio.run(run())
+
+    assert exhausted.status_code == 503
+    assert exhausted.headers[CAYU_EGRESS_ERROR_HEADER] == "upstream_capacity_exhausted"
+    assert recovered.status_code == 200
+    assert cancelled is True
+    assert cancelling == 1
+    assert transport_calls == 1
 
 
 def test_httpx_upstream_routes_logical_host_to_private_service() -> None:
@@ -1137,9 +2286,17 @@ class _MultiCaptureUpstream:
     def __init__(self) -> None:
         self.authorizations: list[str | None] = []
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.authorizations.append(request.headers.get("Authorization"))
-        return CapturedResponse(status_code=200, body=b"{}")
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        async def send() -> CapturedResponse:
+            self.authorizations.append(request.headers.get("Authorization"))
+            return CapturedResponse(status_code=200, body=b"{}")
+
+        return EgressUpstreamOperation(send)
 
 
 def test_broker_uses_rotated_secret_per_request() -> None:

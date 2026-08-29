@@ -38,6 +38,8 @@ from cayu.egress import (
     EgressBinding,
     EgressCapabilityClaim,
     EgressCapabilityEvidence,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
     InvalidEgressReconnectMetadataError,
     RunnerFinalizationResult,
@@ -1051,8 +1053,19 @@ def _capturing_event_factory(
         return event
 
     class _AllowedUpstream:
-        async def send(self, request: CapturedRequest) -> CapturedResponse:
-            return CapturedResponse(status_code=200, body=b"{}")
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            assert isinstance(request, CapturedRequest)
+            assert limits.max_response_bytes > 0
+
+            async def send() -> CapturedResponse:
+                return CapturedResponse(status_code=200, body=b"{}")
+
+            return EgressUpstreamOperation(send)
 
     return (
         _virtual_factory(
@@ -5439,6 +5452,73 @@ def test_runner_close_defers_cancellation_until_grant_drain() -> None:
 
     assert runner.closed is True
     assert teardown_calls["count"] == 1
+
+
+def test_runner_close_settles_upstream_before_virtual_grant_drain() -> None:
+    class _StallingUpstream:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.settled = asyncio.Event()
+
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            assert isinstance(request, CapturedRequest)
+            assert limits.max_response_bytes > 0
+
+            async def send() -> CapturedResponse:
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.settled.set()
+                raise AssertionError("Unreachable stalled upstream completed.")
+
+            async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
+
+    async def run() -> tuple[int, int, bool, dict[str, int]]:
+        adapter = _RecordingAdapter("fake")
+        upstream = _StallingUpstream()
+        factory = _virtual_factory(adapter=adapter, upstream=upstream)
+        result = await factory.create(
+            EnvironmentFactoryRequest(
+                session_id="sess_settle_before_grant_drain",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        broker: TransparentEgressBroker = adapter.captured["broker"]
+        grant = adapter.captured["grant"]
+        captured = _broker_request(grant.presented_value, "/v1/customers")
+        inflight = asyncio.create_task(broker.handle_request(captured))
+        await upstream.started.wait()
+
+        await asyncio.wait_for(managed.close(), timeout=1.0)
+        inflight_response = await asyncio.wait_for(inflight, timeout=1.0)
+        denied = await broker.handle_request(captured)
+        return (
+            inflight_response.status_code,
+            denied.status_code,
+            upstream.settled.is_set(),
+            dict(broker.registry._active_counts),
+        )
+
+    inflight_status, new_request_status, settled, active_counts = asyncio.run(run())
+
+    assert inflight_status == 502
+    assert new_request_status == 403
+    assert settled is True
+    assert active_counts == {}
 
 
 def test_runner_close_bounds_grant_drain_and_retries_without_releasing_resources() -> None:

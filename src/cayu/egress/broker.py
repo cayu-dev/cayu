@@ -4,21 +4,26 @@ import asyncio
 import contextlib
 import json
 import math
+import threading
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import require_clean_nonblank
 from cayu.egress._resolution import (
     InvalidResolvedAddressError,
     ProhibitedResolvedAddressError,
 )
 from cayu.egress._resolution import (
-    resolve_destination as _resolve_destination,
+    resolve_destination_owned as _resolve_destination_owned,
 )
 from cayu.egress._resolution import (
     validated_resolved_address as _validated_resolved_address,
@@ -37,11 +42,22 @@ from cayu.egress.destinations import (
 from cayu.egress.errors import VirtualCredentialError
 from cayu.egress.grants import VirtualCredentialGrant, VirtualCredentialRegistry
 from cayu.egress.policy import BrowserEgressPolicy, EgressPolicy, EgressRequest
-from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretResolver, validate_secret_resolver
+from cayu.vaults import (
+    REDACTED_SECRET,
+    ResolvedSecret,
+    SecretRedactor,
+    SecretRef,
+    SecretResolver,
+    validate_secret_resolver,
+)
 
 CAYU_EGRESS_ERROR_HEADER = "X-Cayu-Egress-Error"
 DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 16
+MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS = 64
+_MAX_ACTIVE_CREDENTIAL_RESOLUTIONS = 16
+DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S = 60.0
 
 # Headers that must not be forwarded verbatim between hops.
 _HOP_BY_HOP = frozenset(
@@ -62,6 +78,16 @@ _HOP_BY_HOP = frozenset(
         CAYU_EGRESS_ERROR_HEADER.lower(),
     }
 )
+
+_PROCESS_CONTROL_SIGNALS = (KeyboardInterrupt, SystemExit, GeneratorExit)
+
+
+def _contains_process_control_signal(error: BaseException) -> bool:
+    if isinstance(error, _PROCESS_CONTROL_SIGNALS):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(_contains_process_control_signal(child) for child in error.exceptions)
+    return False
 
 
 class CapturedRequest(BaseModel):
@@ -150,11 +176,149 @@ class EgressDecision:
     authorization_kind: Literal["virtual_credential", "credentialless"] = "virtual_credential"
 
 
+@dataclass(frozen=True)
+class EgressUpstreamLimits:
+    """Cayu-owned limits that an upstream must enforce while reading."""
+
+    max_response_bytes: int
+    total_timeout_s: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "max_response_bytes",
+            _bounded_response_bytes(self.max_response_bytes),
+        )
+        object.__setattr__(
+            self,
+            "total_timeout_s",
+            _bounded_timeout(self.total_timeout_s),
+        )
+
+
+UpstreamOperationFactory = Callable[[], Awaitable[CapturedResponse]]
+UpstreamCancellationOwner = Callable[[asyncio.Task[CapturedResponse]], Awaitable[None]]
+
+
+class EgressUpstreamOperation:
+    """One prepared upstream call with positive cancellation settlement.
+
+    Construction is side-effect free. ``result()`` starts the operation once.
+    When no cancellation owner is supplied, cancellation waits for natural
+    completion rather than treating cancellation of an asyncio wrapper as
+    proof that opaque delegated work stopped.
+    """
+
+    def __init__(
+        self,
+        operation_factory: UpstreamOperationFactory,
+        *,
+        cancel_and_wait: UpstreamCancellationOwner | None = None,
+    ) -> None:
+        if not callable(operation_factory):
+            raise TypeError("operation_factory must be callable.")
+        if cancel_and_wait is not None and not callable(cancel_and_wait):
+            raise TypeError("cancel_and_wait must be callable or None.")
+        self._operation_factory = operation_factory
+        self._cancellation_owner = cancel_and_wait
+        self._task: asyncio.Task[CapturedResponse] | None = None
+        self._cancelled_before_start = False
+        self._factory_started = False
+        self._settlement_lock = asyncio.Lock()
+
+    def _start_task(self) -> asyncio.Task[CapturedResponse] | None:
+        task = self._task
+        if task is None:
+            if self._cancelled_before_start:
+                return None
+
+            async def invoke() -> CapturedResponse:
+                if self._cancelled_before_start:
+                    raise asyncio.CancelledError(
+                        "Egress upstream operation was cancelled before dispatch."
+                    )
+                self._factory_started = True
+                try:
+                    return await self._operation_factory()
+                except BaseException as error:
+                    if _contains_process_control_signal(error):
+                        raise _QuiescentUpstreamProcessControl(error) from None
+                    raise
+
+            task = asyncio.create_task(
+                invoke(),
+                name="cayu-egress-upstream-operation",
+            )
+            self._task = task
+        return task
+
+    async def result(self) -> CapturedResponse:
+        """Return the provider result, preserving fatal signals for direct callers."""
+
+        task = self._start_task()
+        if task is None:
+            raise asyncio.CancelledError("Egress upstream operation was cancelled before dispatch.")
+        try:
+            return await asyncio.shield(task)
+        except _QuiescentUpstreamProcessControl as outcome:
+            raise outcome.signal from None
+
+    async def cancel_and_wait(self) -> None:
+        """Request cancellation and return only after positive quiescence."""
+
+        async with self._settlement_lock:
+            task = self._task
+            if task is None:
+                self._cancelled_before_start = True
+                return
+            if not self._factory_started:
+                self._cancelled_before_start = True
+                task.cancel("Egress upstream operation was cancelled before dispatch.")
+                outcome = await await_shielded_task_outcome(task)
+                if outcome.timed_out:  # pragma: no cover - no timeout is supplied
+                    raise RuntimeError("Upstream operation settlement timed out.")
+                return
+            if task.done():
+                try:
+                    task.result()
+                except _QuiescentUpstreamProcessControl:
+                    raise
+                except BaseException as error:
+                    if _contains_process_control_signal(error):
+                        raise _QuiescentUpstreamProcessControl(error) from None
+                return
+            if self._cancellation_owner is not None:
+                try:
+                    await self._cancellation_owner(task)
+                except BaseException as error:
+                    task_error: BaseException | None = None
+                    if task.done():
+                        with contextlib.suppress(asyncio.CancelledError):
+                            task_error = task.exception()
+                    if error is task_error and isinstance(error, _QuiescentUpstreamProcessControl):
+                        raise
+                    if error is task_error and _contains_process_control_signal(error):
+                        raise _QuiescentUpstreamProcessControl(error) from None
+                    raise
+            outcome = await await_shielded_task_outcome(task)
+            if isinstance(outcome.error, _QuiescentUpstreamProcessControl):
+                raise outcome.error
+            if outcome.error is not None and _contains_process_control_signal(outcome.error):
+                raise _QuiescentUpstreamProcessControl(outcome.error) from None
+            if outcome.timed_out:  # pragma: no cover - no timeout is supplied
+                raise RuntimeError("Upstream operation settlement timed out.")
+
+
 @runtime_checkable
 class EgressUpstream(Protocol):
-    """Forwards a fully-rewritten request to the real provider."""
+    """Prepares a bounded provider call without dispatching it."""
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse: ...
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation: ...
 
 
 DestinationResolver = Callable[[str, int], Awaitable[Sequence[str]]]
@@ -177,6 +341,26 @@ class _ForwardingAuthorization:
     require_identity_encoding: bool = False
 
 
+@dataclass
+class _ActiveUpstreamOperation:
+    operation: EgressUpstreamOperation
+    result_task: asyncio.Task[CapturedResponse]
+    settlement_task: asyncio.Task[None] | None = None
+
+
+@dataclass
+class _ActiveCredentialResolution:
+    task: asyncio.Task[ResolvedSecret] | None = None
+    started: bool = False
+
+
+@dataclass(eq=False)
+class _ConnectDestinationAdmission:
+    host: str
+    port: int
+    revoked: threading.Event = field(default_factory=threading.Event)
+
+
 class _UpstreamDestinationDeniedError(ValueError):
     pass
 
@@ -197,6 +381,56 @@ class _UpstreamUnsupportedEncodingError(RuntimeError):
     pass
 
 
+class _UpstreamCapacityError(RuntimeError):
+    pass
+
+
+class _QuiescentUpstreamProcessControl(BaseException):
+    """Carries a fatal operation outcome after exact quiescence is proven."""
+
+    def __init__(self, signal: BaseException) -> None:
+        super().__init__("A quiescent upstream operation produced a process-control signal.")
+        self.signal = signal
+
+
+class _UnsettledUpstreamProcessControl(BaseException):
+    """Carries a fatal settlement failure while upstream work may remain active."""
+
+    def __init__(self, signal: BaseException) -> None:
+        super().__init__("Upstream settlement produced a process-control signal.")
+        self.signal = signal
+
+
+async def _owned_upstream_result(operation: EgressUpstreamOperation) -> CapturedResponse:
+    """Invoke the public result seam without leaking fatal signals through its task."""
+
+    try:
+        return await operation.result()
+    except _QuiescentUpstreamProcessControl:
+        raise
+    except BaseException as error:
+        if _contains_process_control_signal(error):
+            raise _QuiescentUpstreamProcessControl(error) from None
+        raise
+
+
+async def _owned_upstream_settlement(operation: EgressUpstreamOperation) -> None:
+    """Run extension settlement without leaking fatal signals through its task."""
+
+    try:
+        await operation.cancel_and_wait()
+    except _QuiescentUpstreamProcessControl:
+        raise
+    except BaseException as error:
+        if _contains_process_control_signal(error):
+            raise _UnsettledUpstreamProcessControl(error) from None
+        raise
+
+
+class _CredentialResolutionCapacityError(RuntimeError):
+    pass
+
+
 class HttpxUpstream:
     """Default upstream that forwards requests to the provider over HTTPS."""
 
@@ -213,70 +447,209 @@ class HttpxUpstream:
         self._max_response_bytes = _bounded_response_bytes(max_response_bytes)
         self._transport = transport
         self._routes = _validated_upstream_routes(routes or {})
-        self._destination_resolver = destination_resolver or _resolve_destination
+        self._owns_destination_resolver = destination_resolver is None
+        self._destination_resolver = destination_resolver or _resolve_destination_owned
+
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        if not isinstance(limits, EgressUpstreamLimits):
+            raise TypeError("limits must be an EgressUpstreamLimits instance.")
+        effective_limits = EgressUpstreamLimits(
+            max_response_bytes=min(self._max_response_bytes, limits.max_response_bytes),
+            total_timeout_s=min(self._timeout_s, limits.total_timeout_s),
+        )
+        return EgressUpstreamOperation(
+            lambda: self._send(request, limits=effective_limits),
+            cancel_and_wait=self._cancel_and_wait,
+        )
 
     async def send(self, request: CapturedRequest) -> CapturedResponse:
+        """Direct convenience entrance using this upstream's configured limits."""
+
+        operation = self.prepare(
+            request,
+            limits=EgressUpstreamLimits(
+                max_response_bytes=self._max_response_bytes,
+                total_timeout_s=self._timeout_s,
+            ),
+        )
+        caller_cancellation: asyncio.CancelledError | None = None
+        cancellation_cause: RuntimeError | None = None
+        child_stopped = False
+        response: CapturedResponse | None = None
         try:
-            target = await self._target(request)
+            response = await operation.result()
+        except asyncio.CancelledError as cancellation:
+            current_task = asyncio.current_task()
+            caller_cancelled = current_task is not None and current_task.cancelling() > 0
+            settlement_task = asyncio.create_task(
+                _owned_upstream_settlement(operation),
+                name="cayu-httpx-upstream-direct-settlement",
+            )
+            outcome = await await_shielded_task_outcome(
+                settlement_task,
+                cancellation=cancellation if caller_cancelled else None,
+            )
+            if caller_cancelled and outcome.cancellation is not None:
+                restore_task_cancellation_requests(
+                    outcome.cancellation_requests_consumed,
+                    cancellation=outcome.cancellation,
+                )
+            if outcome.error is not None:
+                if isinstance(outcome.error, _QuiescentUpstreamProcessControl):
+                    raise outcome.error.signal from cancellation
+                if isinstance(outcome.error, _UnsettledUpstreamProcessControl):
+                    raise outcome.error.signal from cancellation
+                if _contains_process_control_signal(outcome.error):
+                    raise outcome.error from cancellation
+                if caller_cancelled:
+                    caller_cancellation = cancellation
+                    cancellation_cause = RuntimeError(
+                        "Direct upstream cancellation settlement was incomplete."
+                    )
+                else:
+                    child_stopped = True
+            elif caller_cancelled:
+                caller_cancellation = cancellation
+            else:
+                child_stopped = True
+        if caller_cancellation is not None:
+            if cancellation_cause is not None:
+                raise caller_cancellation from cancellation_cause
+            raise caller_cancellation
+        if child_stopped:
+            raise RuntimeError("Direct upstream operation stopped unexpectedly.")
+        assert response is not None
+        return response
+
+    @staticmethod
+    async def _cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+        task.cancel("Cayu egress upstream operation was cancelled.")
+        await await_shielded_task_outcome(task)
+
+    async def _send(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> CapturedResponse:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limits.total_timeout_s
+        try:
+            target = await asyncio.wait_for(
+                self._target(request),
+                timeout=max(deadline - loop.time(), 0.0),
+            )
         except ProhibitedResolvedAddressError as exc:
             raise _UpstreamDestinationDeniedError(
                 "Upstream destination resolved to a prohibited address."
             ) from exc
         except InvalidResolvedAddressError as exc:
             raise _UpstreamDnsError("Upstream destination returned an invalid address.") from exc
-        headers = _forwardable_headers(request.headers)
+        except TimeoutError as exc:
+            raise _UpstreamTimeoutError("Upstream request timed out.") from exc
+
+        remaining = max(deadline - loop.time(), 0.0)
+        if remaining <= 0:
+            raise _UpstreamTimeoutError("Upstream request timed out.")
+        if self._transport is None:
+            try:
+                async with asyncio.timeout(remaining):
+                    return await self._send_to_target(
+                        request,
+                        target=target,
+                        limits=limits,
+                        timeout_s=remaining,
+                    )
+            except (TimeoutError, httpx.TimeoutException) as exc:
+                raise _UpstreamTimeoutError("Upstream request timed out.") from exc
+
+        send_task = asyncio.create_task(
+            self._send_to_target(
+                request,
+                target=target,
+                limits=limits,
+                timeout_s=remaining,
+            ),
+            name="cayu-httpx-injected-transport-send",
+        )
+        try:
+            return await asyncio.wait_for(asyncio.shield(send_task), timeout=remaining)
+        except asyncio.CancelledError as cancellation:
+            outcome = await await_shielded_task_outcome(
+                send_task,
+                cancellation=cancellation,
+            )
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=outcome.cancellation,
+            )
+            raise cancellation
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            await await_shielded_task_outcome(send_task)
+            raise _UpstreamTimeoutError("Upstream request timed out.") from exc
+
+    async def _send_to_target(
+        self,
+        request: CapturedRequest,
+        *,
+        target: _ResolvedUpstreamTarget,
+        limits: EgressUpstreamLimits,
+        timeout_s: float,
+    ) -> CapturedResponse:
+        headers = {
+            key: value
+            for key, value in _forwardable_headers(request.headers).items()
+            if key.lower() != "accept-encoding"
+        }
         headers["Host"] = target.host_header
+        headers["Accept-Encoding"] = "identity"
         extensions = (
             {"sni_hostname": target.sni_hostname} if target.sni_hostname is not None else None
         )
-        try:
-            async with (
-                httpx.AsyncClient(
-                    timeout=self._timeout_s,
-                    transport=self._transport,
-                    trust_env=False,
-                    follow_redirects=False,
-                ) as client,
-                client.stream(
-                    request.method,
-                    target.url,
-                    headers=headers,
-                    content=request.body or None,
-                    extensions=extensions,
-                ) as response,
-            ):
-                content_encoding = response.headers.get("content-encoding")
-                requested_encoding = _header_get(request.headers, "Accept-Encoding")
-                if (
-                    requested_encoding is not None
-                    and requested_encoding.strip().lower() == "identity"
-                    and content_encoding is not None
-                    and content_encoding.strip().lower() != "identity"
-                ):
-                    raise _UpstreamUnsupportedEncodingError(
-                        "Upstream ignored the required identity content encoding."
-                    )
-                content_length = response.headers.get("content-length")
-                if content_length is not None:
-                    with contextlib.suppress(ValueError):
-                        if int(content_length) > self._max_response_bytes:
-                            raise _UpstreamResponseTooLargeError(
-                                "Upstream response exceeded the configured byte limit."
-                            )
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    if len(body) + len(chunk) > self._max_response_bytes:
+        async with (
+            httpx.AsyncClient(
+                timeout=timeout_s,
+                transport=self._transport,
+                trust_env=False,
+                follow_redirects=False,
+            ) as client,
+            client.stream(
+                request.method,
+                target.url,
+                headers=headers,
+                content=request.body or None,
+                extensions=extensions,
+            ) as response,
+        ):
+            content_encoding = response.headers.get("content-encoding")
+            if content_encoding is not None and content_encoding.strip().lower() != "identity":
+                raise _UpstreamUnsupportedEncodingError(
+                    "Upstream ignored the required identity content encoding."
+                )
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                with contextlib.suppress(ValueError):
+                    if int(content_length) > limits.max_response_bytes:
                         raise _UpstreamResponseTooLargeError(
                             "Upstream response exceeded the configured byte limit."
                         )
-                    body.extend(chunk)
-                return CapturedResponse(
-                    status_code=response.status_code,
-                    headers=_decoded_response_headers(dict(response.headers)),
-                    body=bytes(body),
-                )
-        except httpx.TimeoutException as exc:
-            raise _UpstreamTimeoutError("Upstream request timed out.") from exc
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > limits.max_response_bytes:
+                    raise _UpstreamResponseTooLargeError(
+                        "Upstream response exceeded the configured byte limit."
+                    )
+                body.extend(chunk)
+            return CapturedResponse(
+                status_code=response.status_code,
+                headers=_identity_response_headers(dict(response.headers)),
+                body=bytes(body),
+            )
 
     async def _target(self, request: CapturedRequest) -> _ResolvedUpstreamTarget:
         route = self._routes.get(request.host)
@@ -287,7 +660,29 @@ class HttpxUpstream:
             raise ValueError("Upstream target has no hostname.")
         port = split.port or (443 if split.scheme == "https" else 80)
         try:
-            addresses = tuple(await self._destination_resolver(host, port))
+            if self._owns_destination_resolver:
+                addresses = tuple(await self._destination_resolver(host, port))
+            else:
+
+                async def resolve_destination() -> Sequence[str]:
+                    return await self._destination_resolver(host, port)
+
+                resolver_task = asyncio.create_task(
+                    resolve_destination(),
+                    name="cayu-egress-destination-resolution",
+                )
+                try:
+                    addresses = tuple(await asyncio.shield(resolver_task))
+                except asyncio.CancelledError as cancellation:
+                    outcome = await await_shielded_task_outcome(
+                        resolver_task,
+                        cancellation=cancellation,
+                    )
+                    restore_task_cancellation_requests(
+                        outcome.cancellation_requests_consumed,
+                        cancellation=outcome.cancellation,
+                    )
+                    raise cancellation
         except OSError as exc:
             raise _UpstreamDnsError("Upstream destination resolution failed.") from exc
         if not addresses:
@@ -385,9 +780,17 @@ class TransparentEgressBroker:
         audit: Callable[[EgressDecision], None] | None = None,
         require_test_mode_credentials: bool = True,
         browser_max_response_bytes: int | None = None,
+        max_active_upstream_operations: int = DEFAULT_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS,
     ) -> None:
         if resolver is not None:
             validate_secret_resolver(resolver, "resolver")
+        if type(max_active_upstream_operations) is not int:
+            raise TypeError("max_active_upstream_operations must be an integer.")
+        if not 1 <= max_active_upstream_operations <= MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS:
+            raise ValueError(
+                "max_active_upstream_operations must be between 1 and "
+                f"{MAX_EGRESS_MAX_ACTIVE_UPSTREAM_OPERATIONS}."
+            )
         self._registry = registry
         self._resolver = resolver
         self._policies = dict(policies)
@@ -396,9 +799,23 @@ class TransparentEgressBroker:
         self._credentialless_active_requests = 0
         self._credentialless_idle = asyncio.Event()
         self._credentialless_idle.set()
+        self._active_connect_admissions: set[_ConnectDestinationAdmission] = set()
+        self._connect_admissions_idle = asyncio.Event()
+        self._connect_admissions_idle.set()
+        self._revoking_grant_ids: set[str] = set()
         self._upstream = upstream or HttpxUpstream()
         self._audit = audit
         self._require_test_mode = require_test_mode_credentials
+        self._max_active_upstream_operations = max_active_upstream_operations
+        self._active_upstream_operations: dict[object, _ActiveUpstreamOperation | None] = {}
+        self._upstream_operations_idle = asyncio.Event()
+        self._upstream_operations_idle.set()
+        self._active_credential_resolutions: dict[
+            object,
+            _ActiveCredentialResolution | None,
+        ] = {}
+        self._credential_resolutions_idle = asyncio.Event()
+        self._credential_resolutions_idle.set()
         self._browser_max_response_bytes = _bounded_response_bytes(
             DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES
             if browser_max_response_bytes is None
@@ -415,6 +832,80 @@ class TransparentEgressBroker:
         """Whether the broker requires an isolated, independently authenticated transport."""
 
         return bool(self._approved_destinations)
+
+    async def authorize_connect_destination(self, *, host: str, port: int) -> bool:
+        """Return positive coarse authority before the proxy mints a leaf certificate.
+
+        This entrance deliberately authorizes only the HTTPS destination. It does
+        not acquire a credential lease, resolve a secret, or replace the complete
+        method/path authorization performed by :meth:`handle_request` after TLS.
+        Keeping the lookup on the broker's event loop also avoids reading the
+        mutable grant registry from a proxy worker thread.
+        """
+
+        return self._authorized_connect_host(host=host, port=port) is not None
+
+    async def begin_connect_destination_admission(
+        self,
+        *,
+        host: str,
+        port: int,
+    ) -> _ConnectDestinationAdmission | None:
+        """Lease coarse CONNECT authority through leaf generation and success."""
+
+        normalized_host = self._authorized_connect_host(host=host, port=port)
+        if normalized_host is None:
+            return None
+        admission = _ConnectDestinationAdmission(host=normalized_host, port=port)
+        self._active_connect_admissions.add(admission)
+        self._connect_admissions_idle.clear()
+        return admission
+
+    async def connect_destination_admission_is_active(
+        self,
+        admission: _ConnectDestinationAdmission,
+    ) -> bool:
+        """Revalidate one broker-owned CONNECT admission before success."""
+
+        return (
+            admission in self._active_connect_admissions
+            and not admission.revoked.is_set()
+            and self._authorized_connect_host(host=admission.host, port=admission.port)
+            == admission.host
+        )
+
+    async def end_connect_destination_admission(
+        self,
+        admission: _ConnectDestinationAdmission,
+    ) -> None:
+        """Release one CONNECT admission after success or denial is written."""
+
+        self._active_connect_admissions.discard(admission)
+        if not self._active_connect_admissions:
+            self._connect_admissions_idle.set()
+
+    def _authorized_connect_host(self, *, host: str, port: int) -> str | None:
+        if type(port) is not int or port != 443:
+            return None
+        try:
+            normalized_host = normalize_egress_hostname(host, field_name="CONNECT host")
+        except (TypeError, ValueError):
+            return None
+        destination = self._approved_destinations.get((normalized_host, "https", port))
+        if (
+            self._credentialless_authority_active
+            and destination is not None
+            and destination.policy_name in self._policies
+        ):
+            return normalized_host
+        if any(
+            grant.destination == normalized_host
+            and grant.policy_name is not None
+            and grant.policy_name in self._policies
+            for grant in self._registry.active_grants()
+        ):
+            return normalized_host
+        return None
 
     async def handle_request(self, request: CapturedRequest) -> CapturedResponse:
         if type(request) is not CapturedRequest:
@@ -497,10 +988,20 @@ class TransparentEgressBroker:
             try:
                 if self._resolver is None:
                     raise RuntimeError("No credential resolver is configured.")
-                resolved = await self._resolver.resolve(
-                    grant.secret, scope={"grant_id": grant.grant_id}
+                resolved = await self._resolve_credential(
+                    grant.secret,
+                    grant_id=grant.grant_id,
                 )
                 real_secret = resolved.value.get_secret_value()
+            except _CredentialResolutionCapacityError:
+                return self._deny(
+                    request,
+                    grant.grant_id,
+                    policy.name,
+                    503,
+                    "Credential resolution capacity is exhausted.",
+                    error_code="credential_resolution_capacity_exhausted",
+                )
             except Exception:
                 return self._deny(
                     request, grant.grant_id, policy.name, 502, "Credential resolution failed."
@@ -557,12 +1058,89 @@ class TransparentEgressBroker:
         )
 
     async def revoke_authority_and_wait(self, presented_values: Sequence[str]) -> int:
-        """Disable all routes, revoke virtual values, and drain active requests."""
+        """Revoke routes, settle dispatched upstream work, and drain requests."""
 
         self._credentialless_authority_active = False
-        virtual_drain = asyncio.create_task(self._registry.revoke_values_and_wait(presented_values))
-        await asyncio.gather(virtual_drain, self._credentialless_idle.wait())
-        return virtual_drain.result()
+        revoked_count, grant_ids = self._registry.revoke_values(presented_values)
+        for admission in tuple(self._active_connect_admissions):
+            admission.revoked.set()
+        self._revoking_grant_ids.update(grant_ids)
+        drain_grant_ids = tuple(self._revoking_grant_ids)
+        await self.settle_active_operations()
+        await asyncio.gather(
+            self._registry.wait_for_inactive_grants(drain_grant_ids),
+            self._credentialless_idle.wait(),
+            self._connect_admissions_idle.wait(),
+        )
+        self._revoking_grant_ids.difference_update(drain_grant_ids)
+        return revoked_count
+
+    async def settle_active_operations(self) -> None:
+        """Settle every dispatched credential resolution and upstream call."""
+
+        outcomes = await asyncio.gather(
+            self.settle_active_credential_resolutions(),
+            self.settle_active_upstream_operations(),
+            return_exceptions=True,
+        )
+        failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("Egress operation settlement was incomplete.", failures)
+
+    async def settle_active_credential_resolutions(self) -> None:
+        """Retain cancellation-opaque resolution work until natural settlement."""
+
+        resolutions = tuple(
+            (token, owner)
+            for token, owner in tuple(self._active_credential_resolutions.items())
+            if owner is not None and owner.task is not None
+        )
+        failures: list[BaseException] = []
+        for _token, owner in resolutions:
+            task = owner.task
+            assert task is not None
+            if not owner.started:
+                task.cancel("Credential resolution was revoked before dispatch.")
+        for token, owner in resolutions:
+            task = owner.task
+            assert task is not None
+            outcome = await await_shielded_task_outcome(task)
+            if outcome.cancellation is not None:
+                restore_task_cancellation_requests(
+                    outcome.cancellation_requests_consumed,
+                    cancellation=outcome.cancellation,
+                )
+            if outcome.error is not None and _contains_process_control_signal(outcome.error):
+                failures.append(outcome.error)
+            self._release_credential_resolution(token)
+        if failures:
+            raise BaseExceptionGroup(
+                "Credential resolution settlement received a process-control signal.",
+                failures,
+            )
+        await self._credential_resolutions_idle.wait()
+
+    async def settle_active_upstream_operations(self) -> None:
+        """Cancel dispatched upstream calls and retain failures for retry."""
+
+        settlements = tuple(
+            (token, owner, self._arm_upstream_settlement(owner))
+            for token, owner in tuple(self._active_upstream_operations.items())
+            if owner is not None
+        )
+        failures: list[BaseException] = []
+        for token, owner, settlement_task in settlements:
+            try:
+                await self._await_upstream_settlement(
+                    token,
+                    owner,
+                    settlement_task,
+                )
+            except BaseException as exc:
+                failures.append(exc)
+        if failures:
+            raise BaseExceptionGroup("Egress upstream settlement was incomplete.", failures)
+        await self._upstream_operations_idle.wait()
 
     def renew_authority(self, grants: Sequence[VirtualCredentialGrant]) -> None:
         """Install fresh virtual values and reopen unchanged credentialless routes."""
@@ -637,6 +1215,80 @@ class TransparentEgressBroker:
         finally:
             self._end_credentialless_request()
 
+    async def _resolve_credential(
+        self,
+        secret: SecretRef,
+        *,
+        grant_id: str,
+    ) -> ResolvedSecret:
+        token = self._reserve_credential_resolution()
+        if token is None:
+            raise _CredentialResolutionCapacityError("Credential resolution capacity is exhausted.")
+        try:
+            resolver = self._resolver
+            if resolver is None:  # pragma: no cover - checked by the caller
+                raise RuntimeError("No credential resolver is configured.")
+
+            owner = _ActiveCredentialResolution()
+
+            async def resolve() -> ResolvedSecret:
+                owner.started = True
+                return await resolver.resolve(secret, scope={"grant_id": grant_id})
+
+            task = asyncio.create_task(
+                resolve(),
+                name="cayu-egress-credential-resolution",
+            )
+            owner.task = task
+            self._active_credential_resolutions[token] = owner
+            child_cancellation_error: RuntimeError | None = None
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError as cancellation:
+                current_task = asyncio.current_task()
+                if current_task is None or current_task.cancelling() <= 0:
+                    child_cancellation_error = RuntimeError(
+                        "Credential resolution stopped without caller cancellation."
+                    )
+                else:
+                    if not owner.started:
+                        task.cancel("Credential resolution was cancelled before dispatch.")
+                    outcome = await await_shielded_task_outcome(
+                        task,
+                        cancellation=cancellation,
+                    )
+                    if outcome.cancellation is not None:
+                        restore_task_cancellation_requests(
+                            outcome.cancellation_requests_consumed,
+                            cancellation=outcome.cancellation,
+                        )
+                    if outcome.error is not None and _contains_process_control_signal(
+                        outcome.error
+                    ):
+                        raise outcome.error from cancellation
+                    raise cancellation
+            if child_cancellation_error is not None:
+                # Raise only after leaving the handler so the resolver-owned
+                # cancellation and any sensitive diagnostic cannot become the
+                # sanitized error's implicit ``__context__``.
+                raise child_cancellation_error
+            raise RuntimeError("Credential resolution ended without an outcome.")
+        finally:
+            self._release_credential_resolution(token)
+
+    def _reserve_credential_resolution(self) -> object | None:
+        if len(self._active_credential_resolutions) >= _MAX_ACTIVE_CREDENTIAL_RESOLUTIONS:
+            return None
+        token = object()
+        self._active_credential_resolutions[token] = None
+        self._credential_resolutions_idle.clear()
+        return token
+
+    def _release_credential_resolution(self, token: object) -> None:
+        self._active_credential_resolutions.pop(token, None)
+        if not self._active_credential_resolutions:
+            self._credential_resolutions_idle.set()
+
     async def _forward_authorized(
         self,
         *,
@@ -663,8 +1315,29 @@ class TransparentEgressBroker:
                     }
                 }
             )
+        effective_response_limit = (
+            min(
+                MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES,
+                self._browser_max_response_bytes,
+            )
+            if authorization.require_identity_encoding
+            else MAX_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES
+        )
         try:
-            response = await self._upstream.send(upstream_request)
+            response = await self._run_upstream_operation(
+                upstream_request,
+                max_response_bytes=effective_response_limit,
+            )
+        except _UpstreamCapacityError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                503,
+                "Upstream operation capacity is exhausted.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="upstream_capacity_exhausted",
+            )
         except _UpstreamDestinationDeniedError:
             return self._deny(
                 request,
@@ -752,6 +1425,37 @@ class TransparentEgressBroker:
                     authorization_kind=authorization.authorization_kind,
                     error_code="oversized_response",
                 )
+        elif len(response.body) > effective_response_limit:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream response exceeded the proxy byte limit.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="oversized_response",
+            )
+        response_limit = (
+            self._browser_max_response_bytes
+            if authorization.require_identity_encoding
+            else effective_response_limit
+        )
+        try:
+            scrubbed_response = _scrub_response(
+                response,
+                secrets=authorization.secrets,
+                max_body_bytes=response_limit,
+            )
+        except _UpstreamResponseTooLargeError:
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Redacted upstream response exceeded the proxy byte limit.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="oversized_response",
+            )
         self._record(
             EgressDecision(
                 allowed=True,
@@ -765,7 +1469,179 @@ class TransparentEgressBroker:
                 authorization_kind=authorization.authorization_kind,
             )
         )
-        return _scrub_response(response, secrets=authorization.secrets)
+        return scrubbed_response
+
+    async def _run_upstream_operation(
+        self,
+        request: CapturedRequest,
+        *,
+        max_response_bytes: int,
+    ) -> CapturedResponse:
+        token = self._reserve_upstream_operation()
+        if token is None:
+            raise _UpstreamCapacityError("Upstream operation capacity is exhausted.")
+        release_owner = True
+        caller_cancellation: asyncio.CancelledError | None = None
+        cancellation_cause: RuntimeError | None = None
+        child_stopped = False
+        response: CapturedResponse | None = None
+        try:
+            operation = self._upstream.prepare(
+                request,
+                limits=EgressUpstreamLimits(
+                    max_response_bytes=max_response_bytes,
+                    total_timeout_s=DEFAULT_EGRESS_UPSTREAM_TOTAL_TIMEOUT_S,
+                ),
+            )
+            if not isinstance(operation, EgressUpstreamOperation):
+                raise TypeError("Egress upstream returned an invalid prepared operation.")
+            result_task = asyncio.create_task(
+                _owned_upstream_result(operation),
+                name="cayu-egress-upstream-result",
+            )
+            owner = _ActiveUpstreamOperation(
+                operation=operation,
+                result_task=result_task,
+            )
+            self._active_upstream_operations[token] = owner
+            try:
+                response = await asyncio.shield(result_task)
+            except _QuiescentUpstreamProcessControl as outcome:
+                raise outcome.signal from None
+            except asyncio.CancelledError as cancellation:
+                current_task = asyncio.current_task()
+                if current_task is None or current_task.cancelling() <= 0:
+                    await self._settle_upstream_owner(token, owner)
+                    child_stopped = True
+                else:
+                    try:
+                        await self._settle_upstream_owner(
+                            token,
+                            owner,
+                            cancellation=cancellation,
+                        )
+                    except BaseException as settlement_error:
+                        release_owner = False
+                        if _contains_process_control_signal(settlement_error):
+                            raise settlement_error from cancellation
+                        cancellation_cause = RuntimeError(
+                            "Egress upstream cancellation settlement was incomplete."
+                        )
+                    caller_cancellation = cancellation
+        finally:
+            if release_owner:
+                self._release_upstream_operation(token)
+        if caller_cancellation is not None:
+            if cancellation_cause is not None:
+                raise caller_cancellation from cancellation_cause
+            raise caller_cancellation
+        if child_stopped:
+            raise RuntimeError("Egress upstream operation stopped unexpectedly.")
+        assert response is not None
+        return response
+
+    def _reserve_upstream_operation(self) -> object | None:
+        if len(self._active_upstream_operations) >= self._max_active_upstream_operations:
+            return None
+        token = object()
+        self._active_upstream_operations[token] = None
+        self._upstream_operations_idle.clear()
+        return token
+
+    def _release_upstream_operation(self, token: object) -> None:
+        self._active_upstream_operations.pop(token, None)
+        if not self._active_upstream_operations:
+            self._upstream_operations_idle.set()
+
+    async def _settle_upstream_owner(
+        self,
+        token: object,
+        owner: _ActiveUpstreamOperation,
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        settlement_task = self._arm_upstream_settlement(owner)
+        await self._await_upstream_settlement(
+            token,
+            owner,
+            settlement_task,
+            cancellation=cancellation,
+        )
+
+    @staticmethod
+    def _arm_upstream_settlement(
+        owner: _ActiveUpstreamOperation,
+    ) -> asyncio.Task[None]:
+        settlement_task = owner.settlement_task
+        retry_settlement = settlement_task is None
+        if settlement_task is not None and settlement_task.done():
+            try:
+                retry_settlement = settlement_task.exception() is not None
+            except asyncio.CancelledError:
+                retry_settlement = True
+        if retry_settlement:
+
+            async def settle() -> None:
+                quiescent_process_control: _QuiescentUpstreamProcessControl | None = None
+                try:
+                    await _owned_upstream_settlement(owner.operation)
+                except _QuiescentUpstreamProcessControl as error:
+                    quiescent_process_control = error
+                result_outcome = await await_shielded_task_outcome(owner.result_task)
+                if quiescent_process_control is not None:
+                    raise quiescent_process_control from None
+                if isinstance(result_outcome.error, _QuiescentUpstreamProcessControl):
+                    raise result_outcome.error
+                if result_outcome.error is not None and _contains_process_control_signal(
+                    result_outcome.error
+                ):
+                    raise _QuiescentUpstreamProcessControl(result_outcome.error) from None
+
+            settlement_task = asyncio.create_task(
+                settle(),
+                name="cayu-egress-upstream-settlement",
+            )
+            owner.settlement_task = settlement_task
+        assert settlement_task is not None
+        return settlement_task
+
+    async def _await_upstream_settlement(
+        self,
+        token: object,
+        owner: _ActiveUpstreamOperation,
+        settlement_task: asyncio.Task[None],
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        if owner.settlement_task is not settlement_task:
+            raise RuntimeError("Egress upstream settlement ownership changed.")
+        outcome = await await_shielded_task_outcome(
+            settlement_task,
+            cancellation=cancellation,
+        )
+        if outcome.cancellation is not None:
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=outcome.cancellation,
+            )
+        if outcome.error is not None:
+            if isinstance(outcome.error, _QuiescentUpstreamProcessControl):
+                self._release_upstream_operation(token)
+                if cancellation is not None:
+                    raise outcome.error.signal from cancellation
+                raise outcome.error.signal
+            if isinstance(outcome.error, _UnsettledUpstreamProcessControl):
+                if cancellation is not None:
+                    raise outcome.error.signal from cancellation
+                raise outcome.error.signal
+            if _contains_process_control_signal(outcome.error):
+                if cancellation is not None:
+                    raise outcome.error from cancellation
+                raise outcome.error
+            raise RuntimeError("Egress upstream operation did not settle.") from None
+        if outcome.timed_out:
+            raise RuntimeError("Egress upstream operation settlement timed out.")
+        self._release_upstream_operation(token)
 
     def _authority_revoked(
         self,
@@ -868,9 +1744,9 @@ def _forwardable_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in _HOP_BY_HOP}
 
 
-def _decoded_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    # httpx returns decoded response bytes but keeps the provider's compression
-    # metadata. Forwarding stale Content-Encoding makes SDK clients decode twice.
+def _identity_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    # The response passed the identity-encoding gate above. Do not forward even
+    # a redundant identity marker as authority for a downstream transformation.
     return {
         key: value
         for key, value in _forwardable_headers(headers).items()
@@ -879,7 +1755,10 @@ def _decoded_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
 
 
 def _scrub_response(
-    response: CapturedResponse, *, secrets: tuple[str, ...] = ()
+    response: CapturedResponse,
+    *,
+    secrets: tuple[str, ...] = (),
+    max_body_bytes: int,
 ) -> CapturedResponse:
     headers = _forwardable_headers(response.headers)
     if not secrets:
@@ -888,6 +1767,16 @@ def _scrub_response(
     redactor = SecretRedactor(secrets)
     redacted_headers = {key: redactor.redact_text(value) for key, value in headers.items()}
     redacted_body = response.body
+    replacement = REDACTED_SECRET.encode()
     for secret in secrets:
-        redacted_body = redacted_body.replace(secret.encode(), REDACTED_SECRET.encode())
+        encoded_secret = secret.encode()
+        if len(replacement) > len(encoded_secret):
+            projected_size = len(redacted_body) + redacted_body.count(encoded_secret) * (
+                len(replacement) - len(encoded_secret)
+            )
+            if projected_size > max_body_bytes:
+                raise _UpstreamResponseTooLargeError(
+                    "Redaction would expand the response beyond its byte limit."
+                )
+        redacted_body = redacted_body.replace(encoded_secret, replacement)
     return response.model_copy(update={"headers": redacted_headers, "body": redacted_body})

@@ -1519,6 +1519,34 @@ durable attach contract returns an unsupported capability marker on initial
 creation; replaying that checkpoint raises before a replacement runner can be
 created.
 
+The virtual-egress host proxy has one bounded resource owner for every accepted
+connection. Worker capacity is acquired before executor submission, request
+heads have fixed aggregate, line, count, and absolute-time ceilings, and all
+socket phases poll shutdown rather than relying on a platform-specific close to
+wake a blocking TLS read. A CONNECT target receives only coarse destination
+admission before leaf-certificate work; the complete request is independently
+authorized after TLS. Certificate generation is serialized and bounded, and
+its per-session cache is entry- and lifetime-limited. Built-in upstream
+requests require identity content encoding and reject an encoded response
+before reading its body, so decompression cannot allocate outside the response
+ceiling. Their default DNS resolution runs in an owned helper process that is
+terminated and reaped at the same absolute total deadline. Custom upstreams
+must prepare a side-effect-free
+`EgressUpstreamOperation` from the supplied byte and time limits before
+dispatch. The broker owns at most 16 dispatched upstream
+operations by default (hard ceiling 64), rejects excess work before upstream
+dispatch, and does not release an operation slot or credential lease after
+cancellation until `cancel_and_wait()` positively settles the delegated work.
+An upstream without active-abort authority remains naturally draining and
+capacity-counted. Injected HTTPX transports and destination resolvers are
+treated as cancellation-opaque rather than inheriting the built-in transport's
+settlement authority. The broker also rejects any returned body above the hard
+ceiling. Response heads and bodies are written separately to avoid a second
+full-body allocation. Closing the proxy is idempotent and its owned settlement
+continues through caller cancellation until sockets, workers, upstream
+operations, permits, and the final certificate-authority owner are released.
+All rejection codes are fixed and non-echoing.
+
 New `CREATE` operations through the built-in Microsandbox and Lambda MicroVM
 virtual-egress adapters currently fail with
 `EnvironmentAllocationUnsupportedError` before adapter preparation or provider

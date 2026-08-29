@@ -37,6 +37,8 @@ from cayu.egress.broker import (
     CapturedResponse,
     EgressDecision,
     EgressUpstream,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpxUpstream,
     TransparentEgressBroker,
 )
@@ -113,6 +115,8 @@ __all__ = [
     "EgressReconnectNotFoundError",
     "EgressRequest",
     "EgressUpstream",
+    "EgressUpstreamLimits",
+    "EgressUpstreamOperation",
     "HttpEgressPolicy",
     "HttpxUpstream",
     "InvalidEgressReconnectMetadataError",

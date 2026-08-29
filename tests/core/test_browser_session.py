@@ -2884,6 +2884,19 @@ def test_interactive_transport_envelope_covers_every_supported_maximum() -> None
 
 
 def test_browser_session_wire_requires_positive_allocation_retirement_evidence() -> None:
+    fetch_failed_payload = _browser_guest._interactive_error_payload(
+        _browser_guest._GuestFailure(
+            "fetch_failed",
+            allocation_disposition="retired",
+        )
+    )
+    fetch_failed = browser_session_module._parse_runner_response(
+        json.dumps(fetch_failed_payload),
+        max_artifact_bytes=1024,
+    )
+    assert fetch_failed.failure == BrowserBackendFailure("fetch_failed")
+    assert fetch_failed.allocation_disposition == "retired"
+
     allocation_lost_payload = _browser_guest._interactive_error_payload(
         _browser_guest._GuestFailure(
             "allocation_lost",
@@ -3384,6 +3397,65 @@ def test_interactive_guest_classifies_timeout_and_crash_separately() -> None:
             ).code
             == "browser_crash"
         )
+
+
+def test_browser_guest_recognizes_only_playwright_proxy_tunnel_failure() -> None:
+    tunnel_error_type = type(
+        "Error",
+        (RuntimeError,),
+        {"__module__": "playwright.async_api"},
+    )
+
+    assert (
+        _browser_guest._is_proxy_tunnel_failure(
+            tunnel_error_type("net::ERR_TUNNEL_CONNECTION_FAILED")
+        )
+        is True
+    )
+    assert (
+        _browser_guest._is_proxy_tunnel_failure(
+            tunnel_error_type("net::ERR_PROXY_CONNECTION_FAILED")
+        )
+        is False
+    )
+    assert (
+        _browser_guest._is_proxy_tunnel_failure(RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED"))
+        is False
+    )
+    wrapped = RuntimeError("wrapper")
+    wrapped.__cause__ = tunnel_error_type("net::ERR_TUNNEL_CONNECTION_FAILED")
+    assert _browser_guest._is_proxy_tunnel_failure(wrapped) is True
+
+
+def test_interactive_navigation_does_not_call_proxy_failure_a_browser_crash() -> None:
+    playwright_error_type = type(
+        "Error",
+        (RuntimeError,),
+        {"__module__": "playwright.async_api"},
+    )
+
+    failure = _browser_guest._interactive_runtime_failure(
+        "navigate",
+        playwright_error_type("Page.goto: net::ERR_ABORTED"),
+        browser_connected=True,
+        page_open=True,
+    )
+    crashed = _browser_guest._interactive_runtime_failure(
+        "navigate",
+        playwright_error_type("Browser process exited"),
+        browser_connected=False,
+        page_open=False,
+    )
+    disconnected_network_failure = _browser_guest._interactive_runtime_failure(
+        "navigate",
+        playwright_error_type("Page.goto: net::ERR_FAILED"),
+        browser_connected=False,
+        page_open=False,
+    )
+
+    assert failure.code == "fetch_failed"
+    assert crashed.code == "browser_crash"
+    assert disconnected_network_failure.code == "browser_crash"
 
 
 def test_browser_session_uses_the_ordinary_runtime_tool_lifecycle() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
@@ -20,6 +21,8 @@ from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
     EgressBinding,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     SandboxEgressAdapter,
     TransparentEgressBroker,
     VirtualCredentialRegistry,
@@ -48,9 +51,19 @@ class _RecordingUpstream:
         self.requests: list[CapturedRequest] = []
         self.response = response or CapturedResponse(status_code=200, body=b"ok")
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.requests.append(request)
-        return self.response
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            self.requests.append(request)
+            return self.response
+
+        return EgressUpstreamOperation(send)
 
 
 def _public_docs_policy() -> HttpEgressPolicy:
@@ -630,11 +643,22 @@ def test_factory_finalization_revokes_then_drains_inflight_credentialless_reques
             self.release = asyncio.Event()
             self.calls = 0
 
-        async def send(self, request: CapturedRequest) -> CapturedResponse:
-            self.calls += 1
-            self.started.set()
-            await self.release.wait()
-            return CapturedResponse(status_code=200, body=b"too late")
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            assert isinstance(request, CapturedRequest)
+            assert limits.max_response_bytes > 0
+
+            async def send() -> CapturedResponse:
+                self.calls += 1
+                self.started.set()
+                await self.release.wait()
+                return CapturedResponse(status_code=200, body=b"too late")
+
+            return EgressUpstreamOperation(send)
 
     async def run() -> tuple[int, int, bool]:
         adapter = _RecordingAdapter()
@@ -678,6 +702,75 @@ def test_factory_finalization_revokes_then_drains_inflight_credentialless_reques
     assert close_waited is True
     assert inflight_status == 403
     assert new_request_status == 403
+
+
+def test_factory_finalization_settles_upstream_before_credentialless_drain() -> None:
+    class _StallingUpstream:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.settled = asyncio.Event()
+
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            assert isinstance(request, CapturedRequest)
+            assert limits.max_response_bytes > 0
+
+            async def send() -> CapturedResponse:
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.settled.set()
+                raise AssertionError("Unreachable stalled upstream completed.")
+
+            async def cancel_and_wait(task: asyncio.Task[CapturedResponse]) -> None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            return EgressUpstreamOperation(send, cancel_and_wait=cancel_and_wait)
+
+    async def run() -> tuple[int, int, bool, bool]:
+        adapter = _RecordingAdapter()
+        upstream = _StallingUpstream()
+        factory = VirtualEgressEnvironmentFactory(
+            policies={"public-docs": _public_docs_policy()},
+            approved_destinations=[_approved_docs()],
+            adapter=adapter,
+            upstream=upstream,
+        )
+        result = await factory.create(_factory_request())
+        broker = adapter.prepare_calls[0]["broker"]
+        captured = CapturedRequest(
+            method="GET",
+            host="docs.example.com",
+            path="/sdk/index.json",
+        )
+        inflight = asyncio.create_task(broker.handle_request(captured))
+        await upstream.started.wait()
+
+        runner = result.environment.runner
+        assert runner is not None
+        await asyncio.wait_for(runner.close(), timeout=1.0)
+        inflight_response = await asyncio.wait_for(inflight, timeout=1.0)
+        denied = await broker.handle_request(captured)
+        return (
+            inflight_response.status_code,
+            denied.status_code,
+            upstream.settled.is_set(),
+            broker._credentialless_idle.is_set(),
+        )
+
+    inflight_status, new_request_status, settled, drained = asyncio.run(run())
+
+    assert inflight_status == 502
+    assert new_request_status == 403
+    assert settled is True
+    assert drained is True
 
 
 def test_factory_broker_reauthorizes_redirect_target_and_denies_escape() -> None:

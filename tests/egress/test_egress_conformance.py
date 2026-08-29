@@ -21,6 +21,8 @@ from cayu.egress import (
     CapturedResponse,
     EgressAdapterRegistry,
     EgressBinding,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
     SandboxEgressAdapter,
     TransparentEgressBroker,
@@ -153,9 +155,19 @@ def test_registered_builtin_enforces_credentialless_broker_without_fake_grants(
         def __init__(self) -> None:
             self.requests: list[CapturedRequest] = []
 
-        async def send(self, request: CapturedRequest) -> CapturedResponse:
-            self.requests.append(request)
-            return CapturedResponse(status_code=200, body=b"ok")
+        def prepare(
+            self,
+            request: CapturedRequest,
+            *,
+            limits: EgressUpstreamLimits,
+        ) -> EgressUpstreamOperation:
+            assert limits.max_response_bytes > 0
+
+            async def send() -> CapturedResponse:
+                self.requests.append(request)
+                return CapturedResponse(status_code=200, body=b"ok")
+
+            return EgressUpstreamOperation(send)
 
     async def run() -> tuple[bool, tuple[CapturedRequest, ...]]:
         fixture = registration.create_deterministic_fixture()

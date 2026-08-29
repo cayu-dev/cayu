@@ -12,6 +12,8 @@ from cayu.egress import (
     CapturedRequest,
     CapturedResponse,
     EgressBinding,
+    EgressUpstreamLimits,
+    EgressUpstreamOperation,
     HttpEgressPolicy,
     RunnerFinalizationResult,
     SandboxEgressAdapter,
@@ -44,12 +46,22 @@ class RecordingProviderUpstream:
         self._response_id = response_id
         self.authorization: str | None = None
 
-    async def send(self, request: CapturedRequest) -> CapturedResponse:
-        self.authorization = request.headers.get("Authorization")
-        return CapturedResponse(
-            status_code=200,
-            body=json.dumps({"id": self._response_id}).encode(),
-        )
+    def prepare(
+        self,
+        request: CapturedRequest,
+        *,
+        limits: EgressUpstreamLimits,
+    ) -> EgressUpstreamOperation:
+        assert limits.max_response_bytes > 0
+
+        async def send() -> CapturedResponse:
+            self.authorization = request.headers.get("Authorization")
+            return CapturedResponse(
+                status_code=200,
+                body=json.dumps({"id": self._response_id}).encode(),
+            )
+
+        return EgressUpstreamOperation(send)
 
 
 class CapturingEgressAdapter(SandboxEgressAdapter):
