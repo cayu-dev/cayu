@@ -3273,6 +3273,139 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_tasks_interrupted_handoff_recovery
             ON cayu_tasks(status, lease_expires_at, id);
     """,
+    71: """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_deliveries (
+            delivery_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            operation_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+            agent_id TEXT COLLATE BINARY NOT NULL,
+            task_id TEXT COLLATE BINARY NOT NULL,
+            knowledge_namespace TEXT COLLATE BINARY NOT NULL,
+            access_policy_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(access_policy_sha256) = 64
+                AND access_policy_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            checkpoint_revision INTEGER NOT NULL CHECK (
+                checkpoint_revision > 0 AND checkpoint_revision <= 2147483647
+            ),
+            processing_result_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(processing_result_sha256) = 64
+                AND processing_result_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            delivery_json TEXT NOT NULL CHECK (
+                json_valid(delivery_json) AND json_type(delivery_json) = 'object'
+            ),
+            staged_at TEXT NOT NULL,
+            UNIQUE (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ),
+            FOREIGN KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ) REFERENCES cayu_agent_recall_checkpoints(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, revision
+            ) ON DELETE RESTRICT,
+            FOREIGN KEY (operation_id)
+                REFERENCES cayu_agent_recall_checkpoints(operation_id)
+                ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_delivery_states (
+            delivery_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            agent_id TEXT COLLATE BINARY NOT NULL,
+            task_id TEXT COLLATE BINARY NOT NULL,
+            knowledge_namespace TEXT COLLATE BINARY NOT NULL,
+            access_policy_sha256 TEXT COLLATE BINARY NOT NULL,
+            checkpoint_revision INTEGER NOT NULL CHECK (
+                checkpoint_revision > 0 AND checkpoint_revision <= 2147483647
+            ),
+            state TEXT COLLATE BINARY NOT NULL CHECK (
+                state IN ('pending', 'claimed', 'acknowledged')
+            ),
+            attempt INTEGER NOT NULL CHECK (
+                attempt >= 0 AND attempt <= 9223372036854775807
+            ),
+            state_revision INTEGER NOT NULL CHECK (
+                state_revision >= 0 AND state_revision <= 9223372036854775807
+            ),
+            lease_expires_at TEXT,
+            release_id TEXT COLLATE BINARY UNIQUE,
+            acknowledgement_id TEXT COLLATE BINARY UNIQUE,
+            state_json TEXT NOT NULL CHECK (
+                json_valid(state_json) AND json_type(state_json) = 'object'
+            ),
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (state = 'pending' AND lease_expires_at IS NULL
+                    AND acknowledgement_id IS NULL
+                    AND (
+                        (attempt = 0 AND state_revision = 0 AND release_id IS NULL)
+                        OR (attempt > 0 AND state_revision > 0
+                            AND release_id IS NOT NULL)
+                    ))
+                OR (state = 'claimed' AND lease_expires_at IS NOT NULL
+                    AND attempt > 0 AND state_revision > 0
+                    AND release_id IS NULL AND acknowledgement_id IS NULL)
+                OR (state = 'acknowledged' AND lease_expires_at IS NULL
+                    AND attempt > 0 AND state_revision > 0
+                    AND release_id IS NULL AND acknowledgement_id IS NOT NULL)
+            ),
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (release_id)
+                REFERENCES cayu_agent_recall_delivery_releases(release_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ) REFERENCES cayu_agent_recall_deliveries(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_delivery_claims (
+            claim_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            delivery_id TEXT COLLATE BINARY NOT NULL,
+            worker_id TEXT COLLATE BINARY NOT NULL,
+            request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            attempt INTEGER NOT NULL CHECK (
+                attempt > 0 AND attempt <= 9223372036854775807
+            ),
+            claimed_at TEXT NOT NULL,
+            UNIQUE (delivery_id, attempt),
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_delivery_releases (
+            release_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            delivery_id TEXT COLLATE BINARY NOT NULL,
+            claim_id TEXT COLLATE BINARY NOT NULL,
+            request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            release_json TEXT NOT NULL CHECK (
+                json_valid(release_json) AND json_type(release_json) = 'object'
+            ),
+            released_at TEXT NOT NULL,
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (claim_id)
+                REFERENCES cayu_agent_recall_delivery_claims(claim_id)
+                ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_agent_recall_delivery_pending
+            ON cayu_agent_recall_delivery_states(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision, delivery_id
+            ) WHERE state != 'acknowledged';
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -4839,6 +4972,8 @@ def reconcile_schema(
         _validate_revision_67_knowledge_schema(connection)
     if current.revision >= 69:
         _validate_revision_69_work_context_schema(connection)
+    if current.revision >= 71:
+        _validate_revision_71_recall_delivery_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
@@ -6163,6 +6298,254 @@ def _raise_revision_69_sqlite_schema_error(name: str) -> NoReturn:
         "SQLite schema object "
         f"{name!r} conflicts with Cayu's agent work-context/checkpoint contract. "
         "Run schema_mode=MIGRATE to install the additive revision or recreate the database."
+    )
+
+
+def _validate_revision_71_recall_delivery_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_agent_recall_deliveries": (
+            ("delivery_id", "TEXT", 1, 1),
+            ("operation_id", "TEXT", 1, 0),
+            ("agent_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("knowledge_namespace", "TEXT", 1, 0),
+            ("access_policy_sha256", "TEXT", 1, 0),
+            ("checkpoint_revision", "INTEGER", 1, 0),
+            ("processing_result_sha256", "TEXT", 1, 0),
+            ("delivery_json", "TEXT", 1, 0),
+            ("staged_at", "TEXT", 1, 0),
+        ),
+        "cayu_agent_recall_delivery_states": (
+            ("delivery_id", "TEXT", 1, 1),
+            ("agent_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("knowledge_namespace", "TEXT", 1, 0),
+            ("access_policy_sha256", "TEXT", 1, 0),
+            ("checkpoint_revision", "INTEGER", 1, 0),
+            ("state", "TEXT", 1, 0),
+            ("attempt", "INTEGER", 1, 0),
+            ("state_revision", "INTEGER", 1, 0),
+            ("lease_expires_at", "TEXT", 0, 0),
+            ("release_id", "TEXT", 0, 0),
+            ("acknowledgement_id", "TEXT", 0, 0),
+            ("state_json", "TEXT", 1, 0),
+            ("updated_at", "TEXT", 1, 0),
+        ),
+        "cayu_agent_recall_delivery_claims": (
+            ("claim_id", "TEXT", 1, 1),
+            ("delivery_id", "TEXT", 1, 0),
+            ("worker_id", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("attempt", "INTEGER", 1, 0),
+            ("claimed_at", "TEXT", 1, 0),
+        ),
+        "cayu_agent_recall_delivery_releases": (
+            ("release_id", "TEXT", 1, 1),
+            ("delivery_id", "TEXT", 1, 0),
+            ("claim_id", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("release_json", "TEXT", 1, 0),
+            ("released_at", "TEXT", 1, 0),
+        ),
+    }
+    for table, expected in expected_columns.items():
+        actual = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            _raise_revision_71_sqlite_schema_error(table)
+
+    unique_keys = (
+        ("cayu_agent_recall_deliveries", ("delivery_id",)),
+        ("cayu_agent_recall_deliveries", ("operation_id",)),
+        (
+            "cayu_agent_recall_deliveries",
+            (
+                "agent_id",
+                "task_id",
+                "knowledge_namespace",
+                "access_policy_sha256",
+                "checkpoint_revision",
+            ),
+        ),
+        ("cayu_agent_recall_delivery_states", ("delivery_id",)),
+        ("cayu_agent_recall_delivery_states", ("release_id",)),
+        ("cayu_agent_recall_delivery_states", ("acknowledgement_id",)),
+        ("cayu_agent_recall_delivery_claims", ("claim_id",)),
+        ("cayu_agent_recall_delivery_claims", ("delivery_id", "attempt")),
+        ("cayu_agent_recall_delivery_releases", ("release_id",)),
+    )
+    for table, columns in unique_keys:
+        if not _sqlite_has_unique_index(connection, table, columns):
+            _raise_revision_71_sqlite_schema_error(table)
+
+    required_foreign_keys = {
+        "cayu_agent_recall_deliveries": {
+            (
+                "cayu_agent_recall_checkpoints",
+                (
+                    "agent_id",
+                    "task_id",
+                    "knowledge_namespace",
+                    "access_policy_sha256",
+                    "checkpoint_revision",
+                ),
+                (
+                    "agent_id",
+                    "task_id",
+                    "knowledge_namespace",
+                    "access_policy_sha256",
+                    "revision",
+                ),
+                "RESTRICT",
+            ),
+            (
+                "cayu_agent_recall_checkpoints",
+                ("operation_id",),
+                ("operation_id",),
+                "RESTRICT",
+            ),
+        },
+        "cayu_agent_recall_delivery_states": {
+            (
+                "cayu_agent_recall_deliveries",
+                ("delivery_id",),
+                ("delivery_id",),
+                "RESTRICT",
+            ),
+            (
+                "cayu_agent_recall_delivery_releases",
+                ("release_id",),
+                ("release_id",),
+                "RESTRICT",
+            ),
+            (
+                "cayu_agent_recall_deliveries",
+                (
+                    "agent_id",
+                    "task_id",
+                    "knowledge_namespace",
+                    "access_policy_sha256",
+                    "checkpoint_revision",
+                ),
+                (
+                    "agent_id",
+                    "task_id",
+                    "knowledge_namespace",
+                    "access_policy_sha256",
+                    "checkpoint_revision",
+                ),
+                "RESTRICT",
+            ),
+        },
+        "cayu_agent_recall_delivery_claims": {
+            (
+                "cayu_agent_recall_deliveries",
+                ("delivery_id",),
+                ("delivery_id",),
+                "RESTRICT",
+            ),
+        },
+        "cayu_agent_recall_delivery_releases": {
+            (
+                "cayu_agent_recall_deliveries",
+                ("delivery_id",),
+                ("delivery_id",),
+                "RESTRICT",
+            ),
+            (
+                "cayu_agent_recall_delivery_claims",
+                ("claim_id",),
+                ("claim_id",),
+                "RESTRICT",
+            ),
+        },
+    }
+    for table, expected in required_foreign_keys.items():
+        if _sqlite_foreign_key_groups(connection, table) != expected:
+            _raise_revision_71_sqlite_schema_error(table)
+
+    required_sql = {
+        "cayu_agent_recall_deliveries": (
+            "delivery_id text collate binary not null primary key",
+            "operation_id text collate binary not null unique",
+            "checkpoint_revision > 0",
+            "checkpoint_revision <= 2147483647",
+            "length(access_policy_sha256) = 64",
+            "access_policy_sha256 not glob '*[^0-9a-f]*'",
+            "length(processing_result_sha256) = 64",
+            "processing_result_sha256 not glob '*[^0-9a-f]*'",
+            "json_valid(delivery_json)",
+            "json_type(delivery_json) = 'object'",
+        ),
+        "cayu_agent_recall_delivery_states": (
+            "delivery_id text collate binary not null primary key",
+            "state in ('pending', 'claimed', 'acknowledged')",
+            "attempt >= 0",
+            "attempt <= 9223372036854775807",
+            "state_revision >= 0",
+            "state_revision <= 9223372036854775807",
+            "state = 'pending'",
+            "state = 'claimed'",
+            "state = 'acknowledged'",
+            "json_valid(state_json)",
+            "json_type(state_json) = 'object'",
+        ),
+        "cayu_agent_recall_delivery_claims": (
+            "claim_id text collate binary not null primary key",
+            "attempt > 0",
+            "attempt <= 9223372036854775807",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+        ),
+        "cayu_agent_recall_delivery_releases": (
+            "release_id text collate binary not null primary key",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "json_valid(release_json)",
+            "json_type(release_json) = 'object'",
+        ),
+    }
+    for table, fragments in required_sql.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+        if any(fragment not in normalized for fragment in fragments):
+            _raise_revision_71_sqlite_schema_error(table)
+
+    index = "idx_cayu_agent_recall_delivery_pending"
+    row = connection.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index,),
+    ).fetchone()
+    columns = tuple(
+        str(index_row[2]) for index_row in connection.execute(f"PRAGMA index_info({index})")
+    )
+    if (
+        row is None
+        or row[0] != "cayu_agent_recall_delivery_states"
+        or columns
+        != (
+            "agent_id",
+            "task_id",
+            "knowledge_namespace",
+            "access_policy_sha256",
+            "checkpoint_revision",
+            "delivery_id",
+        )
+        or "where state != 'acknowledged'" not in _normalize_sqlite_schema_sql(row[1])
+    ):
+        _raise_revision_71_sqlite_schema_error(index)
+
+
+def _raise_revision_71_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's staged recall-delivery contract. "
+        "Run schema_mode=MIGRATE to install the breaking revision or recreate the database."
     )
 
 
@@ -8029,6 +8412,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_69_work_context_schema(connection)
         if rev.revision == 70:
             _validate_interrupted_task_handoff_schema(connection)
+        if rev.revision == 71:
+            _validate_revision_71_recall_delivery_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

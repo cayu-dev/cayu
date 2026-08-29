@@ -455,6 +455,23 @@ def test_revision_seventy_adds_interrupted_task_handoff_receipts() -> None:
     m.validate(state, app_latest=70, app_min_supported=67)
 
 
+def test_revision_seventy_one_requires_atomic_recall_delivery_writers() -> None:
+    revision = m.revision(71)
+    state = m.SchemaState(revision=71, compatible_from=71)
+
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 71
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 71"):
+        m.validate(state, app_latest=70, app_min_supported=67)
+    m.validate(state, app_latest=71, app_min_supported=71)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 71"):
+        m.validate(
+            m.SchemaState(revision=70, compatible_from=67),
+            app_latest=71,
+            app_min_supported=71,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

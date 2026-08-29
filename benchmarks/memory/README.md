@@ -122,6 +122,25 @@ SQLite bytes per durable revision/receipt/checkpoint record. In-memory and
 SQLite provide the credential-free timing matrix; PostgreSQL runs the same
 behavioral conformance contract in its integration suite.
 
+## Staged-recall delivery overhead
+
+`recall-delivery-performance-v1.json` is the hermetic 50-stage baseline for the
+atomic processing-result/checkpoint handoff and its durable worker lifecycle.
+Regenerate it, or check every fixed p50/p95 ceiling without provider calls, with:
+
+```bash
+PYTHONPATH=src python scripts/run_recall_delivery_performance.py \
+  --output benchmarks/memory/recall-delivery-performance-v1.json \
+  --check
+```
+
+The populated lanes measure atomic stage/checkpoint commitment, oldest-pending
+claim, and acknowledgement. The empty lane runs after all 50 deliveries are
+acknowledged, so it measures the production-shaped indexed no-pending lookup
+without treating pre-feature code as a control. In-memory and SQLite provide the
+credential-free timing matrix; PostgreSQL runs shared conformance, concurrency,
+reopen, migration, and cancellation rollback tests.
+
 ## Revision-bound knowledge-relation overhead
 
 `knowledge-relation-performance-v1.json` is the hermetic baseline for 50 matching

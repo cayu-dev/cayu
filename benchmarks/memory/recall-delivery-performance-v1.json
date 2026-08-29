@@ -1,0 +1,81 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_acknowledgement_p50_ms": 30.0,
+    "memory_acknowledgement_p95_ms": 50.0,
+    "memory_claim_p50_ms": 30.0,
+    "memory_claim_p95_ms": 50.0,
+    "memory_no_pending_p50_ms": 2.5,
+    "memory_no_pending_p95_ms": 5.0,
+    "memory_stage_checkpoint_p50_ms": 25.0,
+    "memory_stage_checkpoint_p95_ms": 40.0,
+    "sqlite_acknowledgement_p50_ms": 50.0,
+    "sqlite_acknowledgement_p95_ms": 200.0,
+    "sqlite_claim_p50_ms": 50.0,
+    "sqlite_claim_p95_ms": 200.0,
+    "sqlite_no_pending_p50_ms": 10.0,
+    "sqlite_no_pending_p95_ms": 100.0,
+    "sqlite_stage_checkpoint_p50_ms": 40.0,
+    "sqlite_stage_checkpoint_p95_ms": 300.0
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "current_staged_recall_queue_after_all_deliveries_acknowledged"
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "acknowledgement_latency": {
+        "p50_ms": 18.126188,
+        "p95_ms": 19.365625
+      },
+      "backend": "memory",
+      "claim_latency": {
+        "p50_ms": 18.16048,
+        "p95_ms": 19.695958
+      },
+      "no_pending_latency": {
+        "p50_ms": 0.054917,
+        "p95_ms": 0.068209
+      },
+      "sample_count": 50,
+      "stage_checkpoint_latency": {
+        "p50_ms": 15.356271,
+        "p95_ms": 17.338083
+      }
+    },
+    {
+      "acknowledgement_latency": {
+        "p50_ms": 25.445542,
+        "p95_ms": 26.750625
+      },
+      "backend": "sqlite",
+      "claim_latency": {
+        "p50_ms": 25.425646,
+        "p95_ms": 26.562375
+      },
+      "no_pending_latency": {
+        "p50_ms": 0.063979,
+        "p95_ms": 0.069333
+      },
+      "sample_count": 50,
+      "stage_checkpoint_latency": {
+        "p50_ms": 16.321666,
+        "p95_ms": 17.79025
+      }
+    }
+  ],
+  "schema_version": "cayu.recall_delivery_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "backends": [
+      "memory",
+      "sqlite"
+    ],
+    "provider_calls": 0,
+    "samples": 50
+  }
+}

@@ -3316,6 +3316,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (68, 67),
         (69, 67),
         (70, 67),
+        (71, 71),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

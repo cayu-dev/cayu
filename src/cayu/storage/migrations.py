@@ -383,6 +383,12 @@ REVISIONS: tuple[Revision, ...] = (
     # Interrupted-task worker release receipts are independent exact-operation
     # evidence. Older writers do not touch the table, so this remains additive.
     Revision(revision=70, kind=RevisionKind.ADDITIVE, compatible_from=67),
+    # Checkpoint-aware recall delivery now stages the exact materialized result
+    # and advances its checkpoint in one commit, then fences every delivery
+    # claim and terminal handoff. Pre-71 checkpoint writers do not maintain
+    # that atomic stage, so mixed-version operation is unsafe. Existing
+    # checkpoints remain valid frontiers; no delivery records are inferred.
+    Revision(revision=71, kind=RevisionKind.BREAKING, compatible_from=71),
 )
 
 #: The revision an empty database is initialized to.

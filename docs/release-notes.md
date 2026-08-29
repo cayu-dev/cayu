@@ -329,6 +329,29 @@ legacy compatibility path. The hermetic performance baseline covers zero-record
 construction, indexed current reads, revision appends, checkpoint advances, and
 incremental SQLite storage.
 
+### Checkpoint-aware recall can be staged without a crash window
+
+`AgentRecallDelivery` now freezes one exact checkpoint-aware processing result,
+its processing and checkpoint fingerprints, full-index or delta classification,
+work-context/access authority, and staging attribution. The work-context store
+commits that immutable payload and the proposed checkpoint compare-and-swap in
+one operation, so cancellation or a failed state write cannot leave either half
+visible. Exact retries converge and conflicting delivery, operation, or
+checkpoint identities fail explicitly.
+
+In-memory, SQLite, and PostgreSQL stores also expose the same scoped
+oldest-pending claim lifecycle with bounded leases, renewal, explicit retry
+release, expiry takeover, stale-worker fencing, and typed downstream
+acknowledgement. Acknowledgement means durable handoff acceptance only; it does
+not synthesize `RecallReceipt`, `ContextExposure`, provider visibility,
+notification consumption, or task completion. The store clock owns lease time:
+future-dated staging, release, and acknowledgement attribution is rejected so a
+caller cannot extend a lease or pin the oldest pending stage. Storage revision
+71 installs empty authoritative delivery tables as a clean prerelease break,
+with no inferred records, backfill, legacy reads, or dual writes. A
+provider-free 50-stage benchmark fixes p50/p95 ceilings for atomic
+stage/checkpoint, claim, acknowledgement, and indexed no-pending paths.
+
 The rebuildable PostgreSQL `cayu_knowledge_embeddings` table now keys rows by
 identity and accepted readiness sequence so multiple projection attempts remain
 available to captured-frontier replay. This is an intentional derived-index

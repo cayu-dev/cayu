@@ -798,15 +798,34 @@ from cayu.storage.memory import (
 from cayu.work_context import (
     AgentRecallCheckpoint,
     AgentRecallCheckpointKey,
+    AgentRecallDelivery,
+    AgentRecallDeliveryClaim,
+    AgentRecallDeliveryConflict,
+    AgentRecallDeliveryEvidenceKind,
+    AgentRecallDeliveryRecord,
+    AgentRecallDeliveryRelease,
+    AgentRecallDeliveryState,
     AgentWorkContext,
     AgentWorkContextConflict,
     AgentWorkContextPublicationReceipt,
     AgentWorkContextStore,
+    _acknowledge_agent_recall_delivery_record,
+    _agent_recall_delivery_release,
     _bounded_identity,
+    _claim_agent_recall_delivery_record,
     _positive_revision,
+    _release_agent_recall_delivery_record,
+    _renew_agent_recall_delivery_record,
+    _require_replayable_delivery_claim_attempt,
+    _utc,
+    _validate_delivery_lease_seconds,
+    agent_recall_delivery_claim_request_sha256,
     agent_work_context_publication_request_sha256,
     copy_agent_recall_checkpoint,
     copy_agent_recall_checkpoint_key,
+    copy_agent_recall_delivery,
+    copy_agent_recall_delivery_claim,
+    copy_agent_recall_delivery_record,
     copy_agent_work_context,
     copy_agent_work_context_publication_receipt,
     validate_agent_recall_checkpoint_advance,
@@ -3381,6 +3400,139 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    71: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_deliveries (
+            delivery_id TEXT COLLATE "C" PRIMARY KEY,
+            operation_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                access_policy_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            checkpoint_revision INTEGER NOT NULL CHECK (
+                checkpoint_revision > 0 AND checkpoint_revision <= 2147483647
+            ),
+            processing_result_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                processing_result_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            delivery_json JSONB NOT NULL CHECK (jsonb_typeof(delivery_json) = 'object'),
+            staged_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ),
+            FOREIGN KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ) REFERENCES cayu_agent_recall_checkpoints(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, revision
+            ) ON DELETE RESTRICT,
+            FOREIGN KEY (operation_id)
+                REFERENCES cayu_agent_recall_checkpoints(operation_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_delivery_claims (
+            claim_id TEXT COLLATE "C" PRIMARY KEY,
+            delivery_id TEXT COLLATE "C" NOT NULL,
+            worker_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            attempt BIGINT NOT NULL CHECK (
+                attempt > 0 AND attempt <= 9223372036854775807
+            ),
+            claimed_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (delivery_id, attempt),
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_delivery_releases (
+            release_id TEXT COLLATE "C" PRIMARY KEY,
+            delivery_id TEXT COLLATE "C" NOT NULL,
+            claim_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            release_json JSONB NOT NULL CHECK (jsonb_typeof(release_json) = 'object'),
+            released_at TIMESTAMPTZ NOT NULL,
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (claim_id)
+                REFERENCES cayu_agent_recall_delivery_claims(claim_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_delivery_states (
+            delivery_id TEXT COLLATE "C" PRIMARY KEY,
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            checkpoint_revision INTEGER NOT NULL CHECK (
+                checkpoint_revision > 0 AND checkpoint_revision <= 2147483647
+            ),
+            state TEXT COLLATE "C" NOT NULL CHECK (
+                state IN ('pending', 'claimed', 'acknowledged')
+            ),
+            attempt BIGINT NOT NULL CHECK (
+                attempt >= 0 AND attempt <= 9223372036854775807
+            ),
+            state_revision BIGINT NOT NULL CHECK (
+                state_revision >= 0 AND state_revision <= 9223372036854775807
+            ),
+            lease_expires_at TIMESTAMPTZ,
+            release_id TEXT COLLATE "C" UNIQUE,
+            acknowledgement_id TEXT COLLATE "C" UNIQUE,
+            state_json JSONB NOT NULL CHECK (jsonb_typeof(state_json) = 'object'),
+            updated_at TIMESTAMPTZ NOT NULL,
+            CHECK (
+                (state = 'pending' AND lease_expires_at IS NULL
+                    AND acknowledgement_id IS NULL
+                    AND (
+                        (attempt = 0 AND state_revision = 0 AND release_id IS NULL)
+                        OR (attempt > 0 AND state_revision > 0
+                            AND release_id IS NOT NULL)
+                    ))
+                OR (state = 'claimed' AND lease_expires_at IS NOT NULL
+                    AND attempt > 0 AND state_revision > 0
+                    AND release_id IS NULL AND acknowledgement_id IS NULL)
+                OR (state = 'acknowledged' AND lease_expires_at IS NULL
+                    AND attempt > 0 AND state_revision > 0
+                    AND release_id IS NULL AND acknowledgement_id IS NOT NULL)
+            ),
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (release_id)
+                REFERENCES cayu_agent_recall_delivery_releases(release_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ) REFERENCES cayu_agent_recall_deliveries(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision
+            ) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_agent_recall_delivery_pending
+            ON cayu_agent_recall_delivery_states(
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision, delivery_id
+            ) WHERE state != 'acknowledged'
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4964,6 +5116,8 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_maintenance_proposal_schema(cur)
                         if current_state.revision >= 69:
                             await self._validate_agent_work_context_schema(cur)
+                        if current_state.revision >= 71:
+                            await self._validate_agent_recall_delivery_schema(cur)
                         if self._min_required_revision >= 45:
                             await self._validate_task_retry_series_schema(cur)
                         if self._min_required_revision >= 46:
@@ -5176,6 +5330,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_maintenance_proposal_schema(cur)
         if state.revision >= 69:
             await self._validate_agent_work_context_schema(cur)
+        if state.revision >= 71:
+            await self._validate_agent_recall_delivery_schema(cur)
         if self._min_required_revision >= 45:
             await self._validate_task_retry_series_schema(cur)
         if self._min_required_revision >= 46:
@@ -5348,6 +5504,8 @@ class _PostgresStoreBase:
             await self._validate_agent_work_context_schema(cur)
         if revision.revision == 70:
             await self._validate_interrupted_task_handoff_schema(cur)
+        if revision.revision == 71:
+            await self._validate_agent_recall_delivery_schema(cur)
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -6953,6 +7111,228 @@ class _PostgresStoreBase:
             "Postgres schema object "
             f"{name!r} conflicts with Cayu's agent work-context/checkpoint contract. "
             "Run schema_mode=MIGRATE to install the additive revision or recreate "
+            "the database."
+        )
+
+    async def _validate_agent_recall_delivery_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_agent_recall_deliveries": (
+                ("delivery_id", "text", "NO", "C"),
+                ("operation_id", "text", "NO", "C"),
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("checkpoint_revision", "integer", "NO", None),
+                ("processing_result_sha256", "text", "NO", "C"),
+                ("delivery_json", "jsonb", "NO", None),
+                ("staged_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_delivery_claims": (
+                ("claim_id", "text", "NO", "C"),
+                ("delivery_id", "text", "NO", "C"),
+                ("worker_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("attempt", "bigint", "NO", None),
+                ("claimed_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_delivery_releases": (
+                ("release_id", "text", "NO", "C"),
+                ("delivery_id", "text", "NO", "C"),
+                ("claim_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("release_json", "jsonb", "NO", None),
+                ("released_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_delivery_states": (
+                ("delivery_id", "text", "NO", "C"),
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("checkpoint_revision", "integer", "NO", None),
+                ("state", "text", "NO", "C"),
+                ("attempt", "bigint", "NO", None),
+                ("state_revision", "bigint", "NO", None),
+                ("lease_expires_at", "timestamp with time zone", "YES", None),
+                ("release_id", "text", "YES", "C"),
+                ("acknowledgement_id", "text", "YES", "C"),
+                ("state_json", "jsonb", "NO", None),
+                ("updated_at", "timestamp with time zone", "NO", None),
+            ),
+        }
+        for table, expected in expected_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable, collation_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_agent_recall_delivery_schema_error(table)
+
+        required_constraints = {
+            "cayu_agent_recall_deliveries": (
+                ("p", ("primary key (delivery_id)",)),
+                ("u", ("unique (operation_id)",)),
+                (
+                    "u",
+                    (
+                        "unique (agent_id, task_id, knowledge_namespace, ",
+                        "access_policy_sha256, checkpoint_revision)",
+                    ),
+                ),
+                ("c", ("access_policy_sha256", "[0-9a-f]{64}")),
+                ("c", ("checkpoint_revision", "> 0", "2147483647")),
+                ("c", ("processing_result_sha256", "[0-9a-f]{64}")),
+                ("c", ("jsonb_typeof(delivery_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (agent_id, task_id, knowledge_namespace, ",
+                        "access_policy_sha256, checkpoint_revision) references ",
+                        "cayu_agent_recall_checkpoints(agent_id, task_id, ",
+                        "knowledge_namespace, access_policy_sha256, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (operation_id) references ",
+                        "cayu_agent_recall_checkpoints(operation_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_delivery_claims": (
+                ("p", ("primary key (claim_id)",)),
+                ("u", ("unique (delivery_id, attempt)",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                ("c", ("attempt", "> 0", "9223372036854775807")),
+                (
+                    "f",
+                    (
+                        "foreign key (delivery_id) references ",
+                        "cayu_agent_recall_deliveries(delivery_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_delivery_releases": (
+                ("p", ("primary key (release_id)",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                ("c", ("jsonb_typeof(release_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (delivery_id) references ",
+                        "cayu_agent_recall_deliveries(delivery_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (claim_id) references ",
+                        "cayu_agent_recall_delivery_claims(claim_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_delivery_states": (
+                ("p", ("primary key (delivery_id)",)),
+                ("u", ("unique (release_id)",)),
+                ("u", ("unique (acknowledgement_id)",)),
+                ("c", ("checkpoint_revision", "> 0", "2147483647")),
+                ("c", ("state", "pending", "claimed", "acknowledged")),
+                ("c", ("attempt", ">= 0", "9223372036854775807")),
+                ("c", ("state_revision", ">= 0", "9223372036854775807")),
+                ("c", ("state = 'pending'", "state = 'claimed'", "state = 'acknowledged'")),
+                ("c", ("jsonb_typeof(state_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (delivery_id) references ",
+                        "cayu_agent_recall_deliveries(delivery_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (release_id) references ",
+                        "cayu_agent_recall_delivery_releases(release_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (agent_id, task_id, knowledge_namespace, ",
+                        "access_policy_sha256, checkpoint_revision) references ",
+                        "cayu_agent_recall_deliveries(agent_id, task_id, ",
+                        "knowledge_namespace, access_policy_sha256, checkpoint_revision)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+        }
+        for table, required in required_constraints.items():
+            await cur.execute(
+                """
+                SELECT constraint_record.contype,
+                       pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = %s
+                """,
+                (table,),
+            )
+            actual = tuple(
+                (str(kind), " ".join(str(definition).lower().split()))
+                for kind, definition in await cur.fetchall()
+            )
+            for expected_kind, fragments in required:
+                if not any(
+                    kind == expected_kind and all(fragment in definition for fragment in fragments)
+                    for kind, definition in actual
+                ):
+                    self._raise_agent_recall_delivery_schema_error(table)
+
+        index = "idx_cayu_agent_recall_delivery_pending"
+        await cur.execute(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema() AND indexname = %s
+            """,
+            (index,),
+        )
+        row = await cur.fetchone()
+        normalized = "" if row is None else " ".join(str(row[0]).lower().split())
+        required_index_fragments = (
+            "cayu_agent_recall_delivery_states using btree ",
+            "(agent_id, task_id, knowledge_namespace, access_policy_sha256, ",
+            "checkpoint_revision, delivery_id)",
+            "where (state <> 'acknowledged'",
+        )
+        if any(fragment not in normalized for fragment in required_index_fragments):
+            self._raise_agent_recall_delivery_schema_error(index)
+
+    @staticmethod
+    def _raise_agent_recall_delivery_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's staged recall-delivery contract. "
+            "Run schema_mode=MIGRATE to install the breaking revision or recreate "
             "the database."
         )
 
@@ -11011,7 +11391,7 @@ async def _lock_agent_work_context_identity_shared(
 class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
     """PostgreSQL work-context/checkpoint store with transaction-fenced CAS."""
 
-    _min_required_revision = 69
+    _min_required_revision = 71
 
     def __init__(
         self,
@@ -11029,6 +11409,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 boundary_name="work-context",
             )
         self._clock = utc_clock(clock)
+        self._clock_is_injected = clock is not None
         super().__init__(
             conninfo,
             pool=pool,
@@ -11222,87 +11603,11 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 "task",
                 checkpoint.task_id,
             )
-            work_context = await self._load_context(
+            await self._advance_checkpoint_locked(
                 cur,
-                checkpoint.task_id,
-                revision=checkpoint.work_context_revision,
-            )
-            current_work_context = await self._load_context(
-                cur,
-                checkpoint.task_id,
-                revision=None,
-            )
-            validate_agent_recall_checkpoint_work_context(
                 checkpoint,
-                work_context,
-                current_work_context,
+                expected_revision=expected_revision,
             )
-            current = await self._load_checkpoint(cur, key, revision=None)
-            validate_agent_recall_checkpoint_advance(
-                checkpoint,
-                expected_revision,
-                current,
-            )
-            await cur.execute(
-                """
-                INSERT INTO cayu_agent_recall_checkpoints (
-                    agent_id, task_id, knowledge_namespace, access_policy_sha256,
-                    revision, work_context_revision, work_context_sha256,
-                    knowledge_sequence, index_readiness_sequence, processing_mode,
-                    knowledge_high_water_sequence,
-                    index_readiness_high_water_sequence,
-                    processing_id, operation_id, record_json, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
-                )
-                """,
-                (
-                    checkpoint.agent_id,
-                    checkpoint.task_id,
-                    checkpoint.knowledge_namespace,
-                    checkpoint.access_policy_sha256,
-                    checkpoint.revision,
-                    checkpoint.work_context_revision,
-                    checkpoint.work_context_sha256,
-                    checkpoint.knowledge_sequence,
-                    checkpoint.index_readiness_sequence,
-                    checkpoint.processing_mode.value,
-                    checkpoint.knowledge_high_water_sequence,
-                    checkpoint.index_readiness_high_water_sequence,
-                    checkpoint.processing_id,
-                    checkpoint.operation_id,
-                    _dumps(checkpoint.model_dump(mode="json")),
-                    checkpoint.updated_at,
-                ),
-            )
-            if current is None:
-                await cur.execute(
-                    """
-                    INSERT INTO cayu_agent_recall_checkpoint_heads (
-                        agent_id, task_id, knowledge_namespace,
-                        access_policy_sha256, current_revision
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (*key.sort_key(), checkpoint.revision),
-                )
-            else:
-                await cur.execute(
-                    """
-                    UPDATE cayu_agent_recall_checkpoint_heads
-                    SET current_revision = %s
-                    WHERE agent_id = %s AND task_id = %s
-                      AND knowledge_namespace = %s AND access_policy_sha256 = %s
-                      AND current_revision = %s
-                    """,
-                    (
-                        checkpoint.revision,
-                        *key.sort_key(),
-                        expected_revision,
-                    ),
-                )
-                if cur.rowcount != 1:
-                    raise AgentWorkContextConflict("stale_checkpoint_revision")
             return copy_agent_recall_checkpoint(checkpoint)
 
     async def load_recall_checkpoint(
@@ -11318,6 +11623,602 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         async with self._pool.connection() as conn, conn.cursor() as cur:
             checkpoint = await self._load_checkpoint(cur, key, revision=revision)
             return None if checkpoint is None else copy_agent_recall_checkpoint(checkpoint)
+
+    async def stage_recall_delivery(
+        self,
+        delivery: AgentRecallDelivery,
+    ) -> AgentRecallDeliveryRecord:
+        delivery = copy_agent_recall_delivery(delivery)
+        key = delivery.key()
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "checkpoint-operation",
+                delivery.operation_id,
+            )
+            await _lock_agent_work_context_identity(cur, "delivery", delivery.delivery_id)
+            existing = await self._load_delivery(cur, delivery.delivery_id)
+            if existing is not None:
+                if existing.delivery != delivery:
+                    raise AgentRecallDeliveryConflict("delivery_id_reused")
+                return copy_agent_recall_delivery_record(existing)
+            await _lock_agent_work_context_identity(cur, "checkpoint", key.fingerprint())
+            await cur.execute(
+                """
+                SELECT delivery_id
+                FROM cayu_agent_recall_deliveries
+                WHERE agent_id = %s AND task_id = %s
+                  AND knowledge_namespace = %s AND access_policy_sha256 = %s
+                  AND checkpoint_revision = %s
+                """,
+                (*key.sort_key(), delivery.checkpoint.revision),
+            )
+            if await cur.fetchone() is not None:
+                raise AgentRecallDeliveryConflict("checkpoint_delivery_exists")
+            operation_delivery = await self._load_delivery_by_operation(
+                cur,
+                delivery.operation_id,
+            )
+            if operation_delivery is not None:
+                raise AgentRecallDeliveryConflict("delivery_operation_reused")
+            checkpoint_replay = await self._load_checkpoint_by_operation(
+                cur,
+                delivery.operation_id,
+            )
+            if checkpoint_replay is not None:
+                raise AgentRecallDeliveryConflict("checkpoint_committed_without_delivery")
+            if delivery.staged_at > await self._authoritative_delivery_now(cur):
+                raise AgentRecallDeliveryConflict("delivery_staged_in_future")
+            await _lock_agent_work_context_identity_shared(cur, "task", delivery.task_id)
+            await self._advance_checkpoint_locked(
+                cur,
+                delivery.checkpoint,
+                expected_revision=delivery.expected_checkpoint_revision,
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_deliveries (
+                    delivery_id, operation_id, agent_id, task_id,
+                    knowledge_namespace, access_policy_sha256,
+                    checkpoint_revision, processing_result_sha256,
+                    delivery_json, staged_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                )
+                """,
+                (
+                    delivery.delivery_id,
+                    delivery.operation_id,
+                    delivery.agent_id,
+                    delivery.task_id,
+                    delivery.knowledge_namespace,
+                    delivery.access_policy_sha256,
+                    delivery.checkpoint.revision,
+                    delivery.processing_result_sha256,
+                    _dumps(delivery.model_dump(mode="json")),
+                    delivery.staged_at,
+                ),
+            )
+            record = AgentRecallDeliveryRecord(
+                delivery=delivery,
+                updated_at=delivery.staged_at,
+            )
+            await self._insert_delivery_state(cur, record)
+            return copy_agent_recall_delivery_record(record)
+
+    async def load_recall_delivery(
+        self,
+        delivery_id: str,
+    ) -> AgentRecallDeliveryRecord | None:
+        delivery_id = _bounded_identity(delivery_id, "delivery_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            record = await self._load_delivery(cur, delivery_id)
+            return None if record is None else copy_agent_recall_delivery_record(record)
+
+    async def claim_recall_delivery(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallDeliveryRecord | None:
+        key = copy_agent_recall_checkpoint_key(key)
+        request_sha256 = agent_recall_delivery_claim_request_sha256(
+            key,
+            claim_id=claim_id,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(cur, "delivery-claim", claim_id)
+            await cur.execute(
+                "SELECT delivery_id, worker_id, request_sha256, attempt "
+                "FROM cayu_agent_recall_delivery_claims WHERE claim_id = %s",
+                (claim_id,),
+            )
+            replay = await cur.fetchone()
+            if replay is not None:
+                if str(replay[2]) != request_sha256:
+                    raise AgentRecallDeliveryConflict("claim_id_reused")
+                record = await self._load_delivery(cur, str(replay[0]))
+                if record is None:  # pragma: no cover - protected by foreign key
+                    raise RuntimeError("Postgres recall-delivery claim lost its delivery.")
+                _require_replayable_delivery_claim_attempt(
+                    record,
+                    claim_id=claim_id,
+                    worker_id=str(replay[1]),
+                    attempt=int(replay[3]),
+                    now=await self._delivery_now(cur, record.updated_at),
+                )
+                return copy_agent_recall_delivery_record(record)
+            await _lock_agent_work_context_identity(cur, "checkpoint", key.fingerprint())
+            await cur.execute(
+                """
+                SELECT delivery.delivery_json::text,
+                       delivery.operation_id,
+                       delivery.processing_result_sha256,
+                       delivery.staged_at,
+                       checkpoint.record_json::text,
+                       state.delivery_id, state.agent_id, state.task_id,
+                       state.knowledge_namespace, state.access_policy_sha256,
+                       state.checkpoint_revision, state.state, state.attempt,
+                       state.state_revision, state.lease_expires_at,
+                       state.release_id, state.acknowledgement_id,
+                       state.state_json::text, state.updated_at
+                FROM cayu_agent_recall_delivery_states AS state
+                JOIN cayu_agent_recall_deliveries AS delivery
+                  ON delivery.delivery_id = state.delivery_id
+                LEFT JOIN cayu_agent_recall_checkpoints AS checkpoint
+                  ON checkpoint.agent_id = delivery.agent_id
+                 AND checkpoint.task_id = delivery.task_id
+                 AND checkpoint.knowledge_namespace = delivery.knowledge_namespace
+                 AND checkpoint.access_policy_sha256 = delivery.access_policy_sha256
+                 AND checkpoint.revision = delivery.checkpoint_revision
+                 AND checkpoint.operation_id = delivery.operation_id
+                WHERE state.agent_id = %s AND state.task_id = %s
+                  AND state.knowledge_namespace = %s
+                  AND state.access_policy_sha256 = %s
+                  AND state.state != 'acknowledged'
+                ORDER BY state.checkpoint_revision, state.delivery_id COLLATE "C"
+                LIMIT 1
+                FOR UPDATE OF state
+                """,
+                key.sort_key(),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            current = self._delivery_record_from_row(row)
+            now = await self._delivery_now(cur, current.updated_at)
+            if (
+                current.state is AgentRecallDeliveryState.CLAIMED
+                and current.claim is not None
+                and current.claim.lease_expires_at > now
+            ):
+                return None
+            claimed = _claim_agent_recall_delivery_record(
+                current,
+                claim_id=claim_id,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+                now=now,
+            )
+            assert claimed.claim is not None
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_delivery_claims (
+                    claim_id, delivery_id, worker_id, request_sha256,
+                    attempt, claimed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    claimed.claim.claim_id,
+                    claimed.delivery.delivery_id,
+                    claimed.claim.worker_id,
+                    request_sha256,
+                    claimed.claim.attempt,
+                    claimed.claim.claimed_at,
+                ),
+            )
+            await self._update_delivery_state(cur, current, claimed)
+            return copy_agent_recall_delivery_record(claimed)
+
+    async def renew_recall_delivery(
+        self,
+        claim: AgentRecallDeliveryClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallDeliveryRecord:
+        claim = copy_agent_recall_delivery_claim(claim)
+        _validate_delivery_lease_seconds(lease_seconds)
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            current = await self._load_delivery(cur, claim.delivery_id, for_update=True)
+            if current is None:
+                raise AgentRecallDeliveryConflict("unknown_delivery")
+            renewed = _renew_agent_recall_delivery_record(
+                current,
+                claim,
+                lease_seconds=lease_seconds,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            if renewed != current:
+                await self._update_delivery_state(cur, current, renewed)
+            return copy_agent_recall_delivery_record(renewed)
+
+    async def release_recall_delivery(
+        self,
+        claim: AgentRecallDeliveryClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallDeliveryRecord:
+        claim = copy_agent_recall_delivery_claim(claim)
+        requested = _agent_recall_delivery_release(
+            claim,
+            release_id=release_id,
+            reason=reason,
+            released_at=released_at,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(cur, "delivery-release", release_id)
+            current = await self._load_delivery(cur, claim.delivery_id, for_update=True)
+            if current is None:
+                raise AgentRecallDeliveryConflict("unknown_delivery")
+            await cur.execute(
+                "SELECT delivery_id, release_json::text "
+                "FROM cayu_agent_recall_delivery_releases WHERE release_id = %s",
+                (requested.release_id,),
+            )
+            replay = await cur.fetchone()
+            if replay is not None:
+                stored = AgentRecallDeliveryRelease.model_validate_json(str(replay[1]))
+                if str(replay[0]) != claim.delivery_id or stored != requested:
+                    raise AgentRecallDeliveryConflict("release_id_reused")
+                if current.release != stored:
+                    raise AgentRecallDeliveryConflict("release_replay_superseded")
+                return copy_agent_recall_delivery_record(current)
+            released = _release_agent_recall_delivery_record(
+                current,
+                claim,
+                release_id=requested.release_id,
+                reason=requested.reason,
+                released_at=requested.released_at,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_delivery_releases (
+                    release_id, delivery_id, claim_id, request_sha256,
+                    release_json, released_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    requested.release_id,
+                    requested.delivery_id,
+                    requested.claim_id,
+                    requested.fingerprint(),
+                    _dumps(requested.model_dump(mode="json")),
+                    requested.released_at,
+                ),
+            )
+            await self._update_delivery_state(cur, current, released)
+            return copy_agent_recall_delivery_record(released)
+
+    async def acknowledge_recall_delivery(
+        self,
+        claim: AgentRecallDeliveryClaim,
+        *,
+        acknowledgement_id: str,
+        evidence_kind: AgentRecallDeliveryEvidenceKind,
+        evidence_ref: str,
+        acknowledged_at: datetime,
+    ) -> AgentRecallDeliveryRecord:
+        claim = copy_agent_recall_delivery_claim(claim)
+        acknowledgement_id = _bounded_identity(acknowledgement_id, "acknowledgement_id")
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "delivery-acknowledgement",
+                acknowledgement_id,
+            )
+            current = await self._load_delivery(cur, claim.delivery_id, for_update=True)
+            if current is None:
+                raise AgentRecallDeliveryConflict("unknown_delivery")
+            await cur.execute(
+                "SELECT delivery_id FROM cayu_agent_recall_delivery_states "
+                "WHERE acknowledgement_id = %s",
+                (acknowledgement_id,),
+            )
+            occupied = await cur.fetchone()
+            if occupied is not None and str(occupied[0]) != claim.delivery_id:
+                raise AgentRecallDeliveryConflict("acknowledgement_reused")
+            acknowledged = _acknowledge_agent_recall_delivery_record(
+                current,
+                claim,
+                acknowledgement_id=acknowledgement_id,
+                evidence_kind=evidence_kind,
+                evidence_ref=evidence_ref,
+                acknowledged_at=acknowledged_at,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            if acknowledged != current:
+                await self._update_delivery_state(cur, current, acknowledged)
+            return copy_agent_recall_delivery_record(acknowledged)
+
+    async def _advance_checkpoint_locked(
+        self,
+        cur: Any,
+        checkpoint: AgentRecallCheckpoint,
+        *,
+        expected_revision: int | None,
+    ) -> None:
+        key = checkpoint.key()
+        work_context = await self._load_context(
+            cur,
+            checkpoint.task_id,
+            revision=checkpoint.work_context_revision,
+        )
+        current_work_context = await self._load_context(
+            cur,
+            checkpoint.task_id,
+            revision=None,
+        )
+        validate_agent_recall_checkpoint_work_context(
+            checkpoint,
+            work_context,
+            current_work_context,
+        )
+        current = await self._load_checkpoint(cur, key, revision=None)
+        validate_agent_recall_checkpoint_advance(
+            checkpoint,
+            expected_revision,
+            current,
+        )
+        await cur.execute(
+            """
+            INSERT INTO cayu_agent_recall_checkpoints (
+                agent_id, task_id, knowledge_namespace, access_policy_sha256,
+                revision, work_context_revision, work_context_sha256,
+                knowledge_sequence, index_readiness_sequence, processing_mode,
+                knowledge_high_water_sequence,
+                index_readiness_high_water_sequence,
+                processing_id, operation_id, record_json, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+            )
+            """,
+            (
+                checkpoint.agent_id,
+                checkpoint.task_id,
+                checkpoint.knowledge_namespace,
+                checkpoint.access_policy_sha256,
+                checkpoint.revision,
+                checkpoint.work_context_revision,
+                checkpoint.work_context_sha256,
+                checkpoint.knowledge_sequence,
+                checkpoint.index_readiness_sequence,
+                checkpoint.processing_mode.value,
+                checkpoint.knowledge_high_water_sequence,
+                checkpoint.index_readiness_high_water_sequence,
+                checkpoint.processing_id,
+                checkpoint.operation_id,
+                _dumps(checkpoint.model_dump(mode="json")),
+                checkpoint.updated_at,
+            ),
+        )
+        if current is None:
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_checkpoint_heads (
+                    agent_id, task_id, knowledge_namespace,
+                    access_policy_sha256, current_revision
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (*key.sort_key(), checkpoint.revision),
+            )
+            return
+        await cur.execute(
+            """
+            UPDATE cayu_agent_recall_checkpoint_heads
+            SET current_revision = %s
+            WHERE agent_id = %s AND task_id = %s
+              AND knowledge_namespace = %s AND access_policy_sha256 = %s
+              AND current_revision = %s
+            """,
+            (
+                checkpoint.revision,
+                *key.sort_key(),
+                expected_revision,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AgentWorkContextConflict("stale_checkpoint_revision")
+
+    async def _delivery_now(self, cur: Any, floor: datetime) -> datetime:
+        return max(await self._authoritative_delivery_now(cur), floor)
+
+    async def _authoritative_delivery_now(self, cur: Any) -> datetime:
+        if self._clock_is_injected:
+            return _utc(self._clock(), "clock result")
+        await cur.execute("SELECT clock_timestamp()")
+        row = await cur.fetchone()
+        if row is None:  # pragma: no cover - PostgreSQL always returns one row
+            raise RuntimeError("Postgres did not return its recall-delivery clock.")
+        return row[0]
+
+    @classmethod
+    async def _load_delivery(
+        cls,
+        cur: Any,
+        delivery_id: str,
+        *,
+        for_update: bool = False,
+    ) -> AgentRecallDeliveryRecord | None:
+        lock_clause = "FOR UPDATE OF state" if for_update else ""
+        await cur.execute(
+            f"""
+            SELECT delivery.delivery_json::text,
+                   delivery.operation_id,
+                   delivery.processing_result_sha256,
+                   delivery.staged_at,
+                   checkpoint.record_json::text,
+                   state.delivery_id, state.agent_id, state.task_id,
+                   state.knowledge_namespace, state.access_policy_sha256,
+                   state.checkpoint_revision, state.state, state.attempt,
+                   state.state_revision, state.lease_expires_at,
+                   state.release_id, state.acknowledgement_id,
+                   state.state_json::text, state.updated_at
+            FROM cayu_agent_recall_deliveries AS delivery
+            JOIN cayu_agent_recall_delivery_states AS state
+              ON state.delivery_id = delivery.delivery_id
+            LEFT JOIN cayu_agent_recall_checkpoints AS checkpoint
+              ON checkpoint.agent_id = delivery.agent_id
+             AND checkpoint.task_id = delivery.task_id
+             AND checkpoint.knowledge_namespace = delivery.knowledge_namespace
+             AND checkpoint.access_policy_sha256 = delivery.access_policy_sha256
+             AND checkpoint.revision = delivery.checkpoint_revision
+             AND checkpoint.operation_id = delivery.operation_id
+            WHERE delivery.delivery_id = %s
+            {lock_clause}
+            """,
+            (delivery_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else cls._delivery_record_from_row(row)
+
+    @classmethod
+    async def _load_delivery_by_operation(
+        cls,
+        cur: Any,
+        operation_id: str,
+    ) -> AgentRecallDeliveryRecord | None:
+        await cur.execute(
+            "SELECT delivery_id FROM cayu_agent_recall_deliveries WHERE operation_id = %s",
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else await cls._load_delivery(cur, str(row[0]))
+
+    @staticmethod
+    def _delivery_record_from_row(row: Sequence[Any]) -> AgentRecallDeliveryRecord:
+        if row[4] is None:
+            raise RuntimeError("Postgres recall delivery conflicts with its checkpoint.")
+        delivery = json.loads(str(row[0]))
+        state = json.loads(str(row[17]))
+        if type(delivery) is not dict or type(state) is not dict:
+            raise RuntimeError("Postgres recall-delivery JSON must contain objects.")
+        state["delivery"] = delivery
+        record = AgentRecallDeliveryRecord.model_validate_json(_dumps(state))
+        checkpoint = AgentRecallCheckpoint.model_validate_json(str(row[4]))
+        lease_expires_at = (
+            record.claim.lease_expires_at
+            if record.state is AgentRecallDeliveryState.CLAIMED and record.claim is not None
+            else None
+        )
+        release_id = None if record.release is None else record.release.release_id
+        acknowledgement_id = (
+            None if record.acknowledgement is None else record.acknowledgement.acknowledgement_id
+        )
+        if (
+            checkpoint != record.delivery.checkpoint
+            or str(row[1]) != record.delivery.operation_id
+            or str(row[2]) != record.delivery.processing_result_sha256
+            or row[3] != record.delivery.staged_at
+            or str(row[5]) != record.delivery.delivery_id
+            or tuple(str(value) for value in row[6:10]) != record.delivery.key().sort_key()
+            or int(row[10]) != record.delivery.checkpoint.revision
+            or str(row[11]) != record.state.value
+            or int(row[12]) != record.attempt
+            or int(row[13]) != record.state_revision
+            or row[14] != lease_expires_at
+            or row[15] != release_id
+            or row[16] != acknowledgement_id
+            or row[18] != record.updated_at
+        ):
+            raise RuntimeError("Postgres recall-delivery indexes conflict with durable state.")
+        return record
+
+    @classmethod
+    async def _insert_delivery_state(
+        cls,
+        cur: Any,
+        record: AgentRecallDeliveryRecord,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_agent_recall_delivery_states (
+                delivery_id, agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_revision, state, attempt,
+                state_revision, lease_expires_at, release_id,
+                acknowledgement_id, state_json, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s::jsonb, %s
+            )
+            """,
+            cls._delivery_state_values(record),
+        )
+
+    @classmethod
+    async def _update_delivery_state(
+        cls,
+        cur: Any,
+        current: AgentRecallDeliveryRecord,
+        updated: AgentRecallDeliveryRecord,
+    ) -> None:
+        await cur.execute(
+            """
+            UPDATE cayu_agent_recall_delivery_states
+            SET agent_id = %s, task_id = %s, knowledge_namespace = %s,
+                access_policy_sha256 = %s, checkpoint_revision = %s, state = %s,
+                attempt = %s, state_revision = %s, lease_expires_at = %s,
+                release_id = %s, acknowledgement_id = %s,
+                state_json = %s::jsonb, updated_at = %s
+            WHERE delivery_id = %s AND state_revision = %s
+            """,
+            (
+                *cls._delivery_state_values(updated)[1:],
+                updated.delivery.delivery_id,
+                current.state_revision,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AgentRecallDeliveryConflict("stale_delivery_state")
+
+    @staticmethod
+    def _delivery_state_values(record: AgentRecallDeliveryRecord) -> tuple[object, ...]:
+        claim = record.claim
+        lease_expires_at = (
+            claim.lease_expires_at
+            if record.state is AgentRecallDeliveryState.CLAIMED and claim is not None
+            else None
+        )
+        state = record.model_dump(mode="json", exclude={"delivery"})
+        return (
+            record.delivery.delivery_id,
+            record.delivery.agent_id,
+            record.delivery.task_id,
+            record.delivery.knowledge_namespace,
+            record.delivery.access_policy_sha256,
+            record.delivery.checkpoint.revision,
+            record.state.value,
+            record.attempt,
+            record.state_revision,
+            lease_expires_at,
+            None if record.release is None else record.release.release_id,
+            (None if record.acknowledgement is None else record.acknowledgement.acknowledgement_id),
+            _dumps(state),
+            record.updated_at,
+        )
 
     @staticmethod
     async def _load_context(

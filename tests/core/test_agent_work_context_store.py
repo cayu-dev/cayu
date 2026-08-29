@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,12 +13,15 @@ from tests.core.work_context_store_conformance import (
     assert_work_context_store_conformance,
     checkpoint,
     context,
+    recall_delivery,
 )
 
 from cayu import (
     AgentRecallCheckpoint,
     AgentRecallCheckpointKey,
     AgentRecallCheckpointMode,
+    AgentRecallDeliveryConflict,
+    AgentRecallDeliveryState,
     AgentWorkContext,
     AgentWorkContextConflict,
     AgentWorkContextPublicationReceipt,
@@ -39,6 +42,18 @@ class _StoreCase:
     open: Any
     reset: Any
     reopenable: bool
+    clock: _ManualClock
+
+
+@dataclass
+class _ManualClock:
+    value: datetime
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, delta: timedelta) -> None:
+        self.value += delta
 
 
 async def _drop_postgres_schema(postgres_dsn: str) -> None:
@@ -61,6 +76,10 @@ async def _drop_postgres_schema(postgres_dsn: str) -> None:
             await cursor.execute(
                 "DROP FUNCTION IF EXISTS "
                 "cayu_test_block_agent_recall_checkpoint_head_update() CASCADE"
+            )
+            await cursor.execute(
+                "DROP FUNCTION IF EXISTS "
+                "cayu_test_block_agent_recall_delivery_state_insert() CASCADE"
             )
         await connection.commit()
 
@@ -116,26 +135,27 @@ async def _release_postgres_advisory_lock(connection: Any, lock_key: int) -> Non
 @pytest.fixture(params=("memory", "sqlite", "postgres"))
 def work_context_store_case(request, tmp_path: Path) -> _StoreCase:
     now = datetime(2026, 8, 28, 9, 0, tzinfo=UTC)
+    clock = _ManualClock(now)
     if request.param == "memory":
 
         async def open_memory():
-            return InMemoryAgentWorkContextStore(clock=lambda: now)
+            return InMemoryAgentWorkContextStore(clock=clock)
 
         async def reset_memory() -> None:
             return None
 
-        return _StoreCase("memory", open_memory, reset_memory, False)
+        return _StoreCase("memory", open_memory, reset_memory, False, clock)
     if request.param == "sqlite":
         location = tmp_path / "work-context.sqlite"
 
         async def open_sqlite():
-            return SQLiteAgentWorkContextStore(location, clock=lambda: now)
+            return SQLiteAgentWorkContextStore(location, clock=clock)
 
         async def reset_sqlite() -> None:
             for path in (location, Path(f"{location}-shm"), Path(f"{location}-wal")):
                 path.unlink(missing_ok=True)
 
-        return _StoreCase("sqlite", open_sqlite, reset_sqlite, True)
+        return _StoreCase("sqlite", open_sqlite, reset_sqlite, True, clock)
 
     postgres_dsn = request.getfixturevalue("postgres_dsn")
 
@@ -147,13 +167,13 @@ def work_context_store_case(request, tmp_path: Path) -> _StoreCase:
             min_size=1,
             max_size=4,
             schema_mode=SchemaMode.CREATE,
-            clock=lambda: now,
+            clock=clock,
         )
 
     async def reset_postgres() -> None:
         await _drop_postgres_schema(postgres_dsn)
 
-    return _StoreCase("postgres", open_postgres, reset_postgres, True)
+    return _StoreCase("postgres", open_postgres, reset_postgres, True, clock)
 
 
 async def _close(store) -> None:
@@ -165,7 +185,10 @@ def test_agent_work_context_store_shared_conformance(work_context_store_case) ->
         await work_context_store_case.reset()
         store = await work_context_store_case.open()
         try:
-            await assert_work_context_store_conformance(store)
+            await assert_work_context_store_conformance(
+                store,
+                advance_clock=work_context_store_case.clock.advance,
+            )
         finally:
             await _close(store)
         if work_context_store_case.reopenable:
@@ -184,6 +207,25 @@ def test_agent_work_context_store_shared_conformance(work_context_store_case) ->
                 )
                 assert persisted_checkpoint is not None
                 assert persisted_checkpoint.revision == 5
+                persisted_delivery = await reopened.load_recall_delivery("delivery:3")
+                assert persisted_delivery is not None
+                assert persisted_delivery.state is AgentRecallDeliveryState.ACKNOWLEDGED
+                assert persisted_delivery.delivery.materialized_result().operation_id == (
+                    "delivery:process:3"
+                )
+                claimed_delivery = await reopened.load_recall_delivery("delivery:4")
+                released_delivery = await reopened.load_recall_delivery("delivery:5")
+                pending_delivery = await reopened.load_recall_delivery("delivery:6")
+                assert pending_delivery is not None
+                assert pending_delivery.state is AgentRecallDeliveryState.PENDING
+                assert pending_delivery.claim is None
+                assert claimed_delivery is not None
+                assert claimed_delivery.state is AgentRecallDeliveryState.CLAIMED
+                assert claimed_delivery.claim is not None
+                assert released_delivery is not None
+                assert released_delivery.state is AgentRecallDeliveryState.PENDING
+                assert released_delivery.release is not None
+                assert released_delivery.release.reason == "durable retry evidence"
             finally:
                 await _close(reopened)
         await work_context_store_case.reset()
@@ -282,10 +324,261 @@ def test_agent_work_context_durable_multi_instance_cas(work_context_store_case) 
                 await second_store.load_recall_checkpoint(initial_checkpoint.key())
                 == stored_checkpoint
             )
+
+            delivery_candidates = (
+                await recall_delivery(
+                    current,
+                    delivery_id="multi-instance:delivery:a",
+                    operation_id="multi-instance:delivery:process:a",
+                    entry_ids=("multi-instance-entry",),
+                ),
+                await recall_delivery(
+                    current,
+                    delivery_id="multi-instance:delivery:b",
+                    operation_id="multi-instance:delivery:process:b",
+                    entry_ids=("multi-instance-entry",),
+                ),
+            )
+            delivery_outcomes = await asyncio.gather(
+                first_store.stage_recall_delivery(delivery_candidates[0]),
+                second_store.stage_recall_delivery(delivery_candidates[1]),
+                return_exceptions=True,
+            )
+            delivery_successes = [
+                outcome for outcome in delivery_outcomes if not isinstance(outcome, BaseException)
+            ]
+            delivery_failures = [
+                outcome for outcome in delivery_outcomes if isinstance(outcome, BaseException)
+            ]
+            assert len(delivery_successes) == 1
+            assert len(delivery_failures) == 1
+            assert isinstance(delivery_failures[0], AgentRecallDeliveryConflict)
+            staged_delivery = delivery_successes[0]
+            assert staged_delivery.delivery in delivery_candidates
+            claim_outcomes = await asyncio.gather(
+                first_store.claim_recall_delivery(
+                    staged_delivery.delivery.key(),
+                    claim_id="multi-instance:claim:a",
+                    worker_id="multi-instance:worker:a",
+                    lease_seconds=30,
+                ),
+                second_store.claim_recall_delivery(
+                    staged_delivery.delivery.key(),
+                    claim_id="multi-instance:claim:b",
+                    worker_id="multi-instance:worker:b",
+                    lease_seconds=30,
+                ),
+            )
+            claimed = [record for record in claim_outcomes if record is not None]
+            assert len(claimed) == 1
+            assert claimed[0].state is AgentRecallDeliveryState.CLAIMED
         finally:
             await _close(first_store)
             await _close(second_store)
             await work_context_store_case.reset()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failing_table",
+    ("cayu_agent_recall_deliveries", "cayu_agent_recall_delivery_states"),
+    ids=("delivery-insert", "state-insert"),
+)
+def test_sqlite_recall_delivery_stage_rolls_back_every_material_boundary(
+    tmp_path: Path,
+    failing_table: str,
+) -> None:
+    async def run() -> None:
+        database = tmp_path / "delivery-stage-rollback.sqlite"
+        store = SQLiteAgentWorkContextStore(database)
+        published = context(revision=1, operation_id="delivery-rollback:sqlite:context")
+        delivery = await recall_delivery(
+            published,
+            delivery_id="delivery-rollback:sqlite",
+            operation_id="delivery-rollback:sqlite:process",
+            entry_ids=("delivery-rollback-entry",),
+        )
+        try:
+            await store.publish_work_context(published, expected_revision=None)
+            store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                f"""
+                CREATE TRIGGER cayu_test_fail_agent_recall_delivery_insert
+                BEFORE INSERT ON {failing_table}
+                BEGIN
+                    SELECT RAISE(ABORT, 'test delivery insert failure');
+                END
+                """
+            )
+            with pytest.raises(sqlite3.IntegrityError, match="test delivery insert failure"):
+                await store.stage_recall_delivery(delivery)
+            assert await store.load_recall_checkpoint(delivery.key()) is None
+            assert await store.load_recall_delivery(delivery.delivery_id) is None
+            store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "DROP TRIGGER cayu_test_fail_agent_recall_delivery_insert"
+            )
+            staged = await store.stage_recall_delivery(delivery)
+            assert staged.delivery == delivery
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failing_table",
+    ("cayu_agent_recall_deliveries", "cayu_agent_recall_delivery_states"),
+    ids=("delivery-insert", "state-insert"),
+)
+def test_postgres_recall_delivery_stage_cancellation_rolls_back_every_material_boundary(
+    postgres_dsn: str,
+    failing_table: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresAgentWorkContextStore
+
+        lock_key = 7_505_119_600_004
+        await _drop_postgres_schema(postgres_dsn)
+        store = PostgresAgentWorkContextStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=1,
+            schema_mode=SchemaMode.CREATE,
+        )
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        pending: asyncio.Task[Any] | None = None
+        held_lock = False
+        published = context(revision=1, operation_id="delivery-rollback:postgres:context")
+        delivery = await recall_delivery(
+            published,
+            delivery_id="delivery-rollback:postgres",
+            operation_id="delivery-rollback:postgres:process",
+            entry_ids=("delivery-rollback-entry",),
+        )
+        try:
+            await store.publish_work_context(published, expected_revision=None)
+            async with blocker.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    CREATE FUNCTION cayu_test_block_agent_recall_delivery_state_insert()
+                    RETURNS trigger
+                    LANGUAGE plpgsql
+                    AS $function$
+                    BEGIN
+                        PERFORM pg_advisory_xact_lock({lock_key});
+                        RETURN NEW;
+                    END
+                    $function$
+                    """
+                )
+                await cursor.execute(
+                    f"""
+                    CREATE TRIGGER cayu_test_block_agent_recall_delivery_state_insert
+                    BEFORE INSERT ON {failing_table}
+                    FOR EACH ROW
+                    EXECUTE FUNCTION cayu_test_block_agent_recall_delivery_state_insert()
+                    """
+                )
+            await blocker.commit()
+            await _acquire_postgres_advisory_lock(blocker, lock_key)
+            held_lock = True
+            pending = asyncio.create_task(store.stage_recall_delivery(delivery))
+            await _wait_for_postgres_head_lock(
+                blocker,
+                lock_key=lock_key,
+                task=pending,
+            )
+            pending.cancel("cancel staged recall before state publication")
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            pending = None
+            assert await store.load_recall_checkpoint(delivery.key()) is None
+            assert await store.load_recall_delivery(delivery.delivery_id) is None
+            await _release_postgres_advisory_lock(blocker, lock_key)
+            held_lock = False
+            staged = await store.stage_recall_delivery(delivery)
+            assert staged.delivery == delivery
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+            if held_lock:
+                await _release_postgres_advisory_lock(blocker, lock_key)
+            if pending is not None:
+                await asyncio.gather(pending, return_exceptions=True)
+            await store.close()
+            await blocker.close()
+            await _drop_postgres_schema(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_sqlite_recall_delivery_rejects_corrupt_denormalized_identity(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = SQLiteAgentWorkContextStore(tmp_path / "delivery-index-corruption.sqlite")
+        published = context(revision=1, operation_id="delivery-corruption:sqlite:context")
+        delivery = await recall_delivery(
+            published,
+            delivery_id="delivery-corruption:sqlite",
+            operation_id="delivery-corruption:sqlite:process",
+            entry_ids=("delivery-corruption-entry",),
+        )
+        try:
+            await store.publish_work_context(published, expected_revision=None)
+            await store.stage_recall_delivery(delivery)
+            store._connection.execute(  # pyright: ignore[reportPrivateUsage]
+                "UPDATE cayu_agent_recall_deliveries "
+                "SET processing_result_sha256 = ? WHERE delivery_id = ?",
+                ("f" * 64, delivery.delivery_id),
+            )
+            with pytest.raises(RuntimeError, match="indexes conflict with durable state"):
+                await store.load_recall_delivery(delivery.delivery_id)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_recall_delivery_rejects_corrupt_denormalized_identity(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresAgentWorkContextStore
+
+        await _drop_postgres_schema(postgres_dsn)
+        store = PostgresAgentWorkContextStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        published = context(revision=1, operation_id="delivery-corruption:postgres:context")
+        delivery = await recall_delivery(
+            published,
+            delivery_id="delivery-corruption:postgres",
+            operation_id="delivery-corruption:postgres:process",
+            entry_ids=("delivery-corruption-entry",),
+        )
+        try:
+            await store.publish_work_context(published, expected_revision=None)
+            await store.stage_recall_delivery(delivery)
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                await connection.execute(
+                    "UPDATE cayu_agent_recall_deliveries "
+                    "SET processing_result_sha256 = %s WHERE delivery_id = %s",
+                    ("f" * 64, delivery.delivery_id),
+                )
+                await connection.commit()
+            with pytest.raises(RuntimeError, match="indexes conflict with durable state"):
+                await store.load_recall_delivery(delivery.delivery_id)
+        finally:
+            await store.close()
+            await _drop_postgres_schema(postgres_dsn)
 
     asyncio.run(run())
 
@@ -807,6 +1100,10 @@ def test_sqlite_revision_69_adds_empty_work_context_storage_without_backfill(
     connection = sqlite3.connect(database)
     try:
         for table in (
+            "cayu_agent_recall_delivery_states",
+            "cayu_agent_recall_delivery_releases",
+            "cayu_agent_recall_delivery_claims",
+            "cayu_agent_recall_deliveries",
             "cayu_agent_recall_checkpoint_heads",
             "cayu_agent_recall_checkpoints",
             "cayu_agent_work_context_publications",
@@ -814,7 +1111,7 @@ def test_sqlite_revision_69_adds_empty_work_context_storage_without_backfill(
             "cayu_agent_work_context_revisions",
         ):
             connection.execute(f"DROP TABLE {table}")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 69")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision IN (69, 70, 71)")
         connection.execute("PRAGMA user_version = 68")
         connection.commit()
     finally:
@@ -825,7 +1122,9 @@ def test_sqlite_revision_69_adds_empty_work_context_storage_without_backfill(
 
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (69,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            schema_migrations.LATEST_REVISION,
+        )
         assert connection.execute(
             "SELECT text FROM cayu_knowledge_revisions "
             "WHERE entry_id = 'revision-67-entry' AND revision = 1"
@@ -1001,12 +1300,18 @@ def test_postgres_revision_69_adds_empty_work_context_storage_without_backfill(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
             async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_agent_recall_delivery_states")
+                await cursor.execute("DROP TABLE cayu_agent_recall_delivery_releases")
+                await cursor.execute("DROP TABLE cayu_agent_recall_delivery_claims")
+                await cursor.execute("DROP TABLE cayu_agent_recall_deliveries")
                 await cursor.execute("DROP TABLE cayu_agent_recall_checkpoint_heads")
                 await cursor.execute("DROP TABLE cayu_agent_recall_checkpoints")
                 await cursor.execute("DROP TABLE cayu_agent_work_context_publications")
                 await cursor.execute("DROP TABLE cayu_agent_work_context_heads")
                 await cursor.execute("DROP TABLE cayu_agent_work_context_revisions")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 69")
+                await cursor.execute(
+                    "DELETE FROM cayu_schema_migrations WHERE revision IN (69, 70, 71)"
+                )
             await connection.commit()
 
         migrator = PostgresAgentWorkContextStore(
@@ -1127,6 +1432,199 @@ def test_postgres_revision_69_rejects_missing_checkpoint_revision_constraint(
         )
         try:
             with pytest.raises(RuntimeError, match="work-context/checkpoint contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+            await _drop_postgres_schema(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_sqlite_revision_71_adds_empty_delivery_storage_without_backfill(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "revision-70-to-71-with-checkpoint.sqlite"
+    published = context(revision=1, operation_id="revision-71:sqlite:context")
+    processed = checkpoint(
+        published,
+        revision=1,
+        operation_id="revision-71:sqlite:checkpoint",
+    )
+
+    async def seed() -> None:
+        store = SQLiteAgentWorkContextStore(database)
+        try:
+            await store.publish_work_context(published, expected_revision=None)
+            await store.advance_recall_checkpoint(processed, expected_revision=None)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for table in (
+            "cayu_agent_recall_delivery_states",
+            "cayu_agent_recall_delivery_releases",
+            "cayu_agent_recall_delivery_claims",
+            "cayu_agent_recall_deliveries",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 71")
+        connection.execute("PRAGMA user_version = 70")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLiteAgentWorkContextStore(database, schema_mode=SchemaMode.MIGRATE)
+
+    async def verify() -> None:
+        try:
+            assert await migrated.load_work_context(published.task_id) == published
+            assert await migrated.load_recall_checkpoint(processed.key()) == processed
+        finally:
+            await migrated.close()
+
+    asyncio.run(verify())
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (71,)
+        for table in (
+            "cayu_agent_recall_deliveries",
+            "cayu_agent_recall_delivery_states",
+            "cayu_agent_recall_delivery_claims",
+            "cayu_agent_recall_delivery_releases",
+        ):
+            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_71_rejects_malformed_delivery_storage(tmp_path: Path) -> None:
+    database = tmp_path / "revision-71-malformed-delivery.sqlite"
+    store = SQLiteAgentWorkContextStore(database)
+    asyncio.run(store.close())
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE cayu_agent_recall_delivery_states")
+        connection.execute(
+            "CREATE TABLE cayu_agent_recall_delivery_states (delivery_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="recall-delivery contract"):
+        SQLiteAgentWorkContextStore(database)
+
+
+def test_postgres_revision_71_adds_empty_delivery_storage_without_backfill(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresAgentWorkContextStore
+
+        await _drop_postgres_schema(postgres_dsn)
+        published = context(revision=1, operation_id="revision-71:postgres:context")
+        processed = checkpoint(
+            published,
+            revision=1,
+            operation_id="revision-71:postgres:checkpoint",
+        )
+        creator = PostgresAgentWorkContextStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await creator.publish_work_context(published, expected_revision=None)
+            await creator.advance_recall_checkpoint(processed, expected_revision=None)
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                for table in (
+                    "cayu_agent_recall_delivery_states",
+                    "cayu_agent_recall_delivery_releases",
+                    "cayu_agent_recall_delivery_claims",
+                    "cayu_agent_recall_deliveries",
+                ):
+                    await cursor.execute(f"DROP TABLE {table}")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 71")
+            await connection.commit()
+
+        migrator = PostgresAgentWorkContextStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            assert await migrator.load_work_context(published.task_id) == published
+            assert await migrator.load_recall_checkpoint(processed.key()) == processed
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (71,)
+            for table in (
+                "cayu_agent_recall_deliveries",
+                "cayu_agent_recall_delivery_states",
+                "cayu_agent_recall_delivery_claims",
+                "cayu_agent_recall_delivery_releases",
+            ):
+                await cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                assert await cursor.fetchone() == (0,)
+        await _drop_postgres_schema(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_revision_71_rejects_malformed_delivery_storage(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresAgentWorkContextStore
+
+        await _drop_postgres_schema(postgres_dsn)
+        creator = PostgresAgentWorkContextStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_agent_recall_delivery_states")
+                await cursor.execute(
+                    "CREATE TABLE cayu_agent_recall_delivery_states (delivery_id TEXT PRIMARY KEY)"
+                )
+            await connection.commit()
+
+        validator = PostgresAgentWorkContextStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="recall-delivery contract"):
                 await validator.ensure_schema()
         finally:
             await validator.close()

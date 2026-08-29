@@ -113,9 +113,10 @@ revision remains independently eligible through its own knowledge change.
 Every processing result carries the exact work-context identity, captured and
 safely processed frontiers, source events, deduplicated eligible revisions,
 bounded recall diagnostics, and an optional `AgentRecallCheckpoint` proposal.
-The processor never calls `advance_recall_checkpoint()`: the caller must first
-finish any application-owned staging and then apply the proposal with the
-checkpoint store's compare-and-swap fence. A truncated event page advances only
+The processor never persists the proposal. A caller that will deliver the
+materialized result must use `stage_recall_delivery()` so the exact result and
+checkpoint compare-and-swap commit together; advancing that checkpoint first
+would reopen the crash window this boundary closes. A truncated event page advances only
 through its returned ordered prefix. If a retired entry makes an old readiness
 event disappear from the current access view, the checkpoint's already proven
 high-water mark remains the monotonic floor. A semantic timeout/failure leaves
@@ -140,6 +141,56 @@ This primitive does not wake agents, inject provider context, claim
 `ContextExposure`, acknowledge notifications, or change the public knowledge
 tools. Those remain separate scheduling, composition, exposure, and delivery
 responsibilities.
+
+### Atomic staged recall delivery
+
+`AgentRecallDelivery` is the bounded, immutable handoff from checkpoint-aware
+processing to a downstream delivery worker. It retains the exact serialized
+`AgentRecallProcessingResult`, its fingerprint, the exact checkpoint and
+checkpoint fingerprint, full-index or delta classification, work-context and
+access authority, and staging attribution. Loading it materializes that frozen
+result directly; it never re-runs retrieval or follows a newer, retired,
+unauthorized, or deleted knowledge revision.
+
+`AgentWorkContextStore.stage_recall_delivery()` commits the delivery and its
+proposed checkpoint in one critical section or database transaction. The
+delivery carries the explicit expected checkpoint revision. Exact replay returns
+the existing record, while a reused delivery ID, operation ID, checkpoint
+revision, stale checkpoint, or stale work context fails with a typed conflict.
+If any checkpoint, delivery, or state write fails or is cancelled, neither the
+stage nor checkpoint is visible.
+
+The queue is scoped by the exact agent, task, namespace, and access-policy key.
+`claim_recall_delivery()` returns only the oldest unacknowledged stage for that
+key and uses an indexed, hard one-record lookup. A claim contains a worker ID,
+attempt, state revision, and bounded lease. Renewal, explicit release for retry,
+lease-expiry takeover, and acknowledgement all require the exact current claim;
+stale workers cannot release or acknowledge a newer attempt. Claim and release
+identities remain reserved after release or takeover so retries cannot silently
+acquire a second identity. An exact retry converges only while its original
+attempt remains retained, and it can return a claimed state only while that
+lease remains live. Expired claimed or renewed replays fail with an expired
+conflict; after takeover, claim and release replays fail with a typed superseded
+conflict instead of returning the newer worker's claim authority.
+
+Lease time is owned by the store clock. A new stage cannot claim a future
+staging time, and release or acknowledgement evidence cannot claim a future
+transition time. Caller attribution therefore cannot move the delivery clock
+forward, extend a configured lease, or pin the oldest pending stage beyond its
+bounded lease.
+
+An acknowledgement records only that a durable downstream boundary accepted the
+stage. Its typed reference may point to a `RecallReceipt`, `ContextExposure`, or
+application handoff, but it does not create that evidence or claim provider
+visibility, model attention, notification consumption, or task completion.
+Provider composition and exposure transitions remain owned by their existing
+runtime contracts.
+
+Storage revision 71 is a clean prerelease break. It installs only empty
+delivery, state, claim, and release tables beside the checkpoint authority. It
+does not infer or backfill deliveries from existing checkpoints, knowledge,
+sessions, transcripts, receipts, or exposures, and there is no legacy read,
+dual-write, or compatibility path.
 
 The nearby context concepts have different lifetimes and owners:
 
@@ -172,6 +223,13 @@ no provider calls. PostgreSQL and pgvector use behavioral integration tests,
 including a query-plan regression proving that frontier-filtered semantic recall
 retains the partial HNSW index; exact scanning remains the bounded-revision,
 negative-filter, oversized-vector, and filtered-underfill fallback.
+
+The checked [staged-recall delivery performance baseline](../benchmarks/memory/recall-delivery-performance-v1.json)
+measures 50 atomic stage/checkpoint commits followed by deterministic claims and
+acknowledgements, plus the indexed no-pending path after all 50 records are
+terminal. It records fixed p50 and p95 ceilings for in-memory and SQLite stores,
+makes no provider calls, and keeps PostgreSQL performance outside the hermetic
+credential-free matrix while exercising the same behavior in integration tests.
 
 ## Bounded cross-source recall
 
