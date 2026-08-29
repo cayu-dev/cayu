@@ -9093,6 +9093,19 @@ The first MCP implementation supports stdio servers:
   third-party `McpSession` that does not implement the internal positive proof
   keeps the source fence until the call settles, favoring safety over refresh
   concurrency.
+- Dynamic-tool authority remains the canonical reference boundary across MCP
+  refresh. `call_tool`, portable `search_tools`, OpenAI client tool search,
+  hosted tool search, and additional-tools projection all resolve through the
+  ordinary catalogue-bound targeted/discovery records. The MCP-specific check
+  is only a live source-generation check at canonical resolution, policy
+  planning, and execution entry: a removed or changed pre-refresh adapter is
+  rejected as catalogue drift before grant consumption, policy, approval,
+  secret/environment resolution, hooks, or target dispatch. An unchanged
+  verified refresh keeps the same snapshot and generation. Pending approval or
+  interrupted recovery also retains the generic exact execution-profile check,
+  while resumes and forks retain their durable name-bounded capability ceiling;
+  they are never rebuilt from the wider post-refresh catalogue. No MCP-only
+  grant, reference, recovery record, or store path is introduced.
 - One refreshable source has one `CayuApp` publication owner. The source may be
   registered by several agents in that application, and one refresh updates all
   of them atomically. Static and refreshable registration of the same source in

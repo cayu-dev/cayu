@@ -1179,6 +1179,10 @@ class ToolRoundExecutor:
                             discovered_record,
                             descriptor,
                         )
+                        or not _tool_dispatch_authority_is_current(
+                            registered_agent,
+                            discovered_record.tool_name,
+                        )
                         or descriptor.name not in ceiling_names
                         or invocation.session_id != session.id
                         or invocation.interaction_id != interaction_id
@@ -1216,6 +1220,13 @@ class ToolRoundExecutor:
                 ):
                     raise RuntimeError(
                         "Resolved targeted-tool checkpoint conflicts with grant state."
+                    )
+                if not _tool_dispatch_authority_is_current(
+                    registered_agent,
+                    invocation.effective_tool_name,
+                ):
+                    raise RuntimeError(
+                        "Resolved targeted-tool checkpoint lost live dispatch authority."
                     )
                 request = self._targeted_tool_use_request(
                     session=session,
@@ -1352,6 +1363,10 @@ class ToolRoundExecutor:
                     or not tool_discovery_record_matches_descriptor(
                         discovered_record,
                         descriptor,
+                    )
+                    or not _tool_dispatch_authority_is_current(
+                        registered_agent,
+                        discovered_record.tool_name,
                     )
                     or discovered_record.tool_name not in ceiling_names
                 ):
@@ -1499,7 +1514,10 @@ class ToolRoundExecutor:
             explicit_rejection = None
             if record.tool_name not in ceiling_names:
                 explicit_rejection = TargetedToolUseRejectionReason.OUT_OF_CEILING
-            elif descriptor is None:
+            elif descriptor is None or not _tool_dispatch_authority_is_current(
+                registered_agent,
+                descriptor.name,
+            ):
                 explicit_rejection = TargetedToolUseRejectionReason.CATALOGUE_DRIFT
             if explicit_rejection is not None:
                 event = targeted_tool_use_rejection_event(
@@ -1679,6 +1697,11 @@ class ToolRoundExecutor:
             or targeted_arguments_sha256(tool_call.arguments) != invocation.arguments_sha256
         ):
             raise RuntimeError("Paused targeted invocation conflicts with its binding.")
+        if not _tool_dispatch_authority_is_current(
+            registered_agent,
+            invocation.effective_tool_name,
+        ):
+            raise RuntimeError("Paused targeted invocation lost live dispatch authority.")
         tool_ref = invocation.tool_ref
         if registered_agent.tool_discovery_mode is not None:
             ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
@@ -1816,6 +1839,7 @@ class ToolRoundExecutor:
         has_authorizable_call = any(
             call.name in executable_names
             and (call.name in exposed_names or call.targeted_tool_invocation is not None)
+            and _tool_dispatch_authority_is_current(registered_agent, call.name)
             for call in tool_calls
         )
         taint_labels = (
@@ -1830,7 +1854,10 @@ class ToolRoundExecutor:
         active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
             active_taint_labels[tool_call.id] = frozenset(taint_labels)
-            if tool_call.name not in executable_names:
+            if tool_call.name not in executable_names or not _tool_dispatch_authority_is_current(
+                registered_agent,
+                tool_call.name,
+            ):
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(
                         call=tool_call,
@@ -1940,6 +1967,7 @@ class ToolRoundExecutor:
         has_authorizable_call = any(
             call.name in executable_names
             and (call.name in exposed_names or call.targeted_tool_invocation is not None)
+            and _tool_dispatch_authority_is_current(registered_agent, call.name)
             for call in tool_calls
         )
         taint_labels = (
@@ -1954,7 +1982,10 @@ class ToolRoundExecutor:
         active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
             active_taint_labels[tool_call.id] = frozenset(taint_labels)
-            if tool_call.name not in executable_names:
+            if tool_call.name not in executable_names or not _tool_dispatch_authority_is_current(
+                registered_agent,
+                tool_call.name,
+            ):
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(
                         call=tool_call,
@@ -2780,6 +2811,7 @@ class ToolRoundExecutor:
         identity_payload = tool_round_identity.payload()
         tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
+        registered_tool = registered_agent.executable_tool(tool_call.name)
         if rejoin_targeted_invocation:
             rejoined_events = await self.rejoin_targeted_tool_call(
                 session=session,
@@ -2844,6 +2876,82 @@ class ToolRoundExecutor:
                 ),
                 "dispatch_kind",
                 "model_tool_name",
+            )
+            outcome = runtime_records.ToolCallOutcome(
+                call=replace(tool_call, arguments={}),
+                result=result,
+            )
+            publication_snapshot = invocation_secrets.InvocationPublicationSnapshot(
+                redactor=self._secret_redactor,
+                unsafe_output=False,
+            )
+            if publication_snapshot_observer is not None:
+                await publication_snapshot_observer(tool_call.id, publication_snapshot)
+            if deferred_terminal_stager is not None:
+                await deferred_terminal_stager(
+                    event,
+                    outcome,
+                    False,
+                    False,
+                    publication_snapshot,
+                )
+                return
+            yield await self._event_writer.emit(event), outcome
+            return
+        mcp_policy_authority_rejected = (
+            policy_evidence is ToolPolicyEvidence.UNREGISTERED
+            and registered_tool is not None
+            and isinstance(registered_tool.tool, McpToolAdapter)
+        )
+        if mcp_policy_authority_rejected or _registered_mcp_tool_authority_is_unavailable(
+            registered_tool
+        ):
+            result = ToolResult(
+                content="MCP tool unavailable because its catalogue authority is not current.",
+                structured={
+                    "status": "rejected",
+                    "reason": "mcp_catalogue_authority_unavailable",
+                },
+                is_error=True,
+            )
+            idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_call_id=tool_call.id,
+                tool_round_id=tool_round_id,
+                approval_id=approval_id,
+                pause_id=input_id,
+            )
+            payload: dict[str, Any] = {
+                "tool_call_id": tool_call.id,
+                "idempotency_key": idempotency_key,
+                "blocked_by": "mcp_catalogue_authority",
+                "reason": "mcp_catalogue_authority_unavailable",
+                "result": result.model_dump(mode="json"),
+                **_targeted_tool_invocation_payload(tool_call),
+                **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                **identity_payload,
+            }
+            if approval_id is not None:
+                payload["approval_id"] = approval_id
+            if input_id is not None:
+                payload["input_id"] = input_id
+            event = _event_with_targeted_tool_invocation_authority(
+                _event_with_tool_round_authority(
+                    event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.TOOL_CALL_FAILED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=tool_call.model_tool_name or tool_call.name,
+                            payload=payload,
+                        ),
+                        execution_profile,
+                    ),
+                    tool_round_identity,
+                    *(field for field in ("approval_id", "input_id") if field in payload),
+                ),
+                tool_call,
             )
             outcome = runtime_records.ToolCallOutcome(
                 call=replace(tool_call, arguments={}),
@@ -3039,7 +3147,6 @@ class ToolRoundExecutor:
             return True
 
         started_event: Event | None = None
-        registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is not None and not registered_tool.publish_arguments:
             publish_arguments_as_unavailable = True
         if taint_labels is None:
@@ -9176,6 +9283,23 @@ def _mcp_servers(
     if registered_environment is None:
         return ()
     return registered_environment.environment.mcp_servers
+
+
+def _registered_mcp_tool_authority_is_unavailable(
+    registered_tool: runtime_records.RegisteredTool | None,
+) -> bool:
+    if registered_tool is None or not isinstance(registered_tool.tool, McpToolAdapter):
+        return False
+    return not registered_tool.tool._dispatch_authority_is_current()
+
+
+def _tool_dispatch_authority_is_current(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_name: str,
+) -> bool:
+    return not _registered_mcp_tool_authority_is_unavailable(
+        registered_agent.executable_tool(tool_name)
+    )
 
 
 def _mcp_manifest_candidates_for_agent(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -15,6 +16,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.mcp as mcp_module
@@ -30,6 +32,8 @@ from cayu import (
     Event,
     EventQuery,
     EventType,
+    ExecutionProfileMismatchError,
+    ForkSessionRequest,
     HttpMcpSession,
     McpClient,
     McpIdleTimeoutError,
@@ -53,12 +57,20 @@ from cayu import (
     McpToolsetRefreshState,
     McpToolsetUnavailable,
     Message,
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+    ResumeRequest,
     RunRequest,
     SessionIdentity,
     SessionStore,
     SQLiteSessionStore,
+    StaticToolExposurePolicy,
     StdioMcpProcessLifetime,
     StdioMcpSession,
+    TargetedToolGrant,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+    ToolCapabilityCeiling,
     ToolContext,
     ToolEffect,
     connect_mcp_toolset,
@@ -75,6 +87,12 @@ from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
 from cayu.mcp._stdio_process import stdio_mcp_parent_death_containment_platform_candidate
 from cayu.mcp.base import _mcp_session_close_task, _retain_mcp_session_close
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+    ToolDiscoveryProjectionResult,
+)
 from cayu.runtime import (
     InMemorySessionStore,
     ToolPolicy,
@@ -88,6 +106,7 @@ from cayu.runtime.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
 )
+from cayu.runtime.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
 from cayu.runtime.sessions import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
@@ -120,6 +139,15 @@ class FakeProvider(ModelProvider):
         self.requests.append(request)
         for event in self.events[len(self.requests) - 1]:
             yield event
+
+
+class RecordingRefreshPolicy(ToolPolicy):
+    def __init__(self) -> None:
+        self.requests: list[ToolPolicyRequest] = []
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        self.requests.append(request)
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
 class FakeMcpSession(McpSession):
@@ -543,14 +571,17 @@ def test_complete_mcp_source_registration_changes_execution_profile_identity() -
 def test_mcp_refresh_keeps_unchanged_snapshot_and_generation() -> None:
     async def run():
         toolset = _fake_toolset()
+        adapter = toolset.tools[0]
         app = CayuApp(enable_logging=False)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             mcp_toolsets=(toolset,),
         )
 
+        assert adapter._dispatch_authority_is_current()
         result = await app.refresh_mcp_toolset(toolset)
-        await toolset.tools[0].run(
+        assert adapter._dispatch_authority_is_current()
+        await adapter.run(
             ToolContext(session_id="unchanged", agent_name="assistant"),
             {"text": "same"},
         )
@@ -584,12 +615,15 @@ def test_mcp_refresh_atomically_replaces_every_registered_agent() -> None:
         result = await app.refresh_mcp_toolset(toolset)
         first = app.get_agent("first")
         second = app.get_agent("second")
+        assert not stale_adapter._dispatch_authority_is_current()
         with pytest.raises(McpToolsetUnavailable, match="stale"):
             await stale_adapter.run(
                 ToolContext(session_id="stale", agent_name="first"),
                 {"text": "must not dispatch"},
             )
         current_adapter = first.tools["mcp__local-mcp__search"].tool
+        assert isinstance(current_adapter, McpToolAdapter)
+        assert current_adapter._dispatch_authority_is_current()
         await current_adapter.run(
             ToolContext(session_id="current", agent_name="first"),
             {"text": "dispatch"},
@@ -660,6 +694,754 @@ def test_mcp_refresh_publishes_new_catalogue_to_later_runtime_sessions() -> None
     ]
 
 
+def test_mcp_refresh_does_not_widen_existing_session_or_fork_ceiling() -> None:
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        completed = [ModelStreamEvent.completed({"finish_reason": "stop"})]
+        provider = FakeProvider([completed, completed])
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        source_session_id = "mcp-refresh-ceiling-source"
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id=source_session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "Start before the refresh.")],
+                )
+            )
+        )
+
+        session.definitions = _fake_tool_definitions("echo", "search")
+        refresh = await app.refresh_mcp_toolset(toolset)
+        await _collect_events(
+            app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session_id,
+                    session_id="mcp-refresh-ceiling-child",
+                )
+            )
+        )
+        resume_errors: list[ExecutionProfileMismatchError] = []
+        for resumable_session_id in (
+            source_session_id,
+            "mcp-refresh-ceiling-child",
+        ):
+            with pytest.raises(ExecutionProfileMismatchError) as exc_info:
+                await _collect_events(
+                    app.resume(
+                        ResumeRequest(
+                            session_id=resumable_session_id,
+                            messages=[Message.text("user", "Continue after the refresh.")],
+                        )
+                    )
+                )
+            resume_errors.append(exc_info.value)
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp-refresh-ceiling-fresh",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "Start after the refresh.")],
+                )
+            )
+        )
+        source = await store.load(source_session_id)
+        child = await store.load("mcp-refresh-ceiling-child")
+        return refresh, provider.requests, source, child, resume_errors
+
+    refresh, requests, source, child, resume_errors = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert [[tool["name"] for tool in request.tools] for request in requests] == [
+        ["mcp__local-mcp__echo"],
+        ["mcp__local-mcp__echo", "mcp__local-mcp__search"],
+    ]
+    assert source is not None and child is not None
+    expected_ceiling = ToolCapabilityCeiling(tool_names=("mcp__local-mcp__echo",))
+    assert source.tool_capability_ceiling == expected_ceiling
+    assert child.tool_capability_ceiling == expected_ceiling
+    assert all("direct_tools" in error.changed_component_classes for error in resume_errors)
+
+
+@pytest.mark.parametrize("refresh_kind", ["changed", "removed"])
+def test_mcp_refresh_rejects_frozen_direct_call_before_policy(refresh_kind: str) -> None:
+    class BlockingToolCallProvider(ModelProvider):
+        name = "blocking-mcp-refresh"
+
+        def __init__(self, tool_name: str) -> None:
+            self.tool_name = tool_name
+            self.requests: list[ModelRequest] = []
+            self.first_request_started = asyncio.Event()
+            self.release_first_response = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                self.first_request_started.set()
+                await self.release_first_response.wait()
+                yield ModelStreamEvent.tool_call(
+                    id="stale-mcp-call",
+                    name=self.tool_name,
+                    arguments={"text": "must fail before policy"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    class RecordingHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.before: list[str] = []
+            self.after: list[str] = []
+
+        async def before_tool_call(self, context: BeforeToolCallHookContext) -> None:
+            self.before.append(context.tool_name)
+
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            self.after.append(context.tool_name)
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = BlockingToolCallProvider(toolset.tools[0].name)
+        policy = RecordingRefreshPolicy()
+        hook = RecordingHook()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            tool_policy=policy,
+            runtime_hooks=(hook,),
+        )
+
+        invocation = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id="mcp-refresh-frozen-direct-call",
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Call the MCP tool.")],
+                    )
+                )
+            )
+        )
+        await provider.first_request_started.wait()
+        session.definitions = (
+            ()
+            if refresh_kind == "removed"
+            else _fake_tool_definitions(
+                "echo",
+                description="Changed after provider dispatch.",
+            )
+        )
+        refresh = await app.refresh_mcp_toolset(toolset)
+        provider.release_first_response.set()
+        events = await invocation
+        return refresh, events, policy.requests, hook, session.calls
+
+    refresh, events, policy_requests, hook, calls = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert policy_requests == []
+    assert hook.before == []
+    assert hook.after == []
+    assert calls == []
+    assert not any(event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
+    assert not any(event.type is EventType.TOOL_CALL_STARTED for event in events)
+    [failed] = [event for event in events if event.type is EventType.TOOL_CALL_FAILED]
+    assert failed.tool_name == "mcp__local-mcp__echo"
+    assert failed.payload["blocked_by"] == "mcp_catalogue_authority"
+    assert failed.payload["reason"] == "mcp_catalogue_authority_unavailable"
+
+
+def test_mcp_authority_cannot_recover_after_policy_was_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checks: list[bool] = []
+
+    def transient_authority(_adapter: McpToolAdapter) -> bool:
+        current = len(checks) >= 2
+        checks.append(current)
+        return current
+
+    monkeypatch.setattr(
+        McpToolAdapter,
+        "_dispatch_authority_is_current",
+        transient_authority,
+    )
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        adapter = toolset.tools[0]
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="transient-authority-mcp-call",
+                        name=adapter.name,
+                        arguments={"text": "must remain rejected"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            ]
+        )
+        policy = RecordingRefreshPolicy()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            tool_policy=policy,
+        )
+        events = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id="mcp-transient-policy-authority",
+                    agent_name="assistant",
+                    messages=[Message.text("user", "Call the MCP tool.")],
+                )
+            )
+        )
+        return adapter, events, policy.requests, session.calls
+
+    adapter, events, policy_requests, calls = asyncio.run(run())
+
+    assert checks == [False, False]
+    assert adapter._dispatch_authority_is_current()
+    assert checks == [False, False, True]
+    assert policy_requests == []
+    assert calls == []
+    assert not any(event.type is EventType.TOOL_CALL_STARTED for event in events)
+
+
+def test_mcp_refresh_revokes_a_direct_call_waiting_for_approval() -> None:
+    class ApprovalProvider(ModelProvider):
+        name = "approval-mcp-refresh"
+
+        def __init__(self, tool_name: str) -> None:
+            self.tool_name = tool_name
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="approval-mcp-call",
+                    name=self.tool_name,
+                    arguments={"text": "must be revoked while paused"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    class ApprovalPolicy(ToolPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ToolPolicyRequest] = []
+
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            self.requests.append(request)
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason="Test the refresh boundary while approval is pending.",
+            )
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = ApprovalProvider(toolset.tools[0].name)
+        policy = ApprovalPolicy()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            tool_policy=policy,
+        )
+        session_id = "mcp-refresh-pending-direct-approval"
+        paused = await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "Call the MCP tool after approval.")],
+                )
+            )
+        )
+        approval = next(
+            event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        session.definitions = _fake_tool_definitions(
+            "echo",
+            description="Changed while direct approval was pending.",
+        )
+        refresh = await app.refresh_mcp_toolset(toolset)
+        with pytest.raises(ExecutionProfileMismatchError) as exc_info:
+            await _collect_events(
+                app.resolve_tool_approval(
+                    ToolApprovalRequest(
+                        session_id=session_id,
+                        approval_id=approval.payload["approval"]["approval_id"],
+                        tool_round_id=approval.payload["tool_round_id"],
+                        tool_call_id=approval.payload["tool_call_id"],
+                        decision=ToolApprovalDecision.APPROVE,
+                    )
+                )
+            )
+        return refresh, paused, exc_info.value, policy.requests, session.calls
+
+    refresh, paused, error, policy_requests, calls = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert paused[-1].type is EventType.SESSION_INTERRUPTED
+    assert calls == []
+    assert len(policy_requests) == 1
+    assert error.changed_component_classes == ("direct_tools",)
+
+
+@pytest.mark.parametrize("refresh_kind", ["changed", "removed"])
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_mcp_refresh_rejects_frozen_targeted_reference_without_consuming_it(
+    refresh_kind: str,
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    class BlockingTargetedProvider(ModelProvider):
+        name = "blocking-mcp-targeted-refresh"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.first_request_started = asyncio.Event()
+            self.release_first_response = asyncio.Event()
+            self.tool_ref: str | None = None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                self.first_request_started.set()
+                await self.release_first_response.wait()
+                assert self.tool_ref is not None
+                yield ModelStreamEvent.tool_call(
+                    id="stale-targeted-mcp-call",
+                    name="call_tool",
+                    arguments={
+                        "tool_ref": self.tool_ref,
+                        "arguments": {"text": "must not consume"},
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = BlockingTargetedProvider()
+        policy = RecordingRefreshPolicy()
+        store = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(
+                tmp_path / f"mcp-refresh-{refresh_kind}.db",
+                public_authority_alias_codec=PublicAuthorityAliasCodec(
+                    PublicAuthorityAliasKeyring(
+                        active_key_id="mcp-refresh-test",
+                        keys={
+                            "mcp-refresh-test": SecretStr(
+                                base64.urlsafe_b64encode(bytes([123]) * 32)
+                                .decode("ascii")
+                                .rstrip("=")
+                            )
+                        },
+                    )
+                ),
+            )
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            targeted_tool_mode="call_tool",
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-mcp-only",
+                tools=(),
+            ),
+            tool_policy=policy,
+        )
+        descriptor = app._agents["assistant"].tool_catalogue.descriptor_for_name(
+            toolset.tools[0].name
+        )
+        session_id = "mcp-refresh-frozen-targeted-reference"
+        invocation = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Call the targeted MCP tool.")],
+                        tool_grants=(
+                            TargetedToolGrant(
+                                request_id="targeted-mcp-echo",
+                                tool_id=descriptor.tool_id,
+                                max_calls=1,
+                                lifetime_seconds=60,
+                            ),
+                        ),
+                    )
+                )
+            )
+        )
+        await provider.first_request_started.wait()
+        [issued] = await app.session_store.list_targeted_tool_grants(session_id)
+        provider.tool_ref = issued.tool_ref
+        session.definitions = (
+            ()
+            if refresh_kind == "removed"
+            else _fake_tool_definitions(
+                "echo",
+                description="Changed after targeted reference issuance.",
+            )
+        )
+        refresh = await app.refresh_mcp_toolset(toolset)
+        provider.release_first_response.set()
+        events = await invocation
+        [current] = await app.session_store.list_targeted_tool_grants(session_id)
+        outcome = (refresh, events, policy.requests, session.calls, current)
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+        return outcome
+
+    refresh, events, policy_requests, calls, record = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert policy_requests == []
+    assert calls == []
+    assert record.used_calls == 0
+    [rejected] = [
+        event for event in events if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+    ]
+    assert rejected.payload["rejection_reason"] == "catalogue_drift"
+
+
+def test_mcp_refresh_rejects_frozen_native_targeted_call_without_consuming_it() -> None:
+    class BlockingNativeTargetedProvider(ModelProvider):
+        name = "blocking-native-mcp-targeted-refresh"
+
+        def __init__(self, tool_name: str) -> None:
+            self.tool_name = tool_name
+            self.requests: list[ModelRequest] = []
+            self.first_request_started = asyncio.Event()
+            self.release_first_response = asyncio.Event()
+
+        def supports_targeted_tool_projection(self, *, model: str, protocol: str) -> bool:
+            return model == "fake-model" and protocol == OPENAI_ADDITIONAL_TOOLS_PROTOCOL
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                projection = request.targeted_tool_projection
+                assert projection is not None
+                assert [tool["name"] for tool in projection.tools] == [self.tool_name]
+                self.first_request_started.set()
+                await self.release_first_response.wait()
+                yield ModelStreamEvent.tool_call(
+                    id="stale-native-targeted-mcp-call",
+                    name=self.tool_name,
+                    arguments={"text": "must not consume"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = BlockingNativeTargetedProvider(toolset.tools[0].name)
+        policy = RecordingRefreshPolicy()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            targeted_tool_mode="openai_additional_tools",
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="native-targeted-mcp-only",
+                tools=(),
+            ),
+            tool_policy=policy,
+        )
+        descriptor = app._agents["assistant"].tool_catalogue.descriptor_for_name(
+            toolset.tools[0].name
+        )
+        session_id = "mcp-refresh-frozen-native-targeted-call"
+        invocation = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Call the targeted MCP tool.")],
+                        tool_grants=(
+                            TargetedToolGrant(
+                                request_id="native-targeted-mcp-echo",
+                                tool_id=descriptor.tool_id,
+                                max_calls=1,
+                                lifetime_seconds=60,
+                            ),
+                        ),
+                    )
+                )
+            )
+        )
+        await provider.first_request_started.wait()
+        session.definitions = _fake_tool_definitions(
+            "echo",
+            description="Changed after native targeted projection.",
+        )
+        refresh = await app.refresh_mcp_toolset(toolset)
+        provider.release_first_response.set()
+        events = await invocation
+        [current] = await app.session_store.list_targeted_tool_grants(session_id)
+        return refresh, events, policy.requests, session.calls, current
+
+    refresh, events, policy_requests, calls, record = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert policy_requests == []
+    assert calls == []
+    assert record.used_calls == 0
+    [rejected] = [
+        event for event in events if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+    ]
+    assert rejected.tool_name == "mcp__local-mcp__echo"
+    assert rejected.payload["rejection_reason"] == "catalogue_drift"
+
+
+def test_mcp_refresh_rejects_frozen_discovery_reference_before_target_policy() -> None:
+    class BlockingDiscoveryProvider(ModelProvider):
+        name = "blocking-mcp-discovery-refresh"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.reference_ready = asyncio.Event()
+            self.release_reference_call = asyncio.Event()
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="search-mcp-tools",
+                    name="search_tools",
+                    arguments={"query": "echo text", "limit": 1},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if len(self.requests) == 2:
+                search_results = [
+                    part
+                    for message in request.messages
+                    if message.role == "tool"
+                    for part in message.content
+                    if part.type == "tool_result" and part.tool_name == "search_tools"
+                ]
+                assert search_results[-1].structured is not None
+                [match] = search_results[-1].structured["matches"]
+                self.reference_ready.set()
+                await self.release_reference_call.wait()
+                yield ModelStreamEvent.tool_call(
+                    id="stale-discovered-mcp-call",
+                    name="call_tool",
+                    arguments={
+                        "tool_ref": match["tool_ref"],
+                        "arguments": {"text": "must fail before target policy"},
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = BlockingDiscoveryProvider()
+        policy = RecordingRefreshPolicy()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            tool_discovery_mode="search_tools",
+            tool_policy=policy,
+        )
+        invocation = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id="mcp-refresh-frozen-discovery-reference",
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Find and call the MCP tool.")],
+                    )
+                )
+            )
+        )
+        await provider.reference_ready.wait()
+        session.definitions = _fake_tool_definitions(
+            "echo",
+            description="Changed after discovery reference issuance.",
+        )
+        refresh = await app.refresh_mcp_toolset(toolset)
+        provider.release_reference_call.set()
+        events = await invocation
+        return refresh, events, policy.requests, session.calls
+
+    refresh, events, policy_requests, calls = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    assert [request.tool_name for request in policy_requests] == ["search_tools"]
+    assert calls == []
+    [rejected] = [
+        event for event in events if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+    ]
+    assert rejected.payload["rejection_reason"] == "catalogue_drift"
+
+
+@pytest.mark.parametrize(
+    ("discovery_mode", "protocol"),
+    [
+        ("openai_tool_search_client", OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL),
+        ("openai_tool_search_hosted", OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL),
+    ],
+)
+def test_mcp_refresh_rejects_frozen_native_discovery_projection_before_target_policy(
+    discovery_mode: str,
+    protocol: str,
+) -> None:
+    class BlockingNativeDiscoveryProvider(ModelProvider):
+        name = "blocking-native-mcp-discovery-refresh"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+            self.reference_ready = asyncio.Event()
+            self.release_reference_call = asyncio.Event()
+
+        def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+            return model == "fake-model" and protocol in {
+                OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+                OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            }
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            projection = request.tool_discovery_projection
+            assert projection is not None
+            assert projection.protocol == protocol
+            if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL and len(self.requests) == 1:
+                assert projection.loaded_tool_names == ()
+                yield ModelStreamEvent.tool_call(
+                    id="native-search-mcp-tools",
+                    name="search_tools",
+                    arguments={"query": "echo text", "limit": 1},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            if (protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL and len(self.requests) > 1) or (
+                protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL and len(self.requests) > 2
+            ):
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+                return
+
+            if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+                assert projection.loaded_tool_names == ("mcp__local-mcp__echo",)
+            else:
+                assert projection.candidate_tool_names == ("mcp__local-mcp__echo",)
+            self.reference_ready.set()
+            await self.release_reference_call.wait()
+            yield ModelStreamEvent.tool_call(
+                id="stale-native-discovered-mcp-call",
+                name="mcp__local-mcp__echo",
+                arguments={"text": "must fail before target policy"},
+            )
+            if protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
+                yield ModelStreamEvent(
+                    type="completed",
+                    payload={"finish_reason": "tool_calls"},
+                    tool_discovery_result=ToolDiscoveryProjectionResult(
+                        loaded_tools=projection.candidate_tools,
+                    ),
+                )
+                return
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+    async def run():
+        toolset = _fake_toolset()
+        session = toolset.session
+        assert isinstance(session, FakeMcpSession)
+        provider = BlockingNativeDiscoveryProvider()
+        policy = RecordingRefreshPolicy()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+            tool_discovery_mode=discovery_mode,
+            tool_policy=policy,
+        )
+        invocation = asyncio.create_task(
+            _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=f"mcp-refresh-frozen-native-discovery-{protocol}",
+                        agent_name="assistant",
+                        messages=[Message.text("user", "Find and call the MCP tool.")],
+                    )
+                )
+            )
+        )
+        await provider.reference_ready.wait()
+        session.definitions = _fake_tool_definitions(
+            "echo",
+            description="Changed after native discovery projection.",
+        )
+        refresh = await app.refresh_mcp_toolset(toolset)
+        provider.release_reference_call.set()
+        events = await invocation
+        return refresh, events, policy.requests, session.calls
+
+    refresh, events, policy_requests, calls = asyncio.run(run())
+
+    assert refresh.status == "accepted"
+    expected_policy_tools = (
+        ["search_tools"] if protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL else []
+    )
+    assert [request.tool_name for request in policy_requests] == expected_policy_tools
+    assert calls == []
+    assert not any(
+        event.type is EventType.TOOL_CALL_STARTED and event.tool_name == "mcp__local-mcp__echo"
+        for event in events
+    )
+    [rejected] = [
+        event for event in events if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+    ]
+    assert rejected.payload["rejection_reason"] == "catalogue_drift"
+
+
 def test_mcp_refresh_policy_block_quarantines_until_verified_retry() -> None:
     async def run():
         toolset = _fake_toolset()
@@ -678,6 +1460,7 @@ def test_mcp_refresh_policy_block_quarantines_until_verified_retry() -> None:
         with pytest.raises(McpToolsetRefreshBlocked, match="Policy action: block"):
             await app.refresh_mcp_toolset(toolset)
         assert toolset.refresh_state is McpToolsetRefreshState.QUARANTINED
+        assert not toolset.tools[0]._dispatch_authority_is_current()
         with pytest.raises(McpToolsetUnavailable, match="not ready"):
             await toolset.tools[0].run(
                 ToolContext(session_id="blocked", agent_name="assistant"),
@@ -687,6 +1470,7 @@ def test_mcp_refresh_policy_block_quarantines_until_verified_retry() -> None:
 
         session.definitions = _fake_tool_definitions("echo")
         retry = await app.refresh_mcp_toolset(toolset)
+        assert toolset.tools[0]._dispatch_authority_is_current()
         await toolset.tools[0].run(
             ToolContext(session_id="restored", agent_name="assistant"),
             {"text": "safe"},
@@ -741,6 +1525,7 @@ def test_mcp_refresh_fences_calls_before_candidate_publication() -> None:
         await session.refresh_started.wait()
 
         assert toolset.refresh_state is McpToolsetRefreshState.REFRESHING
+        assert not toolset.tools[0]._dispatch_authority_is_current()
         with pytest.raises(McpToolsetUnavailable, match="not ready"):
             await toolset.tools[0].run(
                 ToolContext(session_id="refreshing", agent_name="assistant"),

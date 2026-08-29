@@ -137,6 +137,12 @@ register `mcp_toolsets=(toolset,)` when the application owns the complete source
 and needs `await app.refresh_mcp_toolset(toolset)`. Refreshable sources require a
 stable `connection_id`; wrappers sharing one live session also share one source
 owner and generation fence, and additions never widen existing session ceilings.
+Targeted, discovered, and provider-native references keep using Cayu's canonical
+catalogue-bound authority: a changed live source generation rejects an older
+reference before policy or target work, while an exactly unchanged refresh keeps
+the existing generation. Approval recovery, resume, and forks continue through
+the ordinary execution-profile and durable capability-ceiling checks rather than
+an MCP-specific recovery path.
 Apply `McpManifestPolicy`, and test discovery limits, quarantine, stale snapshots,
 timeouts, naming collisions, and policy rejection without trusting server-provided
 descriptions as authority. Cayu does not yet consume MCP list-change notifications

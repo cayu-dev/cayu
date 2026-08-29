@@ -135,6 +135,13 @@ clients, and dashboards together. No storage migration is required.
   fence is held. Blocked candidates cannot rebind dispatch, and a committed
   complete catalogue replaces stale names instead of merging them forward.
   Already-dispatched calls are not rebound.
+- Pre-refresh MCP calls and targeted/discovery references now also check the
+  live source generation before generic governed work. Gateway, OpenAI client
+  and hosted search, and additional-tools projection share the same canonical
+  catalogue-drift rejection; they cannot newly consume a stale grant or reach policy,
+  approval, secrets, environments, hooks, or target execution. Existing
+  execution-profile recovery and durable session/fork ceilings provide the
+  continuation boundary without an MCP-specific durable subsystem.
 - Refreshable sources require an explicit stable
   `McpServerSpec.connection_id` that is unique within the application, cannot
   also be registered through static adapters sharing that live source, and

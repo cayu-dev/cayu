@@ -199,6 +199,11 @@ class _McpToolSource:
         if self.refresh_owner is not owner:
             raise ValueError("The CayuApp does not own refresh authority for this MCP toolset.")
 
+    def dispatch_authority_is_current(self, generation: int) -> bool:
+        """Return whether one immutable snapshot can still enter governed work."""
+
+        return self.state is McpToolsetRefreshState.READY and self.generation == generation
+
     async def begin_refresh(self, *, owner: object, expected_generation: int) -> None:
         async with self.lock:
             self.require_refresh_owner(owner)
@@ -523,6 +528,12 @@ class McpToolAdapter(Tool):
         """Return the immutable dispatch binding used by runtime admission."""
 
         return self.__binding
+
+    def _dispatch_authority_is_current(self) -> bool:
+        """Return whether this snapshot still has live source-generation authority."""
+
+        toolset = self.__binding.toolset
+        return toolset._refresh_source.dispatch_authority_is_current(toolset.generation)
 
     @property
     def toolset(self) -> McpToolset:
