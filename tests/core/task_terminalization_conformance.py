@@ -1,19 +1,301 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 import pytest
 
 from cayu import (
+    ResolutionActor,
+    ResolutionActorSource,
     Task,
+    TaskCancellationReconciliationConflict,
+    TaskCancellationReconciliationEventType,
+    TaskCancellationReconciliationEvidence,
+    TaskCancellationReconciliationOutcome,
+    TaskCancellationReconciliationRejected,
+    TaskCancellationReconciliationRequest,
+    TaskCancellationReconciliationResult,
     TaskCreate,
+    TaskStatus,
     TaskStore,
+    TaskTerminalizationConflict,
     TaskTerminalizationRequest,
     TaskTerminalizationRetryPolicy,
     TaskTerminalizationUncertain,
     TaskTerminalKind,
     terminalize_task_with_retry,
 )
+
+
+def ordinary_cancellation_reconciliation_request(
+    task: Task,
+    *,
+    reconciliation_idempotency_key: str = "ordinary-reconciliation-1",
+    outcome: TaskCancellationReconciliationOutcome = (
+        TaskCancellationReconciliationOutcome.QUIESCENT
+    ),
+    evidence_sha256: str = "a" * 64,
+) -> TaskCancellationReconciliationRequest:
+    assert task.retry_series is None
+    assert task.worker_id is not None
+    assert task.lease_expires_at is not None
+    assert task.status_payload is not None
+    cancellation_idempotency_key = task.status_payload["terminalization_idempotency_key"]
+    event = task.status_payload["event"]
+    assert isinstance(cancellation_idempotency_key, str)
+    assert isinstance(event, dict)
+    cancellation_requested_at = event["occurred_at"]
+    assert isinstance(cancellation_requested_at, str)
+    reconciliation_requested_at = task.updated_at
+    return TaskCancellationReconciliationRequest(
+        task_id=task.id,
+        original_worker_id=task.worker_id,
+        original_lease_expires_at=task.lease_expires_at,
+        cancellation_requested_at=datetime.fromisoformat(cancellation_requested_at),
+        cancellation_idempotency_key=cancellation_idempotency_key,
+        reconciliation_idempotency_key=reconciliation_idempotency_key,
+        reconciliation_requested_at=reconciliation_requested_at,
+        reconciled_by=ResolutionActor(
+            subject="operator:ordinary-reconciler",
+            tenant="tenant-a",
+            source=ResolutionActorSource.REQUEST,
+            claims={"role": "operator"},
+        ),
+        evidence=TaskCancellationReconciliationEvidence(
+            outcome=outcome,
+            validator_id="runtime.effect-receipt",
+            validator_version="1",
+            evidence_id="ordinary-effect-receipt-1",
+            evidence_sha256=evidence_sha256,
+            validated_at=reconciliation_requested_at,
+            execution_profile_fingerprint="b" * 64,
+            effect_fingerprint="c" * 64,
+        ),
+        expected_execution_profile_fingerprint="b" * 64,
+        expected_effect_fingerprint="c" * 64,
+    )
+
+
+async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
+    store: TaskStore,
+) -> None:
+    """Exercise evidence fencing, durable replay, and both terminalization races."""
+
+    assert store.supports_task_cancellation_reconciliation is True
+    assert store.supports_idempotent_terminalization is True
+    await store.create_task(
+        TaskCreate(
+            task_id="ordinary_owner_lost",
+            type="review",
+            metadata={
+                "execution_profile_fingerprint": "b" * 64,
+                "effect_fingerprint": "c" * 64,
+            },
+        )
+    )
+    claimed = await store.claim_task("ordinary-lost-worker", lease_seconds=1)
+    assert claimed is not None
+    requested = await store.cancel_task(claimed.id, {"code": "operator"})
+    stale_request = ordinary_cancellation_reconciliation_request(requested)
+    renewed = await store.heartbeat(
+        claimed.id,
+        "ordinary-lost-worker",
+        extend_seconds=1,
+    )
+    assert renewed is not None
+    assert renewed.lease_expires_at != requested.lease_expires_at
+    assert renewed.status_payload is not None
+    assert requested.status_payload is not None
+    assert renewed.status_payload["event"] == requested.status_payload["event"]
+    request = ordinary_cancellation_reconciliation_request(renewed)
+
+    with pytest.raises(
+        TaskCancellationReconciliationConflict,
+        match="identity is stale",
+    ):
+        await store.reconcile_task_cancellation(stale_request)
+
+    with pytest.raises(
+        TaskCancellationReconciliationConflict,
+        match="lease is still active",
+    ) as active_conflict:
+        await store.reconcile_task_cancellation(request)
+    assert active_conflict.value.event.type is TaskCancellationReconciliationEventType.CONFLICT
+    assert await store.load_task(request.task_id) == renewed
+
+    await asyncio.sleep(1.05)
+    assert await store.claim_task("replacement-before-evidence") is None
+    expired_but_unsettled = await store.load_task(request.task_id)
+    assert expired_but_unsettled == renewed
+
+    mismatched_profile = request.model_copy(
+        update={
+            "evidence": request.evidence.model_copy(
+                update={"execution_profile_fingerprint": "d" * 64}
+            ),
+            "expected_execution_profile_fingerprint": "d" * 64,
+        }
+    )
+    with pytest.raises(
+        TaskCancellationReconciliationConflict,
+        match="stored execution_profile_fingerprint",
+    ):
+        await store.reconcile_task_cancellation(mismatched_profile)
+
+    result = await store.reconcile_task_cancellation(request)
+    replayed = await store.reconcile_task_cancellation(request)
+    receipt = await store.load_task_terminalization_receipt(
+        request.task_id,
+        request.cancellation_idempotency_key,
+    )
+
+    assert replayed == result
+    assert receipt == result.terminalization_receipt
+    assert result.task.status is TaskStatus.CANCELLED
+    assert result.task.worker_id is None
+    assert result.task.lease_expires_at is None
+    assert result.task.error == {"code": "operator"}
+    assert result.task.status_payload == {
+        "cancellation_reconciliation": result.reconciliation.model_dump(
+            mode="json",
+            warnings=False,
+        )
+    }
+    assert result.reconciliation.reconciled_by.claims == {}
+    assert [event.type for event in result.reconciliation.events] == [
+        TaskCancellationReconciliationEventType.CANCELLATION_REQUESTED,
+        TaskCancellationReconciliationEventType.STARTED,
+        TaskCancellationReconciliationEventType.RECONCILED,
+    ]
+    assert all("operator" not in event.model_dump_json() for event in result.reconciliation.events)
+    assert (
+        TaskCancellationReconciliationResult.model_validate_json(result.model_dump_json()) == result
+    )
+    tampered = result.model_dump(mode="json")
+    terminalization_receipt = tampered["terminalization_receipt"]
+    assert isinstance(terminalization_receipt, dict)
+    terminalization_receipt["request_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="terminal receipt"):
+        TaskCancellationReconciliationResult.model_validate(tampered)
+
+    late_worker = await store.terminalize_task(
+        TaskTerminalizationRequest(
+            task_id=request.task_id,
+            worker_id=request.original_worker_id,
+            kind=TaskTerminalKind.CANCELLED,
+            error={"code": "operator"},
+            idempotency_key=request.cancellation_idempotency_key,
+        )
+    )
+    assert late_worker == result.task
+
+    changed = request.model_copy(
+        update={"evidence": request.evidence.model_copy(update={"evidence_sha256": "d" * 64})}
+    )
+    with pytest.raises(TaskCancellationReconciliationConflict, match="another intent"):
+        await store.reconcile_task_cancellation(changed)
+
+    await store.create_task(TaskCreate(task_id="ordinary_worker_wins", type="review"))
+    worker_claim = await store.claim_task("ordinary-winning-worker", lease_seconds=60)
+    assert worker_claim is not None
+    worker_requested = await store.cancel_task(worker_claim.id, {"code": "operator"})
+    losing_reconciliation = ordinary_cancellation_reconciliation_request(
+        worker_requested,
+        reconciliation_idempotency_key="ordinary-reconciliation-worker-lost",
+    )
+    worker_terminal = await store.terminalize_task(
+        TaskTerminalizationRequest(
+            task_id=worker_requested.id,
+            worker_id="ordinary-winning-worker",
+            kind=TaskTerminalKind.CANCELLED,
+            error={"code": "operator"},
+            idempotency_key=losing_reconciliation.cancellation_idempotency_key,
+        )
+    )
+    with pytest.raises(
+        TaskCancellationReconciliationConflict,
+        match="without reconciliation evidence",
+    ):
+        await store.reconcile_task_cancellation(losing_reconciliation)
+    assert await store.load_task(worker_requested.id) == worker_terminal
+
+    await store.create_task(TaskCreate(task_id="ordinary_rejected", type="review"))
+    rejected_claim = await store.claim_task("ordinary-rejected-worker", lease_seconds=60)
+    assert rejected_claim is not None
+    rejected_task = await store.cancel_task(rejected_claim.id, {"code": "operator"})
+    rejected_request = ordinary_cancellation_reconciliation_request(
+        rejected_task,
+        reconciliation_idempotency_key="ordinary-reconciliation-rejected",
+        outcome=TaskCancellationReconciliationOutcome.UNRESOLVED,
+    )
+    with pytest.raises(TaskCancellationReconciliationRejected) as first_rejection:
+        await store.reconcile_task_cancellation(rejected_request)
+    with pytest.raises(TaskCancellationReconciliationRejected) as replayed_rejection:
+        await store.reconcile_task_cancellation(rejected_request)
+    assert replayed_rejection.value.event == first_rejection.value.event
+    assert await store.load_task(rejected_task.id) == rejected_task
+    with pytest.raises(TaskCancellationReconciliationConflict, match="another request"):
+        await store.reconcile_task_cancellation(
+            rejected_request.model_copy(
+                update={
+                    "evidence": rejected_request.evidence.model_copy(
+                        update={"evidence_sha256": "e" * 64}
+                    )
+                }
+            )
+        )
+
+
+async def assert_live_ordinary_cancellation_conformance(store: TaskStore) -> None:
+    """Exercise request fencing, cancellation precedence, and receipt replay."""
+
+    await store.create_task(TaskCreate(task_id="task_live_cancel", type="review"))
+    claimed = await store.claim_task("worker_live_cancel")
+    assert claimed is not None
+    requested = await store.cancel_task(
+        claimed.id,
+        {"reason": "operator cancelled live work"},
+    )
+    assert requested.status is TaskStatus.CLAIMED
+    assert requested.status_reason == "cancellation_requested"
+    assert requested.worker_id == claimed.worker_id
+    assert requested.lease_expires_at == claimed.lease_expires_at
+    assert requested.status_payload is not None
+
+    with pytest.raises(TaskTerminalizationConflict):
+        await store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id=requested.id,
+                worker_id="worker_live_cancel",
+                kind=TaskTerminalKind.COMPLETED,
+                result={"summary": "late completion"},
+                idempotency_key="late-completion",
+            )
+        )
+
+    cancellation = TaskTerminalizationRequest(
+        task_id=requested.id,
+        worker_id="worker_live_cancel",
+        kind=TaskTerminalKind.CANCELLED,
+        error={"reason": "operator cancelled live work"},
+        idempotency_key=requested.status_payload["terminalization_idempotency_key"],
+    )
+    terminal = await store.terminalize_task(cancellation)
+    replayed = await store.terminalize_task(cancellation)
+    receipt = await store.load_task_terminalization_receipt(
+        cancellation.task_id,
+        cancellation.idempotency_key,
+    )
+
+    assert terminal.status is TaskStatus.CANCELLED
+    assert terminal.worker_id is None
+    assert terminal.lease_expires_at is None
+    assert terminal.error == {"reason": "operator cancelled live work"}
+    assert replayed == terminal
+    assert receipt is not None
+    assert receipt.kind is TaskTerminalKind.CANCELLED
+    assert receipt.task == terminal
 
 
 async def assert_task_terminalization_acknowledgement_conformance(

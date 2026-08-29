@@ -32,7 +32,10 @@ from tests.core.task_store_conformance import (
     assert_task_session_invocation_binding_conformance,
 )
 from tests.core.task_terminalization_conformance import (
+    assert_live_ordinary_cancellation_conformance,
+    assert_owner_lost_ordinary_cancellation_reconciliation_conformance,
     assert_task_terminalization_acknowledgement_conformance,
+    ordinary_cancellation_reconciliation_request,
 )
 from tests.core.task_topology_conformance import (
     assert_task_topology_bounded_projection_conformance,
@@ -1987,6 +1990,71 @@ def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
         )
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_live_ordinary_cancellation_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_live_ordinary_cancellation_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_owner_lost_ordinary_cancellation_reconciliation_conformance(
+    postgres_dsn,
+):
+    async def ops(store):
+        await assert_owner_lost_ordinary_cancellation_reconciliation_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_ordinary_cancellation_reconciler_and_late_worker_serialize(
+    postgres_dsn,
+):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        reconciler = _new_store(postgres_dsn)
+        late_worker = _new_store(postgres_dsn)
+        try:
+            await reconciler.create_task(
+                TaskCreate(task_id="postgres-ordinary-reconciliation-race", type="review")
+            )
+            claimed = await reconciler.claim_task("postgres-lost-worker", lease_seconds=1)
+            assert claimed is not None
+            requested = await reconciler.cancel_task(claimed.id, {"code": "operator"})
+            request = ordinary_cancellation_reconciliation_request(requested)
+            await asyncio.sleep(1.05)
+
+            async def terminalize_late_worker():
+                await asyncio.sleep(0.05)
+                return await late_worker.terminalize_task(
+                    TaskTerminalizationRequest(
+                        task_id=request.task_id,
+                        worker_id=request.original_worker_id,
+                        kind=TaskTerminalKind.CANCELLED,
+                        error={"code": "operator"},
+                        idempotency_key=request.cancellation_idempotency_key,
+                    )
+                )
+
+            reconciled, worker_result = await asyncio.gather(
+                reconciler.reconcile_task_cancellation(request),
+                terminalize_late_worker(),
+            )
+            assert worker_result == reconciled.task
+            assert await late_worker.reconcile_task_cancellation(request) == reconciled
+            assert (
+                await reconciler.load_task_terminalization_receipt(
+                    request.task_id,
+                    request.cancellation_idempotency_key,
+                )
+                == reconciled.terminalization_receipt
+            )
+        finally:
+            await reconciler.close()
+            await late_worker.close()
+
+    asyncio.run(run())
 
 
 def test_postgres_task_retry_series_success_budget_and_duplicate_conformance(

@@ -3413,6 +3413,7 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `fail_task(task_id, error)`
 - `terminalize_task(TaskTerminalizationRequest(...))`
 - `load_task_terminalization_receipt(task_id, idempotency_key)`
+- `reconcile_task_cancellation(TaskCancellationReconciliationRequest(...))`
 - `cancel_task(task_id, error=...)`
 
 Verified-work runtime mutations require stronger cancellation settlement than
@@ -3938,11 +3939,11 @@ and task workers, back up the store, run `cayu storage migrate`, and confirm
 revision 62 before starting current workers. Mixed revision-61/revision-62
 workers and application-only rollback are unsupported.
 
-`terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
-boundary for worker-owned tasks. A request carries the exact task and worker,
-terminal kind, terminal JSON payload, and a caller-stable idempotency key. On its
-first application, a supporting store verifies the live worker lease and commits
-both the terminal task snapshot and an immutable
+`terminalize_task(...)` is the claim-fenced, replay-safe completion, failure, or
+cancellation boundary for worker-owned tasks. A request carries the exact task
+and worker, terminal kind, terminal JSON payload, and a caller-stable
+idempotency key. On its first application, a supporting store verifies the live
+worker lease and commits both the terminal task snapshot and an immutable
 `TaskTerminalizationReceipt` in one lock or database transaction. The receipt
 binds the key to a deterministic SHA-256 digest of the whole logical request.
 The task snapshot clears `worker_id` and `lease_expires_at`.
@@ -4126,6 +4127,59 @@ process may later resolve an approval or user-input request, resume the session,
 or run recovery; the existing session/task link then terminalizes the same task.
 Custom worker loops may call the store operation directly after establishing the
 same durable session boundary.
+
+Cancelling an idle ordinary task terminalizes it immediately. Cancelling an
+ordinary task with a live worker instead records a durable
+`cancellation_requested` intent while retaining the exact worker and lease. The
+built-in worker observes that intent through its heartbeat, cancels the handler,
+continues renewing the lease until the handler is quiescent, and then commits a
+claim-fenced `cancelled` terminalization and its immutable receipt. The stored
+cancellation intent wins a concurrent completion or failure. Expired-claim
+reclamation excludes a cancellation-requested task because lease expiry proves
+only owner loss, not handler quiescence or external-effect settlement.
+
+`reconcile_task_cancellation(...)` is the durable operator/application boundary
+for an ordinary cancellation whose owner was lost. It accepts a
+`TaskCancellationReconciliationRequest` only for the exact ordinary task,
+original worker, final lease expiry, cancellation-request event timestamp,
+deterministic cancellation terminalization key, and expected
+`cancellation_requested` reason. The store must observe that lease as expired
+before a positive transition, but expiry is only owner-loss eligibility. It
+never supplies quiescence or external-effect evidence by itself. Task and worker
+identities must fit the bounded reconciliation projection before the live
+cancellation intent is stored, so a newly requested cancellation cannot enter
+an unreconcilable identity state.
+
+The request uses the same bounded `TaskCancellationReconciliationEvidence`
+outcome vocabulary as retry cancellation and requires a separate reconciliation
+idempotency key, timestamp, and `ResolutionActor` provenance. Only `quiescent`,
+`effect_completed`, and `effect_failed` are positive. A positive request
+atomically writes the ordinary immutable `TaskTerminalizationReceipt`, clears
+the worker and lease, retains `cancelled`, and embeds the bounded reconciliation
+projection in the terminal task's `status_payload`. The projection contains the
+stable cancellation-requested, reconciliation-started, and reconciled events;
+hashed identities keep raw evidence, actor authorization claims, and the
+cancellation error out of those events. The external-effect outcomes are
+diagnostic and cannot choose a different terminal status, task result, or error.
+
+`unresolved`, `not_found`, `conflict`, and `unsupported` raise
+`TaskCancellationReconciliationRejected` and leave the task unchanged. Their
+transaction durably binds `(task_id, reconciliation_idempotency_key)` to the
+exact request and rejection event, so exact retries replay across restart while
+changed intent under that key raises
+`TaskCancellationReconciliationConflict`. Stale identity, an active lease, a
+receipt written without reconciliation evidence, or a changed request under the
+cancellation key raises the same typed conflict. The worker terminalization and
+reconciliation use one receipt identity and serialize under the store's task
+lock: whichever commits first is authoritative. If reconciliation wins, a late
+worker's exact cancellation terminalization replays that terminal task; if the
+worker wins first, reconciliation cannot retrofit evidence onto its receipt.
+In-memory, SQLite, and PostgreSQL stores implement this contract. Custom stores
+must override the base operation, set
+`supports_task_cancellation_reconciliation = True`, retain idempotent terminal
+receipt support, and preserve the same atomic receipt, rejection-replay,
+exact-identity, and first-writer-wins semantics before exposing ordinary
+owner-lost recovery.
 
 An unattached queue task may instead opt into a runtime-owned retry series with
 `TaskCreate.retry_policy=TaskRetryPolicy(...)`. The policy requires a positive

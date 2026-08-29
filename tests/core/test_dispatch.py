@@ -3020,7 +3020,9 @@ def test_operator_cancellation_wins_terminal_race_and_restart_acknowledges_recei
             task_id,
             {"reason": "operator cancelled queued work"},
         )
-        assert cancelled.status is TaskStatus.CANCELLED
+        assert cancelled.status is TaskStatus.CLAIMED
+        assert cancelled.status_reason == "cancellation_requested"
+        assert cancelled.worker_id == "worker_operator_cancel"
         allow_terminal_commit.set()
         with pytest.raises(ConnectionError, match="cancelled task acknowledgement lost"):
             await processing
@@ -3103,7 +3105,9 @@ def test_cancelled_queue_task_retains_terminal_receipt_until_hooks_release_profi
             task_id,
             {"reason": "operator cancelled during terminal hook"},
         )
-        assert cancelled.status is TaskStatus.CANCELLED
+        assert cancelled.status is TaskStatus.CLAIMED
+        assert cancelled.status_reason == "cancellation_requested"
+        assert cancelled.worker_id == "worker_blocked_terminal_hook"
         restarted_dispatcher = TaskStoreDispatcher(h.tasks, task_type=_DISPATCH_TASK_TYPE)
         assert (
             await restarted_dispatcher.process_next(

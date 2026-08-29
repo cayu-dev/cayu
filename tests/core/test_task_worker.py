@@ -292,6 +292,67 @@ def test_run_task_worker_claims_runs_and_completes_a_task(tmp_path: Path) -> Non
     assert task.status == "completed"
 
 
+def test_running_ordinary_task_cancellation_is_worker_terminalized(tmp_path: Path) -> None:
+    app, store = _build(tmp_path)
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        created = await store.create_task(TaskCreate(task_id="cancel-live", type="job"))
+
+        async def blocking_handler(
+            _app: CayuApp,
+            _task: Task,
+            _worker_id: str,
+        ) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                blocking_handler,
+                worker_id="worker-cancel-live",
+                query=TaskQuery(type="job"),
+                lease_seconds=1,
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        requested = await store.cancel_task(
+            created.id,
+            {"reason": "operator cancelled live builder"},
+        )
+        assert requested.status is TaskStatus.CLAIMED
+        assert requested.worker_id == "worker-cancel-live"
+        assert requested.lease_expires_at is not None
+        assert requested.status_reason == "cancellation_requested"
+        assert requested.status_payload is not None
+
+        assert await asyncio.wait_for(worker, timeout=3) == 1
+        assert stopped.is_set()
+
+        terminal = await store.load_task(created.id)
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.worker_id is None
+        assert terminal.lease_expires_at is None
+        assert terminal.error == {"reason": "operator cancelled live builder"}
+        key = requested.status_payload["terminalization_idempotency_key"]
+        receipt = await store.load_task_terminalization_receipt(created.id, key)
+        assert receipt is not None
+        assert receipt.kind is TaskTerminalKind.CANCELLED
+        assert receipt.task == terminal
+
+    asyncio.run(scenario())
+
+
 def test_run_task_worker_reconciles_failure_terminalization_acknowledgement_loss() -> None:
     class CommitThenRaiseTaskStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True

@@ -15,7 +15,10 @@ from tests.core.task_store_conformance import (
     assert_task_session_invocation_binding_conformance,
 )
 from tests.core.task_terminalization_conformance import (
+    assert_live_ordinary_cancellation_conformance,
+    assert_owner_lost_ordinary_cancellation_reconciliation_conformance,
     assert_task_terminalization_acknowledgement_conformance,
+    ordinary_cancellation_reconciliation_request,
 )
 
 from cayu import (
@@ -140,6 +143,90 @@ def test_task_store_retry_conformance_for_acknowledgement_failures(
     async def run_store_operations() -> None:
         await assert_task_terminalization_acknowledgement_conformance(store)
         await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_live_ordinary_cancellation_conformance(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_live_ordinary_cancellation_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_owner_lost_ordinary_cancellation_reconciliation_conformance(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_owner_lost_ordinary_cancellation_reconciliation_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_sqlite_ordinary_cancellation_reconciliation_replays_after_restart(tmp_path):
+    async def run_store_operations() -> None:
+        path = tmp_path / "ordinary-reconciliation-restart.sqlite"
+        store = SQLiteTaskStore(path)
+        await store.create_task(TaskCreate(task_id="ordinary_restart", type="review"))
+        claimed = await store.claim_task("ordinary-restart-worker", lease_seconds=1)
+        assert claimed is not None
+        requested = await store.cancel_task(claimed.id, {"code": "operator"})
+        request = ordinary_cancellation_reconciliation_request(requested)
+        await asyncio.sleep(1.05)
+        result = await store.reconcile_task_cancellation(request)
+        await store.close()
+
+        reopened = SQLiteTaskStore(path)
+        try:
+            assert await reopened.reconcile_task_cancellation(request) == result
+            assert (
+                await reopened.load_task_terminalization_receipt(
+                    request.task_id,
+                    request.cancellation_idempotency_key,
+                )
+                == result.terminalization_receipt
+            )
+        finally:
+            await reopened.close()
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_reject_unreconcilable_live_cancellation_identity(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await store.create_task(TaskCreate(task_id="ordinary_bounded", type="review"))
+            oversized_worker = "w" * 1025
+            claimed = await store.claim_task(oversized_worker)
+            assert claimed is not None
+            with pytest.raises(ValueError, match="worker_id must be at most"):
+                await store.cancel_task(claimed.id, {"code": "operator"})
+            unchanged = await store.load_task(claimed.id)
+            assert unchanged == claimed
+        finally:
+            await _close_store(store)
 
     asyncio.run(run_store_operations())
 

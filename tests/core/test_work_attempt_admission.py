@@ -1823,7 +1823,7 @@ def test_sqlite_ordinary_task_mutation_cannot_cross_admission_publication(
                 publication_done.set()
 
         expected_update_fragment = (
-            "SET lease_expires_at" if ordinary_operation == "heartbeat" else "SET status ="
+            "SET lease_expires_at" if ordinary_operation == "heartbeat" else "SET status_reason ="
         )
 
         def interleave_after_ordinary_preflight(statement: str) -> None:

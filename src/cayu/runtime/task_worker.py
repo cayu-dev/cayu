@@ -58,6 +58,8 @@ from cayu.runtime.tasks import (
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,
     TaskTerminalKind,
+    _task_cancellation_requested,
+    _task_cancellation_terminalization_request,
     _task_retry_cancellation_requested,
     _task_retry_requested_cancellation_settlement,
     _task_retry_runtime_terminal_request,
@@ -336,6 +338,29 @@ async def _handle_with_heartbeat(
 
         if retry_elapsed or retry_cancellation_requested:
             terminalization_label = "cancellation" if retry_cancellation_requested else "deadline"
+            if retry_cancellation_requested and task.retry_series is None:
+                current = await task_store.load_task(task.id)
+                if current is None:
+                    raise RuntimeError(
+                        "Task cancellation lost its store-authoritative task after handler "
+                        "quiescence."
+                    )
+                request = _task_cancellation_terminalization_request(
+                    current,
+                    worker_id=worker_id,
+                )
+                if request is None:
+                    raise RuntimeError(
+                        "Task cancellation lost its durable request after handler quiescence."
+                    )
+                await _terminalize_claimed_task_or_detect_peer_winner(
+                    task_store,
+                    request,
+                )
+                ownership_settled = True
+                if retry_elapsed_cancellation is not None:
+                    raise retry_elapsed_cancellation
+                return
             try:
                 (
                     receipt,
@@ -1087,7 +1112,9 @@ async def _heartbeat_until(
                 worker_id,
                 extend_seconds=lease_seconds,
             )
-            if updated is not None and _task_retry_cancellation_requested(updated):
+            if updated is not None and (
+                _task_retry_cancellation_requested(updated) or _task_cancellation_requested(updated)
+            ):
                 return _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
             if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(
                 task_id, worker_id

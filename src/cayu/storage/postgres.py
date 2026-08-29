@@ -469,10 +469,13 @@ from cayu.runtime.sessions import (
     validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
+    _TASK_CANCELLATION_REQUESTED_REASON,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
     TaskAggregateFilter,
+    TaskCancellationReconciliationRequest,
+    TaskCancellationReconciliationResult,
     TaskCreate,
     TaskInvocationSnapshot,
     TaskOperationalSnapshot,
@@ -488,7 +491,6 @@ from cayu.runtime.tasks import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
-    TaskTerminalKind,
     TaskTopologyInconsistent,
     TaskTopologyNode,
     TaskTopologyQuery,
@@ -502,6 +504,7 @@ from cayu.runtime.tasks import (
     _copy_optional_status_payload,
     _copy_optional_status_reason,
     _copy_required_session_binding,
+    _copy_task_cancellation_reconciliation_result,
     _elapsed_claimed_task_retry_settlement,
     _ensure_can_hold_task,
     _ensure_can_resume_task,
@@ -511,14 +514,22 @@ from cayu.runtime.tasks import (
     _ensure_retry_series_queue_attempt,
     _expired_task_retry_settlement,
     _raise_task_claim_attach_error,
+    _reconciled_task_cancellation,
     _reconciled_task_retry_cancellation,
+    _rejected_task_cancellation_reconciliation,
     _rejected_task_retry_cancellation_reconciliation,
+    _replay_task_cancellation_reconciliation,
+    _replay_task_cancellation_reconciliation_rejection,
     _replay_task_retry_cancellation_reconciliation,
     _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
     _running_task_from_create,
     _settled_task_retry_attempt,
+    _task_cancellation_reconciliation_conflict,
+    _task_cancellation_reconciliation_rejection_record,
+    _task_cancellation_requested,
+    _task_cancellation_requested_task,
     _task_from_create,
     _task_invocation_for_attachment,
     _task_retry_cancellation_reconciliation_conflict,
@@ -528,8 +539,11 @@ from cayu.runtime.tasks import (
     _task_retry_reconciliation_identity_is_bounded,
     _task_session_id_for_start,
     _task_session_instance_for_attachment,
+    _TaskCancellationReconciliationRejectionRecord,
     _TaskRetryCancellationReconciliationRejectionRecord,
+    _validate_ordinary_task_terminalization_against_cancellation,
     _validate_task_topology_ancestry,
+    _validated_task_cancellation,
     _validated_task_retry_cancellation,
     _validated_task_retry_terminal_accounting,
     build_task_topology_result,
@@ -537,6 +551,7 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_task_cancellation_reconciliation,
     prepare_task_retry_cancellation_reconciliation,
     prepare_task_retry_settlement,
     prepare_task_terminalization,
@@ -28560,6 +28575,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
+    supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
@@ -29704,11 +29720,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         )
                     now = await self._database_now(cur)
                     _ensure_owned_active_task_lease(task, request.worker_id, now=now)
-                    status = (
-                        TaskStatus.COMPLETED
-                        if request.kind is TaskTerminalKind.COMPLETED
-                        else TaskStatus.FAILED
-                    )
+                    _validate_ordinary_task_terminalization_against_cancellation(task, request)
+                    status = TaskStatus(request.kind.value)
                     verified_work_support.require_contracted_completion_authority(
                         task,
                         status,
@@ -29803,6 +29816,181 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             idempotency_key=idempotency_key,
             row=row,
         )
+
+    async def reconcile_task_cancellation(
+        self,
+        request: TaskCancellationReconciliationRequest,
+    ) -> TaskCancellationReconciliationResult:
+        request, request_sha256 = prepare_task_cancellation_reconciliation(request)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                        "WHERE id = %s FOR UPDATE",
+                        (request.task_id,),
+                    )
+                    task_row = await cur.fetchone()
+                    task = None if task_row is None else pg_support.task_from_row(task_row)
+                    await cur.execute(
+                        "SELECT request_sha256, record_json "
+                        "FROM cayu_task_retry_reconciliation_rejections "
+                        "WHERE task_id = %s AND reconciliation_idempotency_key = %s",
+                        (request.task_id, request.reconciliation_idempotency_key),
+                    )
+                    rejection_row = await cur.fetchone()
+                    await cur.execute(
+                        "SELECT request_sha256, worker_id, terminal_kind, "
+                        "task_json, committed_at "
+                        "FROM cayu_task_terminalization_receipts "
+                        "WHERE task_id = %s AND idempotency_key = %s",
+                        (request.task_id, request.cancellation_idempotency_key),
+                    )
+                    receipt_row = await cur.fetchone()
+                    now = await self._database_now(cur)
+                    if rejection_row is not None:
+                        rejection = _TaskCancellationReconciliationRejectionRecord.model_validate(
+                            _json_obj(rejection_row[1])
+                        )
+                        if rejection.request_sha256 != rejection_row[0]:
+                            raise RuntimeError(
+                                "Postgres cancellation reconciliation rejection contains "
+                                "invalid durable material."
+                            )
+                        raise _replay_task_cancellation_reconciliation_rejection(
+                            request,
+                            request_sha256=request_sha256,
+                            record=rejection,
+                        )
+                    if receipt_row is not None:
+                        receipt = _postgres_task_terminalization_receipt(
+                            task_id=request.task_id,
+                            idempotency_key=request.cancellation_idempotency_key,
+                            row=receipt_row,
+                        )
+                        replayed = _replay_task_cancellation_reconciliation(
+                            request=request,
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                            current_task=task,
+                        )
+                        await conn.commit()
+                        return replayed
+                    if task is None:
+                        raise _task_cancellation_reconciliation_conflict(
+                            request,
+                            "Task cancellation reconciliation task was not found.",
+                        )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                        (request.task_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise WorkAttemptExecutionClaimLost(
+                            "Admitted work attempts cannot use ordinary cancellation "
+                            "reconciliation."
+                        )
+                    rejection = _task_cancellation_reconciliation_rejection_record(
+                        request,
+                        request_sha256=request_sha256,
+                        recorded_at=now,
+                    )
+                    if rejection is not None:
+                        _validated_task_cancellation(
+                            task,
+                            request,
+                            now=now,
+                            require_owner_lost=False,
+                        )
+                        await cur.execute(
+                            "INSERT INTO cayu_task_retry_reconciliation_rejections "
+                            "(task_id, reconciliation_idempotency_key, request_sha256, "
+                            "record_json, recorded_at) VALUES (%s, %s, %s, %s, %s)",
+                            (
+                                rejection.task_id,
+                                rejection.reconciliation_idempotency_key,
+                                rejection.request_sha256,
+                                _dumps(rejection.model_dump(mode="json")),
+                                rejection.recorded_at,
+                            ),
+                        )
+                        await conn.commit()
+                        raise _rejected_task_cancellation_reconciliation(rejection)
+
+                    result = _reconciled_task_cancellation(
+                        task,
+                        request,
+                        request_sha256=request_sha256,
+                        committed_at=now,
+                    )
+                    settled = result.task
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status = %s, status_reason = NULL, status_payload = %s,
+                            result = NULL, error = %s, worker_id = NULL,
+                            lease_expires_at = NULL, started_at = %s,
+                            completed_at = %s, updated_at = %s
+                        WHERE id = %s AND status IN (%s, %s) AND status_reason = %s
+                          AND worker_id = %s AND lease_expires_at = %s
+                          AND lease_expires_at <= %s AND retry_series IS NULL
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            str(settled.status),
+                            _dumps(settled.status_payload),
+                            _dumps(settled.error),
+                            settled.started_at,
+                            settled.completed_at,
+                            settled.updated_at,
+                            request.task_id,
+                            str(TaskStatus.CLAIMED),
+                            str(TaskStatus.RUNNING),
+                            request.expected_status_reason,
+                            request.original_worker_id,
+                            request.original_lease_expires_at,
+                            now,
+                        ),
+                    )
+                    durable_row = await cur.fetchone()
+                    if durable_row is None:
+                        raise _task_cancellation_reconciliation_conflict(
+                            request,
+                            "Task cancellation reconciliation lost its fenced transition.",
+                        )
+                    durable_task = pg_support.task_from_row(durable_row)
+                    receipt = result.terminalization_receipt.model_copy(
+                        update={"task": durable_task},
+                        deep=True,
+                    )
+                    durable_result = TaskCancellationReconciliationResult(
+                        request_sha256=request_sha256,
+                        task=durable_task,
+                        terminalization_receipt=receipt,
+                        reconciliation=result.reconciliation,
+                        committed_at=now,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_task_terminalization_receipts "
+                        "(task_id, idempotency_key, request_sha256, worker_id, "
+                        "terminal_kind, task_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            receipt.task_id,
+                            receipt.idempotency_key,
+                            receipt.request_sha256,
+                            receipt.worker_id,
+                            receipt.kind.value,
+                            _dumps(receipt.task.model_dump(mode="json")),
+                            receipt.committed_at,
+                        ),
+                    )
+                await conn.commit()
+                return _copy_task_cancellation_reconciliation_result(durable_result)
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def settle_task_retry_attempt(
         self,
@@ -30652,6 +30840,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     WHERE id = %s AND worker_id = %s AND status = %s
                       AND session_id IS NULL
                       AND status_reason IS DISTINCT FROM %s
+                      AND status_reason IS DISTINCT FROM %s
                       AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
@@ -30662,6 +30851,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         worker_id,
                         str(TaskStatus.CLAIMED),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+                        _TASK_CANCELLATION_REQUESTED_REASON,
                         now,
                     ),
                 )
@@ -30704,6 +30894,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         updated_at = %s
                     WHERE id = %s AND worker_id = %s AND status = %s
                       AND session_id IS NOT NULL
+                      AND status_reason IS DISTINCT FROM %s
                       AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
@@ -30712,6 +30903,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         task_id,
                         worker_id,
                         str(TaskStatus.RUNNING),
+                        _TASK_CANCELLATION_REQUESTED_REASON,
                         now,
                     ),
                 )
@@ -30770,6 +30962,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 "lease_expires_at IS NOT NULL",
                 "lease_expires_at <= timing.now",
                 "status_reason IS DISTINCT FROM %s",
+                "status_reason IS DISTINCT FROM %s",
                 "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
                 "WHERE NOT attempt.retry_admissible AND ("
                 "attempt.task_id = cayu_tasks.id OR (cayu_tasks.retry_series IS NOT NULL "
@@ -30809,6 +31002,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     [
                         str(TaskStatus.CLAIMED),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+                        _TASK_CANCELLATION_REQUESTED_REASON,
                         *params,
                         max_reclaims,
                         str(TaskStatus.PENDING),
@@ -30887,6 +31081,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         OR (status = %s AND session_id IS NULL)
                       )
                       AND status_reason IS DISTINCT FROM %s
+                      AND status_reason IS DISTINCT FROM %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
@@ -30902,6 +31097,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         str(TaskStatus.NEEDS_ATTENTION),
                         str(TaskStatus.RUNNING),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+                        _TASK_CANCELLATION_REQUESTED_REASON,
                     ),
                 )
                 row = await cur.fetchone()
@@ -30992,7 +31188,46 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         committed_at=now,
                     )
                     terminal_task = cancellation.task
+                elif (
+                    task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+                    and status is TaskStatus.CANCELLED
+                    and task.worker_id is not None
+                    and task.lease_expires_at is not None
+                ):
+                    cancellation_requested = _task_cancellation_requested_task(
+                        task,
+                        error=error,
+                        updated_at=now,
+                    )
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status_reason = %s, status_payload = %s, updated_at = %s
+                        WHERE id = %s AND status IN (%s, %s)
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            cancellation_requested.status_reason,
+                            _dumps(cancellation_requested.status_payload),
+                            cancellation_requested.updated_at,
+                            task_id,
+                            str(TaskStatus.CLAIMED),
+                            str(TaskStatus.RUNNING),
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise TaskTerminalizationConflict(
+                            "Task cancellation lost active ownership."
+                        )
+                    updated = pg_support.task_from_row(row)
+                    await conn.commit()
+                    return updated.model_copy(deep=True)
                 else:
+                    if _task_cancellation_requested(task):
+                        raise TaskTerminalizationConflict(
+                            "Task cancellation is still draining under its current owner."
+                        )
                     terminal_task = task.model_copy(
                         update={
                             "status": status,
@@ -31134,9 +31369,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
             raise ValueError(f"Task {task.id} is not claimed.")
-        if task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON:
+        if task.status_reason in {
+            _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
+            _TASK_CANCELLATION_REQUESTED_REASON,
+        }:
             raise TaskTerminalizationConflict(
-                "Task retry cancellation is still draining under its current owner."
+                "Task cancellation is still draining under its current owner."
             )
         raise RuntimeError(f"Task {task.id} active claim could not be released.")
 
@@ -31154,6 +31392,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             raise ValueError(f"Task {task.id} is not running.")
         if task.session_id is None:
             raise ValueError(f"Task {task.id} is not attached to a session.")
+        if _task_cancellation_requested(task):
+            raise TaskTerminalizationConflict(
+                "Task cancellation is still draining under its current owner."
+            )
         raise RuntimeError(f"Task {task.id} active attached claim could not be released.")
 
     async def _raise_task_claim_attach_error(
