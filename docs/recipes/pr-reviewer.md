@@ -184,8 +184,10 @@ toolset = await connect_mcp_toolset(
 # Static snapshot:
 # app.register_agent(spec, tools=toolset.tools)
 #
-# Explicit complete-source registration with manual atomic refresh:
+# Explicit complete-source registration with governed atomic refresh:
 # app.register_agent(spec, mcp_toolsets=(toolset,))
+# Declared tools/list_changed notifications refresh built-in sessions automatically.
+# Manual refresh remains available and uses the same publication path:
 # result = await app.refresh_mcp_toolset(toolset)
 #
 # await toolset.close() when the application shuts down.

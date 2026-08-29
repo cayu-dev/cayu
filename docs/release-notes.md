@@ -253,9 +253,42 @@ clients, and dashboards together. No storage migration is required.
   share the same source owner and generation fence. Independent sources can
   fetch candidates concurrently while final application publication remains
   serialized and copy-on-write.
-- This slice is trigger-independent and manual. Cayu still ignores legacy MCP
-  list-change notifications, performs no background polling, and does not yet
-  negotiate MCP 2026-07-28.
+- A refresh-owned source whose initialize result declares exact
+  `tools.listChanged: true` now consumes
+  `notifications/tools/list_changed`. Receipt synchronously marks the source
+  dirty and fences old dispatch authority; a short source-owned coalescing
+  window turns a burst into one call through the same bounded, policy-governed,
+  copy-on-write refresh path as `refresh_mcp_toolset()`.
+- Stdio consumes the notification on its existing reader. A signal observed
+  after discovery but before application ownership is retained as one
+  payload-free freshness marker; ownership installation fences dispatch
+  synchronously and reconciles it after the registration transaction completes,
+  so catalogue changes cannot disappear in that gap. Streamable HTTP consumes
+  notifications interleaved in POST/SSE responses and owns one
+  bounded GET/SSE server-message listener when the endpoint supports it.
+  Activation fences dispatch synchronously after registration, while a narrow
+  registration-only allowance lets consecutive agents share the source before
+  the event loop starts. The first valid stream reconciles the catalogue before
+  restoring dispatch, closing the gap between initial `tools/list` and listener
+  establishment. Later continuity loss applies the same fence. Reconnect
+  establishes a new stream, replays a bounded safe SSE cursor through
+  `Last-Event-ID` when available, and reconciles once before restoring dispatch.
+  A validated stream resets reconnect backoff, so routine server-side stream
+  rotation cannot ratchet later continuity fences to the maximum delay.
+  HTTP 405 performs that activation/final reconciliation before selecting the
+  manual-only fallback. Notifications are never replaced with polling. Listener
+  connection and body reads remain idle-bounded and individual SSE events remain
+  size-bounded, but a healthy established stream has no finite RPC lifetime or
+  cumulative-response ceiling that would force periodic catalogue refresh.
+  Stream cleanup retains exact settlement ownership across timeout and
+  cancellation. Protocol violations fence the HTTP session with bounded secret-safe
+  diagnostics instead of entering a silent reconnect loop.
+- A newer signal supersedes any candidate still in discovery or publication.
+  A same-signal failure quarantines the source without a retry loop; a later
+  signal or explicit successful refresh can recover it. Toolset close cancels
+  and joins notification-owned work. MCP 2026-07-28 subscription and cache-hint
+  capabilities remain deferred.
+
 ### Prepared durable children retain exact runtime identity
 
 Durable-subagent submission intent schema 2 now binds the child runtime name

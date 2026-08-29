@@ -4,12 +4,18 @@ JSON-RPC messages are sent as HTTP POST bodies to a single endpoint (`server.url
 The server replies either with `application/json` (one JSON-RPC response) or
 `text/event-stream` (SSE). The SSE stream is consumed incrementally and the matching
 JSON-RPC response is returned the moment it arrives — the call does not wait for the
-server to close the stream. Interim server->client notifications are ignored, but a
-server-initiated request (which this request/response client cannot answer) fails the
+server to close the stream. Exact `notifications/tools/list_changed` notifications
+can be consumed both from POST response streams and, when the server supports it,
+from one session-owned GET/SSE listener. Other notifications remain payload-free and
+ignored, but a server-initiated request (which this client cannot answer) fails the
 session with a protocol error rather than being silently dropped. Cayu incrementally
 enforces message/event and aggregate-response byte limits, an inbound idle timeout,
-and an absolute call deadline. A session id (`Mcp-Session-Id`) issued on `initialize` is echoed on every
-later request, and `MCP-Protocol-Version` is sent on every request after
+and an absolute call deadline. Listener activation and later gaps fence catalogue
+dispatch until a stream is established and reconciled; safe SSE cursors are replayed
+with `Last-Event-ID`. Listener exchanges retain cancellation-resistant reads and
+stream cleanup through the same session-wide settlement barrier as POST. A session
+id (`Mcp-Session-Id`) issued on `initialize` is echoed on
+every later request, and `MCP-Protocol-Version` is sent on every request after
 initialization. The JSON<->model parsing is the shared logic in `cayu.mcp._jsonrpc`,
 identical to the stdio transport.
 
@@ -97,6 +103,7 @@ from cayu.mcp.base import (
     McpToolResult,
     _await_mcp_session_cleanup_task,
     _credential_safe_mcp_cancellation,
+    _is_mcp_tools_list_changed_notification,
     _McpCallerCancellationBoundary,
     _McpToolDiscovery,
     _McpToolDispatchSignal,
@@ -121,7 +128,15 @@ _ACCEPT_HEADER = f"{_JSON_CONTENT_TYPE}, {_SSE_CONTENT_TYPE}"
 _MAX_ERROR_BODY_CHARS = 2_000
 _TRUNCATED_ERROR_BODY_DETAIL = "<response body omitted because safe retention was incomplete>"
 _SSE_LINE_ENDING = re.compile(rb"[\r\n]")
+_MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.25
+_MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
+_MAX_SSE_REPLAY_EVENT_ID_BYTES = 1024
+_LAST_EVENT_ID_HEADER = "last-event-id"
 _T = TypeVar("_T")
+
+
+async def _sleep_before_mcp_server_listener_reconnect(delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
 
 
 class _McpUnexpectedTransportCancellationError(McpProtocolError):
@@ -134,6 +149,14 @@ class _McpExtensionTransportProtocolError(RuntimeError):
 
 class _McpHttpStatusError(McpProtocolError):
     """A bounded HTTP response carried a non-successful status."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _http_server_listener_status_is_retryable(status_code: int) -> bool:
+    return status_code in {408, 425, 429} or 500 <= status_code <= 599
 
 
 @dataclass(slots=True)
@@ -431,12 +454,365 @@ class HttpMcpSession(McpSession):
         self._tool_transport_names: dict[str, str] = {}
         self._resource_transport_uris: dict[str, str] = {}
         self._authority_mapping_lock = asyncio.Lock()
+        self._tools_list_changed_handler: Callable[[], None] | None = None
+        self._tools_list_changed_continuity_handler: Callable[[bool], None] | None = None
+        self._server_listener_task: asyncio.Task[None] | None = None
+        self._server_listener_unavailable = False
+        self._server_listener_has_connected = False
+        self._server_listener_connection_epoch = 0
+        self._server_listener_needs_reconciliation = False
+        self._server_listener_last_event_id: str | None = None
+        self._server_listener_failure_message: str | None = None
 
     @property
     def initialize_result(self) -> McpInitializeResult:
         if self._initialize_result is None:
             raise McpProtocolError("MCP session has not been initialized.")
         return self._initialize_result
+
+    def _set_tools_list_changed_handler(
+        self,
+        handler: Callable[[], None] | None,
+    ) -> bool:
+        if handler is not None and self._closed:
+            return False
+        if handler is not None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return False
+        self._tools_list_changed_handler = handler
+        if handler is None:
+            self._server_listener_has_connected = False
+            self._server_listener_needs_reconciliation = False
+            self._server_listener_last_event_id = None
+            task = self._server_listener_task
+            if task is not None and not task.done():
+                task.cancel()
+            return True
+        # Installation happens synchronously during application registration.
+        # Fence dispatch now, before the listener task can yield through its
+        # first GET, so a catalogue mutation between discovery and connection
+        # cannot leave the initial snapshot callable. The source has a narrow
+        # registration-only allowance for this activation fence, preserving
+        # consecutive synchronous registrations that share one source.
+        self._mark_server_listener_gap()
+        self._ensure_server_listener()
+        return True
+
+    def _set_tools_list_changed_continuity_handler(
+        self,
+        handler: Callable[[bool], None] | None,
+    ) -> bool:
+        if handler is not None and self._closed:
+            return False
+        self._tools_list_changed_continuity_handler = handler
+        return True
+
+    def _mark_server_listener_gap(self) -> None:
+        if self._server_listener_needs_reconciliation:
+            return
+        self._server_listener_needs_reconciliation = True
+        handler = self._tools_list_changed_continuity_handler
+        if handler is not None:
+            handler(False)
+
+    def _reconcile_server_listener_gap(self) -> None:
+        if not self._server_listener_needs_reconciliation:
+            return
+        self._server_listener_needs_reconciliation = False
+        handler = self._tools_list_changed_continuity_handler
+        if handler is not None:
+            handler(True)
+
+    def _record_server_listener_event_id(self, event_id: str | None) -> None:
+        self._server_listener_last_event_id = event_id
+
+    def _tools_list_changed_listener_failure_message(self) -> str | None:
+        return self._server_listener_failure_message
+
+    def _ensure_server_listener(self) -> None:
+        if (
+            self._closed
+            or self._server_listener_unavailable
+            or self._tools_list_changed_handler is None
+        ):
+            return
+        task = self._server_listener_task
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._run_server_listener())
+        self._server_listener_task = task
+        task.add_done_callback(self._server_listener_completed)
+
+    def _server_listener_completed(self, task: asyncio.Task[None]) -> None:
+        if self._server_listener_task is task:
+            self._server_listener_task = None
+        _consume_task_result(task)
+        self._ensure_server_listener()
+
+    async def _run_server_listener(self) -> None:
+        reconnect_delay_s = _MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S
+        while not self._closed and self._tools_list_changed_handler is not None:
+            connection_epoch = self._server_listener_connection_epoch
+            try:
+                supported = await self._listen_for_server_messages_once()
+            except asyncio.CancelledError:
+                return
+            except _McpHttpStatusError as error:
+                if self._closed or not _http_server_listener_status_is_retryable(error.status_code):
+                    self._mark_server_listener_gap()
+                    self._fence_failed_server_listener(error)
+                    return
+                if self._server_listener_has_connected:
+                    self._mark_server_listener_gap()
+                if self._tools_list_changed_handler is None:
+                    return
+                if self._server_listener_connection_epoch != connection_epoch:
+                    reconnect_delay_s = _MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S
+                await _sleep_before_mcp_server_listener_reconnect(reconnect_delay_s)
+                reconnect_delay_s = min(
+                    reconnect_delay_s * 2,
+                    _MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S,
+                )
+                continue
+            except McpPeerClosedError:
+                if self._server_listener_has_connected:
+                    self._mark_server_listener_gap()
+                if self._closed or self._tools_list_changed_handler is None:
+                    return
+                if self._server_listener_connection_epoch != connection_epoch:
+                    reconnect_delay_s = _MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S
+                await _sleep_before_mcp_server_listener_reconnect(reconnect_delay_s)
+                reconnect_delay_s = min(
+                    reconnect_delay_s * 2,
+                    _MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S,
+                )
+                continue
+            except McpProtocolError as error:
+                self._mark_server_listener_gap()
+                self._fence_failed_server_listener(error)
+                return
+            except (httpx.HTTPError, TimeoutError):
+                if self._server_listener_has_connected:
+                    self._mark_server_listener_gap()
+                if self._closed or self._tools_list_changed_handler is None:
+                    return
+                if self._server_listener_connection_epoch != connection_epoch:
+                    reconnect_delay_s = _MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S
+                await _sleep_before_mcp_server_listener_reconnect(reconnect_delay_s)
+                reconnect_delay_s = min(
+                    reconnect_delay_s * 2,
+                    _MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S,
+                )
+                continue
+            except Exception as error:
+                self._mark_server_listener_gap()
+                safe_error = credential_safe_mcp_transport_failure(
+                    error,
+                    redactor=self._secret_redactor,
+                    context="MCP HTTP server-message listener failed",
+                    preserve_cause=True,
+                )
+                error = None
+                if isinstance(safe_error, McpProtocolError):
+                    self._fence_failed_server_listener(safe_error)
+                else:
+                    protocol_error = McpProtocolError(str(safe_error))
+                    self._fence_failed_server_listener(protocol_error)
+                return
+            except BaseException:
+                self._mark_server_listener_gap()
+                self._closed = True
+                self._fenced = True
+                raise
+            if not supported:
+                self._server_listener_unavailable = True
+                self._server_listener_last_event_id = None
+                self._reconcile_server_listener_gap()
+                return
+            if self._server_listener_connection_epoch != connection_epoch:
+                reconnect_delay_s = _MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S
+            self._mark_server_listener_gap()
+            await _sleep_before_mcp_server_listener_reconnect(reconnect_delay_s)
+            reconnect_delay_s = min(
+                reconnect_delay_s * 2,
+                _MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S,
+            )
+
+    async def _listen_for_server_messages_once(self) -> bool:
+        # A server-message listener is an intentionally long-lived response, not
+        # one finite RPC exchange. Keep connection/body reads idle-bounded while
+        # allowing a healthy stream to outlive total_call_timeout_s. Individual
+        # SSE events remain bounded by max_message_bytes below.
+        budget = _HttpCallBudget(
+            self.transport_limits,
+            enforce_total_deadline=False,
+        )
+        headers = {
+            **self._protocol_headers(),
+            "accept": _SSE_CONTENT_TYPE,
+        }
+        last_event_id = self._server_listener_last_event_id
+        listener_redactor = _mcp_server_listener_redactor(
+            self._secret_redactor,
+            last_event_id,
+        )
+        if last_event_id is not None:
+            headers[_LAST_EVENT_ID_HEADER] = last_event_id
+        stream_context = self._http.stream(
+            "GET",
+            self._url,
+            headers=headers,
+            follow_redirects=False,
+        )
+        exchange_owner = _HttpExchangeOwner(stream_context)
+        self._register_http_exchange(exchange_owner)
+        listener_cancelled = False
+        deferred_listener_error: BaseException | None = None
+        try:
+            response = await budget.wait(stream_context.__aenter__())
+            exchange_owner.record_entered_response(response)
+            budget.note_activity()
+            if response.status_code == 405:
+                return False
+            self._record_response_ownership(response, initialize_request=False)
+            _validate_http_response_headers(
+                response,
+                limits=self.transport_limits,
+                enforce_response_size=False,
+            )
+            await self._handle_status(
+                response,
+                budget=budget,
+                redactor=listener_redactor,
+            )
+            content_type = response.headers.get("content-type", "")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            content_type = ""
+            if media_type != _SSE_CONTENT_TYPE:
+                raise McpProtocolError(
+                    "MCP HTTP server-message listener did not return text/event-stream."
+                )
+            self._server_listener_has_connected = True
+            self._server_listener_connection_epoch += 1
+            self._reconcile_server_listener_gap()
+            await _read_sse_server_messages(
+                response,
+                redactor=listener_redactor,
+                limits=self.transport_limits,
+                budget=budget,
+                tools_list_changed_handler=self._tools_list_changed_handler,
+                event_id_handler=self._record_server_listener_event_id,
+            )
+            self._mark_server_listener_gap()
+            return True
+        except asyncio.CancelledError:
+            listener_cancelled = True
+            self._mark_server_listener_gap()
+            raise
+        except (_McpHttpStatusError, McpPeerClosedError, httpx.HTTPError, TimeoutError):
+            self._mark_server_listener_gap()
+            raise
+        except Exception as error:
+            self._mark_server_listener_gap()
+            listener_redactor = _mcp_server_listener_redactor(
+                listener_redactor,
+                self._server_listener_last_event_id,
+            )
+            safe_error = credential_safe_mcp_transport_failure(
+                error,
+                redactor=listener_redactor,
+                context="MCP HTTP server-message listener failed",
+                preserve_cause=True,
+            )
+            error = None
+            deferred_listener_error = safe_error
+        except BaseException as error:
+            self._mark_server_listener_gap()
+            listener_redactor = _mcp_server_listener_redactor(
+                listener_redactor,
+                self._server_listener_last_event_id,
+            )
+            safe_error = credential_safe_mcp_fatal_signal(
+                error,
+                redactor=listener_redactor,
+                context="MCP HTTP server-message listener failed",
+            )
+            error = None
+            deferred_listener_error = safe_error
+        finally:
+            # A timed-out or cancelled body read may suppress cancellation and
+            # keep owning the response iterator. Start context exit to interrupt
+            # that read, then retain and observe both owners through the same
+            # session-wide settlement barrier used by POST exchanges. On listener
+            # cancellation the retained task becomes close()'s owner; otherwise
+            # retry cannot begin until the old stream is completely settled.
+            if exchange_owner.entered and exchange_owner.exit_task is None:
+                exchange_owner.start_exit()
+            listener_redactor = _mcp_server_listener_redactor(
+                listener_redactor,
+                self._server_listener_last_event_id,
+            )
+            settlement_task = asyncio.create_task(
+                _settle_registered_http_exchange(
+                    exchange_owner=exchange_owner,
+                    abandoned_tasks=budget.take_abandoned_tasks(),
+                    redactor=listener_redactor,
+                    defer_client_close_to_parent=True,
+                )
+            )
+            self._retain_settlement_task(settlement_task)
+            if not listener_cancelled:
+                await asyncio.shield(settlement_task)
+            settlement_task = None
+            exchange_owner = None
+            stream_context = None
+            last_event_id = None
+            headers.clear()
+        if deferred_listener_error is not None:
+            raise deferred_listener_error from None
+        raise AssertionError("MCP HTTP server-message listener returned without an outcome.")
+
+    def _fence_failed_server_listener(self, error: McpProtocolError) -> None:
+        self._mark_server_listener_gap()
+        safe_error = credential_safe_mcp_transport_failure(
+            error,
+            redactor=self._secret_redactor,
+            context="MCP HTTP server-message listener failed",
+            preserve_cause=True,
+        )
+        error = McpProtocolError("MCP HTTP server-message listener failed; session closed.")
+        set_exception_cause(error, safe_error)
+        self._server_listener_failure_message = str(safe_error)
+        self._closed = True
+        self._fenced = True
+        self._tools_list_changed_handler = None
+        self._tools_list_changed_continuity_handler = None
+        self._server_listener_has_connected = False
+        self._server_listener_last_event_id = None
+        if self._session_id is not None or self._cleanup_session_id is not None:
+            self._begin_failed_session_close(
+                error,
+                terminate_fenced_session=True,
+            )
+        else:
+            _attach_http_settlement_task(error, self._ensure_client_close_task())
+
+    async def _stop_server_listener(self) -> None:
+        self._tools_list_changed_handler = None
+        self._tools_list_changed_continuity_handler = None
+        self._server_listener_has_connected = False
+        self._server_listener_needs_reconciliation = False
+        self._server_listener_last_event_id = None
+        task = self._server_listener_task
+        self._server_listener_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        with suppress(BaseException):
+            await task
 
     async def initialize(self) -> None:
         def parse_initialize_result(result: Any) -> McpInitializeResult:
@@ -737,6 +1113,10 @@ class HttpMcpSession(McpSession):
         # Run cleanup in a shielded task so the DELETE + aclose still complete even
         # if the caller is cancelled mid-close (mirrors StdioMcpSession.close).
         if self._close_task is None:
+            # McpToolset.close() removes the source callback before reaching this
+            # point. A direct session close with an active callback must still
+            # revoke the refresh-owned catalogue synchronously.
+            self._mark_server_listener_gap()
             self._closed = True
             self._close_task = asyncio.create_task(self._close_impl())
         sanitized_cancellation: asyncio.CancelledError | None = None
@@ -765,6 +1145,15 @@ class HttpMcpSession(McpSession):
         # Even when a subclass must finish its own close synchronously, the
         # inherited HTTP request entrances can be fenced immediately.
         self._closed = True
+        self._mark_server_listener_gap()
+        self._tools_list_changed_handler = None
+        self._tools_list_changed_continuity_handler = None
+        self._server_listener_has_connected = False
+        self._server_listener_needs_reconciliation = False
+        self._server_listener_last_event_id = None
+        listener_task = self._server_listener_task
+        if listener_task is not None and not listener_task.done():
+            listener_task.cancel()
         # A subclass may add work or reuse entrances that ``_closed`` does not
         # fence. It must explicitly override this proof hook before discovery
         # cleanup can safely continue in the background.
@@ -903,6 +1292,7 @@ class HttpMcpSession(McpSession):
             )
 
     async def _close_impl(self, *, report_server_cleanup_failure: bool = False) -> None:
+        await self._stop_server_listener()
         budget = _HttpCallBudget(self.transport_limits)
         active_wait_task = asyncio.create_task(self._wait_for_active_http_exchanges())
         active_exchanges_settled = await _wait_for_http_close_task(
@@ -1136,6 +1526,7 @@ class HttpMcpSession(McpSession):
         initialize_request: bool,
         already_reported_failure_ids: frozenset[int] = frozenset(),
     ) -> None:
+        self._mark_server_listener_gap()
         self._closed = True
         self._fenced = True
         initialization_cleanup: Callable[[], Coroutine[Any, Any, None]] | None = None
@@ -1252,6 +1643,7 @@ class HttpMcpSession(McpSession):
         error = McpCallDeadlineExceededError(
             "MCP HTTP exchange exceeded its total call deadline during response processing."
         )
+        self._mark_server_listener_gap()
         self._closed = True
         self._fenced = True
         if self._session_id is not None or self._cleanup_session_id is not None:
@@ -1638,6 +2030,9 @@ class HttpMcpSession(McpSession):
         content = b""
         try:
             if self._closed:
+                listener_failure = self._tools_list_changed_listener_failure_message()
+                if listener_failure is not None:
+                    raise McpProtocolError(listener_failure)
                 raise McpProtocolError("MCP HTTP session is closed.")
             budget.check_total_deadline()
             if not json_utf8_size_within_limit(
@@ -1733,6 +2128,7 @@ class HttpMcpSession(McpSession):
                         redactor=failure_redactor,
                         limits=self.transport_limits,
                         budget=budget,
+                        tools_list_changed_handler=self._tools_list_changed_handler,
                     )
                 else:
                     message = await _read_json_response(
@@ -1972,6 +2368,7 @@ class HttpMcpSession(McpSession):
             # Status is authoritative even when representation headers are
             # malformed. Never let a rejected body leave an expired logical
             # session reusable.
+            self._mark_server_listener_gap()
             self._session_id = None
             self._cleanup_session_id = None
             self._cleanup_protocol_version = None
@@ -2001,6 +2398,7 @@ class HttpMcpSession(McpSession):
         if response.status_code == 404:
             # The session is gone (spec): poison the session so callers can't keep
             # using it, and drop the dead id so close() skips the doomed DELETE.
+            self._mark_server_listener_gap()
             self._session_id = None
             self._cleanup_session_id = None
             self._cleanup_protocol_version = None
@@ -2013,7 +2411,10 @@ class HttpMcpSession(McpSession):
                 sse_events=sse_events,
                 retain=False,
             )
-            raise _McpHttpStatusError("MCP HTTP session expired or was not found (HTTP 404).")
+            raise _McpHttpStatusError(
+                "MCP HTTP session expired or was not found (HTTP 404).",
+                status_code=404,
+            )
         if not 200 <= response.status_code < 300:
             body, source_complete = await _read_http_error_body(
                 response,
@@ -2033,7 +2434,8 @@ class HttpMcpSession(McpSession):
                 body = b""
                 source_complete = False
             raise _McpHttpStatusError(
-                f"MCP HTTP request failed with HTTP {response.status_code}: {detail}"
+                f"MCP HTTP request failed with HTTP {response.status_code}: {detail}",
+                status_code=response.status_code,
             )
 
     async def _delete_session(
@@ -2064,7 +2466,8 @@ class HttpMcpSession(McpSession):
             known_status_failure: _McpHttpStatusError | None = None
             if not 200 <= response.status_code < 300:
                 known_status_failure = _McpHttpStatusError(
-                    f"MCP HTTP request failed with HTTP {response.status_code}."
+                    f"MCP HTTP request failed with HTTP {response.status_code}.",
+                    status_code=response.status_code,
                 )
             try:
                 _validate_http_response_headers(response, limits=self.transport_limits)
@@ -2229,7 +2632,7 @@ def _decode_jsonrpc_bytes(data: bytes) -> dict[str, Any]:
 
 
 class _HttpCallBudget:
-    """Monotonic idle and total-deadline accounting for one HTTP exchange."""
+    """Monotonic idle and optional total-deadline accounting for an HTTP exchange."""
 
     __slots__ = (
         "_abandoned_tasks",
@@ -2240,20 +2643,28 @@ class _HttpCallBudget:
         "max_response_bytes",
     )
 
-    def __init__(self, limits: McpTransportLimits) -> None:
+    def __init__(
+        self,
+        limits: McpTransportLimits,
+        *,
+        enforce_total_deadline: bool = True,
+    ) -> None:
         self._loop = asyncio.get_running_loop()
         self._abandoned_tasks: set[asyncio.Future[Any]] = set()
         started_at = self._loop.time()
         self._last_activity = started_at
         self._idle_timeout_s = limits.idle_timeout_s
-        self._deadline = started_at + limits.total_call_timeout_s
+        self._deadline = (
+            started_at + limits.total_call_timeout_s if enforce_total_deadline else None
+        )
         self.max_response_bytes = limits.max_response_bytes
 
     def note_activity(self) -> None:
         self._last_activity = self._loop.time()
 
     def total_deadline_expired(self) -> bool:
-        return self._loop.time() >= self._deadline
+        deadline = self._deadline
+        return deadline is not None and self._loop.time() >= deadline
 
     def check_total_deadline(self) -> None:
         if self.total_deadline_expired():
@@ -2282,7 +2693,8 @@ class _HttpCallBudget:
         on_started: Callable[[], None] | None = None,
     ) -> _T:
         now = self._loop.time()
-        if now >= self._deadline:
+        deadline = self._deadline
+        if deadline is not None and now >= deadline:
             self._close_unstarted_awaitable(awaitable)
             raise McpCallDeadlineExceededError(
                 "MCP HTTP exchange exceeded its total call deadline."
@@ -2297,7 +2709,7 @@ class _HttpCallBudget:
         try:
             done, _ = await asyncio.wait(
                 {task},
-                timeout=min(self._deadline, idle_deadline) - now,
+                timeout=(idle_deadline if deadline is None else min(deadline, idle_deadline)) - now,
             )
         except asyncio.CancelledError:
             self._cancel_and_retain(task)
@@ -2324,7 +2736,7 @@ class _HttpCallBudget:
             return _unwrap_mcp_owned_task_result(task.result())
         self._cancel_and_retain(task)
         now = self._loop.time()
-        if now >= self._deadline:
+        if deadline is not None and now >= deadline:
             raise McpCallDeadlineExceededError(
                 "MCP HTTP exchange exceeded its total call deadline."
             )
@@ -2334,7 +2746,8 @@ class _HttpCallBudget:
         """Wait within this budget without cancelling or wrapping an existing owner."""
 
         now = self._loop.time()
-        if now >= self._deadline:
+        deadline = self._deadline
+        if deadline is not None and now >= deadline:
             raise McpCallDeadlineExceededError(
                 "MCP HTTP exchange exceeded its total call deadline."
             )
@@ -2342,7 +2755,7 @@ class _HttpCallBudget:
         idle_deadline = self._last_activity + self._idle_timeout_s
         done, _ = await asyncio.wait(
             {task},
-            timeout=min(self._deadline, idle_deadline) - now,
+            timeout=(idle_deadline if deadline is None else min(deadline, idle_deadline)) - now,
         )
         if done:
             if task.cancelled():
@@ -2353,7 +2766,7 @@ class _HttpCallBudget:
             self.check_wait_deadlines()
             return _unwrap_mcp_owned_task_result(task.result())
         now = self._loop.time()
-        if now >= self._deadline:
+        if deadline is not None and now >= deadline:
             raise McpCallDeadlineExceededError(
                 "MCP HTTP exchange exceeded its total call deadline."
             )
@@ -2372,6 +2785,7 @@ def _validate_http_response_headers(
     response: httpx.Response,
     *,
     limits: McpTransportLimits,
+    enforce_response_size: bool = True,
 ) -> None:
     content_encoding = ""
     encodings: list[str] = []
@@ -2388,7 +2802,10 @@ def _validate_http_response_headers(
         stripped = content_length.strip()
         if not stripped.isascii() or not stripped.isdecimal():
             raise McpProtocolError("MCP HTTP response had an invalid Content-Length header.")
-        if _decimal_exceeds_limit(stripped, limits.max_response_bytes):
+        if enforce_response_size and _decimal_exceeds_limit(
+            stripped,
+            limits.max_response_bytes,
+        ):
             raise McpResponseTooLargeError(
                 f"MCP HTTP response exceeded {limits.max_response_bytes} bytes."
             )
@@ -2411,7 +2828,7 @@ async def _iter_bounded_http_body(
     response: httpx.Response,
     *,
     budget: _HttpCallBudget,
-    max_response_bytes: int,
+    max_response_bytes: int | None,
 ) -> AsyncGenerator[bytes, None]:
     total_bytes = 0
     if response.is_stream_consumed:
@@ -2423,13 +2840,14 @@ async def _iter_bounded_http_body(
             if not chunk:
                 continue
             budget.note_activity()
-            total_bytes += len(chunk)
-            if total_bytes > max_response_bytes:
-                content = b""
-                chunk = b""
-                raise McpResponseTooLargeError(
-                    f"MCP HTTP response exceeded {max_response_bytes} bytes."
-                )
+            if max_response_bytes is not None:
+                total_bytes += len(chunk)
+                if total_bytes > max_response_bytes:
+                    content = b""
+                    chunk = b""
+                    raise McpResponseTooLargeError(
+                        f"MCP HTTP response exceeded {max_response_bytes} bytes."
+                    )
             try:
                 yield chunk
             finally:
@@ -2450,12 +2868,13 @@ async def _iter_bounded_http_body(
         if not chunk:
             continue
         budget.note_activity()
-        total_bytes += len(chunk)
-        if total_bytes > max_response_bytes:
-            chunk = b""
-            raise McpResponseTooLargeError(
-                f"MCP HTTP response exceeded {max_response_bytes} bytes."
-            )
+        if max_response_bytes is not None:
+            total_bytes += len(chunk)
+            if total_bytes > max_response_bytes:
+                chunk = b""
+                raise McpResponseTooLargeError(
+                    f"MCP HTTP response exceeded {max_response_bytes} bytes."
+                )
         try:
             yield chunk
         finally:
@@ -2702,6 +3121,109 @@ async def _read_json_response(
         data = b""
 
 
+async def _read_sse_server_messages(
+    response: httpx.Response,
+    *,
+    redactor: SecretRedactor,
+    limits: McpTransportLimits,
+    budget: _HttpCallBudget,
+    tools_list_changed_handler: Callable[[], None] | None,
+    event_id_handler: Callable[[str | None], None] | None,
+) -> None:
+    """Consume one bounded GET/SSE listener stream without retaining payloads."""
+
+    chunks = _iter_bounded_http_body(
+        response,
+        budget=budget,
+        # The listener retains no aggregate body. Applying the finite-response
+        # ceiling across its lifetime would eventually kill every healthy
+        # stream; the parser instead bounds each unfinished event below.
+        max_response_bytes=None,
+    )
+    data_lines: list[str] = []
+    event_id: str | None = None
+    event_id_seen = False
+    lines = _aiter_bounded_sse_lines(
+        chunks,
+        max_event_bytes=limits.max_message_bytes,
+    )
+    try:
+        async with aclosing(chunks), aclosing(lines):
+            async for line in lines:
+                try:
+                    if line == "":
+                        message = _sse_event_message(data_lines)
+                        data_lines = []
+                        if message is not None:
+                            event_redactor = (
+                                _mcp_server_listener_redactor(redactor, event_id)
+                                if event_id is not None and "method" in message and "id" in message
+                                else redactor
+                            )
+                            try:
+                                _dispatch_server_message(
+                                    message,
+                                    redactor=event_redactor,
+                                    tools_list_changed_handler=tools_list_changed_handler,
+                                )
+                            finally:
+                                event_redactor = None
+                                message.clear()
+                                message = {}
+                        if event_id_seen and event_id_handler is not None:
+                            event_id_handler(event_id)
+                        event_id = None
+                        event_id_seen = False
+                        continue
+                    if line.startswith("data:"):
+                        data = line[len("data:") :]
+                        if data.startswith(" "):
+                            data = data[1:]
+                        data_lines.append(data)
+                        data = ""
+                        continue
+                    if line == "id" or line.startswith("id:"):
+                        candidate = "" if line == "id" else line[len("id:") :]
+                        if candidate.startswith(" "):
+                            candidate = candidate[1:]
+                        event_id = _safe_sse_replay_event_id(candidate)
+                        event_id_seen = True
+                        candidate = ""
+                finally:
+                    line = ""
+    finally:
+        data_lines.clear()
+        event_id = None
+
+
+def _safe_sse_replay_event_id(value: str) -> str | None:
+    """Return an HTTP-header-safe SSE replay cursor, or clear replay authority."""
+
+    if not value:
+        return None
+    if (
+        not value.isascii()
+        or len(value) > _MAX_SSE_REPLAY_EVENT_ID_BYTES
+        or value != value.strip()
+        or any(ord(character) < 0x20 or ord(character) > 0x7E for character in value)
+    ):
+        return None
+    return value
+
+
+def _mcp_server_listener_redactor(
+    redactor: SecretRedactor,
+    *event_ids: str | None,
+) -> SecretRedactor:
+    """Treat opaque SSE replay authority as private diagnostic material."""
+
+    resolved = redactor
+    for event_id in event_ids:
+        if event_id:
+            resolved = resolved.with_secret(event_id)
+    return resolved
+
+
 async def _read_sse_response(
     response: httpx.Response,
     request_id: int,
@@ -2710,6 +3232,7 @@ async def _read_sse_response(
     redactor: SecretRedactor,
     limits: McpTransportLimits,
     budget: _HttpCallBudget,
+    tools_list_changed_handler: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Read the SSE stream incrementally and return the response matching the request.
 
@@ -2747,9 +3270,15 @@ async def _read_sse_response(
                                 "MCP HTTP response id did not match the request.",
                                 cleanup_protocol_version=cleanup_protocol_version,
                             )
-                        _reject_server_message(message, redactor=redactor)
-                        message.clear()
-                        message = {}
+                        try:
+                            _dispatch_server_message(
+                                message,
+                                redactor=redactor,
+                                tools_list_changed_handler=tools_list_changed_handler,
+                            )
+                        finally:
+                            message.clear()
+                            message = {}
                         continue
                     if line.startswith("data:"):
                         data = line[len("data:") :]
@@ -2885,10 +3414,11 @@ def _sse_event_message(data_lines: list[str]) -> dict[str, Any] | None:
         text = ""
 
 
-def _reject_server_message(
+def _dispatch_server_message(
     message: dict[str, Any],
     *,
     redactor: SecretRedactor,
+    tools_list_changed_handler: Callable[[], None] | None = None,
 ) -> None:
     # A server-initiated request (method + id) cannot be answered by this
     # request/response client, so fail loudly rather than leave the server waiting
@@ -2900,6 +3430,8 @@ def _reject_server_message(
         raise McpProtocolError(
             f"Cayu does not service MCP server requests over HTTP: {safe_method}."
         )
+    if _is_mcp_tools_list_changed_notification(message) and tools_list_changed_handler is not None:
+        tools_list_changed_handler()
 
 
 def _attach_http_cleanup_failure(

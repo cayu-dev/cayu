@@ -145,8 +145,13 @@ the ordinary execution-profile and durable capability-ceiling checks rather than
 an MCP-specific recovery path.
 Apply `McpManifestPolicy`, and test discovery limits, quarantine, stale snapshots,
 timeouts, naming collisions, and policy rejection without trusting server-provided
-descriptions as authority. Cayu does not yet consume MCP list-change notifications
-or negotiate MCP 2026-07-28.
+descriptions as authority. When an explicitly refresh-owned built-in session declares
+exact `tools.listChanged: true`, Cayu fences the dirty source and coalesces
+`notifications/tools/list_changed` into the same governed refresh path. Stdio uses
+its existing reader; Streamable HTTP also owns an optional GET/SSE listener, with
+HTTP 405 falling back to explicit refresh and never polling. See
+`examples/mcp_list_changed_refresh.py` for a deterministic credential-free server.
+MCP 2026-07-28 subscription and cache-hint capabilities remain deferred.
 
 ## sessions
 

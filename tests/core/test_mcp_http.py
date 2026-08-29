@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 from typing import Any
 
@@ -14,11 +15,15 @@ from cayu import (
     AgentSpec,
     CayuApp,
     HttpMcpClient,
+    McpIdleTimeoutError,
     McpManifestPolicy,
     McpManifestPolicyAction,
     McpProtocolError,
     McpServerSpec,
+    McpToolset,
     McpToolsetRefreshBlocked,
+    McpToolsetRefreshState,
+    McpTransportLimits,
     StdioMcpClient,
     connect_mcp_toolset,
 )
@@ -57,6 +62,7 @@ class FakeMcpHttpServer:
         timeout_on: str | None = None,
         sse_content_type: str = "text/event-stream",
         sse_extra_events: list[dict[str, Any]] | None = None,
+        sse_extra_events_on: str | None = None,
         sse_trailing_events: list[dict[str, Any]] | None = None,
         empty_sse_on: str | None = None,
         bad_jsonrpc_on: str | None = None,
@@ -66,6 +72,11 @@ class FakeMcpHttpServer:
         invalid_portable_canary: str = "",
         fold_sse: bool = False,
         paginate: bool = False,
+        tools_list_changed: bool = False,
+        get_sse_events: list[dict[str, Any]] | None = None,
+        get_sse_event_ids: list[str | None] | None = None,
+        get_status_after_first: int = 405,
+        tools_before_second_get: list[dict[str, Any]] | None = None,
     ) -> None:
         self.sse = sse
         self.paginate = paginate
@@ -81,6 +92,7 @@ class FakeMcpHttpServer:
         self.instructions = instructions
         self.timeout_on = timeout_on
         self.sse_extra_events = sse_extra_events
+        self.sse_extra_events_on = sse_extra_events_on
         self.sse_trailing_events = sse_trailing_events
         self.empty_sse_on = empty_sse_on
         self.bad_jsonrpc_on = bad_jsonrpc_on
@@ -88,6 +100,13 @@ class FakeMcpHttpServer:
         self.raw_json_document = raw_json_document
         self.invalid_portable_result_on = invalid_portable_result_on
         self.invalid_portable_canary = invalid_portable_canary
+        self.tools_list_changed = tools_list_changed
+        self.get_sse_events = get_sse_events
+        self.get_sse_event_ids = get_sse_event_ids
+        self.get_status_after_first = get_status_after_first
+        self.tools_before_second_get = tools_before_second_get
+        self.get_calls = 0
+        self.get_headers: list[dict[str, str]] = []
         self.calls: list[tuple[str, dict[str, str]]] = []  # (method, lowercased headers)
         self.tool_call_names: list[str] = []
         self.initialized = False
@@ -101,6 +120,26 @@ class FakeMcpHttpServer:
         if request.method == "DELETE":
             self.deleted = True
             return httpx.Response(200)
+        if request.method == "GET":
+            self.get_calls += 1
+            self.get_headers.append({key.lower(): value for key, value in request.headers.items()})
+            if self.get_sse_events is None or self.get_calls > 1:
+                if self.get_calls == 2 and self.tools_before_second_get is not None:
+                    self.tools = self.tools_before_second_get
+                return httpx.Response(self.get_status_after_first)
+            event_ids = self.get_sse_event_ids or [None] * len(self.get_sse_events)
+            if len(event_ids) != len(self.get_sse_events):
+                raise AssertionError("GET/SSE event ids must match the event count")
+            blocks = []
+            for event, event_id in zip(self.get_sse_events, event_ids, strict=True):
+                id_line = "" if event_id is None else f"id: {event_id}\n"
+                blocks.append(f"event: message\n{id_line}data: {json.dumps(event)}\n\n")
+            body = "".join(blocks).encode()
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body,
+            )
         body = json.loads(request.content)
         method = body.get("method")
         self.calls.append((method, {k.lower(): v for k, v in request.headers.items()}))
@@ -148,7 +187,9 @@ class FakeMcpHttpServer:
         if method == "initialize":
             result = {
                 "protocolVersion": self.protocol_version,
-                "capabilities": {},
+                "capabilities": (
+                    {"tools": {"listChanged": True}} if self.tools_list_changed else {}
+                ),
                 "serverInfo": {"name": "fake", "version": "1.0"},
             }
             if self.instructions is not None:
@@ -190,7 +231,11 @@ class FakeMcpHttpServer:
             # Optionally emit server->client notification events (no matching id)
             # before the response, to exercise the multi-event skip path.
             events: list[dict[str, Any]] = []
-            if self.sse_extra_events and method != "initialize":
+            if (
+                self.sse_extra_events
+                and method != "initialize"
+                and (self.sse_extra_events_on is None or self.sse_extra_events_on == method)
+            ):
                 events.extend(self.sse_extra_events)
             events.append(payload)
             # Optionally keep the stream open with events AFTER the response, to verify
@@ -218,10 +263,207 @@ class FakeMcpHttpServer:
         return next(headers for call_method, headers in self.calls if call_method == method)
 
 
+class BlockingMcpServerMessageStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        await self._release.wait()
+        if False:  # pragma: no cover - retain the async-iterator type
+            yield b""
+
+    async def aclose(self) -> None:
+        self.closed.set()
+        self._release.set()
+
+
+class BlockingGetMcpHttpServer(FakeMcpHttpServer):
+    def __init__(self) -> None:
+        super().__init__(tools_list_changed=True)
+        self.stream = BlockingMcpServerMessageStream()
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.get_calls += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=self.stream,
+            )
+        return super()._handle(request)
+
+
+class HealthyKeepaliveMcpServerMessageStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.chunks_sent = 0
+
+    async def __aiter__(self):
+        self.started.set()
+        while True:
+            await asyncio.sleep(0.005)
+            # Complete, individually bounded SSE comments provide continuous
+            # transport activity without carrying JSON-RPC authority.
+            self.chunks_sent += 1
+            yield b":" + (b"x" * 252) + b"\n\n"
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class HealthyKeepaliveGetMcpHttpServer(FakeMcpHttpServer):
+    def __init__(self) -> None:
+        super().__init__(tools_list_changed=True)
+        self.stream = HealthyKeepaliveMcpServerMessageStream()
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.get_calls += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=self.stream,
+            )
+        return super()._handle(request)
+
+
+class FiniteLargeGetMcpHttpServer(FakeMcpHttpServer):
+    def __init__(self) -> None:
+        super().__init__(tools_list_changed=True)
+        self.listener_body = (b":" + (b"x" * 60) + b"\n\n") * 20
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.get_calls += 1
+            if self.get_calls == 1:
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content=self.listener_body,
+                )
+            return httpx.Response(405)
+        return super()._handle(request)
+
+
+class ReplayCursorFailureMcpHttpServer(FakeMcpHttpServer):
+    def __init__(self, cursor: str) -> None:
+        super().__init__(tools_list_changed=True)
+        self.cursor = cursor
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.get_calls += 1
+            self.get_headers.append({key.lower(): value for key, value in request.headers.items()})
+            if self.get_calls == 1:
+                event = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/list_changed",
+                }
+                body = f"id: {self.cursor}\ndata: {json.dumps(event)}\n\n".encode()
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content=body,
+                )
+            raise RuntimeError(
+                f"extension echoed replay authority {request.headers['last-event-id']}"
+            )
+        return super()._handle(request)
+
+
+class StartupChangingGetMcpHttpServer(BlockingGetMcpHttpServer):
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.tools = [
+                *_DEFAULT_TOOLS,
+                {
+                    "name": "summarize",
+                    "description": "Summarize text.",
+                    "inputSchema": {"type": "object"},
+                },
+            ]
+        return super()._handle(request)
+
+
+class CancellationResistantMcpServerMessageStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.cancelled = asyncio.Event()
+        self.closed = asyncio.Event()
+        self._release = asyncio.Event()
+
+    async def __aiter__(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self._release.wait()
+            raise RuntimeError("cancellation-resistant listener read failed") from None
+        if False:  # pragma: no cover - retain the async-iterator type
+            yield b""
+
+    async def aclose(self) -> None:
+        self.closed.set()
+        self._release.set()
+
+
+class CancellationResistantGetMcpHttpServer(FakeMcpHttpServer):
+    def __init__(self) -> None:
+        super().__init__(tools_list_changed=True)
+        self.stream = CancellationResistantMcpServerMessageStream()
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.get_calls += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=self.stream,
+            )
+        return super()._handle(request)
+
+
+class RotatingGetMcpHttpServer(FakeMcpHttpServer):
+    def __init__(self, *, retryable_failures: int = 0) -> None:
+        super().__init__(tools_list_changed=True)
+        self.retryable_failures = retryable_failures
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.get_calls += 1
+            self.get_headers.append({key.lower(): value for key, value in request.headers.items()})
+            if self.get_calls <= self.retryable_failures:
+                return httpx.Response(503)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"",
+            )
+        return super()._handle(request)
+
+
 def _server_spec(**overrides: Any) -> McpServerSpec:
     overrides.setdefault("name", "remote")
     overrides.setdefault("url", "https://mcp.example/rpc")
     return McpServerSpec(**overrides)
+
+
+async def _wait_for_http_mcp_tools(app: CayuApp, *tool_names: str) -> None:
+    async with asyncio.timeout(2):
+        while tuple(app.get_agent("assistant").tools) != tool_names:
+            await asyncio.sleep(0.001)
+
+
+async def _wait_for_http_mcp_refresh_state(
+    toolset: McpToolset,
+    state: McpToolsetRefreshState,
+) -> None:
+    async with asyncio.timeout(2):
+        while toolset.refresh_state is not state:
+            await asyncio.sleep(0.001)
 
 
 def test_http_json_transport_lists_and_calls_tools() -> None:
@@ -340,6 +582,854 @@ def test_http_sse_skips_non_matching_events() -> None:
     tools, result = asyncio.run(run())
     assert tools[0].name == "search"
     assert result.content[0]["text"] == "ok"
+
+
+def test_http_interleaved_list_changed_notification_uses_shared_refresh_core() -> None:
+    server = FakeMcpHttpServer(
+        sse=True,
+        tools_list_changed=True,
+        sse_extra_events_on="resources/list",
+        sse_extra_events=[
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {"ignored": "server payload"},
+            }
+        ],
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-interleaved-list-changed"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        stale_adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
+        server.tools = [
+            *_DEFAULT_TOOLS,
+            {
+                "name": "summarize",
+                "description": "Summarize text.",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        try:
+            await toolset.session.list_resources()
+            assert toolset.refresh_state in {
+                McpToolsetRefreshState.DIRTY,
+                McpToolsetRefreshState.REFRESHING,
+                McpToolsetRefreshState.READY,
+            }
+            await _wait_for_http_mcp_tools(
+                app,
+                "mcp__remote__search",
+                "mcp__remote__summarize",
+            )
+            return stale_adapter._dispatch_authority_is_current()
+        finally:
+            await toolset.close()
+
+    assert asyncio.run(run()) is False
+
+
+def test_http_get_sse_list_changed_listener_uses_shared_refresh_core() -> None:
+    server = FakeMcpHttpServer(
+        tools_list_changed=True,
+        get_sse_events=[
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+            }
+        ],
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-get-list-changed"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        server.tools = [
+            *_DEFAULT_TOOLS,
+            {
+                "name": "summarize",
+                "description": "Summarize text.",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        try:
+            await _wait_for_http_mcp_tools(
+                app,
+                "mcp__remote__search",
+                "mcp__remote__summarize",
+            )
+            return server.get_calls
+        finally:
+            await toolset.close()
+
+    assert asyncio.run(run()) >= 1
+
+
+def test_http_get_sse_disconnect_fences_until_reconnect_reconciles_catalogue() -> None:
+    refreshed_tools = [
+        *_DEFAULT_TOOLS,
+        {
+            "name": "summarize",
+            "description": "Summarize text.",
+            "inputSchema": {"type": "object"},
+        },
+    ]
+    server = FakeMcpHttpServer(
+        tools_list_changed=True,
+        get_sse_events=[],
+        tools_before_second_get=refreshed_tools,
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-disconnect"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        stale_adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            await asyncio.sleep(0)
+            assert toolset.refresh_state is McpToolsetRefreshState.DIRTY
+            assert stale_adapter._dispatch_authority_is_current() is False
+            async with asyncio.timeout(2):
+                while tuple(app.get_agent("assistant").tools) != (
+                    "mcp__remote__search",
+                    "mcp__remote__summarize",
+                ):
+                    await asyncio.sleep(0.001)
+            list_calls = sum(method == "tools/list" for method, _ in server.calls)
+            return (
+                toolset.refresh_state,
+                list_calls,
+                server.get_calls,
+                stale_adapter._dispatch_authority_is_current(),
+            )
+        finally:
+            await toolset.close()
+
+    state, list_calls, get_calls, stale_is_current = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.READY
+    assert list_calls == 2
+    assert get_calls == 2
+    assert stale_is_current is False
+
+
+def test_http_get_sse_reconnect_sends_the_last_safe_event_id() -> None:
+    server = FakeMcpHttpServer(
+        tools_list_changed=True,
+        get_sse_events=[
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/list_changed",
+            }
+        ],
+        get_sse_event_ids=["catalogue-cursor-7"],
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-replay-cursor"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while server.get_calls < 2:
+                    await asyncio.sleep(0.001)
+            return server.get_headers
+        finally:
+            await toolset.close()
+
+    get_headers = asyncio.run(run())
+
+    assert "last-event-id" not in get_headers[0]
+    assert get_headers[1]["last-event-id"] == "catalogue-cursor-7"
+
+
+def test_http_listener_failure_does_not_publish_private_replay_cursor() -> None:
+    cursor = "private-replay-cursor-canary"
+    server = ReplayCursorFailureMcpHttpServer(cursor)
+
+    async def run() -> McpProtocolError:
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-private-replay-cursor"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while not session._closed:
+                    await asyncio.sleep(0.001)
+            with pytest.raises(McpProtocolError) as exc_info:
+                await app.refresh_mcp_toolset(toolset)
+            return exc_info.value
+        finally:
+            await toolset.close()
+
+    error = asyncio.run(run())
+
+    assert server.get_calls == 2
+    assert server.get_headers[1]["last-event-id"] == cursor
+    assert REDACTED_SECRET in str(error)
+    _assert_cayu_traceback_does_not_retain_secret(error, cursor)
+
+
+def test_http_get_sse_reconnect_backoff_resets_after_each_valid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cayu.mcp.http._MCP_SERVER_LISTENER_INITIAL_RECONNECT_DELAY_S", 0.02)
+    monkeypatch.setattr("cayu.mcp.http._MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S", 0.32)
+    reconnect_delays: list[float] = []
+
+    async def record_reconnect_delay(delay_s: float) -> None:
+        reconnect_delays.append(delay_s)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(
+        "cayu.mcp.http._sleep_before_mcp_server_listener_reconnect",
+        record_reconnect_delay,
+    )
+    server = RotatingGetMcpHttpServer(retryable_failures=3)
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-rotating-stream"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while server.get_calls < 6:
+                    await asyncio.sleep(0.001)
+        finally:
+            await toolset.close()
+
+    asyncio.run(run())
+
+    # Consecutive connection failures back off. A valid stream then proves
+    # connectivity even when the server rotates it immediately, so routine
+    # rotations restart from the initial delay instead of inheriting failures.
+    assert reconnect_delays[:5] == pytest.approx((0.02, 0.04, 0.08, 0.02, 0.02))
+
+
+def test_http_healthy_listener_outlives_finite_rpc_limits_without_polling() -> None:
+    server = HealthyKeepaliveGetMcpHttpServer()
+    limits = McpTransportLimits(
+        max_message_bytes=1024,
+        max_response_bytes=1024,
+        idle_timeout_s=1,
+        total_call_timeout_s=0.2,
+    )
+
+    async def run() -> tuple[bool, McpToolsetRefreshState, bool, int, int, bool, int]:
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-healthy-keepalive"),
+            client=HttpMcpClient(
+                transport=server.transport,
+                transport_limits=limits,
+            ),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+            await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
+            await asyncio.sleep(0.5)
+            return (
+                session._closed,
+                toolset.refresh_state,
+                adapter._dispatch_authority_is_current(),
+                server.get_calls,
+                sum(method == "tools/list" for method, _ in server.calls),
+                server.stream.closed.is_set(),
+                server.stream.chunks_sent,
+            )
+        finally:
+            await toolset.close()
+
+    closed, state, current, get_calls, list_calls, stream_closed, chunks_sent = asyncio.run(run())
+
+    assert closed is False
+    assert state is McpToolsetRefreshState.READY
+    assert current is True
+    assert get_calls == 1
+    assert list_calls == 2
+    assert stream_closed is False
+    assert chunks_sent * 255 > limits.max_response_bytes
+
+
+def test_http_finite_listener_body_uses_event_limits_not_rpc_aggregate_limit() -> None:
+    server = FiniteLargeGetMcpHttpServer()
+    limits = McpTransportLimits(
+        max_message_bytes=1024,
+        max_response_bytes=1024,
+        idle_timeout_s=1,
+        total_call_timeout_s=0.2,
+    )
+
+    async def run() -> tuple[bool, McpToolsetRefreshState, bool, int, int]:
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-finite-large-body"),
+            client=HttpMcpClient(
+                transport=server.transport,
+                transport_limits=limits,
+            ),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while (
+                    server.get_calls < 2
+                    or toolset.refresh_state is not McpToolsetRefreshState.READY
+                ):
+                    await asyncio.sleep(0.001)
+            return (
+                session._closed,
+                toolset.refresh_state,
+                adapter._dispatch_authority_is_current(),
+                server.get_calls,
+                sum(method == "tools/list" for method, _ in server.calls),
+            )
+        finally:
+            await toolset.close()
+
+    closed, state, current, get_calls, list_calls = asyncio.run(run())
+
+    assert len(server.listener_body) > limits.max_response_bytes
+    assert closed is False
+    assert state is McpToolsetRefreshState.READY
+    assert current is True
+    assert get_calls == 2
+    assert list_calls == 2
+
+
+@pytest.mark.parametrize(
+    "notification",
+    [
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/list_changed",
+            "params": {"ignored": True},
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+            "params": [],
+        },
+    ],
+)
+def test_http_unknown_or_malformed_notification_does_not_start_refresh_work(
+    notification: dict[str, Any],
+) -> None:
+    server = FakeMcpHttpServer(
+        sse=True,
+        tools_list_changed=True,
+        sse_extra_events_on="resources/list",
+        sse_extra_events=[notification],
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-unknown-notification"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
+            baseline_list_calls = sum(method == "tools/list" for method, _ in server.calls)
+            await toolset.session.list_resources()
+            await asyncio.sleep(0.1)
+            list_calls = sum(method == "tools/list" for method, _ in server.calls)
+            return toolset.refresh_state, baseline_list_calls, list_calls
+        finally:
+            await toolset.close()
+
+    state, baseline_list_calls, list_calls = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.READY
+    # Listener activation performs one reconciliation before async
+    # notification ownership becomes dispatchable.
+    assert baseline_list_calls == 2
+    assert list_calls == baseline_list_calls
+
+
+def test_http_get_405_keeps_manual_refresh_as_the_non_polling_fallback() -> None:
+    server = FakeMcpHttpServer(tools_list_changed=True)
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-unavailable"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        async with asyncio.timeout(2):
+            while (
+                server.get_calls < 1
+                or toolset.refresh_state is not McpToolsetRefreshState.READY
+                or sum(method == "tools/list" for method, _ in server.calls) < 2
+            ):
+                await asyncio.sleep(0.001)
+        server.tools = [
+            *_DEFAULT_TOOLS,
+            {
+                "name": "summarize",
+                "description": "Summarize text.",
+                "inputSchema": {"type": "object"},
+            },
+        ]
+        try:
+            await asyncio.sleep(0.1)
+            before = tuple(app.get_agent("assistant").tools)
+            refresh = await app.refresh_mcp_toolset(toolset)
+            after = tuple(app.get_agent("assistant").tools)
+            return before, after, refresh.status, server.get_calls
+        finally:
+            await toolset.close()
+
+    before, after, status, get_calls = asyncio.run(run())
+
+    assert before == ("mcp__remote__search",)
+    assert after == ("mcp__remote__search", "mcp__remote__summarize")
+    assert status == "accepted"
+    assert get_calls == 1
+
+
+def test_http_first_listener_activation_fences_and_reconciles_startup_gap() -> None:
+    server = StartupChangingGetMcpHttpServer()
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-startup-gap"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        stale_adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            assert toolset.refresh_state is McpToolsetRefreshState.DIRTY
+            assert stale_adapter._dispatch_authority_is_current() is False
+            await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+            await _wait_for_http_mcp_tools(
+                app,
+                "mcp__remote__search",
+                "mcp__remote__summarize",
+            )
+            return (
+                toolset.refresh_state,
+                sum(method == "tools/list" for method, _ in server.calls),
+                stale_adapter._dispatch_authority_is_current(),
+            )
+        finally:
+            await toolset.close()
+
+    state, list_calls, stale_is_current = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.READY
+    assert list_calls == 2
+    assert stale_is_current is False
+
+
+def test_http_listener_activation_rolls_back_before_failed_app_registration() -> None:
+    first_server = FakeMcpHttpServer(tools_list_changed=True)
+    occupied_server = FakeMcpHttpServer()
+
+    async def run():
+        first = await connect_mcp_toolset(
+            _server_spec(name="first", connection_id="first"),
+            client=HttpMcpClient(transport=first_server.transport),
+        )
+        occupied = await connect_mcp_toolset(
+            _server_spec(name="occupied", connection_id="occupied"),
+            client=HttpMcpClient(transport=occupied_server.transport),
+        )
+        occupied_app = CayuApp(enable_logging=False)
+        occupied_app.register_agent(
+            AgentSpec(name="occupied", model="fake-model"),
+            mcp_toolsets=(occupied,),
+        )
+        rejected_app = CayuApp(enable_logging=False)
+        try:
+            with pytest.raises(ValueError, match="only one CayuApp"):
+                rejected_app.register_agent(
+                    AgentSpec(name="rejected", model="fake-model"),
+                    mcp_toolsets=(first, occupied),
+                )
+            await asyncio.sleep(0)
+            first_session = first.session
+            assert isinstance(first_session, HttpMcpSession)
+            return (
+                first.refresh_state,
+                first._refresh_source.refresh_owner,
+                first_session._tools_list_changed_handler,
+                first_server.get_calls,
+            )
+        finally:
+            await first.close()
+            await occupied.close()
+
+    state, owner, handler, get_calls = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.READY
+    assert owner is None
+    assert handler is None
+    assert get_calls == 0
+
+
+def test_http_listener_start_does_not_block_synchronous_multi_agent_registration() -> None:
+    server = BlockingGetMcpHttpServer()
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-shared-registration"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="first", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        app.register_agent(
+            AgentSpec(name="second", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+            return tuple(app.get_agent("first").tools), tuple(app.get_agent("second").tools)
+        finally:
+            await toolset.close()
+
+    first_tools, second_tools = asyncio.run(run())
+
+    assert first_tools == ("mcp__remote__search",)
+    assert second_tools == first_tools
+
+
+def test_http_get_sse_server_request_fences_session_without_reconnect() -> None:
+    cursor = "private-server-request-event-id-canary"
+    server = FakeMcpHttpServer(
+        tools_list_changed=True,
+        get_sse_events=[
+            {
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": f"sampling/createMessage/{cursor}",
+                "params": {},
+            }
+        ],
+        get_sse_event_ids=[cursor],
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-server-request"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        stale_adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while not session._closed:
+                    await asyncio.sleep(0.001)
+            await asyncio.sleep(0.3)
+            with pytest.raises(McpProtocolError, match="server request") as exc_info:
+                await app.refresh_mcp_toolset(toolset)
+            return (
+                toolset.refresh_state,
+                stale_adapter._dispatch_authority_is_current(),
+                server.get_calls,
+                exc_info.value,
+            )
+        finally:
+            await toolset.close()
+
+    state, stale_is_current, get_calls, error = asyncio.run(run())
+
+    assert state in {
+        McpToolsetRefreshState.DIRTY,
+        McpToolsetRefreshState.QUARANTINED,
+    }
+    assert stale_is_current is False
+    assert get_calls == 1
+    assert REDACTED_SECRET in str(error)
+    _assert_cayu_traceback_does_not_retain_secret(error, cursor)
+
+
+def test_http_get_non_sse_success_fences_session_without_reconnect() -> None:
+    server = FakeMcpHttpServer(
+        tools_list_changed=True,
+        get_status_after_first=200,
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-invalid-representation"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while not session._closed:
+                    await asyncio.sleep(0.001)
+            await asyncio.sleep(0.3)
+            with pytest.raises(McpProtocolError, match="did not return text/event-stream"):
+                await app.refresh_mcp_toolset(toolset)
+            return toolset.refresh_state, server.get_calls
+        finally:
+            await toolset.close()
+
+    state, get_calls = asyncio.run(run())
+
+    assert state is McpToolsetRefreshState.DIRTY
+    assert get_calls == 1
+
+
+def test_http_get_404_fences_the_refreshable_source() -> None:
+    server = FakeMcpHttpServer(
+        tools_list_changed=True,
+        get_status_after_first=404,
+    )
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-session-expired"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            async with asyncio.timeout(2):
+                while toolset.refresh_state not in {
+                    McpToolsetRefreshState.DIRTY,
+                    McpToolsetRefreshState.QUARANTINED,
+                }:
+                    await asyncio.sleep(0.001)
+            return toolset.refresh_state, adapter._dispatch_authority_is_current()
+        finally:
+            await toolset.close()
+
+    state, current = asyncio.run(run())
+
+    assert state in {
+        McpToolsetRefreshState.DIRTY,
+        McpToolsetRefreshState.QUARANTINED,
+    }
+    assert current is False
+
+
+def test_http_fatal_post_timeout_fences_refresh_owned_catalogue_authority() -> None:
+    server = BlockingGetMcpHttpServer()
+
+    async def run() -> tuple[bool, McpToolsetRefreshState, bool]:
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-post-timeout"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        stale_adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+        await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
+        assert stale_adapter._dispatch_authority_is_current() is True
+        server.timeout_on = "tools/call"
+        try:
+            with pytest.raises(McpIdleTimeoutError):
+                await session.call_tool("search", {})
+            return (
+                session._closed,
+                toolset.refresh_state,
+                stale_adapter._dispatch_authority_is_current(),
+            )
+        finally:
+            await toolset.close()
+
+    assert asyncio.run(run()) == (
+        True,
+        McpToolsetRefreshState.DIRTY,
+        False,
+    )
+
+
+def test_http_post_404_fences_refresh_owned_catalogue_authority() -> None:
+    server = BlockingGetMcpHttpServer()
+
+    async def run() -> tuple[bool, McpToolsetRefreshState, bool]:
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-post-session-expired"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        stale_adapter = toolset.tools[0]
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+        await _wait_for_http_mcp_refresh_state(toolset, McpToolsetRefreshState.READY)
+        assert stale_adapter._dispatch_authority_is_current() is True
+        server.expire_after_init = True
+        try:
+            with pytest.raises(McpProtocolError, match="expired or was not found"):
+                await session.call_tool("search", {})
+            return (
+                session._closed,
+                toolset.refresh_state,
+                stale_adapter._dispatch_authority_is_current(),
+            )
+        finally:
+            await toolset.close()
+
+    assert asyncio.run(run()) == (
+        True,
+        McpToolsetRefreshState.DIRTY,
+        False,
+    )
+
+
+def test_http_get_sse_listener_is_cancelled_and_joined_on_toolset_close() -> None:
+    server = BlockingGetMcpHttpServer()
+
+    async def run():
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-close"),
+            client=HttpMcpClient(transport=server.transport),
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        await asyncio.wait_for(server.stream.started.wait(), timeout=1)
+        await asyncio.wait_for(toolset.close(), timeout=1)
+        return server.stream.closed.is_set()
+
+    assert asyncio.run(run()) is True
+
+
+def test_http_listener_settles_cancellation_resistant_reads_without_task_leaks() -> None:
+    server = CancellationResistantGetMcpHttpServer()
+    limits = McpTransportLimits(
+        max_message_bytes=1024,
+        max_response_bytes=2048,
+        idle_timeout_s=0.01,
+        total_call_timeout_s=0.05,
+    )
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        prior_exception_handler = loop.get_exception_handler()
+        loop_failures: list[dict[str, Any]] = []
+        loop.set_exception_handler(lambda _loop, context: loop_failures.append(context))
+        toolset = await connect_mcp_toolset(
+            _server_spec(connection_id="http-listener-resistant-read"),
+            client=HttpMcpClient(
+                transport=server.transport,
+                transport_limits=limits,
+            ),
+        )
+        session = toolset.session
+        assert isinstance(session, HttpMcpSession)
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            mcp_toolsets=(toolset,),
+        )
+        try:
+            await asyncio.wait_for(server.stream.cancelled.wait(), timeout=1)
+            async with asyncio.timeout(2):
+                while not session._closed:
+                    await asyncio.sleep(0.001)
+        finally:
+            await toolset.close()
+            for _ in range(3):
+                gc.collect()
+                await asyncio.sleep(0)
+            loop.set_exception_handler(prior_exception_handler)
+        return loop_failures, server.stream.closed.is_set()
+
+    loop_failures, stream_closed = asyncio.run(run())
+
+    assert loop_failures == []
+    assert stream_closed is True
 
 
 def test_http_empty_sse_raises() -> None:

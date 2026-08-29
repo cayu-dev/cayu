@@ -9408,10 +9408,54 @@ The first MCP implementation supports stdio servers:
   server-added tools; catalogue/profile continuation and dynamic-reference
   reconstruction still perform their ordinary fail-closed checks against the
   newly registered generation.
-- Manual refresh does not consume `notifications/tools/list_changed`, start a
-  listener, or poll. The current clients negotiate MCP through 2025-06-18;
-  legacy change-signal ownership and the MCP 2026-07-28
-  `subscriptions/listen`/cache-hint protocol remain separate capabilities.
+- For an explicitly registered complete source, exact initialize capability
+  `tools.listChanged: true` arms payload-free handling of
+  `notifications/tools/list_changed`. Static `tools=toolset.tools`
+  registrations, undeclared/malformed capabilities, and third-party sessions
+  without the internal lifecycle-owned handler remain manual-only. Receipt
+  synchronously changes the source to `dirty`, so old adapters cannot dispatch,
+  then coalesces a burst into the same trigger-independent
+  `refresh_mcp_toolset()` core. No server payload becomes authority.
+- A signal received during discovery or staged publication supersedes that
+  candidate before transport or application authority can commit. A failure
+  for the latest observed signal quarantines the source without an automatic
+  retry loop; a newer signal may retry, and explicit refresh remains available.
+  Notification refresh tasks are source-owned and are cancelled and joined by
+  toolset close.
+- Stdio observes signals on its existing bounded reader. If that reader observes
+  a signal after discovery but before an application claims refresh ownership,
+  the session retains one payload-free freshness marker. Installing ownership
+  synchronously reports a continuity gap, then reconciles after the synchronous
+  registration transaction commits; rollback cancels that activation and keeps
+  the marker for the next owner. Streamable HTTP observes exact signals
+  interleaved in POST/SSE responses and, while the source
+  is refresh-owned, uses one bounded session GET/SSE listener for asynchronous
+  server messages. Listener activation synchronously dirties the source after
+  registration and performs one reconciliation under the first valid stream;
+  consecutive synchronous agent registrations may finish against that fenced
+  activation snapshot, but it is not dispatchable. HTTP 405 performs the same
+  activation reconciliation before selecting an explicit-refresh fallback; it
+  is not a reason to poll. After establishment, loss of continuity synchronously
+  dirties the source, so no old adapter can dispatch while reconnect is pending.
+  Every reconnect performs one reconciliation while the new stream is live; a
+  reconnect that receives HTTP 405 performs the same final reconciliation before
+  selecting the manual-only fallback. Reconnects carry the last bounded,
+  HTTP-header-safe SSE event ID when the server supplied one. GET/SSE exchanges
+  register the exact entering response, body-read, stream-exit, and retained
+  settlement owners, so timeout, cancellation, and close neither orphan tasks nor
+  close the shared client ahead of transport work. Listener connection and body
+  reads remain idle-bounded and individual SSE events remain size-bounded. Once
+  established, the non-retaining stream does not inherit a finite RPC lifetime or
+  cumulative-response ceiling; a healthy stream therefore neither rotates nor
+  performs full catalogue refresh on a timer. Transient transport and retryable
+  HTTP failures reconnect with bounded backoff. Malformed events,
+  oversized events, unsupported server requests, permanent HTTP rejection, and
+  other protocol failures fence the logical HTTP session and expose a bounded,
+  secret-safe refresh diagnostic instead of being retried silently. A validated
+  stream resets transient reconnect backoff before any later continuity loss, so
+  routine stream rotation does not inherit failure history. The current
+  clients negotiate MCP through 2025-06-18. MCP 2026-07-28
+  `subscriptions/listen` and cache hints remain separate deferred capabilities.
 - Callers must close the toolset when the application or environment shuts down.
   Tool adapters intentionally reuse that initialized session instead of launching
   a fresh MCP process for every tool call.

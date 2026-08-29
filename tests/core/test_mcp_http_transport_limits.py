@@ -3388,6 +3388,21 @@ def test_http_expired_deadline_wins_over_completed_child_exception() -> None:
     assert isinstance(abandoned[0].exception(), RuntimeError)
 
 
+def test_http_continuous_budget_disables_only_the_total_deadline() -> None:
+    async def run() -> tuple[bool, int]:
+        budget = _HttpCallBudget(
+            _limits(idle_timeout_s=0.02, total_call_timeout_s=0.001),
+            enforce_total_deadline=False,
+        )
+        with pytest.raises(McpIdleTimeoutError):
+            await budget.wait(asyncio.Event().wait())
+        abandoned = budget.take_abandoned_tasks()
+        await asyncio.gather(*abandoned, return_exceptions=True)
+        return budget.total_deadline_expired(), len(abandoned)
+
+    assert asyncio.run(run()) == (False, 1)
+
+
 def test_http_deadline_before_response_headers_poisons_and_closes_client() -> None:
     secret = "mcp-http-late-handler-secret"
     handler_started = asyncio.Event()
