@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from tests.environments.sync_ownership_assertions import assert_sync_resources_owned
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 from tests.runners.lambda_microvm_harness import (
     ConformanceLambdaClient,
@@ -2648,7 +2649,7 @@ def test_egress_teardown_retains_sync_owner_until_runner_is_quiescent(
             await binding.finalize(bound, outcome="completed")
         assert not (source_root / "recreated.txt").exists()
         assert (source_root / "transient.txt").read_bytes() == b"first-sync"
-        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         with pytest.raises(ValueError, match="already bound by an active session"):
             await inner.bind(source, None, session_id="competing-session")
 
@@ -2658,7 +2659,7 @@ def test_egress_teardown_retains_sync_owner_until_runner_is_quiescent(
         await target.delete("transient.txt")
         await target.write_bytes("recreated.txt", b"retry-sync")
         await binding.finalize(bound, outcome="completed")
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
         assert (source_root / "state.txt").read_bytes() == b"retry-sync"
         assert not (source_root / "transient.txt").exists()
@@ -2757,7 +2758,7 @@ def test_egress_teardown_does_not_read_runner_bound_target_after_quiescence(
         await finalize_task
         assert runner.is_closed
         assert target.operations_after_close == 0
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -2851,7 +2852,7 @@ def test_egress_teardown_drains_dispatched_write_before_authoritative_sync(
         assert runner.is_closed
         assert target.operations_after_close == 0
         assert (source_root / "state.txt").read_bytes() == b"late-dispatched-write"
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3089,7 +3090,7 @@ def test_egress_teardown_retries_only_after_deferred_sync_command_settles(
         with pytest.raises(RuntimeError, match="sync command was interrupted"):
             await binding.finalize(bound, outcome="interrupted")
         assert not runner.is_closed
-        assert inner._fixed_target_owners == {"sync-command-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
 
         retry = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
         await asyncio.sleep(0)
@@ -3178,7 +3179,7 @@ def test_egress_teardown_retires_target_killed_by_command_cleanup(
             await binding.finalize(bound, outcome="interrupted")
         assert first_failure.value is sync_error
         assert runner.is_closed
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
         assert adapter.torn_down == 1
 
@@ -3282,7 +3283,7 @@ def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
             await binding.finalize(bound, outcome="interrupted")
         assert current_task.cancelling() == 0
         assert not runner.is_closed
-        assert inner._fixed_target_owners == {"uncertain-command-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
 
         # This explicit operator assertion is the only recovery path when a
         # runner reports deferred cleanup but supplies no settlement contract.
@@ -3430,11 +3431,11 @@ def test_cancelled_egress_teardown_retains_gate_until_dispatched_write_syncs(
         assert finalize_task.cancelled()
         assert runner.is_closed
         assert (source_root / "state.txt").read_bytes() == b"settled-after-cancellation"
-        assert inner._fixed_target_owners == {"cancelled-drain-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
 
         snapshot = await binding.finalize(bound, outcome="interrupted")
         assert snapshot is not None
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3498,13 +3499,13 @@ def test_egress_teardown_retains_sync_owner_until_post_cleanup_diagnostics_finis
             await binding.finalize(bound, outcome="completed")
         assert runner.is_closed
         assert target.operations_after_close == 0
-        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         assert bound.state_key in inner._states
 
         snapshot = await binding.finalize(bound, outcome="completed")
         assert snapshot is not None
         assert target.operations_after_close == 0
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3560,7 +3561,7 @@ def test_egress_teardown_retries_partial_runner_bound_copy_before_cleanup(
         assert not runner.is_closed
         assert (source_root / "a.txt").read_bytes() == b"new-a"
         assert (source_root / "b.txt").read_bytes() == b"old-b"
-        assert inner._fixed_target_owners == {"partial-copy-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         assert bound.state_key in inner._states
         with pytest.raises(ValueError, match="already bound by an active session"):
             await SyncBinding(target_workspace=target).bind(
@@ -3576,7 +3577,7 @@ def test_egress_teardown_retries_partial_runner_bound_copy_before_cleanup(
         assert target.operations_after_close == 0
         assert (source_root / "a.txt").read_bytes() == b"new-a"
         assert (source_root / "b.txt").read_bytes() == b"new-b"
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3632,7 +3633,7 @@ def test_egress_teardown_retries_partial_runner_bound_delete_before_cleanup(
         assert not runner.is_closed
         assert not (source_root / "a.txt").exists()
         assert (source_root / "b.txt").exists()
-        assert inner._fixed_target_owners == {"partial-delete-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         assert bound.state_key in inner._states
 
         source.fail_delete_call = None
@@ -3642,7 +3643,7 @@ def test_egress_teardown_retries_partial_runner_bound_delete_before_cleanup(
         assert target.operations_after_close == 0
         assert not (source_root / "a.txt").exists()
         assert not (source_root / "b.txt").exists()
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3700,13 +3701,13 @@ def test_egress_teardown_retains_readable_target_after_sync_failure(
         assert exc_info.value is sync_error
         assert not runner.is_closed
         assert target.operations_after_close == 0
-        assert inner._fixed_target_owners == {"failed-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         assert bound.state_key in inner._states
 
         assert await binding.finalize(bound, outcome="completed") is not None
         assert runner.is_closed
         assert target.operations_after_close == 0
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3759,13 +3760,13 @@ def test_egress_teardown_retains_sync_owner_after_revocation_cancellation(
             await finalize_task
         assert finalize_task.cancelling() == 0
         assert finalize_task.cancelled()
-        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         assert bound.state_key in inner._states
         with pytest.raises(ValueError, match="already bound by an active session"):
             await inner.bind(source, None, session_id="competing-session")
 
         await binding.finalize(bound, outcome="completed")
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3836,14 +3837,14 @@ def test_nested_egress_teardown_retains_sync_owner_until_outer_runner_is_quiesce
         await outer_cleanup_started.wait()
         assert inner_runner.is_closed
         assert not outer_runner.is_closed
-        assert sync_binding._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         with pytest.raises(ValueError, match="already bound by an active session"):
             await sync_binding.bind(source, None, session_id="competing-session")
 
         allow_outer_cleanup.set()
         await finalize_task
         assert outer_runner.is_closed
-        assert sync_binding._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert sync_binding._states == {}
 
     asyncio.run(run())
@@ -3893,13 +3894,13 @@ def test_egress_teardown_defers_no_sync_back_release_until_runner_is_quiescent(
 
         with pytest.raises(RuntimeError, match="runner still live"):
             await binding.finalize(bound, outcome=outcome)
-        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         assert inner._states[bound.state_key].defer_finalize_release
         with pytest.raises(ValueError, match="already bound by an active session"):
             await inner.bind(source, None, session_id="competing-session")
 
         await binding.finalize(bound, outcome=outcome)
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
         assert inner._states == {}
 
     asyncio.run(run())
@@ -3957,7 +3958,13 @@ def test_app_lazily_retries_retained_egress_cleanup_before_new_environment_work(
                 )
             )
         ]
-        assert inner._fixed_target_owners
+        generation = next(iter(inner._states))
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
         assert (
             "sess_retained_egress_cleanup" in app._environment_lifecycle._active_environment_setups
         )
@@ -3980,7 +3987,12 @@ def test_app_lazily_retries_retained_egress_cleanup_before_new_environment_work(
         # its final harvest when the unrelated run returns.
         assert adapter.finalize_calls == 2
         assert await app.drain_environment_cleanups(timeout_s=0.2) is True
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=False,
+        )
         assert inner._states == {}
         assert (
             "sess_retained_egress_cleanup"
@@ -6874,10 +6886,10 @@ def test_managed_runner_rejects_second_stateful_binding_before_inner_mutation(
                 session_id="second-managed-binding",
             )
         assert target_factory_calls == 1
-        assert inner._fixed_target_owners == {"single-owner-target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
 
         await binding.finalize(bound, outcome="completed")
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
 
     asyncio.run(run())
 
@@ -6970,14 +6982,20 @@ def test_inflight_binding_admission_blocks_runner_release_until_quiescence_is_ar
         with pytest.raises(TimeoutError, match="binding lifecycle boundary"):
             async with asyncio.timeout(0.2):
                 await finalizer
-        assert inner._fixed_target_owners
+        generation = next(iter(inner._states))
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
         assert adapter.binding_finalize_calls == 0
 
         allow_bind_return.set()
         bound = await bind_task
         await binding.finalize(bound, outcome="interrupted")
         assert adapter.binding_finalize_calls == 1
-        assert inner._fixed_target_owners == {}
+        assert_sync_resources_owned(bound, expected=False)
 
     asyncio.run(run())
 

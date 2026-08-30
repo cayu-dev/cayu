@@ -3007,7 +3007,7 @@ def test_late_secret_revision_fails_closed_before_tool_result_publication(
     handle = InvocationRunnerHandle(
         runner_type(),
         redactor_snapshot_provider=tracker.snapshot,
-        ambiguous_capture_observer=tracker.record_ambiguous_runner_capture,
+        ambiguous_capture_observer=tracker.record_ambiguous_output_capture,
     )
 
     class LateSecretTool(Tool):
@@ -3062,7 +3062,7 @@ def test_pending_secret_resolution_seals_runner_output_and_cannot_publish_late_s
     )
     tracker = InvocationSecretTracker(SecretRedactor())
     token = tracker.begin_resolution()
-    tracker.record_ambiguous_runner_capture(0)
+    tracker.record_ambiguous_output_capture(0)
 
     publication = tracker.seal_for_publication()
 
@@ -3088,7 +3088,7 @@ def test_duplicate_secret_resolution_does_not_stale_ambiguous_capture() -> None:
     assert tracker.snapshot().revision == 0
     assert tracker.snapshot().redactor is initial
 
-    tracker.record_ambiguous_runner_capture(0)
+    tracker.record_ambiguous_output_capture(0)
     tracker.record(
         ResolvedSecret(
             name="second_alias",
@@ -3115,7 +3115,7 @@ def test_only_genuinely_new_secret_stales_ambiguous_capture() -> None:
         )
     )
     assert tracker.snapshot().revision == 1
-    tracker.record_ambiguous_runner_capture(1)
+    tracker.record_ambiguous_output_capture(1)
     tracker.record(
         ResolvedSecret(
             name="first_alias",
@@ -3142,7 +3142,7 @@ def test_duplicate_secret_after_bounded_capture_preserves_safe_tool_result() -> 
     handle = InvocationRunnerHandle(
         _LateSecretRunner(),
         redactor_snapshot_provider=tracker.snapshot,
-        ambiguous_capture_observer=tracker.record_ambiguous_runner_capture,
+        ambiguous_capture_observer=tracker.record_ambiguous_output_capture,
     )
 
     class DuplicateSecretTool(Tool):

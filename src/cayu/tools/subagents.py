@@ -83,8 +83,6 @@ SUBAGENT_CANCEL_CLEANUP_TIMEOUT_S = 10.0
 # child every 50ms wastes store round-trips. Start responsive, then back off.
 SUBAGENT_RESULT_POLL_MIN_INTERVAL_S = 0.05
 SUBAGENT_RESULT_POLL_MAX_INTERVAL_S = 1.0
-# Retained for backward compatibility with callers importing the old name.
-SUBAGENT_RESULT_POLL_INTERVAL_S = SUBAGENT_RESULT_POLL_MIN_INTERVAL_S
 # Page size for enumerating a parent's background children. ``SessionQuery.limit``
 # caps at 1000; we keyset-paginate rather than truncate at a single page.
 _SUBAGENT_CHILD_LIST_PAGE_SIZE = 1000

@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
+from tests.environments.sync_ownership_assertions import assert_sync_resources_owned
 
 from cayu import (
     AgentSpec,
@@ -227,11 +228,11 @@ def test_sync_binding_partial_finalize_failure_is_durable_and_runtime_abandons(
         # abort therefore abandons this exact generation instead of leaking the
         # fixed target for the lifetime of the app.
         assert binding._states == {}
-        assert binding._fixed_target_owners == {}
         rebound = await binding.bind(source, None, session_id="workspace-sync-rebind")
+        assert_sync_resources_owned(rebound, expected=True)
         binding.abandon(rebound)
+        assert_sync_resources_owned(rebound, expected=False)
         assert binding._states == {}
-        assert binding._fixed_target_owners == {}
         return events, partial_source, durable_session, durable_events
 
     events, partial_source, session, durable_events = asyncio.run(exercise_contract())
@@ -277,7 +278,7 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
 ) -> None:
     store = FailingFinalizeEvidenceStore()
     sink = InMemoryEventSink()
-    app, binding, source, _target, target_root = _sync_durability_test_app(
+    app, binding, source, target, target_root = _sync_durability_test_app(
         tmp_path,
         store,
         event_sink=sink,
@@ -305,8 +306,14 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
         # not replaced during the same unwind.
         assert len(store.finalize_evidence_attempt_ids) == 1
         assert len(set(store.finalize_evidence_attempt_ids)) == 1
-        assert binding._fixed_target_owners
         assert binding._states
+        generation = next(iter(binding._states))
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
         assert "sync-durability-session" in app._environment_lifecycle._active_environment_setups
 
         target_before_rebind = {
@@ -335,7 +342,12 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
         assert events[-1].type == EventType.SESSION_COMPLETED
         assert len(store.finalize_evidence_attempt_ids) == 2
         assert len(set(store.finalize_evidence_attempt_ids)) == 1
-        assert binding._fixed_target_owners == {}
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=False,
+        )
         assert binding._states == {}
         assert (
             "sync-durability-session" not in app._environment_lifecycle._active_environment_setups
@@ -358,7 +370,9 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
         assert [event.id for event in private_sink_failures] == [finalize_failures[0].id]
 
         rebound = await binding.bind(source, None, session_id="successful-rebind")
+        assert_sync_resources_owned(rebound, expected=True)
         binding.abandon(rebound)
+        assert_sync_resources_owned(rebound, expected=False)
 
     asyncio.run(exercise_contract())
 
@@ -384,7 +398,6 @@ def test_sync_binding_releases_owner_after_finalize_failure_commit_is_reconciled
         assert source.failed_writes == 1
         assert store.finalize_evidence_attempt_ids
         assert len(set(store.finalize_evidence_attempt_ids)) == 1
-        assert binding._fixed_target_owners == {}
         assert binding._states == {}
         assert (
             "sync-durability-reconciled"
@@ -400,7 +413,9 @@ def test_sync_binding_releases_owner_after_finalize_failure_commit_is_reconciled
         assert events[-1].type == EventType.SESSION_COMPLETED
 
         rebound = await binding.bind(source, None, session_id="reconciled-rebind")
+        assert_sync_resources_owned(rebound, expected=True)
         binding.abandon(rebound)
+        assert_sync_resources_owned(rebound, expected=False)
 
     asyncio.run(exercise_contract())
 
@@ -409,7 +424,7 @@ def test_concurrent_lazy_cleanup_sweeps_cannot_release_pending_sync_owner_early(
     tmp_path: Path,
 ) -> None:
     store = FailingFinalizeEvidenceStore()
-    app, binding, _source, _target, _target_root = _sync_durability_test_app(tmp_path, store)
+    app, binding, source, target, _target_root = _sync_durability_test_app(tmp_path, store)
 
     async def exercise_contract() -> None:
         with pytest.raises(OSError, match="forced sync write failure"):
@@ -440,7 +455,13 @@ def test_concurrent_lazy_cleanup_sweeps_cannot_release_pending_sync_owner_early(
             EventType.INTERACTION_STARTED,
             EventType.INTERACTION_COMPLETED,
         ]
-        assert binding._fixed_target_owners
+        generation = next(iter(binding._states))
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
 
         store.fail_finalize_evidence = False
         store.block_finalize_evidence = True
@@ -449,7 +470,12 @@ def test_concurrent_lazy_cleanup_sweeps_cannot_release_pending_sync_owner_early(
         )
         await store.finalize_evidence_append_started.wait()
         await app._environment_lifecycle._settle_retained_environment_cleanups()
-        assert binding._fixed_target_owners
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
         assert binding._states
         retained = app._environment_lifecycle._active_environment_setups[
             "sync-concurrent-settlement"
@@ -461,7 +487,12 @@ def test_concurrent_lazy_cleanup_sweeps_cannot_release_pending_sync_owner_early(
         store.allow_finalize_evidence_append.set()
         await first_sweep
         await settlement_task
-        assert binding._fixed_target_owners == {}
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=False,
+        )
         assert binding._states == {}
         assert len(store.finalize_evidence_attempt_ids) == 2
         assert len(set(store.finalize_evidence_attempt_ids)) == 1
@@ -473,7 +504,7 @@ def test_lazy_cleanup_sweep_keeps_owned_settlement_alive_after_trigger_cancellat
     tmp_path: Path,
 ) -> None:
     store = FailingFinalizeEvidenceStore()
-    app, binding, _source, _target, _target_root = _sync_durability_test_app(tmp_path, store)
+    app, binding, source, target, _target_root = _sync_durability_test_app(tmp_path, store)
 
     async def exercise_contract() -> None:
         with pytest.raises(OSError, match="forced sync write failure"):
@@ -487,7 +518,13 @@ def test_lazy_cleanup_sweep_keeps_owned_settlement_alive_after_trigger_cancellat
                     )
                 )
             ]
-        assert binding._fixed_target_owners
+        generation = next(iter(binding._states))
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
 
         store.fail_finalize_evidence = False
         store.block_finalize_evidence = True
@@ -510,7 +547,12 @@ def test_lazy_cleanup_sweep_keeps_owned_settlement_alive_after_trigger_cancellat
         with pytest.raises(asyncio.CancelledError, match="stop cleanup trigger"):
             await asyncio.wait_for(trigger_task, timeout=1)
         assert trigger_task.cancelled()
-        assert binding._fixed_target_owners
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=True,
+        )
         retained = app._environment_lifecycle._active_environment_setups[
             "sync-cancelled-settlement"
         ]
@@ -520,7 +562,12 @@ def test_lazy_cleanup_sweep_keeps_owned_settlement_alive_after_trigger_cancellat
 
         store.allow_finalize_evidence_append.set()
         await settlement_task
-        assert binding._fixed_target_owners == {}
+        assert_sync_resources_owned(
+            source,
+            target,
+            generation=generation,
+            expected=False,
+        )
         assert binding._states == {}
         assert len(store.finalize_evidence_attempt_ids) == 2
         assert len(set(store.finalize_evidence_attempt_ids)) == 1

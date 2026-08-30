@@ -1287,10 +1287,6 @@ class SyncBinding(WorkspaceBinding):
             )
         self._state_lock = threading.Lock()
         self._states: dict[str, _SyncBindingState] = {}
-        # Retained as a target-oriented compatibility diagnostic for existing callers. The
-        # authoritative source-and-target exclusion registry is process-wide and keyed by
-        # Workspace.resource_key.
-        self._fixed_target_owners: dict[str, str] = {}
 
     async def bind(
         self,
@@ -1517,8 +1513,6 @@ class SyncBinding(WorkspaceBinding):
                     lambda: _run_sync_target_provisioner(target_provision),
                     operation="SyncBinding target provisioning",
                 )
-            with self._state_lock:
-                self._fixed_target_owners[target.id] = state_key
             source_paths = await _list_workspace_paths(
                 workspace,
                 self.pattern,
@@ -1612,10 +1606,6 @@ class SyncBinding(WorkspaceBinding):
             # A failed bind must not leak either a provisional source claim or a promoted pair (the
             # state that would release it was never stored). Success keeps both resources until the
             # bind's state is dropped.
-            if target is not None:
-                with self._state_lock:
-                    if self._fixed_target_owners.get(target.id) == state_key:
-                        del self._fixed_target_owners[target.id]
             if source_resource_key is not None:
                 if target_resource_key is None:
                     _release_sync_resource(source_resource_key, generation=state_key)
@@ -1668,8 +1658,6 @@ class SyncBinding(WorkspaceBinding):
                 generation=state_key,
             )
             del self._states[state_key]
-            if self._fixed_target_owners.get(state.target_id) == state_key:
-                del self._fixed_target_owners[state.target_id]
         return ownership
 
     def _validate_lifecycle_bound_result(
@@ -1932,14 +1920,11 @@ class SyncBinding(WorkspaceBinding):
             ):
                 raise RuntimeError("SyncBinding lost resource ownership during bind.")
             self._states[state_key] = state
-            self._fixed_target_owners[state.target_id] = state_key
 
     def _remove_state_locked(self, state_key: str) -> None:
         """Pop one state and release both reservations held by its exact generation."""
         state = self._states.pop(state_key, None)
         if state is not None:
-            if self._fixed_target_owners.get(state.target_id) == state_key:
-                del self._fixed_target_owners[state.target_id]
             _release_sync_resources(
                 state.source_resource_key,
                 state.target_resource_key,

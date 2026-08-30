@@ -207,11 +207,6 @@ class InvocationSecretTracker:
             raise RuntimeError("Output capture completed after tool publication.")
         self._ambiguous_capture_revisions.append(revision)
 
-    def record_ambiguous_runner_capture(self, revision: int) -> None:
-        """Compatibility alias for runner-specific capture callers."""
-
-        self.record_ambiguous_output_capture(revision)
-
     def seal_for_publication(self) -> InvocationPublicationSnapshot:
         """Freeze secret registration and classify revision-stale bounded captures."""
 

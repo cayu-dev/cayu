@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.environments.sync_ownership_assertions import assert_sync_resources_owned
 
 import cayu.environments.bindings as bindings_module
 from cayu.environments import (
@@ -1775,7 +1776,7 @@ def test_sync_binding_rejects_substituted_source_before_real_filesystem_write(
         assert (source_root / "a.txt").read_text(encoding="utf-8") == "before"
         assert not (substituted_root / "a.txt").exists()
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
 
         await binding.finalize(bound, outcome="completed")
 
@@ -1784,7 +1785,6 @@ def test_sync_binding_rejects_substituted_source_before_real_filesystem_write(
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "after"
     assert not (substituted_root / "a.txt").exists()
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_rejects_substituted_target_before_generation_release(tmp_path) -> None:
@@ -1808,13 +1808,51 @@ def test_sync_binding_rejects_substituted_target_before_generation_release(tmp_p
             await binding.finalize(forged, outcome="completed")
 
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         binding.abandon(bound)
 
     asyncio.run(run())
 
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
+
+
+@pytest.mark.parametrize("released_resource", ("source", "target"))
+def test_released_ownership_assertion_rejects_one_sided_generation_leak(
+    tmp_path: Path,
+    released_resource: str,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    source_key = source.resource_key
+    target_key = target.resource_key
+    assert source_key is not None
+    assert target_key is not None
+    generation = f"one-sided-{released_resource}-release"
+
+    bindings_module._reserve_sync_resources(
+        source,
+        target,
+        source_resource_key=source_key,
+        target_resource_key=target_key,
+        generation=generation,
+    )
+    try:
+        released_key = source_key if released_resource == "source" else target_key
+        bindings_module._release_sync_resource(released_key, generation=generation)
+
+        with pytest.raises(AssertionError):
+            assert_sync_resources_owned(
+                source,
+                target,
+                generation=generation,
+                expected=False,
+            )
+    finally:
+        _release_sync_resources(source_key, target_key, generation=generation)
 
 
 @pytest.mark.parametrize(
@@ -1857,7 +1895,7 @@ def test_sync_binding_lifecycle_rejects_substituted_resource_ownership(
                 binding._requires_mutation_quiescence(forged)
 
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         binding.abandon(bound)
 
     asyncio.run(run())
@@ -1885,7 +1923,7 @@ def test_sync_binding_rejects_concurrent_bind_on_fixed_target(tmp_path) -> None:
     bound = asyncio.run(run())
     # The reservation was taken before any mutating await, so the rejected bind never touched the
     # target, and sess_a's reservation is still held.
-    assert binding._fixed_target_owners == {"target": bound.state_key}
+    assert_sync_resources_owned(bound, expected=True)
 
 
 def test_sync_binding_reserves_fixed_target_before_mutating_await(tmp_path) -> None:
@@ -1910,7 +1948,7 @@ def test_sync_binding_reserves_fixed_target_before_mutating_await(tmp_path) -> N
         return await first_task
 
     bound = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": bound.state_key}
+    assert_sync_resources_owned(bound, expected=True)
 
 
 def test_sync_binding_rejects_concurrent_reuse_of_source_before_target_mutation(
@@ -2406,13 +2444,12 @@ def test_sync_binding_cancellation_releases_only_inflight_owner(tmp_path) -> Non
         assert cancelled_task.cancelling() == 1
         assert cancelled_task.cancelled()
         assert binding._states == {}
-        assert binding._fixed_target_owners == {}
 
         source.block_list = False
         return await binding.bind(source, None, session_id="sess_retry")
 
     rebound = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": rebound.state_key}
+    assert_sync_resources_owned(rebound, expected=True)
 
 
 def test_sync_binding_bind_cancellation_waits_for_dispatched_delete(tmp_path) -> None:
@@ -2435,7 +2472,6 @@ def test_sync_binding_bind_cancellation_waits_for_dispatched_delete(tmp_path) ->
         cancelled_task.cancel("stop old bind")
         await asyncio.sleep(0)
         assert not cancelled_task.done()
-        assert binding._fixed_target_owners
         with pytest.raises(ValueError, match="already bound by an active session"):
             await binding.bind(source, None, session_id="sess_competing")
 
@@ -2445,7 +2481,6 @@ def test_sync_binding_bind_cancellation_waits_for_dispatched_delete(tmp_path) ->
         assert cancelled_task.cancelling() == 1
         assert cancelled_task.cancelled()
         assert binding._states == {}
-        assert binding._fixed_target_owners == {}
 
         target.block_delete = False
         rebound = await binding.bind(source, None, session_id="sess_retry")
@@ -2453,7 +2488,7 @@ def test_sync_binding_bind_cancellation_waits_for_dispatched_delete(tmp_path) ->
         return rebound
 
     rebound = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": rebound.state_key}
+    assert_sync_resources_owned(rebound, expected=True)
 
 
 def test_sync_binding_allows_sequential_reuse_of_fixed_target(tmp_path) -> None:
@@ -2473,7 +2508,7 @@ def test_sync_binding_allows_sequential_reuse_of_fixed_target(tmp_path) -> None:
         return await binding.bind(source, None, session_id="sess_b")
 
     rebound = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": rebound.state_key}
+    assert_sync_resources_owned(rebound, expected=True)
 
 
 def test_sync_binding_abandon_releases_fixed_target(tmp_path) -> None:
@@ -2493,7 +2528,7 @@ def test_sync_binding_abandon_releases_fixed_target(tmp_path) -> None:
         return await binding.bind(source, None, session_id="sess_b")
 
     rebound = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": rebound.state_key}
+    assert_sync_resources_owned(rebound, expected=True)
 
 
 def test_sync_binding_factory_allows_unrelated_resource_pairs(tmp_path) -> None:
@@ -2535,7 +2570,6 @@ def test_sync_binding_factory_allows_unrelated_resource_pairs(tmp_path) -> None:
 
     asyncio.run(run())
     assert len(made) == 2
-    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_factory_and_fixed_target_share_resource_registry(tmp_path) -> None:
@@ -2704,10 +2738,9 @@ def test_sync_binding_releases_fixed_target_when_bind_fails(tmp_path) -> None:
         with pytest.raises(RuntimeError, match="clear failed"):
             await binding.bind(source, None, session_id="sess_fail")
         # The failed bind released its reservation, so a retry can bind the same target.
-        assert binding._fixed_target_owners == {}
         target.fail_clear = False
         rebound = await binding.bind(source, None, session_id="sess_retry")
-        assert binding._fixed_target_owners == {"target": rebound.state_key}
+        assert_sync_resources_owned(rebound, expected=True)
 
     asyncio.run(run())
 
@@ -2751,7 +2784,7 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
             await binding.finalize(bound, outcome="completed")
         assert len(binding._states) == 1
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         with pytest.raises(ValueError, match="already bound by an active session"):
             await SyncBinding(target_workspace=alternate_target).bind(
                 source,
@@ -2829,7 +2862,6 @@ def test_sync_binding_deferred_finalize_advances_path_baselines(tmp_path) -> Non
 
     asyncio.run(run())
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_finalization_excludes_other_lifecycle_operations(tmp_path) -> None:
@@ -2862,7 +2894,7 @@ def test_sync_binding_finalization_excludes_other_lifecycle_operations(tmp_path)
         return await binding.bind(source, None, session_id="sess_waiting")
 
     rebound = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": rebound.state_key}
+    assert_sync_resources_owned(rebound, expected=True)
 
 
 def test_sync_binding_finalization_cancellation_restores_owner_for_retry(tmp_path) -> None:
@@ -2892,7 +2924,7 @@ def test_sync_binding_finalization_cancellation_restores_owner_for_retry(tmp_pat
         assert finalize_task.cancelling() == 1
         assert finalize_task.cancelled()
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         with pytest.raises(ValueError, match="already bound by an active session"):
             await SyncBinding(target_workspace=alternate_target).bind(
                 source,
@@ -2909,7 +2941,6 @@ def test_sync_binding_finalization_cancellation_restores_owner_for_retry(tmp_pat
 
     asyncio.run(run())
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_finalize_cancellation_waits_for_dispatched_write(tmp_path) -> None:
@@ -2946,14 +2977,13 @@ def test_sync_binding_finalize_cancellation_waits_for_dispatched_write(tmp_path)
         assert finalize_task.cancelling() == 1
         assert finalize_task.cancelled()
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
 
         source.block_write = False
         await binding.finalize(bound, outcome="completed")
 
     asyncio.run(run())
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "retry-write"
 
 
@@ -2980,7 +3010,7 @@ def test_sync_binding_preserves_cancellation_and_late_mutation_failure(tmp_path)
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await finalize_task
         assert binding._states[bound.state_key].phase == "active"
-        assert binding._fixed_target_owners == {"target": bound.state_key}
+        assert_sync_resources_owned(bound, expected=True)
         binding.abandon(bound)
         return exc_info.value
 
@@ -2990,7 +3020,6 @@ def test_sync_binding_preserves_cancellation_and_late_mutation_failure(tmp_path)
     assert str(failure.exceptions[0]) == "cancel while writing"
     assert failure.exceptions[1] is mutation_error
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_stale_cleanup_cannot_release_new_owner(tmp_path) -> None:
@@ -3034,7 +3063,7 @@ def test_sync_binding_stale_cleanup_cannot_release_new_owner(tmp_path) -> None:
             target.resource_key,
             generation=first.state_key,
         )
-        assert binding._fixed_target_owners == {"target": second.state_key}
+        assert_sync_resources_owned(second, expected=True)
         with pytest.raises(ValueError, match="already bound by an active session"):
             await SyncBinding(target_workspace=alternate_target).bind(
                 source,
@@ -3051,7 +3080,6 @@ def test_sync_binding_stale_cleanup_cannot_release_new_owner(tmp_path) -> None:
 
     asyncio.run(run())
     assert binding._states == {}
-    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_respects_sync_back_and_delete_options(tmp_path) -> None:
@@ -3619,7 +3647,7 @@ def test_sync_binding_same_session_rebind_cannot_displace_fixed_target(tmp_path)
         return first
 
     first = asyncio.run(run())
-    assert binding._fixed_target_owners == {"target": first.state_key}
+    assert_sync_resources_owned(first, expected=True)
 
 
 def test_sync_binding_retains_fixed_target_beyond_historical_ttl_until_exact_owner_release(
@@ -3647,7 +3675,7 @@ def test_sync_binding_retains_fixed_target_beyond_historical_ttl_until_exact_own
             await binding.bind(source, None, session_id="sess_waiting")
         binding.abandon(owner)
         rebound = await binding.bind(source, None, session_id="sess_waiting")
-        assert binding._fixed_target_owners == {"target": rebound.state_key}
+        assert_sync_resources_owned(rebound, expected=True)
 
     asyncio.run(run())
 
