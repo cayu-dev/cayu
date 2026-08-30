@@ -119,6 +119,13 @@ class SecretRedactor:
             raise TypeError("SecretRedactor.is_exact_secret expects a string.")
         return value in self._values
 
+    def contains_secret_bytes(self, value: bytes) -> bool:
+        """Return whether raw bytes contain any registered non-marker secret."""
+
+        if type(value) is not bytes:
+            raise TypeError("SecretRedactor.contains_secret_bytes expects bytes.")
+        return any(pattern in value for pattern in self._secret_byte_patterns())
+
     def redact_uppercase_text(self, value: str) -> str:
         """Redact text against uppercase-normalized registered secret values."""
 

@@ -376,7 +376,7 @@ def test_staged_web_access_authority_survives_only_owned_durable_reconstruction(
     projected = _project_staged_terminal_event(
         persisted,
         redactor=redactor,
-        trust_persisted_web_access_authority=True,
+        trust_persisted_tool_result_authority=True,
     )
     projected_access = projected.payload["result"]["structured"]["access"]
     assert projected_access["outcome"] == "bot_challenge"
@@ -406,7 +406,7 @@ def test_staged_web_access_authority_survives_only_owned_durable_reconstruction(
         _project_staged_terminal_event(
             persisted.model_copy(update={"payload": tampered_payload}),
             redactor=redactor,
-            trust_persisted_web_access_authority=True,
+            trust_persisted_tool_result_authority=True,
         )
 
 

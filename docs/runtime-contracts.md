@@ -7537,6 +7537,8 @@ The first built-in tools are:
 - `search_text`: search file contents through the active runner in bounded `files`, `content`, or `count` mode
 - `git_changes`: inspect pageable status, filename-safe numstat summaries, or bounded unified diffs through the active runner; `diff_offset` continues a truncated single-file diff
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
+- `publish_workspace_artifact`: snapshot one sealed-policy workspace file and return a durable opaque reference usable only through authorized descendant handoff
+- `materialize_shared_artifact`: verify one explicitly passed ancestor reference and grant, then create or revision-replace the approved destination in the current workspace
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
 - `run_check`: select one immutable application-owned process check by a finite name; argv, cwd, environment, stdin, limits, runner, image, and network are not model input
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, background mode returns after in-process startup, and durable mode returns after child-first task-queue publication
@@ -8753,6 +8755,134 @@ readback remains explicit and bounded through `ReadFileTool`.
 Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. `ArtifactStore.read_bytes(..., max_bytes=N)` is a hard materialization contract: implementations must not read into application memory or return more than `N` content bytes, and must mark the result truncated when more bytes exist. Server and tool callers rely on this guarantee for custom stores as well as `LocalArtifactStore`. Store implementations raise `InvalidArtifactIdError` for ids that are syntactically invalid for that store, `FileNotFoundError` for valid ids that do not exist, and `ArtifactStoreUnavailableError` for operational backend failures; other validation failures indicate invalid store data. The control-plane artifact APIs consistently expose operational failures as typed `503` responses and invalid store results as typed `500` responses. Read consumers revalidate store results, reject content returned beyond the requested bound, require returned metadata to identify the requested artifact, and require `metadata.size_bytes` to equal the reported full byte count. Artifact metadata records and their nested JSON metadata are immutable after construction. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
 
 `read_file` re-admits every file attachment returned by a built-in or custom artifact reader at the final tool-result boundary. Admission uses a bounded store read to verify current scope, content type, actual stored size, and the call's current `max_attachment_bytes`; rejection returns no attachment reference and does not delete a reusable artifact. Cached image/PDF derivations also verify their stored content hash before reuse, so missing or corrupt cache entries are rebuilt while an intact oversized derivation is rejected without being recomputed. The later provider-request boundary independently reapplies the application's per-file, aggregate-byte, and attachment-count limits across the complete model request.
+
+### Lineage-scoped shared-artifact handoff
+
+Cayu provides two optional application-sealed tools for explicitly handing one
+workspace file to a later fork or subagent without sharing mutable workspaces:
+
+- `publish_workspace_artifact(path)` snapshots one exact policy-approved regular
+  file into the configured `ArtifactStore` and returns a canonical opaque
+  `SharedArtifactRef` plus a durable publication receipt.
+- `materialize_shared_artifact(ref, destination)` asks Runtime to authorize the
+  reference against durable session lineage, verifies the artifact bytes and
+  metadata, and creates or revision-replaces one policy-approved regular file in
+  the caller's governed workspace.
+
+Applications opt in by constructing one immutable `SharedArtifactPolicy` and
+registering tools that carry the same policy fingerprint:
+
+```python
+from cayu import (
+    MaterializeSharedArtifactTool,
+    PublishWorkspaceArtifactTool,
+    SharedArtifactPolicy,
+)
+
+handoff_policy = SharedArtifactPolicy(
+    publish_path_prefixes=("handoff",),
+    materialize_path_prefixes=("received",),
+    allowed_content_types=("text/plain", "text/x-python"),
+    max_bytes=4 * 1024 * 1024,
+    max_publications_per_session=32,
+    grant_ttl_seconds=6 * 60 * 60,
+    max_lineage_depth=16,
+    retention_class="lineage_handoff",
+    allow_overwrite=False,
+)
+
+shared_artifact_tools = (
+    PublishWorkspaceArtifactTool(handoff_policy),
+    MaterializeSharedArtifactTool(handoff_policy),
+)
+```
+
+The model-facing flow is deliberately explicit:
+
+```text
+parent writes handoff/solver.py
+parent calls publish_workspace_artifact({"path": "handoff/solver.py"})
+parent passes only the returned opaque ref in the fork/subagent request
+child calls materialize_shared_artifact({
+  "ref": "cayu-shared-artifact-v1....",
+  "destination": "received/solver.py"
+})
+child executes or reads received/solver.py through its ordinary governed tools
+```
+
+The opaque reference is routing identity, not authority. It carries the exact
+artifact-store id, deterministic artifact id, digest, byte size, source session
+id, and grant id. Runtime authorizes materialization only when all of the
+following remain true at the instant of use:
+
+- the grant exists in the source session, is active, unexpired, and matches the
+  application policy fingerprint and complete reference;
+- the source session instance, root invocation, root session, origin, and causal
+  budget still match the immutable values sealed into the grant;
+- the caller proves its exact current session instance and reaches the source
+  through no more than the policy's bounded lineage depth;
+- every traversed child edge was created by Runtime as an explicit `fork` or
+  `subagent` edge. SDK, HTTP, task, and workflow-step sessions do not become
+  authorized merely by setting a parent id; and
+- the active artifact store has the referenced stable id and returns exact
+  session-scoped metadata, digest, and byte-count evidence.
+
+Possessing or decoding a reference therefore does not authorize an unrelated
+session. Ordinary `read_file(artifact_id=...)` and `list_artifacts(scope="session")`
+retain their existing session-owner checks, so publishing a handoff does not
+widen raw child artifact visibility. `materialize_shared_artifact` is the sole
+model-facing cross-session read-and-copy path. Applications can revoke an active
+grant programmatically with `revoke_shared_artifact_grant(...)`; revocation
+retains the durable grant record and reason as evidence.
+
+Both operations are deterministic and receipt-backed. Publication reserves its
+bounded per-session slot and preparation atomically, writes a deterministic
+artifact idempotently, then atomically replaces the preparation with a terminal
+receipt and grant. Materialization reserves the exact destination identity,
+uses create-if-absent or revision-checked replace semantics, verifies the final
+bytes, and atomically publishes its receipt. Exact concurrent calls, retries,
+caller cancellation after dispatch, and lost commit acknowledgements converge
+on the same receipt; recovery reattaches a terminal result from the durable call
+locator without replaying a completed mutation. When only a preparation is
+durable, Runtime gives the reconciler bounded workspace access, a read-only
+unredacted artifact-evidence reader, and a run-fenced compare-and-set. The raw
+artifact store and its write, list, and delete authority are not exposed. The
+reconciler promotes the preparation only after the exact digest, size, identity,
+and metadata prove that the idempotent effect already completed; absent evidence
+is left outcome-unknown and is never reported as success. A different path,
+content, policy, store, session instance, or destination before-state does not
+join that identity.
+
+Path traversal, absolute paths, symbolic links, directories, missing or corrupt
+artifacts, oversized content, disallowed content types, exhausted publication
+counts, expired or revoked grants, unsupported lineage, and implicit overwrite
+all fail closed with bounded structured error codes. Overwrite is disabled by
+default; when enabled, Cayu seals the observed destination revision and refuses
+to replace a concurrently changed file. Publication refuses source bytes that
+contain a secret registered in that tool invocation; materialization repeats
+the same check against the child's current invocation registry before writing.
+Both reads use a revision-stable secret snapshot, and Runtime freezes the
+complete invocation secret scope and requires every durable grant, preparation,
+receipt, index, and recovery locator to survive exact sealing before storage.
+The redaction marker itself remains ordinary data. Shared-artifact handoff never
+grants a vault, proxy, or credential handle and never substitutes redacted bytes
+for the exact file: a collision returns a fixed refusal instead. This is an
+exact-known-value guard, not taint tracking or a general content-classification
+system; it cannot recognize transformed credentials or values that were never
+registered in the invocation. Applications must keep allowed handoff paths
+credential-free and govern every tool that can write them. No publication
+automatically enters an `AgentSnapshot`: the parent application or evolving
+agent must separately decide whether the file is scratch, retained run evidence,
+or promoted anatomy.
+
+The grant and both receipts live in `SessionStore` durable operation records;
+the bytes live in the named `ArtifactStore`. A fresh worker can therefore reopen
+SQLite or PostgreSQL session state and the same local or remote artifact store,
+load the already-created child session, and materialize the ref after the parent
+process has exited. Reconnection requires the same stable store id and durable
+bytes; a VM directory, process-local object, or newly named store is not proof of
+the original handoff. See `examples/lineage_shared_artifacts/README.md` for the
+complete application and operator sequence.
 
 ### Workspace/artifact bridge
 

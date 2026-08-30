@@ -8,7 +8,13 @@ import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 
 from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart, ToolResultPart
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core.tools import (
+    DurableToolRecoveryAuthority,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -80,6 +86,7 @@ class _DurableRecoveryRecordingTool(_RecordingTool):
         arguments: dict[str, Any],
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+        recovery_authority: Any = None,
     ) -> ToolResult | None:
         assert await load_operation("missing-browser-operation") is None
         self.recovery_calls.append(
@@ -96,6 +103,7 @@ class _DurableRecoveryRecordingTool(_RecordingTool):
                 "idempotency_key": idempotency_key,
                 "arguments": arguments,
                 "started": started,
+                "recovery_authority": recovery_authority,
             }
         )
         return ToolResult(
@@ -626,7 +634,7 @@ def test_pending_round_recovery_retains_checkpoint_without_call_boundary() -> No
     asyncio.run(scenario())
 
 
-def test_pending_round_recovery_uses_read_only_durable_tool_reconciler() -> None:
+def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> None:
     async def scenario() -> None:
         session_id = "sess_durable_tool_recovery"
         identity = _tool_round_identity("d")
@@ -750,6 +758,11 @@ def test_pending_round_recovery_uses_read_only_durable_tool_reconciler() -> None
         assert tool.recovery_calls[0]["model_attempt_id"] == identity.model_attempt_id
         assert tool.recovery_calls[0]["arguments"] == {"value": 7}
         assert tool.recovery_calls[0]["started"] is True
+        recovery_authority = tool.recovery_calls[0]["recovery_authority"]
+        assert isinstance(recovery_authority, DurableToolRecoveryAuthority)
+        assert recovery_authority.workspace is None
+        assert recovery_authority.artifact_reader is None
+        assert callable(recovery_authority.compare_and_set_operation)
         transcript = await store.load_transcript(session_id)
         result_parts = [
             part

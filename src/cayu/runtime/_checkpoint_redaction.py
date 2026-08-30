@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_json_value
+from cayu.runtime._shared_artifact_results import persisted_shared_artifact_control_paths
 from cayu.runtime._web_access_results import persisted_web_access_control_paths
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
@@ -682,7 +683,9 @@ def durable_value_contains_secret(
     if type(value) is dict:
         trusted_web_control_paths = _trusted_web_control_paths
         if _is_staged_terminal_event(path):
-            relative_paths = persisted_web_access_control_paths(value)
+            relative_paths = persisted_web_access_control_paths(
+                value
+            ) | persisted_shared_artifact_control_paths(value)
             if relative_paths:
                 trusted_web_control_paths = frozenset(
                     (*path, *relative_path) for relative_path in relative_paths

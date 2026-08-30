@@ -19,6 +19,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, event_payload_authority_is_runtime_generated
 from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime._diagnostics import (
     MAX_DIAGNOSTIC_UTF8_BYTES,
@@ -286,10 +287,15 @@ def redact_tool_result_event(
     if event_controls:
         payload.update(event_controls)
     payload["result"] = redacted_result.model_dump()
-    return web_access_results.restore_attested_tool_result(
+    restored_event, restored_result = web_access_results.restore_attested_tool_result(
         event.model_copy(update={"payload": payload}),
         original=result,
         redacted=redacted_result,
+    )
+    return shared_artifact_results.restore_attested_tool_result(
+        restored_event,
+        original=result,
+        redacted=restored_result,
     )
 
 

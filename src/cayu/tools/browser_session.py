@@ -29,6 +29,7 @@ from cayu.artifacts import (
     copy_artifact_read_result,
 )
 from cayu.core.tools import (
+    DurableToolRecoveryAuthority,
     Tool,
     ToolContext,
     ToolEffect,
@@ -1033,10 +1034,11 @@ class BrowserSessionTool(Tool):
         arguments: dict[str, Any],
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+        recovery_authority: DurableToolRecoveryAuthority | None = None,
     ) -> ToolResult | None:
         """Reconcile browser evidence without dispatching or replaying an action."""
 
-        del started
+        del started, recovery_authority
         try:
             request = _validated_request(arguments, max_wait_ms=self.max_wait_ms)
         except (TypeError, ValueError):

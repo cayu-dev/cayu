@@ -42,6 +42,8 @@ corresponding credentials or service.
 - [`modal_runner.py`](modal_runner.py) — an application-owned remote runner.
 - [`artifact_file_live.py`](artifact_file_live.py) and
   [`artifact_workspace_bridge.py`](artifact_workspace_bridge.py) — durable files and mutable workspaces.
+- [`lineage_shared_artifacts/`](lineage_shared_artifacts/) — explicit, receipt-backed
+  parent-to-fork/subagent file handoff with fresh-process reconstruction gates.
 - [`fastapi_stripe_virtual_egress.py`](fastapi_stripe_virtual_egress.py) — virtual credentials and restricted egress.
 - [`github_cli_virtual_egress.py`](github_cli_virtual_egress.py) — an unmodified CLI with a brokered token and restricted egress.
 - [`aws/`](aws/) — Bedrock, Lambda MicroVM, and AWS environment examples.

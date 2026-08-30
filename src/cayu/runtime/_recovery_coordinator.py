@@ -18,7 +18,7 @@ import contextlib
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -42,11 +42,12 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
+    copy_durable_json_object,
     copy_durable_json_value,
     copy_json_value,
     require_clean_nonblank,
 )
-from cayu.artifacts import ArtifactReadResult, copy_artifact_read_result
+from cayu.artifacts import ArtifactReadResult, ArtifactStore, copy_artifact_read_result
 from cayu.core.events import (
     Event,
     EventType,
@@ -57,7 +58,12 @@ from cayu.core.events import (
 )
 from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
 from cayu.core.thinking import ThinkingConfig
-from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
+from cayu.core.tools import (
+    _TOOL_POLICY_DENIAL_SOURCE,
+    DurableToolOperationConflict,
+    DurableToolRecoveryAuthority,
+    ToolResult,
+)
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
 from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
@@ -73,6 +79,7 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
@@ -279,6 +286,7 @@ from cayu.runtime.sessions import (
     ModelCompletionStage,
     RuntimePublicationReceipt,
     Session,
+    SessionOperationPublication,
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
@@ -1400,6 +1408,29 @@ InteractionTransitionReplayFailures = Callable[
     [BaseException],
     tuple[Exception, ...] | None,
 ]
+
+
+class _DurableArtifactRecoveryReader:
+    """Expose exact artifact reads without handing extensions the raw store."""
+
+    __slots__ = ("__artifact_store", "id")
+
+    def __init__(self, artifact_store: ArtifactStore) -> None:
+        if not isinstance(artifact_store, ArtifactStore):
+            raise TypeError("Durable artifact recovery requires an ArtifactStore.")
+        self.__artifact_store = artifact_store
+        self.id = artifact_store.id
+
+    async def read_bytes(
+        self,
+        artifact_id: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> ArtifactReadResult:
+        return await self.__artifact_store.read_bytes(
+            artifact_id,
+            max_bytes=max_bytes,
+        )
 
 
 class RecoveryCoordinator:
@@ -11366,6 +11397,89 @@ class RecoveryCoordinator:
                         storage_key,
                     )
 
+                async def compare_and_set_durable_tool_operation(
+                    storage_key: str,
+                    expected: dict[str, Any] | None,
+                    desired: dict[str, Any],
+                    secondary_records: Mapping[str, dict[str, Any]],
+                ) -> dict[str, Any]:
+                    expected_copy = (
+                        None
+                        if expected is None
+                        else copy_durable_json_object(
+                            expected,
+                            "durable_tool_recovery.expected",
+                        )
+                    )
+                    desired_copy = copy_durable_json_object(
+                        desired,
+                        "durable_tool_recovery.desired",
+                    )
+                    secondary_copy = {
+                        key: copy_durable_json_object(
+                            value,
+                            f"durable_tool_recovery.secondary[{key!r}]",
+                        )
+                        for key, value in secondary_records.items()
+                    }
+                    if storage_key in secondary_copy:
+                        raise ValueError("Durable tool recovery cannot duplicate its primary key.")
+
+                    def publish(
+                        current_session: Session,
+                        checkpoint: dict[str, Any] | None,
+                        current: dict[str, Any] | None,
+                    ) -> SessionOperationPublication:
+                        if (
+                            current_session.id != session.id
+                            or current_session.run_epoch != session.run_epoch
+                        ):
+                            raise SessionRunFenced(
+                                "Durable tool recovery lost its parent run authority."
+                            )
+                        if current != expected_copy:
+                            raise DurableToolOperationConflict(
+                                "Durable tool recovery state changed before publication."
+                            )
+                        return SessionOperationPublication(
+                            checkpoint={} if checkpoint is None else checkpoint,
+                            operation_records={storage_key: desired_copy, **secondary_copy},
+                        )
+
+                    await self._session_store.publish_session_operation(
+                        session.id,
+                        idempotency_key=storage_key,
+                        operation_transform=publish,
+                        events=[],
+                        expected_statuses={session.status},
+                        expected_run_epoch=session.run_epoch,
+                    )
+                    return copy_durable_json_object(
+                        desired_copy,
+                        "durable_tool_recovery.result",
+                    )
+
+                recovery_artifact_store = (
+                    None
+                    if registered_environment is None
+                    else registered_environment.environment.artifact_store
+                )
+                recovery_authority = DurableToolRecoveryAuthority(
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    workspace=(
+                        None
+                        if registered_environment is None
+                        else registered_environment.environment.workspace
+                    ),
+                    artifact_reader=(
+                        None
+                        if recovery_artifact_store is None
+                        else _DurableArtifactRecoveryReader(recovery_artifact_store)
+                    ),
+                    compare_and_set_operation=compare_and_set_durable_tool_operation,
+                )
+
                 result = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(
                     parent_session_id=session.id,
                     parent_run_epoch=(pending_round.source_run_epoch or session.run_epoch),
@@ -11389,6 +11503,7 @@ class RecoveryCoordinator:
                     ),
                     started=pending_tool_call.tool_call_id in effective_started_ids,
                     load_operation=load_durable_tool_operation,
+                    recovery_authority=recovery_authority,
                 )
                 if result is not None and type(result) is not ToolResult:
                     raise TypeError("Durable tool recovery must return ToolResult or None.")
@@ -11614,6 +11729,11 @@ class RecoveryCoordinator:
                 )
                 terminal_event = web_access_results.restore_persisted_web_access_result_authority(
                     terminal_event
+                )
+                terminal_event = (
+                    shared_artifact_results.restore_persisted_shared_artifact_result_authority(
+                        terminal_event
+                    )
                 )
             expected_public_outcome = runtime_records.ToolCallOutcome(
                 call=runtime_records.copy_tool_call_request(

@@ -32,6 +32,7 @@ import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.fork_groups as fork_group_module
 import cayu.runtime.sessions as sessions_module
+import cayu.tools.shared_artifacts as shared_artifacts_module
 from cayu import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
@@ -313,6 +314,12 @@ from cayu.runtime.workspace_observation_recovery import (
 )
 from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.storage.migrations import SchemaMode
+from cayu.tools.shared_artifacts import (
+    SharedArtifactAudience,
+    SharedArtifactGrant,
+    SharedArtifactPolicy,
+    SharedArtifactRef,
+)
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace
 
@@ -3329,6 +3336,108 @@ def test_session_store_conformance_parent_deletion_preserves_root_invocation(
             assert loaded.parent_session_id is None
             assert loaded.invocation == child.invocation
             assert loaded.invocation.root_session_id == parent.id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_shared_artifact_lineage_grant(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            suffix = session_store_case[0]
+            parent = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"shared-artifact-parent-{suffix}",
+                    causal_budget_id=f"shared-artifact-budget-{suffix}",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            parent = await store.transition_status(
+                parent.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            child = await store.create(
+                sessions_module.run_request_with_runtime_invocation(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=f"shared-artifact-child-{suffix}",
+                        parent_session_id=parent.id,
+                        causal_budget_id=parent.causal_budget_id,
+                        messages=[],
+                    ),
+                    source=SessionExecutionSource.SUBAGENT,
+                ),
+                identity=_identity(),
+            )
+            policy = SharedArtifactPolicy(
+                publish_path_prefixes=("handoff",),
+                materialize_path_prefixes=("received",),
+                allowed_content_types=("text/plain",),
+            )
+            reference = SharedArtifactRef(
+                artifact_store_id="conformance-artifacts",
+                artifact_id="art_" + "1" * 32,
+                content_digest="sha256:" + "2" * 64,
+                size_bytes=5,
+                source_session_id=parent.id,
+                access_grant_id="sag_" + "3" * 32,
+            )
+            published_at = datetime(2026, 8, 29, 12, tzinfo=UTC)
+            grant = SharedArtifactGrant(
+                reference=reference,
+                source_session_instance_id=parent.instance_id,
+                source_workspace_id="parent-workspace",
+                source_path_sha256="4" * 64,
+                root_invocation_id=parent.invocation.root_invocation_id,
+                root_session_id=parent.invocation.root_session_id,
+                invocation_origin_sha256=shared_artifacts_module._origin_sha256(
+                    parent.invocation.origin
+                ),
+                causal_budget_id=parent.causal_budget_id,
+                content_type="text/plain",
+                policy_fingerprint=policy.fingerprint,
+                audience=SharedArtifactAudience.DESCENDANT_FORK_OR_SUBAGENT,
+                max_lineage_depth=4,
+                retention_class="lineage_handoff",
+                published_at=published_at,
+                expires_at=published_at + timedelta(hours=1),
+            )
+            grant_key = shared_artifacts_module._grant_storage_key(reference.access_grant_id)
+
+            def publish_grant(current_session, checkpoint, current):
+                assert current_session.instance_id == parent.instance_id
+                assert current is None
+                return SessionOperationPublication(
+                    checkpoint={} if checkpoint is None else checkpoint,
+                    operation_records={grant_key: grant.model_dump(mode="json")},
+                )
+
+            await store.publish_session_operation(
+                parent.id,
+                idempotency_key=grant_key,
+                operation_transform=publish_grant,
+                events=[],
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=parent.run_epoch,
+            )
+            store = await _reopen_store(session_store_case, store)
+
+            authorized = await shared_artifacts_module.authorize_shared_artifact_materialization(
+                session_store=store,
+                caller_session_id=child.id,
+                caller_session_instance_id=child.instance_id,
+                reference=reference.model_dump(mode="json"),
+                policy_fingerprint=policy.fingerprint,
+                observed_at=(published_at + timedelta(minutes=1)).isoformat(),
+            )
+            assert SharedArtifactGrant.model_validate(authorized) == grant
         finally:
             await _close_store(store)
 

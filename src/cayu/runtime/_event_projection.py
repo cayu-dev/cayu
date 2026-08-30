@@ -38,6 +38,13 @@ from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime._shared_artifact_results import (
+    SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+    SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS,
+)
+from cayu.runtime._shared_artifact_results import (
+    restore_attested_event_result as restore_shared_artifact_attested_event_result,
+)
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.runtime._web_access_results import (
     WEB_ACCESS_RESULT_AUTHORITY_FIELD,
@@ -1373,6 +1380,7 @@ _TOOL_EVENT_NESTED_PATHS = (
     _TOOL_RESULT_NESTED_PATHS
     | _TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS
     | WEB_ACCESS_RESULT_EVENT_SCHEMA_PATHS
+    | SHARED_ARTIFACT_RESULT_EVENT_SCHEMA_PATHS
 )
 _TOOL_DENIAL_RESULT_NESTED_PATHS = _TOOL_RESULT_NESTED_PATHS | {
     ("result", "structured", "decision"),
@@ -2323,6 +2331,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "tool_execution_boundary",
         "tool_timeout_strength",
         WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+        SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
     }
     tool_actor_paths = _resolution_actor_nested_paths("resolved_by")
     policies[EventType.TOOL_CALL_STARTED] = _policy(
@@ -2367,8 +2376,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
                 *_TOOL_LINKAGE_AUTHORITY_KEYS,
                 *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
                 WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+                SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
             },
-            internal_authority_keys={WEB_ACCESS_RESULT_AUTHORITY_FIELD},
+            internal_authority_keys={
+                WEB_ACCESS_RESULT_AUTHORITY_FIELD,
+                SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
+            },
             public_authority_keys=(
                 _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
                 | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
@@ -3535,6 +3548,12 @@ def _prepare_runtime_event(
         trust_persisted=False,
         reject_malformed=True,
     )
+    restore_shared_artifact_attested_event_result(
+        event,
+        redacted_payload=redacted_payload,
+        trust_persisted=False,
+        reject_malformed=True,
+    )
     redacted_payload.update(_top_level_controls(controls))
     _restore_nested_controls(
         event,
@@ -3844,6 +3863,12 @@ def _project_runtime_event(
         redactor=redactor,
     )
     restore_attested_event_result(
+        event,
+        redacted_payload=redacted_payload,
+        trust_persisted=trust_persisted_projection,
+        reject_malformed=False,
+    )
+    restore_shared_artifact_attested_event_result(
         event,
         redacted_payload=redacted_payload,
         trust_persisted=trust_persisted_projection,

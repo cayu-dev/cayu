@@ -442,6 +442,20 @@ class ArtifactStoreHandle(Protocol):
 
 
 @runtime_checkable
+class DurableArtifactRecoveryReader(Protocol):
+    """Read-only, unredacted artifact evidence used by Runtime recovery.
+
+    This capability is distinct from the invocation-facing artifact facade:
+    recovery must compare exact stored bytes with a durable digest, but it must
+    not expose write, list, or delete authority to the reconciler.
+    """
+
+    id: str
+
+    async def read_bytes(self, artifact_id: str, *, max_bytes: int | None = None) -> Any: ...
+
+
+@runtime_checkable
 class RunnerHandle(Protocol):
     """Narrow invocation-aware command capability handed to tools.
 
@@ -513,10 +527,12 @@ class KnowledgeStoreHandle(Protocol):
 
 @runtime_checkable
 class DurableToolRecovery(Protocol):
-    """Narrow read-only recovery seam for one pending durable tool call.
+    """Narrow evidence-reconciliation seam for one pending durable tool call.
 
-    Recovery receives only opaque runtime identity and an operation-record
-    loader. It cannot dispatch the tool or access the session store directly.
+    Recovery cannot dispatch the tool or access the session store directly. A
+    runtime may provide bounded resource observation and one run-fenced durable
+    compare-and-set so a reconciler can promote already-proven preparation
+    evidence without replaying the effect.
     """
 
     async def reconcile_durable_tool_call(
@@ -535,9 +551,24 @@ class DurableToolRecovery(Protocol):
         arguments: dict[str, Any],
         started: bool,
         load_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+        recovery_authority: DurableToolRecoveryAuthority | None = None,
     ) -> ToolResult | None:
         """Return authenticated durable evidence, or ``None`` for generic recovery."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class DurableToolRecoveryAuthority:
+    """Runtime-owned observation and settlement authority for durable recovery."""
+
+    agent_name: str
+    environment_name: str | None
+    workspace: WorkspaceHandle | None
+    artifact_reader: DurableArtifactRecoveryReader | None
+    compare_and_set_operation: Callable[
+        [str, dict[str, Any] | None, dict[str, Any], Mapping[str, dict[str, Any]]],
+        Awaitable[dict[str, Any]],
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,7 +584,9 @@ class _RuntimeToolInvocationAuthority:
     effective_arguments_sha256: str
     execution_profile_fingerprint: str
     environment_allocation_fingerprint: str | None
+    current_session_lineage: Mapping[str, Any]
     load_durable_operation: Callable[[str], Awaitable[dict[str, Any] | None]]
+    authorize_shared_artifact: Callable[[dict[str, Any], str, str], Awaitable[dict[str, Any]]]
     compare_and_set_durable_operation: Callable[
         [str, dict[str, Any] | None, dict[str, Any], Mapping[str, dict[str, Any]]],
         Awaitable[dict[str, Any]],
@@ -566,6 +599,15 @@ _RUNTIME_TOOL_INVOCATION_AUTHORITIES: dict[
     int,
     tuple[ReferenceType[Any], _RuntimeToolInvocationAuthority],
 ] = {}
+
+
+async def _shared_artifact_authority_unavailable(
+    reference: dict[str, Any],
+    policy_fingerprint: str,
+    observed_at: str,
+) -> dict[str, Any]:
+    del reference, policy_fingerprint, observed_at
+    raise RuntimeError("Runtime shared-artifact authority is unavailable.")
 
 
 def _bind_runtime_tool_invocation_authority(
@@ -582,7 +624,10 @@ def _bind_runtime_tool_invocation_authority(
     effective_arguments: dict[str, Any],
     execution_profile_fingerprint: str,
     environment_allocation_fingerprint: str | None,
+    current_session_lineage: Mapping[str, Any] | None = None,
     load_durable_operation: Callable[[str], Awaitable[dict[str, Any] | None]],
+    authorize_shared_artifact: Callable[[dict[str, Any], str, str], Awaitable[dict[str, Any]]]
+    | None = None,
     compare_and_set_durable_operation: Callable[
         [str, dict[str, Any] | None, dict[str, Any], Mapping[str, dict[str, Any]]],
         Awaitable[dict[str, Any]],
@@ -598,6 +643,8 @@ def _bind_runtime_tool_invocation_authority(
         raise TypeError("Runtime secret publication sealer must be callable.")
     if not callable(load_durable_operation):
         raise TypeError("Runtime durable operation loader must be callable.")
+    if authorize_shared_artifact is not None and not callable(authorize_shared_artifact):
+        raise TypeError("Runtime shared-artifact authorizer must be callable.")
     if not callable(compare_and_set_durable_operation):
         raise TypeError("Runtime durable operation publisher must be callable.")
     if not callable(seal_durable_output):
@@ -621,7 +668,18 @@ def _bind_runtime_tool_invocation_authority(
         ).hexdigest(),
         execution_profile_fingerprint=execution_profile_fingerprint,
         environment_allocation_fingerprint=environment_allocation_fingerprint,
+        current_session_lineage=freeze_json_value(
+            copy_durable_json_object(
+                {} if current_session_lineage is None else current_session_lineage,
+                "current_session_lineage",
+            )
+        ),
         load_durable_operation=load_durable_operation,
+        authorize_shared_artifact=(
+            _shared_artifact_authority_unavailable
+            if authorize_shared_artifact is None
+            else authorize_shared_artifact
+        ),
         compare_and_set_durable_operation=compare_and_set_durable_operation,
         seal_durable_output=seal_durable_output,
         secret_publication_sealer=secret_publication_sealer,

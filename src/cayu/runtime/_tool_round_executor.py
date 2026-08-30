@@ -84,6 +84,7 @@ from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
@@ -637,6 +638,9 @@ class _ToolRoundPublicationCoordinator:
             tool_exposure=self._tool_exposure,
         )
         restored = web_access_results.restore_persisted_web_access_result_authority(restored)
+        restored = shared_artifact_results.restore_persisted_shared_artifact_result_authority(
+            restored
+        )
         observed_fingerprint = restored.payload.get(EXECUTION_PROFILE_FINGERPRINT_FIELD)
         if (
             observed_fingerprint is not None
@@ -828,7 +832,7 @@ class _ToolRoundPublicationCoordinator:
                         "event": _project_staged_terminal_event(
                             item.event,
                             redactor=redactor,
-                            trust_persisted_web_access_authority=True,
+                            trust_persisted_tool_result_authority=True,
                         )
                     },
                     deep=True,
@@ -3759,6 +3763,22 @@ class ToolRoundExecutor:
                     storage_key,
                 )
 
+            async def authorize_shared_artifact(
+                reference: dict[str, Any],
+                policy_fingerprint: str,
+                observed_at: str,
+            ) -> dict[str, Any]:
+                from cayu.tools.shared_artifacts import authorize_shared_artifact_materialization
+
+                return await authorize_shared_artifact_materialization(
+                    session_store=self._session_store,
+                    caller_session_id=session.id,
+                    caller_session_instance_id=session.instance_id,
+                    reference=reference,
+                    policy_fingerprint=policy_fingerprint,
+                    observed_at=observed_at,
+                )
+
             async def compare_and_set_durable_operation(
                 storage_key: str,
                 expected: dict[str, Any] | None,
@@ -3894,7 +3914,15 @@ class ToolRoundExecutor:
                     if registered_environment is None
                     else registered_environment.live_allocation_fingerprint
                 ),
+                current_session_lineage={
+                    "session_id": session.id,
+                    "session_instance_id": session.instance_id,
+                    "parent_session_id": session.parent_session_id,
+                    "causal_budget_id": session.causal_budget_id,
+                    "invocation": session.invocation.model_dump(mode="json"),
+                },
                 load_durable_operation=load_durable_operation,
+                authorize_shared_artifact=authorize_shared_artifact,
                 compare_and_set_durable_operation=(compare_and_set_durable_operation),
                 seal_durable_output=seal_durable_output,
                 secret_publication_sealer=invocation_secret_scope.seal_for_publication,
@@ -5918,6 +5946,11 @@ class ToolRoundExecutor:
             original=projected_result,
             redacted=projected_result,
         )
+        projected_event, projected_result = shared_artifact_results.restore_attested_tool_result(
+            projected_event,
+            original=projected_result,
+            redacted=projected_result,
+        )
         projected_event = event_with_runtime_nested_payload_authority(
             projected_event,
             _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
@@ -6113,6 +6146,11 @@ class ToolRoundExecutor:
             if modified is not None:
                 if attested_result is not None:
                     modified = web_access_results.preserve_attested_controls_across_hook(
+                        tool_event,
+                        original=attested_result,
+                        replacement=modified,
+                    )
+                    modified = shared_artifact_results.preserve_attested_controls_across_hook(
                         tool_event,
                         original=attested_result,
                         replacement=modified,
@@ -10068,6 +10106,11 @@ def _prepare_tool_result_event(
         result,
         tool=runtime_tool,
     )
+    event = shared_artifact_results.attest_runtime_shared_artifact_result(
+        event,
+        result,
+        tool=runtime_tool,
+    )
     event, result = _validate_and_synchronize_tool_result_event(
         event=event,
         result=result,
@@ -10258,12 +10301,13 @@ def _project_staged_terminal_event(
     event: Event,
     *,
     redactor: SecretRedactor,
-    trust_persisted_web_access_authority: bool = False,
+    trust_persisted_tool_result_authority: bool = False,
 ) -> Event:
     """Progressively sanitize one private terminal without changing its identity."""
 
-    if trust_persisted_web_access_authority:
+    if trust_persisted_tool_result_authority:
         event = web_access_results.restore_persisted_web_access_result_authority(event)
+        event = shared_artifact_results.restore_persisted_shared_artifact_result_authority(event)
     raw_result = event.payload.get("result")
     if type(raw_result) is not dict:
         raise ValueError("Staged terminal event requires a tool result object.")

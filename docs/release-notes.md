@@ -89,6 +89,32 @@ guard.
 
 ## Unreleased
 
+### Explicit lineage-scoped parent-to-child artifact handoff
+
+Applications can now register sealed `publish_workspace_artifact` and
+`materialize_shared_artifact` tools so a parent can preserve one generated file,
+pass its opaque reference explicitly, and let an authorized fork or subagent
+reconstruct it in an isolated workspace—even after a process restart. Runtime
+validates the exact source and caller session instances, bounded fork/subagent
+ancestry, root invocation and origin, causal budget, active grant, policy
+fingerprint, stable artifact-store identity, metadata, digest, size, destination
+policy, and overwrite precondition. Reference possession alone is not authority;
+ordinary artifact read/list scope remains unchanged.
+
+Publication and materialization use deterministic identities, atomic durable
+preparations and receipts, cancellation-safe settlement, lost-ack recovery, and
+bounded retry/concurrency convergence. Revocation and expiry fail closed.
+Recovery receives only a narrow exact-byte artifact reader, not the raw store or
+its write/list/delete surface. Files containing a secret registered in the
+publishing or materializing invocation are refused before cross-session copy,
+and every protocol record must survive exact Runtime secret-scope sealing before
+storage. Paths,
+content types, bytes, publication count, lineage depth, retention class, and
+overwrite behavior are sealed by `SharedArtifactPolicy`. The feature does not
+automatically promote generated files into `AgentSnapshot`; applications still
+own the scratch/evidence/anatomy disposition decision. No storage migration is
+required because the protocol uses existing bounded session-operation records.
+
 ### Evals can verify workspace and artifact outputs without Python assertions
 
 Portable suites and Control Plane now author workspace-file presence/absence,

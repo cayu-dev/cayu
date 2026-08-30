@@ -17,6 +17,7 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _shared_artifact_results as shared_artifact_results
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _transcript as transcript_support
 from cayu.runtime import _web_access_results as web_access_results
@@ -1283,6 +1284,7 @@ def _recovery_safe_staged_terminals(
         if type(payload) is not dict:
             raise AssertionError("Staged terminal payload copied as a non-object.")
         payload.pop(web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
+        payload.pop(shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
         payload["result"] = fixed_result.model_dump(mode="json")
         payload["recovered"] = True
         payload["secret_scope_incomplete"] = True
@@ -1423,6 +1425,7 @@ def hook_scope_unavailable_recovery_event(event: Event) -> Event:
     )
     payload = copy_durable_json_value(event.payload, "recovered_terminal.payload")
     payload.pop(web_access_results.WEB_ACCESS_RESULT_AUTHORITY_FIELD, None)
+    payload.pop(shared_artifact_results.SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD, None)
     payload["result"] = result.model_dump(mode="json")
     payload["recovered"] = True
     return copy_event(
