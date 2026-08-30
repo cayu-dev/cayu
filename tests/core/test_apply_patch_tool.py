@@ -10,9 +10,19 @@ from pathlib import Path
 import pytest
 
 from cayu import (
+    AgentSpec,
     ApplyPatchTool,
+    CayuApp,
+    Environment,
+    EnvironmentSpec,
+    EventType,
+    InMemorySessionStore,
     LocalArtifactStore,
     LocalWorkspace,
+    Message,
+    ModelStreamEvent,
+    RunRequest,
+    ScriptedModelProvider,
     ToolContext,
     ToolEffect,
     WorkspaceMoveAmbiguousError,
@@ -28,6 +38,7 @@ from cayu.tools._resources import (
     InvocationWorkspaceMutationOwner,
     invocation_workspace_handle,
 )
+from cayu.tools.patches import _patch_journal_key
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -57,6 +68,91 @@ def test_apply_patch_schema_and_effect_contract() -> None:
     assert operations["maxItems"] == 100
     assert operations["items"]["additionalProperties"] is False
     assert operations["items"]["properties"]["edits"]["items"]["additionalProperties"] is False
+
+
+def test_cayu_app_native_apply_patch_publishes_applied_result(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    arguments = {
+        "operations": [
+            {
+                "type": "create",
+                "path": "created.txt",
+                "content": "private patch body\n",
+            }
+        ]
+    }
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_apply_patch",
+                    name="apply_patch",
+                    arguments=arguments,
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=LocalWorkspace(root, workspace_id="workspace"),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ApplyPatchTool()],
+    )
+
+    async def run_and_load():
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-native-apply-patch",
+                    messages=[Message.text("user", "create the file")],
+                )
+            )
+        ]
+        transcript = await store.load_transcript("session-native-apply-patch")
+        completed = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+        tool_call_identity = completed.payload["result"]["structured"]["tool_call_identity"]
+        journal = await store.load_session_operation(
+            "session-native-apply-patch",
+            _patch_journal_key("session-native-apply-patch", tool_call_identity),
+        )
+        return events, transcript, journal
+
+    events, transcript, journal = asyncio.run(run_and_load())
+
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    started = next(event for event in events if event.type is EventType.TOOL_CALL_STARTED)
+    assert started.payload["arguments_state"] == "quarantined"
+    assert "arguments" not in started.payload
+    completed = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    assert completed.payload.get("outcome_unknown", False) is False
+    assert completed.payload.get("manual_reconciliation_required", False) is False
+    assert completed.payload["arguments_state"] == "unavailable"
+    assert "arguments" not in completed.payload
+    assert completed.payload["result"]["structured"]["outcome"] == "applied"
+    assert journal is not None
+    assert journal["state"] == "terminal"
+    assert journal["terminal_outcome"] == "applied"
+    assert (root / "created.txt").read_text() == "private patch body\n"
+    assistant_call = next(
+        part for message in transcript for part in message.content if part.type == "tool_call"
+    )
+    assert assistant_call.arguments == {}
 
 
 def test_apply_patch_applies_create_two_updates_move_and_delete(tmp_path: Path) -> None:
@@ -721,6 +817,70 @@ def test_apply_patch_profile_identity_binds_limits_and_protected_paths() -> None
     assert default.behavior_profile_id != changed_limit.behavior_profile_id
     assert default.behavior_profile_id != changed_paths.behavior_profile_id
     assert default._execution_profile_material()["cross_file_atomic"] is False
+
+
+def test_apply_patch_terminal_journal_failure_requires_fresh_read(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    workspace = LocalWorkspace(root, workspace_id="workspace")
+    arguments = {"operations": [{"type": "create", "path": "created.txt", "content": "created\n"}]}
+    records: dict[str, dict[str, object]] = {}
+
+    async def load_operation(storage_key: str):
+        return records.get(storage_key)
+
+    async def compare_and_set_operation(storage_key, expected, desired, secondary):
+        assert records.get(storage_key) == expected
+        assert secondary == {}
+        records[storage_key] = desired
+        return desired
+
+    def fail_terminal_seal(record):
+        del record
+        raise RuntimeError("terminal unavailable")
+
+    ctx = ToolContext(
+        session_id="session",
+        agent_name="agent",
+        environment_name="coding",
+        workspace_id="workspace",
+        idempotency_key="tool-invocation",
+        workspace=workspace,
+    )
+    _bind_runtime_tool_invocation_authority(
+        ctx,
+        parent_task_id="task",
+        parent_run_epoch=3,
+        model_step_id="mstep_00000000000000000000000000000000",
+        model_attempt_id="mattempt_00000000000000000000000000000000",
+        tool_round_id="tround_00000000000000000000000000000000",
+        tool_call_id="call",
+        tool_name="apply_patch",
+        idempotency_key="tool-invocation",
+        effective_arguments=arguments,
+        execution_profile_fingerprint="profile",
+        environment_allocation_fingerprint="allocation",
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
+        seal_durable_output=fail_terminal_seal,
+        secret_publication_sealer=lambda: None,
+    )
+
+    result = asyncio.run(ApplyPatchTool().run(ctx, arguments))
+
+    assert result.is_error is True
+    assert result.structured == {
+        "version": 2,
+        "patch_id": result.structured["patch_id"],
+        "outcome": "ambiguous",
+        "workspace_outcome": "applied",
+        "failure_category": "durable_terminal_unavailable",
+        "workspace_may_have_changed": True,
+        "requires_fresh_read": True,
+    }
+    assert len(json.dumps(result.model_dump(mode="json")).encode()) < 2_048
+    assert next(iter(records.values()))["state"] == "in_progress"
+    assert (root / "created.txt").read_text() == "created\n"
 
 
 def test_apply_patch_refuses_hard_link_move_without_mutating_names(tmp_path: Path) -> None:

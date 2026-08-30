@@ -822,14 +822,10 @@ class ApplyPatchTool(Tool):
                     failure_category = "durable_settlement_unavailable"
                 break
 
-        if journal is not None:
-            try:
-                await journal.terminal(outcome, failure_category)
-            except (asyncio.CancelledError, _PatchJournalError):
-                outcome = "ambiguous" if applied_count else "failed"
-                failure_category = "durable_terminal_unavailable"
-
-        return await self._result(
+        # Result projection records the exact invocation-secret revision that
+        # bounds the public output. Capture it before terminal journaling seals
+        # that scope; the runtime cannot publish the result until run() returns.
+        result = await self._result(
             ctx,
             prepared,
             evidence,
@@ -837,6 +833,15 @@ class ApplyPatchTool(Tool):
             failure_category=failure_category,
             projection_snapshot=projection_snapshot,
         )
+        if journal is not None:
+            try:
+                await journal.terminal(outcome, failure_category)
+            except (asyncio.CancelledError, _PatchJournalError):
+                return _terminal_journal_failure_result(
+                    prepared,
+                    workspace_outcome=outcome,
+                )
+        return result
 
     async def _result(
         self,
@@ -1192,6 +1197,29 @@ def _journal_failure_result(*, mutated: bool) -> ToolResult:
             "failure_category": "durable_journal_unavailable",
             "workspace_may_have_changed": mutated,
             "requires_fresh_read": mutated,
+        },
+        is_error=True,
+    )
+
+
+def _terminal_journal_failure_result(
+    prepared: _PreparedPatch,
+    *,
+    workspace_outcome: PatchOutcome,
+) -> ToolResult:
+    return ToolResult(
+        content=(
+            "Patch terminal settlement could not be published durably. Re-read every "
+            "affected path before proposing a repair."
+        ),
+        structured={
+            "version": PATCH_RESULT_VERSION,
+            "patch_id": prepared.patch_id,
+            "outcome": "ambiguous",
+            "workspace_outcome": workspace_outcome,
+            "failure_category": "durable_terminal_unavailable",
+            "workspace_may_have_changed": True,
+            "requires_fresh_read": True,
         },
         is_error=True,
     )
