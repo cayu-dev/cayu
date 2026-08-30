@@ -14,6 +14,7 @@ from cayu._validation import DurableValueError
 from cayu.storage import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
+    KnowledgeActivationConflict,
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeMaintenanceDecisionKind,
@@ -71,7 +72,14 @@ def test_review_workflow_rejects_nonportable_scope_and_entry_text(
 
     workflow = KnowledgeReviewWorkflow(InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE))
     with pytest.raises(DurableValueError) as invalid_entry:
-        asyncio.run(workflow.approve(invalid_text))
+        asyncio.run(
+            workflow.approve(
+                invalid_text,
+                operation_id="review-invalid-text",
+                reviewer_identity="reviewer",
+                reviewer_version="1",
+            )
+        )
     assert invalid_entry.value.code == code
     assert "workload-secret-value" not in str(invalid_entry.value)
 
@@ -136,7 +144,12 @@ def test_review_workflow_approves_pending_entry() -> None:
             access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(store, namespace="project:cayu")
-        approved = await workflow.approve("pending_git")
+        approved = await workflow.approve(
+            "pending_git",
+            operation_id="review-pending-git",
+            reviewer_identity="security-reviewer",
+            reviewer_version="1",
+        )
         default_search = await store.search(
             KnowledgeQuery(text="brokered credential proxy", namespace="project:cayu")
         )
@@ -144,8 +157,109 @@ def test_review_workflow_approves_pending_entry() -> None:
 
     approved, default_search = asyncio.run(run())
 
-    assert approved.status is KnowledgeStatus.ACTIVE
+    assert approved.entry.status is KnowledgeStatus.ACTIVE
+    assert approved.receipt.authority.decision.policy_identity == "security-reviewer"
     assert [hit.entry.id for hit in default_search.hits] == ["pending_git"]
+
+
+def test_review_workflow_rejects_store_mutation_of_activation_authority() -> None:
+    class MutatingAuthorityStore(InMemoryKnowledgeStore):
+        async def approve_pending_entry(
+            self,
+            authority,
+            *,
+            access_scope=None,
+            expected_namespace=None,
+            expected_labels=None,
+        ):
+            authority.decision.annotations.clear()
+            authority.decision.annotations["store"] = "rewritten"
+            return await super().approve_pending_entry(
+                authority,
+                access_scope=access_scope,
+                expected_namespace=expected_namespace,
+                expected_labels=expected_labels,
+            )
+
+    async def run():
+        store = MutatingAuthorityStore(
+            [
+                KnowledgeEntry(
+                    id="pending_mutation",
+                    text="Review attribution must remain application-owned.",
+                    status=KnowledgeStatus.PENDING,
+                )
+            ],
+            access_scope=_ACCESS_SCOPE,
+        )
+        workflow = KnowledgeReviewWorkflow(store)
+        with pytest.raises(KnowledgeActivationConflict) as conflict:
+            await workflow.approve(
+                "pending_mutation",
+                operation_id="review-authority-mutation",
+                reviewer_identity="security-reviewer",
+                reviewer_version="1",
+                annotations={"review": "original"},
+            )
+        receipt = await store.load_activation_receipt("review-authority-mutation")
+        return conflict.value.reason, receipt
+
+    reason, receipt = asyncio.run(run())
+
+    assert reason == "operation_mismatch"
+    assert receipt is not None
+    assert receipt.authority.decision.annotations == {"store": "rewritten"}
+
+
+def test_review_workflow_rejects_forged_returned_active_revision() -> None:
+    class ForgingApprovalStore(InMemoryKnowledgeStore):
+        async def approve_pending_entry(
+            self,
+            authority,
+            *,
+            access_scope=None,
+            expected_namespace=None,
+            expected_labels=None,
+        ):
+            approval = await super().approve_pending_entry(
+                authority,
+                access_scope=access_scope,
+                expected_namespace=expected_namespace,
+                expected_labels=expected_labels,
+            )
+            return approval.model_copy(
+                update={
+                    "entry": approval.entry.model_copy(update={"text": "A forged review result."})
+                }
+            )
+
+    async def run():
+        store = ForgingApprovalStore(
+            [
+                KnowledgeEntry(
+                    id="pending_forged_result",
+                    text="Review results must match the durable active revision.",
+                    status=KnowledgeStatus.PENDING,
+                )
+            ],
+            access_scope=_ACCESS_SCOPE,
+        )
+        workflow = KnowledgeReviewWorkflow(store)
+        with pytest.raises(KnowledgeActivationConflict) as conflict:
+            await workflow.approve(
+                "pending_forged_result",
+                operation_id="review-forged-result",
+                reviewer_identity="security-reviewer",
+                reviewer_version="1",
+            )
+        durable = await store.get_entry("pending_forged_result", revision=2)
+        return conflict.value.reason, durable
+
+    reason, durable = asyncio.run(run())
+
+    assert reason == "operation_mismatch"
+    assert durable is not None
+    assert durable.text == "Review results must match the durable active revision."
 
 
 def test_review_workflow_rejects_pending_entry_as_archived() -> None:
@@ -195,7 +309,12 @@ def test_review_workflow_refuses_non_pending_entries() -> None:
             access_scope=_ACCESS_SCOPE,
         )
         workflow = KnowledgeReviewWorkflow(store, namespace="project:cayu")
-        await workflow.approve("active_git")
+        await workflow.approve(
+            "active_git",
+            operation_id="review-active-git",
+            reviewer_identity="reviewer",
+            reviewer_version="1",
+        )
 
     with pytest.raises(ValueError, match="not 'pending'"):
         asyncio.run(run())
@@ -220,7 +339,12 @@ def test_review_workflow_refuses_entries_outside_scope() -> None:
             namespace="project:cayu",
             labels={"project": "cayu"},
         )
-        await workflow.approve("pending_other")
+        await workflow.approve(
+            "pending_other",
+            operation_id="review-pending-other",
+            reviewer_identity="reviewer",
+            reviewer_version="1",
+        )
 
     with pytest.raises(PermissionError, match="outside review namespace"):
         asyncio.run(run())
@@ -245,7 +369,12 @@ def test_review_workflow_rejects_revision_drift_during_status_transition() -> No
             namespace="project:cayu",
             labels={"project": "cayu"},
         )
-        await workflow.approve("pending_git")
+        await workflow.approve(
+            "pending_git",
+            operation_id="review-drifted-git",
+            reviewer_identity="reviewer",
+            reviewer_version="1",
+        )
 
     with pytest.raises(KnowledgeRevisionConflict):
         asyncio.run(run())

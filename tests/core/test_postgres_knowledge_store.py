@@ -9,6 +9,9 @@ import pytest
 from tests.core.knowledge_access_scope_conformance import (
     assert_knowledge_access_scope_conformance,
 )
+from tests.core.knowledge_governance_conformance import (
+    assert_inaccessible_malformed_activation_receipt_is_hidden,
+)
 from tests.core.knowledge_index_readiness_conformance import (
     assert_index_readiness_conformance,
 )
@@ -90,6 +93,7 @@ from cayu.storage.memory import (
     _knowledge_access_snapshot_json,
     _knowledge_chunk_content_hash,
     _knowledge_publication_v1_request_sha256,
+    knowledge_entry_payload_bytes,
 )
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
 from cayu.work_context import agent_recall_facet_aspect
@@ -104,6 +108,540 @@ _MAINTENANCE_EVALUATION_RESULTS = (
     Path(__file__).resolve().parents[2]
     / "benchmarks/memory/knowledge-maintenance-evaluation-results-v1.json"
 )
+
+
+def test_postgres_governed_publication_and_review_approval_are_atomic(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import (
+            KnowledgeActivationSource,
+            KnowledgeGovernanceConfig,
+            KnowledgeGovernanceMode,
+            KnowledgeReviewWorkflow,
+            PostgresKnowledgeStore,
+            decide_knowledge_activation,
+            prepare_knowledge_activation_request,
+        )
+
+        class SnapshotCheckingActivationStore(PostgresKnowledgeStore):
+            verify_next_activation_read_snapshot = False
+
+            async def _load_activation_receipt(
+                self,
+                cur,
+                operation_id,
+                *,
+                access_scope,
+                deny_inaccessible,
+            ):
+                if self.verify_next_activation_read_snapshot:
+                    self.verify_next_activation_read_snapshot = False
+                    await cur.execute("SHOW transaction_isolation")
+                    isolation = await cur.fetchone()
+                    await cur.execute("SHOW transaction_read_only")
+                    read_only = await cur.fetchone()
+                    assert isolation is not None and isolation[0] == "repeatable read"
+                    assert read_only is not None and read_only[0] == "on"
+                return await super()._load_activation_receipt(
+                    cur,
+                    operation_id,
+                    access_scope=access_scope,
+                    deny_inaccessible=deny_inaccessible,
+                )
+
+        await _drop_all(postgres_dsn)
+        store = SnapshotCheckingActivationStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+            entry = KnowledgeEntry(
+                id="postgres-governed-entry",
+                text="Reviewed production knowledge requires attributed approval.",
+                status=KnowledgeStatus.PENDING,
+                created_at=now,
+                updated_at=now,
+                source_type="test",
+                source_id="postgres-governance",
+                source_hash="postgres-governance-sha256",
+            )
+            chunks = [
+                KnowledgeChunk(
+                    id="postgres-governed-entry:r1:0",
+                    entry_id=entry.id,
+                    text=entry.text,
+                    chunk_index=0,
+                )
+            ]
+            request = prepare_knowledge_activation_request(
+                entry,
+                chunks,
+                access_scope=_ACCESS_SCOPE,
+                operation_id="postgres-governed-publication",
+                governance_mode=KnowledgeGovernanceMode.REVIEWED,
+                source=KnowledgeActivationSource.CURATOR,
+            )
+            authority = await decide_knowledge_activation(
+                request,
+                config=KnowledgeGovernanceConfig(),
+            )
+            publication = await store.publish_entry_revision(
+                entry,
+                chunks,
+                access_scope=_ACCESS_SCOPE,
+                operation_id="postgres-governed-publication",
+                activation_authority=authority,
+            )
+            store.verify_next_activation_read_snapshot = True
+            publication_audit = await store.load_activation_receipt(
+                "postgres-governed-publication",
+                access_scope=_ACCESS_SCOPE,
+            )
+            workflow = KnowledgeReviewWorkflow(store, access_scope=_ACCESS_SCOPE)
+            approval = await workflow.approve(
+                entry.id,
+                operation_id="postgres-reviewed-approval",
+                reviewer_identity="human.release-reviewer",
+                reviewer_version="2026-08",
+            )
+            replay = await workflow.approve(
+                entry.id,
+                operation_id="postgres-reviewed-approval",
+                reviewer_identity="human.release-reviewer",
+                reviewer_version="2026-08",
+            )
+            active_audit = await store.load_activation_receipt(
+                "postgres-reviewed-approval",
+                access_scope=KnowledgeAccessScope.for_namespace("default"),
+            )
+            approval_publication = await store.load_entry_publication_receipt(
+                "postgres-reviewed-approval",
+                access_scope=KnowledgeAccessScope.for_namespace("default"),
+            )
+            assert publication_audit is not None
+            assert publication_audit.publication_request_sha256 == publication.request_sha256
+            assert approval.entry.status is KnowledgeStatus.ACTIVE
+            assert approval.entry.revision == 2
+            assert replay.entry == approval.entry
+            assert replay.receipt.replayed is True
+            assert replay.receipt.authority.decision.policy_identity == ("human.release-reviewer")
+            assert active_audit is not None
+            assert active_audit.entry_revision == approval.entry.revision
+            assert approval_publication is not None
+            assert approval_publication.request_sha256 == active_audit.publication_request_sha256
+            assert approval_publication.committed_at == active_audit.committed_at
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_activation_receipt_failure_rolls_back_the_whole_publication(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import (
+            KnowledgeActivationSource,
+            KnowledgeGovernanceConfig,
+            KnowledgeGovernanceMode,
+            PostgresKnowledgeStore,
+            decide_knowledge_activation,
+            prepare_knowledge_activation_request,
+        )
+
+        class FailingActivationReceiptStore(PostgresKnowledgeStore):
+            async def _insert_activation_receipt(self, cur, receipt, *, access_entry):
+                raise RuntimeError("injected activation receipt failure")
+
+        await _drop_all(postgres_dsn)
+        store = FailingActivationReceiptStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            now = datetime(2026, 8, 30, 12, tzinfo=UTC)
+            entry = KnowledgeEntry(
+                id="postgres-failed-governed-entry",
+                text="Activation receipt failure rolls back every authoritative write.",
+                status=KnowledgeStatus.PENDING,
+                created_at=now,
+                updated_at=now,
+            )
+            chunks = [
+                KnowledgeChunk(
+                    id="postgres-failed-governed-entry:r1:0",
+                    entry_id=entry.id,
+                    text=entry.text,
+                    chunk_index=0,
+                )
+            ]
+            request = prepare_knowledge_activation_request(
+                entry,
+                chunks,
+                access_scope=_ACCESS_SCOPE,
+                operation_id="postgres-failed-governed-publication",
+                governance_mode=KnowledgeGovernanceMode.REVIEWED,
+                source=KnowledgeActivationSource.CURATOR,
+            )
+            authority = await decide_knowledge_activation(
+                request,
+                config=KnowledgeGovernanceConfig(),
+            )
+            with pytest.raises(RuntimeError, match="injected activation receipt failure"):
+                await store.publish_entry_revision(
+                    entry,
+                    chunks,
+                    operation_id="postgres-failed-governed-publication",
+                    activation_authority=authority,
+                )
+            assert await store.get_entry(entry.id) is None
+            assert (
+                await store.load_entry_publication_receipt("postgres-failed-governed-publication")
+                is None
+            )
+            assert (
+                await store.load_activation_receipt("postgres-failed-governed-publication") is None
+            )
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_review_activation_receipt_failure_rolls_back_the_successor(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import KnowledgeReviewWorkflow, PostgresKnowledgeStore
+
+        class FailingActivationReceiptStore(PostgresKnowledgeStore):
+            async def _insert_activation_receipt(self, cur, receipt, *, access_entry):
+                raise RuntimeError("injected review activation receipt failure")
+
+        await _drop_all(postgres_dsn)
+        store = FailingActivationReceiptStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            entry = KnowledgeEntry(
+                id="postgres-failed-review-entry",
+                text="Review activation receipt failure preserves the pending revision.",
+                status=KnowledgeStatus.PENDING,
+            )
+            await store.create_entry(entry)
+            workflow = KnowledgeReviewWorkflow(store)
+            with pytest.raises(
+                RuntimeError,
+                match="injected review activation receipt failure",
+            ):
+                await workflow.approve(
+                    entry.id,
+                    operation_id="postgres-failed-review-approval",
+                    reviewer_identity="human.release-reviewer",
+                    reviewer_version="2026-08",
+                )
+            current = await store.get_entry(entry.id)
+            assert current is not None
+            assert current.status is KnowledgeStatus.PENDING
+            assert current.revision == 1
+            assert (
+                await store.load_entry_publication_receipt("postgres-failed-review-approval")
+                is None
+            )
+            assert await store.load_activation_receipt("postgres-failed-review-approval") is None
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_review_approval_cannot_reuse_a_publication_operation(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import (
+            KnowledgeActivationConflict,
+            KnowledgeReviewWorkflow,
+            PostgresKnowledgeStore,
+        )
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            occupied = KnowledgeEntry(
+                id="postgres-operation-owner",
+                text="This publication owns the shared operation.",
+            )
+            await store.publish_entry_revision(
+                occupied,
+                [
+                    KnowledgeChunk(
+                        id="postgres-operation-owner:r1:0",
+                        entry_id=occupied.id,
+                        text=occupied.text,
+                        chunk_index=0,
+                    )
+                ],
+                operation_id="postgres-shared-operation",
+            )
+            pending = KnowledgeEntry(
+                id="postgres-pending-review",
+                text="This pending entry cannot reuse the operation.",
+                status=KnowledgeStatus.PENDING,
+            )
+            await store.create_entry(pending)
+            workflow = KnowledgeReviewWorkflow(store)
+            with pytest.raises(KnowledgeActivationConflict) as conflict:
+                await workflow.approve(
+                    pending.id,
+                    operation_id="postgres-shared-operation",
+                    reviewer_identity="human.release-reviewer",
+                    reviewer_version="2026-08",
+                )
+            assert conflict.value.reason == "operation_occupied"
+            current = await store.get_entry(pending.id)
+            assert current is not None
+            assert current.status is KnowledgeStatus.PENDING
+            assert current.revision == 1
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_activation_receipt_rejects_inconsistent_indexed_columns(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import (
+            KnowledgeActivationConflict,
+            KnowledgeActivationSource,
+            KnowledgeGovernanceConfig,
+            KnowledgeGovernanceMode,
+            PostgresKnowledgeStore,
+            decide_knowledge_activation,
+            prepare_knowledge_activation_request,
+        )
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            entry = KnowledgeEntry(
+                id="postgres-inconsistent-activation",
+                text="Indexed activation columns must agree with the JSON envelope.",
+                status=KnowledgeStatus.PENDING,
+            )
+            chunks = [
+                KnowledgeChunk(
+                    id="postgres-inconsistent-activation:r1:0",
+                    entry_id=entry.id,
+                    text=entry.text,
+                    chunk_index=0,
+                )
+            ]
+            request = prepare_knowledge_activation_request(
+                entry,
+                chunks,
+                access_scope=_ACCESS_SCOPE,
+                operation_id="postgres-inconsistent-activation",
+                governance_mode=KnowledgeGovernanceMode.REVIEWED,
+                source=KnowledgeActivationSource.CURATOR,
+            )
+            authority = await decide_knowledge_activation(
+                request,
+                config=KnowledgeGovernanceConfig(),
+            )
+            await store.publish_entry_revision(
+                entry,
+                chunks,
+                operation_id=request.operation_id,
+                activation_authority=authority,
+            )
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE cayu_knowledge_activation_receipts "
+                        "SET publication_request_sha256 = %s WHERE operation_id = %s",
+                        ("b" * 64, request.operation_id),
+                    )
+                await connection.commit()
+            with pytest.raises(KnowledgeActivationConflict) as conflict:
+                await store.load_activation_receipt(request.operation_id)
+            assert conflict.value.reason == "malformed_receipt"
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_inaccessible_malformed_activation_receipt_is_hidden(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+
+        async def corrupt_receipt(operation_id: str) -> None:
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE cayu_knowledge_activation_receipts "
+                        "SET receipt_json = '{}' WHERE operation_id = %s",
+                        (operation_id,),
+                    )
+                await connection.commit()
+
+        try:
+            await assert_inaccessible_malformed_activation_receipt_is_hidden(
+                store,
+                corrupt_receipt=corrupt_receipt,
+            )
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_governed_replay_rejects_receipt_commit_boundary_mismatch(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import (
+            KnowledgeActivationSource,
+            KnowledgeGovernanceConfig,
+            KnowledgeGovernanceMode,
+            KnowledgePublicationConflict,
+            PostgresKnowledgeStore,
+            decide_knowledge_activation,
+            prepare_knowledge_activation_request,
+        )
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            entry = KnowledgeEntry(
+                id="postgres-mismatched-activation-commit",
+                text="Publication and activation receipts share one commit boundary.",
+                status=KnowledgeStatus.PENDING,
+            )
+            chunks = [
+                KnowledgeChunk(
+                    id="postgres-mismatched-activation-commit:r1:0",
+                    entry_id=entry.id,
+                    text=entry.text,
+                    chunk_index=0,
+                )
+            ]
+            request = prepare_knowledge_activation_request(
+                entry,
+                chunks,
+                access_scope=_ACCESS_SCOPE,
+                operation_id="postgres-mismatched-activation-commit",
+                governance_mode=KnowledgeGovernanceMode.REVIEWED,
+                source=KnowledgeActivationSource.CURATOR,
+            )
+            authority = await decide_knowledge_activation(
+                request,
+                config=KnowledgeGovernanceConfig(),
+            )
+            await store.publish_entry_revision(
+                entry,
+                chunks,
+                operation_id=request.operation_id,
+                activation_authority=authority,
+            )
+            activation = await store.load_activation_receipt(request.operation_id)
+            assert activation is not None
+            shifted = activation.model_copy(
+                update={"committed_at": activation.committed_at + timedelta(seconds=1)}
+            )
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE cayu_knowledge_activation_receipts "
+                        "SET committed_at = %s, receipt_json = %s WHERE operation_id = %s",
+                        (
+                            shifted.committed_at,
+                            shifted.model_dump_json(),
+                            request.operation_id,
+                        ),
+                    )
+                await connection.commit()
+            with pytest.raises(KnowledgePublicationConflict) as conflict:
+                await store.publish_entry_revision(
+                    entry,
+                    chunks,
+                    operation_id=request.operation_id,
+                    activation_authority=authority,
+                )
+            assert conflict.value.reason == "activation_mismatch"
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
 
 
 def _maintenance_result_without_backend_latency(
@@ -361,6 +899,8 @@ _TABLES = (
     "cayu_knowledge_change_audiences",
     "cayu_knowledge_changes",
     "cayu_knowledge_evidence",
+    "cayu_knowledge_activation_retirements",
+    "cayu_knowledge_activation_receipts",
     "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
@@ -454,40 +994,55 @@ async def _insert_pre_revision_65_entry(
             )
             await cursor.execute(
                 """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'cayu_knowledge_revisions'
+                      AND column_name = 'payload_bytes'
+                )
+                """
+            )
+            has_payload_bytes = bool((await cursor.fetchone())[0])
+            payload_column = ", payload_bytes" if has_payload_bytes else ""
+            payload_placeholder = ", %s" if has_payload_bytes else ""
+            values = (
+                entry.id,
+                entry.revision,
+                entry.text,
+                entry.kind,
+                str(entry.visibility),
+                str(entry.status),
+                str(entry.created_by_type),
+                entry.created_by,
+                entry.created_at,
+                entry.updated_at,
+                entry.source_type,
+                entry.source_uri,
+                entry.source_id,
+                entry.source_hash,
+                entry.importance,
+                entry.importance_source,
+                entry.confidence,
+                entry.last_used_at,
+                entry.expires_at,
+                entry.title,
+                Jsonb(entry.metadata),
+            )
+            await cursor.execute(
+                f"""
                 INSERT INTO cayu_knowledge_revisions (
                     entry_id, revision, text, kind, visibility, status,
                     created_by_type, created_by, created_at, updated_at,
                     source_type, source_uri, source_id, source_hash,
                     importance, importance_source, confidence, last_used_at,
-                    expires_at, title, metadata
+                    expires_at, title, metadata{payload_column}
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{payload_placeholder}
                 )
                 """,
-                (
-                    entry.id,
-                    entry.revision,
-                    entry.text,
-                    entry.kind,
-                    str(entry.visibility),
-                    str(entry.status),
-                    str(entry.created_by_type),
-                    entry.created_by,
-                    entry.created_at,
-                    entry.updated_at,
-                    entry.source_type,
-                    entry.source_uri,
-                    entry.source_id,
-                    entry.source_hash,
-                    entry.importance,
-                    entry.importance_source,
-                    entry.confidence,
-                    entry.last_used_at,
-                    entry.expires_at,
-                    entry.title,
-                    Jsonb(entry.metadata),
-                ),
+                (*values, knowledge_entry_payload_bytes(entry)) if has_payload_bytes else values,
             )
         await connection.commit()
 
@@ -2244,12 +2799,14 @@ def test_postgres_remember_knowledge_reconciles_ack_loss_and_restart(
                 *,
                 operation_id,
                 expected_revision=None,
+                activation_authority=None,
             ):
                 await super().publish_entry_revision(
                     entry,
                     chunks,
                     operation_id=operation_id,
                     expected_revision=expected_revision,
+                    activation_authority=activation_authority,
                 )
                 raise RuntimeError("secret canary acknowledgement failure")
 
@@ -5704,6 +6261,108 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
             schema_mode=SchemaMode.MIGRATE,
             access_scope=_ACCESS_SCOPE,
         )
+        revisions = schema_migrations.REVISIONS
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 67
+        )
+        migrator._min_required_revision = 67
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+            schema_migrations.REVISIONS = revisions
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (67,)
+            await cursor.execute(
+                "SELECT text FROM cayu_knowledge_revisions "
+                "WHERE entry_id = 'revision-66-entry' AND revision = 1"
+            )
+            assert await cursor.fetchone() == ("Preserve this exact revision.",)
+            await cursor.execute("SELECT COUNT(*) FROM cayu_knowledge_maintenance_proposals")
+            assert await cursor.fetchone() == (0,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_75_refuses_populated_knowledge_without_backfill(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=74)
+        entry = KnowledgeEntry(
+            id="revision-74-entry",
+            text="Revision 75 must not infer activation authority.",
+        )
+        await _insert_pre_revision_65_entry(postgres_dsn, entry)
+
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(
+                schema_migrations.SchemaTooOld,
+                match="clean prerelease knowledge-activation-authority break",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (74,)
+            await cursor.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = %s AND revision = 1",
+                (entry.id,),
+            )
+            assert await cursor.fetchone() == (entry.text,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_activation_receipts')")
+            assert await cursor.fetchone() == (None,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_activation_retirements')")
+            assert await cursor.fetchone() == (None,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_75_initializes_empty_knowledge_schema_directly(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=74)
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
         try:
             await migrator.ensure_schema()
         finally:
@@ -5715,13 +6374,113 @@ def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
             assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
-            await cursor.execute(
-                "SELECT text FROM cayu_knowledge_revisions "
-                "WHERE entry_id = 'revision-66-entry' AND revision = 1"
-            )
-            assert await cursor.fetchone() == ("Preserve this exact revision.",)
-            await cursor.execute("SELECT COUNT(*) FROM cayu_knowledge_maintenance_proposals")
-            assert await cursor.fetchone() == (0,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_activation_receipts')")
+            assert await cursor.fetchone() == ("cayu_knowledge_activation_receipts",)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_activation_retirements')")
+            assert await cursor.fetchone() == ("cayu_knowledge_activation_retirements",)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_75_rejects_malformed_activation_storage(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_activation_receipts")
+                await cursor.execute(
+                    "CREATE TABLE cayu_knowledge_activation_receipts "
+                    "(operation_id TEXT PRIMARY KEY)"
+                )
+            await connection.commit()
+
+        validator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="knowledge-activation authority contract",
+            ):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_75_rejects_malformed_activation_retirement_storage(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_activation_retirements")
+                await cursor.execute(
+                    "CREATE TABLE cayu_knowledge_activation_retirements (entry_id TEXT PRIMARY KEY)"
+                )
+            await connection.commit()
+
+        validator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="knowledge-activation authority contract",
+            ):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
 
     try:
         asyncio.run(run())
@@ -5831,7 +6590,6 @@ def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
         from cayu.storage import postgres as postgres_storage
 
         await _drop_all(postgres_dsn)
@@ -5925,36 +6683,47 @@ def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated
             await connection.commit()
 
         await _initialize_historical_schema(postgres_dsn, through_revision=43)
-        store = PostgresKnowledgeStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.VALIDATE,
-            access_scope=_ACCESS_SCOPE,
-        )
-        store._min_required_revision = 43
         try:
-            replay = await store.publish_entry_revision(
-                entry,
-                [chunk],
-                operation_id=operation_id,
-            )
-            assert replay.replayed is True
-            assert replay.committed_at == timestamp
-            assert await store.get_entry(entry.id) == entry
-            assert await store.read_chunks(entry.id) == [chunk]
-            evidence = await store.read_evidence(entry.id)
-            assert evidence is not None
-            assert evidence.evidence == []
-            assert evidence.total_evidence_known == 0
             async with (
                 await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
                 connection.cursor() as cursor,
             ):
+                await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+                assert await cursor.fetchone() == (43,)
+                await cursor.execute(
+                    "SELECT current_revision FROM cayu_knowledge_entries WHERE id = %s",
+                    (entry.id,),
+                )
+                assert await cursor.fetchone() == (1,)
+                await cursor.execute(
+                    "SELECT text, metadata FROM cayu_knowledge_revisions "
+                    "WHERE entry_id = %s AND revision = 1",
+                    (entry.id,),
+                )
+                assert await cursor.fetchone() == (entry.text, entry.metadata)
+                await cursor.execute(
+                    "SELECT key, value FROM cayu_knowledge_labels "
+                    "WHERE entry_id = %s AND entry_revision = 1",
+                    (entry.id,),
+                )
+                assert await cursor.fetchone() == ("project", "cayu")
+                await cursor.execute(
+                    "SELECT id, text FROM cayu_knowledge_chunks "
+                    "WHERE entry_id = %s AND entry_revision = 1",
+                    (entry.id,),
+                )
+                assert await cursor.fetchone() == (chunk.id, chunk.text)
+                await cursor.execute(
+                    "SELECT request_sha256, committed_at "
+                    "FROM cayu_knowledge_publication_receipts WHERE operation_id = %s",
+                    (operation_id,),
+                )
+                assert await cursor.fetchone() == (request_sha256, timestamp)
+                await cursor.execute("SELECT COUNT(*) FROM cayu_knowledge_evidence")
+                assert await cursor.fetchone() == (0,)
                 await cursor.execute("SELECT COUNT(*) FROM cayu_knowledge_changes")
                 assert await cursor.fetchone() == (0,)
         finally:
-            await store.close()
             await _drop_all(postgres_dsn)
 
     asyncio.run(run())

@@ -69,6 +69,24 @@ MAX_KNOWLEDGE_MAINTENANCE_SOURCES = 50
 MAX_KNOWLEDGE_MAINTENANCE_BYTES = 256_000
 MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES = 16_384
 MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES = 16_384
+MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES = 16_384
+MAX_KNOWLEDGE_ACTIVATION_CHUNKS = 10_000
+MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS = 10_000
+MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES = 65_536
+MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES = 256
+MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES = 1_048_576
+MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES = 1_114_112
+_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES = 1_048_576
+_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME = datetime(
+    9999,
+    12,
+    31,
+    23,
+    59,
+    59,
+    999999,
+    tzinfo=UTC,
+)
 MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS = 2**31 - 1
 MAX_KNOWLEDGE_INDEX_READINESS_LIMIT = 1_000
 MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT = 10_000
@@ -150,6 +168,54 @@ class KnowledgeActorType(StrEnum):
     USER = "user"
     MODEL = "model"
     SYSTEM = "system"
+
+
+class KnowledgeGovernanceMode(StrEnum):
+    """Application-selected authority model for one high-level knowledge write."""
+
+    REVIEWED = "reviewed"
+    POLICY_AUTOMATIC = "policy_automatic"
+    AUTONOMOUS = "autonomous"
+
+
+class KnowledgeActivationDisposition(StrEnum):
+    """Application-policy outcome for one exact activation request."""
+
+    ACTIVATE = "activate"
+    ROUTE_TO_REVIEW = "route_to_review"
+    REJECT = "reject"
+
+
+class KnowledgeActivationSource(StrEnum):
+    """High-level boundary that requested an activation decision."""
+
+    CURATOR = "curator"
+    MODEL_TOOL = "model_tool"
+    REVIEW_APPROVAL = "review_approval"
+
+
+def _knowledge_activation_schema_version(value: object) -> int:
+    if type(value) is not int or value != 1:
+        raise ValueError("`schema_version` must be the integer 1.")
+    return value
+
+
+def _knowledge_activation_identity(value: object, field_name: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"`{field_name}` must be a string.")
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES:
+        raise ValueError(
+            f"`{field_name}` must be at most {MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES} UTF-8 bytes."
+        )
+    return value
+
+
+def _knowledge_activation_revision(value: object, field_name: str) -> int:
+    if type(value) is not int:
+        raise ValueError(f"`{field_name}` must be an integer.")
+    _validate_knowledge_revision(value, field_name)
+    return value
 
 
 class KnowledgeSearchMode(StrEnum):
@@ -522,10 +588,15 @@ class KnowledgeEntry(BaseModel):
     def validate_id(cls, value: str) -> str:
         return _knowledge_entry_id(value, "id")
 
-    @field_validator("namespace", "kind", "created_by")
+    @field_validator("namespace", "kind")
     @classmethod
     def validate_clean_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("created_by", mode="before")
+    @classmethod
+    def validate_created_by(cls, value: object) -> str:
+        return _knowledge_activation_identity(value, "created_by")
 
     @field_validator("revision")
     @classmethod
@@ -624,6 +695,58 @@ class _KnowledgeAccessSnapshot(BaseModel):
     @classmethod
     def copy_labels(cls, value) -> dict[str, str]:
         return copy_label_map(value, "labels")
+
+
+class _KnowledgeActivationRetirement(BaseModel):
+    """Content-free final authority retained when governed knowledge is pruned."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    entry_id: str
+    entry_revision: int
+    access_snapshot: _KnowledgeAccessSnapshot
+    retired_at: datetime
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("entry_revision")
+    @classmethod
+    def validate_entry_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "entry_revision")
+        return value
+
+    @field_validator("access_snapshot", mode="before")
+    @classmethod
+    def copy_access_snapshot(cls, value: object) -> object:
+        if type(value) is _KnowledgeAccessSnapshot:
+            return value.model_copy(deep=True)
+        return value
+
+    @field_validator("retired_at")
+    @classmethod
+    def validate_retired_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`retired_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_document_size(self) -> _KnowledgeActivationRetirement:
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge activation retirement",
+                )
+            )
+            > _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES
+        ):
+            raise ValueError(
+                "Knowledge activation retirement authority exceeds its canonical byte limit."
+            )
+        return self
 
 
 class _KnowledgeRelationAccessSnapshot(BaseModel):
@@ -867,6 +990,478 @@ class KnowledgeEvidence(BaseModel):
                 f"Knowledge evidence must be at most {MAX_KNOWLEDGE_EVIDENCE_BYTES} "
                 "canonical UTF-8 bytes."
             )
+        return self
+
+
+class KnowledgeGovernanceConfig(BaseModel):
+    """Host-owned mode, policy identity, and execution bound for activation."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        validate_default=True,
+    )
+
+    schema_version: Literal[1] = 1
+    mode: KnowledgeGovernanceMode = KnowledgeGovernanceMode.REVIEWED
+    policy_identity: str | None = None
+    policy_version: str | None = None
+    policy_timeout_seconds: float = 30.0
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> int:
+        return _knowledge_activation_schema_version(value)
+
+    @field_validator("policy_identity", "policy_version", mode="before")
+    @classmethod
+    def validate_optional_identity(cls, value: object, info) -> str | None:
+        if value is None:
+            return None
+        return _knowledge_activation_identity(value, info.field_name)
+
+    @field_validator("policy_timeout_seconds", mode="before")
+    @classmethod
+    def validate_timeout(cls, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("`policy_timeout_seconds` must be a number.")
+        value = require_finite(float(value), "policy_timeout_seconds")
+        if value <= 0.0 or value > 3_600.0:
+            raise ValueError("`policy_timeout_seconds` must be between 0 and 3600 seconds.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_policy_authority(self) -> KnowledgeGovernanceConfig:
+        has_identity = self.policy_identity is not None
+        has_version = self.policy_version is not None
+        if has_identity != has_version:
+            raise ValueError("Activation policy identity and version must be configured together.")
+        if self.mode is KnowledgeGovernanceMode.REVIEWED and has_identity:
+            raise ValueError("Reviewed governance cannot configure an automatic policy.")
+        if self.mode is not KnowledgeGovernanceMode.REVIEWED and not has_identity:
+            raise ValueError("Automatic and autonomous governance require an explicit policy.")
+        return self
+
+
+class KnowledgeActivationRequest(BaseModel):
+    """Copied bounded material presented to one application activation policy."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        validate_default=True,
+    )
+
+    schema_version: Literal[1] = 1
+    operation_id: str
+    mode: KnowledgeGovernanceMode
+    source: KnowledgeActivationSource
+    candidate_entry: KnowledgeEntry
+    chunks: tuple[KnowledgeChunk, ...]
+    evidence: tuple[KnowledgeEvidence, ...] = ()
+    expected_revision: int | None = None
+    target_revision: int
+    access_scope: KnowledgeAccessScope
+    evaluator_identity: str | None = None
+    evaluator_result: dict[str, Any] | None = None
+    evaluator_decision_sha256: str | None = None
+    forbidden_authority_identities: tuple[str, ...] = ()
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> int:
+        return _knowledge_activation_schema_version(value)
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _knowledge_publication_operation_id(value)
+
+    @field_validator("candidate_entry", mode="before")
+    @classmethod
+    def copy_entry(cls, value: object) -> object:
+        if type(value) is KnowledgeEntry:
+            return copy_knowledge_entry(value)
+        return value
+
+    @field_validator("chunks", mode="before")
+    @classmethod
+    def copy_chunks(cls, value: object) -> object:
+        if not isinstance(value, list | tuple):
+            raise TypeError("`chunks` must be a list or tuple.")
+        if len(value) > MAX_KNOWLEDGE_ACTIVATION_CHUNKS:
+            raise ValueError(
+                f"`chunks` cannot contain more than {MAX_KNOWLEDGE_ACTIVATION_CHUNKS} records."
+            )
+        return tuple(
+            copy_knowledge_chunk(item) if type(item) is KnowledgeChunk else item for item in value
+        )
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def copy_evidence(cls, value: object) -> object:
+        if not isinstance(value, list | tuple):
+            raise TypeError("`evidence` must be a list or tuple.")
+        if len(value) > MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS:
+            raise ValueError(
+                "`evidence` cannot contain more than "
+                f"{MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS} records."
+            )
+        return tuple(
+            copy_knowledge_evidence(item) if type(item) is KnowledgeEvidence else item
+            for item in value
+        )
+
+    @field_validator("expected_revision", mode="before")
+    @classmethod
+    def validate_expected_revision(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return _knowledge_activation_revision(value, "expected_revision")
+
+    @field_validator("target_revision", mode="before")
+    @classmethod
+    def validate_target_revision(cls, value: object) -> int:
+        return _knowledge_activation_revision(value, "target_revision")
+
+    @field_validator("access_scope", mode="before")
+    @classmethod
+    def copy_access_scope(cls, value: object) -> object:
+        if type(value) is KnowledgeAccessScope:
+            return copy_knowledge_access_scope(value)
+        return value
+
+    @field_validator("evaluator_decision_sha256")
+    @classmethod
+    def validate_sha256(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError(f"`{info.field_name}` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("evaluator_identity", mode="before")
+    @classmethod
+    def validate_evaluator_identity(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _knowledge_activation_identity(value, "evaluator_identity")
+
+    @field_validator("evaluator_result", mode="before")
+    @classmethod
+    def copy_evaluator_result(cls, value: object) -> object:
+        if value is None:
+            return None
+        copied = copy_durable_json_object(value, "evaluator_result")
+        if len(canonical_durable_json_bytes(copied, "evaluator_result")) > (
+            MAX_KNOWLEDGE_ACTIVATION_EVALUATOR_RESULT_BYTES
+        ):
+            raise ValueError("`evaluator_result` exceeds its canonical byte limit.")
+        return copied
+
+    @field_validator("forbidden_authority_identities", mode="before")
+    @classmethod
+    def copy_forbidden_identities(cls, value: object) -> tuple[str, ...]:
+        if not isinstance(value, list | tuple):
+            raise TypeError("`forbidden_authority_identities` must be a list or tuple.")
+        copied: list[str] = []
+        for item in value:
+            if type(item) is not str:
+                raise TypeError("Forbidden authority identities must be strings.")
+            clean = _knowledge_activation_identity(item, "forbidden_authority_identities")
+            if clean not in copied:
+                copied.append(clean)
+        if len(copied) > 16:
+            raise ValueError("At most 16 forbidden authority identities may be supplied.")
+        return tuple(copied)
+
+    @model_validator(mode="after")
+    def validate_exact_material(self) -> KnowledgeActivationRequest:
+        expected_target = 1 if self.expected_revision is None else self.expected_revision + 1
+        if self.target_revision != expected_target:
+            raise ValueError("`target_revision` must follow `expected_revision`.")
+        if self.candidate_entry.status is not KnowledgeStatus.PENDING:
+            raise ValueError("Activation policy must receive a pending candidate projection.")
+        candidate_revision = self.candidate_entry.revision
+        if self.source is KnowledgeActivationSource.REVIEW_APPROVAL:
+            if self.mode is not KnowledgeGovernanceMode.REVIEWED:
+                raise ValueError("Review approval requires reviewed governance.")
+            if self.expected_revision is None or candidate_revision != self.expected_revision:
+                raise ValueError("Review approval must bind the current pending revision.")
+        elif candidate_revision != self.target_revision:
+            raise ValueError("Generated activation candidates must bind the target revision.")
+        _copy_entry_chunks(self.candidate_entry.id, candidate_revision, list(self.chunks))
+        _copy_entry_evidence(
+            self.candidate_entry.id,
+            candidate_revision,
+            list(self.evidence),
+            chunks=list(self.chunks),
+        )
+        evaluator_fields = (
+            self.evaluator_identity,
+            self.evaluator_result,
+            self.evaluator_decision_sha256,
+        )
+        if any(value is None for value in evaluator_fields) != all(
+            value is None for value in evaluator_fields
+        ):
+            raise ValueError(
+                "Evaluator identity, result, and decision fingerprint must appear together."
+            )
+        if (
+            self.evaluator_result is not None
+            and self.evaluator_decision_sha256
+            != sha256(
+                canonical_durable_json_bytes(
+                    self.evaluator_result,
+                    "knowledge activation evaluator result",
+                )
+            ).hexdigest()
+        ):
+            raise ValueError("Evaluator result does not match its decision fingerprint.")
+        request_bytes = canonical_durable_json_bytes(
+            self.model_dump(mode="json"),
+            "knowledge activation request",
+        )
+        if len(request_bytes) > MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES:
+            raise ValueError("Knowledge activation request exceeds its canonical byte limit.")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "knowledge activation request",
+            )
+        ).hexdigest()
+
+    @property
+    def access_scope_sha256(self) -> str:
+        """Return the canonical identity of the copied policy-visible scope."""
+
+        return knowledge_access_scope_sha256(self.access_scope)
+
+
+class KnowledgeActivationDecision(BaseModel):
+    """Exact application-owned disposition for one activation request."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        validate_default=True,
+    )
+
+    schema_version: Literal[1] = 1
+    request_sha256: str
+    disposition: KnowledgeActivationDisposition
+    policy_identity: str
+    policy_version: str
+    code: str
+    annotations: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> int:
+        return _knowledge_activation_schema_version(value)
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`request_sha256` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("policy_identity", "policy_version", "code", mode="before")
+    @classmethod
+    def validate_identity(cls, value: object, info) -> str:
+        return _knowledge_activation_identity(value, info.field_name)
+
+    @field_validator("annotations", mode="before")
+    @classmethod
+    def copy_annotations(cls, value: dict[str, Any]) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, "annotations")
+        if len(canonical_durable_json_bytes(copied, "annotations")) > (
+            MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES
+        ):
+            raise ValueError("Activation annotations exceed their canonical byte limit.")
+        return copied
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "knowledge activation decision",
+            )
+        ).hexdigest()
+
+
+class KnowledgeActivationAuthority(BaseModel):
+    """Validated request/decision pair handed to the mechanical store boundary."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        validate_default=True,
+    )
+
+    request: KnowledgeActivationRequest
+    decision: KnowledgeActivationDecision
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def copy_request(cls, value: object) -> object:
+        if type(value) is KnowledgeActivationRequest:
+            return value.model_copy(deep=True)
+        return value
+
+    @field_validator("decision", mode="before")
+    @classmethod
+    def copy_decision(cls, value: object) -> object:
+        if type(value) is KnowledgeActivationDecision:
+            return value.model_copy(deep=True)
+        return value
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> KnowledgeActivationAuthority:
+        if self.decision.request_sha256 != self.request.fingerprint:
+            raise ValueError("Activation decision does not bind its exact request.")
+        if self.decision.policy_identity in self.request.forbidden_authority_identities:
+            raise ValueError("A generator, evaluator, or model cannot authorize activation.")
+        if (
+            self.request.mode is KnowledgeGovernanceMode.REVIEWED
+            and self.request.source is not KnowledgeActivationSource.REVIEW_APPROVAL
+            and self.decision.disposition is not KnowledgeActivationDisposition.ROUTE_TO_REVIEW
+        ):
+            raise ValueError("Reviewed governance can only route generated knowledge to review.")
+        return self
+
+
+class KnowledgeActivationReceipt(BaseModel):
+    """Immutable store-authored attribution for one governed revision operation."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        validate_default=True,
+    )
+
+    schema_version: Literal[1] = 1
+    operation_id: str
+    entry_id: str
+    entry_revision: int
+    expected_revision: int | None
+    publication_request_sha256: str
+    authority: KnowledgeActivationAuthority
+    committed_at: datetime
+    replayed: bool = False
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> int:
+        return _knowledge_activation_schema_version(value)
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _knowledge_publication_operation_id(value)
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("entry_revision", mode="before")
+    @classmethod
+    def validate_entry_revision(cls, value: object) -> int:
+        return _knowledge_activation_revision(value, "entry_revision")
+
+    @field_validator("expected_revision", mode="before")
+    @classmethod
+    def validate_expected_revision(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return _knowledge_activation_revision(value, "expected_revision")
+
+    @field_validator("publication_request_sha256")
+    @classmethod
+    def validate_publication_request_sha256(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`publication_request_sha256` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("committed_at")
+    @classmethod
+    def validate_committed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`committed_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("replayed", mode="before")
+    @classmethod
+    def validate_replayed(cls, value: object) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`replayed` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_exact_binding(self) -> KnowledgeActivationReceipt:
+        request = self.authority.request
+        if (
+            self.operation_id != request.operation_id
+            or self.entry_id != request.candidate_entry.id
+            or self.entry_revision != request.target_revision
+            or self.expected_revision != request.expected_revision
+        ):
+            raise ValueError("Activation receipt does not bind its exact operation and revision.")
+        if self.authority.decision.disposition is KnowledgeActivationDisposition.REJECT:
+            raise ValueError("Rejected activation decisions cannot have publication receipts.")
+        receipt_bytes = canonical_durable_json_bytes(
+            self.model_dump(mode="json"),
+            "knowledge activation receipt",
+        )
+        if len(receipt_bytes) > MAX_KNOWLEDGE_ACTIVATION_RECEIPT_BYTES:
+            raise ValueError("Knowledge activation receipt exceeds its canonical byte limit.")
+        return self
+
+
+class KnowledgeReviewApproval(BaseModel):
+    """Exact activated revision and durable reviewed-approval attribution."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        validate_default=True,
+    )
+
+    entry: KnowledgeEntry
+    receipt: KnowledgeActivationReceipt
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> KnowledgeReviewApproval:
+        if (
+            self.entry.id != self.receipt.entry_id
+            or self.entry.revision != self.receipt.entry_revision
+            or self.entry.status is not KnowledgeStatus.ACTIVE
+            or self.receipt.authority.request.source
+            is not KnowledgeActivationSource.REVIEW_APPROVAL
+            or self.receipt.authority.decision.disposition
+            is not KnowledgeActivationDisposition.ACTIVATE
+        ):
+            raise ValueError("Reviewed approval does not bind one active review successor.")
         return self
 
 
@@ -3062,6 +3657,14 @@ class KnowledgePublicationConflict(RuntimeError):
         super().__init__("Knowledge publication conflicts with durable state.")
 
 
+class KnowledgeActivationConflict(RuntimeError):
+    """An idempotent activation operation conflicts with durable state."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge activation conflicts with durable state.")
+
+
 class KnowledgePublicationReceipt(BaseModel):
     """Bounded immutable evidence for one atomic entry-and-chunks publication."""
 
@@ -3545,7 +4148,12 @@ class KnowledgeStore(ABC):
         access_scope: KnowledgeAccessScope | None = None,
         hard: bool = False,
     ) -> KnowledgeEntry | None:
-        """Append a tombstone by default, or physically erase after a CAS check."""
+        """Append a tombstone by default, or physically erase after a CAS check.
+
+        Hard deletion also erases governed activation history retained after
+        expiration pruning. In that case the canonical entry is already absent,
+        so a successful, idempotent audit purge returns ``None``.
+        """
 
     async def publish_entry_revision(
         self,
@@ -3556,6 +4164,7 @@ class KnowledgeStore(ABC):
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
+        activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> KnowledgePublicationReceipt:
         """Publish one create/append exactly once with immutable replay evidence.
 
@@ -3568,6 +4177,32 @@ class KnowledgeStore(ABC):
 
         raise NotImplementedError(
             "This KnowledgeStore does not support owned revision publication."
+        )
+
+    async def approve_pending_entry(
+        self,
+        authority: KnowledgeActivationAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeReviewApproval:
+        """Atomically append one active successor under explicit reviewed authority."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support attributed knowledge review approval."
+        )
+
+    async def load_activation_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        """Load immutable activation attribution for one exact operation."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support knowledge activation receipts."
         )
 
     async def load_entry_publication_receipt(
@@ -3923,6 +4558,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._evidence: dict[tuple[str, int], list[KnowledgeEvidence]] = {}
         self._publication_receipts: dict[str, KnowledgePublicationReceipt] = {}
         self._publication_access: dict[str, _KnowledgeAccessSnapshot] = {}
+        self._activation_receipts: dict[str, KnowledgeActivationReceipt] = {}
+        self._activation_access: dict[str, _KnowledgeAccessSnapshot] = {}
+        self._activation_entry_ids: set[str] = set()
+        self._activation_retirements: dict[str, _KnowledgeActivationRetirement] = {}
         self._relations: dict[str, KnowledgeRelation] = {}
         self._relation_ids_by_endpoint: dict[tuple[str, int], set[str]] = {}
         self._relation_semantics: dict[tuple[str, str, int, str, int], str] = {}
@@ -4002,6 +4641,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 expected_revision=None,
                 actual_revision=existing.revision,
             )
+        retirement = self._activation_retirements.get(entry.id)
+        if retirement is not None:
+            _require_knowledge_activation_retirement_access(
+                scope,
+                retirement,
+                operation="create_entry",
+            )
+            raise KnowledgePublicationConflict("entry_retired")
         copied_chunks = self._revision_chunks(entry, chunks)
         copied_evidence = _copy_entry_evidence(
             entry.id,
@@ -4167,7 +4814,37 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             raise ValueError("`hard` must be a boolean.")
         entry = self._current_entry(clean_id)
         if entry is None:
+            if not hard:
+                return None
+            retirement = self._activation_retirements.get(clean_id)
+            if retirement is None:
+                return None
+            _require_knowledge_activation_retirement_access(
+                scope,
+                retirement,
+                operation="delete_entry",
+            )
+            if retirement.entry_revision != expected_revision:
+                raise KnowledgeRevisionConflict(
+                    clean_id,
+                    expected_revision=expected_revision,
+                    actual_revision=retirement.entry_revision,
+                )
+            activation_operation_ids = [
+                operation_id
+                for operation_id, receipt in self._activation_receipts.items()
+                if receipt.entry_id == clean_id
+            ]
+            if not activation_operation_ids:
+                raise KnowledgeActivationConflict("malformed_retirement")
+            for operation_id in activation_operation_ids:
+                self._activation_receipts.pop(operation_id, None)
+                self._activation_access.pop(operation_id, None)
+            self._activation_entry_ids.discard(clean_id)
+            self._activation_retirements.pop(clean_id)
             return None
+        if clean_id in self._activation_retirements:
+            raise KnowledgeActivationConflict("malformed_retirement")
         _require_knowledge_entry_access(scope, entry, operation="delete_entry")
         if entry.revision != expected_revision:
             raise KnowledgeRevisionConflict(
@@ -4179,6 +4856,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             self._require_maintenance_replacement_history_preserved(clean_id)
             change = self._prepare_change(entry, kind=KnowledgeChangeKind.HARD_DELETED)
             self._drop_relations_for_entry(clean_id)
+            activation_operation_ids = [
+                operation_id
+                for operation_id, receipt in self._activation_receipts.items()
+                if receipt.entry_id == clean_id
+            ]
+            for operation_id in activation_operation_ids:
+                self._activation_receipts.pop(operation_id, None)
+                self._activation_access.pop(operation_id, None)
+            self._activation_entry_ids.discard(clean_id)
             self._entries.pop(clean_id, None)
             self._current_revisions.pop(clean_id, None)
             for key in [key for key in self._entry_payload_bytes if key[0] == clean_id]:
@@ -4221,6 +4907,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             (entry, self._prepare_change(entry, kind=KnowledgeChangeKind.EXPIRED))
             for entry in expired_entries
         ]
+        prepared_retirements: dict[str, _KnowledgeActivationRetirement] = {}
+        governed_entry_ids = {receipt.entry_id for receipt in self._activation_receipts.values()}
+        for entry, change in prepared_changes:
+            if entry.id not in governed_entry_ids:
+                continue
+            if entry.id in self._activation_retirements:
+                raise KnowledgeActivationConflict("malformed_retirement")
+            prepared_retirements[entry.id] = _knowledge_activation_retirement(
+                entry,
+                retired_at=change.committed_at,
+            )
         for entry, change in prepared_changes:
             entry_id = entry.id
             self._drop_relations_for_entry(entry_id)
@@ -4232,6 +4929,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 self._chunks.pop(key, None)
             for key in [key for key in self._evidence if key[0] == entry_id]:
                 self._evidence.pop(key, None)
+            retirement = prepared_retirements.get(entry_id)
+            if retirement is not None:
+                self._activation_retirements[entry_id] = retirement
             self._record_change(change, before_entry=entry, after_entry=None)
         return len(expired_entries)
 
@@ -4244,6 +4944,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
+        activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
         (
@@ -4258,8 +4959,24 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             evidence=evidence,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
+        copied_authority = (
+            None
+            if activation_authority is None
+            else copy_knowledge_activation_authority(activation_authority)
+        )
+        if copied_authority is not None:
+            _validate_activation_publication_material(
+                copied_authority,
+                operation_id=operation_id,
+                entry=copied_entry,
+                chunks=copied_chunks,
+                evidence=copied_evidence,
+                expected_revision=expected_revision,
+                access_scope=scope,
+            )
         existing_receipt = self._publication_receipts.get(operation_id)
         if existing_receipt is not None:
             receipt_access = self._publication_access.get(operation_id)
@@ -4267,6 +4984,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 raise KnowledgePublicationConflict("malformed_receipt")
             if not _knowledge_scope_allows_snapshot(scope, receipt_access):
                 raise KnowledgeAccessDenied("publish_entry_revision")
+            existing_activation = self._load_activation_receipt_in_scope(
+                operation_id,
+                scope,
+                deny_inaccessible=True,
+            )
+            if (
+                existing_activation is not None
+                and existing_activation.authority.request.source
+                is KnowledgeActivationSource.REVIEW_APPROVAL
+            ):
+                raise KnowledgePublicationConflict("operation_occupied")
             _validate_knowledge_publication_replay(
                 existing_receipt,
                 entry=copied_entry,
@@ -4274,14 +5002,42 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 evidence=copied_evidence,
                 expected_revision=expected_revision,
                 request_sha256=request_sha256,
+                activation_authority=copied_authority,
             )
+            if copied_authority is None:
+                if existing_activation is not None:
+                    raise KnowledgePublicationConflict("activation_mismatch")
+            elif existing_activation is None or not _activation_receipt_matches(
+                existing_activation,
+                authority=copied_authority,
+                publication_request_sha256=request_sha256,
+                publication_committed_at=existing_receipt.committed_at,
+            ):
+                raise KnowledgePublicationConflict("activation_mismatch")
             return copy_knowledge_publication_receipt(existing_receipt, replayed=True)
+        if (
+            self._load_activation_receipt_in_scope(
+                operation_id,
+                scope,
+                deny_inaccessible=True,
+            )
+            is not None
+        ):
+            raise KnowledgePublicationConflict("operation_occupied")
         existing_entry = self._current_entry(copied_entry.id)
         actual_revision = None if existing_entry is None else existing_entry.revision
         if existing_entry is not None:
             _require_knowledge_entry_access(
                 scope, existing_entry, operation="publish_entry_revision"
             )
+        retirement = self._activation_retirements.get(copied_entry.id)
+        if retirement is not None:
+            _require_knowledge_activation_retirement_access(
+                scope,
+                retirement,
+                operation="publish_entry_revision",
+            )
+            raise KnowledgePublicationConflict("entry_retired")
         if actual_revision != expected_revision:
             raise KnowledgeRevisionConflict(
                 copied_entry.id,
@@ -4295,6 +5051,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 operation="publish_entry_revision",
             )
             _validate_revision_successor(existing_entry, copied_entry)
+            if copied_authority is None and copied_entry.id in self._activation_entry_ids:
+                _require_knowledge_activation_retirement_capacity(copied_entry)
         self._require_chunk_ids_available(
             copied_chunks,
             access_scope=scope,
@@ -4306,6 +5064,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             operation="publish_entry_revision",
         )
         payload_bytes = knowledge_entry_payload_bytes(copied_entry)
+        committed_at = datetime.now(UTC)
         receipt = KnowledgePublicationReceipt(
             operation_id=operation_id,
             entry_id=copied_entry.id,
@@ -4314,7 +5073,20 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             request_sha256=request_sha256,
             entry_created_at=copied_entry.created_at,
             entry_updated_at=copied_entry.updated_at,
-            committed_at=datetime.now(UTC),
+            committed_at=committed_at,
+        )
+        activation_receipt = (
+            None
+            if copied_authority is None
+            else KnowledgeActivationReceipt(
+                operation_id=operation_id,
+                entry_id=copied_entry.id,
+                entry_revision=copied_entry.revision,
+                expected_revision=expected_revision,
+                publication_request_sha256=request_sha256,
+                authority=copied_authority,
+                committed_at=committed_at,
+            )
         )
         change = self._prepare_change(
             copied_entry,
@@ -4333,6 +5105,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._current_revisions[copied_entry.id] = copied_entry.revision
         self._publication_receipts[operation_id] = receipt
         self._publication_access[operation_id] = _knowledge_access_snapshot(copied_entry)
+        if activation_receipt is not None:
+            self._activation_receipts[operation_id] = activation_receipt
+            self._activation_access[operation_id] = _knowledge_access_snapshot(copied_entry)
+            self._activation_entry_ids.add(copied_entry.id)
         self._record_change(
             change,
             before_entry=existing_entry,
@@ -4637,6 +5413,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
         _validate_revision_successor(current, entry)
         _require_knowledge_successor_access(access_scope, entry, operation=operation)
+        if entry.id in self._activation_entry_ids:
+            _require_knowledge_activation_retirement_capacity(entry)
         previous_chunks = self._chunks.get((current.id, current.revision), [])
         copied_chunks = self._revision_chunks(entry, chunks, previous=current)
         if inherit_evidence:
@@ -4880,6 +5658,40 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return [_default_chunk_for_entry(entry)]
         return _copy_chunks_for_revision(previous_chunks, entry)
 
+    def _load_activation_receipt_in_scope(
+        self,
+        operation_id: str,
+        scope: KnowledgeAccessScope,
+        *,
+        deny_inaccessible: bool,
+    ) -> KnowledgeActivationReceipt | None:
+        receipt = self._activation_receipts.get(operation_id)
+        if receipt is None:
+            return None
+        snapshot = self._activation_access.get(operation_id)
+        if snapshot is None:
+            raise KnowledgeActivationConflict("malformed_receipt")
+        cutoff = datetime.now(UTC)
+        if not _knowledge_scope_allows_snapshot(scope, snapshot, now=cutoff):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("load_activation_receipt")
+            return None
+        current = self._current_entry(receipt.entry_id)
+        retirement = self._activation_retirements.get(receipt.entry_id)
+        if not _knowledge_scope_allows_activation_receipt(
+            scope,
+            snapshot,
+            current,
+            retirement=retirement,
+            entry_id=receipt.entry_id,
+            entry_revision=receipt.entry_revision,
+            now=cutoff,
+        ):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("load_activation_receipt")
+            return None
+        return receipt
+
     async def load_entry_publication_receipt(
         self,
         operation_id: str,
@@ -4895,6 +5707,159 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if snapshot is None or not _knowledge_scope_allows_snapshot(scope, snapshot):
             return None
         return copy_knowledge_publication_receipt(receipt)
+
+    async def load_activation_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_publication_operation_id(operation_id)
+        receipt = self._load_activation_receipt_in_scope(
+            operation_id,
+            scope,
+            deny_inaccessible=False,
+        )
+        if receipt is None:
+            return None
+        return copy_knowledge_activation_receipt(receipt)
+
+    async def approve_pending_entry(
+        self,
+        authority: KnowledgeActivationAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeReviewApproval:
+        scope = self._operation_access_scope(access_scope)
+        authority = copy_knowledge_activation_authority(authority)
+        request = authority.request
+        _validate_review_approval_authority(authority, access_scope=scope)
+        expected_namespace = (
+            require_clean_nonblank(expected_namespace, "expected_namespace")
+            if expected_namespace is not None
+            else None
+        )
+        expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        existing_receipt = self._load_activation_receipt_in_scope(
+            request.operation_id,
+            scope,
+            deny_inaccessible=True,
+        )
+        if existing_receipt is not None:
+            publication = self._publication_receipts.get(request.operation_id)
+            publication_snapshot = self._publication_access.get(request.operation_id)
+            if publication is None or publication_snapshot is None:
+                raise KnowledgeActivationConflict("malformed_receipt")
+            if not _knowledge_scope_allows_snapshot(scope, publication_snapshot):
+                raise KnowledgeAccessDenied("approve_pending_entry")
+            approval = _replay_review_approval_from_receipts(
+                publication,
+                existing_receipt,
+                authority=authority,
+            )
+            if approval is None:
+                raise KnowledgeActivationConflict("operation_mismatch")
+            _validate_review_approval_scope(
+                approval.entry,
+                expected_namespace=expected_namespace,
+                expected_labels=expected_labels,
+            )
+            return approval
+        if request.operation_id in self._publication_receipts:
+            raise KnowledgeActivationConflict("operation_occupied")
+        current = self._current_entry(request.candidate_entry.id)
+        if current is None:
+            raise KeyError(f"Knowledge entry {request.candidate_entry.id!r} does not exist.")
+        _require_knowledge_entry_access(scope, current, operation="approve_pending_entry")
+        if current.revision != request.expected_revision:
+            raise KnowledgeRevisionConflict(
+                current.id,
+                expected_revision=request.expected_revision,
+                actual_revision=current.revision,
+            )
+        if current != request.candidate_entry:
+            raise KnowledgeActivationConflict("candidate_material_mismatch")
+        if current.status is not KnowledgeStatus.PENDING:
+            raise ValueError("Reviewed approval requires a pending entry.")
+        _validate_review_approval_scope(
+            current,
+            expected_namespace=expected_namespace,
+            expected_labels=expected_labels,
+        )
+        current_chunks = self._chunks.get((current.id, current.revision), [])
+        current_evidence = self._evidence.get((current.id, current.revision), [])
+        if list(request.chunks) != current_chunks or list(request.evidence) != current_evidence:
+            raise KnowledgeActivationConflict("candidate_material_mismatch")
+        activated = current.model_copy(
+            update={
+                "revision": request.target_revision,
+                "status": KnowledgeStatus.ACTIVE,
+                "updated_at": _next_updated_at(current),
+            }
+        )
+        _require_knowledge_activation_retirement_capacity(activated)
+        self._require_maintenance_replacement_mutation_allowed(
+            current,
+            successor=activated,
+            operation="approve_pending_entry",
+        )
+        _require_knowledge_successor_access(
+            scope,
+            activated,
+            operation="approve_pending_entry",
+        )
+        target_chunks = self._revision_chunks(activated, None, previous=current)
+        target_evidence = _copy_evidence_for_revision(
+            current_evidence,
+            entry=activated,
+            previous_chunks=current_chunks,
+            chunks=target_chunks,
+        )
+        self._require_chunk_ids_available(
+            target_chunks,
+            access_scope=scope,
+            operation="approve_pending_entry",
+        )
+        self._require_evidence_ids_available(
+            target_evidence,
+            access_scope=scope,
+            operation="approve_pending_entry",
+        )
+        committed_at = datetime.now(UTC)
+        publication_receipt, receipt = _prepare_review_approval_receipts(
+            current,
+            activated,
+            target_chunks,
+            target_evidence,
+            authority,
+            committed_at=committed_at,
+        )
+        change = self._prepare_change(
+            activated,
+            kind=KnowledgeChangeKind.STATUS_TRANSITIONED,
+            operation_id=request.operation_id,
+            committed_at=committed_at,
+        )
+        self._entries[activated.id][activated.revision] = activated
+        self._entry_payload_bytes[(activated.id, activated.revision)] = (
+            knowledge_entry_payload_bytes(activated)
+        )
+        self._chunks[(activated.id, activated.revision)] = target_chunks
+        self._evidence[(activated.id, activated.revision)] = target_evidence
+        self._current_revisions[activated.id] = activated.revision
+        self._publication_receipts[request.operation_id] = publication_receipt
+        self._publication_access[request.operation_id] = _knowledge_access_snapshot(activated)
+        self._activation_receipts[request.operation_id] = receipt
+        self._activation_access[request.operation_id] = _knowledge_access_snapshot(activated)
+        self._activation_entry_ids.add(activated.id)
+        self._record_change(change, before_entry=current, after_entry=activated)
+        return KnowledgeReviewApproval(
+            entry=copy_knowledge_entry(activated),
+            receipt=copy_knowledge_activation_receipt(receipt),
+        )
 
     async def publish_relations(
         self,
@@ -7426,6 +8391,15 @@ def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
     ).decode("utf-8")
 
 
+def _knowledge_activation_retirement_json(retirement: _KnowledgeActivationRetirement) -> str:
+    if type(retirement) is not _KnowledgeActivationRetirement:
+        raise TypeError("retirement must be a _KnowledgeActivationRetirement.")
+    return canonical_durable_json_bytes(
+        retirement.model_dump(mode="json"),
+        "knowledge activation retirement",
+    ).decode("utf-8")
+
+
 def _knowledge_relation_access_snapshot_json(
     snapshot: _KnowledgeRelationAccessSnapshot,
 ) -> str:
@@ -7480,6 +8454,12 @@ def _parse_knowledge_access_snapshot_json(value: str) -> _KnowledgeAccessSnapsho
     return _KnowledgeAccessSnapshot.model_validate_json(value)
 
 
+def _parse_knowledge_activation_retirement_json(value: str) -> _KnowledgeActivationRetirement:
+    if type(value) is not str:
+        raise TypeError("Knowledge activation retirement must be JSON text.")
+    return _KnowledgeActivationRetirement.model_validate_json(value)
+
+
 def _parse_knowledge_relation_access_snapshot_json(
     value: str,
 ) -> _KnowledgeRelationAccessSnapshot:
@@ -7506,6 +8486,77 @@ def _knowledge_scope_allows_snapshot(
         return False
     cutoff = datetime.now(UTC) if now is None else now
     return scope.include_expired or snapshot.expires_at is None or snapshot.expires_at > cutoff
+
+
+def _knowledge_scope_allows_activation_receipt(
+    scope: KnowledgeAccessScope,
+    snapshot: _KnowledgeAccessSnapshot,
+    current_entry: KnowledgeEntry | None,
+    *,
+    retirement: _KnowledgeActivationRetirement | None,
+    entry_id: str,
+    entry_revision: int,
+    now: datetime | None = None,
+) -> bool:
+    """Authorize content-bearing activation history against its current entry.
+
+    Expiration pruning deliberately retains a separate content-free final access
+    authority. A missing current entry without that explicit marker is malformed;
+    receipt-local expiry is never treated as evidence that pruning occurred.
+    """
+
+    cutoff = datetime.now(UTC) if now is None else now
+    if not _knowledge_scope_allows_snapshot(scope, snapshot, now=cutoff):
+        return False
+    if current_entry is not None:
+        if retirement is not None:
+            raise KnowledgeActivationConflict("malformed_retirement")
+        return _knowledge_scope_allows_entry(scope, current_entry, now=cutoff)
+    if (
+        retirement is None
+        or retirement.entry_id != entry_id
+        or retirement.entry_revision < entry_revision
+    ):
+        raise KnowledgeActivationConflict("malformed_receipt")
+    return scope.include_expired and _knowledge_scope_allows_snapshot_dimensions(
+        scope,
+        retirement.access_snapshot,
+    )
+
+
+def _knowledge_activation_retirement(
+    entry: KnowledgeEntry,
+    *,
+    retired_at: datetime,
+) -> _KnowledgeActivationRetirement:
+    return _KnowledgeActivationRetirement(
+        entry_id=entry.id,
+        entry_revision=entry.revision,
+        access_snapshot=_knowledge_access_snapshot(entry),
+        retired_at=retired_at,
+    )
+
+
+def _require_knowledge_activation_retirement_capacity(entry: KnowledgeEntry) -> None:
+    """Prove one governed successor can always preserve final access authority."""
+
+    _knowledge_activation_retirement(
+        entry,
+        retired_at=_MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_TIME,
+    )
+
+
+def _require_knowledge_activation_retirement_access(
+    scope: KnowledgeAccessScope,
+    retirement: _KnowledgeActivationRetirement,
+    *,
+    operation: str,
+) -> None:
+    if not scope.include_expired or not _knowledge_scope_allows_snapshot_dimensions(
+        scope,
+        retirement.access_snapshot,
+    ):
+        raise KnowledgeAccessDenied(operation)
 
 
 def _knowledge_scope_allows_snapshot_dimensions(
@@ -8100,6 +9151,118 @@ def copy_knowledge_publication_receipt(
     )
 
 
+def copy_knowledge_activation_request(
+    request: KnowledgeActivationRequest,
+) -> KnowledgeActivationRequest:
+    if type(request) is not KnowledgeActivationRequest:
+        raise TypeError("KnowledgeActivationRequest instances must not be subclasses.")
+    return KnowledgeActivationRequest.model_validate(request.model_dump(mode="python"))
+
+
+def copy_knowledge_activation_decision(
+    decision: KnowledgeActivationDecision,
+) -> KnowledgeActivationDecision:
+    if type(decision) is not KnowledgeActivationDecision:
+        raise TypeError("KnowledgeActivationDecision instances must not be subclasses.")
+    return KnowledgeActivationDecision.model_validate(decision.model_dump(mode="python"))
+
+
+def copy_knowledge_activation_authority(
+    authority: KnowledgeActivationAuthority,
+) -> KnowledgeActivationAuthority:
+    if type(authority) is not KnowledgeActivationAuthority:
+        raise TypeError("KnowledgeActivationAuthority instances must not be subclasses.")
+    return KnowledgeActivationAuthority.model_validate(authority.model_dump(mode="python"))
+
+
+def copy_knowledge_activation_receipt(
+    receipt: KnowledgeActivationReceipt,
+    *,
+    replayed: bool | None = None,
+) -> KnowledgeActivationReceipt:
+    if type(receipt) is not KnowledgeActivationReceipt:
+        raise TypeError("KnowledgeActivationReceipt instances must not be subclasses.")
+    return KnowledgeActivationReceipt(
+        schema_version=receipt.schema_version,
+        operation_id=receipt.operation_id,
+        entry_id=receipt.entry_id,
+        entry_revision=receipt.entry_revision,
+        expected_revision=receipt.expected_revision,
+        publication_request_sha256=receipt.publication_request_sha256,
+        authority=copy_knowledge_activation_authority(receipt.authority),
+        committed_at=receipt.committed_at,
+        replayed=receipt.replayed if replayed is None else replayed,
+    )
+
+
+def _knowledge_activation_receipt_json(receipt: KnowledgeActivationReceipt) -> str:
+    """Return the exact canonical receipt document used by durable backends."""
+
+    copied = copy_knowledge_activation_receipt(receipt)
+    return canonical_durable_json_bytes(
+        copied.model_dump(mode="json"),
+        "knowledge activation receipt",
+    ).decode("utf-8")
+
+
+def copy_knowledge_review_approval(approval: KnowledgeReviewApproval) -> KnowledgeReviewApproval:
+    if type(approval) is not KnowledgeReviewApproval:
+        raise TypeError("KnowledgeReviewApproval instances must not be subclasses.")
+    return KnowledgeReviewApproval(
+        entry=copy_knowledge_entry(approval.entry),
+        receipt=copy_knowledge_activation_receipt(approval.receipt),
+    )
+
+
+def prepare_knowledge_activation_request(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    *,
+    evidence: list[KnowledgeEvidence] | None = None,
+    access_scope: KnowledgeAccessScope,
+    operation_id: str,
+    governance_mode: KnowledgeGovernanceMode,
+    source: KnowledgeActivationSource,
+    expected_revision: int | None = None,
+    evaluator_identity: str | None = None,
+    evaluator_result: dict[str, Any] | None = None,
+    evaluator_decision_sha256: str | None = None,
+    forbidden_authority_identities: tuple[str, ...] = (),
+) -> KnowledgeActivationRequest:
+    """Copy the exact bounded candidate material presented to activation policy."""
+
+    if type(access_scope) is not KnowledgeAccessScope:
+        raise TypeError("`access_scope` must be a KnowledgeAccessScope.")
+    candidate = copy_knowledge_entry(entry)
+    if candidate.status is not KnowledgeStatus.PENDING:
+        candidate = candidate.model_copy(update={"status": KnowledgeStatus.PENDING})
+    copied_chunks = _copy_entry_chunks(candidate.id, candidate.revision, chunks)
+    copied_evidence = _copy_entry_evidence(
+        candidate.id,
+        candidate.revision,
+        evidence or [],
+        chunks=copied_chunks,
+    )
+    target_revision = (
+        1 if expected_revision is None else _next_knowledge_revision(expected_revision)
+    )
+    return KnowledgeActivationRequest(
+        operation_id=operation_id,
+        mode=governance_mode,
+        source=source,
+        candidate_entry=candidate,
+        chunks=tuple(copied_chunks),
+        evidence=tuple(copied_evidence),
+        expected_revision=expected_revision,
+        target_revision=target_revision,
+        access_scope=access_scope,
+        evaluator_identity=evaluator_identity,
+        evaluator_result=evaluator_result,
+        evaluator_decision_sha256=evaluator_decision_sha256,
+        forbidden_authority_identities=forbidden_authority_identities,
+    )
+
+
 def prepare_knowledge_publication(
     entry: KnowledgeEntry,
     chunks: list[KnowledgeChunk],
@@ -8107,6 +9270,7 @@ def prepare_knowledge_publication(
     evidence: list[KnowledgeEvidence] | None = None,
     operation_id: str,
     expected_revision: int | None = None,
+    activation_authority: KnowledgeActivationAuthority | None = None,
 ) -> tuple[
     str,
     KnowledgeEntry,
@@ -8130,11 +9294,26 @@ def prepare_knowledge_publication(
         evidence or [],
         chunks=copied_chunks,
     )
+    copied_authority = (
+        None
+        if activation_authority is None
+        else copy_knowledge_activation_authority(activation_authority)
+    )
+    if copied_authority is not None:
+        _validate_activation_publication_material(
+            copied_authority,
+            operation_id=clean_operation_id,
+            entry=copied_entry,
+            chunks=copied_chunks,
+            evidence=copied_evidence,
+            expected_revision=expected_revision,
+        )
     request_sha256 = _knowledge_publication_request_sha256(
         copied_entry,
         copied_chunks,
         copied_evidence,
         expected_revision=expected_revision,
+        activation_authority=copied_authority,
     )
     return (
         clean_operation_id,
@@ -8160,10 +9339,11 @@ def _validate_knowledge_publication_replay(
     evidence: list[KnowledgeEvidence],
     expected_revision: int | None,
     request_sha256: str,
+    activation_authority: KnowledgeActivationAuthority | None = None,
 ) -> None:
     receipt = copy_knowledge_publication_receipt(receipt)
     accepted_request_sha256s = {request_sha256}
-    if not evidence:
+    if not evidence and activation_authority is None:
         # Revision 42 receipts bind the same entry-and-chunks authority tuple
         # under the v1 digest contract. Revision 43 preserves those receipts,
         # so an exact empty-evidence retry must remain idempotent after migration.
@@ -8183,6 +9363,249 @@ def _validate_knowledge_publication_replay(
         or receipt.entry_updated_at != entry.updated_at
     ):
         raise KnowledgePublicationConflict("operation_mismatch")
+
+
+def _validate_activation_publication_material(
+    authority: KnowledgeActivationAuthority,
+    *,
+    operation_id: str,
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+    expected_revision: int | None,
+    access_scope: KnowledgeAccessScope | None = None,
+) -> None:
+    authority = copy_knowledge_activation_authority(authority)
+    _require_knowledge_activation_retirement_capacity(entry)
+    request = authority.request
+    decision = authority.decision
+    if request.source is KnowledgeActivationSource.REVIEW_APPROVAL:
+        raise ValueError("Review approval cannot use generated revision publication.")
+    if (
+        request.operation_id != operation_id
+        or request.expected_revision != expected_revision
+        or request.target_revision != entry.revision
+    ):
+        raise ValueError("Activation authority does not bind the publication operation.")
+    candidate_entry = entry.model_copy(update={"status": KnowledgeStatus.PENDING})
+    if request.candidate_entry != candidate_entry:
+        raise ValueError("Activation authority does not bind the publication entry material.")
+    if list(request.chunks) != chunks or list(request.evidence) != evidence:
+        raise ValueError("Activation authority does not bind publication chunks and evidence.")
+    if access_scope is not None and request.access_scope_sha256 != knowledge_access_scope_sha256(
+        access_scope
+    ):
+        raise ValueError("Activation authority does not bind the publication access scope.")
+    required_status = (
+        KnowledgeStatus.ACTIVE
+        if decision.disposition is KnowledgeActivationDisposition.ACTIVATE
+        else KnowledgeStatus.PENDING
+    )
+    if decision.disposition is KnowledgeActivationDisposition.REJECT:
+        raise ValueError("Rejected activation requests cannot be published.")
+    if entry.status is not required_status:
+        raise ValueError("Publication status conflicts with activation disposition.")
+
+
+def _validate_review_approval_authority(
+    authority: KnowledgeActivationAuthority,
+    *,
+    access_scope: KnowledgeAccessScope,
+) -> None:
+    request = authority.request
+    decision = authority.decision
+    if (
+        request.mode is not KnowledgeGovernanceMode.REVIEWED
+        or request.source is not KnowledgeActivationSource.REVIEW_APPROVAL
+        or decision.disposition is not KnowledgeActivationDisposition.ACTIVATE
+        or request.access_scope_sha256 != knowledge_access_scope_sha256(access_scope)
+    ):
+        raise ValueError("Reviewed activation authority is invalid for this operation.")
+
+
+def _validate_review_approval_scope(
+    entry: KnowledgeEntry,
+    *,
+    expected_namespace: str | None,
+    expected_labels: dict[str, str],
+) -> None:
+    """Require one fresh or replayed approval to remain in its review scope."""
+
+    if expected_namespace is not None and entry.namespace != expected_namespace:
+        raise ValueError("Knowledge entry does not match expected namespace.")
+    for key, value in expected_labels.items():
+        if entry.labels.get(key) != value:
+            raise ValueError("Knowledge entry does not match expected labels.")
+
+
+def _activation_receipt_matches(
+    receipt: KnowledgeActivationReceipt,
+    *,
+    authority: KnowledgeActivationAuthority,
+    publication_request_sha256: str,
+    publication_committed_at: datetime,
+) -> bool:
+    try:
+        copied = copy_knowledge_activation_receipt(receipt)
+        return (
+            copied.operation_id == authority.request.operation_id
+            and copied.expected_revision == authority.request.expected_revision
+            and copied.entry_id == authority.request.candidate_entry.id
+            and copied.entry_revision == authority.request.target_revision
+            and copied.publication_request_sha256 == publication_request_sha256
+            and copied.committed_at == publication_committed_at
+            and copied.authority == authority
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _review_approval_publication_request_sha256(
+    before: KnowledgeEntry,
+    after: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+    authority: KnowledgeActivationAuthority,
+) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-reviewed-activation-v1",
+                "before": before.model_dump(mode="json"),
+                "after": after.model_dump(mode="json"),
+                "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+                "evidence": [item.model_dump(mode="json") for item in evidence],
+                "activation_authority": authority.model_dump(mode="json"),
+            },
+            "reviewed knowledge activation",
+        )
+    ).hexdigest()
+
+
+def _prepare_review_approval_receipts(
+    before: KnowledgeEntry,
+    after: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+    authority: KnowledgeActivationAuthority,
+    *,
+    committed_at: datetime,
+) -> tuple[KnowledgePublicationReceipt, KnowledgeActivationReceipt]:
+    request_sha256 = _review_approval_publication_request_sha256(
+        before,
+        after,
+        chunks,
+        evidence,
+        authority,
+    )
+    publication = KnowledgePublicationReceipt(
+        operation_id=authority.request.operation_id,
+        entry_id=after.id,
+        entry_revision=after.revision,
+        expected_revision=before.revision,
+        request_sha256=request_sha256,
+        entry_created_at=after.created_at,
+        entry_updated_at=after.updated_at,
+        committed_at=committed_at,
+    )
+    activation = KnowledgeActivationReceipt(
+        operation_id=authority.request.operation_id,
+        entry_id=after.id,
+        entry_revision=after.revision,
+        expected_revision=before.revision,
+        publication_request_sha256=request_sha256,
+        authority=authority,
+        committed_at=committed_at,
+    )
+    return publication, activation
+
+
+def _review_approval_receipts_match(
+    publication: KnowledgePublicationReceipt,
+    activation: KnowledgeActivationReceipt,
+    *,
+    authority: KnowledgeActivationAuthority,
+    before: KnowledgeEntry,
+    after: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+) -> bool:
+    try:
+        publication = copy_knowledge_publication_receipt(publication)
+        activation = copy_knowledge_activation_receipt(activation)
+        expected_publication, expected_activation = _prepare_review_approval_receipts(
+            before,
+            after,
+            chunks,
+            evidence,
+            authority,
+            committed_at=activation.committed_at,
+        )
+        return (
+            publication == expected_publication
+            and activation == expected_activation
+            and publication.committed_at == activation.committed_at
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _replay_review_approval_from_receipts(
+    publication: KnowledgePublicationReceipt,
+    activation: KnowledgeActivationReceipt,
+    *,
+    authority: KnowledgeActivationAuthority,
+) -> KnowledgeReviewApproval | None:
+    """Authenticate and reconstruct an exact reviewed approval from durable receipts."""
+
+    try:
+        publication = copy_knowledge_publication_receipt(publication, replayed=False)
+        activation = copy_knowledge_activation_receipt(activation, replayed=False)
+        authority = copy_knowledge_activation_authority(authority)
+        request = authority.request
+        if (
+            request.mode is not KnowledgeGovernanceMode.REVIEWED
+            or request.source is not KnowledgeActivationSource.REVIEW_APPROVAL
+            or authority.decision.disposition is not KnowledgeActivationDisposition.ACTIVATE
+        ):
+            return None
+        before = copy_knowledge_entry(request.candidate_entry)
+        before_chunks = [copy_knowledge_chunk(chunk) for chunk in request.chunks]
+        before_evidence = [copy_knowledge_evidence(item) for item in request.evidence]
+        after = before.model_copy(
+            update={
+                "revision": request.target_revision,
+                "status": KnowledgeStatus.ACTIVE,
+                "updated_at": publication.entry_updated_at,
+            }
+        )
+        target_chunks = (
+            [_default_chunk_for_entry(after)]
+            if _has_only_default_chunk(before, before_chunks)
+            else _copy_chunks_for_revision(before_chunks, after)
+        )
+        target_evidence = _copy_evidence_for_revision(
+            before_evidence,
+            entry=after,
+            previous_chunks=before_chunks,
+            chunks=target_chunks,
+        )
+        if not _review_approval_receipts_match(
+            publication,
+            activation,
+            authority=authority,
+            before=before,
+            after=after,
+            chunks=target_chunks,
+            evidence=target_evidence,
+        ):
+            return None
+        return KnowledgeReviewApproval(
+            entry=copy_knowledge_entry(after),
+            receipt=copy_knowledge_activation_receipt(activation, replayed=True),
+        )
+    except (RuntimeError, TypeError, ValueError):
+        return None
 
 
 def prepare_knowledge_relations(
@@ -8877,16 +10300,28 @@ def _knowledge_publication_request_sha256(
     evidence: list[KnowledgeEvidence],
     *,
     expected_revision: int | None,
+    activation_authority: KnowledgeActivationAuthority | None = None,
 ) -> str:
+    if activation_authority is None:
+        material = {
+            "contract": "cayu-knowledge-revision-publication-v2",
+            "expected_revision": expected_revision,
+            "entry": entry.model_dump(mode="json"),
+            "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+            "evidence": [item.model_dump(mode="json") for item in evidence],
+        }
+    else:
+        material = {
+            "contract": "cayu-knowledge-revision-publication-v3",
+            "expected_revision": expected_revision,
+            "entry": entry.model_dump(mode="json"),
+            "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
+            "evidence": [item.model_dump(mode="json") for item in evidence],
+            "activation_authority": activation_authority.model_dump(mode="json"),
+        }
     return sha256(
         canonical_durable_json_bytes(
-            {
-                "contract": "cayu-knowledge-revision-publication-v2",
-                "expected_revision": expected_revision,
-                "entry": entry.model_dump(mode="json"),
-                "chunks": [chunk.model_dump(mode="json") for chunk in chunks],
-                "evidence": [item.model_dump(mode="json") for item in evidence],
-            },
+            material,
             "knowledge publication",
         )
     ).hexdigest()

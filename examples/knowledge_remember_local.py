@@ -69,8 +69,16 @@ async def main() -> None:
     pending_review = await reviewer.list_pending(source_type="tool", limit=5)
     print_json("reviewer_pending_entries", [item.entry.id for item in pending_review.entries])
 
-    approved = await reviewer.approve(pending_review.entries[0].entry.id)
-    print_json("approved_pending_entry", {"entry_id": approved.id, "status": approved.status.value})
+    approved = await reviewer.approve(
+        pending_review.entries[0].entry.id,
+        operation_id="example-reviewed-remember",
+        reviewer_identity="example-reviewer",
+        reviewer_version="1",
+    )
+    print_json(
+        "approved_pending_entry",
+        {"entry_id": approved.entry.id, "status": approved.entry.status.value},
+    )
 
     approved_search = await SearchKnowledgeTool().run(
         ctx,

@@ -1285,6 +1285,19 @@ pending, active, archived, or deleted proposal reports that durable state; it do
 create a replacement revision or rerun an evaluator after the exact proposal is known to
 be durable.
 
+Activation receipts retain the full bounded request for exact replay and audit, so access
+requires both the immutable publication-time scope and the logical entry's current scope.
+Expiration pruning atomically replaces the current boundary with a content-free final-revision
+retirement authority; it never infers pruning from a receipt's own expiry. A retained receipt
+requires its publication scope, that final retirement scope, and explicit expired-material
+authority. The marker prevents reuse of the logical entry ID until hard deletion erases it and
+all activation receipts. Hard deletion can perform that erasure after pruning and returns
+`None` because the canonical entry was already removed; the content-free publication receipt
+remains solely to preserve operation-id occupancy. Database reads authorize the receipt against
+current-entry or retirement authority in one stable snapshot. The final authority has a
+1,048,576-byte canonical limit, so every governed publication and later successor is rejected
+before mutation if its final access scope could not be preserved during expiration pruning.
+
 `LearningBatchResult` reports batch, signal, and candidate outcomes with stable codes.
 Generator failure invalidates the whole batch before any write. Evaluator, policy, and
 store failures are isolated per candidate where the durable outcome can be established

@@ -199,7 +199,12 @@ def test_curator_persists_pending_revision_with_exact_evidence_and_review_path()
             KnowledgeQuery(text="migrations service", namespace="project:cayu")
         )
         review = KnowledgeReviewWorkflow(store, namespace="project:cayu")
-        approved = await review.approve(entry_id)
+        approved = await review.approve(
+            entry_id,
+            operation_id="review-deploy-migrations",
+            reviewer_identity="release-reviewer",
+            reviewer_version="1",
+        )
         recalled = await store.search(
             KnowledgeQuery(text="migrations service", namespace="project:cayu")
         )
@@ -228,7 +233,7 @@ def test_curator_persists_pending_revision_with_exact_evidence_and_review_path()
     assert evidence.evidence[0].source_id == "signal-1"
     assert evidence.evidence[0].metadata["learning_signal_id"] == "signal-1"
     assert hidden.hits == []
-    assert approved.status is KnowledgeStatus.ACTIVE
+    assert approved.entry.status is KnowledgeStatus.ACTIVE
     assert [hit.entry.id for hit in recalled.hits] == [entry.id]
 
 
@@ -242,7 +247,10 @@ def test_curator_uses_the_same_publication_path_with_sqlite(tmp_path) -> None:
             entry = await store.get_entry(entry_id)
             evidence = await store.read_evidence(entry_id)
             approved = await KnowledgeReviewWorkflow(store, namespace="project:cayu").approve(
-                entry_id
+                entry_id,
+                operation_id="review-deploy-migrations-sqlite",
+                reviewer_identity="release-reviewer",
+                reviewer_version="1",
             )
             recalled = await store.search(
                 KnowledgeQuery(text="migrations service", namespace="project:cayu")
@@ -256,7 +264,7 @@ def test_curator_uses_the_same_publication_path_with_sqlite(tmp_path) -> None:
     assert result.candidates[0].outcome is LearningCandidateOutcome.PENDING_PERSISTED
     assert entry is not None and entry.status is KnowledgeStatus.PENDING
     assert evidence is not None and evidence.total_evidence_known == 1
-    assert approved.status is KnowledgeStatus.ACTIVE
+    assert approved.entry.status is KnowledgeStatus.ACTIVE
     assert [hit.entry.id for hit in recalled.hits] == [entry.id]
 
 
@@ -329,7 +337,12 @@ def test_curator_reprocessing_preserves_active_and_archived_status() -> None:
         active_curator = _curator(active_store)
         first = await active_curator.curate(_batch(_signal()))
         active_id = _entry_id(first.candidates[0])
-        await KnowledgeReviewWorkflow(active_store, namespace="project:cayu").approve(active_id)
+        await KnowledgeReviewWorkflow(active_store, namespace="project:cayu").approve(
+            active_id,
+            operation_id="review-active-reprocessing",
+            reviewer_identity="release-reviewer",
+            reviewer_version="1",
+        )
         active = await active_curator.curate(_batch(_signal()))
 
         archived_store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)

@@ -144,7 +144,12 @@ async def main() -> None:
         namespace=_NAMESPACE,
         labels=_LABELS,
     )
-    approved = await reviewer.approve(pending.entries[0].entry.id)
+    approved = await reviewer.approve(
+        pending.entries[0].entry.id,
+        operation_id="example-reviewed-curation",
+        reviewer_identity="deployment-reviewer",
+        reviewer_version="1",
+    )
 
     later_run = await sessions.create(
         RunRequest(
@@ -157,7 +162,7 @@ async def main() -> None:
     recalled = await knowledge.search(
         KnowledgeQuery(text="migration service startup", namespace=_NAMESPACE)
     )
-    print("approved:", approved.status.value)
+    print("approved:", approved.entry.status.value)
     print("later run:", later_run.id)
     print("recalled:", [hit.entry.text for hit in recalled.hits])
 

@@ -12,24 +12,61 @@ from cayu._validation import (
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
+    MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
+    MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
+    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
     KnowledgeAccessScope,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationConflict,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
+    KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeEvidenceResult,
+    KnowledgeGovernanceMode,
     KnowledgeListQuery,
     KnowledgeListResult,
     KnowledgeMaintenanceDecision,
     KnowledgeMaintenanceDecisionKind,
     KnowledgeMaintenanceDecisionReceipt,
     KnowledgeMaintenanceProposal,
+    KnowledgePublicationReceipt,
+    KnowledgeReviewApproval,
     KnowledgeStatus,
     KnowledgeVisibility,
+    _replay_review_approval_from_receipts,
     copy_knowledge_access_scope,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
+    prepare_knowledge_activation_request,
 )
 
 _KNOWLEDGE_REVIEW_STORE_METHODS = (
+    "approve_pending_entry",
     "get_entry",
+    "read_chunks",
+    "read_evidence",
     "transition_entry_status",
     "list_entries",
+    "load_entry_publication_receipt",
+    "load_activation_receipt",
 )
+_CURATOR_FORBIDDEN_REVIEW_IDENTITY_FIELDS = (
+    "candidate_generator_identity",
+    "evaluator_identity",
+    "policy_identity",
+)
+
+
+def _review_forbidden_activation_identities(entry: KnowledgeEntry) -> tuple[str, ...]:
+    identities = [entry.created_by]
+    curator_audit = entry.metadata.get("cayu_curator")
+    if type(curator_audit) is dict:
+        for field_name in _CURATOR_FORBIDDEN_REVIEW_IDENTITY_FIELDS:
+            value = curator_audit.get(field_name)
+            if type(value) is str and value.strip() and value not in identities:
+                identities.append(value)
+    return tuple(identities)
 
 
 class _KnowledgeReviewStore(Protocol):
@@ -53,6 +90,49 @@ class _KnowledgeReviewStore(Protocol):
         expected_namespace: str | None = None,
         expected_labels: dict[str, str] | None = None,
     ) -> KnowledgeEntry: ...
+
+    async def read_chunks(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope,
+        max_chunks: int,
+        max_bytes: int,
+    ) -> list[KnowledgeChunk]: ...
+
+    async def read_evidence(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope,
+        max_records: int,
+        max_bytes: int,
+    ) -> KnowledgeEvidenceResult | None: ...
+
+    async def approve_pending_entry(
+        self,
+        authority: KnowledgeActivationAuthority,
+        *,
+        access_scope: KnowledgeAccessScope,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeReviewApproval: ...
+
+    async def load_activation_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeActivationReceipt | None: ...
+
+    async def load_entry_publication_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgePublicationReceipt | None: ...
 
     async def list_entries(
         self,
@@ -135,19 +215,145 @@ class KnowledgeReviewWorkflow:
 
         return await self._require_pending_entry(entry_id)
 
-    async def approve(self, entry_id: str) -> KnowledgeEntry:
-        """Approve one pending entry, making it visible to normal recall."""
+    async def approve(
+        self,
+        entry_id: str,
+        *,
+        operation_id: str,
+        reviewer_identity: str,
+        reviewer_version: str,
+        code: str = "approved",
+        annotations: dict[str, object] | None = None,
+    ) -> KnowledgeReviewApproval:
+        """Approve one exact pending revision with durable reviewer attribution."""
 
-        entry = await self._require_pending_entry(entry_id)
-        return await self.store.transition_entry_status(
-            entry.id,
-            expected_revision=entry.revision,
+        from cayu.knowledge_governance import reviewed_approval_authority
+
+        clean_entry_id = require_clean_nonblank(entry_id, "entry_id")
+        raw_prior = await self.store.load_activation_receipt(
+            operation_id,
             access_scope=self.access_scope,
-            from_status=KnowledgeStatus.PENDING,
-            to_status=KnowledgeStatus.ACTIVE,
-            expected_namespace=self.namespace,
-            expected_labels=self.labels,
         )
+        if raw_prior is not None:
+            try:
+                prior = copy_knowledge_activation_receipt(raw_prior)
+                prior_request = prior.authority.request
+                if (
+                    prior.entry_id != clean_entry_id
+                    or prior_request.mode is not KnowledgeGovernanceMode.REVIEWED
+                    or prior_request.source is not KnowledgeActivationSource.REVIEW_APPROVAL
+                    or prior_request.forbidden_authority_identities
+                    != _review_forbidden_activation_identities(prior_request.candidate_entry)
+                ):
+                    raise ValueError("Operation is not the requested reviewed approval.")
+                self._require_entry_in_scope(prior_request.candidate_entry)
+                replay_authority = reviewed_approval_authority(
+                    prior_request,
+                    reviewer_identity=reviewer_identity,
+                    reviewer_version=reviewer_version,
+                    code=code,
+                    annotations=annotations,
+                )
+            except (TypeError, ValueError):
+                raise KnowledgeActivationConflict("operation_mismatch") from None
+            if replay_authority != prior.authority:
+                raise KnowledgeActivationConflict("operation_mismatch")
+            return await self._approve_with_exact_authority(replay_authority)
+        entry = await self._require_pending_entry(clean_entry_id)
+        chunks = await self.store.read_chunks(
+            entry.id,
+            revision=entry.revision,
+            access_scope=self.access_scope,
+            max_chunks=MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
+            max_bytes=MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+        )
+        evidence_result = await self.store.read_evidence(
+            entry.id,
+            revision=entry.revision,
+            access_scope=self.access_scope,
+            max_records=MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
+            max_bytes=MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+        )
+        if evidence_result is None:
+            raise RuntimeError("Pending knowledge evidence disappeared during review.")
+        if evidence_result.truncated:
+            raise ValueError("Pending knowledge evidence exceeds the activation request bound.")
+        request = prepare_knowledge_activation_request(
+            entry,
+            chunks,
+            evidence=evidence_result.evidence,
+            access_scope=self.access_scope,
+            operation_id=operation_id,
+            governance_mode=KnowledgeGovernanceMode.REVIEWED,
+            source=KnowledgeActivationSource.REVIEW_APPROVAL,
+            expected_revision=entry.revision,
+            forbidden_authority_identities=_review_forbidden_activation_identities(entry),
+        )
+        authority = reviewed_approval_authority(
+            request,
+            reviewer_identity=reviewer_identity,
+            reviewer_version=reviewer_version,
+            code=code,
+            annotations=annotations,
+        )
+        return await self._approve_with_exact_authority(authority)
+
+    async def _approve_with_exact_authority(
+        self,
+        authority: KnowledgeActivationAuthority,
+    ) -> KnowledgeReviewApproval:
+        """Keep extension mutation from redefining reviewed attribution."""
+
+        expected_authority = copy_knowledge_activation_authority(authority)
+        raw_approval = await self.store.approve_pending_entry(
+            copy_knowledge_activation_authority(expected_authority),
+            access_scope=copy_knowledge_access_scope(self.access_scope),
+            expected_namespace=self.namespace,
+            expected_labels=dict(self.labels),
+        )
+        try:
+            if type(raw_approval) is not KnowledgeReviewApproval:
+                raise TypeError("Review store returned an invalid approval.")
+            approval = KnowledgeReviewApproval.model_validate(
+                raw_approval.model_dump(mode="python")
+            )
+            if approval.receipt.authority != expected_authority:
+                raise ValueError("Review store changed activation authority.")
+        except (TypeError, ValueError):
+            raise KnowledgeActivationConflict("operation_mismatch") from None
+        self._require_entry_in_scope(approval.entry)
+
+        try:
+            durable_activation = await self.store.load_activation_receipt(
+                expected_authority.request.operation_id,
+                access_scope=copy_knowledge_access_scope(self.access_scope),
+            )
+            durable_publication = await self.store.load_entry_publication_receipt(
+                expected_authority.request.operation_id,
+                access_scope=copy_knowledge_access_scope(self.access_scope),
+            )
+            if durable_activation is None or durable_publication is None:
+                raise ValueError("Review activation receipt is missing.")
+            expected_approval = _replay_review_approval_from_receipts(
+                durable_publication,
+                durable_activation,
+                authority=expected_authority,
+            )
+            if expected_approval is None:
+                raise ValueError("Review receipts do not bind the requested approval.")
+            durable_receipt = copy_knowledge_activation_receipt(
+                expected_approval.receipt,
+                replayed=False,
+            )
+            returned_receipt = copy_knowledge_activation_receipt(
+                approval.receipt,
+                replayed=False,
+            )
+        except (TypeError, ValueError):
+            raise KnowledgeActivationConflict("operation_mismatch") from None
+        if durable_receipt != returned_receipt or expected_approval.entry != approval.entry:
+            raise KnowledgeActivationConflict("operation_mismatch")
+        return approval
 
     async def reject(self, entry_id: str) -> KnowledgeEntry:
         """Reject one pending entry while retaining it for audit."""

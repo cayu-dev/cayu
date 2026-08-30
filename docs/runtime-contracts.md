@@ -10271,6 +10271,43 @@ directly. A populated pre-63 schema fails before DDL and must be explicitly
 replaced. No content is interpreted into a proposal, relation, decision, or
 receipt, and there is no backfill, dual write, or compatibility adapter.
 
+Revision 75 adds the breaking knowledge-activation authority boundary. It
+creates `cayu_knowledge_activation_receipts`, its bounded entry/revision audit
+index, and the content-free `cayu_knowledge_activation_retirements` lifecycle
+authority table. It does not infer authority for earlier knowledge, publication
+receipts, review actions, sessions, or exposures, and it contains no backfill,
+dual write, or legacy read path. A governed publication commits its exact
+revision, chunks, evidence, change/outbox record, publication receipt, and
+activation receipt in one transaction. The receipt deliberately remains after
+normal expiration pruning so an audit does not become a second retrieval index
+or prevent lifecycle cleanup. Because the receipt contains the exact activation
+request, reads must pass both its immutable publication-time scope and the
+entry's current scope. Before expiration removes a governed logical entry, the
+same transaction records its final revision and access snapshot in a content-free
+retirement authority. Receipt-local timestamps never imply pruning. A retained
+receipt requires its immutable publication scope, that final retirement scope,
+and explicit `include_expired` authority. The marker reserves the logical entry
+ID until the retained audit is erased, preventing a recreated entry from
+replacing the final access boundary. Hard deletion erases every activation
+receipt and its retirement marker atomically, including when expiration already
+removed the canonical entry; this post-prune purge returns `None` because no
+canonical entry remains. Content-free publication receipts retain operation-id
+occupancy. Activation receipt reads authorize against the current-entry boundary
+and optional retirement authority from one stable database snapshot, so pruning
+cannot make a reader combine mutually exclusive lifecycle states. Retirement
+authorities are capped at 1,048,576 canonical UTF-8 bytes. A governed publication
+and every later successor revision must fit that final authority before the
+revision is accepted; expiration pruning therefore cannot discover an
+unrepresentable access boundary after durable knowledge has already changed.
+Activation requests are capped at 1,048,576
+canonical UTF-8 bytes and activation receipts at 1,114,112 canonical UTF-8
+bytes. Every backend applies those same public bounds to the compact durable
+document; PostgreSQL stores the receipt document as validated JSON text so
+`jsonb` display whitespace cannot silently reduce its accepted range relative
+to memory or SQLite. Exact replay also requires the publication and activation
+receipts to carry the same store-authored `committed_at`; a mismatched pair is
+not accepted as evidence of one atomic governed write.
+
 The deterministic backend conformance registry lives in
 `tests/core/test_knowledge_store_shared_conformance.py`, with reusable scenarios
 and registration types in `tests/core/knowledge_store_conformance.py`. A

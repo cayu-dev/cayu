@@ -59,6 +59,7 @@ from cayu.storage import (
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
+from cayu.storage.memory import knowledge_entry_payload_bytes
 from cayu.tools import RememberKnowledgeTool
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
@@ -158,39 +159,45 @@ def _insert_pre_revision_65_entry(
             sqlite_support.format_datetime(entry.updated_at),
         ),
     )
+    has_payload_bytes = "payload_bytes" in {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(cayu_knowledge_revisions)")
+    }
+    payload_column = ", payload_bytes" if has_payload_bytes else ""
+    payload_placeholder = ", ?" if has_payload_bytes else ""
+    values = (
+        entry.id,
+        entry.revision,
+        entry.text,
+        entry.kind,
+        str(entry.visibility),
+        str(entry.status),
+        str(entry.created_by_type),
+        entry.created_by,
+        sqlite_support.format_datetime(entry.created_at),
+        sqlite_support.format_datetime(entry.updated_at),
+        entry.source_type,
+        entry.source_uri,
+        entry.source_id,
+        entry.source_hash,
+        entry.importance,
+        entry.importance_source,
+        entry.confidence,
+        sqlite_support.format_optional_datetime(entry.last_used_at),
+        sqlite_support.format_optional_datetime(entry.expires_at),
+        entry.title,
+        sqlite_support.json_dumps(entry.metadata),
+    )
     connection.execute(
-        """
+        f"""
         INSERT INTO cayu_knowledge_revisions (
             entry_id, revision, text, kind, visibility, status,
             created_by_type, created_by, created_at, updated_at,
             source_type, source_uri, source_id, source_hash,
             importance, importance_source, confidence, last_used_at,
-            expires_at, title, metadata_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            expires_at, title, metadata_json{payload_column}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{payload_placeholder})
         """,
-        (
-            entry.id,
-            entry.revision,
-            entry.text,
-            entry.kind,
-            str(entry.visibility),
-            str(entry.status),
-            str(entry.created_by_type),
-            entry.created_by,
-            sqlite_support.format_datetime(entry.created_at),
-            sqlite_support.format_datetime(entry.updated_at),
-            entry.source_type,
-            entry.source_uri,
-            entry.source_id,
-            entry.source_hash,
-            entry.importance,
-            entry.importance_source,
-            entry.confidence,
-            sqlite_support.format_optional_datetime(entry.last_used_at),
-            sqlite_support.format_optional_datetime(entry.expires_at),
-            entry.title,
-            sqlite_support.json_dumps(entry.metadata),
-        ),
+        (*values, knowledge_entry_payload_bytes(entry)) if has_payload_bytes else values,
     )
 
 
@@ -369,6 +376,36 @@ def _reconcile_sqlite_through_revision_64(connection: sqlite3.Connection) -> Non
             connection,
             schema_migrations.SchemaMode.MIGRATE,
             app_min_supported=63,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _reconcile_sqlite_through_revision_67(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 67
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=67,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _reconcile_sqlite_through_revision_74(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 74
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=74,
         )
     finally:
         schema_migrations.REVISIONS = revisions
@@ -593,6 +630,7 @@ def test_sqlite_remember_knowledge_reconciles_ack_loss_and_restart(tmp_path) -> 
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             await super().publish_entry_revision(
                 entry,
@@ -600,6 +638,7 @@ def test_sqlite_remember_knowledge_reconciles_ack_loss_and_restart(tmp_path) -> 
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             raise RuntimeError("secret canary acknowledgement failure")
 
@@ -1988,18 +2027,10 @@ def test_sqlite_revision_67_adds_empty_proposal_storage_without_backfill(tmp_pat
     finally:
         connection.close()
 
-    store = SQLiteKnowledgeStore(
-        database,
-        schema_mode=schema_migrations.SchemaMode.MIGRATE,
-        access_scope=_ACCESS_SCOPE,
-    )
-    store._connection.close()
     connection = sqlite_support.connect(database)
     try:
-        assert (
-            connection.execute("PRAGMA user_version").fetchone()[0]
-            == schema_migrations.LATEST_REVISION
-        )
+        _reconcile_sqlite_through_revision_67(connection)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 67
         assert (
             connection.execute(
                 "SELECT text FROM cayu_knowledge_revisions "
@@ -2015,6 +2046,137 @@ def test_sqlite_revision_67_adds_empty_proposal_storage_without_backfill(tmp_pat
         )
     finally:
         connection.close()
+
+
+def test_sqlite_revision_75_refuses_populated_knowledge_without_backfill(
+    tmp_path,
+) -> None:
+    database = tmp_path / "revision-74-to-75-populated.sqlite"
+    connection = sqlite_support.connect(database)
+    entry = KnowledgeEntry(
+        id="revision-74-entry",
+        text="Revision 75 must not infer activation authority.",
+    )
+    try:
+        _reconcile_sqlite_through_revision_74(connection)
+        with sqlite_support._transaction(connection):
+            _insert_pre_revision_65_entry(connection, entry)
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match="clean prerelease knowledge-activation-authority break",
+    ):
+        SQLiteKnowledgeStore(
+            database,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+
+    connection = sqlite_support.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 74
+        assert (
+            connection.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = ? AND revision = 1",
+                (entry.id,),
+            ).fetchone()[0]
+            == entry.text
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_activation_receipts'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_activation_retirements'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_75_initializes_empty_knowledge_schema_directly(
+    tmp_path,
+) -> None:
+    database = tmp_path / "revision-74-to-75-empty.sqlite"
+    connection = sqlite_support.connect(database)
+    try:
+        _reconcile_sqlite_through_revision_74(connection)
+    finally:
+        connection.close()
+
+    store = SQLiteKnowledgeStore(
+        database,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        access_scope=_ACCESS_SCOPE,
+    )
+    store._connection.close()
+
+    connection = sqlite_support.connect(database)
+    try:
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema_migrations.LATEST_REVISION
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_activation_receipts'"
+            ).fetchone()
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_activation_retirements'"
+            ).fetchone()
+            is not None
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_75_rejects_malformed_activation_storage(tmp_path) -> None:
+    database = tmp_path / "revision-75-malformed-activation.sqlite"
+    store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+    store._connection.close()
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute("DROP TABLE cayu_knowledge_activation_receipts")
+        connection.execute(
+            "CREATE TABLE cayu_knowledge_activation_receipts (operation_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="knowledge-activation authority contract"):
+        SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+
+
+def test_sqlite_revision_75_rejects_malformed_activation_retirement_storage(tmp_path) -> None:
+    database = tmp_path / "revision-75-malformed-activation-retirement.sqlite"
+    store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+    store._connection.close()
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute("DROP TABLE cayu_knowledge_activation_retirements")
+        connection.execute(
+            "CREATE TABLE cayu_knowledge_activation_retirements (entry_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="knowledge-activation authority contract"):
+        SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
 
 
 def test_sqlite_revision_67_rejects_malformed_proposal_storage(tmp_path) -> None:

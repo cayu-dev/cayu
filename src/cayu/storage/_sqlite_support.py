@@ -3845,6 +3845,47 @@ _MIGRATION_STEPS: dict[int, str] = {
             )
             WHERE authored_suite_launch_revision IS NOT NULL;
     """,
+    75: """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_activation_receipts (
+            operation_id TEXT COLLATE BINARY PRIMARY KEY,
+            entry_id TEXT COLLATE BINARY NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            expected_revision INTEGER
+                CHECK (expected_revision > 0 AND expected_revision <= 2147483647),
+            publication_request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(publication_request_sha256) = 64
+                AND publication_request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json)
+                AND json_type(receipt_json) = 'object'
+                AND length(CAST(receipt_json AS BLOB)) BETWEEN 1 AND 1114112
+            ),
+            access_snapshot_json TEXT NOT NULL CHECK (
+                json_valid(access_snapshot_json)
+                AND json_type(access_snapshot_json) = 'object'
+            ),
+            CHECK (
+                (expected_revision IS NULL AND entry_revision = 1)
+                OR entry_revision = expected_revision + 1
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_activation_receipts_entry_revision
+            ON cayu_knowledge_activation_receipts(entry_id, entry_revision);
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_activation_retirements (
+            entry_id TEXT COLLATE BINARY PRIMARY KEY,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            retired_at TEXT NOT NULL,
+            retirement_json TEXT NOT NULL CHECK (
+                json_valid(retirement_json)
+                AND json_type(retirement_json) = 'object'
+                AND length(CAST(retirement_json AS BLOB)) BETWEEN 1 AND 1048576
+            )
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -4211,6 +4252,11 @@ _KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES = (
     "cayu_knowledge_maintenance_decisions",
     "cayu_knowledge_maintenance_proposals",
 )
+_KNOWLEDGE_ACTIVATION_CLEAN_BREAK_TABLES = (
+    *_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
+    "cayu_knowledge_activation_receipts",
+    "cayu_knowledge_activation_retirements",
+)
 
 
 def _reject_populated_pre_knowledge_relation_database(
@@ -4243,6 +4289,17 @@ def _reject_populated_pre_bounded_knowledge_entry_database(
         candidates=_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
         revision=65,
         contract="bounded-entry-read",
+    )
+
+
+def _reject_populated_pre_knowledge_activation_database(
+    connection: sqlite3.Connection,
+) -> None:
+    _reject_populated_pre_knowledge_contract_database(
+        connection,
+        candidates=_KNOWLEDGE_ACTIVATION_CLEAN_BREAK_TABLES,
+        revision=75,
+        contract="knowledge-activation-authority",
     )
 
 
@@ -5486,6 +5543,8 @@ def reconcile_schema(
         )
     if current.revision >= 73:
         _validate_revision_73_recall_subscription_schema(connection)
+    if current.revision >= 75:
+        _validate_revision_75_knowledge_activation_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
@@ -7504,6 +7563,119 @@ def _raise_revision_73_sqlite_schema_error(name: str) -> NoReturn:
     )
 
 
+def _validate_revision_75_knowledge_activation_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    table = "cayu_knowledge_activation_receipts"
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    )
+    expected_columns = (
+        ("operation_id", "TEXT", 0, 1),
+        ("entry_id", "TEXT", 1, 0),
+        ("entry_revision", "INTEGER", 1, 0),
+        ("expected_revision", "INTEGER", 0, 0),
+        ("publication_request_sha256", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+        ("access_snapshot_json", "TEXT", 1, 0),
+    )
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    normalized = _normalize_sqlite_schema_sql(None if table_row is None else table_row[0])
+    required_fragments = (
+        "operation_id text collate binary primary key",
+        "entry_id text collate binary not null",
+        "publication_request_sha256 text collate binary not null",
+        "entry_revision > 0",
+        "entry_revision <= 2147483647",
+        "expected_revision > 0",
+        "expected_revision <= 2147483647",
+        "length(publication_request_sha256) = 64",
+        "publication_request_sha256 not glob '*[^0-9a-f]*'",
+        "json_valid(receipt_json)",
+        "json_type(receipt_json) = 'object'",
+        "length(cast(receipt_json as blob)) between 1 and 1114112",
+        "json_valid(access_snapshot_json)",
+        "json_type(access_snapshot_json) = 'object'",
+        "expected_revision is null and entry_revision = 1",
+        "entry_revision = expected_revision + 1",
+    )
+    if (
+        columns != expected_columns
+        or _sqlite_foreign_key_groups(connection, table)
+        or any(fragment not in normalized for fragment in required_fragments)
+    ):
+        _raise_revision_75_sqlite_schema_error(table)
+
+    index = "idx_cayu_knowledge_activation_receipts_entry_revision"
+    index_row = connection.execute(
+        "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index,),
+    ).fetchone()
+    index_columns = tuple(str(row[2]) for row in connection.execute(f"PRAGMA index_info({index})"))
+    index_collations = tuple(
+        str(row[4]).upper()
+        for row in connection.execute(f"PRAGMA index_xinfo({index})")
+        if int(row[5]) == 1
+    )
+    if (
+        index_row is None
+        or index_row[0] != table
+        or index_columns
+        != (
+            "entry_id",
+            "entry_revision",
+        )
+        or index_collations != ("BINARY", "BINARY")
+    ):
+        _raise_revision_75_sqlite_schema_error(index)
+
+    retirement_table = "cayu_knowledge_activation_retirements"
+    retirement_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f"PRAGMA table_info({retirement_table})")
+    )
+    expected_retirement_columns = (
+        ("entry_id", "TEXT", 0, 1),
+        ("entry_revision", "INTEGER", 1, 0),
+        ("retired_at", "TEXT", 1, 0),
+        ("retirement_json", "TEXT", 1, 0),
+    )
+    retirement_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (retirement_table,),
+    ).fetchone()
+    retirement_sql = _normalize_sqlite_schema_sql(
+        None if retirement_row is None else retirement_row[0]
+    )
+    required_retirement_fragments = (
+        "entry_id text collate binary primary key",
+        "entry_revision > 0",
+        "entry_revision <= 2147483647",
+        "json_valid(retirement_json)",
+        "json_type(retirement_json) = 'object'",
+        "length(cast(retirement_json as blob)) between 1 and 1048576",
+    )
+    if (
+        retirement_columns != expected_retirement_columns
+        or _sqlite_foreign_key_groups(connection, retirement_table)
+        or any(fragment not in retirement_sql for fragment in required_retirement_fragments)
+    ):
+        _raise_revision_75_sqlite_schema_error(retirement_table)
+
+
+def _raise_revision_75_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's knowledge-activation authority contract. "
+        "Run schema_mode=MIGRATE to install revision 75 or recreate the database."
+    )
+
+
 def _validate_revision_44_knowledge_schema(connection: sqlite3.Connection) -> None:
     expected_columns = {
         "cayu_knowledge_index_readiness_events": (
@@ -9331,6 +9503,12 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         and any(revision.revision == 73 for revision in schema.pending(current))
     ):
         _reject_populated_pre_recall_subscription_database(connection)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 75
+        and any(revision.revision == 75 for revision in schema.pending(current))
+    ):
+        _reject_populated_pre_knowledge_activation_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -9416,6 +9594,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             # BEGIN IMMEDIATE fences revision-71 delivery writers between the
             # clean-break check and installation of input-bound subscriptions.
             _reject_populated_pre_recall_subscription_database(connection)
+        if rev.revision == 75:
+            # BEGIN IMMEDIATE fences pre-75 writers between the clean-break
+            # check and installation of exact activation authority.
+            _reject_populated_pre_knowledge_activation_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -9499,6 +9681,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_73_recall_subscription_schema(connection)
         if rev.revision == 74:
             _validate_eval_run_trial_checkpoint_schema(connection)
+        if rev.revision == 75:
+            _validate_revision_75_knowledge_activation_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

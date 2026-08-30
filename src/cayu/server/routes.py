@@ -500,9 +500,11 @@ from cayu.server.sse import (
     sse_message_data_bytes,
 )
 from cayu.storage import (
+    KnowledgeActivationConflict,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListItem,
+    KnowledgeReviewApproval,
     KnowledgeReviewWorkflow,
     KnowledgeRevisionConflict,
     KnowledgeVisibility,
@@ -11414,15 +11416,18 @@ def create_router(
 
     async def _apply_knowledge_review_action(action, entry_id: str):
         try:
-            entry = await action(entry_id)
+            result = await action(entry_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except KnowledgeRevisionConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeActivationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        entry = result.entry if isinstance(result, KnowledgeReviewApproval) else result
         return _serialize_reviewed_knowledge_entry(entry)
 
     @router.get(
@@ -11512,9 +11517,25 @@ def create_router(
         dependencies=protected,
         response_model=ApiReviewedKnowledgeEntry,
     )
-    async def approve_knowledge(entry_id: NonBlankString):
+    async def approve_knowledge(
+        entry_id: NonBlankString,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=256),
+        ] = None,
+    ):
         workflow = _knowledge_review_workflow()
-        return await _apply_knowledge_review_action(workflow.approve, entry_id)
+        operation_id = idempotency_key or f"server-knowledge-review-{uuid4().hex}"
+        return await _apply_knowledge_review_action(
+            lambda item_id: workflow.approve(
+                item_id,
+                operation_id=operation_id,
+                reviewer_identity="cayu.server.knowledge-review",
+                reviewer_version="1",
+                annotations={"channel": "protected-http"},
+            ),
+            entry_id,
+        )
 
     @router.post(
         "/knowledge/{entry_id}/reject",

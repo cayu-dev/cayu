@@ -203,7 +203,12 @@ async def build() -> EvalPlan:
         access_scope=knowledge_access_scope,
         namespace="cayu:runtime-acceptance",
     )
-    await review.approve(KNOWLEDGE_ENTRY_ID)
+    await review.approve(
+        KNOWLEDGE_ENTRY_ID,
+        operation_id="runtime-acceptance-knowledge-review",
+        reviewer_identity="runtime-acceptance-reviewer",
+        reviewer_version="1",
+    )
 
     app = CayuApp(
         context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),

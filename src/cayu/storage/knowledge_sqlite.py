@@ -34,6 +34,10 @@ from cayu.storage.memory import (
     KNOWLEDGE_CHUNK_TEXT_PROJECTION,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationConflict,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
     KnowledgeActorType,
     KnowledgeChange,
     KnowledgeChangeBatch,
@@ -81,6 +85,7 @@ from cayu.storage.memory import (
     KnowledgeRelationPublicationReceipt,
     KnowledgeRelationQuery,
     KnowledgeRelationResult,
+    KnowledgeReviewApproval,
     KnowledgeRevisionConflict,
     KnowledgeRevisionRef,
     KnowledgeSearchMode,
@@ -88,6 +93,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _activation_receipt_matches,
     _bounded_knowledge_evidence,
     _bounded_knowledge_index_identity,
     _bounded_knowledge_lineage_result,
@@ -101,6 +107,9 @@ from cayu.storage.memory import (
     _knowledge_access_scope_sha256,
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
+    _knowledge_activation_receipt_json,
+    _knowledge_activation_retirement,
+    _knowledge_activation_retirement_json,
     _knowledge_change_audiences,
     _knowledge_change_claim_sha256,
     _knowledge_change_identity,
@@ -122,22 +131,30 @@ from cayu.storage.memory import (
     _knowledge_relation_change_audiences,
     _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
+    _knowledge_scope_allows_activation_receipt,
     _knowledge_scope_allows_lineage_endpoint,
     _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
+    _KnowledgeActivationRetirement,
     _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
     _next_knowledge_revision,
     _parse_knowledge_access_snapshot_json,
+    _parse_knowledge_activation_retirement_json,
     _parse_knowledge_maintenance_access_snapshot_json,
     _parse_knowledge_relation_access_snapshot_json,
+    _prepare_review_approval_receipts,
+    _replay_review_approval_from_receipts,
+    _require_knowledge_activation_retirement_access,
+    _require_knowledge_activation_retirement_capacity,
     _require_knowledge_entry_access,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
     _require_knowledge_maintenance_publication_boundary,
     _require_knowledge_maintenance_source_evidence,
     _require_knowledge_successor_access,
+    _validate_activation_publication_material,
     _validate_knowledge_change_limit,
     _validate_knowledge_change_sequence,
     _validate_knowledge_index_readiness_limit,
@@ -149,9 +166,13 @@ from cayu.storage.memory import (
     _validate_knowledge_relation_publication_replay,
     _validate_knowledge_revision,
     _validate_knowledge_search_frontier,
+    _validate_review_approval_authority,
+    _validate_review_approval_scope,
     _validate_revision_append,
     _validate_revision_successor,
     copy_knowledge_access_scope,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
     copy_knowledge_change_claim,
     copy_knowledge_change_consumer_state,
     copy_knowledge_chunk,
@@ -187,7 +208,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
         (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
     }
 )
-_SQLITE_MIN_REQUIRED_REVISION = 67
+_SQLITE_MIN_REQUIRED_REVISION = 75
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -276,6 +297,14 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         expected_revision=None,
                         actual_revision=existing_entry.revision,
                     )
+                retirement = self._load_activation_retirement_unlocked(entry.id)
+                if retirement is not None:
+                    _require_knowledge_activation_retirement_access(
+                        scope,
+                        retirement,
+                        operation="create_entry",
+                    )
+                    raise KnowledgePublicationConflict("entry_retired")
                 self._require_chunk_ids_available_unlocked(
                     copied_chunks,
                     access_scope=scope,
@@ -481,7 +510,42 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             with sqlite_support._transaction(self._connection):
                 entry = self._load_entry_unlocked(clean_id)
                 if entry is None:
+                    if not hard:
+                        return None
+                    retirement = self._load_activation_retirement_unlocked(clean_id)
+                    if retirement is None:
+                        return None
+                    _require_knowledge_activation_retirement_access(
+                        scope,
+                        retirement,
+                        operation="delete_entry",
+                    )
+                    if retirement.entry_revision != expected_revision:
+                        raise KnowledgeRevisionConflict(
+                            clean_id,
+                            expected_revision=expected_revision,
+                            actual_revision=retirement.entry_revision,
+                        )
+                    receipt_count = int(
+                        self._connection.execute(
+                            "SELECT COUNT(*) FROM cayu_knowledge_activation_receipts "
+                            "WHERE entry_id = ?",
+                            (clean_id,),
+                        ).fetchone()[0]
+                    )
+                    if receipt_count < 1:
+                        raise KnowledgeActivationConflict("malformed_retirement")
+                    self._connection.execute(
+                        "DELETE FROM cayu_knowledge_activation_receipts WHERE entry_id = ?",
+                        (clean_id,),
+                    )
+                    self._connection.execute(
+                        "DELETE FROM cayu_knowledge_activation_retirements WHERE entry_id = ?",
+                        (clean_id,),
+                    )
                     return None
+                if self._load_activation_retirement_unlocked(clean_id) is not None:
+                    raise KnowledgeActivationConflict("malformed_retirement")
                 _require_knowledge_entry_access(scope, entry, operation="delete_entry")
                 if entry.revision != expected_revision:
                     raise KnowledgeRevisionConflict(
@@ -499,6 +563,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         before_entry=entry,
                         after_entry=None,
                         kind=KnowledgeChangeKind.HARD_DELETED,
+                    )
+                    self._connection.execute(
+                        "DELETE FROM cayu_knowledge_activation_receipts WHERE entry_id = ?",
+                        (clean_id,),
                     )
                     self._delete_chunks_unlocked(clean_id)
                     self._connection.execute(
@@ -558,6 +626,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     return 0
                 # FTS is a virtual table (no FK cascade), so clear chunks/FTS explicitly; the
                 # entries DELETE then cascades to labels/aspects/impact_targets.
+                retired_at = datetime.now(UTC)
                 for entry_id in expired_ids:
                     entry = self._load_entry_unlocked(entry_id)
                     if entry is None:
@@ -569,6 +638,20 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         after_entry=None,
                         kind=KnowledgeChangeKind.EXPIRED,
                     )
+                    has_activation_receipt = bool(
+                        self._connection.execute(
+                            "SELECT EXISTS("
+                            "SELECT 1 FROM cayu_knowledge_activation_receipts "
+                            "WHERE entry_id = ? LIMIT 1)",
+                            (entry_id,),
+                        ).fetchone()[0]
+                    )
+                    if has_activation_receipt:
+                        if self._load_activation_retirement_unlocked(entry_id) is not None:
+                            raise KnowledgeActivationConflict("malformed_retirement")
+                        self._insert_activation_retirement_unlocked(
+                            _knowledge_activation_retirement(entry, retired_at=retired_at)
+                        )
                     self._delete_chunks_unlocked(entry_id)
                 self._connection.executemany(
                     "DELETE FROM cayu_knowledge_entries WHERE id = ?",
@@ -585,6 +668,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
+        activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
         (
@@ -599,8 +683,24 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             evidence=evidence,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
+        copied_authority = (
+            None
+            if activation_authority is None
+            else copy_knowledge_activation_authority(activation_authority)
+        )
+        if copied_authority is not None:
+            _validate_activation_publication_material(
+                copied_authority,
+                operation_id=operation_id,
+                entry=copied_entry,
+                chunks=copied_chunks,
+                evidence=copied_evidence,
+                expected_revision=expected_revision,
+                access_scope=scope,
+            )
         async with self._lock:
             with sqlite_support._transaction(self._connection):
                 existing_receipt = self._load_publication_receipt_unlocked(
@@ -608,6 +708,17 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     access_scope=scope,
                 )
                 if existing_receipt is not None:
+                    existing_activation = self._load_activation_receipt_unlocked(
+                        operation_id,
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    if (
+                        existing_activation is not None
+                        and existing_activation.authority.request.source
+                        is KnowledgeActivationSource.REVIEW_APPROVAL
+                    ):
+                        raise KnowledgePublicationConflict("operation_occupied")
                     _validate_knowledge_publication_replay(
                         existing_receipt,
                         entry=copied_entry,
@@ -615,11 +726,29 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         evidence=copied_evidence,
                         expected_revision=expected_revision,
                         request_sha256=request_sha256,
+                        activation_authority=copied_authority,
                     )
+                    if copied_authority is None:
+                        if existing_activation is not None:
+                            raise KnowledgePublicationConflict("activation_mismatch")
+                    elif existing_activation is None or not _activation_receipt_matches(
+                        existing_activation,
+                        authority=copied_authority,
+                        publication_request_sha256=request_sha256,
+                        publication_committed_at=existing_receipt.committed_at,
+                    ):
+                        raise KnowledgePublicationConflict("activation_mismatch")
                     return copy_knowledge_publication_receipt(
                         existing_receipt,
                         replayed=True,
                     )
+                existing_activation = self._load_activation_receipt_unlocked(
+                    operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if existing_activation is not None:
+                    raise KnowledgePublicationConflict("operation_occupied")
                 existing_entry = self._load_entry_unlocked(copied_entry.id)
                 actual_revision = None if existing_entry is None else existing_entry.revision
                 if existing_entry is not None:
@@ -628,6 +757,14 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         existing_entry,
                         operation="publish_entry_revision",
                     )
+                retirement = self._load_activation_retirement_unlocked(copied_entry.id)
+                if retirement is not None:
+                    _require_knowledge_activation_retirement_access(
+                        scope,
+                        retirement,
+                        operation="publish_entry_revision",
+                    )
+                    raise KnowledgePublicationConflict("entry_retired")
                 if actual_revision != expected_revision:
                     raise KnowledgeRevisionConflict(
                         copied_entry.id,
@@ -643,6 +780,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                         operation="publish_entry_revision",
                     )
                     _validate_revision_successor(existing_entry, copied_entry)
+                    if copied_authority is None and self._has_activation_receipts_unlocked(
+                        copied_entry.id
+                    ):
+                        _require_knowledge_activation_retirement_capacity(copied_entry)
                 self._require_chunk_ids_available_unlocked(
                     copied_chunks,
                     access_scope=scope,
@@ -653,6 +794,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     access_scope=scope,
                     operation="publish_entry_revision",
                 )
+                committed_at = datetime.now(UTC)
                 receipt = KnowledgePublicationReceipt(
                     operation_id=operation_id,
                     entry_id=copied_entry.id,
@@ -661,7 +803,20 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     request_sha256=request_sha256,
                     entry_created_at=copied_entry.created_at,
                     entry_updated_at=copied_entry.updated_at,
-                    committed_at=datetime.now(UTC),
+                    committed_at=committed_at,
+                )
+                activation_receipt = (
+                    None
+                    if copied_authority is None
+                    else KnowledgeActivationReceipt(
+                        operation_id=operation_id,
+                        entry_id=copied_entry.id,
+                        entry_revision=copied_entry.revision,
+                        expected_revision=expected_revision,
+                        publication_request_sha256=request_sha256,
+                        authority=copied_authority,
+                        committed_at=committed_at,
+                    )
                 )
                 if existing_entry is None:
                     self._insert_entry_unlocked(copied_entry)
@@ -686,6 +841,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     committed_at=receipt.committed_at,
                 )
                 self._insert_publication_receipt_unlocked(receipt, copied_entry)
+                if activation_receipt is not None:
+                    self._insert_activation_receipt_unlocked(
+                        activation_receipt,
+                        access_entry=copied_entry,
+                    )
             return copy_knowledge_publication_receipt(receipt)
 
     async def load_entry_publication_receipt(
@@ -699,6 +859,164 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         async with self._lock:
             receipt = self._load_publication_receipt_in_scope_unlocked(operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
+    async def load_activation_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_publication_operation_id(operation_id)
+        async with self._lock:
+            with sqlite_support._transaction(
+                self._connection,
+                begin_immediate=False,
+            ):
+                receipt = self._load_activation_receipt_unlocked(
+                    operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=False,
+                )
+        return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    async def approve_pending_entry(
+        self,
+        authority: KnowledgeActivationAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeReviewApproval:
+        scope = self._operation_access_scope(access_scope)
+        authority = copy_knowledge_activation_authority(authority)
+        request = authority.request
+        _validate_review_approval_authority(authority, access_scope=scope)
+        expected_namespace = (
+            require_clean_nonblank(expected_namespace, "expected_namespace")
+            if expected_namespace is not None
+            else None
+        )
+        expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                existing_receipt = self._load_activation_receipt_unlocked(
+                    request.operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if existing_receipt is not None:
+                    publication = self._load_publication_receipt_unlocked(
+                        request.operation_id,
+                        access_scope=scope,
+                    )
+                    if publication is None:
+                        raise KnowledgeActivationConflict("malformed_receipt")
+                    approval = _replay_review_approval_from_receipts(
+                        publication,
+                        existing_receipt,
+                        authority=authority,
+                    )
+                    if approval is None:
+                        raise KnowledgeActivationConflict("operation_mismatch")
+                    _validate_review_approval_scope(
+                        approval.entry,
+                        expected_namespace=expected_namespace,
+                        expected_labels=expected_labels,
+                    )
+                    return approval
+                if (
+                    self._load_publication_receipt_unlocked(
+                        request.operation_id,
+                        access_scope=scope,
+                    )
+                    is not None
+                ):
+                    raise KnowledgeActivationConflict("operation_occupied")
+                current = self._load_entry_unlocked(request.candidate_entry.id)
+                if current is None:
+                    raise KeyError(
+                        f"Knowledge entry {request.candidate_entry.id!r} does not exist."
+                    )
+                _require_knowledge_entry_access(scope, current, operation="approve_pending_entry")
+                if current.revision != request.expected_revision:
+                    raise KnowledgeRevisionConflict(
+                        current.id,
+                        expected_revision=request.expected_revision,
+                        actual_revision=current.revision,
+                    )
+                if current != request.candidate_entry:
+                    raise KnowledgeActivationConflict("candidate_material_mismatch")
+                if current.status is not KnowledgeStatus.PENDING:
+                    raise ValueError("Reviewed approval requires a pending entry.")
+                _validate_review_approval_scope(
+                    current,
+                    expected_namespace=expected_namespace,
+                    expected_labels=expected_labels,
+                )
+                current_chunks = self._load_chunks_unlocked(
+                    current.id,
+                    revision=current.revision,
+                )
+                current_evidence = self._load_evidence_unlocked(
+                    current.id,
+                    revision=current.revision,
+                )
+                if (
+                    list(request.chunks) != current_chunks
+                    or list(request.evidence) != current_evidence
+                ):
+                    raise KnowledgeActivationConflict("candidate_material_mismatch")
+                activated = current.model_copy(
+                    update={
+                        "revision": request.target_revision,
+                        "status": KnowledgeStatus.ACTIVE,
+                        "updated_at": max(
+                            datetime.now(UTC),
+                            current.created_at,
+                            current.updated_at,
+                        ),
+                    }
+                )
+                _require_knowledge_activation_retirement_capacity(activated)
+                target_chunks = (
+                    [_default_chunk_for_entry(activated)]
+                    if _has_only_default_chunk(current, current_chunks)
+                    else _copy_chunks_for_revision(current_chunks, activated)
+                )
+                target_evidence = _copy_evidence_for_revision(
+                    current_evidence,
+                    entry=activated,
+                    previous_chunks=current_chunks,
+                    chunks=target_chunks,
+                )
+                committed_at = datetime.now(UTC)
+                publication_receipt, receipt = _prepare_review_approval_receipts(
+                    current,
+                    activated,
+                    target_chunks,
+                    target_evidence,
+                    authority,
+                    committed_at=committed_at,
+                )
+                self._append_revision_unlocked(
+                    activated,
+                    expected_revision=current.revision,
+                    chunks=None,
+                    evidence=None,
+                    access_scope=scope,
+                    operation="approve_pending_entry",
+                    change_kind=KnowledgeChangeKind.STATUS_TRANSITIONED,
+                    inherit_evidence=True,
+                    change_operation_id=request.operation_id,
+                    committed_at=committed_at,
+                )
+                self._insert_publication_receipt_unlocked(publication_receipt, activated)
+                self._insert_activation_receipt_unlocked(
+                    receipt,
+                    access_entry=activated,
+                )
+                return KnowledgeReviewApproval(entry=activated, receipt=receipt)
 
     async def publish_relations(
         self,
@@ -3046,6 +3364,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         _validate_revision_successor(current, entry)
         _require_knowledge_successor_access(access_scope, entry, operation=operation)
+        if self._has_activation_receipts_unlocked(entry.id):
+            _require_knowledge_activation_retirement_capacity(entry)
         previous_chunks = self._load_chunks_unlocked(
             entry.id,
             revision=current.revision,
@@ -4274,6 +4594,176 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 sqlite_support.format_datetime(receipt.entry_updated_at),
                 sqlite_support.format_datetime(receipt.committed_at),
                 _knowledge_access_snapshot_json(_knowledge_access_snapshot(entry)),
+            ),
+        )
+
+    def _has_activation_receipts_unlocked(self, entry_id: str) -> bool:
+        return bool(
+            self._connection.execute(
+                "SELECT EXISTS("
+                "SELECT 1 FROM cayu_knowledge_activation_receipts "
+                "WHERE entry_id = ? LIMIT 1)",
+                (entry_id,),
+            ).fetchone()[0]
+        )
+
+    def _load_activation_receipt_unlocked(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> KnowledgeActivationReceipt | None:
+        row = self._connection.execute(
+            """
+            SELECT operation_id, entry_id, entry_revision, expected_revision,
+                   publication_request_sha256, committed_at,
+                   receipt_json, access_snapshot_json
+            FROM cayu_knowledge_activation_receipts
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            snapshot = _parse_knowledge_access_snapshot_json(row["access_snapshot_json"])
+        except Exception:
+            raise KnowledgeActivationConflict("malformed_receipt") from None
+        cutoff = datetime.now(UTC)
+        if not _knowledge_scope_allows_snapshot(access_scope, snapshot, now=cutoff):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("load_activation_receipt")
+            return None
+        access_sql, access_params = _knowledge_access_scope_filter_sql(
+            access_scope,
+            now=cutoff,
+        )
+        current_access = self._connection.execute(
+            f"""
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM cayu_knowledge_current_entries AS e
+                    WHERE e.id = ?
+                ) AS entry_exists,
+                EXISTS (
+                    SELECT 1
+                    FROM cayu_knowledge_current_entries AS e
+                    WHERE e.id = ?
+                    {access_sql}
+                ) AS entry_allowed
+            """,
+            (row["entry_id"], row["entry_id"], *access_params),
+        ).fetchone()
+        if current_access is None:
+            raise KnowledgeActivationConflict("malformed_receipt")
+        current_exists = bool(current_access["entry_exists"])
+        retirement = self._load_activation_retirement_unlocked(str(row["entry_id"]))
+        if current_exists:
+            if retirement is not None:
+                raise KnowledgeActivationConflict("malformed_retirement")
+            current_allowed = bool(current_access["entry_allowed"])
+        else:
+            current_allowed = _knowledge_scope_allows_activation_receipt(
+                access_scope,
+                snapshot,
+                None,
+                retirement=retirement,
+                entry_id=str(row["entry_id"]),
+                entry_revision=int(row["entry_revision"]),
+                now=cutoff,
+            )
+        if not current_allowed:
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("load_activation_receipt")
+            return None
+        try:
+            receipt = KnowledgeActivationReceipt.model_validate_json(row["receipt_json"])
+            if (
+                receipt.operation_id != row["operation_id"]
+                or receipt.entry_id != row["entry_id"]
+                or receipt.entry_revision != row["entry_revision"]
+                or receipt.expected_revision != row["expected_revision"]
+                or receipt.publication_request_sha256 != row["publication_request_sha256"]
+                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+            ):
+                raise ValueError("Activation receipt columns disagree with its JSON envelope.")
+        except Exception:
+            raise KnowledgeActivationConflict("malformed_receipt") from None
+        return receipt
+
+    def _load_activation_retirement_unlocked(
+        self,
+        entry_id: str,
+    ) -> _KnowledgeActivationRetirement | None:
+        row = self._connection.execute(
+            "SELECT entry_id, entry_revision, retired_at, retirement_json "
+            "FROM cayu_knowledge_activation_retirements WHERE entry_id = ?",
+            (entry_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            retirement = _parse_knowledge_activation_retirement_json(row["retirement_json"])
+            if (
+                retirement.entry_id != row["entry_id"]
+                or retirement.entry_revision != row["entry_revision"]
+                or retirement.retired_at != sqlite_support.parse_datetime(row["retired_at"])
+            ):
+                raise ValueError("Activation retirement columns disagree with its envelope.")
+        except Exception:
+            raise KnowledgeActivationConflict("malformed_retirement") from None
+        return retirement
+
+    def _insert_activation_retirement_unlocked(
+        self,
+        retirement: _KnowledgeActivationRetirement,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_activation_retirements (
+                entry_id, entry_revision, retired_at, retirement_json
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                retirement.entry_id,
+                retirement.entry_revision,
+                sqlite_support.format_datetime(retirement.retired_at),
+                _knowledge_activation_retirement_json(retirement),
+            ),
+        )
+
+    def _insert_activation_receipt_unlocked(
+        self,
+        receipt: KnowledgeActivationReceipt,
+        *,
+        access_entry: KnowledgeEntry,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_activation_receipts (
+                operation_id,
+                entry_id,
+                entry_revision,
+                expected_revision,
+                publication_request_sha256,
+                committed_at,
+                receipt_json,
+                access_snapshot_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.operation_id,
+                receipt.entry_id,
+                receipt.entry_revision,
+                receipt.expected_revision,
+                receipt.publication_request_sha256,
+                sqlite_support.format_datetime(receipt.committed_at),
+                _knowledge_activation_receipt_json(receipt),
+                _knowledge_access_snapshot_json(_knowledge_access_snapshot(access_entry)),
             ),
         )
 

@@ -1830,10 +1830,31 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
     assert detail_body["chunks"][0]["entry_revision"] == 1
     assert detail_body["chunks"][0]["text"] == detail_body["text"]
 
-    approved = client.post("/api/knowledge/pending_git/approve")
+    review_headers = {"Idempotency-Key": "dashboard-review-pending-git"}
+    approved = client.post(
+        "/api/knowledge/pending_git/approve",
+        headers=review_headers,
+    )
     assert approved.status_code == 200
     assert approved.json()["status"] == "active"
     assert approved.json()["revision"] == 2
+
+    replay = client.post(
+        "/api/knowledge/pending_git/approve",
+        headers=review_headers,
+    )
+    assert replay.status_code == 200
+    assert replay.json() == approved.json()
+    activation = asyncio.run(
+        store.load_activation_receipt(
+            "dashboard-review-pending-git",
+            access_scope=access_scope,
+        )
+    )
+    assert activation is not None
+    assert activation.replayed is False
+    assert activation.authority.decision.policy_identity == "cayu.server.knowledge-review"
+    assert activation.authority.decision.annotations == {"channel": "protected-http"}
 
     empty = client.get("/api/knowledge/pending")
     assert empty.status_code == 200
@@ -1872,11 +1893,13 @@ def test_server_rejects_pending_knowledge_with_archived_status() -> None:
 
 def test_server_maps_concurrent_knowledge_review_revision_to_conflict() -> None:
     class RacingKnowledgeStore(InMemoryKnowledgeStore):
-        async def transition_entry_status(self, entry_id, *, expected_revision, **kwargs):
+        async def approve_pending_entry(self, authority, **kwargs):
+            request = authority.request
+            assert request.expected_revision is not None
             raise KnowledgeRevisionConflict(
-                entry_id,
-                expected_revision=expected_revision,
-                actual_revision=expected_revision + 1,
+                request.candidate_entry.id,
+                expected_revision=request.expected_revision,
+                actual_revision=request.expected_revision + 1,
             )
 
     store = RacingKnowledgeStore(

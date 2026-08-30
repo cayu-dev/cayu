@@ -643,6 +643,10 @@ from cayu.storage.memory import (
     MAX_KNOWLEDGE_ENTRY_ID_BYTES,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationConflict,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
     KnowledgeActorType,
     KnowledgeChange,
     KnowledgeChangeBatch,
@@ -696,6 +700,7 @@ from cayu.storage.memory import (
     KnowledgeRelationPublicationReceipt,
     KnowledgeRelationQuery,
     KnowledgeRelationResult,
+    KnowledgeReviewApproval,
     KnowledgeRevisionConflict,
     KnowledgeRevisionRef,
     KnowledgeSearchMode,
@@ -703,6 +708,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _activation_receipt_matches,
     _bounded_knowledge_evidence,
     _bounded_knowledge_index_identity,
     _bounded_knowledge_lineage_result,
@@ -719,6 +725,9 @@ from cayu.storage.memory import (
     _knowledge_access_scope_sha256,
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
+    _knowledge_activation_receipt_json,
+    _knowledge_activation_retirement,
+    _knowledge_activation_retirement_json,
     _knowledge_change_audiences,
     _knowledge_change_claim_sha256,
     _knowledge_change_identity,
@@ -744,17 +753,24 @@ from cayu.storage.memory import (
     _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
     _knowledge_relation_semantic_key,
+    _knowledge_scope_allows_activation_receipt,
     _knowledge_scope_allows_lineage_endpoint,
     _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
+    _KnowledgeActivationRetirement,
     _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
     _next_knowledge_revision,
     _parse_knowledge_access_snapshot_json,
+    _parse_knowledge_activation_retirement_json,
     _parse_knowledge_maintenance_access_snapshot_json,
     _parse_knowledge_relation_access_snapshot_json,
+    _prepare_review_approval_receipts,
     _query_terms_have_positive_terms,
+    _replay_review_approval_from_receipts,
+    _require_knowledge_activation_retirement_access,
+    _require_knowledge_activation_retirement_capacity,
     _require_knowledge_entry_access,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
@@ -764,6 +780,7 @@ from cayu.storage.memory import (
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
+    _validate_activation_publication_material,
     _validate_knowledge_change_limit,
     _validate_knowledge_change_sequence,
     _validate_knowledge_embedding_work_record_limit,
@@ -778,10 +795,14 @@ from cayu.storage.memory import (
     _validate_knowledge_search_frontier,
     _validate_nonnegative_float,
     _validate_positive_int,
+    _validate_review_approval_authority,
+    _validate_review_approval_scope,
     _validate_revision_append,
     _validate_revision_successor,
     _validate_unit_float,
     copy_knowledge_access_scope,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
     copy_knowledge_change_claim,
     copy_knowledge_change_consumer_state,
     copy_knowledge_chunk,
@@ -2827,6 +2848,44 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
                 AND document_bytes = octet_length(checkpoint_json)
             ),
             PRIMARY KEY (run_id, case_id, trial_number)
+        )
+        """,
+    ),
+    75: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_activation_receipts (
+            operation_id TEXT COLLATE "C" PRIMARY KEY,
+            entry_id TEXT COLLATE "C" NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            expected_revision INTEGER
+                CHECK (expected_revision > 0 AND expected_revision <= 2147483647),
+            publication_request_sha256 TEXT COLLATE "C" NOT NULL
+                CHECK (publication_request_sha256 ~ '^[0-9a-f]{64}$'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                octet_length(receipt_json) BETWEEN 1 AND 1114112
+                AND jsonb_typeof(receipt_json::jsonb) = 'object'
+            ),
+            access_snapshot JSONB NOT NULL CHECK (jsonb_typeof(access_snapshot) = 'object'),
+            CHECK (
+                (expected_revision IS NULL AND entry_revision = 1)
+                OR entry_revision = expected_revision + 1
+            )
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_activation_receipts_entry_revision "
+        "ON cayu_knowledge_activation_receipts(entry_id, entry_revision)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_activation_retirements (
+            entry_id TEXT COLLATE "C" PRIMARY KEY,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            retired_at TIMESTAMPTZ NOT NULL,
+            retirement_json TEXT NOT NULL CHECK (
+                octet_length(retirement_json) BETWEEN 1 AND 1048576
+                AND jsonb_typeof(retirement_json::jsonb) = 'object'
+            )
         )
         """,
     ),
@@ -5094,6 +5153,12 @@ _KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES = (
 _KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES = (
     *_KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES,
     "cayu_knowledge_maintenance_decisions",
+    "cayu_knowledge_maintenance_proposals",
+)
+_KNOWLEDGE_ACTIVATION_CLEAN_BREAK_TABLES = (
+    *_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
+    "cayu_knowledge_activation_receipts",
+    "cayu_knowledge_activation_retirements",
 )
 
 
@@ -5121,6 +5186,15 @@ async def _reject_populated_pre_bounded_knowledge_entry_database(cur: Any) -> No
         candidates=_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
         revision=65,
         contract="bounded-entry-read",
+    )
+
+
+async def _reject_populated_pre_knowledge_activation_database(cur: Any) -> None:
+    await _reject_populated_pre_knowledge_contract_database(
+        cur,
+        candidates=_KNOWLEDGE_ACTIVATION_CLEAN_BREAK_TABLES,
+        revision=75,
+        contract="knowledge-activation-authority",
     )
 
 
@@ -5428,6 +5502,7 @@ class _PostgresStoreBase:
         relation_preflight_complete = False
         maintenance_preflight_complete = False
         bounded_entry_preflight_complete = False
+        activation_preflight_complete = False
         while True:
             concurrent_revision: schema.Revision | None = None
             concurrent_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
@@ -5517,6 +5592,14 @@ class _PostgresStoreBase:
                         and any(revision.revision == 73 for revision in schema.pending(current))
                     ):
                         await _reject_populated_pre_recall_subscription_database(cur)
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 75
+                        and any(revision.revision == 75 for revision in schema.pending(current))
+                        and (not activation_preflight_complete or current == 74)
+                    ):
+                        await _reject_populated_pre_knowledge_activation_database(cur)
+                        activation_preflight_complete = True
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -5606,6 +5689,8 @@ class _PostgresStoreBase:
                             await self._validate_interrupted_task_handoff_schema(cur)
                         if self._min_required_revision >= 74:
                             await self._validate_eval_run_trial_checkpoint_schema(cur)
+                        if self._min_required_revision >= 75:
+                            await self._validate_knowledge_activation_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -5622,6 +5707,8 @@ class _PostgresStoreBase:
                             await _reject_populated_pre_bounded_knowledge_entry_database(cur)
                         if revision.revision == 73:
                             await _reject_populated_pre_recall_subscription_database(cur)
+                        if revision.revision == 75:
+                            await _reject_populated_pre_knowledge_activation_database(cur)
                         concurrent_indexes = _CONCURRENT_INDEX_MIGRATIONS.get(
                             revision.revision,
                             (),
@@ -5829,6 +5916,8 @@ class _PostgresStoreBase:
             await self._validate_interrupted_task_handoff_schema(cur)
         if self._min_required_revision >= 74:
             await self._validate_eval_run_trial_checkpoint_schema(cur)
+        if self._min_required_revision >= 75:
+            await self._validate_knowledge_activation_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -5975,6 +6064,161 @@ class _PostgresStoreBase:
             await self._validate_agent_recall_subscription_schema(cur)
         if revision.revision == 74:
             await self._validate_eval_run_trial_checkpoint_schema(cur)
+        if revision.revision == 75:
+            await self._validate_knowledge_activation_schema(cur)
+
+    async def _validate_knowledge_activation_schema(self, cur: Any) -> None:
+        table = "cayu_knowledge_activation_receipts"
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable, collation_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_knowledge_activation_receipts'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("operation_id", "text", "NO", "C"),
+            ("entry_id", "text", "NO", "C"),
+            ("entry_revision", "integer", "NO", None),
+            ("expected_revision", "integer", "YES", None),
+            ("publication_request_sha256", "text", "NO", "C"),
+            ("committed_at", "timestamp with time zone", "NO", None),
+            ("receipt_json", "text", "NO", None),
+            ("access_snapshot", "jsonb", "NO", None),
+        ):
+            self._raise_knowledge_activation_schema_error(table)
+
+        await cur.execute(
+            """
+            SELECT constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_knowledge_activation_receipts'
+            """
+        )
+        constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        )
+        required = (
+            ("p", ("primary key (operation_id)",)),
+            ("c", ("entry_revision > 0", "entry_revision <= 2147483647")),
+            ("c", ("expected_revision > 0", "expected_revision <= 2147483647")),
+            ("c", ("publication_request_sha256", "[0-9a-f]{64}")),
+            (
+                "c",
+                (
+                    "octet_length(receipt_json)",
+                    "jsonb_typeof((receipt_json)::jsonb)",
+                    "object",
+                    "1114112",
+                ),
+            ),
+            ("c", ("jsonb_typeof(access_snapshot)", "object")),
+            (
+                "c",
+                (
+                    "expected_revision is null",
+                    "entry_revision = 1",
+                    "entry_revision = (expected_revision + 1)",
+                ),
+            ),
+        )
+        if any(kind == "f" for kind, _definition in constraints) or any(
+            not any(
+                actual_kind == expected_kind
+                and all(fragment in definition for fragment in fragments)
+                for actual_kind, definition in constraints
+            )
+            for expected_kind, fragments in required
+        ):
+            self._raise_knowledge_activation_schema_error(table)
+
+        index = "idx_cayu_knowledge_activation_receipts_entry_revision"
+        await cur.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = current_schema() AND indexname = %s",
+            (index,),
+        )
+        row = await cur.fetchone()
+        definition = "" if row is None else " ".join(str(row[0]).lower().split())
+        if (
+            "cayu_knowledge_activation_receipts using btree (entry_id, entry_revision)"
+            not in definition
+        ):
+            self._raise_knowledge_activation_schema_error(index)
+
+        retirement_table = "cayu_knowledge_activation_retirements"
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable, collation_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_knowledge_activation_retirements'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("entry_id", "text", "NO", "C"),
+            ("entry_revision", "integer", "NO", None),
+            ("retired_at", "timestamp with time zone", "NO", None),
+            ("retirement_json", "text", "NO", None),
+        ):
+            self._raise_knowledge_activation_schema_error(retirement_table)
+        await cur.execute(
+            """
+            SELECT constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_knowledge_activation_retirements'
+            """
+        )
+        retirement_constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        )
+        retirement_required = (
+            ("p", ("primary key (entry_id)",)),
+            ("c", ("entry_revision > 0", "entry_revision <= 2147483647")),
+            (
+                "c",
+                (
+                    "octet_length(retirement_json)",
+                    "jsonb_typeof((retirement_json)::jsonb)",
+                    "object",
+                    "1048576",
+                ),
+            ),
+        )
+        if any(kind == "f" for kind, _definition in retirement_constraints) or any(
+            not any(
+                actual_kind == expected_kind
+                and all(fragment in definition for fragment in fragments)
+                for actual_kind, definition in retirement_constraints
+            )
+            for expected_kind, fragments in retirement_required
+        ):
+            self._raise_knowledge_activation_schema_error(retirement_table)
+
+    @staticmethod
+    def _raise_knowledge_activation_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's knowledge-activation authority contract. "
+            "Run `cayu storage migrate` to install revision 75 or recreate the database."
+        )
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -14763,7 +15007,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 67
+    _min_required_revision = 75
 
     def __init__(
         self,
@@ -14843,6 +15087,14 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             expected_revision=None,
                             actual_revision=existing_entry.revision,
                         )
+                    retirement = await self._load_activation_retirement(cur, entry.id)
+                    if retirement is not None:
+                        _require_knowledge_activation_retirement_access(
+                            scope,
+                            retirement,
+                            operation="create_entry",
+                        )
+                        raise KnowledgePublicationConflict("entry_retired")
                     await self._require_chunk_ids_available(
                         cur,
                         copied_chunks,
@@ -15074,8 +15326,44 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     await _lock_knowledge_entry(cur, entry_id)
                     entry = await self._load_entry(cur, entry_id)
                     if entry is None:
+                        if not hard:
+                            await conn.commit()
+                            return None
+                        retirement = await self._load_activation_retirement(cur, entry_id)
+                        if retirement is None:
+                            await conn.commit()
+                            return None
+                        _require_knowledge_activation_retirement_access(
+                            scope,
+                            retirement,
+                            operation="delete_entry",
+                        )
+                        if retirement.entry_revision != expected_revision:
+                            raise KnowledgeRevisionConflict(
+                                entry_id,
+                                expected_revision=expected_revision,
+                                actual_revision=retirement.entry_revision,
+                            )
+                        await cur.execute(
+                            "SELECT COUNT(*) FROM cayu_knowledge_activation_receipts "
+                            "WHERE entry_id = %s",
+                            (entry_id,),
+                        )
+                        receipt_count_row = await cur.fetchone()
+                        if receipt_count_row is None or int(receipt_count_row[0]) < 1:
+                            raise KnowledgeActivationConflict("malformed_retirement")
+                        await cur.execute(
+                            "DELETE FROM cayu_knowledge_activation_receipts WHERE entry_id = %s",
+                            (entry_id,),
+                        )
+                        await cur.execute(
+                            "DELETE FROM cayu_knowledge_activation_retirements WHERE entry_id = %s",
+                            (entry_id,),
+                        )
                         await conn.commit()
                         return None
+                    if await self._load_activation_retirement(cur, entry_id) is not None:
+                        raise KnowledgeActivationConflict("malformed_retirement")
                     _require_knowledge_entry_access(scope, entry, operation="delete_entry")
                     if entry.revision != expected_revision:
                         raise KnowledgeRevisionConflict(
@@ -15095,6 +15383,10 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             before_entry=entry,
                             after_entry=None,
                             kind=KnowledgeChangeKind.HARD_DELETED,
+                        )
+                        await cur.execute(
+                            "DELETE FROM cayu_knowledge_activation_receipts WHERE entry_id = %s",
+                            (entry_id,),
                         )
                         await cur.execute(
                             "DELETE FROM cayu_knowledge_entries WHERE id = %s",
@@ -15185,6 +15477,16 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             now=cutoff,
                         )
                     ]
+                    governed_entry_ids: set[str] = set()
+                    if eligible and self._min_required_revision >= 75:
+                        await cur.execute(
+                            "SELECT DISTINCT entry_id "
+                            "FROM cayu_knowledge_activation_receipts "
+                            "WHERE entry_id = ANY(%s)",
+                            ([entry.id for entry in eligible],),
+                        )
+                        governed_entry_ids = {str(row[0]) for row in await cur.fetchall()}
+                    retired_at = datetime.now(UTC)
                     for entry in eligible:
                         await self._insert_change(
                             cur,
@@ -15192,6 +15494,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             after_entry=None,
                             kind=KnowledgeChangeKind.EXPIRED,
                         )
+                        if entry.id in governed_entry_ids:
+                            if await self._load_activation_retirement(cur, entry.id) is not None:
+                                raise KnowledgeActivationConflict("malformed_retirement")
+                            await self._insert_activation_retirement(
+                                cur,
+                                _knowledge_activation_retirement(entry, retired_at=retired_at),
+                            )
                     if eligible:
                         await cur.execute(
                             "DELETE FROM cayu_knowledge_entries WHERE id = ANY(%s)",
@@ -15213,6 +15522,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
+        activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> KnowledgePublicationReceipt:
         scope = self._operation_access_scope(access_scope)
         (
@@ -15227,8 +15537,24 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             evidence=evidence,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
         _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
+        copied_authority = (
+            None
+            if activation_authority is None
+            else copy_knowledge_activation_authority(activation_authority)
+        )
+        if copied_authority is not None:
+            _validate_activation_publication_material(
+                copied_authority,
+                operation_id=operation_id,
+                entry=copied_entry,
+                chunks=copied_chunks,
+                evidence=copied_evidence,
+                expected_revision=expected_revision,
+                access_scope=scope,
+            )
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -15248,6 +15574,18 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         access_scope=scope,
                     )
                     if existing_receipt is not None:
+                        existing_activation = await self._load_activation_receipt(
+                            cur,
+                            operation_id,
+                            access_scope=scope,
+                            deny_inaccessible=True,
+                        )
+                        if (
+                            existing_activation is not None
+                            and existing_activation.authority.request.source
+                            is KnowledgeActivationSource.REVIEW_APPROVAL
+                        ):
+                            raise KnowledgePublicationConflict("operation_occupied")
                         _validate_knowledge_publication_replay(
                             existing_receipt,
                             entry=copied_entry,
@@ -15255,12 +15593,31 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             evidence=copied_evidence,
                             expected_revision=expected_revision,
                             request_sha256=request_sha256,
+                            activation_authority=copied_authority,
                         )
+                        if copied_authority is None:
+                            if existing_activation is not None:
+                                raise KnowledgePublicationConflict("activation_mismatch")
+                        elif existing_activation is None or not _activation_receipt_matches(
+                            existing_activation,
+                            authority=copied_authority,
+                            publication_request_sha256=request_sha256,
+                            publication_committed_at=existing_receipt.committed_at,
+                        ):
+                            raise KnowledgePublicationConflict("activation_mismatch")
                         await conn.commit()
                         return copy_knowledge_publication_receipt(
                             existing_receipt,
                             replayed=True,
                         )
+                    existing_activation = await self._load_activation_receipt(
+                        cur,
+                        operation_id,
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    if existing_activation is not None:
+                        raise KnowledgePublicationConflict("operation_occupied")
                     existing_entry = await self._load_entry(cur, copied_entry.id)
                     if existing_entry is not None:
                         _require_knowledge_entry_access(
@@ -15268,6 +15625,14 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             existing_entry,
                             operation="publish_entry_revision",
                         )
+                    retirement = await self._load_activation_retirement(cur, copied_entry.id)
+                    if retirement is not None:
+                        _require_knowledge_activation_retirement_access(
+                            scope,
+                            retirement,
+                            operation="publish_entry_revision",
+                        )
+                        raise KnowledgePublicationConflict("entry_retired")
                     actual_revision = None if existing_entry is None else existing_entry.revision
                     if actual_revision != expected_revision:
                         raise KnowledgeRevisionConflict(
@@ -15285,6 +15650,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             operation="publish_entry_revision",
                         )
                         _validate_revision_successor(existing_entry, copied_entry)
+                        if (
+                            self._min_required_revision >= 75
+                            and copied_authority is None
+                            and await self._has_activation_receipts(cur, copied_entry.id)
+                        ):
+                            _require_knowledge_activation_retirement_capacity(copied_entry)
                     await self._require_chunk_ids_available(
                         cur,
                         copied_chunks,
@@ -15310,6 +15681,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     await self._insert_chunks(cur, copied_entry, copied_chunks)
                     await self._insert_evidence(cur, copied_evidence)
                     await _lock_knowledge_change_sequence(cur)
+                    committed_at = datetime.now(UTC)
                     receipt = KnowledgePublicationReceipt(
                         operation_id=operation_id,
                         entry_id=copied_entry.id,
@@ -15318,7 +15690,20 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         request_sha256=request_sha256,
                         entry_created_at=copied_entry.created_at,
                         entry_updated_at=copied_entry.updated_at,
-                        committed_at=datetime.now(UTC),
+                        committed_at=committed_at,
+                    )
+                    activation_receipt = (
+                        None
+                        if copied_authority is None
+                        else KnowledgeActivationReceipt(
+                            operation_id=operation_id,
+                            entry_id=copied_entry.id,
+                            entry_revision=copied_entry.revision,
+                            expected_revision=expected_revision,
+                            publication_request_sha256=request_sha256,
+                            authority=copied_authority,
+                            committed_at=committed_at,
+                        )
                     )
                     await self._insert_change(
                         cur,
@@ -15333,6 +15718,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         committed_at=receipt.committed_at,
                     )
                     await self._insert_publication_receipt(cur, receipt, copied_entry)
+                    if activation_receipt is not None:
+                        await self._insert_activation_receipt(
+                            cur,
+                            activation_receipt,
+                            access_entry=copied_entry,
+                        )
                 await conn.commit()
                 return copy_knowledge_publication_receipt(receipt)
             except UniqueViolation:
@@ -15354,6 +15745,189 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         async with self._pool.connection() as conn, conn.cursor() as cur:
             receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
+    async def load_activation_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_publication_operation_id(operation_id)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            receipt = await self._load_activation_receipt(
+                cur,
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+        return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    async def approve_pending_entry(
+        self,
+        authority: KnowledgeActivationAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        expected_namespace: str | None = None,
+        expected_labels: dict[str, str] | None = None,
+    ) -> KnowledgeReviewApproval:
+        scope = self._operation_access_scope(access_scope)
+        authority = copy_knowledge_activation_authority(authority)
+        request = authority.request
+        _validate_review_approval_authority(authority, access_scope=scope)
+        expected_namespace = (
+            require_clean_nonblank(expected_namespace, "expected_namespace")
+            if expected_namespace is not None
+            else None
+        )
+        expected_labels = copy_label_map(expected_labels or {}, "expected_labels")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        operation_ids=(request.operation_id,),
+                    )
+                    await _lock_knowledge_entry(cur, request.candidate_entry.id)
+                    existing_receipt = await self._load_activation_receipt(
+                        cur,
+                        request.operation_id,
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    if existing_receipt is not None:
+                        publication = await self._load_publication_receipt(
+                            cur,
+                            request.operation_id,
+                            access_scope=scope,
+                        )
+                        if publication is None:
+                            raise KnowledgeActivationConflict("malformed_receipt")
+                        approval = _replay_review_approval_from_receipts(
+                            publication,
+                            existing_receipt,
+                            authority=authority,
+                        )
+                        if approval is None:
+                            raise KnowledgeActivationConflict("operation_mismatch")
+                        _validate_review_approval_scope(
+                            approval.entry,
+                            expected_namespace=expected_namespace,
+                            expected_labels=expected_labels,
+                        )
+                        await conn.commit()
+                        return approval
+                    if (
+                        await self._load_publication_receipt(
+                            cur,
+                            request.operation_id,
+                            access_scope=scope,
+                        )
+                        is not None
+                    ):
+                        raise KnowledgeActivationConflict("operation_occupied")
+                    current = await self._load_entry(cur, request.candidate_entry.id)
+                    if current is None:
+                        raise KeyError(
+                            f"Knowledge entry {request.candidate_entry.id!r} does not exist."
+                        )
+                    _require_knowledge_entry_access(
+                        scope,
+                        current,
+                        operation="approve_pending_entry",
+                    )
+                    if current.revision != request.expected_revision:
+                        raise KnowledgeRevisionConflict(
+                            current.id,
+                            expected_revision=request.expected_revision,
+                            actual_revision=current.revision,
+                        )
+                    if current != request.candidate_entry:
+                        raise KnowledgeActivationConflict("candidate_material_mismatch")
+                    if current.status is not KnowledgeStatus.PENDING:
+                        raise ValueError("Reviewed approval requires a pending entry.")
+                    _validate_review_approval_scope(
+                        current,
+                        expected_namespace=expected_namespace,
+                        expected_labels=expected_labels,
+                    )
+                    current_chunks = await self._load_chunks(
+                        cur,
+                        current.id,
+                        revision=current.revision,
+                    )
+                    current_evidence = await self._load_evidence(
+                        cur,
+                        current.id,
+                        revision=current.revision,
+                    )
+                    if (
+                        list(request.chunks) != current_chunks
+                        or list(request.evidence) != current_evidence
+                    ):
+                        raise KnowledgeActivationConflict("candidate_material_mismatch")
+                    activated = current.model_copy(
+                        update={
+                            "revision": request.target_revision,
+                            "status": KnowledgeStatus.ACTIVE,
+                            "updated_at": max(
+                                datetime.now(UTC),
+                                current.created_at,
+                                current.updated_at,
+                            ),
+                        }
+                    )
+                    _require_knowledge_activation_retirement_capacity(activated)
+                    target_chunks = (
+                        [_default_chunk_for_entry(activated)]
+                        if _knowledge_has_only_default_chunk(current, current_chunks)
+                        else _copy_chunks_for_revision(current_chunks, activated)
+                    )
+                    target_evidence = _copy_evidence_for_revision(
+                        current_evidence,
+                        entry=activated,
+                        previous_chunks=current_chunks,
+                        chunks=target_chunks,
+                    )
+                    committed_at = datetime.now(UTC)
+                    publication_receipt, receipt = _prepare_review_approval_receipts(
+                        current,
+                        activated,
+                        target_chunks,
+                        target_evidence,
+                        authority,
+                        committed_at=committed_at,
+                    )
+                    await self._append_revision(
+                        cur,
+                        activated,
+                        expected_revision=current.revision,
+                        chunks=None,
+                        evidence=None,
+                        access_scope=scope,
+                        operation="approve_pending_entry",
+                        change_kind=KnowledgeChangeKind.STATUS_TRANSITIONED,
+                        inherit_evidence=True,
+                        change_operation_id=request.operation_id,
+                        committed_at=committed_at,
+                    )
+                    await self._insert_publication_receipt(cur, publication_receipt, activated)
+                    await self._insert_activation_receipt(
+                        cur,
+                        receipt,
+                        access_entry=activated,
+                    )
+                await conn.commit()
+                return KnowledgeReviewApproval(entry=activated, receipt=receipt)
+            except UniqueViolation:
+                await conn.rollback()
+                raise KnowledgeActivationConflict("concurrent_occupancy") from None
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def publish_relations(
         self,
@@ -17612,6 +18186,11 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             )
         _validate_revision_successor(current, entry)
         _require_knowledge_successor_access(access_scope, entry, operation=operation)
+        if self._min_required_revision >= 75 and await self._has_activation_receipts(
+            cur,
+            entry.id,
+        ):
+            _require_knowledge_activation_retirement_capacity(entry)
         previous_chunks = await self._load_chunks(
             cur,
             entry.id,
@@ -17862,6 +18441,189 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 receipt.entry_updated_at,
                 receipt.committed_at,
                 _knowledge_access_snapshot_json(_knowledge_access_snapshot(entry)),
+            ),
+        )
+
+    @staticmethod
+    async def _has_activation_receipts(cur: Any, entry_id: str) -> bool:
+        await cur.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM cayu_knowledge_activation_receipts "
+            "WHERE entry_id = %s LIMIT 1)",
+            (entry_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise KnowledgeActivationConflict("malformed_receipt")
+        return bool(row[0])
+
+    async def _load_activation_receipt(
+        self,
+        cur: Any,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> KnowledgeActivationReceipt | None:
+        await cur.execute(
+            """
+            SELECT operation_id, entry_id, entry_revision, expected_revision,
+                   publication_request_sha256, committed_at,
+                   receipt_json, access_snapshot::text
+            FROM cayu_knowledge_activation_receipts
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            snapshot = _parse_knowledge_access_snapshot_json(row[7])
+        except Exception:
+            raise KnowledgeActivationConflict("malformed_receipt") from None
+        cutoff = datetime.now(UTC)
+        if not _knowledge_scope_allows_snapshot(access_scope, snapshot, now=cutoff):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("load_activation_receipt")
+            return None
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(
+            access_scope,
+            now=cutoff,
+        )
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_current_entries AS e
+                        WHERE e.id = %s
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_current_entries AS e
+                        WHERE e.id = %s
+                        {access_sql}
+                    )
+                """,
+            ),
+            (row[1], row[1], *access_params),
+        )
+        current_access = await cur.fetchone()
+        if current_access is None:
+            raise KnowledgeActivationConflict("malformed_receipt")
+        current_exists = bool(current_access[0])
+        retirement = await self._load_activation_retirement(cur, str(row[1]))
+        if current_exists:
+            if retirement is not None:
+                raise KnowledgeActivationConflict("malformed_retirement")
+            current_allowed = bool(current_access[1])
+        else:
+            current_allowed = _knowledge_scope_allows_activation_receipt(
+                access_scope,
+                snapshot,
+                None,
+                retirement=retirement,
+                entry_id=str(row[1]),
+                entry_revision=int(row[2]),
+                now=cutoff,
+            )
+        if not current_allowed:
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("load_activation_receipt")
+            return None
+        try:
+            receipt = KnowledgeActivationReceipt.model_validate_json(row[6])
+            if (
+                receipt.operation_id != row[0]
+                or receipt.entry_id != row[1]
+                or receipt.entry_revision != row[2]
+                or receipt.expected_revision != row[3]
+                or receipt.publication_request_sha256 != row[4]
+                or receipt.committed_at != row[5]
+            ):
+                raise ValueError("Activation receipt columns disagree with its JSON envelope.")
+        except Exception:
+            raise KnowledgeActivationConflict("malformed_receipt") from None
+        return receipt
+
+    async def _load_activation_retirement(
+        self,
+        cur: Any,
+        entry_id: str,
+    ) -> _KnowledgeActivationRetirement | None:
+        await cur.execute(
+            "SELECT entry_id, entry_revision, retired_at, retirement_json "
+            "FROM cayu_knowledge_activation_retirements WHERE entry_id = %s",
+            (entry_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            retirement = _parse_knowledge_activation_retirement_json(row[3])
+            if (
+                retirement.entry_id != row[0]
+                or retirement.entry_revision != row[1]
+                or retirement.retired_at != row[2]
+            ):
+                raise ValueError("Activation retirement columns disagree with its envelope.")
+        except Exception:
+            raise KnowledgeActivationConflict("malformed_retirement") from None
+        return retirement
+
+    async def _insert_activation_retirement(
+        self,
+        cur: Any,
+        retirement: _KnowledgeActivationRetirement,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_activation_retirements (
+                entry_id, entry_revision, retired_at, retirement_json
+            )
+            VALUES (%s, %s, %s, %s)
+            """,
+            (
+                retirement.entry_id,
+                retirement.entry_revision,
+                retirement.retired_at,
+                _knowledge_activation_retirement_json(retirement),
+            ),
+        )
+
+    async def _insert_activation_receipt(
+        self,
+        cur: Any,
+        receipt: KnowledgeActivationReceipt,
+        *,
+        access_entry: KnowledgeEntry,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_activation_receipts (
+                operation_id,
+                entry_id,
+                entry_revision,
+                expected_revision,
+                publication_request_sha256,
+                committed_at,
+                receipt_json,
+                access_snapshot
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                receipt.operation_id,
+                receipt.entry_id,
+                receipt.entry_revision,
+                receipt.expected_revision,
+                receipt.publication_request_sha256,
+                receipt.committed_at,
+                _knowledge_activation_receipt_json(receipt),
+                _knowledge_access_snapshot_json(_knowledge_access_snapshot(access_entry)),
             ),
         )
 

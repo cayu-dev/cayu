@@ -406,6 +406,11 @@ REVISIONS: tuple[Revision, ...] = (
     # workers do not consult the recovery or lane fences, so mixed-version eval
     # execution is unsafe.
     Revision(revision=74, kind=RevisionKind.BREAKING, compatible_from=74),
+    # High-level knowledge activation now records exact application authority
+    # atomically beside generated publication or reviewed approval. Populated
+    # pre-75 knowledge stores are rejected rather than assigned inferred
+    # governance history; older writers do not maintain the new invariant.
+    Revision(revision=75, kind=RevisionKind.BREAKING, compatible_from=75),
 )
 
 #: The revision an empty database is initialized to.

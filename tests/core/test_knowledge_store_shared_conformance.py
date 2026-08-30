@@ -11,6 +11,10 @@ import pytest
 from tests.core.knowledge_access_scope_conformance import (
     assert_knowledge_access_scope_conformance,
 )
+from tests.core.knowledge_governance_conformance import (
+    assert_activation_receipt_lifecycle_conformance,
+    assert_knowledge_governance_conformance,
+)
 from tests.core.knowledge_index_readiness_conformance import (
     assert_index_readiness_conformance,
 )
@@ -241,6 +245,37 @@ def test_knowledge_store_shared_maintenance_contract(knowledge_store_case) -> No
         store = await _open_store(knowledge_store_case)
         try:
             await assert_knowledge_maintenance_conformance(store)
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_shared_governance_contract(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            await assert_knowledge_governance_conformance(
+                store,
+                access_scope=_ACCESS_SCOPE,
+            )
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_shared_activation_receipt_lifecycle_contract(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            await assert_activation_receipt_lifecycle_conformance(store)
         finally:
             await _close_store(store)
             await _reset_case(knowledge_store_case)

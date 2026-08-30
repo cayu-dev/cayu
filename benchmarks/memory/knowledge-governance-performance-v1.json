@@ -1,0 +1,74 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_automatic_activation_p95_ms": 25.0,
+    "memory_receipt_lookup_p95_ms": 25.0,
+    "memory_reviewed_routing_p95_ms": 25.0,
+    "sqlite_automatic_activation_p95_ms": 100.0,
+    "sqlite_receipt_lookup_p95_ms": 50.0,
+    "sqlite_reviewed_routing_p95_ms": 100.0,
+    "sqlite_storage_bytes_per_activation_receipt": 65536
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "current_runtime_zero_activation_receipts",
+    "operation_count": 40
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "automatic_activation_latency": {
+        "p50_ms": 4.454771,
+        "p95_ms": 4.6095
+      },
+      "backend": "memory",
+      "control_storage_bytes": null,
+      "governed_storage_bytes": null,
+      "operation_count": 40,
+      "operations_per_mode": 20,
+      "receipt_lookup_latency": {
+        "p50_ms": 0.955646,
+        "p95_ms": 1.011167
+      },
+      "reviewed_routing_latency": {
+        "p50_ms": 4.229563,
+        "p95_ms": 4.515625
+      },
+      "storage_byte_overhead": null,
+      "storage_bytes_per_activation_receipt": null
+    },
+    {
+      "automatic_activation_latency": {
+        "p50_ms": 4.846792,
+        "p95_ms": 5.023209
+      },
+      "backend": "sqlite",
+      "control_storage_bytes": 1785856,
+      "governed_storage_bytes": 1949696,
+      "operation_count": 40,
+      "operations_per_mode": 20,
+      "receipt_lookup_latency": {
+        "p50_ms": 1.475791,
+        "p95_ms": 1.637792
+      },
+      "reviewed_routing_latency": {
+        "p50_ms": 4.718542,
+        "p95_ms": 6.149083
+      },
+      "storage_byte_overhead": 163840,
+      "storage_bytes_per_activation_receipt": 4096.0
+    }
+  ],
+  "schema_version": "cayu.knowledge_governance_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "automatic_operations": 20,
+    "operation_count": 40,
+    "operations_per_mode": 20,
+    "provider_calls": 0,
+    "reviewed_operations": 20
+  }
+}
