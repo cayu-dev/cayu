@@ -439,6 +439,121 @@ def test_scenario_execution_partitions_memory_limits_before_trial_dispatch() -> 
     asyncio.run(exercise())
 
 
+def test_scenario_execution_resumes_only_missing_durable_terminal_trials() -> None:
+    class CheckpointCrashStore(InMemoryEvalStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.crash_after_first_checkpoint = True
+
+        async def save_trial_checkpoint(self, claim, checkpoint, *, redact_json) -> None:
+            await super().save_trial_checkpoint(
+                claim,
+                checkpoint,
+                redact_json=redact_json,
+            )
+            if self.crash_after_first_checkpoint:
+                self.crash_after_first_checkpoint = False
+                raise RuntimeError("simulated process loss after durable checkpoint")
+
+    async def exercise() -> None:
+        trial_count = 3
+        provider = _ApprovalProvider(request_approval=False)
+        target = _approval_target(provider, max_trials=trial_count)
+        scenario = EvalScenarioDocumentV2.create(
+            id="simple-restart",
+            target_key=target.key,
+            name="Simple restart",
+            events=(
+                ScenarioInitialInputEventV2(
+                    sequence=0,
+                    id="initial",
+                    input=ScenarioInputV2.create(
+                        (
+                            ScenarioUserMessageV2.create(
+                                (ScenarioTextPartV2(text="Complete this request."),)
+                            ),
+                        )
+                    ),
+                ),
+            ),
+        )
+        preflight = await preflight_eval_scenario(
+            scenario,
+            target,
+            ScenarioLaunchSettingsV2(
+                trials=trial_count,
+                max_concurrency=1,
+                timeout_seconds=30,
+            ),
+            actor_authorized=True,
+        )
+        assert preflight.binding is not None
+        binding = preflight.binding
+        corpus = corpus_for_eval_scenario(scenario, binding, target)
+        compiled = compile_corpus_suite(corpus, target, "scenario")
+        store = CheckpointCrashStore()
+        await store.save_scenario(scenario, redact_json=target.app.redact_json)
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        request = EvalRunRequest(
+            run_id="scenario-terminal-restart",
+            idempotency_key="sha256:" + "e" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id="scenario",
+            suite_revision=compiled.run_contract.suite_revision,
+            max_concurrency=1,
+            invocation=EvalRunInvocation(
+                max_steps=binding.max_steps,
+                limits=binding.operator_run_limits,
+                cost_budget=binding.cost_budget,
+                scenario=EvalScenarioRunInvocation(
+                    scenario_revision=scenario.revision,
+                    binding_revision=binding.revision,
+                    environment_name=binding.environment_name,
+                    trials=binding.trials,
+                    timeout_seconds=binding.timeout_seconds,
+                ),
+            ),
+        )
+        await store.admit_run(request, redact_json=target.app.redact_json)
+        first = await store.claim_run(target_key=target.key, lease_seconds=30)
+        assert first is not None
+        with pytest.raises(ExceptionGroup, match="unhandled errors in a TaskGroup"):
+            await run_compiled_eval_scenario(
+                target,
+                compiled,
+                scenario,
+                binding,
+                store=store,
+                claim=first.claim,
+                max_concurrency=1,
+                poll_seconds=0.001,
+            )
+        assert provider.request_count == 1
+        await store.release_run(first.claim)
+
+        second = await store.claim_run(target_key=target.key, lease_seconds=30)
+        assert second is not None
+        assert second.run.scenario_progress is not None
+        assert second.run.scenario_progress.trials[0].phase == "completed"
+        result = await run_compiled_eval_scenario(
+            target,
+            compiled,
+            scenario,
+            binding,
+            store=store,
+            claim=second.claim,
+            max_concurrency=1,
+            poll_seconds=0.001,
+        )
+
+        assert provider.request_count == trial_count
+        assert [trial.trial_number for trial in result.run.cases[0].trials] == [1, 2, 3]
+        assert result.run.cases[0].reliability.passed_trials == trial_count
+
+    asyncio.run(exercise())
+
+
 def test_scenario_execution_rejects_the_wrong_approval_occurrence() -> None:
     async def exercise() -> None:
         target = _approval_target(_ApprovalProvider())

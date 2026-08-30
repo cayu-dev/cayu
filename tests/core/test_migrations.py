@@ -472,7 +472,7 @@ def test_revision_seventy_one_requires_atomic_recall_delivery_writers() -> None:
         )
 
 
-def test_revision_seventy_two_raises_the_durable_corpus_concurrency_ceiling() -> None:
+def test_revision_seventy_two_fences_current_durable_eval_execution() -> None:
     revision = m.revision(72)
     state = m.SchemaState(revision=72, compatible_from=72)
 
@@ -481,6 +481,12 @@ def test_revision_seventy_two_raises_the_durable_corpus_concurrency_ceiling() ->
     with pytest.raises(m.SchemaTooNew, match="understands revision >= 72"):
         m.validate(state, app_latest=71, app_min_supported=71)
     m.validate(state, app_latest=72, app_min_supported=72)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 72"):
+        m.validate(
+            m.SchemaState(revision=71, compatible_from=71),
+            app_latest=72,
+            app_min_supported=72,
+        )
 
 
 def test_revision_seventy_three_requires_input_bound_recall_results() -> None:
@@ -497,6 +503,23 @@ def test_revision_seventy_three_requires_input_bound_recall_results() -> None:
             m.SchemaState(revision=72, compatible_from=72),
             app_latest=73,
             app_min_supported=73,
+        )
+
+
+def test_revision_seventy_four_fences_recoverable_eval_trials() -> None:
+    revision = m.revision(74)
+    state = m.SchemaState(revision=74, compatible_from=74)
+
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 74
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 74"):
+        m.validate(state, app_latest=73, app_min_supported=73)
+    m.validate(state, app_latest=74, app_min_supported=74)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 74"):
+        m.validate(
+            m.SchemaState(revision=73, compatible_from=73),
+            app_latest=74,
+            app_min_supported=74,
         )
 
 

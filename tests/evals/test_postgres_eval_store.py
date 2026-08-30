@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from contextlib import suppress
 
@@ -190,7 +191,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn, tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_requires_and_migrates_revision_seventy_two(
+def test_postgres_eval_store_requires_and_migrates_revision_seventy_four(
     postgres_dsn,
     monkeypatch,
 ) -> None:
@@ -217,27 +218,83 @@ def test_postgres_eval_store_requires_and_migrates_revision_seventy_two(
                 schema_migrations,
                 "REVISIONS",
                 tuple(
-                    revision for revision in schema_migrations.REVISIONS if revision.revision <= 71
+                    revision for revision in schema_migrations.REVISIONS if revision.revision <= 73
                 ),
             )
             legacy.setattr(
                 evals_postgres_module.PostgresEvalStore,
                 "_min_required_revision",
-                68,
+                72,
             )
             old_store = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
             try:
                 await _save_corpus(old_store, corpus)
-                await _admit_run(old_store, _request(corpus, run_id="old-run"))
-                lease = await old_store.claim_run()
-                assert lease is not None
-                await _publish_result(old_store, lease.claim, result)
             finally:
                 await old_store.close()
 
+        old_request = _request(corpus, run_id="old-run")
+        result_document = json.dumps(
+            result.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        timestamp = "2026-08-30T00:00:00+00:00"
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                """
+                INSERT INTO cayu_eval_runs (
+                    run_id, idempotency_key, corpus_revision, target_key,
+                    suite_id, suite_revision, max_concurrency, invocation_json,
+                    status, created_at, updated_at, started_at, finished_at,
+                    result_revision, result_status, result_score, result_duration_ms
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    old_request.run_id,
+                    old_request.idempotency_key,
+                    old_request.corpus_revision,
+                    old_request.target_key,
+                    old_request.suite_id,
+                    old_request.suite_revision,
+                    old_request.max_concurrency,
+                    old_request.invocation.model_dump_json(),
+                    "completed",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    result.revision,
+                    result.run.status,
+                    result.run.score,
+                    result.run.duration_ms,
+                ),
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_eval_results (
+                    run_id, revision, result, result_bytes, created_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    old_request.run_id,
+                    result.revision,
+                    result_document,
+                    len(result_document.encode("utf-8")),
+                    timestamp,
+                ),
+            )
+            await conn.commit()
+
         validating = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(SchemaTooOld, match="requires >= 72"):
+            with pytest.raises(SchemaTooOld, match="requires >= 74"):
                 await validating.list_corpora()
         finally:
             await validating.close()
@@ -390,6 +447,7 @@ def test_postgres_eval_store_creates_revision_sixty_eight_schema(postgres_dsn) -
                 "cayu_eval_corpora",
                 "cayu_eval_result_records",
                 "cayu_eval_results",
+                "cayu_eval_run_trial_checkpoints",
                 "cayu_eval_runs",
                 "cayu_eval_scenarios",
                 "cayu_eval_suites",

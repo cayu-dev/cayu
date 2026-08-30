@@ -3817,6 +3817,31 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_eval_runs(
                 target_key, status, lease_expires_at, created_at ASC, run_id ASC
             );
+
+    """,
+    74: """
+        CREATE TABLE IF NOT EXISTS cayu_eval_run_trial_checkpoints (
+            run_id TEXT COLLATE BINARY NOT NULL
+                REFERENCES cayu_eval_runs(run_id) ON DELETE CASCADE,
+            case_id TEXT COLLATE BINARY NOT NULL,
+            trial_number INTEGER NOT NULL CHECK (trial_number BETWEEN 1 AND 100),
+            checkpoint_json TEXT NOT NULL CHECK (
+                json_valid(checkpoint_json)
+                AND json_type(checkpoint_json) = 'object'
+                AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 41943040
+            ),
+            document_bytes INTEGER NOT NULL CHECK (
+                document_bytes BETWEEN 1 AND 41943040
+                AND document_bytes = length(CAST(checkpoint_json AS BLOB))
+            ),
+            PRIMARY KEY (run_id, case_id, trial_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_authored_suite_launch_claim
+            ON cayu_eval_runs(
+                authored_suite_launch_revision, authored_suite_launch_lane,
+                created_at ASC, run_id ASC, status
+            )
+            WHERE authored_suite_launch_revision IS NOT NULL;
     """,
 }
 
@@ -3958,6 +3983,32 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "processing_schema_version",
             "TEXT COLLATE BINARY NOT NULL CHECK (processing_schema_version = "
             "'cayu.agent_recall_processing.v3')",
+        ),
+    ),
+    74: (
+        (
+            "cayu_eval_runs",
+            "trial_checkpoint_count",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (trial_checkpoint_count BETWEEN 0 AND 100000)",
+        ),
+        (
+            "cayu_eval_runs",
+            "trial_checkpoint_bytes",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (trial_checkpoint_bytes BETWEEN 0 AND 41943040)",
+        ),
+        (
+            "cayu_eval_runs",
+            "authored_suite_launch_revision",
+            "TEXT COLLATE BINARY CHECK (authored_suite_launch_revision IS NULL OR "
+            "(length(authored_suite_launch_revision) = 71 AND "
+            "substr(authored_suite_launch_revision, 1, 7) = 'sha256:' AND "
+            "substr(authored_suite_launch_revision, 8) NOT GLOB '*[^0-9a-f]*'))",
+        ),
+        (
+            "cayu_eval_runs",
+            "authored_suite_launch_lane",
+            "INTEGER CHECK (authored_suite_launch_lane IS NULL OR "
+            "authored_suite_launch_lane BETWEEN 0 AND 63)",
         ),
     ),
 }
@@ -5485,6 +5536,8 @@ def reconcile_schema(
         _validate_eval_judge_calibration_schema(connection)
     if app_min_supported >= 72:
         _validate_eval_run_max_concurrency_schema(connection)
+    if app_min_supported >= 74:
+        _validate_eval_run_trial_checkpoint_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -8723,6 +8776,102 @@ def _validate_eval_run_scenario_progress_column(connection: sqlite3.Connection) 
         )
 
 
+def _validate_eval_run_trial_checkpoint_schema(connection: sqlite3.Connection) -> None:
+    run_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), row[4])
+        for row in connection.execute("PRAGMA table_info(cayu_eval_runs)")
+    }
+    if run_columns.get("trial_checkpoint_count") != ("INTEGER", 1, "0"):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.trial_checkpoint_count' conflicts "
+            "with Cayu's revision-74 eval trial recovery contract. Run `cayu storage "
+            "migrate` or restore the database from a known-good backup."
+        )
+    if run_columns.get("trial_checkpoint_bytes") != ("INTEGER", 1, "0"):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.trial_checkpoint_bytes' conflicts "
+            "with Cayu's revision-74 eval trial recovery contract. Run `cayu storage "
+            "migrate` or restore the database from a known-good backup."
+        )
+    checkpoint_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_eval_run_trial_checkpoints)")
+    )
+    if checkpoint_columns != (
+        ("run_id", "TEXT", 1, 1),
+        ("case_id", "TEXT", 1, 2),
+        ("trial_number", "INTEGER", 1, 3),
+        ("checkpoint_json", "TEXT", 1, 0),
+        ("document_bytes", "INTEGER", 1, 0),
+    ):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_run_trial_checkpoints' conflicts with "
+            "Cayu's revision-74 eval trial recovery contract. Run `cayu storage migrate` "
+            "or restore the database from a known-good backup."
+        )
+    checkpoint_foreign_keys = tuple(
+        (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+        for row in connection.execute("PRAGMA foreign_key_list(cayu_eval_run_trial_checkpoints)")
+    )
+    if checkpoint_foreign_keys != (("cayu_eval_runs", "run_id", "run_id", "CASCADE"),):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_run_trial_checkpoints' has an invalid "
+            "run ownership constraint. Run `cayu storage migrate` or restore the "
+            "database from a known-good backup."
+        )
+    if run_columns.get("authored_suite_launch_revision") != ("TEXT", 0, None):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.authored_suite_launch_revision' "
+            "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
+            "Run `cayu storage migrate` or restore the database from a known-good backup."
+        )
+    if run_columns.get("authored_suite_launch_lane") != ("INTEGER", 0, None):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.authored_suite_launch_lane' "
+            "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
+            "Run `cayu storage migrate` or restore the database from a known-good backup."
+        )
+    index_row = next(
+        (
+            row
+            for row in connection.execute("PRAGMA index_list(cayu_eval_runs)")
+            if str(row[1]) == "idx_cayu_eval_runs_authored_suite_launch_claim"
+        ),
+        None,
+    )
+    index = (
+        None
+        if index_row is None
+        else (
+            int(index_row[2]),
+            int(index_row[4]),
+            tuple(
+                str(column[2])
+                for column in connection.execute(
+                    "PRAGMA index_info(idx_cayu_eval_runs_authored_suite_launch_claim)"
+                )
+            ),
+        )
+    )
+    expected = (
+        0,
+        1,
+        (
+            "authored_suite_launch_revision",
+            "authored_suite_launch_lane",
+            "created_at",
+            "run_id",
+            "status",
+        ),
+    )
+    if index != expected:
+        raise RuntimeError(
+            "SQLite schema object 'idx_cayu_eval_runs_authored_suite_launch_claim' "
+            "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
+            "Run `cayu storage migrate` or restore the database from a known-good backup."
+        )
+
+
 def _validate_session_message_queue_typed_message_column(
     connection: sqlite3.Connection,
 ) -> None:
@@ -9346,6 +9495,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
                 require_processing_schema_version=True,
             )
             _validate_revision_73_recall_subscription_schema(connection)
+        if rev.revision == 74:
+            _validate_eval_run_trial_checkpoint_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

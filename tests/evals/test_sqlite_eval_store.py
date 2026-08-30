@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 from contextlib import suppress
@@ -9,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 from tests.evals.eval_store_conformance import (
     _scenario,
+    _terminal_trial_checkpoint,
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
@@ -34,6 +36,7 @@ from cayu.evals.store import (
     EvalBaselineKey,
     EvalBaselineUpdate,
     EvalRunClaim,
+    EvalRunFailureCode,
     EvalRunInvocation,
     EvalRunRecord,
     EvalRunRequest,
@@ -187,6 +190,64 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
+def test_sqlite_trial_checkpoints_are_normalized_and_cleared_atomically(tmp_path) -> None:
+    path = tmp_path / "evals.db"
+
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        store = SQLiteEvalStore(path)
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run()
+            assert lease is not None
+            checkpoint = _terminal_trial_checkpoint(corpus)
+            await store.save_trial_checkpoint(
+                lease.claim,
+                checkpoint,
+                redact_json=_NO_SECRETS.redact_json,
+            )
+
+            connection = sqlite3.connect(path)
+            try:
+                count, total_bytes = connection.execute(
+                    "SELECT trial_checkpoint_count, trial_checkpoint_bytes "
+                    "FROM cayu_eval_runs WHERE run_id = ?",
+                    (lease.claim.run_id,),
+                ).fetchone()
+                rows = connection.execute(
+                    "SELECT case_id, trial_number, checkpoint_json, document_bytes "
+                    "FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?",
+                    (lease.claim.run_id,),
+                ).fetchall()
+            finally:
+                connection.close()
+            assert count == 1
+            assert len(rows) == 1
+            assert rows[0][0:2] == (checkpoint.case_id, checkpoint.trial_number)
+            assert rows[0][2].startswith("{")
+            assert rows[0][3] == total_bytes == len(rows[0][2].encode("utf-8"))
+
+            await store.fail_run(lease.claim, EvalRunFailureCode.EXECUTION_FAILED)
+            connection = sqlite3.connect(path)
+            try:
+                assert connection.execute(
+                    "SELECT trial_checkpoint_count, trial_checkpoint_bytes "
+                    "FROM cayu_eval_runs WHERE run_id = ?",
+                    (lease.claim.run_id,),
+                ).fetchone() == (0, 0)
+                assert connection.execute(
+                    "SELECT COUNT(*) FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?",
+                    (lease.claim.run_id,),
+                ).fetchone() == (0,)
+            finally:
+                connection.close()
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
 def test_sqlite_eval_store_creates_revision_sixty_eight_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
@@ -270,6 +331,7 @@ def test_sqlite_eval_store_creates_revision_sixty_eight_schema(tmp_path) -> None
         "cayu_eval_corpora",
         "cayu_eval_result_records",
         "cayu_eval_results",
+        "cayu_eval_run_trial_checkpoints",
         "cayu_eval_runs",
         "cayu_eval_scenarios",
         "cayu_eval_suites",
@@ -347,16 +409,16 @@ def test_sqlite_eval_store_requires_current_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 72"):
+    with pytest.raises(SchemaTooOld, match="requires >= 74"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
 
-def test_sqlite_eval_store_requires_and_migrates_revision_seventy_two(
+def test_sqlite_eval_store_requires_and_migrates_revision_seventy_four(
     tmp_path,
     monkeypatch,
 ) -> None:
     async def exercise() -> None:
-        path = tmp_path / "evals-revision-71.db"
+        path = tmp_path / "evals-revision-73.db"
         corpus = _corpus(trials=1)
         result = await run_corpus_suite(
             _target(_provider(trials=1)),
@@ -370,25 +432,78 @@ def test_sqlite_eval_store_requires_and_migrates_revision_seventy_two(
                 schema_migrations,
                 "REVISIONS",
                 tuple(
-                    revision for revision in schema_migrations.REVISIONS if revision.revision <= 71
+                    revision for revision in schema_migrations.REVISIONS if revision.revision <= 73
                 ),
             )
             legacy.setattr(
                 evals_sqlite_module,
                 "_SQLITE_EVAL_MIN_REQUIRED_REVISION",
-                68,
+                72,
             )
             old_store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
             try:
                 await _save_corpus(old_store, corpus)
-                await _admit_run(old_store, _request(corpus, run_id="old-run"))
-                lease = await old_store.claim_run()
-                assert lease is not None
-                await _publish_result(old_store, lease.claim, result)
             finally:
                 await old_store.close()
 
-        with pytest.raises(SchemaTooOld, match="requires >= 72"):
+        old_request = _request(corpus, run_id="old-run")
+        result_document = json.dumps(
+            result.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        timestamp = "2026-08-30T00:00:00+00:00"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO cayu_eval_runs (
+                    run_id, idempotency_key, corpus_revision, target_key,
+                    suite_id, suite_revision, max_concurrency, invocation_json,
+                    status, created_at, updated_at, started_at, finished_at,
+                    result_revision, result_status, result_score, result_duration_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    old_request.run_id,
+                    old_request.idempotency_key,
+                    old_request.corpus_revision,
+                    old_request.target_key,
+                    old_request.suite_id,
+                    old_request.suite_revision,
+                    old_request.max_concurrency,
+                    old_request.invocation.model_dump_json(),
+                    "completed",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    result.revision,
+                    result.run.status,
+                    result.run.score,
+                    result.run.duration_ms,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cayu_eval_results (
+                    run_id, revision, result_json, result_bytes, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    old_request.run_id,
+                    result.revision,
+                    result_document,
+                    len(result_document.encode("utf-8")),
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with pytest.raises(SchemaTooOld, match="requires >= 74"):
             SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
 
         migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)

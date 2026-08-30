@@ -391,6 +391,7 @@ _POSTGRES_TABLES = (
     "cayu_eval_baselines",
     "cayu_eval_result_records",
     "cayu_eval_results",
+    "cayu_eval_run_trial_checkpoints",
     "cayu_eval_runs",
     "cayu_eval_cases",
     "cayu_eval_suites",

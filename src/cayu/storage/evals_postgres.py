@@ -33,6 +33,8 @@ from cayu.evals.scenario import (
     eval_scenario_from_json,
 )
 from cayu.evals.store import (
+    EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES,
+    EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS,
     TERMINAL_EVAL_RUN_STATUSES,
     EvalAuthoredSuiteCatalogEntry,
     EvalAuthoredSuiteCatalogPage,
@@ -69,6 +71,7 @@ from cayu.evals.store import (
     EvalRunSpec,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalRunTrialCheckpoint,
     EvalScenarioApprovalDecisionRecord,
     EvalScenarioApprovalSubmission,
     EvalScenarioCatalogEntry,
@@ -103,10 +106,13 @@ from cayu.evals.store import (
     _prepare_result_for_store,
     _prepare_run_request_for_store,
     _prepare_scenario_catalog_for_store,
+    _prepare_trial_checkpoint_for_store,
     _read_limit,
     _scenario_progress_for_claim,
     _store_identifier,
     _validate_baseline_result,
+    _validate_trial_checkpoints_for_result,
+    _validated_trial_checkpoints,
     authored_suite_catalog_entry,
     authored_suite_scenario_cases,
     decode_authored_suite_cursor,
@@ -118,6 +124,7 @@ from cayu.evals.store import (
     decode_suite_cursor,
     eval_result_record,
     eval_run_invocation_from_json,
+    eval_run_trial_checkpoint_from_json,
     result_summary,
     validate_authored_suite_scenario,
     validate_result_for_run,
@@ -129,7 +136,7 @@ from cayu.evals.suite_authoring import (
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 72
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 74
 
 _RUN_COLUMNS = """
     run_id,
@@ -154,7 +161,11 @@ _RUN_COLUMNS = """
     result_score,
     result_duration_ms,
     failure_code,
-    scenario_progress_json
+    scenario_progress_json,
+    trial_checkpoint_count,
+    trial_checkpoint_bytes,
+    authored_suite_launch_revision,
+    authored_suite_launch_lane
 """
 
 _RESULT_RECORD_COLUMNS = """
@@ -188,6 +199,13 @@ async def _database_now(cur: Any) -> datetime:
 
 
 def _request_from_row(row: Any) -> EvalRunRequest:
+    invocation = eval_run_invocation_from_json(row[7])
+    if row[25] != invocation.authored_suite_launch_revision:
+        raise RuntimeError(
+            "Stored authored-suite launch identity conflicts with durable invocation."
+        )
+    if row[26] != invocation.authored_suite_launch_lane:
+        raise RuntimeError("Stored authored-suite launch lane conflicts with durable invocation.")
     return EvalRunRequest(
         run_id=row[0],
         idempotency_key=row[1],
@@ -196,7 +214,51 @@ def _request_from_row(row: Any) -> EvalRunRequest:
         suite_id=row[4],
         suite_revision=row[5],
         max_concurrency=row[6],
-        invocation=eval_run_invocation_from_json(row[7]),
+        invocation=invocation,
+    )
+
+
+async def _load_trial_checkpoints(
+    cur: Any,
+    row: Any,
+) -> tuple[EvalRunTrialCheckpoint, ...]:
+    await cur.execute(
+        """
+        SELECT case_id, trial_number, checkpoint_json, document_bytes
+        FROM cayu_eval_run_trial_checkpoints
+        WHERE run_id = %s
+        ORDER BY case_id ASC, trial_number ASC
+        """,
+        (row[0],),
+    )
+    checkpoint_rows = await cur.fetchall()
+    checkpoints: list[EvalRunTrialCheckpoint] = []
+    document_bytes = 0
+    for checkpoint_row in checkpoint_rows:
+        checkpoint = eval_run_trial_checkpoint_from_json(checkpoint_row[2])
+        actual_bytes = len(checkpoint_row[2].encode("utf-8"))
+        if (
+            checkpoint.case_id != checkpoint_row[0]
+            or checkpoint.trial_number != checkpoint_row[1]
+            or checkpoint_row[3] != actual_bytes
+        ):
+            raise RuntimeError("Stored eval trial checkpoint contradicts its indexed slot.")
+        checkpoints.append(checkpoint)
+        document_bytes += actual_bytes
+    if len(checkpoints) != row[23]:
+        raise RuntimeError("Stored eval trial checkpoint count is inconsistent.")
+    if document_bytes != row[24]:
+        raise RuntimeError("Stored eval trial checkpoint byte total is inconsistent.")
+    return _validated_trial_checkpoints(
+        tuple(checkpoints),
+        expected_document_bytes=document_bytes,
+    )
+
+
+async def _delete_trial_checkpoints(cur: Any, run_id: str) -> None:
+    await cur.execute(
+        "DELETE FROM cayu_eval_run_trial_checkpoints WHERE run_id = %s",
+        (run_id,),
     )
 
 
@@ -304,6 +366,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
+    trial_checkpointing: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_EVAL_MIN_REQUIRED_REVISION
@@ -964,8 +1027,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         INSERT INTO cayu_eval_runs (
                             run_id, idempotency_key, corpus_revision, target_key,
                             suite_id, suite_revision, max_concurrency, invocation_json, status,
-                            created_at, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            created_at, updated_at, authored_suite_launch_revision,
+                            authored_suite_launch_lane
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT DO NOTHING
                         RETURNING run_id
                         """,
@@ -981,6 +1045,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             str(EvalRunStatus.QUEUED),
                             now,
                             now,
+                            request.invocation.authored_suite_launch_revision,
+                            request.invocation.authored_suite_launch_lane,
                         ),
                     )
                     inserted = await cur.fetchone()
@@ -1083,17 +1149,37 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             try:
                 async with conn.cursor() as cur:
                     now = await _database_now(cur)
-                    target_clause = "" if target_key is None else "AND target_key = %s"
+                    target_clause = "" if target_key is None else "AND candidate.target_key = %s"
                     target_params: tuple[str, ...] = () if target_key is None else (target_key,)
                     await cur.execute(
                         f"""
                         SELECT {_RUN_COLUMNS}
-                        FROM cayu_eval_runs
-                        WHERE ownership_epoch < 9223372036854775807
+                        FROM cayu_eval_runs AS candidate
+                        WHERE candidate.ownership_epoch < 9223372036854775807
                           {target_clause}
-                          AND (status = %s
-                           OR (status IN (%s, %s) AND lease_expires_at <= %s))
-                        ORDER BY created_at ASC, run_id ASC
+                          AND (candidate.status = %s
+                           OR (candidate.status IN (%s, %s)
+                               AND candidate.lease_expires_at <= %s))
+                          AND (
+                              candidate.authored_suite_launch_revision IS NULL
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM cayu_eval_runs AS predecessor
+                                  WHERE predecessor.authored_suite_launch_revision =
+                                        candidate.authored_suite_launch_revision
+                                    AND predecessor.authored_suite_launch_lane =
+                                        candidate.authored_suite_launch_lane
+                                    AND predecessor.status NOT IN (%s, %s, %s)
+                                    AND (
+                                        predecessor.created_at < candidate.created_at
+                                        OR (
+                                            predecessor.created_at = candidate.created_at
+                                            AND predecessor.run_id < candidate.run_id
+                                        )
+                                    )
+                              )
+                          )
+                        ORDER BY candidate.created_at ASC, candidate.run_id ASC
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1
                         """,
@@ -1103,6 +1189,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             str(EvalRunStatus.RUNNING),
                             str(EvalRunStatus.CANCELLING),
                             now,
+                            str(EvalRunStatus.COMPLETED),
+                            str(EvalRunStatus.FAILED),
+                            str(EvalRunStatus.CANCELLED),
                         ),
                     )
                     row = await cur.fetchone()
@@ -1113,6 +1202,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         EvalRunStatus.CANCELLING if row[13] is not None else EvalRunStatus.RUNNING
                     )
                     next_epoch = row[15] + 1
+                    checkpoints = await _load_trial_checkpoints(cur, row)
                     progress = _scenario_progress_for_claim(
                         (
                             None
@@ -1121,6 +1211,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         ),
                         scenario=_request_from_row(row).invocation.scenario,
                         attempt=next_epoch,
+                        terminal_trial_numbers=frozenset(item.trial_number for item in checkpoints),
                     )
                     await cur.execute(
                         """
@@ -1176,12 +1267,32 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     await cur.execute(
                         f"""
                         SELECT {_RUN_COLUMNS}
-                        FROM cayu_eval_runs
-                        WHERE ownership_epoch < 9223372036854775807
-                          AND target_key IN ({placeholders})
-                          AND (status = %s
-                           OR (status IN (%s, %s) AND lease_expires_at <= %s))
-                        ORDER BY created_at ASC, run_id ASC
+                        FROM cayu_eval_runs AS candidate
+                        WHERE candidate.ownership_epoch < 9223372036854775807
+                          AND candidate.target_key IN ({placeholders})
+                          AND (candidate.status = %s
+                           OR (candidate.status IN (%s, %s)
+                               AND candidate.lease_expires_at <= %s))
+                          AND (
+                              candidate.authored_suite_launch_revision IS NULL
+                              OR NOT EXISTS (
+                                  SELECT 1
+                                  FROM cayu_eval_runs AS predecessor
+                                  WHERE predecessor.authored_suite_launch_revision =
+                                        candidate.authored_suite_launch_revision
+                                    AND predecessor.authored_suite_launch_lane =
+                                        candidate.authored_suite_launch_lane
+                                    AND predecessor.status NOT IN (%s, %s, %s)
+                                    AND (
+                                        predecessor.created_at < candidate.created_at
+                                        OR (
+                                            predecessor.created_at = candidate.created_at
+                                            AND predecessor.run_id < candidate.run_id
+                                        )
+                                    )
+                              )
+                          )
+                        ORDER BY candidate.created_at ASC, candidate.run_id ASC
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1
                         """,
@@ -1191,6 +1302,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             str(EvalRunStatus.RUNNING),
                             str(EvalRunStatus.CANCELLING),
                             now,
+                            str(EvalRunStatus.COMPLETED),
+                            str(EvalRunStatus.FAILED),
+                            str(EvalRunStatus.CANCELLED),
                         ),
                     )
                     row = await cur.fetchone()
@@ -1202,6 +1316,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     )
                     claim_id = str(uuid4())
                     next_epoch = row[15] + 1
+                    checkpoints = await _load_trial_checkpoints(cur, row)
                     progress = _scenario_progress_for_claim(
                         (
                             None
@@ -1210,6 +1325,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         ),
                         scenario=_request_from_row(row).invocation.scenario,
                         attempt=next_epoch,
+                        terminal_trial_numbers=frozenset(item.trial_number for item in checkpoints),
                     )
                     await cur.execute(
                         """
@@ -1314,7 +1430,11 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             finished_at = CASE WHEN %s = %s THEN %s ELSE finished_at END,
                             claim_id = CASE WHEN %s = %s THEN NULL ELSE claim_id END,
                             lease_expires_at = CASE
-                                WHEN %s = %s THEN NULL ELSE lease_expires_at END
+                                WHEN %s = %s THEN NULL ELSE lease_expires_at END,
+                            trial_checkpoint_count = CASE WHEN %s = %s THEN 0
+                                ELSE trial_checkpoint_count END,
+                            trial_checkpoint_bytes = CASE WHEN %s = %s THEN 0
+                                ELSE trial_checkpoint_bytes END
                         WHERE run_id = %s
                         """,
                         (
@@ -1328,9 +1448,15 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             str(EvalRunStatus.CANCELLED),
                             str(next_status),
                             str(EvalRunStatus.CANCELLED),
+                            str(next_status),
+                            str(EvalRunStatus.CANCELLED),
+                            str(next_status),
+                            str(EvalRunStatus.CANCELLED),
                             run_id,
                         ),
                     )
+                    if next_status is EvalRunStatus.CANCELLED:
+                        await _delete_trial_checkpoints(cur, run_id)
                     updated = await self._require_run_row(cur, run_id)
                 await conn.commit()
                 return _run_record_from_row(updated)
@@ -1412,6 +1538,119 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     updated = await self._require_run_row(cur, claim.run_id)
                 await conn.commit()
                 return _run_record_from_row(updated)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_trial_checkpoints(
+        self,
+        claim: EvalRunClaim,
+    ) -> tuple[EvalRunTrialCheckpoint, ...]:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            row = await self._require_run_row(cur, claim.run_id, for_update=True)
+            now = await _database_now(cur)
+            self._require_live_claim(row, claim, now)
+            return await _load_trial_checkpoints(cur, row)
+
+    async def save_trial_checkpoint(
+        self,
+        claim: EvalRunClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        prepared = await asyncio.to_thread(
+            _prepare_trial_checkpoint_for_store,
+            checkpoint,
+            redact_json=redact_json,
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, claim.run_id, for_update=True)
+                    now = await _database_now(cur)
+                    self._require_live_claim(row, claim, now)
+                    request = _request_from_row(row)
+                    await cur.execute(
+                        """
+                        SELECT suites.trials
+                        FROM cayu_eval_suites AS suites
+                        JOIN cayu_eval_cases AS cases
+                          ON cases.corpus_revision = suites.corpus_revision
+                         AND cases.suite_id = suites.suite_id
+                        WHERE suites.corpus_revision = %s AND suites.suite_id = %s
+                          AND cases.case_id = %s
+                        """,
+                        (
+                            request.corpus_revision,
+                            request.suite_id,
+                            prepared.checkpoint.case_id,
+                        ),
+                    )
+                    suite_row = await cur.fetchone()
+                    if suite_row is None:
+                        raise EvalRunStateConflict(
+                            "Eval trial checkpoint case does not belong to its run."
+                        )
+                    validated = prepared.checkpoint
+                    if validated.trial_number > suite_row[0]:
+                        raise EvalRunStateConflict(
+                            "Eval trial checkpoint number exceeds its immutable policy."
+                        )
+                    key = (validated.case_id, validated.trial_number)
+                    await cur.execute(
+                        """
+                        SELECT checkpoint_json, document_bytes
+                        FROM cayu_eval_run_trial_checkpoints
+                        WHERE run_id = %s AND case_id = %s AND trial_number = %s
+                        """,
+                        (claim.run_id, *key),
+                    )
+                    existing = await cur.fetchone()
+                    if existing is not None:
+                        if existing[1] != len(existing[0].encode("utf-8")):
+                            raise RuntimeError(
+                                "Stored eval trial checkpoint byte accounting is inconsistent."
+                            )
+                        current = eval_run_trial_checkpoint_from_json(existing[0])
+                        if current == validated:
+                            await conn.commit()
+                            return
+                        raise EvalRunStateConflict(
+                            "Eval trial slot already has another terminal result."
+                        )
+                    if row[23] >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+                        raise ValueError("Eval run trial checkpoints exceed their item limit.")
+                    if row[24] + prepared.document_bytes > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES:
+                        raise ValueError("Eval run trial checkpoints exceed their byte limit.")
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_eval_run_trial_checkpoints (
+                            run_id, case_id, trial_number, checkpoint_json, document_bytes
+                        ) VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            claim.run_id,
+                            *key,
+                            prepared.document,
+                            prepared.document_bytes,
+                        ),
+                    )
+                    await cur.execute(
+                        """
+                        UPDATE cayu_eval_runs
+                        SET trial_checkpoint_count = trial_checkpoint_count + 1,
+                            trial_checkpoint_bytes = trial_checkpoint_bytes + %s,
+                            updated_at = %s
+                        WHERE run_id = %s
+                        """,
+                        (prepared.document_bytes, now, claim.run_id),
+                    )
+                await conn.commit()
             except BaseException:
                 await conn.rollback()
                 raise
@@ -1529,6 +1768,10 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     self._require_live_claim(row, claim, now)
                     if status is not EvalRunStatus.RUNNING:
                         raise EvalRunStateConflict("Only a running eval may publish a result.")
+                    _validate_trial_checkpoints_for_result(
+                        await _load_trial_checkpoints(cur, row),
+                        validated,
+                    )
                     summary = result_summary(validated)
                     await cur.execute(
                         """
@@ -1558,7 +1801,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         SET status = %s, updated_at = %s, finished_at = %s,
                             lease_expires_at = NULL, result_revision = %s,
                             result_status = %s, result_score = %s,
-                            result_duration_ms = %s
+                            result_duration_ms = %s, trial_checkpoint_count = 0,
+                            trial_checkpoint_bytes = 0
                         WHERE run_id = %s
                         """,
                         (
@@ -1572,6 +1816,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             claim.run_id,
                         ),
                     )
+                    await _delete_trial_checkpoints(cur, claim.run_id)
                     updated = await self._require_run_row(cur, claim.run_id)
                 await conn.commit()
                 return _run_record_from_row(updated)
@@ -1628,7 +1873,11 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         UPDATE cayu_eval_runs
                         SET status = %s, updated_at = %s, finished_at = %s,
                             cancel_requested_at = %s, claim_id = NULL,
-                            lease_expires_at = NULL
+                            lease_expires_at = NULL,
+                            trial_checkpoint_count = CASE WHEN %s = %s THEN 0
+                                ELSE trial_checkpoint_count END,
+                            trial_checkpoint_bytes = CASE WHEN %s = %s THEN 0
+                                ELSE trial_checkpoint_bytes END
                         WHERE run_id = %s
                         """,
                         (
@@ -1636,9 +1885,15 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             now,
                             finished_at,
                             cancel_requested_at,
+                            str(next_status),
+                            str(EvalRunStatus.CANCELLED),
+                            str(next_status),
+                            str(EvalRunStatus.CANCELLED),
                             claim.run_id,
                         ),
                     )
+                    if next_status is EvalRunStatus.CANCELLED:
+                        await _delete_trial_checkpoints(cur, claim.run_id)
                     updated = await self._require_run_row(cur, claim.run_id)
                 await conn.commit()
                 return _run_record_from_row(updated)
@@ -2016,7 +2271,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         UPDATE cayu_eval_runs
                         SET status = %s, updated_at = %s, finished_at = %s,
                             cancel_requested_at = %s, lease_expires_at = NULL,
-                            failure_code = %s
+                            failure_code = %s, trial_checkpoint_count = 0,
+                            trial_checkpoint_bytes = 0
                         WHERE run_id = %s
                         """,
                         (
@@ -2028,6 +2284,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             claim.run_id,
                         ),
                     )
+                    await _delete_trial_checkpoints(cur, claim.run_id)
                     updated = await self._require_run_row(cur, claim.run_id)
                 await conn.commit()
                 return _run_record_from_row(updated)

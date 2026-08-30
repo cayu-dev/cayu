@@ -2785,6 +2785,44 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "scenario_progress_json::jsonb IS NOT NULL))",
     ),
     57: ("ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS message_json JSONB",),
+    74: (
+        "ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS "
+        "trial_checkpoint_count INTEGER NOT NULL DEFAULT 0 CHECK "
+        "(trial_checkpoint_count BETWEEN 0 AND 100000)",
+        "ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS "
+        "trial_checkpoint_bytes BIGINT NOT NULL DEFAULT 0 CHECK "
+        "(trial_checkpoint_bytes BETWEEN 0 AND 41943040)",
+        "ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS "
+        "authored_suite_launch_revision TEXT CHECK "
+        "(authored_suite_launch_revision IS NULL OR "
+        "authored_suite_launch_revision ~ '^sha256:[0-9a-f]{64}$')",
+        "ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS "
+        "authored_suite_launch_lane INTEGER CHECK "
+        "(authored_suite_launch_lane IS NULL OR "
+        "authored_suite_launch_lane BETWEEN 0 AND 63)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_authored_suite_launch_claim "
+        "ON cayu_eval_runs(authored_suite_launch_revision, authored_suite_launch_lane, "
+        "created_at ASC, run_id ASC, status) "
+        "WHERE authored_suite_launch_revision IS NOT NULL",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_run_trial_checkpoints (
+            run_id TEXT COLLATE "C" NOT NULL
+                REFERENCES cayu_eval_runs(run_id) ON DELETE CASCADE,
+            case_id TEXT COLLATE "C" NOT NULL,
+            trial_number INTEGER NOT NULL CHECK (trial_number BETWEEN 1 AND 100),
+            checkpoint_json TEXT NOT NULL CHECK (
+                octet_length(checkpoint_json) BETWEEN 1 AND 41943040
+                AND checkpoint_json::jsonb IS NOT NULL
+                AND jsonb_typeof(checkpoint_json::jsonb) = 'object'
+            ),
+            document_bytes BIGINT NOT NULL CHECK (
+                document_bytes BETWEEN 1 AND 41943040
+                AND document_bytes = octet_length(checkpoint_json)
+            ),
+            PRIMARY KEY (run_id, case_id, trial_number)
+        )
+        """,
+    ),
     58: (
         "ALTER TABLE cayu_completion_verification_claims "
         "ADD COLUMN IF NOT EXISTS verifier_profile_fingerprint TEXT "
@@ -5559,6 +5597,8 @@ class _PostgresStoreBase:
                             await self._validate_local_execution_attempt_schema(cur)
                         if self._min_required_revision >= 70:
                             await self._validate_interrupted_task_handoff_schema(cur)
+                        if self._min_required_revision >= 74:
+                            await self._validate_eval_run_trial_checkpoint_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -5780,6 +5820,8 @@ class _PostgresStoreBase:
             await self._validate_eval_run_max_concurrency_schema(cur)
         if self._min_required_revision >= 70:
             await self._validate_interrupted_task_handoff_schema(cur)
+        if self._min_required_revision >= 74:
+            await self._validate_eval_run_trial_checkpoint_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -5924,6 +5966,8 @@ class _PostgresStoreBase:
                 require_processing_schema_version=True,
             )
             await self._validate_agent_recall_subscription_schema(cur)
+        if revision.revision == 74:
+            await self._validate_eval_run_trial_checkpoint_schema(cur)
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -8919,6 +8963,155 @@ class _PostgresStoreBase:
                 "conflicts with Cayu's revision-56 controlled-scenario execution "
                 "contract. Run `cayu storage migrate` or restore the database from "
                 "a known-good backup."
+            )
+
+    async def _validate_eval_run_trial_checkpoint_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_runs'
+              AND column_name = 'trial_checkpoint_count'
+            """
+        )
+        count_column = await cur.fetchone()
+        if count_column is None or count_column[:2] != ("integer", "NO") or count_column[2] is None:
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.trial_checkpoint_count' "
+                "conflicts with Cayu's revision-74 eval trial recovery contract. "
+                "Run `cayu storage migrate` or restore the database from a known-good backup."
+            )
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_runs'
+              AND column_name = 'trial_checkpoint_bytes'
+            """
+        )
+        bytes_column = await cur.fetchone()
+        if bytes_column is None or bytes_column[:2] != ("bigint", "NO") or bytes_column[2] is None:
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.trial_checkpoint_bytes' "
+                "conflicts with Cayu's revision-74 eval trial recovery contract. "
+                "Run `cayu storage migrate` or restore the database from a known-good backup."
+            )
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_run_trial_checkpoints'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("run_id", "text", "NO"),
+            ("case_id", "text", "NO"),
+            ("trial_number", "integer", "NO"),
+            ("checkpoint_json", "text", "NO"),
+            ("document_bytes", "bigint", "NO"),
+        ):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_run_trial_checkpoints' conflicts "
+                "with Cayu's revision-74 eval trial recovery contract. Run `cayu storage "
+                "migrate` or restore the database from a known-good backup."
+            )
+        await cur.execute(
+            """
+            SELECT constraint_state.contype,
+                   pg_get_constraintdef(constraint_state.oid)
+            FROM pg_catalog.pg_constraint AS constraint_state
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_state.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_eval_run_trial_checkpoints'
+              AND constraint_state.contype IN ('p', 'f')
+            ORDER BY constraint_state.contype
+            """
+        )
+        ownership_constraints = {
+            str(kind): " ".join(str(definition).lower().split())
+            for kind, definition in await cur.fetchall()
+        }
+        if ownership_constraints != {
+            "f": ("foreign key (run_id) references cayu_eval_runs(run_id) on delete cascade"),
+            "p": "primary key (run_id, case_id, trial_number)",
+        }:
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_run_trial_checkpoints' has invalid "
+                "slot identity or run ownership constraints. Run `cayu storage migrate` "
+                "or restore the database from a known-good backup."
+            )
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_runs'
+              AND column_name = 'authored_suite_launch_lane'
+            """
+        )
+        if await cur.fetchone() != ("integer", "YES", None):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.authored_suite_launch_lane' "
+                "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
+                "Run `cayu storage migrate` or restore the database from a known-good backup."
+            )
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_runs'
+              AND column_name = 'authored_suite_launch_revision'
+            """
+        )
+        if await cur.fetchone() != ("text", "YES", None):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.authored_suite_launch_revision' "
+                "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
+                "Run `cayu storage migrate` or restore the database from a known-good backup."
+            )
+        await cur.execute(
+            """
+            SELECT index_state.indisvalid,
+                   index_state.indisready,
+                   pg_get_indexdef(index_record.oid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_eval_runs'
+              AND index_record.relname =
+                  'idx_cayu_eval_runs_authored_suite_launch_claim'
+            """
+        )
+        index_row = await cur.fetchone()
+        normalized_definition = (
+            "" if index_row is None else " ".join(str(index_row[2]).lower().split())
+        )
+        if (
+            index_row is None
+            or not bool(index_row[0])
+            or not bool(index_row[1])
+            or "using btree (authored_suite_launch_revision, authored_suite_launch_lane, "
+            "created_at, run_id, status)"
+            not in normalized_definition
+            or "where (authored_suite_launch_revision is not null)" not in normalized_definition
+        ):
+            raise RuntimeError(
+                "Postgres schema object 'idx_cayu_eval_runs_authored_suite_launch_claim' "
+                "conflicts with Cayu's revision-74 authored-suite concurrency contract. "
+                "Run `cayu storage migrate` or restore the database from a known-good backup."
             )
 
     async def _validate_session_message_queue_typed_message_column(self, cur: Any) -> None:

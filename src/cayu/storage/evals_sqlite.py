@@ -36,6 +36,8 @@ from cayu.evals.scenario import (
     eval_scenario_from_json,
 )
 from cayu.evals.store import (
+    EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES,
+    EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS,
     TERMINAL_EVAL_RUN_STATUSES,
     EvalAuthoredSuiteCatalogEntry,
     EvalAuthoredSuiteCatalogPage,
@@ -72,6 +74,7 @@ from cayu.evals.store import (
     EvalRunSpec,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalRunTrialCheckpoint,
     EvalScenarioApprovalDecisionRecord,
     EvalScenarioApprovalSubmission,
     EvalScenarioCatalogEntry,
@@ -106,10 +109,13 @@ from cayu.evals.store import (
     _prepare_result_for_store,
     _prepare_run_request_for_store,
     _prepare_scenario_catalog_for_store,
+    _prepare_trial_checkpoint_for_store,
     _read_limit,
     _scenario_progress_for_claim,
     _store_identifier,
     _validate_baseline_result,
+    _validate_trial_checkpoints_for_result,
+    _validated_trial_checkpoints,
     authored_suite_catalog_entry,
     authored_suite_scenario_cases,
     decode_authored_suite_cursor,
@@ -121,6 +127,7 @@ from cayu.evals.store import (
     decode_suite_cursor,
     eval_result_record,
     eval_run_invocation_from_json,
+    eval_run_trial_checkpoint_from_json,
     result_summary,
     validate_authored_suite_scenario,
     validate_result_for_run,
@@ -134,7 +141,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 72
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 74
 
 _RUN_COLUMNS = """
     run_id,
@@ -159,7 +166,11 @@ _RUN_COLUMNS = """
     result_score,
     result_duration_ms,
     failure_code,
-    scenario_progress_json
+    scenario_progress_json,
+    trial_checkpoint_count,
+    trial_checkpoint_bytes,
+    authored_suite_launch_revision,
+    authored_suite_launch_lane
 """
 
 _RESULT_RECORD_COLUMNS = """
@@ -188,6 +199,13 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
 
 
 def _request_from_row(row: sqlite3.Row) -> EvalRunRequest:
+    invocation = eval_run_invocation_from_json(row["invocation_json"])
+    if row["authored_suite_launch_revision"] != invocation.authored_suite_launch_revision:
+        raise RuntimeError(
+            "Stored authored-suite launch identity conflicts with durable invocation."
+        )
+    if row["authored_suite_launch_lane"] != invocation.authored_suite_launch_lane:
+        raise RuntimeError("Stored authored-suite launch lane conflicts with durable invocation.")
     return EvalRunRequest(
         run_id=row["run_id"],
         idempotency_key=row["idempotency_key"],
@@ -196,7 +214,50 @@ def _request_from_row(row: sqlite3.Row) -> EvalRunRequest:
         suite_id=row["suite_id"],
         suite_revision=row["suite_revision"],
         max_concurrency=row["max_concurrency"],
-        invocation=eval_run_invocation_from_json(row["invocation_json"]),
+        invocation=invocation,
+    )
+
+
+def _load_trial_checkpoints(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> tuple[EvalRunTrialCheckpoint, ...]:
+    checkpoint_rows = connection.execute(
+        """
+        SELECT case_id, trial_number, checkpoint_json, document_bytes
+        FROM cayu_eval_run_trial_checkpoints
+        WHERE run_id = ?
+        ORDER BY case_id ASC, trial_number ASC
+        """,
+        (row["run_id"],),
+    ).fetchall()
+    checkpoints: list[EvalRunTrialCheckpoint] = []
+    document_bytes = 0
+    for checkpoint_row in checkpoint_rows:
+        checkpoint = eval_run_trial_checkpoint_from_json(checkpoint_row["checkpoint_json"])
+        actual_bytes = len(checkpoint_row["checkpoint_json"].encode("utf-8"))
+        if (
+            checkpoint.case_id != checkpoint_row["case_id"]
+            or checkpoint.trial_number != checkpoint_row["trial_number"]
+            or checkpoint_row["document_bytes"] != actual_bytes
+        ):
+            raise RuntimeError("Stored eval trial checkpoint contradicts its indexed slot.")
+        checkpoints.append(checkpoint)
+        document_bytes += actual_bytes
+    if len(checkpoints) != row["trial_checkpoint_count"]:
+        raise RuntimeError("Stored eval trial checkpoint count is inconsistent.")
+    if document_bytes != row["trial_checkpoint_bytes"]:
+        raise RuntimeError("Stored eval trial checkpoint byte total is inconsistent.")
+    return _validated_trial_checkpoints(
+        tuple(checkpoints),
+        expected_document_bytes=document_bytes,
+    )
+
+
+def _delete_trial_checkpoints(connection: sqlite3.Connection, run_id: str) -> None:
+    connection.execute(
+        "DELETE FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?",
+        (run_id,),
     )
 
 
@@ -304,6 +365,7 @@ class SQLiteEvalStore(EvalStore):
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
+    trial_checkpointing: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
 
@@ -1021,8 +1083,9 @@ class SQLiteEvalStore(EvalStore):
                     INSERT INTO cayu_eval_runs (
                         run_id, idempotency_key, corpus_revision, target_key,
                         suite_id, suite_revision, max_concurrency, invocation_json, status,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, updated_at, authored_suite_launch_revision,
+                        authored_suite_launch_lane
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request.run_id,
@@ -1036,6 +1099,8 @@ class SQLiteEvalStore(EvalStore):
                         str(EvalRunStatus.QUEUED),
                         timestamp,
                         timestamp,
+                        request.invocation.authored_suite_launch_revision,
+                        request.invocation.authored_suite_launch_lane,
                     ),
                 )
                 row = self._load_run_row(connection, request.run_id)
@@ -1131,17 +1196,36 @@ class SQLiteEvalStore(EvalStore):
                 connection.execute("BEGIN IMMEDIATE")
                 now = datetime.now(UTC)
                 claim_id = str(uuid4())
-                target_clause = "" if target_key is None else "AND target_key = ?"
+                target_clause = "" if target_key is None else "AND candidate.target_key = ?"
                 target_params: tuple[str, ...] = () if target_key is None else (target_key,)
                 row = connection.execute(
                     f"""
                     SELECT {_RUN_COLUMNS}
-                    FROM cayu_eval_runs
-                    WHERE ownership_epoch < 9223372036854775807
+                    FROM cayu_eval_runs AS candidate
+                    WHERE candidate.ownership_epoch < 9223372036854775807
                       {target_clause}
-                      AND (status = ?
-                       OR (status IN (?, ?) AND lease_expires_at <= ?))
-                    ORDER BY created_at ASC, run_id ASC
+                      AND (candidate.status = ?
+                       OR (candidate.status IN (?, ?) AND candidate.lease_expires_at <= ?))
+                      AND (
+                          candidate.authored_suite_launch_revision IS NULL
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_eval_runs AS predecessor
+                              WHERE predecessor.authored_suite_launch_revision =
+                                    candidate.authored_suite_launch_revision
+                                AND predecessor.authored_suite_launch_lane =
+                                    candidate.authored_suite_launch_lane
+                                AND predecessor.status NOT IN (?, ?, ?)
+                                AND (
+                                    predecessor.created_at < candidate.created_at
+                                    OR (
+                                        predecessor.created_at = candidate.created_at
+                                        AND predecessor.run_id < candidate.run_id
+                                    )
+                                )
+                          )
+                      )
+                    ORDER BY candidate.created_at ASC, candidate.run_id ASC
                     LIMIT 1
                     """,
                     (
@@ -1150,6 +1234,9 @@ class SQLiteEvalStore(EvalStore):
                         str(EvalRunStatus.RUNNING),
                         str(EvalRunStatus.CANCELLING),
                         _format_datetime(now),
+                        str(EvalRunStatus.COMPLETED),
+                        str(EvalRunStatus.FAILED),
+                        str(EvalRunStatus.CANCELLED),
                     ),
                 ).fetchone()
                 if row is None:
@@ -1171,6 +1258,9 @@ class SQLiteEvalStore(EvalStore):
                     ),
                     scenario=_request_from_row(row).invocation.scenario,
                     attempt=next_epoch,
+                    terminal_trial_numbers=frozenset(
+                        item.trial_number for item in _load_trial_checkpoints(connection, row)
+                    ),
                 )
                 connection.execute(
                     """
@@ -1229,12 +1319,31 @@ class SQLiteEvalStore(EvalStore):
                 row = connection.execute(
                     f"""
                     SELECT {_RUN_COLUMNS}
-                    FROM cayu_eval_runs
-                    WHERE ownership_epoch < 9223372036854775807
-                      AND target_key IN ({placeholders})
-                      AND (status = ?
-                       OR (status IN (?, ?) AND lease_expires_at <= ?))
-                    ORDER BY created_at ASC, run_id ASC
+                    FROM cayu_eval_runs AS candidate
+                    WHERE candidate.ownership_epoch < 9223372036854775807
+                      AND candidate.target_key IN ({placeholders})
+                      AND (candidate.status = ?
+                       OR (candidate.status IN (?, ?) AND candidate.lease_expires_at <= ?))
+                      AND (
+                          candidate.authored_suite_launch_revision IS NULL
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_eval_runs AS predecessor
+                              WHERE predecessor.authored_suite_launch_revision =
+                                    candidate.authored_suite_launch_revision
+                                AND predecessor.authored_suite_launch_lane =
+                                    candidate.authored_suite_launch_lane
+                                AND predecessor.status NOT IN (?, ?, ?)
+                                AND (
+                                    predecessor.created_at < candidate.created_at
+                                    OR (
+                                        predecessor.created_at = candidate.created_at
+                                        AND predecessor.run_id < candidate.run_id
+                                    )
+                                )
+                          )
+                      )
+                    ORDER BY candidate.created_at ASC, candidate.run_id ASC
                     LIMIT 1
                     """,
                     (
@@ -1243,6 +1352,9 @@ class SQLiteEvalStore(EvalStore):
                         str(EvalRunStatus.RUNNING),
                         str(EvalRunStatus.CANCELLING),
                         _format_datetime(now),
+                        str(EvalRunStatus.COMPLETED),
+                        str(EvalRunStatus.FAILED),
+                        str(EvalRunStatus.CANCELLED),
                     ),
                 ).fetchone()
                 if row is None:
@@ -1264,6 +1376,9 @@ class SQLiteEvalStore(EvalStore):
                     ),
                     scenario=_request_from_row(row).invocation.scenario,
                     attempt=next_epoch,
+                    terminal_trial_numbers=frozenset(
+                        item.trial_number for item in _load_trial_checkpoints(connection, row)
+                    ),
                 )
                 connection.execute(
                     """
@@ -1377,7 +1492,11 @@ class SQLiteEvalStore(EvalStore):
                         cancel_requested_at = COALESCE(cancel_requested_at, ?),
                         finished_at = CASE WHEN ? = ? THEN ? ELSE finished_at END,
                         claim_id = CASE WHEN ? = ? THEN NULL ELSE claim_id END,
-                        lease_expires_at = CASE WHEN ? = ? THEN NULL ELSE lease_expires_at END
+                        lease_expires_at = CASE WHEN ? = ? THEN NULL ELSE lease_expires_at END,
+                        trial_checkpoint_count = CASE WHEN ? = ? THEN 0
+                            ELSE trial_checkpoint_count END,
+                        trial_checkpoint_bytes = CASE WHEN ? = ? THEN 0
+                            ELSE trial_checkpoint_bytes END
                     WHERE run_id = ?
                     """,
                     (
@@ -1391,9 +1510,15 @@ class SQLiteEvalStore(EvalStore):
                         str(EvalRunStatus.CANCELLED),
                         str(next_status),
                         str(EvalRunStatus.CANCELLED),
+                        str(next_status),
+                        str(EvalRunStatus.CANCELLED),
+                        str(next_status),
+                        str(EvalRunStatus.CANCELLED),
                         run_id,
                     ),
                 )
+                if next_status is EvalRunStatus.CANCELLED:
+                    _delete_trial_checkpoints(connection, run_id)
                 updated = self._require_run_row(connection, run_id)
                 connection.commit()
                 return _run_record_from_row(updated)
@@ -1491,6 +1616,133 @@ class SQLiteEvalStore(EvalStore):
                 raise
 
         return await self._run(operation)
+
+    async def load_trial_checkpoints(
+        self,
+        claim: EvalRunClaim,
+    ) -> tuple[EvalRunTrialCheckpoint, ...]:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+
+        def operation(connection: sqlite3.Connection) -> tuple[EvalRunTrialCheckpoint, ...]:
+            try:
+                connection.execute("BEGIN")
+                now = datetime.now(UTC)
+                row = self._require_run_row(connection, claim.run_id)
+                self._require_live_claim(row, claim, now)
+                checkpoints = _load_trial_checkpoints(connection, row)
+                connection.commit()
+                return checkpoints
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def save_trial_checkpoint(
+        self,
+        claim: EvalRunClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        prepared = await asyncio.to_thread(
+            _prepare_trial_checkpoint_for_store,
+            checkpoint,
+            redact_json=redact_json,
+        )
+
+        def operation(connection: sqlite3.Connection) -> None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                row = self._require_run_row(connection, claim.run_id)
+                self._require_live_claim(row, claim, now)
+                request = _request_from_row(row)
+                suite_row = connection.execute(
+                    """
+                    SELECT suites.trials
+                    FROM cayu_eval_suites AS suites
+                    JOIN cayu_eval_cases AS cases
+                      ON cases.corpus_revision = suites.corpus_revision
+                     AND cases.suite_id = suites.suite_id
+                    WHERE suites.corpus_revision = ? AND suites.suite_id = ?
+                      AND cases.case_id = ?
+                    """,
+                    (
+                        request.corpus_revision,
+                        request.suite_id,
+                        prepared.checkpoint.case_id,
+                    ),
+                ).fetchone()
+                if suite_row is None:
+                    raise EvalRunStateConflict(
+                        "Eval trial checkpoint case does not belong to its run."
+                    )
+                validated = prepared.checkpoint
+                if validated.trial_number > suite_row["trials"]:
+                    raise EvalRunStateConflict(
+                        "Eval trial checkpoint number exceeds its immutable policy."
+                    )
+                key = (validated.case_id, validated.trial_number)
+                existing = connection.execute(
+                    """
+                    SELECT checkpoint_json, document_bytes
+                    FROM cayu_eval_run_trial_checkpoints
+                    WHERE run_id = ? AND case_id = ? AND trial_number = ?
+                    """,
+                    (claim.run_id, *key),
+                ).fetchone()
+                if existing is not None:
+                    if existing["document_bytes"] != len(
+                        existing["checkpoint_json"].encode("utf-8")
+                    ):
+                        raise RuntimeError(
+                            "Stored eval trial checkpoint byte accounting is inconsistent."
+                        )
+                    current = eval_run_trial_checkpoint_from_json(existing["checkpoint_json"])
+                    if current == validated:
+                        connection.commit()
+                        return
+                    raise EvalRunStateConflict(
+                        "Eval trial slot already has another terminal result."
+                    )
+                if row["trial_checkpoint_count"] >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+                    raise ValueError("Eval run trial checkpoints exceed their item limit.")
+                if (
+                    row["trial_checkpoint_bytes"] + prepared.document_bytes
+                    > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES
+                ):
+                    raise ValueError("Eval run trial checkpoints exceed their byte limit.")
+                connection.execute(
+                    """
+                    INSERT INTO cayu_eval_run_trial_checkpoints (
+                        run_id, case_id, trial_number, checkpoint_json, document_bytes
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim.run_id,
+                        *key,
+                        prepared.document,
+                        prepared.document_bytes,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE cayu_eval_runs
+                    SET trial_checkpoint_count = trial_checkpoint_count + 1,
+                        trial_checkpoint_bytes = trial_checkpoint_bytes + ?,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (prepared.document_bytes, _format_datetime(now), claim.run_id),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+        await self._run(operation)
 
     async def submit_scenario_approval(
         self,
@@ -1609,6 +1861,10 @@ class SQLiteEvalStore(EvalStore):
                 self._require_live_claim(row, claim, now)
                 if status is not EvalRunStatus.RUNNING:
                     raise EvalRunStateConflict("Only a running eval may publish a result.")
+                _validate_trial_checkpoints_for_result(
+                    _load_trial_checkpoints(connection, row),
+                    validated,
+                )
                 summary = result_summary(validated)
                 connection.execute(
                     """
@@ -1637,7 +1893,8 @@ class SQLiteEvalStore(EvalStore):
                     UPDATE cayu_eval_runs
                     SET status = ?, updated_at = ?, finished_at = ?, lease_expires_at = NULL,
                         result_revision = ?, result_status = ?, result_score = ?,
-                        result_duration_ms = ?
+                        result_duration_ms = ?, trial_checkpoint_count = 0,
+                        trial_checkpoint_bytes = 0
                     WHERE run_id = ?
                     """,
                     (
@@ -1651,6 +1908,7 @@ class SQLiteEvalStore(EvalStore):
                         claim.run_id,
                     ),
                 )
+                _delete_trial_checkpoints(connection, claim.run_id)
                 updated = self._require_run_row(connection, claim.run_id)
                 connection.commit()
                 return _run_record_from_row(updated)
@@ -1709,7 +1967,11 @@ class SQLiteEvalStore(EvalStore):
                     UPDATE cayu_eval_runs
                     SET status = ?, updated_at = ?, finished_at = ?,
                         cancel_requested_at = ?, claim_id = NULL,
-                        lease_expires_at = NULL
+                        lease_expires_at = NULL,
+                        trial_checkpoint_count = CASE WHEN ? = ? THEN 0
+                            ELSE trial_checkpoint_count END,
+                        trial_checkpoint_bytes = CASE WHEN ? = ? THEN 0
+                            ELSE trial_checkpoint_bytes END
                     WHERE run_id = ?
                     """,
                     (
@@ -1717,9 +1979,15 @@ class SQLiteEvalStore(EvalStore):
                         _format_datetime(now),
                         finished_at,
                         cancel_requested_at,
+                        str(next_status),
+                        str(EvalRunStatus.CANCELLED),
+                        str(next_status),
+                        str(EvalRunStatus.CANCELLED),
                         claim.run_id,
                     ),
                 )
+                if next_status is EvalRunStatus.CANCELLED:
+                    _delete_trial_checkpoints(connection, claim.run_id)
                 updated = self._require_run_row(connection, claim.run_id)
                 connection.commit()
                 return _run_record_from_row(updated)
@@ -2082,7 +2350,8 @@ class SQLiteEvalStore(EvalStore):
                     """
                     UPDATE cayu_eval_runs
                     SET status = ?, updated_at = ?, finished_at = ?,
-                        cancel_requested_at = ?, lease_expires_at = NULL, failure_code = ?
+                        cancel_requested_at = ?, lease_expires_at = NULL, failure_code = ?,
+                        trial_checkpoint_count = 0, trial_checkpoint_bytes = 0
                     WHERE run_id = ?
                     """,
                     (
@@ -2094,6 +2363,7 @@ class SQLiteEvalStore(EvalStore):
                         claim.run_id,
                     ),
                 )
+                _delete_trial_checkpoints(connection, claim.run_id)
                 updated = self._require_run_row(connection, claim.run_id)
                 connection.commit()
                 return _run_record_from_row(updated)

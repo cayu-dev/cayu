@@ -399,6 +399,13 @@ REVISIONS: tuple[Revision, ...] = (
     # Mixed pre-73 processing-result writers would publish the old contract,
     # so this is a clean break. No subscription or wake state is inferred.
     Revision(revision=73, kind=RevisionKind.BREAKING, compatible_from=73),
+    # Eval workers now checkpoint each terminal trial before aggregate
+    # publication and reuse those slots after lease recovery. Authored-suite
+    # launch parts also use durable concurrency lanes so their shared ceiling
+    # holds across coordinators without serializing independent work. Pre-74
+    # workers do not consult the recovery or lane fences, so mixed-version eval
+    # execution is unsafe.
+    Revision(revision=74, kind=RevisionKind.BREAKING, compatible_from=74),
 )
 
 #: The revision an empty database is initialized to.

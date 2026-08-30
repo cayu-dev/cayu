@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -78,6 +77,7 @@ from cayu.evals.store import (
     EvalRunCostBudget,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalRunTrialCheckpoint,
     EvalScenarioRunInvocation,
     EvalScenarioRunProgress,
     EvalScenarioTrialFailureCode,
@@ -85,6 +85,7 @@ from cayu.evals.store import (
     EvalScenarioTrialProgress,
     EvalStore,
 )
+from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.runtime.approvals import (
     ResolutionActor,
     ResolutionActorSource,
@@ -801,6 +802,7 @@ async def run_compiled_eval_scenario(
     expected_app_manifest_fingerprint: str | None = None,
     expected_execution_profile: ExecutionProfileIdentity | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
 ) -> CorpusExecutionResult:
     """Execute all scenario trials and return the ordinary corpus result shape."""
 
@@ -815,6 +817,8 @@ async def run_compiled_eval_scenario(
         )
     if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
         raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
+    if accepted_exposure is not None and type(accepted_exposure) is not EvalSuiteRunExposureV1:
+        raise TypeError("accepted_exposure must be an exact EvalSuiteRunExposureV1 or None.")
     target_before = evaluation_target_identity(target, project_root=manifest_project_root)
     if (
         expected_app_manifest_fingerprint is not None
@@ -863,6 +867,14 @@ async def run_compiled_eval_scenario(
     )
     memory_attribution_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(binding.trials)
     slots = [None] * binding.trials
+    checkpoints = await store.load_trial_checkpoints(claim)
+    for checkpoint in checkpoints:
+        if checkpoint.case_id != case.id or checkpoint.trial_number > binding.trials:
+            raise EvalRunStateConflict("Recovered scenario trial does not match its run.")
+        slots[checkpoint.trial_number - 1] = (
+            checkpoint.result,
+            checkpoint.public_data,
+        )
     semaphore = asyncio.Semaphore(max_concurrency)
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
         max_operations=max_concurrency
@@ -927,17 +939,30 @@ async def run_compiled_eval_scenario(
                     memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
                 )
                 await driver.reconcile_terminal_progress()
+                result, public_data = execution
+                if public_data is None:
+                    raise RuntimeError("Scenario trial execution lost its public projection.")
+                await store.save_trial_checkpoint(
+                    claim,
+                    EvalRunTrialCheckpoint(
+                        case_id=case.id,
+                        result=result,
+                        public_data=public_data,
+                    ),
+                    redact_json=target.app.redact_json,
+                )
                 slots[trial_number - 1] = execution
 
-    started_at = datetime.now(UTC)
     async with memory_attribution_read_lifecycle, asyncio.TaskGroup() as group:
         for trial_number in range(1, binding.trials + 1):
-            group.create_task(execute_trial(trial_number))
-    completed_at = datetime.now(UTC)
+            if slots[trial_number - 1] is None:
+                group.create_task(execute_trial(trial_number))
     executions = [item for item in slots if item is not None]
     if len(executions) != binding.trials:
         raise RuntimeError("Scenario execution lost a trial result.")
     trial_results = [item[0] for item in executions]
+    started_at = min(result.started_at for result in trial_results)
+    completed_at = max(result.completed_at for result in trial_results)
     public_data = tuple(item[1] for item in executions)
     if any(item is None for item in public_data):
         raise RuntimeError("Scenario execution lost a public trial projection.")
@@ -946,6 +971,7 @@ async def run_compiled_eval_scenario(
         trial_results,
         started_at=started_at,
         completed_at=completed_at,
+        trial_policy=compiled.run_contract.trial_policy,
     )
     internal_run = EvalRun(
         suite_id=compiled.suite.id,
@@ -966,6 +992,7 @@ async def run_compiled_eval_scenario(
         {case.id: public_data},
         manifest_project_root,
         external_trials,
+        accepted_exposure,
     )
 
 

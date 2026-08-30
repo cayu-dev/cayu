@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -22,7 +23,13 @@ from cayu.evals.execution import (
     CorpusExecutionResult,
     EvaluationTargetIdentity,
 )
+from cayu.evals.models import EvalStatus, EvalTrialResult
 from cayu.evals.promotion import CapturedRunScoreV1
+from cayu.evals.result_contract import (
+    EvalTrialDiagnosticCode,
+    EvalTrialOutputPreviewV1,
+    _EvalTrialPublicData,
+)
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultOrigin,
@@ -55,6 +62,7 @@ from cayu.evals.store import (
     EvalRunRequest,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalRunTrialCheckpoint,
     EvalScenarioApprovalSubmission,
     EvalScenarioCatalogQuery,
     EvalScenarioRunInvocation,
@@ -299,6 +307,24 @@ def _request(
         suite_revision=suite.revision,
         max_concurrency=concurrency,
         invocation=EvalRunInvocation() if invocation is None else invocation,
+    )
+
+
+def _terminal_trial_checkpoint(corpus: EvalCorpusDocument) -> EvalRunTrialCheckpoint:
+    now = datetime.now(UTC)
+    return EvalRunTrialCheckpoint(
+        case_id=corpus.cases[0].id,
+        result=EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.ERROR,
+            error="candidate execution failed",
+            started_at=now,
+            completed_at=now,
+        ),
+        public_data=_EvalTrialPublicData(
+            diagnostic_code=EvalTrialDiagnosticCode.EXECUTION_FAILED,
+            output=EvalTrialOutputPreviewV1.unavailable(),
+        ),
     )
 
 
@@ -918,6 +944,55 @@ async def assert_eval_store_conformance(
         (corpus.cases[0].id, corpus.cases[0].revision)
     ]
 
+    launch_corpus = _corpus_with_target(corpus, "suite-launch-target")
+    await store.save_corpus(launch_corpus, redact_json=_NO_SECRETS.redact_json)
+    launch_suite = launch_corpus.suites[0]
+    launch_revision = "sha256:" + "1" * 64
+    suite_revision = "sha256:" + "2" * 64
+    selection_revision = "sha256:" + "3" * 64
+
+    def launch_part(part: int, lane: int) -> EvalRunRequest:
+        return EvalRunRequest(
+            run_id=f"suite-launch-part-{part}",
+            idempotency_key="sha256:" + str(part + 3) * 64,
+            corpus_revision=launch_corpus.revision,
+            target_key=launch_corpus.target_key,
+            suite_id=launch_suite.id,
+            suite_revision=launch_suite.revision,
+            max_concurrency=1,
+            invocation=EvalRunInvocation(
+                authored_suite_revision=suite_revision,
+                authored_suite_selection_revision=selection_revision,
+                authored_suite_launch_revision=launch_revision,
+                authored_suite_launch_lane=lane,
+            ),
+        )
+
+    await store.admit_run(launch_part(1, 0), redact_json=_NO_SECRETS.redact_json)
+    await store.admit_run(launch_part(2, 1), redact_json=_NO_SECRETS.redact_json)
+    await store.admit_run(launch_part(3, 0), redact_json=_NO_SECRETS.redact_json)
+    parallel_claims = await asyncio.gather(
+        store.claim_run(target_key=launch_corpus.target_key),
+        store.claim_run_for_targets((launch_corpus.target_key,)),
+    )
+    claimed_launches = tuple(claim for claim in parallel_claims if claim is not None)
+    assert len(claimed_launches) == 2
+    claimed_by_id = {claim.run.id: claim for claim in claimed_launches}
+    assert set(claimed_by_id) == {"suite-launch-part-1", "suite-launch-part-2"}
+    assert await store.claim_run(target_key=launch_corpus.target_key) is None
+    await store.fail_run(
+        claimed_by_id["suite-launch-part-1"].claim,
+        EvalRunFailureCode.EXECUTION_FAILED,
+    )
+    third_launch = await store.claim_run_for_targets((launch_corpus.target_key,))
+    assert third_launch is not None
+    assert third_launch.run.id == "suite-launch-part-3"
+    await store.fail_run(
+        claimed_by_id["suite-launch-part-2"].claim,
+        EvalRunFailureCode.EXECUTION_FAILED,
+    )
+    await store.fail_run(third_launch.claim, EvalRunFailureCode.EXECUTION_FAILED)
+
     invocation = EvalRunInvocation(
         source=SessionExecutionSource.HTTP_RUN,
         origin=InvocationOrigin(
@@ -1046,6 +1121,39 @@ async def assert_eval_store_conformance(
     failure_claimed = await store.claim_run()
     assert failure_claimed is not None
     stale_failure_claim = failure_claimed.claim
+    checkpoint = _terminal_trial_checkpoint(corpus)
+    checkpoint_secret = "checkpoint-secret-canary-ABCDEFGHIJKLMNOP"
+    unsafe_checkpoint = checkpoint.model_copy(
+        update={"result": checkpoint.result.model_copy(update={"error": checkpoint_secret})}
+    )
+    with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
+        await store.save_trial_checkpoint(
+            stale_failure_claim,
+            unsafe_checkpoint,
+            redact_json=SecretRedactor(checkpoint_secret).redact_json,
+        )
+    await store.save_trial_checkpoint(
+        stale_failure_claim,
+        checkpoint,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    await store.save_trial_checkpoint(
+        stale_failure_claim,
+        checkpoint,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert await store.load_trial_checkpoints(stale_failure_claim) == (checkpoint,)
+    conflicting_checkpoint = checkpoint.model_copy(
+        update={
+            "result": checkpoint.result.model_copy(update={"error": "different terminal outcome"})
+        }
+    )
+    with pytest.raises(EvalRunStateConflict, match="another terminal result"):
+        await store.save_trial_checkpoint(
+            stale_failure_claim,
+            conflicting_checkpoint,
+            redact_json=_NO_SECRETS.redact_json,
+        )
     released = await store.release_run(stale_failure_claim)
     assert released.status is EvalRunStatus.QUEUED
     failure_reclaimed = await store.claim_run()
@@ -1053,6 +1161,9 @@ async def assert_eval_store_conformance(
     with pytest.raises(EvalRunClaimLost):
         await store.heartbeat_run(stale_failure_claim)
     failure_claim = failure_reclaimed.claim
+    assert await store.load_trial_checkpoints(failure_claim) == (checkpoint,)
+    with pytest.raises(EvalRunClaimLost):
+        await store.load_trial_checkpoints(stale_failure_claim)
     failed = await store.fail_run(failure_claim, EvalRunFailureCode.EXECUTION_FAILED)
     assert failed.status is EvalRunStatus.FAILED
     assert await store.fail_run(failure_claim, EvalRunFailureCode.EXECUTION_FAILED) == failed
