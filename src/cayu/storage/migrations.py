@@ -389,6 +389,11 @@ REVISIONS: tuple[Revision, ...] = (
     # that atomic stage, so mixed-version operation is unsafe. Existing
     # checkpoints remain valid frontiers; no delivery records are inferred.
     Revision(revision=71, kind=RevisionKind.BREAKING, compatible_from=71),
+    # Corpus execution may now persist per-run concurrency above 32 through the
+    # shared signed-32-bit portable representation maximum. Widening the durable
+    # eval-run constraint lets newer writers persist values that older binaries
+    # reject, so mixed-version operation is unsafe.
+    Revision(revision=72, kind=RevisionKind.BREAKING, compatible_from=72),
 )
 
 #: The revision an empty database is initialized to.

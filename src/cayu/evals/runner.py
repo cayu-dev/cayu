@@ -7,6 +7,7 @@ import math
 import traceback
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
@@ -37,6 +38,7 @@ from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
 from cayu.evals.assertions import EvalAssertion
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY, EvalExecutionCapacity
 from cayu.evals.corpus import EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
@@ -696,6 +698,7 @@ async def run_eval_suite(
     max_concurrency: int = 1,
     case_timeout_seconds: float | None = None,
     trials: int = 1,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> EvalRun:
     """Run every case in the suite and aggregate the results.
 
@@ -724,6 +727,7 @@ async def run_eval_suite(
         case_timeout_seconds=case_timeout_seconds,
         trials=trials,
         public_output_preview_bytes=None,
+        execution_capacity=execution_capacity,
     )
     return run
 
@@ -739,6 +743,7 @@ async def _run_eval_suite_with_public_projection(
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
     run_id: str | None = None,
     trial_request_transform: TrialRequestTransform | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
     """Run a corpus suite and return its separate runner-owned public sidecar."""
 
@@ -754,6 +759,7 @@ async def _run_eval_suite_with_public_projection(
         run_stream=run_stream,
         run_id=run_id,
         trial_request_transform=trial_request_transform,
+        execution_capacity=execution_capacity,
     )
     if public_data is None:
         raise RuntimeError("Corpus execution lost its runner-owned public projection.")
@@ -773,6 +779,7 @@ async def _run_eval_suite(
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
     run_id: str | None = None,
     trial_request_transform: TrialRequestTransform | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -783,6 +790,8 @@ async def _run_eval_suite(
         raise TypeError("run_eval_suite max_concurrency must be an int.")
     if max_concurrency < 1:
         raise ValueError("run_eval_suite max_concurrency must be >= 1.")
+    if max_concurrency > EVAL_MAX_CONCURRENCY:
+        raise ValueError(f"run_eval_suite max_concurrency must be <= {EVAL_MAX_CONCURRENCY}.")
     if type(retain_final_output) is not bool:
         raise TypeError("run_eval_suite retain_final_output must be a bool.")
     if not retain_final_output and retain_trajectory:
@@ -798,6 +807,8 @@ async def _run_eval_suite(
     run_id = str(uuid4()) if run_id is None else require_durable_clean_nonblank(run_id, "run_id")
     if trial_request_transform is not None and not callable(trial_request_transform):
         raise TypeError("trial_request_transform must be callable or None.")
+    if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
+        raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
     started_at = datetime.now(UTC)
     trial_count = len(suite.cases) * trials
     memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
@@ -824,6 +835,7 @@ async def _run_eval_suite(
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             run_stream=run_stream,
             trial_request_transform=trial_request_transform,
+            execution_capacity=execution_capacity,
         )
     completed_at = datetime.now(UTC)
     status = aggregate_eval_status(result.status for result in results)
@@ -854,9 +866,12 @@ async def run_eval_plan(
     max_concurrency: int = 1,
     case_timeout_seconds: float | None = None,
     trials: int | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> EvalRun | CorpusExecutionResult:
     if type(plan) is not EvalPlan:
         raise TypeError("run_eval_plan requires an EvalPlan.")
+    if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
+        raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
     if plan.corpus_target is not None:
         from cayu.evals.corpus import EvalCorpusDocument
         from cayu.evals.execution import run_corpus_suite
@@ -874,6 +889,7 @@ async def run_eval_plan(
             corpus,
             suite_id,
             max_concurrency=max_concurrency,
+            execution_capacity=execution_capacity,
         )
     if corpus is not None or suite_id is not None:
         raise ValueError("Direct EvalPlan execution does not accept corpus or suite_id.")
@@ -886,6 +902,7 @@ async def run_eval_plan(
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
         trials=1 if trials is None else trials,
+        execution_capacity=execution_capacity,
     )
 
 
@@ -905,30 +922,36 @@ async def _run_suite_cases(
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None,
     trial_request_transform: TrialRequestTransform | None,
+    execution_capacity: EvalExecutionCapacity | None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
 ]:
     if max_concurrency == 1:
-        executions = [
-            await _run_eval_case(
-                app,
-                case,
-                suite_id=suite.id,
-                retain_trajectory=retain_trajectory,
-                retain_final_output=retain_final_output,
-                timeout_seconds=case_timeout_seconds,
-                trials=trials,
-                public_output_preview_bytes=public_output_preview_bytes,
-                memory_attribution_bounds=memory_attribution_bounds,
-                memory_attribution_source_limit=memory_attribution_source_limit,
-                memory_attribution_max_bytes=memory_attribution_max_bytes,
-                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-                run_stream=run_stream,
-                trial_request_transform=trial_request_transform,
+        executions = []
+        for case in suite.cases:
+            capacity_slot = (
+                nullcontext() if execution_capacity is None else execution_capacity.slot()
             )
-            for case in suite.cases
-        ]
+            async with capacity_slot:
+                executions.append(
+                    await _run_eval_case(
+                        app,
+                        case,
+                        suite_id=suite.id,
+                        retain_trajectory=retain_trajectory,
+                        retain_final_output=retain_final_output,
+                        timeout_seconds=case_timeout_seconds,
+                        trials=trials,
+                        public_output_preview_bytes=public_output_preview_bytes,
+                        memory_attribution_bounds=memory_attribution_bounds,
+                        memory_attribution_source_limit=memory_attribution_source_limit,
+                        memory_attribution_max_bytes=memory_attribution_max_bytes,
+                        memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                        run_stream=run_stream,
+                        trial_request_transform=trial_request_transform,
+                    )
+                )
         results = [result for result, _ in executions]
         if public_output_preview_bytes is None:
             return results, None
@@ -951,25 +974,29 @@ async def _run_suite_cases(
 
     async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
         async with semaphore:
-            if case_started_at[index] is None:
-                case_started_at[index] = datetime.now(UTC)
-            slots[index][trial_number - 1] = await _run_case_once_with_public_projection(
-                app,
-                case,
-                trial_number=trial_number,
-                suite_id=suite.id,
-                retain_trajectory=retain_trajectory,
-                retain_final_output=retain_final_output,
-                timeout_seconds=case_timeout_seconds,
-                public_output_preview_bytes=public_output_preview_bytes,
-                memory_attribution_bounds=memory_attribution_bounds,
-                memory_attribution_source_limit=memory_attribution_source_limit,
-                memory_attribution_max_bytes=memory_attribution_max_bytes,
-                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-                run_stream=run_stream,
-                trial_request_transform=trial_request_transform,
+            capacity_slot = (
+                nullcontext() if execution_capacity is None else execution_capacity.slot()
             )
-            case_completed_at[index] = datetime.now(UTC)
+            async with capacity_slot:
+                if case_started_at[index] is None:
+                    case_started_at[index] = datetime.now(UTC)
+                slots[index][trial_number - 1] = await _run_case_once_with_public_projection(
+                    app,
+                    case,
+                    trial_number=trial_number,
+                    suite_id=suite.id,
+                    retain_trajectory=retain_trajectory,
+                    retain_final_output=retain_final_output,
+                    timeout_seconds=case_timeout_seconds,
+                    public_output_preview_bytes=public_output_preview_bytes,
+                    memory_attribution_bounds=memory_attribution_bounds,
+                    memory_attribution_source_limit=memory_attribution_source_limit,
+                    memory_attribution_max_bytes=memory_attribution_max_bytes,
+                    memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                    run_stream=run_stream,
+                    trial_request_transform=trial_request_transform,
+                )
+                case_completed_at[index] = datetime.now(UTC)
 
     async with asyncio.TaskGroup() as group:
         for index, case in enumerate(suite.cases):

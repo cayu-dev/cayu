@@ -27,6 +27,7 @@ from cayu.artifacts import (
     InvalidArtifactIdError,
     copy_artifact_read_result,
 )
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TRIALS,
@@ -35,11 +36,7 @@ from cayu.evals.corpus import (
     _sha256_hex,
     _sha256_revision,
 )
-from cayu.evals.execution import (
-    CORPUS_EXECUTION_MAX_CONCURRENCY,
-    CorpusTarget,
-    evaluation_target_identity,
-)
+from cayu.evals.execution import CorpusTarget, evaluation_target_identity
 from cayu.evals.scenario import (
     EVAL_SCENARIO_MAX_ARTIFACT_REQUIREMENTS,
     EVAL_SCENARIO_MAX_SECRET_REQUIREMENTS,
@@ -183,7 +180,7 @@ class ScenarioLaunchSettingsV2(_ScenarioPreflightModel):
     max_concurrency: StrictInt = Field(
         default=1,
         ge=1,
-        le=CORPUS_EXECUTION_MAX_CONCURRENCY,
+        le=EVAL_MAX_CONCURRENCY,
     )
     timeout_seconds: StrictInt = Field(
         default=300,
@@ -280,7 +277,7 @@ class ScenarioLaunchBindingV2(_ScenarioPreflightModel):
     environment_name: StrictStr | None = Field(default=None, max_length=256)
     approval_behavior: Literal["fresh_decision"] = "fresh_decision"
     trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
-    max_concurrency: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
     max_steps: StrictInt = Field(ge=1, le=256)
     target_limits: RunLimits

@@ -32,6 +32,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
     thaw_json_value,
 )
+from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.evals.execution import CorpusTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
@@ -353,6 +354,11 @@ class EvalsConfig(BaseModel):
 
     target: CorpusTarget = Field(exclude=True, repr=False)
     store: EvalStore = Field(exclude=True, repr=False)
+    execution_capacity: EvalExecutionCapacity = Field(
+        default_factory=EvalExecutionCapacity,
+        exclude=True,
+        repr=False,
+    )
     execution_profile_policy: EvalExecutionProfilePolicyV1 = Field(
         default_factory=EvalExecutionProfilePolicyV1.safe_default
     )
@@ -391,6 +397,9 @@ class EvalsConfig(BaseModel):
         elif not config.store.durable:
             message = "store must be durable."
             location = "store"
+        elif type(config.execution_capacity) is not EvalExecutionCapacity:
+            message = "execution_capacity must be an exact EvalExecutionCapacity."
+            location = "execution_capacity"
         elif config.execution_profile_policy.max_trials > config.target.limits.max_trials:
             message = "execution profile trial ceiling exceeds target authority."
             location = "execution_profile_policy"

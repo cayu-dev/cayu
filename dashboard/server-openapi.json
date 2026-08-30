@@ -210,6 +210,30 @@
             ],
             "title": "Memory Evidence Fingerprint"
           },
+          "open_operation_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Open Operation Ids",
+            "type": "array"
+          },
+          "pending_approval_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Pending Approval Ids",
+            "type": "array"
+          },
+          "provider_continuation_ids": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Provider Continuation Ids",
+            "type": "array"
+          },
           "record_type": {
             "const": "cayu.agent-snapshot-result",
             "default": "cayu.agent-snapshot-result",
@@ -225,9 +249,20 @@
             "title": "Runtime Evidence Fingerprint",
             "type": "string"
           },
+          "safe_frontier_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Safe Frontier Fingerprint"
+          },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -5873,7 +5908,7 @@
           },
           "max_concurrency": {
             "default": 1,
-            "maximum": 32.0,
+            "maximum": 2147483647.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -11404,7 +11439,7 @@
             "type": "integer"
           },
           "max_concurrency": {
-            "maximum": 32.0,
+            "maximum": 2147483647.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -13338,7 +13373,7 @@
             "$ref": "#/components/schemas/EvalRunInvocation"
           },
           "max_concurrency": {
-            "maximum": 32.0,
+            "maximum": 2147483647.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -15277,7 +15312,7 @@
             "type": "string"
           },
           "max_concurrency": {
-            "maximum": 32.0,
+            "maximum": 2147483647.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -26300,7 +26335,7 @@
             "title": "Environment Name"
           },
           "max_concurrency": {
-            "maximum": 32.0,
+            "maximum": 2147483647.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -26535,7 +26570,7 @@
           },
           "max_concurrency": {
             "default": 1,
-            "maximum": 32.0,
+            "maximum": 2147483647.0,
             "minimum": 1.0,
             "title": "Max Concurrency",
             "type": "integer"
@@ -26821,7 +26856,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "37",
+            "default": "38",
             "title": "Contract Version",
             "type": "string"
           },
@@ -31320,7 +31355,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "37",
+            "default": "38",
             "title": "Contract Version",
             "type": "string"
           }
@@ -33779,7 +33814,7 @@
                   },
                   "max_concurrency": {
                     "default": 1,
-                    "maximum": 32,
+                    "maximum": 2147483647,
                     "minimum": 1,
                     "title": "Max Concurrency",
                     "type": "integer"

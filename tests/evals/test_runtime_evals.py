@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Event as ThreadEvent
@@ -27,6 +28,7 @@ from cayu import (
     EvalCase,
     EvalCaseResult,
     EvalContext,
+    EvalExecutionCapacity,
     EvalOutcome,
     EvalRun,
     EvalStatus,
@@ -1632,6 +1634,83 @@ def test_max_concurrency_fills_slots_with_trials_from_one_case():
     assert provider.max_active == 3
     assert [trial.trial_number for trial in result.cases[0].trials] == [1, 2, 3]
     assert result.status == EvalStatus.PASSED
+
+
+def test_shared_execution_capacity_bounds_trials_across_concurrent_runs():
+    async def exercise() -> tuple[_OverlapProbeProvider, EvalExecutionCapacity]:
+        provider = _OverlapProbeProvider(expected=2)
+        app = _app_with_provider(provider)
+        capacity = EvalExecutionCapacity(max_active_trials=2)
+        await asyncio.gather(
+            run_eval_suite(
+                app,
+                EvalSuite(id="first", cases=[_case("a"), _case("b")]),
+                max_concurrency=2,
+                execution_capacity=capacity,
+            ),
+            run_eval_suite(
+                app,
+                EvalSuite(id="second", cases=[_case("c"), _case("d")]),
+                max_concurrency=2,
+                execution_capacity=capacity,
+            ),
+        )
+        return provider, capacity
+
+    provider, capacity = asyncio.run(exercise())
+
+    assert provider.max_active == 2
+    assert capacity.max_active_trials == 2
+    assert capacity.peak_active_trials == 2
+    assert capacity.active_trials == 0
+
+
+def test_default_execution_capacity_holds_100_and_cleans_up_cancelled_101st_waiter():
+    async def exercise() -> EvalExecutionCapacity:
+        capacity = EvalExecutionCapacity()
+        entered = asyncio.Event()
+
+        async def wait_for_slot() -> None:
+            async with capacity.slot():
+                entered.set()
+
+        async with AsyncExitStack() as slots:
+            for _ in range(100):
+                await slots.enter_async_context(capacity.slot())
+            assert capacity.active_trials == 100
+
+            waiter = asyncio.create_task(wait_for_slot())
+            await asyncio.sleep(0)
+            assert not waiter.done()
+            assert not entered.is_set()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+        assert capacity.active_trials == 0
+        async with capacity.slot():
+            assert capacity.active_trials == 1
+        return capacity
+
+    capacity = asyncio.run(exercise())
+
+    assert capacity.max_active_trials == 100
+    assert capacity.peak_active_trials == 100
+    assert capacity.active_trials == 0
+
+
+def test_eval_execution_capacity_allows_large_operator_selected_capacity():
+    capacity = EvalExecutionCapacity(max_active_trials=10_000)
+
+    async def use_one_slot() -> None:
+        async with capacity.slot():
+            assert capacity.active_trials == 1
+
+    asyncio.run(use_one_slot())
+    asyncio.run(use_one_slot())
+
+    assert capacity.max_active_trials == 10_000
+    assert capacity.active_trials == 0
 
 
 def test_run_eval_suite_rejects_invalid_concurrency_and_timeout():

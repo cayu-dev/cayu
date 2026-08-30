@@ -30,6 +30,7 @@ from cayu.evals.calibration import (
     EvalJudgeCalibrationDraftV1,
     EvalJudgeCalibrationReportV1,
 )
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -41,10 +42,7 @@ from cayu.evals.corpus import (
     RunInputSpec,
     TrialRequestSpec,
 )
-from cayu.evals.execution import (
-    CORPUS_EXECUTION_MAX_CONCURRENCY,
-    CorpusExecutionResult,
-)
+from cayu.evals.execution import CorpusExecutionResult
 from cayu.evals.execution_comparison import CorpusExecutionComparison
 from cayu.evals.execution_profiles import EvalExecutionProfileV1
 from cayu.evals.promotion import (
@@ -1062,7 +1060,7 @@ class EvalTargetCatalogEntry(ApiBaseModel):
     )
     app_manifest_fingerprint: EvalSha256Hex
     max_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
-    max_concurrency: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     max_timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
     max_steps: StrictInt = Field(ge=1, le=256)
     cost_budget_available: StrictBool
@@ -1226,7 +1224,7 @@ class EvalRunCreateRequest(ApiBaseModel):
     corpus_revision: EvalRevision
     suite_id: PromotionPortableId
     expected_execution_profile_revision: EvalRevision
-    max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_concurrency: StrictInt = Field(default=1, ge=1, le=EVAL_MAX_CONCURRENCY)
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
@@ -1506,7 +1504,7 @@ class CapturedEvaluationLaunchRequest(CapturedEvaluationSaveRequest):
 
     trial_request: TrialRequestSpec = Field(default_factory=TrialRequestSpec)
     expected_execution_profile_revision: EvalRevision
-    max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_concurrency: StrictInt = Field(default=1, ge=1, le=EVAL_MAX_CONCURRENCY)
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None

@@ -89,6 +89,28 @@ guard.
 
 ## Unreleased
 
+### Evals separate per-run concurrency from shared runtime capacity
+
+Evaluation targets and durable run records no longer impose a universal
+32- or 100-trial concurrency ceiling. The existing target and run
+`max_concurrency` values remain finite per-run authority and dispatch controls,
+with a portable representation maximum of 2,147,483,647 shared by public models,
+SQLite, PostgreSQL, and browser clients.
+Applications may now share an `EvalExecutionCapacity` across concurrent run
+coordinators to bound aggregate active trials in one process. The shared
+capacity defaults to 100, is explicitly operator-configurable without a
+Runtime-defined upper ceiling, and releases permits across success, failure,
+timeout, and cancellation. The 100 default is the N9 deployment target, not a
+power-of-two or Runtime-wide limit. Storage revision 72 replaces the obsolete
+32 ceiling with the portable representation maximum while retaining the
+positive-integer invariant. Migrate shared stores and upgrade workers together;
+do not mix pre-72 writers with the widened contract.
+
+The server/dashboard contract advances from version 37 to version 38 for the
+widened Evals concurrency schemas. Upgrade independently deployed servers,
+generated clients, and dashboards together; a v37 client must not guess the new
+authority from a v38 server.
+
 ### Complete agents can be exported, copied, imported, and freshly materialized
 
 `AgentBundle` now transports one exact `AgentSnapshotRef` plus its complete

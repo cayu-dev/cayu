@@ -472,6 +472,17 @@ def test_revision_seventy_one_requires_atomic_recall_delivery_writers() -> None:
         )
 
 
+def test_revision_seventy_two_raises_the_durable_corpus_concurrency_ceiling() -> None:
+    revision = m.revision(72)
+    state = m.SchemaState(revision=72, compatible_from=72)
+
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 72
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 72"):
+        m.validate(state, app_latest=71, app_min_supported=71)
+    m.validate(state, app_latest=72, app_min_supported=72)
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

@@ -26,11 +26,13 @@ from tests.evals.test_memory_reporting import _report_fixture
 
 import cayu.evals.execution as execution_module
 import cayu.server.evals_worker as evals_worker_module
+import cayu.server.routes as routes_module
 import cayu.storage.evals_sqlite as evals_sqlite_module
 from cayu import (
     AgentSpec,
     CayuApp,
     CorpusTarget,
+    EvalExecutionCapacity,
     EvalExecutionProfilePolicyV1,
     Message,
     ModelJudgeTarget,
@@ -250,6 +252,39 @@ def test_evals_rejects_a_target_from_another_application(tmp_path) -> None:
         )
         with pytest.raises(ValueError, match="attached CayuApp"):
             create_server(other, config=config)
+    finally:
+        asyncio.run(store.close())
+
+
+def test_server_preserves_explicit_shared_eval_execution_capacity(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    target = _target(_provider())
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    capacity = EvalExecutionCapacity(max_active_trials=10_000)
+    observed = []
+
+    class RecordingCoordinator:
+        def __init__(self, runtime) -> None:
+            observed.append(runtime.execution_capacity)
+
+        def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(routes_module, "EvalRunCoordinator", RecordingCoordinator)
+    config = ServerConfig.protected(
+        _authenticate,
+        dashboard=DashboardConfig(enabled=False),
+        evals=_evals_config(target, store, execution_capacity=capacity),
+    )
+    try:
+        with TestClient(create_server(target.app, config=config)):
+            pass
+        assert observed == [capacity]
     finally:
         asyncio.run(store.close())
 

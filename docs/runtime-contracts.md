@@ -214,6 +214,16 @@ state. Automatic storage and identity without an executable target publish
 `eval_target_not_configured`; no Evals worker or mutation route is mounted from
 that partial state.
 
+One explicit `EvalsConfig` also carries one exact process-local
+`EvalExecutionCapacity` through server assembly into every coordinator in that
+capacity domain; validation must not replace it with a fresh default instance.
+Its default of 100 active trials is the N9 deployment target, not a power-of-two
+requirement or Runtime-wide maximum, and operators may choose a larger finite
+value from measured downstream capacity. Per-run `max_concurrency` remains a
+separate dispatch authority. Its public and durable representation is bounded
+to 1 through 2,147,483,647 across Python models, browser clients, SQLite, and
+PostgreSQL; that representational maximum is not an operational recommendation.
+
 A project may additionally declare a synchronous `service_factory` using
 Cayu's maintained public-agent service contract. The factory accepts the
 explicit `ServiceMode` selected by serving or deployment inspection and returns
@@ -10735,8 +10745,11 @@ content. `EvalRun.schema_version == 9`, trajectory schema version 5, and
 `PublishedEvalRun.schema_version == 8` bind the new evidence and typed result
 details. Result compatibility continues to use exact assertion revisions and
 the admitted evidence-policy revision, so digest/text changes or policy changes
-cannot compare as the same contract. Server/dashboard contract version 37
-carries the authoring, readiness, promotion, and drill-down shapes.
+cannot compare as the same contract. Server/dashboard contract version 38
+carries the authoring, readiness, promotion, drill-down, and widened portable
+Evals concurrency shapes. Independently deployed version-37 servers, clients,
+and dashboards must upgrade or regenerate together rather than guessing the
+new authority.
 
 ## Portable memory intervention evidence
 

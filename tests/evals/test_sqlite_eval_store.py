@@ -6,6 +6,7 @@ import threading
 from contextlib import suppress
 
 import pytest
+from pydantic import ValidationError
 from tests.evals.eval_store_conformance import (
     _scenario,
     assert_captured_eval_store_conformance,
@@ -26,6 +27,7 @@ from tests.evals.test_corpus_execution import (
 from tests.evals.test_judge_calibration import _calibration_report
 
 import cayu.storage.evals_sqlite as evals_sqlite_module
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import EvalCorpusDocument
 from cayu.evals.execution import CorpusExecutionResult, run_corpus_suite
 from cayu.evals.store import (
@@ -73,6 +75,7 @@ def _request(
     *,
     run_id: str = "run-1",
     idempotency_digit: str = "1",
+    max_concurrency: int = 1,
 ) -> EvalRunRequest:
     suite = corpus.suites[0]
     return EvalRunRequest(
@@ -82,8 +85,27 @@ def _request(
         target_key=corpus.target_key,
         suite_id=suite.id,
         suite_revision=suite.revision,
-        max_concurrency=1,
+        max_concurrency=max_concurrency,
     )
+
+
+def test_sqlite_eval_store_durably_admits_operator_selected_concurrency(tmp_path) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        store = SQLiteEvalStore(tmp_path / "evals.db")
+        try:
+            await _save_corpus(store, corpus)
+            admitted = await _admit_run(
+                store,
+                _request(corpus, max_concurrency=EVAL_MAX_CONCURRENCY),
+            )
+            assert admitted.spec.max_concurrency == EVAL_MAX_CONCURRENCY
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+    with pytest.raises(ValidationError, match="less than or equal"):
+        _request(_corpus(trials=1), max_concurrency=EVAL_MAX_CONCURRENCY + 1)
 
 
 def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
@@ -306,7 +328,7 @@ def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_pr
         connection.close()
 
 
-def test_sqlite_eval_store_requires_revision_sixty_eight_calibration_schema(
+def test_sqlite_eval_store_requires_current_schema(
     tmp_path,
 ) -> None:
     path = tmp_path / "evals-revision-56-validate.db"
@@ -325,8 +347,81 @@ def test_sqlite_eval_store_requires_revision_sixty_eight_calibration_schema(
         schema_migrations.REVISIONS = revisions
         connection.close()
 
-    with pytest.raises(SchemaTooOld, match="requires >= 68"):
+    with pytest.raises(SchemaTooOld, match="requires >= 72"):
         SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+
+
+def test_sqlite_eval_store_requires_and_migrates_revision_seventy_two(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        path = tmp_path / "evals-revision-71.db"
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+
+        with monkeypatch.context() as legacy:
+            legacy.setattr(
+                schema_migrations,
+                "REVISIONS",
+                tuple(
+                    revision for revision in schema_migrations.REVISIONS if revision.revision <= 71
+                ),
+            )
+            legacy.setattr(
+                evals_sqlite_module,
+                "_SQLITE_EVAL_MIN_REQUIRED_REVISION",
+                68,
+            )
+            old_store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+            try:
+                await _save_corpus(old_store, corpus)
+                await _admit_run(old_store, _request(corpus, run_id="old-run"))
+                lease = await old_store.claim_run()
+                assert lease is not None
+                await _publish_result(old_store, lease.claim, result)
+            finally:
+                await old_store.close()
+
+        with pytest.raises(SchemaTooOld, match="requires >= 72"):
+            SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+
+        migrated = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+        try:
+            admitted = await _admit_run(
+                migrated,
+                _request(
+                    corpus,
+                    run_id="wide-run",
+                    idempotency_digit="2",
+                    max_concurrency=EVAL_MAX_CONCURRENCY,
+                ),
+            )
+            assert admitted.spec.max_concurrency == EVAL_MAX_CONCURRENCY
+            assert await migrated.load_result("old-run") == result
+        finally:
+            await migrated.close()
+
+        connection = sqlite3.connect(path)
+        try:
+            assert connection.execute("PRAGMA user_version").fetchone() == (72,)
+            assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+            foreign_tables = {
+                row[2]
+                for row in connection.execute(
+                    "PRAGMA foreign_key_list(cayu_eval_results)"
+                ).fetchall()
+            }
+            assert "cayu_eval_runs" in foreign_tables
+        finally:
+            connection.close()
+
+    asyncio.run(exercise())
 
 
 def test_sqlite_revision_sixty_four_rejects_conflicting_authored_suite_table(

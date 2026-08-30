@@ -21,6 +21,11 @@ from pydantic import (
 from cayu._validation import json_utf8_size_within_limit
 from cayu.core.messages import Message, MessageRole, TextPart, detach_message
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
+from cayu.evals.capacity import (
+    DEFAULT_EVAL_MAX_ACTIVE_TRIALS,
+    EVAL_MAX_CONCURRENCY,
+    EvalExecutionCapacity,
+)
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_MESSAGE_CHARS,
@@ -76,7 +81,10 @@ from cayu.runtime.sessions import RunRequest, copy_run_request
 CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES = EVAL_CORPUS_MAX_MESSAGES_PER_CASE
 CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS = EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS * 2
 CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS = 8 << 20
-CORPUS_EXECUTION_MAX_CONCURRENCY = 32
+CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY = DEFAULT_EVAL_MAX_ACTIVE_TRIALS
+# Backwards-compatible import name. This value is the default target authority,
+# not a Runtime-wide ceiling; callers may configure a larger finite value.
+CORPUS_EXECUTION_MAX_CONCURRENCY = CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY
 CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES = 1 << 20
 CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES = 64 << 10
 CORPUS_EXECUTION_RESULT_MAX_BYTES = 40 << 20
@@ -121,9 +129,9 @@ class CorpusExecutionLimits(BaseModel):
         le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     )
     max_concurrency: StrictInt = Field(
-        default=CORPUS_EXECUTION_MAX_CONCURRENCY,
+        default=CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY,
         ge=1,
-        le=CORPUS_EXECUTION_MAX_CONCURRENCY,
+        le=EVAL_MAX_CONCURRENCY,
     )
     max_bootstrap_messages: StrictInt = Field(
         default=CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES,
@@ -1278,6 +1286,7 @@ async def run_corpus_suite(
     suite_id: str,
     *,
     max_concurrency: int = 1,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> CorpusExecutionResult:
     """Execute one corpus suite through Cayu's existing runner and publish it safely."""
 
@@ -1291,6 +1300,7 @@ async def run_corpus_suite(
         validated_target,
         compiled,
         max_concurrency=max_concurrency,
+        execution_capacity=execution_capacity,
     )
 
 
@@ -1303,6 +1313,7 @@ async def _run_compiled_corpus_suite(
     expected_app_manifest_fingerprint: str | None = None,
     expected_execution_profile: ExecutionProfileIdentity | None = None,
     native_run_id: str | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> CorpusExecutionResult:
     """Execute one internally compiled suite without repeating corpus compilation."""
 
@@ -1418,6 +1429,7 @@ async def _run_compiled_corpus_suite(
         ),
         run_id=selected_run_id,
         trial_request_transform=trial_request_transform,
+        execution_capacity=execution_capacity,
     )
     return await asyncio.to_thread(
         _finalize_compiled_corpus_result,

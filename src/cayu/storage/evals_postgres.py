@@ -129,7 +129,7 @@ from cayu.evals.suite_authoring import (
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 68
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 72
 
 _RUN_COLUMNS = """
     run_id,

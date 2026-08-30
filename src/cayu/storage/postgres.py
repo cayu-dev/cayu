@@ -3533,6 +3533,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             ) WHERE state != 'acknowledged'
         """,
     ),
+    72: (
+        "ALTER TABLE cayu_eval_runs DROP CONSTRAINT IF EXISTS cayu_eval_runs_max_concurrency_check",
+        "ALTER TABLE cayu_eval_runs ADD CONSTRAINT "
+        "cayu_eval_runs_max_concurrency_check "
+        "CHECK (max_concurrency >= 1 AND max_concurrency <= 2147483647)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -5368,6 +5374,8 @@ class _PostgresStoreBase:
             await self._validate_eval_authored_suite_schema(cur)
         if self._min_required_revision >= 68:
             await self._validate_eval_judge_calibration_schema(cur)
+        if self._min_required_revision >= 72:
+            await self._validate_eval_run_max_concurrency_schema(cur)
         if self._min_required_revision >= 70:
             await self._validate_interrupted_task_handoff_schema(cur)
         if state.revision >= 23:
@@ -7988,6 +7996,39 @@ class _PostgresStoreBase:
                 "Postgres schema object 'cayu_eval_runs.invocation_json' conflicts "
                 "with Cayu's revision-50 durable eval invocation contract. Run "
                 "`cayu storage migrate` or restore the database from a known-good backup."
+            )
+
+    async def _validate_eval_run_max_concurrency_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT column_record.data_type,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM information_schema.columns AS column_record
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.nspname = column_record.table_schema
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.relnamespace = namespace.oid
+             AND table_record.relname = column_record.table_name
+            LEFT JOIN pg_catalog.pg_constraint AS constraint_record
+              ON constraint_record.conrelid = table_record.oid
+             AND constraint_record.conname = 'cayu_eval_runs_max_concurrency_check'
+            WHERE column_record.table_schema = current_schema()
+              AND column_record.table_name = 'cayu_eval_runs'
+              AND column_record.column_name = 'max_concurrency'
+            """
+        )
+        row = await cur.fetchone()
+        definition = "" if row is None or row[1] is None else "".join(str(row[1]).lower().split())
+        if (
+            row is None
+            or row[0] != "integer"
+            or "max_concurrency>=1" not in definition
+            or "max_concurrency<=2147483647" not in definition
+        ):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.max_concurrency' conflicts "
+                "with Cayu's revision-72 portable concurrency contract. Run `cayu "
+                "storage migrate` or restore the database from a known-good backup."
             )
 
     async def _validate_eval_run_scenario_progress_column(self, cur: Any) -> None:

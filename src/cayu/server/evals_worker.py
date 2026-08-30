@@ -472,6 +472,7 @@ class EvalRunCoordinator:
                 ),
                 expected_execution_profile=prepared.execution_profile,
                 native_run_id=lease.run.id,
+                execution_capacity=self._config.execution_capacity,
             )
         else:
             if prepared.scenario_binding is None:
@@ -490,6 +491,7 @@ class EvalRunCoordinator:
                     registration.catalog_entry.app_manifest_fingerprint
                 ),
                 expected_execution_profile=prepared.execution_profile,
+                execution_capacity=self._config.execution_capacity,
             )
         execution = asyncio.create_task(
             execution_coro,

@@ -62,16 +62,22 @@ async def _publish_result(store, claim, result):
     )
 
 
-def _request(corpus, *, run_id: str = "run-1") -> EvalRunRequest:
+def _request(
+    corpus,
+    *,
+    run_id: str = "run-1",
+    idempotency_digit: str = "1",
+    max_concurrency: int = 1,
+) -> EvalRunRequest:
     suite = corpus.suites[0]
     return EvalRunRequest(
         run_id=run_id,
-        idempotency_key="sha256:" + "1" * 64,
+        idempotency_key="sha256:" + idempotency_digit * 64,
         corpus_revision=corpus.revision,
         target_key=corpus.target_key,
         suite_id=suite.id,
         suite_revision=suite.revision,
-        max_concurrency=1,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -180,6 +186,90 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn, tmp_path) -> None:
             assert await restarted.load_result("structural-restart") == structure_result
         finally:
             await restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_eval_store_requires_and_migrates_revision_seventy_two(
+    postgres_dsn,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        import cayu.storage.evals_postgres as evals_postgres_module
+        from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
+        from cayu.storage import migrations as schema_migrations
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode, SchemaTooOld
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+
+        with monkeypatch.context() as legacy:
+            legacy.setattr(
+                schema_migrations,
+                "REVISIONS",
+                tuple(
+                    revision for revision in schema_migrations.REVISIONS if revision.revision <= 71
+                ),
+            )
+            legacy.setattr(
+                evals_postgres_module.PostgresEvalStore,
+                "_min_required_revision",
+                68,
+            )
+            old_store = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+            try:
+                await _save_corpus(old_store, corpus)
+                await _admit_run(old_store, _request(corpus, run_id="old-run"))
+                lease = await old_store.claim_run()
+                assert lease is not None
+                await _publish_result(old_store, lease.claim, result)
+            finally:
+                await old_store.close()
+
+        validating = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(SchemaTooOld, match="requires >= 72"):
+                await validating.list_corpora()
+        finally:
+            await validating.close()
+
+        migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            admitted = await _admit_run(
+                migrated,
+                _request(
+                    corpus,
+                    run_id="wide-run",
+                    idempotency_digit="2",
+                    max_concurrency=EVAL_MAX_CONCURRENCY,
+                ),
+            )
+            assert admitted.spec.max_concurrency == EVAL_MAX_CONCURRENCY
+            assert await migrated.load_result("old-run") == result
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT revision FROM cayu_schema_migrations WHERE revision = 72")
+            assert await cur.fetchone() == (72,)
+            await cur.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_eval_runs' AND column_name = 'max_concurrency'"
+            )
+            assert await cur.fetchone() == ("integer",)
 
     asyncio.run(exercise())
 

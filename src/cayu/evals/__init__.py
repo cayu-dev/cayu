@@ -46,6 +46,7 @@ from cayu.evals.calibration import (
     prepare_eval_judge_calibration,
     run_eval_judge_calibration_trial,
 )
+from cayu.evals.capacity import DEFAULT_EVAL_MAX_ACTIVE_TRIALS, EvalExecutionCapacity
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -124,6 +125,7 @@ from cayu.evals.evidence import (
     project_assertion_evidence_view,
 )
 from cayu.evals.execution import (
+    CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY,
     CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES,
     CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES,
     CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
@@ -671,6 +673,7 @@ __all__ = [
     "CORPUS_EXECUTION_COMPARISON_MAX_BYTES",
     "CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES",
     "CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES",
+    "CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY",
     "CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES",
     "CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES",
     "CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS",
@@ -682,6 +685,7 @@ __all__ = [
     "CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES",
     "CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES",
     "CORPUS_EXECUTION_RESULT_SCHEMA_VERSION",
+    "DEFAULT_EVAL_MAX_ACTIVE_TRIALS",
     "EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE",
     "EVAL_CORPUS_MAX_BYTES",
     "EVAL_CORPUS_MAX_CASES",
@@ -830,6 +834,7 @@ __all__ = [
     "EvalCorpusInspectionV1",
     "EvalCorpusSuiteInspectionV1",
     "EvalExecutionCandidateIdentityV1",
+    "EvalExecutionCapacity",
     "EvalExecutionProfileBindingV1",
     "EvalExecutionProfilePolicyV1",
     "EvalExecutionProfileV1",

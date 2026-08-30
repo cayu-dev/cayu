@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 from cayu._validation import require_durable_clean_nonblank, require_unicode_scalar_text
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
+from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
@@ -549,6 +550,7 @@ class ResolvedEvalsRuntime:
 
     registry: EvalTargetRegistry
     store: EvalStore
+    execution_capacity: EvalExecutionCapacity
     lease_seconds: int
     poll_interval_seconds: float
     shutdown_grace_seconds: float
@@ -558,6 +560,8 @@ class ResolvedEvalsRuntime:
             raise TypeError("registry must be an exact EvalTargetRegistry.")
         if not isinstance(self.store, EvalStore) or not self.store.durable:
             raise TypeError("store must be a durable EvalStore.")
+        if type(self.execution_capacity) is not EvalExecutionCapacity:
+            raise TypeError("execution_capacity must be an exact EvalExecutionCapacity.")
 
 
 def generated_eval_target_registry(
@@ -741,6 +745,7 @@ def resolved_evals_runtime(
                 policy=explicit.execution_profile_policy,
             ),
             store=explicit.store,
+            execution_capacity=explicit.execution_capacity,
             lease_seconds=explicit.lease_seconds,
             poll_interval_seconds=explicit.poll_interval_seconds,
             shutdown_grace_seconds=explicit.shutdown_grace_seconds,
@@ -750,6 +755,7 @@ def resolved_evals_runtime(
     return ResolvedEvalsRuntime(
         registry=registry,
         store=automatic_store,
+        execution_capacity=EvalExecutionCapacity(),
         lease_seconds=DEFAULT_EVAL_LEASE_SECONDS,
         poll_interval_seconds=DEFAULT_EVAL_POLL_INTERVAL_SECONDS,
         shutdown_grace_seconds=DEFAULT_EVAL_SHUTDOWN_GRACE_SECONDS,

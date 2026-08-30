@@ -3406,6 +3406,120 @@ _MIGRATION_STEPS: dict[int, str] = {
                 access_policy_sha256, checkpoint_revision, delivery_id
             ) WHERE state != 'acknowledged';
     """,
+    72: """
+        ALTER TABLE cayu_eval_runs RENAME TO cayu_eval_runs_revision_71;
+
+        CREATE TABLE cayu_eval_runs (
+            run_id TEXT COLLATE BINARY PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            corpus_revision TEXT NOT NULL
+                REFERENCES cayu_eval_corpora(revision),
+            target_key TEXT NOT NULL,
+            suite_id TEXT COLLATE BINARY NOT NULL,
+            suite_revision TEXT NOT NULL,
+            max_concurrency INTEGER NOT NULL
+                CHECK (max_concurrency >= 1 AND max_concurrency <= 2147483647),
+            invocation_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled')
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            cancel_requested_at TEXT,
+            claim_id TEXT,
+            ownership_epoch INTEGER NOT NULL DEFAULT 0
+                CHECK (ownership_epoch >= 0 AND ownership_epoch <= 9223372036854775807),
+            lease_expires_at TEXT,
+            result_revision TEXT,
+            result_status TEXT CHECK (
+                result_status IS NULL
+                OR result_status IN ('passed', 'failed', 'unavailable', 'error')
+            ),
+            result_score REAL CHECK (
+                result_score IS NULL OR (result_score >= 0.0 AND result_score <= 1.0)
+            ),
+            result_duration_ms INTEGER CHECK (
+                result_duration_ms IS NULL OR result_duration_ms >= 0
+            ),
+            failure_code TEXT CHECK (
+                failure_code IS NULL OR failure_code IN (
+                    'target_unavailable', 'corpus_unavailable', 'execution_failed',
+                    'worker_interrupted'
+                )
+            ),
+            scenario_progress_json TEXT CHECK (
+                scenario_progress_json IS NULL OR (
+                    json_valid(scenario_progress_json)
+                    AND length(CAST(scenario_progress_json AS BLOB)) BETWEEN 1 AND 262144
+                )
+            ),
+            CHECK (
+                (status IN ('completed', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+                OR (status NOT IN ('completed', 'failed', 'cancelled') AND finished_at IS NULL)
+            ),
+            CHECK (
+                (status IN ('cancelling', 'cancelled') AND cancel_requested_at IS NOT NULL)
+                OR (status NOT IN ('cancelling', 'cancelled') AND cancel_requested_at IS NULL)
+            ),
+            CHECK (
+                (status IN ('running', 'cancelling') AND started_at IS NOT NULL
+                    AND claim_id IS NOT NULL
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at > updated_at)
+                OR (status NOT IN ('running', 'cancelling') AND lease_expires_at IS NULL)
+            ),
+            CHECK (status NOT IN ('completed', 'failed') OR started_at IS NOT NULL),
+            CHECK (
+                (status = 'completed' AND result_revision IS NOT NULL
+                    AND result_status IS NOT NULL AND result_duration_ms IS NOT NULL)
+                OR (status != 'completed' AND result_revision IS NULL
+                    AND result_status IS NULL AND result_score IS NULL
+                    AND result_duration_ms IS NULL)
+            ),
+            CHECK (
+                (result_status IN ('passed', 'failed') AND result_score IS NOT NULL)
+                OR (result_status NOT IN ('passed', 'failed') AND result_score IS NULL)
+                OR result_status IS NULL
+            ),
+            CHECK (
+                (status = 'failed' AND failure_code IS NOT NULL)
+                OR (status != 'failed' AND failure_code IS NULL)
+            ),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        );
+
+        INSERT INTO cayu_eval_runs (
+            run_id, idempotency_key, corpus_revision, target_key, suite_id,
+            suite_revision, max_concurrency, invocation_json, status, created_at,
+            updated_at, started_at, finished_at, cancel_requested_at, claim_id,
+            ownership_epoch, lease_expires_at, result_revision, result_status,
+            result_score, result_duration_ms, failure_code, scenario_progress_json
+        )
+        SELECT
+            run_id, idempotency_key, corpus_revision, target_key, suite_id,
+            suite_revision, max_concurrency, invocation_json, status, created_at,
+            updated_at, started_at, finished_at, cancel_requested_at, claim_id,
+            ownership_epoch, lease_expires_at, result_revision, result_status,
+            result_score, result_duration_ms, failure_code, scenario_progress_json
+        FROM cayu_eval_runs_revision_71;
+
+        DROP TABLE cayu_eval_runs_revision_71;
+
+        CREATE INDEX idx_cayu_eval_runs_catalog
+            ON cayu_eval_runs(created_at DESC, run_id ASC);
+        CREATE INDEX idx_cayu_eval_runs_status_claim
+            ON cayu_eval_runs(status, lease_expires_at, created_at ASC, run_id ASC);
+        CREATE INDEX idx_cayu_eval_runs_corpus_catalog
+            ON cayu_eval_runs(corpus_revision, created_at DESC, run_id ASC);
+        CREATE INDEX idx_cayu_eval_runs_target_catalog
+            ON cayu_eval_runs(target_key, created_at DESC, run_id ASC);
+        CREATE INDEX idx_cayu_eval_runs_target_status_claim
+            ON cayu_eval_runs(
+                target_key, status, lease_expires_at, created_at ASC, run_id ASC
+            );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -5024,6 +5138,8 @@ def reconcile_schema(
         _validate_local_execution_attempt_schema(connection)
     if app_min_supported >= 68:
         _validate_eval_judge_calibration_schema(connection)
+    if app_min_supported >= 72:
+        _validate_eval_run_max_concurrency_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -7241,6 +7357,19 @@ def _validate_captured_eval_case_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_eval_run_max_concurrency_schema(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_eval_runs'"
+    ).fetchone()
+    normalized = "" if row is None or row[0] is None else "".join(str(row[0]).lower().split())
+    if "check(max_concurrency>=1andmax_concurrency<=2147483647)" not in normalized:
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.max_concurrency' conflicts with "
+            "Cayu's revision-72 portable concurrency contract. Run `cayu storage "
+            "migrate` or restore the database from a known-good backup."
+        )
+
+
 def _validate_eval_scenario_schema(connection: sqlite3.Connection) -> None:
     expected_columns = (
         ("revision", "TEXT", 0, 1),
@@ -8307,6 +8436,9 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _record_revision(connection, rev)
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return
+    if rev.revision == 72:
+        _apply_revision_seventy_two(connection, rev)
+        return
     with _transaction(connection):
         if rev.revision == 42:
             # Recheck under the same immediate writer transaction that owns the
@@ -8416,6 +8548,29 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_71_recall_delivery_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
+
+
+def _apply_revision_seventy_two(
+    connection: sqlite3.Connection,
+    rev: schema.Revision,
+) -> None:
+    """Rebuild the eval-run check without retargeting dependent foreign keys."""
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        with _transaction(connection):
+            for statement in _iter_statements(_MIGRATION_STEPS[72]):
+                connection.execute(statement)
+            _validate_eval_run_max_concurrency_schema(connection)
+            violation = connection.execute("PRAGMA foreign_key_check").fetchone()
+            if violation is not None:
+                raise RuntimeError("SQLite migration revision 72 broke an eval-store foreign key.")
+            _record_revision(connection, rev)
+            connection.execute(f"PRAGMA user_version = {rev.revision}")
+    finally:
+        connection.execute("PRAGMA legacy_alter_table = OFF")
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _apply_revision_seventeen(

@@ -22,6 +22,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
@@ -31,7 +32,6 @@ from cayu.evals.corpus import (
 from cayu.evals.execution import (
     CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES,
     CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
-    CORPUS_EXECUTION_MAX_CONCURRENCY,
     CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS,
     CorpusTarget,
 )
@@ -82,7 +82,7 @@ class EvalExecutionProfilePolicyV1(BaseModel):
     max_concurrency: StrictInt = Field(
         default=1,
         ge=1,
-        le=CORPUS_EXECUTION_MAX_CONCURRENCY,
+        le=EVAL_MAX_CONCURRENCY,
     )
 
     @field_validator("schema_version", mode="before")
@@ -213,7 +213,7 @@ class EvalExecutionResourceCeilingsV1(BaseModel):
 
     max_cases: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_CASES)
     max_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
-    max_concurrency: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     max_timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
     max_bootstrap_messages: StrictInt = Field(
         ge=0,

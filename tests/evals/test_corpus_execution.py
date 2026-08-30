@@ -17,6 +17,7 @@ from cayu import (
     ContextExposurePage,
     Environment,
     EnvironmentSpec,
+    EvalExecutionCapacity,
     EvalTrialDiagnosticCode,
     InMemorySessionStore,
     LocalWorkspace,
@@ -33,6 +34,7 @@ from cayu import (
     ToolSpec,
     WorkspaceBranchRequest,
 )
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -53,6 +55,7 @@ from cayu.evals.corpus import (
     pricing_profile_identity,
 )
 from cayu.evals.execution import (
+    CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY,
     CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES,
     CorpusExecutionLimits,
     CorpusExecutionResult,
@@ -498,6 +501,17 @@ def _model_judge_corpus(
         suites=(suite,),
         cases=(case,),
     )
+
+
+def test_corpus_execution_separates_the_default_from_the_portable_field_maximum() -> None:
+    assert CORPUS_EXECUTION_DEFAULT_MAX_CONCURRENCY == 100
+    assert CorpusExecutionLimits().max_concurrency == 100
+    assert (
+        CorpusExecutionLimits(max_concurrency=EVAL_MAX_CONCURRENCY).max_concurrency
+        == EVAL_MAX_CONCURRENCY
+    )
+    with pytest.raises(ValidationError, match="less than or equal"):
+        CorpusExecutionLimits(max_concurrency=EVAL_MAX_CONCURRENCY + 1)
 
 
 def test_compile_corpus_suite_uses_only_trusted_bootstrap_then_corpus_user_input():
@@ -1102,6 +1116,57 @@ def test_eval_plan_corpus_mode_uses_the_shared_execution_service():
 
     assert result.run.status == "passed"
     assert len(provider.requests) == 2
+
+
+def test_eval_plan_forwards_the_shared_execution_capacity_to_both_modes(monkeypatch):
+    target = _target(_provider())
+    corpus = _corpus()
+    capacity = EvalExecutionCapacity(max_active_trials=10_000)
+    observed = []
+    direct_result = object()
+    corpus_result = object()
+
+    async def observe_direct(*args, **kwargs):
+        observed.append(kwargs.get("execution_capacity"))
+        return direct_result
+
+    async def observe_corpus(*args, **kwargs):
+        observed.append(kwargs.get("execution_capacity"))
+        return corpus_result
+
+    monkeypatch.setattr(runner_module, "run_eval_suite", observe_direct)
+    monkeypatch.setattr(execution_module, "run_corpus_suite", observe_corpus)
+    direct_suite = runner_module.EvalSuite(
+        id="direct-plan",
+        cases=[
+            runner_module.EvalCase(
+                id="case",
+                request=RunRequest(agent_name=target.request_base.agent_name, messages=[]),
+            )
+        ],
+    )
+
+    assert (
+        asyncio.run(
+            run_eval_plan(
+                EvalPlan(app=target.app, suite=direct_suite),
+                execution_capacity=capacity,
+            )
+        )
+        is direct_result
+    )
+    assert (
+        asyncio.run(
+            run_eval_plan(
+                EvalPlan(corpus_target=target),
+                corpus=corpus,
+                suite_id="refund-regressions",
+                execution_capacity=capacity,
+            )
+        )
+        is corpus_result
+    )
+    assert observed == [capacity, capacity]
 
 
 def test_eval_plan_modes_are_mutually_exclusive_and_corpus_settings_are_authoritative():

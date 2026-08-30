@@ -184,8 +184,8 @@ Protected servers with durable Evals expose preview/save/catalog/download at
 execution and reports target or scenario-reference readiness. Save accepts only
 the exact reviewed revision, scans it through the target's credential-redaction
 boundary, and atomically verifies every scenario reference. The authored-suite
-catalog was introduced at storage revision 64; the current calibration-aware
-SQLite and PostgreSQL EvalStore implementations require revision 68. These
+catalog was introduced at storage revision 64; the current SQLite and PostgreSQL
+EvalStore implementations require revision 72. These
 authoring contracts
 do not create provider, tool, environment, fixture, secret, or runtime
 authority, and they do not change the existing one-trial execution default.
@@ -616,7 +616,9 @@ Input is bounded both per case and across the fully compiled suite, including th
 trusted bootstrap repeated for each case, so compilation cannot multiply one
 large bootstrap into an unbounded working set. The compiled-suite ceiling is
 8,388,608 input characters. A target may lower case, trial, timeout,
-concurrency, bootstrap, and input ceilings but cannot raise Cayu's hard limits.
+bootstrap, and input ceilings but cannot raise Cayu's hard limits. Concurrency
+is different: the target publishes a finite per-run ceiling, but Runtime does
+not impose a universal upper bound on the operator-selected value.
 The target key and application release ID are public result identity: both must
 cross the target app's workload-secret redaction boundary unchanged, or target
 validation fails before provider dispatch.
@@ -2005,7 +2007,7 @@ An embedded authenticated Cayu server can attach exactly one trusted
 `EvalsConfig` is complete programmatic V1 wiring and is off by default:
 
 ```python
-from cayu import SQLiteEvalStore
+from cayu import EvalExecutionCapacity, SQLiteEvalStore
 from cayu.server import BasicAuth, EvalsConfig, ServerConfig, create_server
 from cayu.storage.migrations import SchemaMode
 
@@ -2057,16 +2059,21 @@ For a host-owned FastAPI application, pass the same complete wiring directly to 
 mount. The `CorpusTarget.app` must be the exact `CayuApp` being mounted:
 
 ```python
-from cayu import SQLiteEvalStore
+from cayu import EvalExecutionCapacity, SQLiteEvalStore
 from cayu.server import AuthenticatedAccess, EvalsConfig, mount_cayu
 from cayu.storage.migrations import SchemaMode
 
 eval_store = SQLiteEvalStore("cayu.db", schema_mode=SchemaMode.MIGRATE)
+eval_capacity = EvalExecutionCapacity(max_active_trials=100)
 mount_cayu(
     server,
     target.app,
     access=AuthenticatedAccess(dependency=require_operator),
-    evals=EvalsConfig(target=target, store=eval_store),
+    evals=EvalsConfig(
+        target=target,
+        store=eval_store,
+        execution_capacity=eval_capacity,
+    ),
 )
 ```
 
@@ -2081,10 +2088,21 @@ for registered agents.
 The target must reference the exact `CayuApp` attached to the server. Open
 access, a disabled API, an in-memory store, incomplete wiring, or an unavailable
 target identity rejects during construction and mounts no Evals execution
-surface. `target` and `store` are excluded from configuration serialization and
-diagnostics. `ServerSettings` does not deserialize application objects,
+surface. `target`, `store`, and `execution_capacity` are excluded from
+configuration serialization and diagnostics. `ServerSettings` does not deserialize application objects,
 credentials, database handles, or executable targets from environment values;
 applications resolve those trusted objects before constructing `EvalsConfig`.
+`execution_capacity` is a process-local aggregate trial governor. Share one
+`EvalExecutionCapacity` instance across every coordinator that should compete
+for the same capacity domain. It defaults to 100 active trials, accepts larger
+operator-selected values such as 10,000, and remains independent of each run's
+`max_concurrency`. The per-run value bounds how much that run can request; the
+shared capacity bounds how many trials cooperating runs may execute at once.
+The default 100 is the N9 deployment target, not a power-of-two implementation
+choice or a Runtime-wide maximum. Configure it from measured provider, session,
+store, and memory capacity. Durable per-run `max_concurrency` fields have the
+separate portable representation limit 2,147,483,647 so PostgreSQL, SQLite, and
+browser clients reject an out-of-range value before storage.
 
 The protected `/api/evals` surface imports and downloads immutable corpora,
 lists corpora/suites/cases, creates and lists runs, reads status and terminal

@@ -37,6 +37,7 @@ from cayu.evals.calibration import (
     eval_judge_calibration_report_from_json,
     eval_judge_calibration_report_to_json,
 )
+from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -57,7 +58,6 @@ from cayu.evals.corpus import (
     inspect_eval_corpus,
 )
 from cayu.evals.execution import (
-    CORPUS_EXECUTION_MAX_CONCURRENCY,
     CORPUS_EXECUTION_RESULT_MAX_BYTES,
     CorpusExecutionResult,
 )
@@ -1649,7 +1649,7 @@ class EvalRunSpec(_EvalStoreModel):
     target_key: StrictStr
     suite_id: StrictStr
     suite_revision: StrictStr
-    max_concurrency: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_concurrency: StrictInt = Field(ge=1, le=EVAL_MAX_CONCURRENCY)
     invocation: EvalRunInvocation = Field(default_factory=EvalRunInvocation)
 
     @field_validator("run_id")

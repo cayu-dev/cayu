@@ -19,6 +19,7 @@ from cayu.artifacts import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import FilePart, Message, MessageRole, TextPart
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
+from cayu.evals.capacity import EvalExecutionCapacity
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -799,6 +800,7 @@ async def run_compiled_eval_scenario(
     manifest_project_root: Path | None = None,
     expected_app_manifest_fingerprint: str | None = None,
     expected_execution_profile: ExecutionProfileIdentity | None = None,
+    execution_capacity: EvalExecutionCapacity | None = None,
 ) -> CorpusExecutionResult:
     """Execute all scenario trials and return the ordinary corpus result shape."""
 
@@ -811,6 +813,8 @@ async def run_compiled_eval_scenario(
         raise TypeError(
             "expected_execution_profile must be an exact ExecutionProfileIdentity or None."
         )
+    if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
+        raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
     target_before = evaluation_target_identity(target, project_root=manifest_project_root)
     if (
         expected_app_manifest_fingerprint is not None
@@ -902,22 +906,28 @@ async def run_compiled_eval_scenario(
             ),
         )
         async with semaphore:
-            execution = await _run_case_once_with_public_projection(
-                target.app,
-                case,
-                trial_number=trial_number,
-                suite_id=compiled.suite.id,
-                retain_final_output=False,
-                timeout_seconds=binding.timeout_seconds,
-                public_output_preview_bytes=output_preview_bytes,
-                memory_attribution_bounds=memory_attribution_bounds,
-                memory_attribution_source_limit=memory_attribution_source_limit,
-                memory_attribution_max_bytes=memory_attribution_max_bytes,
-                run_stream=driver,
-                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            capacity_slot = (
+                contextlib.nullcontext()
+                if execution_capacity is None
+                else execution_capacity.slot()
             )
-            await driver.reconcile_terminal_progress()
-            slots[trial_number - 1] = execution
+            async with capacity_slot:
+                execution = await _run_case_once_with_public_projection(
+                    target.app,
+                    case,
+                    trial_number=trial_number,
+                    suite_id=compiled.suite.id,
+                    retain_final_output=False,
+                    timeout_seconds=binding.timeout_seconds,
+                    public_output_preview_bytes=output_preview_bytes,
+                    memory_attribution_bounds=memory_attribution_bounds,
+                    memory_attribution_source_limit=memory_attribution_source_limit,
+                    memory_attribution_max_bytes=memory_attribution_max_bytes,
+                    run_stream=driver,
+                    memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                )
+                await driver.reconcile_terminal_progress()
+                slots[trial_number - 1] = execution
 
     started_at = datetime.now(UTC)
     async with memory_attribution_read_lifecycle, asyncio.TaskGroup() as group:

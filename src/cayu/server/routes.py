@@ -4135,6 +4135,7 @@ def create_router(
             evals = EvalsConfig(
                 target=evals.target,
                 store=evals.store,
+                execution_capacity=evals.execution_capacity,
                 execution_profile_policy=evals.execution_profile_policy,
                 lease_seconds=evals.lease_seconds,
                 poll_interval_seconds=evals.poll_interval_seconds,

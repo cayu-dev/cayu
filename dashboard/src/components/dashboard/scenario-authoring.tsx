@@ -23,7 +23,6 @@ import {
   type EvalScenario,
   type EvalScenarioDraft,
   type EvalScenarioPreview,
-  type EvalTarget,
   fetchEnvironments,
   fetchEvalTargets,
   launchEvalScenario,
@@ -47,9 +46,14 @@ import {
 import type {
   ScenarioInputV2,
   ScenarioJsonPartV2,
-  ScenarioLaunchSettingsV2,
   ScenarioSecretRequirementV2,
 } from "@/lib/generated/server-api"
+import {
+  DEFAULT_SCENARIO_SETTINGS,
+  MAX_SAFE_SCENARIO_RUNTIME_LIMIT,
+  type ScenarioSettingsDraft,
+  scenarioLaunchSettingsContract,
+} from "@/lib/scenario-launch-settings"
 
 const SELECT_CLASS =
   "h-8 w-full rounded-lg border border-input bg-background px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -65,36 +69,6 @@ export type ScenarioAuthoringState = Readonly<{
   dirty: boolean
   pending: boolean
 }>
-
-type ScenarioSettingsDraft = {
-  environmentName: string
-  trials: string
-  maxConcurrency: string
-  timeoutSeconds: string
-  maxSteps: string
-  maxTotalTokens: string
-  maxToolCalls: string
-  maxElapsedSeconds: string
-  maxEstimatedCost: string
-  currency: string
-  artifactReferences: Record<string, string>
-}
-
-const DEFAULT_SETTINGS: ScenarioSettingsDraft = Object.freeze({
-  environmentName: "",
-  trials: "1",
-  maxConcurrency: "1",
-  timeoutSeconds: "300",
-  maxSteps: "",
-  maxTotalTokens: "",
-  maxToolCalls: "",
-  maxElapsedSeconds: "",
-  maxEstimatedCost: "",
-  currency: "USD",
-  artifactReferences: {},
-})
-
-const MAX_SAFE_RUNTIME_LIMIT = Number.MAX_SAFE_INTEGER
 
 function clone<T>(value: T): T {
   return structuredClone(value)
@@ -174,84 +148,6 @@ function defaultEvent(draft: EvalScenarioDraft, kind: Exclude<ScenarioEvent["kin
   return eventForKind(kind, draft.events.length, nextPortableId(draft, prefix))
 }
 
-function optionalPositiveInteger(value: string, maximum: number): number | null | undefined {
-  if (value.trim() === "") return undefined
-  const parsed = Number(value)
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) return null
-  return parsed
-}
-
-function settingsContract(
-  settings: ScenarioSettingsDraft,
-  target: EvalTarget | undefined,
-): ScenarioLaunchSettingsV2 | null {
-  const trials = Number(settings.trials)
-  const maxConcurrency = Number(settings.maxConcurrency)
-  const timeoutSeconds = Number(settings.timeoutSeconds)
-  const maxSteps = optionalPositiveInteger(settings.maxSteps, 256)
-  const maxTotalTokens = optionalPositiveInteger(settings.maxTotalTokens, MAX_SAFE_RUNTIME_LIMIT)
-  const maxToolCalls = optionalPositiveInteger(settings.maxToolCalls, MAX_SAFE_RUNTIME_LIMIT)
-  const maxElapsedSeconds = optionalPositiveInteger(
-    settings.maxElapsedSeconds,
-    MAX_SAFE_RUNTIME_LIMIT,
-  )
-  if (
-    !Number.isInteger(trials) ||
-    trials < 1 ||
-    trials > 100 ||
-    !Number.isInteger(maxConcurrency) ||
-    maxConcurrency < 1 ||
-    maxConcurrency > 32 ||
-    !Number.isInteger(timeoutSeconds) ||
-    timeoutSeconds < 1 ||
-    timeoutSeconds > 3_600 ||
-    maxSteps === null ||
-    maxTotalTokens === null ||
-    maxToolCalls === null ||
-    maxElapsedSeconds === null
-  ) {
-    return null
-  }
-  const hasLimits =
-    maxTotalTokens !== undefined || maxToolCalls !== undefined || maxElapsedSeconds !== undefined
-  const cost = settings.maxEstimatedCost.trim()
-  let costBudget: ScenarioLaunchSettingsV2["cost_budget"]
-  if (cost !== "") {
-    const currency = settings.currency.trim().toUpperCase()
-    if (
-      !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(cost) ||
-      Number(cost) <= 0 ||
-      target?.cost_budget_available !== true ||
-      !target.cost_budget_currencies.includes(currency)
-    ) {
-      return null
-    }
-    costBudget = { max_estimated_cost: cost, currency }
-  }
-  const artifactReferences = Object.fromEntries(
-    Object.entries(settings.artifactReferences)
-      .map(([key, value]) => [key, value.trim()])
-      .filter(([, value]) => value !== ""),
-  )
-  return {
-    environment_name: settings.environmentName.trim() || null,
-    trials,
-    max_concurrency: maxConcurrency,
-    timeout_seconds: timeoutSeconds,
-    max_steps: maxSteps ?? null,
-    limits: hasLimits
-      ? {
-          scope: "run",
-          max_total_tokens: maxTotalTokens,
-          max_tool_calls: maxToolCalls,
-          max_elapsed_seconds: maxElapsedSeconds,
-        }
-      : null,
-    cost_budget: costBudget ?? null,
-    artifact_references: artifactReferences,
-  }
-}
-
 export function ScenarioAuthoring({
   captured,
   disabled = false,
@@ -273,7 +169,7 @@ export function ScenarioAuthoring({
   const formId = useId()
   const [draft, setDraft] = useState(() => draftFromScenario(captured))
   const [settings, setSettings] = useState<ScenarioSettingsDraft>(() => ({
-    ...DEFAULT_SETTINGS,
+    ...DEFAULT_SCENARIO_SETTINGS,
     artifactReferences: {},
   }))
   const [preview, setPreview] = useState<EvalScenarioPreview | null>(null)
@@ -316,13 +212,13 @@ export function ScenarioAuthoring({
     hasUnmaterializedArtifactBindings
   const previewCurrent =
     preview !== null && previewIdentity === currentIdentity && invalidJsonEditors === 0
-  const settingsValue = settingsContract(settings, selectedTarget)
+  const settingsValue = scenarioLaunchSettingsContract(settings, selectedTarget)
 
   useEffect(() => {
     controllerRef.current?.abort()
     const nextDraft = draftFromScenario(captured)
     setDraft(nextDraft)
-    setSettings({ ...DEFAULT_SETTINGS, artifactReferences: {} })
+    setSettings({ ...DEFAULT_SCENARIO_SETTINGS, artifactReferences: {} })
     setPreview(null)
     setPreviewIdentity(null)
     setError(null)
@@ -732,7 +628,7 @@ export function ScenarioAuthoring({
               <NumberSetting
                 label="Concurrency"
                 value={settings.maxConcurrency}
-                maximum={selectedTarget?.max_concurrency ?? 32}
+                maximum={selectedTarget?.max_concurrency ?? 100}
                 edit={(maxConcurrency) =>
                   setSettings((current) => ({ ...current, maxConcurrency }))
                 }
@@ -757,7 +653,7 @@ export function ScenarioAuthoring({
               <NumberSetting
                 label="Max total tokens per trial"
                 value={settings.maxTotalTokens}
-                maximum={MAX_SAFE_RUNTIME_LIMIT}
+                maximum={MAX_SAFE_SCENARIO_RUNTIME_LIMIT}
                 optional
                 edit={(maxTotalTokens) =>
                   setSettings((current) => ({ ...current, maxTotalTokens }))
@@ -766,14 +662,14 @@ export function ScenarioAuthoring({
               <NumberSetting
                 label="Max tool calls per trial"
                 value={settings.maxToolCalls}
-                maximum={MAX_SAFE_RUNTIME_LIMIT}
+                maximum={MAX_SAFE_SCENARIO_RUNTIME_LIMIT}
                 optional
                 edit={(maxToolCalls) => setSettings((current) => ({ ...current, maxToolCalls }))}
               />
               <NumberSetting
                 label="Max run time per trial"
                 value={settings.maxElapsedSeconds}
-                maximum={MAX_SAFE_RUNTIME_LIMIT}
+                maximum={MAX_SAFE_SCENARIO_RUNTIME_LIMIT}
                 optional
                 edit={(maxElapsedSeconds) =>
                   setSettings((current) => ({ ...current, maxElapsedSeconds }))

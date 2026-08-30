@@ -106,6 +106,18 @@ export type AgentSnapshotResultBinding = {
      */
     memory_evidence_fingerprint?: string | null;
     /**
+     * Open Operation Ids
+     */
+    open_operation_ids?: Array<string>;
+    /**
+     * Pending Approval Ids
+     */
+    pending_approval_ids?: Array<string>;
+    /**
+     * Provider Continuation Ids
+     */
+    provider_continuation_ids?: Array<string>;
+    /**
      * Record Type
      */
     record_type?: 'cayu.agent-snapshot-result';
@@ -118,9 +130,13 @@ export type AgentSnapshotResultBinding = {
      */
     runtime_evidence_fingerprint: string;
     /**
+     * Safe Frontier Fingerprint
+     */
+    safe_frontier_fingerprint?: string | null;
+    /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     /**
      * Session Id
      */

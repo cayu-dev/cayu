@@ -26,6 +26,10 @@ import {
   scenarioEvalLaunchRequestIdentity,
   shortEvalIdentity,
 } from "../src/lib/evals-dashboard.ts"
+import {
+  DEFAULT_SCENARIO_SETTINGS,
+  scenarioLaunchSettingsContract,
+} from "../src/lib/scenario-launch-settings.ts"
 
 const evalLaunchRegistryKey = (scope) =>
   `cayu.eval-launch-idempotency.v1:${encodeURIComponent(scope)}`
@@ -45,6 +49,28 @@ class MemoryStorage {
     this.items.delete(key)
   }
 }
+
+test("scenario launch settings honor the selected target above 32", () => {
+  const target = {
+    max_trials: 100,
+    max_concurrency: 10_000,
+    max_timeout_seconds: 3_600,
+    cost_budget_available: false,
+    cost_budget_currencies: [],
+  }
+  const widened = {
+    ...DEFAULT_SCENARIO_SETTINGS,
+    maxConcurrency: "10000",
+  }
+
+  assert.equal(scenarioLaunchSettingsContract(widened, target).max_concurrency, 10_000)
+  assert.equal(
+    scenarioLaunchSettingsContract({ ...widened, maxConcurrency: "10001" }, target),
+    null,
+  )
+  assert.equal(scenarioLaunchSettingsContract(widened, { ...target, max_concurrency: 32 }), null)
+  assert.equal(scenarioLaunchSettingsContract(widened, undefined), null)
+})
 
 function run(status, result = null) {
   return { status, result }
