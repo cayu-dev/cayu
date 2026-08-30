@@ -986,6 +986,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
         SearchKnowledgeTool,
     )
     from cayu.tools.named_checks import RunCheckTool
+    from cayu.tools.patches import ApplyPatchTool
     from cayu.tools.search import SearchTextTool
     from cayu.tools.user_input import UserInputTool
     from cayu.tools.web import WebFetchTool
@@ -994,6 +995,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
     tool_types = (
         ExecCommandTool,
         RunCheckTool,
+        ApplyPatchTool,
         DeleteFileTool,
         EditFileTool,
         ListArtifactsTool,

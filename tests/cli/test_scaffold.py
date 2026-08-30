@@ -326,6 +326,7 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
         "list_files",
         "search_text",
         "read_file",
+        "apply_patch",
         "write_file",
         "edit_file",
         "delete_file",
@@ -490,6 +491,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     reviewer = app._agents["docker-coder-reviewer"]
     assert set(reviewer.tools) == set()
     assert "run_check" in primary.tools
+    assert "apply_patch" in primary.tools
     assert "exec_command" not in primary.tools
     assert primary.execution_requirements.code_trust == "trusted"
     assert primary.execution_requirements.network_access == "deny_by_default"

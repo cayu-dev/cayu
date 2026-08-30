@@ -23,8 +23,10 @@ from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
     guard_create,
     guard_delete_if_revision,
+    guard_move_if_revision,
     guard_read,
     guard_replace,
+    guard_require_absent,
 )
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.base import (
@@ -32,6 +34,7 @@ from cayu.workspaces.base import (
     RunnerBoundWorkspace,
     TarWriter,
     WorkspaceListResult,
+    WorkspaceMoveResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
     _local_resource_key,
@@ -793,6 +796,49 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
                 expected_revision, owner="RunnerWorkspace"
             ),
             original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
+        )
+
+    async def require_absent(self, path: str) -> None:
+        path = _validate_relative_path(path)
+        self._require_path_allowed(path)
+        await guard_require_absent(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            rel_path=path,
+            original_path=path,
+            backend="Runner",
+            python_executable=self.python_executable,
+        )
+
+    async def move_if_revision(
+        self,
+        source_path: str,
+        destination_path: str,
+        *,
+        expected_source_revision: str,
+        require_destination_absent: bool = True,
+    ) -> WorkspaceMoveResult:
+        if type(require_destination_absent) is not bool:
+            raise TypeError("Workspace require_destination_absent must be a bool.")
+        if not require_destination_absent:
+            raise ValueError("Workspace moves must require an absent destination.")
+        source = _validate_relative_path(source_path)
+        destination = _validate_relative_path(destination_path)
+        self._require_path_allowed(source)
+        self._require_path_allowed(destination)
+        return await guard_move_if_revision(
+            self._runner,
+            root=self._runner.resolve_cwd(self.cwd),
+            source_rel_path=source,
+            destination_rel_path=destination,
+            expected_revision=_validate_workspace_revision(
+                expected_source_revision,
+                owner="RunnerWorkspace",
+            ),
+            original_source_path=source,
+            original_destination_path=destination,
             backend="Runner",
             python_executable=self.python_executable,
         )

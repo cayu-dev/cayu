@@ -12,8 +12,10 @@ from cayu.workspaces._local_guard import (
     create_regular,
     delete_regular,
     delete_regular_if_revision,
+    move_regular_if_revision,
     open_regular_for_read,
     replace_regular_if_revision,
+    require_absent_regular,
     write_regular,
 )
 from cayu.workspaces._mutations import (
@@ -21,11 +23,13 @@ from cayu.workspaces._mutations import (
     mutation_result,
     mutation_result_from_identities,
     workspace_path_lock,
+    workspace_path_locks,
     workspace_source_lock,
 )
 from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
+    WorkspaceMoveResult,
     WorkspaceMutationResult,
     WorkspaceReadOffsetError,
     WorkspaceReadResult,
@@ -294,6 +298,36 @@ class LocalWorkspace(Workspace):
             expected_revision,
         )
 
+    async def require_absent(self, path: str) -> None:
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        await asyncio.to_thread(_require_file_absent, self.root, relative_path)
+
+    async def move_if_revision(
+        self,
+        source_path: str,
+        destination_path: str,
+        *,
+        expected_source_revision: str,
+        require_destination_absent: bool = True,
+    ) -> WorkspaceMoveResult:
+        if type(require_destination_absent) is not bool:
+            raise TypeError("Workspace require_destination_absent must be a bool.")
+        if not require_destination_absent:
+            raise ValueError("Workspace moves must require an absent destination.")
+        expected_source_revision = _validate_revision(expected_source_revision)
+        source = _validate_workspace_relative_path(source_path)
+        destination = _validate_workspace_relative_path(destination_path)
+        self._require_path_allowed(source)
+        self._require_path_allowed(destination)
+        return await asyncio.to_thread(
+            _move_file_if_revision,
+            self.root,
+            source,
+            destination,
+            expected_source_revision,
+        )
+
     async def list(
         self,
         pattern: str = "**/*",
@@ -449,6 +483,32 @@ def _delete_file_if_revision(
     ):
         before = delete_regular_if_revision(root, relative_path, expected_revision)
         return mutation_result_from_identities("delete", before=before, after=None)
+
+
+def _require_file_absent(root: Path, relative_path: str) -> None:
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
+        require_absent_regular(root, relative_path)
+
+
+def _move_file_if_revision(
+    root: Path,
+    source_path: str,
+    destination_path: str,
+    expected_source_revision: str,
+) -> WorkspaceMoveResult:
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_locks(root, source_path, destination_path),
+    ):
+        return move_regular_if_revision(
+            root,
+            source_path,
+            destination_path,
+            expected_source_revision,
+        )
 
 
 def _list_files(

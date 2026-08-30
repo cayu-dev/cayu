@@ -109,6 +109,7 @@ class WorkspaceReadOffsetError(ValueError):
 
 
 WorkspaceMutationOperation = Literal["create", "replace", "delete"]
+WorkspaceMoveFidelity = Literal["atomic_rename", "link_unlink"]
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,75 @@ class WorkspaceMutationResult:
             raise ValueError(
                 f"WorkspaceMutationResult {self.operation} requires complete after metadata."
             )
+
+
+@dataclass(frozen=True)
+class WorkspaceMoveResult:
+    """Evidence for one conditional, no-overwrite workspace file move.
+
+    ``link_unlink`` is intentionally distinct from ``atomic_rename``: the
+    destination link is created conditionally before the source name is
+    removed, so a backend using that portable implementation must not claim a
+    single atomic rename.
+    """
+
+    source_before_revision: str
+    source_after_revision: None
+    destination_before_revision: None
+    destination_after_revision: str
+    source_before_sha256: str
+    source_after_sha256: None
+    destination_before_sha256: None
+    destination_after_sha256: str
+    source_before_bytes: int
+    source_after_bytes: None
+    destination_before_bytes: None
+    destination_after_bytes: int
+    fidelity: WorkspaceMoveFidelity
+
+    def __post_init__(self) -> None:
+        for field_name in ("source_before_revision", "destination_after_revision"):
+            value = getattr(self, field_name)
+            if type(value) is not str or not value.strip():
+                raise ValueError(f"WorkspaceMoveResult {field_name} must be nonblank.")
+        for field_name in ("source_before_sha256", "destination_after_sha256"):
+            value = getattr(self, field_name)
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(
+                    f"WorkspaceMoveResult {field_name} must be a lowercase SHA-256 digest."
+                )
+        for field_name in ("source_before_bytes", "destination_after_bytes"):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"WorkspaceMoveResult {field_name} must be non-negative.")
+        if self.fidelity not in {"atomic_rename", "link_unlink"}:
+            raise ValueError("WorkspaceMoveResult fidelity is invalid.")
+        if (
+            self.source_before_revision != self.destination_after_revision
+            or self.source_before_sha256 != self.destination_after_sha256
+            or self.source_before_bytes != self.destination_after_bytes
+        ):
+            raise ValueError("WorkspaceMoveResult must preserve the moved content identity.")
+
+
+class WorkspacePreconditionUnsupportedError(RuntimeError):
+    """A workspace cannot authoritatively evaluate a required precondition."""
+
+
+class WorkspaceMoveUnsupportedError(RuntimeError):
+    """A workspace cannot provide a conditional same-workspace regular-file move."""
+
+
+class WorkspaceMoveAmbiguousError(RuntimeError):
+    """A move may have created its destination before settlement became uncertain."""
+
+    def __init__(self, result: WorkspaceMoveResult | None = None) -> None:
+        self.result = result
+        super().__init__("Workspace move settlement is ambiguous; observe both paths freshly.")
 
 
 class WorkspaceRevisionMismatchError(RuntimeError):
@@ -397,6 +467,44 @@ class Workspace(ABC):
         expected_revision: str,
     ) -> WorkspaceMutationResult:
         """Delete a file only when its current opaque revision matches."""
+
+    async def require_absent(self, path: str) -> None:
+        """Authoritatively preflight that one workspace path is absent.
+
+        This is an optional compatibility capability. Implementations used by
+        the structured patch tool must override it; the later create or move
+        still retains its own conditional absence precondition because this
+        preflight is not a lock.
+        """
+
+        del path
+        raise WorkspacePreconditionUnsupportedError(
+            f"{type(self).__name__} does not support authoritative absence preconditions."
+        )
+
+    async def move_if_revision(
+        self,
+        source_path: str,
+        destination_path: str,
+        *,
+        expected_source_revision: str,
+        require_destination_absent: bool = True,
+    ) -> WorkspaceMoveResult:
+        """Conditionally move one regular file within this workspace.
+
+        Implementations must never overwrite the destination and must report
+        their actual move fidelity. Unsupported adapters fail explicitly; they
+        never fall back to shell execution or an unlabelled copy/delete pair.
+        """
+
+        del source_path, destination_path, expected_source_revision
+        if type(require_destination_absent) is not bool:
+            raise TypeError("Workspace require_destination_absent must be a bool.")
+        if not require_destination_absent:
+            raise ValueError("Workspace moves must require an absent destination.")
+        raise WorkspaceMoveUnsupportedError(
+            f"{type(self).__name__} does not support conditional file moves."
+        )
 
     @abstractmethod
     async def list(

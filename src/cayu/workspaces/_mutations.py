@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import unicodedata
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from cayu._filesystem_lock import cooperative_path_lock
-from cayu.workspaces.base import WorkspaceMutationOperation, WorkspaceMutationResult
+from cayu.workspaces.base import (
+    WorkspaceMoveFidelity,
+    WorkspaceMoveResult,
+    WorkspaceMutationOperation,
+    WorkspaceMutationResult,
+)
 
 
 @dataclass(slots=True)
@@ -68,6 +74,29 @@ def mutation_result_from_identities(
     )
 
 
+def move_result_from_identity(
+    identity: tuple[str, str, int],
+    *,
+    fidelity: WorkspaceMoveFidelity,
+) -> WorkspaceMoveResult:
+    revision, digest, size = identity
+    return WorkspaceMoveResult(
+        source_before_revision=revision,
+        source_after_revision=None,
+        destination_before_revision=None,
+        destination_after_revision=revision,
+        source_before_sha256=digest,
+        source_after_sha256=None,
+        destination_before_sha256=None,
+        destination_after_sha256=digest,
+        source_before_bytes=size,
+        source_after_bytes=None,
+        destination_before_bytes=None,
+        destination_after_bytes=size,
+        fidelity=fidelity,
+    )
+
+
 @contextmanager
 def workspace_path_lock(root: Path, relative_path: str) -> Iterator[None]:
     """Serialize cooperative workspace clients addressing one root/path."""
@@ -77,6 +106,25 @@ def workspace_path_lock(root: Path, relative_path: str) -> Iterator[None]:
         relative_path,
         lock_directory_name="cayu-workspace-locks",
     ):
+        yield
+
+
+@contextmanager
+def workspace_path_locks(root: Path, *relative_paths: str) -> Iterator[None]:
+    """Acquire multiple cooperative path locks in one deterministic order."""
+
+    ordered = sorted(
+        relative_paths,
+        key=lambda value: unicodedata.normalize("NFC", value.replace("\\", "/")).casefold(),
+    )
+    identities = [
+        unicodedata.normalize("NFC", value.replace("\\", "/")).casefold() for value in ordered
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError("Workspace paths must identify distinct files.")
+    with ExitStack() as stack:
+        for path in ordered:
+            stack.enter_context(workspace_path_lock(root, path))
         yield
 
 

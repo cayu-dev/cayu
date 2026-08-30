@@ -246,6 +246,42 @@ async def verify_paging_and_conditional_mutations(workspace: Workspace) -> None:
     with pytest.raises(FileNotFoundError):
         await workspace.read_bytes("created.txt")
 
+    await workspace.require_absent("move-destination.txt")
+    await workspace.create_bytes("move-source.txt", b"move-source")
+    move_source = await workspace.read_bytes("move-source.txt")
+    with pytest.raises(WorkspaceRevisionMismatchError):
+        await workspace.move_if_revision(
+            "move-source.txt",
+            "move-destination.txt",
+            expected_source_revision=f"{move_source.revision}-stale",
+        )
+    moved = await workspace.move_if_revision(
+        "move-source.txt",
+        "move-destination.txt",
+        expected_source_revision=move_source.revision,
+    )
+    assert moved.source_before_revision == move_source.revision
+    assert moved.destination_after_revision == move_source.revision
+    assert moved.source_before_sha256 == move_source.sha256
+    assert moved.destination_after_sha256 == move_source.sha256
+    assert moved.fidelity in {"atomic_rename", "link_unlink"}
+    with pytest.raises(FileNotFoundError):
+        await workspace.read_bytes("move-source.txt")
+    assert (await workspace.read_bytes("move-destination.txt")).content == b"move-source"
+    with pytest.raises(FileExistsError):
+        await workspace.require_absent("move-destination.txt")
+
+    await workspace.create_bytes("blocked-move-source.txt", b"source")
+    blocked_source = await workspace.read_bytes("blocked-move-source.txt")
+    with pytest.raises(FileExistsError):
+        await workspace.move_if_revision(
+            "blocked-move-source.txt",
+            "move-destination.txt",
+            expected_source_revision=blocked_source.revision,
+        )
+    assert (await workspace.read_bytes("blocked-move-source.txt")).content == b"source"
+    assert (await workspace.read_bytes("move-destination.txt")).content == b"move-source"
+
     await workspace.write_bytes("race.txt", b"base")
     race_revision = (await workspace.read_bytes("race.txt")).revision
 

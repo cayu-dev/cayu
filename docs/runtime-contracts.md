@@ -7531,6 +7531,23 @@ The first built-in tools are:
 - `write_file`: create a missing UTF-8 file or conditionally overwrite an existing revision, capped by `max_bytes`
 - `edit_file`: apply one or more exact, non-overlapping replacements against one complete UTF-8 snapshot as a conditional mutation
 - `delete_file`: delete one existing file through an opaque revision precondition
+- `apply_patch`: preflight one bounded UTF-8 create/update/delete/move graph, then
+  execute an implementation-ordered sequence of per-file conditional workspace
+  mutations. It never claims a cross-file transaction. Its result records each
+  operation as `applied`, `not_started`, `conflict`, `failed`, or `unknown`; a
+  `partial`, `ambiguous`, or `cancelled` outcome requires fresh reads before repair.
+  Patch bodies are quarantined from terminal argument publication, diffs are
+  redacted and independently bounded per file and in aggregate, and a larger safe
+  manifest is retained as a session artifact when configured storage can accept it.
+  A dynamic invocation secret scope is sealed before that durable write; direct
+  static-redactor callers recheck after the write and remove a revision-stale artifact.
+  Runtime-owned calls also journal a content-free operation graph before dispatch
+  and advance each operation through an `unknown` dispatch boundary to its settled
+  status. Recovery reads that journal, fails closed on profile or argument drift,
+  and never replays the patch. When acknowledgement was not durably settled, the
+  runtime recovery authority uses the original authenticated patch paths to observe
+  current before/projected-after identities, advances the journal by compare-and-set,
+  and reports `unknown` only when fresh state cannot prove a safe classification.
 - `list_files`: list files in the active workspace with deterministic `offset`
   continuation, capped by `limit` and `max_result_bytes`; applications may configure
   directory-name exclusions and a bounded scan window on the registered tool instance
@@ -8574,8 +8591,20 @@ Workspace result objects enforce consistent metadata:
 
 - `WorkspaceReadResult`: `truncated` must equal `offset + source_bytes_read < total_bytes`; every truncated page must make positive raw-source progress, so `next_offset` is strictly greater than `offset`; an exact-EOF empty page remains valid and exposes no `next_offset`; `content` may be shorter or empty after redaction and `redaction_truncated` reports projection loss; revision and SHA-256 metadata require a complete offset-zero source snapshot
 - `WorkspaceMutationResult`: create has only after metadata, delete has only before metadata, and replace has both
+- `WorkspaceMoveResult`: source-before and destination-after identities must match;
+  `fidelity="link_unlink"` truthfully reports the portable conditional no-overwrite
+  link/unlink implementation and is not an atomic rename claim
 - `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
 - `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
+
+`Workspace.require_absent(path)` is the authoritative preflight capability used for
+create and move destinations; the later `create_bytes` or `move_if_revision` call
+still repeats the conditional absence precondition because preflight is not a lock.
+`Workspace.move_if_revision(...)` accepts only one same-workspace regular-file source,
+an exact observed revision, and an absent destination. The maintained local and
+runner-backed adapters implement it without shell execution. Unsupported adapters
+raise a typed capability error, and settlement loss after destination creation raises
+typed ambiguity rather than reporting success or attempting an unverified rollback.
 
 The deterministic conformance registry in
 `tests/workspaces/test_workspace_conformance.py` exercises every exported

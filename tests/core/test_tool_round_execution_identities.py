@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from tests.core._event_projection_support import private_events_for_public_events
 
+from cayu import ApplyPatchTool
 from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import (
     DurableToolRecoveryAuthority,
@@ -773,6 +774,136 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
         assert len(result_parts) == 1
         assert result_parts[0].structured == {"recovered": True}
         assert any(event.type is EventType.TOOL_CALL_COMPLETED for event in recovered_events)
+
+    asyncio.run(scenario())
+
+
+def test_pending_round_recovery_calls_apply_patch_with_runtime_authority() -> None:
+    async def scenario() -> None:
+        session_id = "sess_apply_patch_durable_recovery"
+        identity = _tool_round_identity("e")
+        arguments = {
+            "operations": [{"type": "create", "path": "created.txt", "content": "created\n"}]
+        }
+        tool_call = _tool_call(name="apply_patch", arguments=arguments)
+        checkpoint, _pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
+            None,
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            source_run_epoch=1,
+            tool_calls=[tool_call],
+            policy_outcomes=None,
+            tool_round_identity=identity,
+        )
+        pending = dict(checkpoint["pending_tool_round"])
+        pending["policy_state"] = "planned"
+        pending["policy_context_version"] = 1
+        pending["tool_calls"] = [
+            {
+                **call,
+                "policy_evidence": "authoritative",
+                "policy_decision": "allow",
+                "reason": None,
+                "metadata": {},
+            }
+            for call in pending["tool_calls"]
+        ]
+        checkpoint["pending_tool_round"] = pending
+        assistant_message = transcript_helpers.assistant_message_with_tool_round(
+            Message.tool_call(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+            ),
+            identity,
+        )
+        source_messages = [Message.text("user", "patch")]
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_SequencedProvider([]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="sequenced-model"),
+            tools=[ApplyPatchTool()],
+        )
+        await store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                messages=source_messages,
+            ),
+            identity=SessionIdentity(
+                provider_name="sequenced",
+                model="sequenced-model",
+            ),
+            interaction_started_event=Event(
+                id="evt-apply-patch-recovery-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id="interaction-apply-patch-recovery",
+                agent_name="assistant",
+            ),
+            interaction_source_messages=source_messages,
+        )
+        await store.append_transcript_messages(session_id, [assistant_message])
+        await store.checkpoint(session_id, checkpoint)
+        await store.append_event(
+            session_id,
+            Event(
+                id="evt-apply-patch-call-started",
+                type=EventType.TOOL_CALL_STARTED,
+                session_id=session_id,
+                interaction_id="interaction-apply-patch-recovery",
+                agent_name="assistant",
+                tool_name=tool_call.name,
+                payload={
+                    **identity.payload(),
+                    "tool_call_id": tool_call.id,
+                    "arguments_state": "quarantined",
+                    "idempotency_key": tool_execution.tool_idempotency_key(
+                        session_id=session_id,
+                        tool_round_id=identity.tool_round_id,
+                        tool_call_id=tool_call.id,
+                    ),
+                },
+            ),
+        )
+        session = await store.load(session_id)
+        assert session is not None
+        messages = await store.load_transcript(session_id)
+        claim = await app._recovery_coordinator._claim_incomplete_recovery(
+            session=session,
+            inactive_before=None,
+        )
+        assert claim is not None
+
+        try:
+            recovered_events = [
+                event
+                async for event in app._recovery_coordinator.recover_pending_tool_round(
+                    session=claim.session,
+                    registered_agent=app._get_registered_agent("assistant"),
+                    registered_environment=None,
+                    messages=messages,
+                    incomplete_recovery_claimed=True,
+                )
+            ]
+        finally:
+            await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
+                session_id=session_id,
+                claim_id=claim.claim_id,
+                authoritative_failure=None,
+            )
+
+        assert all(isinstance(event, Event) for event in recovered_events)
+        result_parts = [
+            part
+            for message in await store.load_transcript(session_id)
+            for part in message.content
+            if isinstance(part, ToolResultPart)
+        ]
+        assert len(result_parts) == 1
+        assert result_parts[0].tool_name == "apply_patch"
 
     asyncio.run(scenario())
 

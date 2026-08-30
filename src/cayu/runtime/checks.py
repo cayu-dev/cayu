@@ -42,6 +42,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
 )
 _WORKSPACE_TOOL_NAMES = frozenset(
     {
+        "apply_patch",
         "delete_file",
         "edit_file",
         "list_files",

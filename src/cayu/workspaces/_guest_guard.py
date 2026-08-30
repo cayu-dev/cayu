@@ -46,7 +46,11 @@ from typing import TYPE_CHECKING
 
 from cayu.runners import ExecCommand
 from cayu.workspaces.base import (
+    WorkspaceMoveAmbiguousError,
+    WorkspaceMoveResult,
+    WorkspaceMoveUnsupportedError,
     WorkspaceMutationResult,
+    WorkspacePreconditionUnsupportedError,
     WorkspaceReadOffsetError,
     WorkspaceRevisionMismatchError,
 )
@@ -67,6 +71,7 @@ _STATUS_UNSUPPORTED = "unsupported"
 _STATUS_EXISTS = "exists"
 _STATUS_OFFSET = "offset"
 _STATUS_STALE = "stale"
+_STATUS_AMBIGUOUS = "ambiguous"
 
 _READ_OUTPUT_HEADROOM_BYTES = 4096
 
@@ -397,6 +402,24 @@ def workspace_path_lock(root_fd, rel_path):
 
 
 @contextlib.contextmanager
+def workspace_path_locks(root_fd, *rel_paths):
+    ordered = sorted(
+        rel_paths,
+        key=lambda value: unicodedata.normalize("NFC", value.replace("\\", "/")).casefold(),
+    )
+    identities = [
+        unicodedata.normalize("NFC", value.replace("\\", "/")).casefold()
+        for value in ordered
+    ]
+    if len(set(identities)) != len(identities):
+        raise GuardPathError("escape")
+    with contextlib.ExitStack() as stack:
+        for path in ordered:
+            stack.enter_context(workspace_path_lock(root_fd, path))
+        yield
+
+
+@contextlib.contextmanager
 def workspace_source_lock(root_fd, exclusive):
     # Cooperate with guest-side multi-path branch capture/publication.
     root_info = os.fstat(root_fd)
@@ -460,10 +483,10 @@ def create_guarded_regular_atomic(name, dir_fd, content):
             pass
 
 
-def _conditional_snapshot(name, dir_fd):
+def _conditional_snapshot(name, dir_fd, require_single_link=True):
     fd, info = open_guarded_regular(name, dir_fd)
     try:
-        if info.st_nlink != 1:
+        if require_single_link and info.st_nlink != 1:
             raise GuardPathError("hardlink")
         digest = hashlib.sha256()
         size = 0
@@ -517,6 +540,68 @@ def delete_guarded_regular_if_revision(name, dir_fd, expected_revision):
         return None, revision
     os.unlink(name, dir_fd=dir_fd)
     return (revision, digest, size), None
+
+
+def require_guarded_absent(name, dir_fd):
+    try:
+        guarded_lstat(name, dir_fd)
+    except GuardPathError as exc:
+        if exc.status == "enoent":
+            return
+        raise
+    raise GuardPathError("exists")
+
+
+def move_guarded_regular_if_revision(
+    root_fd,
+    source_parts,
+    destination_parts,
+    expected_revision,
+):
+    source_parent_fd = None
+    destination_parent_fd = None
+    try:
+        source_parent_fd, source_name = open_guarded_parent(
+            root_fd, source_parts, False
+        )
+        before = _conditional_snapshot(source_name, source_parent_fd)
+        if before[0] != expected_revision:
+            return None, before[0], False
+        destination_parent_fd, destination_name = open_guarded_parent(
+            root_fd, destination_parts, True
+        )
+        require_guarded_absent(destination_name, destination_parent_fd)
+        try:
+            os.link(
+                source_name,
+                destination_name,
+                src_dir_fd=source_parent_fd,
+                dst_dir_fd=destination_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise GuardPathError("exists") from exc
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                raise GuardPathError("unsupported") from exc
+            raise
+        destination = _conditional_snapshot(
+            destination_name,
+            destination_parent_fd,
+            require_single_link=False,
+        )
+        identity = before[:3]
+        if destination[:3] != identity:
+            return identity, None, True
+        try:
+            os.unlink(source_name, dir_fd=source_parent_fd)
+        except OSError:
+            return identity, None, True
+        return identity, None, False
+    finally:
+        for fd in (destination_parent_fd, source_parent_fd):
+            if fd is not None:
+                os.close(fd)
 
 
 def delete_guarded_regular(name, dir_fd):
@@ -587,6 +672,24 @@ def mutation_payload_from_identity(operation, before, after):
     }
 
 
+def move_payload_from_identity(before):
+    return {
+        "source_before_revision": before[0],
+        "source_after_revision": None,
+        "destination_before_revision": None,
+        "destination_after_revision": before[0],
+        "source_before_sha256": before[1],
+        "source_after_sha256": None,
+        "destination_before_sha256": None,
+        "destination_after_sha256": before[1],
+        "source_before_bytes": before[2],
+        "source_after_bytes": None,
+        "destination_before_bytes": None,
+        "destination_after_bytes": before[2],
+        "fidelity": "link_unlink",
+    }
+
+
 def main():
     mode = sys.argv[1]
     root = sys.argv[2]
@@ -597,6 +700,34 @@ def main():
     try:
         parts = guarded_parts(rel_path)
         root_fd = open_guard_root(root)
+        if mode == "require-absent":
+            with workspace_source_lock(root_fd, False), workspace_path_lock(
+                root_fd, rel_path
+            ):
+                parent_fd, leaf_name = open_guarded_parent(root_fd, parts, False)
+                require_guarded_absent(leaf_name, parent_fd)
+                finish("ok")
+        if mode == "move-if-revision":
+            destination_path = sys.argv[4]
+            expected_revision = sys.argv[5]
+            destination_parts = guarded_parts(destination_path)
+            with workspace_source_lock(root_fd, False), workspace_path_locks(
+                root_fd, rel_path, destination_path
+            ):
+                before_data, stale_revision, ambiguous = (
+                    move_guarded_regular_if_revision(
+                        root_fd,
+                        parts,
+                        destination_parts,
+                        expected_revision,
+                    )
+                )
+                if stale_revision is not None:
+                    finish("stale " + stale_revision)
+                assert before_data is not None
+                print("ambiguous" if ambiguous else "ok")
+                print(json.dumps(move_payload_from_identity(before_data)))
+                return
         with workspace_source_lock(root_fd, False), workspace_path_lock(root_fd, rel_path):
             parent_fd, leaf_name = open_guarded_parent(
                 root_fd, parts, mode in ("write", "create")
@@ -850,6 +981,126 @@ async def guard_delete_if_revision(
         timeout_s=timeout_s,
         python_executable=python_executable,
     )
+
+
+async def guard_require_absent(
+    runner: Runner,
+    *,
+    root: str,
+    rel_path: str,
+    original_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> None:
+    result = await _exec_guard(
+        runner,
+        "require-absent",
+        root,
+        rel_path,
+        timeout_s=timeout_s,
+        python_executable=python_executable,
+    )
+    status, _ = _guard_status(
+        result,
+        mode="require absent",
+        backend=backend,
+        original_path=original_path,
+    )
+    if status in {_STATUS_OK, _STATUS_ENOENT}:
+        return
+    if status == _STATUS_EXISTS:
+        raise FileExistsError(f"Workspace file already exists: {original_path}")
+    if status == _STATUS_UNSUPPORTED:
+        raise WorkspacePreconditionUnsupportedError(
+            f"{backend} workspace cannot authoritatively prove target absence."
+        )
+    if status in {_STATUS_NOTDIR, _STATUS_NOTFILE}:
+        raise FileNotFoundError(f"Workspace path is not creatable: {original_path}")
+    _raise_common_status(
+        status,
+        mode="require absent",
+        backend=backend,
+        original_path=original_path,
+    )
+
+
+async def guard_move_if_revision(
+    runner: Runner,
+    *,
+    root: str,
+    source_rel_path: str,
+    destination_rel_path: str,
+    expected_revision: str,
+    original_source_path: str,
+    original_destination_path: str,
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> WorkspaceMoveResult:
+    result = await _exec_guard(
+        runner,
+        "move-if-revision",
+        root,
+        source_rel_path,
+        destination_rel_path,
+        expected_revision,
+        timeout_s=timeout_s,
+        python_executable=python_executable,
+    )
+    status, payload = _guard_status(
+        result,
+        mode="move",
+        backend=backend,
+        original_path=original_source_path,
+    )
+    if status == _STATUS_EXISTS:
+        raise FileExistsError(f"Workspace file already exists: {original_destination_path}")
+    if status.startswith(f"{_STATUS_STALE} "):
+        raise WorkspaceRevisionMismatchError(
+            expected_revision,
+            status.partition(" ")[2],
+        )
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
+        raise FileNotFoundError(f"Workspace file not found: {original_source_path}")
+    if status == _STATUS_HARDLINK:
+        raise WorkspaceMoveUnsupportedError(
+            f"{backend} workspace move refuses a hard-linked source."
+        )
+    if status == _STATUS_UNSUPPORTED:
+        raise WorkspaceMoveUnsupportedError(
+            f"{backend} workspace cannot provide a conditional same-workspace move."
+        )
+    if status not in {_STATUS_OK, _STATUS_AMBIGUOUS}:
+        _raise_common_status(
+            status,
+            mode="move",
+            backend=backend,
+            original_path=original_source_path,
+        )
+    move = _parse_move_payload(
+        payload,
+        backend=backend,
+        original_path=original_source_path,
+    )
+    if status == _STATUS_AMBIGUOUS:
+        raise WorkspaceMoveAmbiguousError(move)
+    return move
+
+
+def _parse_move_payload(
+    payload: str,
+    *,
+    backend: str,
+    original_path: str,
+) -> WorkspaceMoveResult:
+    try:
+        decoded = json.loads(payload)
+        return WorkspaceMoveResult(**decoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"{backend} workspace guard returned invalid move metadata: {original_path}"
+        ) from exc
 
 
 async def _guard_conditional_mutation(

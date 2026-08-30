@@ -22,7 +22,12 @@ from cayu.tools._redaction import (
     InvocationRedactorSnapshot,
     resolve_invocation_redactor_snapshot,
 )
-from cayu.workspaces import Workspace, WorkspaceReadResult
+from cayu.workspaces import (
+    Workspace,
+    WorkspaceMoveResult,
+    WorkspaceMutationResult,
+    WorkspaceReadResult,
+)
 
 
 class InvocationResourceReadError(RuntimeError):
@@ -94,7 +99,14 @@ class InvocationWorkspaceMutationOwner:
         finally:
             self.__active.discard(current)
 
-    async def run(self, operation_factory: Callable[[], Awaitable[Any]]) -> Any:
+    async def run(
+        self,
+        operation_factory: Callable[[], Awaitable[Any]],
+        *,
+        result_observer: Callable[[Any], None] | None = None,
+    ) -> Any:
+        if result_observer is not None and not callable(result_observer):
+            raise TypeError("Workspace mutation result observer must be callable.")
         with self.track_current_task():
             outcome = await await_invocation_operation(
                 operation_factory,
@@ -118,9 +130,15 @@ class InvocationWorkspaceMutationOwner:
                 [outcome.cancellation, mutation_error],
             ) from mutation_error
         if outcome.cancellation is not None:
+            if result_observer is not None:
+                with suppress(Exception):
+                    result_observer(outcome.result)
             raise outcome.cancellation
         if mutation_error is not None:
             raise mutation_error
+        if result_observer is not None:
+            with suppress(Exception):
+                result_observer(outcome.result)
         return outcome.result
 
     def seal_and_transfer_pending(self) -> None:
@@ -479,6 +497,66 @@ class InvocationWorkspaceHandle(Workspace):
             path=path,
         )
 
+    async def require_absent(self, path: str) -> None:
+        await self.__workspace.require_absent(path)
+
+    async def move_if_revision(
+        self,
+        source_path: str,
+        destination_path: str,
+        *,
+        expected_source_revision: str,
+        require_destination_absent: bool = True,
+    ):
+        def operation_factory():
+            return self.__workspace.move_if_revision(
+                source_path,
+                destination_path,
+                expected_source_revision=expected_source_revision,
+                require_destination_absent=require_destination_absent,
+            )
+
+        def observe(result: Any) -> None:
+            observer = self.__direct_mutation_observer
+            if observer is None:
+                return
+            if type(result) is WorkspaceMoveResult:
+                source_result = WorkspaceMutationResult(
+                    operation="delete",
+                    before_revision=result.source_before_revision,
+                    after_revision=None,
+                    before_sha256=result.source_before_sha256,
+                    after_sha256=None,
+                    before_bytes=result.source_before_bytes,
+                    after_bytes=None,
+                )
+                destination_result = WorkspaceMutationResult(
+                    operation="create",
+                    before_revision=None,
+                    after_revision=result.destination_after_revision,
+                    before_sha256=None,
+                    after_sha256=result.destination_after_sha256,
+                    before_bytes=None,
+                    after_bytes=result.destination_after_bytes,
+                )
+                with suppress(Exception):
+                    observer("delete_if_revision", source_path, source_result)
+                with suppress(Exception):
+                    observer("create_bytes", destination_path, destination_result)
+            else:
+                with suppress(Exception):
+                    observer("move_if_revision", source_path, result)
+
+        if self.__mutation_owner is None:
+            result = await operation_factory()
+            observe(result)
+        else:
+            result = await self.__mutation_owner.run(
+                operation_factory,
+                result_observer=observe,
+            )
+        return result
+
     async def _run_mutation(
         self,
         operation_factory: Callable[[], Awaitable[Any]],
@@ -486,17 +564,22 @@ class InvocationWorkspaceHandle(Workspace):
         method: str,
         path: str,
     ) -> Any:
-        result = (
-            await operation_factory()
-            if self.__mutation_owner is None
-            else await self.__mutation_owner.run(operation_factory)
-        )
-        if self.__direct_mutation_observer is not None:
-            # Evidence collection is best-effort after the delegate has
-            # authoritatively completed. It must never turn a committed
-            # workspace mutation into a reported tool failure.
-            with suppress(Exception):
-                self.__direct_mutation_observer(method, path, result)
+        def observe(result: Any) -> None:
+            if self.__direct_mutation_observer is not None:
+                # Evidence collection is best-effort after the delegate has
+                # authoritatively completed. It must never turn a committed
+                # workspace mutation into a reported tool failure.
+                with suppress(Exception):
+                    self.__direct_mutation_observer(method, path, result)
+
+        if self.__mutation_owner is None:
+            result = await operation_factory()
+            observe(result)
+        else:
+            result = await self.__mutation_owner.run(
+                operation_factory,
+                result_observer=observe,
+            )
         return result
 
     async def list(self, pattern: str = "**/*", *, limit: int | None = None):

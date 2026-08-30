@@ -10,13 +10,16 @@ from cayu.workspaces._guest_guard import (
     guard_create,
     guard_delete,
     guard_delete_if_revision,
+    guard_move_if_revision,
     guard_read,
     guard_replace,
+    guard_require_absent,
     guard_write,
 )
 from cayu.workspaces.base import (
     RunnerBoundWorkspace,
     WorkspaceListResult,
+    WorkspaceMoveResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
     _validate_absolute_guest_root,
@@ -206,6 +209,44 @@ class E2BWorkspace(RunnerBoundWorkspace):
             rel_path=self._contained_rel_path(path),
             expected_revision=_validate_workspace_revision(expected_revision, owner="E2BWorkspace"),
             original_path=path,
+            backend="E2B",
+            timeout_s=self._guard_timeout_s(),
+        )
+
+    async def require_absent(self, path: str) -> None:
+        relative = self._contained_rel_path(path)
+        await guard_require_absent(
+            self._runner,
+            root=self.root,
+            rel_path=relative,
+            original_path=path,
+            backend="E2B",
+            timeout_s=self._guard_timeout_s(),
+        )
+
+    async def move_if_revision(
+        self,
+        source_path: str,
+        destination_path: str,
+        *,
+        expected_source_revision: str,
+        require_destination_absent: bool = True,
+    ) -> WorkspaceMoveResult:
+        if type(require_destination_absent) is not bool:
+            raise TypeError("Workspace require_destination_absent must be a bool.")
+        if not require_destination_absent:
+            raise ValueError("Workspace moves must require an absent destination.")
+        return await guard_move_if_revision(
+            self._runner,
+            root=self.root,
+            source_rel_path=self._contained_rel_path(source_path),
+            destination_rel_path=self._contained_rel_path(destination_path),
+            expected_revision=_validate_workspace_revision(
+                expected_source_revision,
+                owner="E2BWorkspace",
+            ),
+            original_source_path=source_path,
+            original_destination_path=destination_path,
             backend="E2B",
             timeout_s=self._guard_timeout_s(),
         )

@@ -21,7 +21,13 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import BinaryIO, NoReturn
 
-from cayu.workspaces.base import WorkspaceRevisionMismatchError
+from cayu.workspaces._mutations import move_result_from_identity
+from cayu.workspaces.base import (
+    WorkspaceMoveAmbiguousError,
+    WorkspaceMoveResult,
+    WorkspaceMoveUnsupportedError,
+    WorkspaceRevisionMismatchError,
+)
 
 _ESCAPE_ERRNOS = (errno.ELOOP, errno.EMLINK)
 _MISSING_ERRNOS = (errno.ENOENT, errno.ENOTDIR)
@@ -212,8 +218,18 @@ def _open_regular(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
     return descriptor, info
 
 
-def _identity_at(parent_fd: int, name: str) -> tuple[tuple[str, str, int], int]:
+def _identity_at(
+    parent_fd: int,
+    name: str,
+    *,
+    require_single_link: bool = False,
+) -> tuple[tuple[str, str, int], int]:
     descriptor, info = _open_regular(parent_fd, name)
+    if require_single_link and info.st_nlink != 1:
+        os.close(descriptor)
+        raise WorkspaceMoveUnsupportedError(
+            "Workspace move refuses a hard-linked source whose alias metadata is unrepresentable."
+        )
     digest = hashlib.sha256()
     size = 0
     with os.fdopen(descriptor, "rb") as source:
@@ -457,6 +473,84 @@ def create_regular(
             _create_at(parent_fd, name, content, staging_name=staging_name)
     except _LocalGuardPathError as exc:
         _raise_workspace_path_error(exc, relative_path)
+
+
+def require_absent_regular(root: Path, relative_path: str) -> None:
+    """Require an absent final path without following any component."""
+
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise FileExistsError(f"Workspace file already exists: {relative_path}")
+    except _LocalGuardPathError as exc:
+        if exc.status == "missing":
+            return
+        _raise_workspace_path_error(exc, relative_path)
+
+
+def move_regular_if_revision(
+    root: Path,
+    source_path: str,
+    destination_path: str,
+    expected_source_revision: str,
+) -> WorkspaceMoveResult:
+    """Conditionally move by no-overwrite link then unlink.
+
+    The link creation is the authoritative destination-absence precondition.
+    Its two-name window is reported as ``link_unlink`` rather than as an atomic
+    rename. If unlink settlement fails after the link, the caller receives an
+    ambiguity carrying the known destination identity.
+    """
+
+    try:
+        with (
+            _open_parent(root, source_path) as (source_parent_fd, source_name),
+            _open_parent(root, destination_path, create=True) as (
+                destination_parent_fd,
+                destination_name,
+            ),
+        ):
+            before, _mode = _identity_at(
+                source_parent_fd,
+                source_name,
+                require_single_link=True,
+            )
+            if before[0] != expected_source_revision:
+                raise WorkspaceRevisionMismatchError(expected_source_revision, before[0])
+            try:
+                os.link(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=destination_parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise FileExistsError(f"Workspace file already exists: {destination_path}") from exc
+            except OSError as exc:
+                if exc.errno == errno.EXDEV:
+                    raise WorkspaceMoveUnsupportedError(
+                        "Workspace move crosses filesystem devices and cannot preserve "
+                        "the conditional move contract."
+                    ) from exc
+                raise
+            result = move_result_from_identity(before, fidelity="link_unlink")
+            destination_identity, _destination_mode = _identity_at(
+                destination_parent_fd,
+                destination_name,
+            )
+            if destination_identity != before:
+                raise WorkspaceMoveAmbiguousError(None)
+            try:
+                os.unlink(source_name, dir_fd=source_parent_fd)
+            except BaseException as exc:
+                raise WorkspaceMoveAmbiguousError(result) from exc
+            return result
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, source_path)
 
 
 def write_regular(root: Path, relative_path: str, content: bytes) -> None:

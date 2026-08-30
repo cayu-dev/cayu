@@ -52,6 +52,7 @@ from cayu.tools.knowledge import (
 )
 from cayu.tools.named_checks import NamedCheck, RunCheckTool
 from cayu.tools.parallel import ParallelAIWebAdapter
+from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.search import SearchTextTool
 from cayu.tools.shared_artifacts import (
     DEFAULT_SHARED_ARTIFACT_GRANT_TTL_SECONDS,
@@ -150,6 +151,7 @@ __all__ = [
     "PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME",
     "SHARED_ARTIFACT_REFERENCE_PREFIX",
     "SHARED_ARTIFACT_SCHEMA_VERSION",
+    "ApplyPatchTool",
     "ArtifactReadRequest",
     "ArtifactReader",
     "BackgroundSubagentTaskRegistry",
