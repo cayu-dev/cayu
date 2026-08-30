@@ -42,7 +42,11 @@ from cayu.storage import (
     SQLiteKnowledgeStore,
     knowledge_chunk_embedding_identity,
 )
-from cayu.work_context import AgentWorkContext
+from cayu.work_context import (
+    DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
+    AgentWorkContext,
+    agent_recall_facet_aspect,
+)
 
 _NOW = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
 _NAMESPACE = "project:cayu"
@@ -95,6 +99,7 @@ def _request(
             knowledge_namespace=_NAMESPACE,
             current_time=_NOW,
         ),
+        checkpoint_stream_id=DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
         checkpoint=checkpoint,
         frontier=frontier,
         processing_id=f"processing-{operation}",
@@ -121,6 +126,81 @@ async def _create_entry(store, entry_id: str, text: str) -> None:
         ],
         access_scope=_scope(),
     )
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_filter_only_recall_enforces_or_within_and_across_exact_aspect_groups(
+    backend: str,
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        scope = _scope()
+        store = (
+            InMemoryKnowledgeStore(access_scope=scope)
+            if backend == "memory"
+            else SQLiteKnowledgeStore(tmp_path / "exact-facet-recall.sqlite", access_scope=scope)
+        )
+        scope_a = agent_recall_facet_aspect("scope_ids", "scope:a")
+        scope_b = agent_recall_facet_aspect("scope_ids", "scope:b")
+        entity_target = agent_recall_facet_aspect("entity_ids", "entity:target")
+        entity_other = agent_recall_facet_aspect("entity_ids", "entity:other")
+
+        async def create(entry_id: str, aspects: list[str]) -> None:
+            await store.create_entry(
+                KnowledgeEntry(
+                    id=entry_id,
+                    namespace=_NAMESPACE,
+                    text=f"unrelated body for {entry_id}",
+                    aspects=aspects,
+                ),
+                [
+                    KnowledgeChunk(
+                        id=f"{entry_id}-chunk",
+                        entry_id=entry_id,
+                        text=f"unrelated body for {entry_id}",
+                        chunk_index=0,
+                    )
+                ],
+                access_scope=scope,
+            )
+
+        await create("facet-target", [scope_b, entity_target])
+        await create("facet-wrong-entity", [scope_b, entity_other])
+        await create("facet-wrong-scope", [entity_target])
+        processor = AgentRecallProcessor(store, fusion_config=_fusion_config())
+        context = _context()
+        result = await processor.process(
+            AgentRecallProcessingRequest(
+                agent_id="agent-reviewer",
+                work_context=context,
+                situation=RecallSituation(
+                    query="exact knowledge facet subscription",
+                    knowledge_access_scope=scope,
+                    knowledge_namespace=_NAMESPACE,
+                    knowledge_aspect_groups=(
+                        (scope_a, scope_b),
+                        (entity_target,),
+                    ),
+                    knowledge_filter_only=True,
+                    current_time=_NOW,
+                ),
+                checkpoint_stream_id="subscription:facet-filter",
+                checkpoint=None,
+                processing_id="processing-facet-filter",
+                operation_id="facet-filter",
+                updated_by="test-suite",
+                updated_at=_NOW,
+            )
+        )
+
+        assert result.recall is not None
+        assert [candidate.record.locator["entry_id"] for candidate in result.recall.candidates] == [
+            "facet-target"
+        ]
+        if isinstance(store, SQLiteKnowledgeStore):
+            await store.close()
+
+    asyncio.run(run())
 
 
 class _RecallEmbeddingProvider(TextEmbeddingProvider):
@@ -415,6 +495,7 @@ def test_request_rejects_a_scope_that_would_couple_namespace_frontiers() -> None
                 knowledge_namespace=_NAMESPACE,
                 current_time=_NOW,
             ),
+            checkpoint_stream_id=DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
             processing_id="processing-broad-scope",
             operation_id="broad-scope",
             updated_by="test-suite",
@@ -1102,6 +1183,7 @@ def test_request_rejects_caller_supplied_ephemeral_work_context() -> None:
                 knowledge_namespace=_NAMESPACE,
                 current_time=_NOW,
             ),
+            checkpoint_stream_id=DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
             processing_id="processing-invalid",
             operation_id="invalid",
             updated_by="test-suite",

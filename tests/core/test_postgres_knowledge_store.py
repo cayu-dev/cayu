@@ -92,6 +92,7 @@ from cayu.storage.memory import (
     _knowledge_publication_v1_request_sha256,
 )
 from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, SchemaMode
+from cayu.work_context import agent_recall_facet_aspect
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -313,6 +314,26 @@ def test_postgres_bounded_entry_read_reuses_one_authorization_time(
 
 
 _TABLES = (
+    "cayu_agent_recall_subscription_wake_states",
+    "cayu_agent_recall_subscription_wake_releases",
+    "cayu_agent_recall_subscription_wake_claims",
+    "cayu_agent_recall_subscription_evaluations",
+    "cayu_agent_recall_subscription_states",
+    "cayu_agent_recall_subscription_releases",
+    "cayu_agent_recall_subscription_claims",
+    "cayu_agent_recall_subscription_publications",
+    "cayu_agent_recall_subscription_heads",
+    "cayu_agent_recall_subscription_revisions",
+    "cayu_agent_recall_delivery_acknowledgements",
+    "cayu_agent_recall_delivery_releases",
+    "cayu_agent_recall_delivery_claims",
+    "cayu_agent_recall_delivery_states",
+    "cayu_agent_recall_deliveries",
+    "cayu_agent_recall_checkpoint_heads",
+    "cayu_agent_recall_checkpoints",
+    "cayu_agent_work_context_publications",
+    "cayu_agent_work_context_heads",
+    "cayu_agent_work_context_revisions",
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",
     "cayu_knowledge_index_readiness_events",
@@ -1539,6 +1560,7 @@ def test_postgres_exact_revision_search_filters_before_ranking(postgres_dsn: str
 def test_postgres_checkpoint_recall_full_delta_and_no_work_parity(postgres_dsn: str) -> None:
     async def run() -> None:
         from cayu import (
+            DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
             KNOWLEDGE_LEXICAL_CHANNEL,
             KNOWLEDGE_SEMANTIC_CHANNEL,
             AgentRecallProcessingMode,
@@ -1592,6 +1614,7 @@ def test_postgres_checkpoint_recall_full_delta_and_no_work_parity(postgres_dsn: 
                     knowledge_namespace=namespace,
                     current_time=now,
                 ),
+                checkpoint_stream_id=DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
                 checkpoint=checkpoint,
                 processing_id=f"processing-{operation_id}",
                 operation_id=operation_id,
@@ -4105,10 +4128,10 @@ def test_postgres_knowledge_store_structured_keyword_search(postgres_dsn: str) -
 def test_postgres_knowledge_store_filter_only_exact_aspect_groups(
     postgres_dsn: str,
 ) -> None:
-    scope_a = "scope:a"
-    scope_b = "scope:b"
-    entity_target = "entity:target"
-    entity_other = "entity:other"
+    scope_a = agent_recall_facet_aspect("scope_ids", "scope:a")
+    scope_b = agent_recall_facet_aspect("scope_ids", "scope:b")
+    entity_target = agent_recall_facet_aspect("entity_ids", "entity:target")
+    entity_other = agent_recall_facet_aspect("entity_ids", "entity:other")
 
     async def ops(store):
         await store.create_entry(

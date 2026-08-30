@@ -192,6 +192,78 @@ does not infer or backfill deliveries from existing checkpoints, knowledge,
 sessions, transcripts, receipts, or exposures, and there is no legacy read,
 dual-write, or compatibility path.
 
+### Idle recall subscriptions
+
+Active runtimes continue to call `AgentRecallProcessor` inline. An idle task can
+instead publish an immutable `AgentRecallSubscription` that binds one exact
+agent, task, namespace, access-policy fingerprint, current work-context
+revision/hash, admission policy, bounded query/facets, priority, minimum
+interval, expiry, and active/paused/cancelled status. Updates are immutable
+revisions guarded by compare-and-swap. Every declared facet must already belong
+to the bound work context, so a subscription can narrow that task's retrieval
+input but cannot silently acquire unrelated scope.
+
+Each subscription owns an independent checkpoint stream derived from its
+subscription ID and exact retrieval-shaping input. Two subscriptions over the
+same agent, task, namespace, and access policy therefore observe the same
+change frontier without consuming one another's progress. Schedule- or
+policy-only revisions retain the cursor, while changing the query or facets
+starts a fresh full-index stream so newly matching older knowledge is not
+skipped. A scheduler must pass the claimed subscription's checkpoint key and
+stream ID through processing and commit unchanged.
+
+Facets are exact indexed filters, not extra search prose. Add the corresponding
+`agent_recall_facet_aspect(field_name, value)` tokens to a knowledge entry's
+`aspects` when publishing it. Values within one facet category are ORed, while
+different categories are ANDed. A subscription without `query` performs a
+bounded metadata-only lookup over those exact groups; unrelated text cannot
+produce a match.
+
+No background service is required. An existing application scheduler can claim
+the oldest due subscription for the agent/task/namespace/access authority of a
+checkpoint key, build its single-namespace situation with
+`subscription.recall_situation()`, and then load and process the claimed
+subscription's exact stream key. Claims use
+store-clock leases, exact replay, renewal, release, expiry takeover, and stale
+runner fencing. Paused, cancelled, expired, stale-context, unauthorized, or
+already-waiting subscriptions are not due. Priority breaks ties only after the
+oldest due time; it does not bypass scope or timing authority.
+
+`commit_recall_subscription_evaluation()` has two successful material outcomes:
+
+- weak or empty admitted material commits the successor checkpoint and an
+  immutable silent evaluation receipt, without a delivery or wake;
+- relevant non-empty material atomically commits the successor checkpoint,
+  exact staged `AgentRecallDelivery`, immutable evaluation receipt, and one
+  pending `AgentRecallSubscriptionWake`.
+
+Failure or cancellation publishes none of those records. A pending wake
+coalesces another evaluation for that subscription, while later knowledge and
+index-readiness frontiers remain eligible after the wake is accepted. The
+committed delivery is authoritative; wake recovery never re-runs retrieval to
+reconstruct its payload.
+
+The wake has its own scheduler claim/release/acknowledgement lifecycle. Wake
+acknowledgement means only that the application scheduler durably accepted a
+request to revisit the task. It makes the already staged delivery available to
+the normal delivery lifecycle, but does not claim or acknowledge that delivery,
+mutate a `TaskStore` record, dispatch a provider call, create a `RecallReceipt`
+or `ContextExposure`, assert model attention, or consume a notification. The
+runtime must later claim and acknowledge the delivery against its actual
+downstream evidence boundary.
+
+Storage revision 73 is a clean prerelease break because processing results now
+bind their exact retrieval-shaping input and every subscription has an isolated
+checkpoint stream. Every staged delivery must project that processing-result
+schema version into a constrained column, so a process running the older
+contract cannot insert an unreadable result after migration. Revision 73 is for
+fresh schemas only: databases with the older checkpoint shape are rejected and
+must be recreated. It installs empty subscription revision/head/publication,
+runner claim/release/state, evaluation, and scheduler-wake claim/release/state
+tables with bounded indexes. It does not infer or backfill records from tasks,
+contexts, checkpoints, deliveries, knowledge, sessions, receipts, exposures,
+or notifications, and it adds no compatibility or dual-write path.
+
 The nearby context concepts have different lifetimes and owners:
 
 - `RecallSituation` is ephemeral caller input for one retrieval boundary. Its
@@ -230,6 +302,13 @@ acknowledgements, plus the indexed no-pending path after all 50 records are
 terminal. It records fixed p50 and p95 ceilings for in-memory and SQLite stores,
 makes no provider calls, and keeps PostgreSQL performance outside the hermetic
 credential-free matrix while exercising the same behavior in integration tests.
+
+The checked [idle recall-subscription performance baseline](../benchmarks/memory/recall-subscription-performance-v1.json)
+measures 50 indexed zero-due claims, silent evaluation commits, atomic relevant
+wake publications, scheduler claims, and scheduler acknowledgements for both
+in-memory and SQLite stores. It makes no provider calls and applies fixed p50
+and p95 ceilings; PostgreSQL exercises the same lifecycle through shared
+conformance, concurrency, migration, reopen, and cancellation tests.
 
 ## Bounded cross-source recall
 

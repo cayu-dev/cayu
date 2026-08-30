@@ -807,31 +807,66 @@ from cayu.work_context import (
     AgentRecallDeliveryRecord,
     AgentRecallDeliveryRelease,
     AgentRecallDeliveryState,
+    AgentRecallSubscription,
+    AgentRecallSubscriptionClaim,
+    AgentRecallSubscriptionConflict,
+    AgentRecallSubscriptionEvaluation,
+    AgentRecallSubscriptionPublicationReceipt,
+    AgentRecallSubscriptionRecord,
+    AgentRecallSubscriptionRelease,
+    AgentRecallSubscriptionRunState,
+    AgentRecallSubscriptionWake,
+    AgentRecallSubscriptionWakeClaim,
+    AgentRecallSubscriptionWakeRelease,
+    AgentRecallSubscriptionWakeState,
     AgentWorkContext,
     AgentWorkContextConflict,
     AgentWorkContextPublicationReceipt,
     AgentWorkContextStore,
     _acknowledge_agent_recall_delivery_record,
+    _acknowledge_agent_recall_subscription_wake,
     _agent_recall_delivery_release,
+    _agent_recall_subscription_release,
+    _agent_recall_subscription_wake_release,
     _bounded_identity,
     _claim_agent_recall_delivery_record,
+    _claim_agent_recall_subscription_record,
+    _claim_agent_recall_subscription_wake,
     _positive_revision,
+    _prepare_agent_recall_subscription_evaluation,
     _release_agent_recall_delivery_record,
+    _release_agent_recall_subscription_record,
+    _release_agent_recall_subscription_wake,
     _renew_agent_recall_delivery_record,
+    _renew_agent_recall_subscription_record,
+    _renew_agent_recall_subscription_wake,
     _require_replayable_delivery_claim_attempt,
+    _require_replayable_subscription_wake_claim,
     _utc,
     _validate_delivery_lease_seconds,
     agent_recall_delivery_claim_request_sha256,
+    agent_recall_subscription_claim_request_sha256,
+    agent_recall_subscription_evaluation_request_sha256,
+    agent_recall_subscription_publication_request_sha256,
+    agent_recall_subscription_wake_claim_request_sha256,
     agent_work_context_publication_request_sha256,
     copy_agent_recall_checkpoint,
     copy_agent_recall_checkpoint_key,
     copy_agent_recall_delivery,
     copy_agent_recall_delivery_claim,
     copy_agent_recall_delivery_record,
+    copy_agent_recall_subscription,
+    copy_agent_recall_subscription_claim,
+    copy_agent_recall_subscription_evaluation,
+    copy_agent_recall_subscription_publication_receipt,
+    copy_agent_recall_subscription_record,
+    copy_agent_recall_subscription_wake,
+    copy_agent_recall_subscription_wake_claim,
     copy_agent_work_context,
     copy_agent_work_context_publication_receipt,
     validate_agent_recall_checkpoint_advance,
     validate_agent_recall_checkpoint_work_context,
+    validate_agent_recall_subscription_publication,
     validate_agent_work_context_publication,
 )
 
@@ -3324,6 +3359,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             access_policy_sha256 TEXT COLLATE "C" NOT NULL CHECK (
                 access_policy_sha256 ~ '^[0-9a-f]{64}$'
             ),
+            checkpoint_stream_id TEXT COLLATE "C" NOT NULL,
             revision INTEGER NOT NULL CHECK (
                 revision > 0 AND revision <= 2147483647
             ),
@@ -3360,7 +3396,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             CHECK (index_readiness_sequence <= index_readiness_high_water_sequence),
             PRIMARY KEY (
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, revision
+                access_policy_sha256, checkpoint_stream_id, revision
             ),
             FOREIGN KEY (task_id, work_context_revision)
                 REFERENCES cayu_agent_work_context_revisions(task_id, revision)
@@ -3373,18 +3409,20 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             task_id TEXT COLLATE "C" NOT NULL,
             knowledge_namespace TEXT COLLATE "C" NOT NULL,
             access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            checkpoint_stream_id TEXT COLLATE "C" NOT NULL,
             current_revision INTEGER NOT NULL CHECK (
                 current_revision > 0 AND current_revision <= 2147483647
             ),
             PRIMARY KEY (
-                agent_id, task_id, knowledge_namespace, access_policy_sha256
+                agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, checkpoint_stream_id
             ),
             FOREIGN KEY (
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, current_revision
+                access_policy_sha256, checkpoint_stream_id, current_revision
             ) REFERENCES cayu_agent_recall_checkpoints(
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, revision
+                access_policy_sha256, checkpoint_stream_id, revision
             ) ON DELETE RESTRICT
         )
         """,
@@ -3413,6 +3451,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             access_policy_sha256 TEXT COLLATE "C" NOT NULL CHECK (
                 access_policy_sha256 ~ '^[0-9a-f]{64}$'
             ),
+            checkpoint_stream_id TEXT COLLATE "C" NOT NULL,
             checkpoint_revision INTEGER NOT NULL CHECK (
                 checkpoint_revision > 0 AND checkpoint_revision <= 2147483647
             ),
@@ -3423,14 +3462,14 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             staged_at TIMESTAMPTZ NOT NULL,
             UNIQUE (
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, checkpoint_revision
+                access_policy_sha256, checkpoint_stream_id, checkpoint_revision
             ),
             FOREIGN KEY (
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, checkpoint_revision
+                access_policy_sha256, checkpoint_stream_id, checkpoint_revision
             ) REFERENCES cayu_agent_recall_checkpoints(
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, revision
+                access_policy_sha256, checkpoint_stream_id, revision
             ) ON DELETE RESTRICT,
             FOREIGN KEY (operation_id)
                 REFERENCES cayu_agent_recall_checkpoints(operation_id)
@@ -3480,6 +3519,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             task_id TEXT COLLATE "C" NOT NULL,
             knowledge_namespace TEXT COLLATE "C" NOT NULL,
             access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            checkpoint_stream_id TEXT COLLATE "C" NOT NULL,
             checkpoint_revision INTEGER NOT NULL CHECK (
                 checkpoint_revision > 0 AND checkpoint_revision <= 2147483647
             ),
@@ -3520,10 +3560,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
                 ON DELETE RESTRICT,
             FOREIGN KEY (
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, checkpoint_revision
+                access_policy_sha256, checkpoint_stream_id, checkpoint_revision
             ) REFERENCES cayu_agent_recall_deliveries(
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, checkpoint_revision
+                access_policy_sha256, checkpoint_stream_id, checkpoint_revision
             ) ON DELETE RESTRICT
         )
         """,
@@ -3531,7 +3571,314 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_agent_recall_delivery_pending
             ON cayu_agent_recall_delivery_states(
                 agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, checkpoint_revision, delivery_id
+                access_policy_sha256, checkpoint_stream_id,
+                checkpoint_revision, delivery_id
+            ) WHERE state != 'acknowledged'
+        """,
+    ),
+    73: (
+        """
+        ALTER TABLE cayu_agent_recall_deliveries
+            ADD COLUMN IF NOT EXISTS processing_schema_version TEXT COLLATE "C"
+            NOT NULL CHECK (
+                processing_schema_version = 'cayu.agent_recall_processing.v3'
+            )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_revisions (
+            subscription_id TEXT COLLATE "C" NOT NULL,
+            revision INTEGER NOT NULL CHECK (
+                revision > 0 AND revision <= 2147483647
+            ),
+            operation_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                access_policy_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            work_context_revision INTEGER NOT NULL CHECK (
+                work_context_revision > 0 AND work_context_revision <= 2147483647
+            ),
+            work_context_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                work_context_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            status TEXT COLLATE "C" NOT NULL CHECK (
+                status IN ('active', 'paused', 'cancelled')
+            ),
+            priority INTEGER NOT NULL CHECK (
+                priority >= 0 AND priority <= 1000
+            ),
+            subscription_json JSONB NOT NULL CHECK (
+                jsonb_typeof(subscription_json) = 'object'
+            ),
+            expires_at TIMESTAMPTZ NOT NULL,
+            published_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (subscription_id, revision),
+            FOREIGN KEY (task_id, work_context_revision)
+                REFERENCES cayu_agent_work_context_revisions(task_id, revision)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_heads (
+            subscription_id TEXT COLLATE "C" PRIMARY KEY,
+            current_revision INTEGER NOT NULL CHECK (
+                current_revision > 0 AND current_revision <= 2147483647
+            ),
+            FOREIGN KEY (subscription_id, current_revision)
+                REFERENCES cayu_agent_recall_subscription_revisions(
+                    subscription_id, revision
+                ) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_publications (
+            operation_id TEXT COLLATE "C" PRIMARY KEY,
+            subscription_id TEXT COLLATE "C" NOT NULL,
+            subscription_revision INTEGER NOT NULL CHECK (
+                subscription_revision > 0 AND subscription_revision <= 2147483647
+            ),
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            receipt_json JSONB NOT NULL CHECK (jsonb_typeof(receipt_json) = 'object'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            FOREIGN KEY (subscription_id, subscription_revision)
+                REFERENCES cayu_agent_recall_subscription_revisions(
+                    subscription_id, revision
+                ) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_claims (
+            claim_id TEXT COLLATE "C" PRIMARY KEY,
+            subscription_id TEXT COLLATE "C" NOT NULL,
+            subscription_revision INTEGER NOT NULL CHECK (
+                subscription_revision > 0 AND subscription_revision <= 2147483647
+            ),
+            runner_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            attempt BIGINT NOT NULL CHECK (
+                attempt > 0 AND attempt <= 9223372036854775807
+            ),
+            claimed_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (subscription_id, attempt),
+            FOREIGN KEY (subscription_id, subscription_revision)
+                REFERENCES cayu_agent_recall_subscription_revisions(
+                    subscription_id, revision
+                ) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_releases (
+            release_id TEXT COLLATE "C" PRIMARY KEY,
+            subscription_id TEXT COLLATE "C" NOT NULL,
+            claim_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            release_json JSONB NOT NULL CHECK (jsonb_typeof(release_json) = 'object'),
+            released_at TIMESTAMPTZ NOT NULL,
+            FOREIGN KEY (subscription_id)
+                REFERENCES cayu_agent_recall_subscription_heads(subscription_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (claim_id)
+                REFERENCES cayu_agent_recall_subscription_claims(claim_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_states (
+            subscription_id TEXT COLLATE "C" PRIMARY KEY,
+            current_revision INTEGER NOT NULL CHECK (
+                current_revision > 0 AND current_revision <= 2147483647
+            ),
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            run_state TEXT COLLATE "C" NOT NULL CHECK (
+                run_state IN ('due', 'claimed')
+            ),
+            attempt BIGINT NOT NULL CHECK (
+                attempt >= 0 AND attempt <= 9223372036854775807
+            ),
+            state_revision BIGINT NOT NULL CHECK (
+                state_revision >= 0 AND state_revision <= 9223372036854775807
+            ),
+            lease_expires_at TIMESTAMPTZ,
+            release_id TEXT COLLATE "C" UNIQUE,
+            next_evaluation_at TIMESTAMPTZ NOT NULL,
+            last_evaluation_id TEXT COLLATE "C",
+            state_json JSONB NOT NULL CHECK (jsonb_typeof(state_json) = 'object'),
+            updated_at TIMESTAMPTZ NOT NULL,
+            CHECK (
+                (run_state = 'due' AND lease_expires_at IS NULL)
+                OR (run_state = 'claimed' AND lease_expires_at IS NOT NULL
+                    AND release_id IS NULL AND attempt > 0 AND state_revision > 0)
+            ),
+            FOREIGN KEY (subscription_id, current_revision)
+                REFERENCES cayu_agent_recall_subscription_revisions(
+                    subscription_id, revision
+                ) ON DELETE RESTRICT,
+            FOREIGN KEY (release_id)
+                REFERENCES cayu_agent_recall_subscription_releases(release_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_evaluations (
+            evaluation_id TEXT COLLATE "C" PRIMARY KEY,
+            subscription_id TEXT COLLATE "C" NOT NULL,
+            subscription_revision INTEGER NOT NULL CHECK (
+                subscription_revision > 0 AND subscription_revision <= 2147483647
+            ),
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            claim_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            processing_operation_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            outcome TEXT COLLATE "C" NOT NULL CHECK (
+                outcome IN ('no_work', 'silent', 'wake')
+            ),
+            delivery_id TEXT COLLATE "C" UNIQUE,
+            evaluation_json JSONB NOT NULL CHECK (
+                jsonb_typeof(evaluation_json) = 'object'
+            ),
+            committed_at TIMESTAMPTZ NOT NULL,
+            CHECK (
+                (outcome = 'wake' AND delivery_id IS NOT NULL)
+                OR (outcome != 'wake' AND delivery_id IS NULL)
+            ),
+            FOREIGN KEY (subscription_id, subscription_revision)
+                REFERENCES cayu_agent_recall_subscription_revisions(
+                    subscription_id, revision
+                ) ON DELETE RESTRICT,
+            FOREIGN KEY (claim_id)
+                REFERENCES cayu_agent_recall_subscription_claims(claim_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_wake_claims (
+            claim_id TEXT COLLATE "C" PRIMARY KEY,
+            wake_id TEXT COLLATE "C" NOT NULL,
+            delivery_id TEXT COLLATE "C" NOT NULL,
+            runner_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            attempt BIGINT NOT NULL CHECK (
+                attempt > 0 AND attempt <= 9223372036854775807
+            ),
+            claimed_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (wake_id, attempt),
+            FOREIGN KEY (wake_id)
+                REFERENCES cayu_agent_recall_subscription_evaluations(evaluation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_wake_releases (
+            release_id TEXT COLLATE "C" PRIMARY KEY,
+            wake_id TEXT COLLATE "C" NOT NULL,
+            claim_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL CHECK (
+                request_sha256 ~ '^[0-9a-f]{64}$'
+            ),
+            release_json JSONB NOT NULL CHECK (jsonb_typeof(release_json) = 'object'),
+            released_at TIMESTAMPTZ NOT NULL,
+            FOREIGN KEY (wake_id)
+                REFERENCES cayu_agent_recall_subscription_evaluations(evaluation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (claim_id)
+                REFERENCES cayu_agent_recall_subscription_wake_claims(claim_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_agent_recall_subscription_wake_states (
+            wake_id TEXT COLLATE "C" PRIMARY KEY,
+            delivery_id TEXT COLLATE "C" NOT NULL UNIQUE,
+            agent_id TEXT COLLATE "C" NOT NULL,
+            task_id TEXT COLLATE "C" NOT NULL,
+            knowledge_namespace TEXT COLLATE "C" NOT NULL,
+            access_policy_sha256 TEXT COLLATE "C" NOT NULL,
+            state TEXT COLLATE "C" NOT NULL CHECK (
+                state IN ('pending', 'claimed', 'acknowledged')
+            ),
+            attempt BIGINT NOT NULL CHECK (
+                attempt >= 0 AND attempt <= 9223372036854775807
+            ),
+            state_revision BIGINT NOT NULL CHECK (
+                state_revision >= 0 AND state_revision <= 9223372036854775807
+            ),
+            claim_id TEXT COLLATE "C",
+            lease_expires_at TIMESTAMPTZ,
+            release_id TEXT COLLATE "C" UNIQUE,
+            acknowledgement_id TEXT COLLATE "C" UNIQUE,
+            state_json JSONB NOT NULL CHECK (jsonb_typeof(state_json) = 'object'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            CHECK (
+                (state = 'pending' AND (
+                    (attempt = 0 AND state_revision = 0 AND claim_id IS NULL
+                     AND lease_expires_at IS NULL AND release_id IS NULL)
+                    OR (attempt > 0 AND state_revision > 0 AND claim_id IS NOT NULL
+                        AND lease_expires_at IS NULL AND release_id IS NOT NULL)
+                ) AND acknowledgement_id IS NULL)
+                OR (state = 'claimed' AND attempt > 0 AND state_revision > 0
+                    AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL
+                    AND release_id IS NULL AND acknowledgement_id IS NULL)
+                OR (state = 'acknowledged' AND attempt > 0 AND state_revision > 0
+                    AND claim_id IS NOT NULL AND lease_expires_at IS NULL
+                    AND release_id IS NULL AND acknowledgement_id IS NOT NULL)
+            ),
+            FOREIGN KEY (wake_id)
+                REFERENCES cayu_agent_recall_subscription_evaluations(evaluation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (delivery_id)
+                REFERENCES cayu_agent_recall_deliveries(delivery_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (claim_id)
+                REFERENCES cayu_agent_recall_subscription_wake_claims(claim_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (release_id)
+                REFERENCES cayu_agent_recall_subscription_wake_releases(release_id)
+                ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_agent_recall_subscription_due
+            ON cayu_agent_recall_subscription_states(
+                agent_id, task_id, knowledge_namespace, access_policy_sha256,
+                next_evaluation_at, subscription_id
+            )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_agent_recall_subscription_evaluations
+            ON cayu_agent_recall_subscription_evaluations(
+                subscription_id, evaluation_id
+            )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_agent_recall_subscription_wakes
+            ON cayu_agent_recall_subscription_wake_states(
+                agent_id, task_id, knowledge_namespace, access_policy_sha256,
+                committed_at, wake_id
             ) WHERE state != 'acknowledged'
         """,
     ),
@@ -4599,6 +4946,41 @@ async def _reject_populated_pre_task_invocation_database(cur: Any) -> None:
         )
 
 
+async def _reject_populated_pre_recall_subscription_database(cur: Any) -> None:
+    await cur.execute("SELECT to_regclass('cayu_agent_recall_checkpoints')")
+    checkpoint_registered = await cur.fetchone()
+    if checkpoint_registered is not None and checkpoint_registered[0] is not None:
+        await cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_agent_recall_checkpoints'
+              AND column_name = 'checkpoint_stream_id'
+            """
+        )
+        if await cur.fetchone() is None:
+            raise schema.SchemaTooOld(
+                "Storage revision 73 introduces independent recall checkpoint streams and "
+                "does not migrate the prerelease checkpoint schema. Recreate the Cayu "
+                "database before starting this build."
+            )
+    await cur.execute("SELECT to_regclass('cayu_agent_recall_deliveries')")
+    delivery_registered = await cur.fetchone()
+    if delivery_registered is None or delivery_registered[0] is None:
+        return
+    await cur.execute("LOCK TABLE cayu_agent_recall_deliveries IN SHARE ROW EXCLUSIVE MODE")
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_agent_recall_deliveries)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 73 binds recall results to exact subscription input "
+            "and cannot migrate a populated recall-delivery database without "
+            "inventing missing retrieval authority. Recreate the Cayu database before "
+            "starting this build."
+        )
+
+
 async def _reject_populated_pre_knowledge_access_snapshot_database(cur: Any) -> None:
     await cur.execute("SELECT to_regclass('cayu_knowledge_publication_receipts')")
     registered = await cur.fetchone()
@@ -5084,6 +5466,12 @@ class _PostgresStoreBase:
                     ):
                         await _reject_populated_pre_bounded_knowledge_entry_database(cur)
                         bounded_entry_preflight_complete = True
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 73
+                        and any(revision.revision == 73 for revision in schema.pending(current))
+                    ):
+                        await _reject_populated_pre_recall_subscription_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -5125,7 +5513,12 @@ class _PostgresStoreBase:
                         if current_state.revision >= 69:
                             await self._validate_agent_work_context_schema(cur)
                         if current_state.revision >= 71:
-                            await self._validate_agent_recall_delivery_schema(cur)
+                            await self._validate_agent_recall_delivery_schema(
+                                cur,
+                                require_processing_schema_version=(current_state.revision >= 73),
+                            )
+                        if current_state.revision >= 73:
+                            await self._validate_agent_recall_subscription_schema(cur)
                         if self._min_required_revision >= 45:
                             await self._validate_task_retry_series_schema(cur)
                         if self._min_required_revision >= 46:
@@ -5180,6 +5573,8 @@ class _PostgresStoreBase:
                             await _reject_revision_43_knowledge_identity_overflow(cur)
                         if revision.revision == 65:
                             await _reject_populated_pre_bounded_knowledge_entry_database(cur)
+                        if revision.revision == 73:
+                            await _reject_populated_pre_recall_subscription_database(cur)
                         concurrent_indexes = _CONCURRENT_INDEX_MIGRATIONS.get(
                             revision.revision,
                             (),
@@ -5339,7 +5734,12 @@ class _PostgresStoreBase:
         if state.revision >= 69:
             await self._validate_agent_work_context_schema(cur)
         if state.revision >= 71:
-            await self._validate_agent_recall_delivery_schema(cur)
+            await self._validate_agent_recall_delivery_schema(
+                cur,
+                require_processing_schema_version=state.revision >= 73,
+            )
+        if state.revision >= 73:
+            await self._validate_agent_recall_subscription_schema(cur)
         if self._min_required_revision >= 45:
             await self._validate_task_retry_series_schema(cur)
         if self._min_required_revision >= 46:
@@ -5516,6 +5916,14 @@ class _PostgresStoreBase:
             await self._validate_interrupted_task_handoff_schema(cur)
         if revision.revision == 71:
             await self._validate_agent_recall_delivery_schema(cur)
+        if revision.revision == 72:
+            await self._validate_eval_run_max_concurrency_schema(cur)
+        if revision.revision == 73:
+            await self._validate_agent_recall_delivery_schema(
+                cur,
+                require_processing_schema_version=True,
+            )
+            await self._validate_agent_recall_subscription_schema(cur)
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -6883,6 +7291,7 @@ class _PostgresStoreBase:
                 ("task_id", "text", "NO", "C"),
                 ("knowledge_namespace", "text", "NO", "C"),
                 ("access_policy_sha256", "text", "NO", "C"),
+                ("checkpoint_stream_id", "text", "NO", "C"),
                 ("revision", "integer", "NO", None),
                 ("work_context_revision", "integer", "NO", None),
                 ("work_context_sha256", "text", "NO", "C"),
@@ -6901,6 +7310,7 @@ class _PostgresStoreBase:
                 ("task_id", "text", "NO", "C"),
                 ("knowledge_namespace", "text", "NO", "C"),
                 ("access_policy_sha256", "text", "NO", "C"),
+                ("checkpoint_stream_id", "text", "NO", "C"),
                 ("current_revision", "integer", "NO", None),
             ),
         }
@@ -6966,13 +7376,14 @@ class _PostgresStoreBase:
                     "p",
                     (
                         "primary key (agent_id, task_id, knowledge_namespace, ",
-                        "access_policy_sha256, revision)",
+                        "access_policy_sha256, checkpoint_stream_id, revision)",
                     ),
                     (
                         "agent_id",
                         "task_id",
                         "knowledge_namespace",
                         "access_policy_sha256",
+                        "checkpoint_stream_id",
                         "revision",
                     ),
                 ),
@@ -7048,9 +7459,15 @@ class _PostgresStoreBase:
                     "p",
                     (
                         "primary key (agent_id, task_id, knowledge_namespace, ",
-                        "access_policy_sha256)",
+                        "access_policy_sha256, checkpoint_stream_id)",
                     ),
-                    ("agent_id", "task_id", "knowledge_namespace", "access_policy_sha256"),
+                    (
+                        "agent_id",
+                        "task_id",
+                        "knowledge_namespace",
+                        "access_policy_sha256",
+                        "checkpoint_stream_id",
+                    ),
                 ),
                 (
                     "c",
@@ -7061,9 +7478,11 @@ class _PostgresStoreBase:
                     "f",
                     (
                         "foreign key (agent_id, task_id, knowledge_namespace, ",
-                        "access_policy_sha256, current_revision) references ",
+                        "access_policy_sha256, checkpoint_stream_id, ",
+                        "current_revision) references ",
                         "cayu_agent_recall_checkpoints(agent_id, task_id, ",
-                        "knowledge_namespace, access_policy_sha256, revision)",
+                        "knowledge_namespace, access_policy_sha256, ",
+                        "checkpoint_stream_id, revision)",
                         "on delete restrict",
                     ),
                     (
@@ -7071,6 +7490,7 @@ class _PostgresStoreBase:
                         "task_id",
                         "knowledge_namespace",
                         "access_policy_sha256",
+                        "checkpoint_stream_id",
                         "current_revision",
                     ),
                 ),
@@ -7124,19 +7544,34 @@ class _PostgresStoreBase:
             "the database."
         )
 
-    async def _validate_agent_recall_delivery_schema(self, cur: Any) -> None:
+    async def _validate_agent_recall_delivery_schema(
+        self,
+        cur: Any,
+        *,
+        require_processing_schema_version: bool = False,
+    ) -> None:
+        delivery_columns = (
+            ("delivery_id", "text", "NO", "C"),
+            ("operation_id", "text", "NO", "C"),
+            ("agent_id", "text", "NO", "C"),
+            ("task_id", "text", "NO", "C"),
+            ("knowledge_namespace", "text", "NO", "C"),
+            ("access_policy_sha256", "text", "NO", "C"),
+            ("checkpoint_stream_id", "text", "NO", "C"),
+            ("checkpoint_revision", "integer", "NO", None),
+            ("processing_result_sha256", "text", "NO", "C"),
+            ("delivery_json", "jsonb", "NO", None),
+            ("staged_at", "timestamp with time zone", "NO", None),
+        )
+        delivery_columns_with_processing_schema = (
+            *delivery_columns,
+            ("processing_schema_version", "text", "NO", "C"),
+        )
         expected_columns = {
             "cayu_agent_recall_deliveries": (
-                ("delivery_id", "text", "NO", "C"),
-                ("operation_id", "text", "NO", "C"),
-                ("agent_id", "text", "NO", "C"),
-                ("task_id", "text", "NO", "C"),
-                ("knowledge_namespace", "text", "NO", "C"),
-                ("access_policy_sha256", "text", "NO", "C"),
-                ("checkpoint_revision", "integer", "NO", None),
-                ("processing_result_sha256", "text", "NO", "C"),
-                ("delivery_json", "jsonb", "NO", None),
-                ("staged_at", "timestamp with time zone", "NO", None),
+                delivery_columns_with_processing_schema
+                if require_processing_schema_version
+                else delivery_columns
             ),
             "cayu_agent_recall_delivery_claims": (
                 ("claim_id", "text", "NO", "C"),
@@ -7160,6 +7595,7 @@ class _PostgresStoreBase:
                 ("task_id", "text", "NO", "C"),
                 ("knowledge_namespace", "text", "NO", "C"),
                 ("access_policy_sha256", "text", "NO", "C"),
+                ("checkpoint_stream_id", "text", "NO", "C"),
                 ("checkpoint_revision", "integer", "NO", None),
                 ("state", "text", "NO", "C"),
                 ("attempt", "bigint", "NO", None),
@@ -7171,6 +7607,7 @@ class _PostgresStoreBase:
                 ("updated_at", "timestamp with time zone", "NO", None),
             ),
         }
+        validate_processing_schema_version = require_processing_schema_version
         for table, expected in expected_columns.items():
             await cur.execute(
                 """
@@ -7181,7 +7618,15 @@ class _PostgresStoreBase:
                 """,
                 (table,),
             )
-            if tuple(await cur.fetchall()) != expected:
+            actual = tuple(await cur.fetchall())
+            if (
+                table == "cayu_agent_recall_deliveries"
+                and not require_processing_schema_version
+                and actual == delivery_columns_with_processing_schema
+            ):
+                validate_processing_schema_version = True
+                continue
+            if actual != expected:
                 self._raise_agent_recall_delivery_schema_error(table)
 
         required_constraints = {
@@ -7192,7 +7637,8 @@ class _PostgresStoreBase:
                     "u",
                     (
                         "unique (agent_id, task_id, knowledge_namespace, ",
-                        "access_policy_sha256, checkpoint_revision)",
+                        "access_policy_sha256, checkpoint_stream_id, ",
+                        "checkpoint_revision)",
                     ),
                 ),
                 ("c", ("access_policy_sha256", "[0-9a-f]{64}")),
@@ -7203,9 +7649,11 @@ class _PostgresStoreBase:
                     "f",
                     (
                         "foreign key (agent_id, task_id, knowledge_namespace, ",
-                        "access_policy_sha256, checkpoint_revision) references ",
+                        "access_policy_sha256, checkpoint_stream_id, ",
+                        "checkpoint_revision) references ",
                         "cayu_agent_recall_checkpoints(agent_id, task_id, ",
-                        "knowledge_namespace, access_policy_sha256, revision)",
+                        "knowledge_namespace, access_policy_sha256, ",
+                        "checkpoint_stream_id, revision)",
                         "on delete restrict",
                     ),
                 ),
@@ -7283,14 +7731,26 @@ class _PostgresStoreBase:
                     "f",
                     (
                         "foreign key (agent_id, task_id, knowledge_namespace, ",
-                        "access_policy_sha256, checkpoint_revision) references ",
+                        "access_policy_sha256, checkpoint_stream_id, ",
+                        "checkpoint_revision) references ",
                         "cayu_agent_recall_deliveries(agent_id, task_id, ",
-                        "knowledge_namespace, access_policy_sha256, checkpoint_revision)",
+                        "knowledge_namespace, access_policy_sha256, ",
+                        "checkpoint_stream_id, checkpoint_revision)",
                         "on delete restrict",
                     ),
                 ),
             ),
         }
+        if validate_processing_schema_version:
+            required_constraints["cayu_agent_recall_deliveries"] += (
+                (
+                    "c",
+                    (
+                        "processing_schema_version",
+                        "cayu.agent_recall_processing.v3",
+                    ),
+                ),
+            )
         for table, required in required_constraints.items():
             await cur.execute(
                 """
@@ -7331,7 +7791,7 @@ class _PostgresStoreBase:
         required_index_fragments = (
             "cayu_agent_recall_delivery_states using btree ",
             "(agent_id, task_id, knowledge_namespace, access_policy_sha256, ",
-            "checkpoint_revision, delivery_id)",
+            "checkpoint_stream_id, checkpoint_revision, delivery_id)",
             "where (state <> 'acknowledged'",
         )
         if any(fragment not in normalized for fragment in required_index_fragments):
@@ -7344,6 +7804,416 @@ class _PostgresStoreBase:
             f"{name!r} conflicts with Cayu's staged recall-delivery contract. "
             "Run schema_mode=MIGRATE to install the breaking revision or recreate "
             "the database."
+        )
+
+    async def _validate_agent_recall_subscription_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_agent_recall_subscription_revisions": (
+                ("subscription_id", "text", "NO", "C"),
+                ("revision", "integer", "NO", None),
+                ("operation_id", "text", "NO", "C"),
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("work_context_revision", "integer", "NO", None),
+                ("work_context_sha256", "text", "NO", "C"),
+                ("status", "text", "NO", "C"),
+                ("priority", "integer", "NO", None),
+                ("subscription_json", "jsonb", "NO", None),
+                ("expires_at", "timestamp with time zone", "NO", None),
+                ("published_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_heads": (
+                ("subscription_id", "text", "NO", "C"),
+                ("current_revision", "integer", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_publications": (
+                ("operation_id", "text", "NO", "C"),
+                ("subscription_id", "text", "NO", "C"),
+                ("subscription_revision", "integer", "NO", None),
+                ("request_sha256", "text", "NO", "C"),
+                ("receipt_json", "jsonb", "NO", None),
+                ("committed_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_claims": (
+                ("claim_id", "text", "NO", "C"),
+                ("subscription_id", "text", "NO", "C"),
+                ("subscription_revision", "integer", "NO", None),
+                ("runner_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("attempt", "bigint", "NO", None),
+                ("claimed_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_releases": (
+                ("release_id", "text", "NO", "C"),
+                ("subscription_id", "text", "NO", "C"),
+                ("claim_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("release_json", "jsonb", "NO", None),
+                ("released_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_states": (
+                ("subscription_id", "text", "NO", "C"),
+                ("current_revision", "integer", "NO", None),
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("run_state", "text", "NO", "C"),
+                ("attempt", "bigint", "NO", None),
+                ("state_revision", "bigint", "NO", None),
+                ("lease_expires_at", "timestamp with time zone", "YES", None),
+                ("release_id", "text", "YES", "C"),
+                ("next_evaluation_at", "timestamp with time zone", "NO", None),
+                ("last_evaluation_id", "text", "YES", "C"),
+                ("state_json", "jsonb", "NO", None),
+                ("updated_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_evaluations": (
+                ("evaluation_id", "text", "NO", "C"),
+                ("subscription_id", "text", "NO", "C"),
+                ("subscription_revision", "integer", "NO", None),
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("claim_id", "text", "NO", "C"),
+                ("processing_operation_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("outcome", "text", "NO", "C"),
+                ("delivery_id", "text", "YES", "C"),
+                ("evaluation_json", "jsonb", "NO", None),
+                ("committed_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_wake_claims": (
+                ("claim_id", "text", "NO", "C"),
+                ("wake_id", "text", "NO", "C"),
+                ("delivery_id", "text", "NO", "C"),
+                ("runner_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("attempt", "bigint", "NO", None),
+                ("claimed_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_wake_releases": (
+                ("release_id", "text", "NO", "C"),
+                ("wake_id", "text", "NO", "C"),
+                ("claim_id", "text", "NO", "C"),
+                ("request_sha256", "text", "NO", "C"),
+                ("release_json", "jsonb", "NO", None),
+                ("released_at", "timestamp with time zone", "NO", None),
+            ),
+            "cayu_agent_recall_subscription_wake_states": (
+                ("wake_id", "text", "NO", "C"),
+                ("delivery_id", "text", "NO", "C"),
+                ("agent_id", "text", "NO", "C"),
+                ("task_id", "text", "NO", "C"),
+                ("knowledge_namespace", "text", "NO", "C"),
+                ("access_policy_sha256", "text", "NO", "C"),
+                ("state", "text", "NO", "C"),
+                ("attempt", "bigint", "NO", None),
+                ("state_revision", "bigint", "NO", None),
+                ("claim_id", "text", "YES", "C"),
+                ("lease_expires_at", "timestamp with time zone", "YES", None),
+                ("release_id", "text", "YES", "C"),
+                ("acknowledgement_id", "text", "YES", "C"),
+                ("state_json", "jsonb", "NO", None),
+                ("committed_at", "timestamp with time zone", "NO", None),
+                ("updated_at", "timestamp with time zone", "NO", None),
+            ),
+        }
+        for table, expected in expected_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable, collation_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_agent_recall_subscription_schema_error(table)
+
+        required_constraints = {
+            "cayu_agent_recall_subscription_revisions": (
+                ("p", ("primary key (subscription_id, revision)",)),
+                ("u", ("unique (operation_id)",)),
+                ("c", ("revision > 0", "2147483647")),
+                ("c", ("access_policy_sha256", "[0-9a-f]{64}")),
+                ("c", ("work_context_sha256", "[0-9a-f]{64}")),
+                ("c", ("status", "active", "paused", "cancelled")),
+                ("c", ("priority >= 0", "priority <= 1000")),
+                ("c", ("jsonb_typeof(subscription_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (task_id, work_context_revision) references ",
+                        "cayu_agent_work_context_revisions(task_id, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_wake_claims": (
+                ("p", ("primary key (claim_id)",)),
+                ("u", ("unique (wake_id, attempt)",)),
+                ("c", ("attempt > 0", "9223372036854775807")),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                (
+                    "f",
+                    (
+                        "foreign key (wake_id) references ",
+                        "cayu_agent_recall_subscription_evaluations(evaluation_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (delivery_id) references ",
+                        "cayu_agent_recall_deliveries(delivery_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_wake_releases": (
+                ("p", ("primary key (release_id)",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                ("c", ("jsonb_typeof(release_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (wake_id) references ",
+                        "cayu_agent_recall_subscription_evaluations(evaluation_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (claim_id) references ",
+                        "cayu_agent_recall_subscription_wake_claims(claim_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_wake_states": (
+                ("p", ("primary key (wake_id)",)),
+                ("u", ("unique (delivery_id)",)),
+                ("u", ("unique (release_id)",)),
+                ("u", ("unique (acknowledgement_id)",)),
+                ("c", ("state", "pending", "claimed", "acknowledged")),
+                ("c", ("state_revision >= 0", "9223372036854775807")),
+                ("c", ("jsonb_typeof(state_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (wake_id) references ",
+                        "cayu_agent_recall_subscription_evaluations(evaluation_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (delivery_id) references ",
+                        "cayu_agent_recall_deliveries(delivery_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (claim_id) references ",
+                        "cayu_agent_recall_subscription_wake_claims(claim_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (release_id) references ",
+                        "cayu_agent_recall_subscription_wake_releases(release_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_heads": (
+                ("p", ("primary key (subscription_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (subscription_id, current_revision) references ",
+                        "cayu_agent_recall_subscription_revisions(subscription_id, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_publications": (
+                ("p", ("primary key (operation_id)",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                ("c", ("jsonb_typeof(receipt_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (subscription_id, subscription_revision) references ",
+                        "cayu_agent_recall_subscription_revisions(subscription_id, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_claims": (
+                ("p", ("primary key (claim_id)",)),
+                ("u", ("unique (subscription_id, attempt)",)),
+                ("c", ("attempt > 0", "9223372036854775807")),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                (
+                    "f",
+                    (
+                        "foreign key (subscription_id, subscription_revision) references ",
+                        "cayu_agent_recall_subscription_revisions(subscription_id, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_releases": (
+                ("p", ("primary key (release_id)",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                ("c", ("jsonb_typeof(release_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (subscription_id) references ",
+                        "cayu_agent_recall_subscription_heads(subscription_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (claim_id) references ",
+                        "cayu_agent_recall_subscription_claims(claim_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_states": (
+                ("p", ("primary key (subscription_id)",)),
+                ("u", ("unique (release_id)",)),
+                ("c", ("run_state", "due", "claimed")),
+                ("c", ("state_revision >= 0", "9223372036854775807")),
+                ("c", ("jsonb_typeof(state_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (subscription_id, current_revision) references ",
+                        "cayu_agent_recall_subscription_revisions(subscription_id, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (release_id) references ",
+                        "cayu_agent_recall_subscription_releases(release_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+            "cayu_agent_recall_subscription_evaluations": (
+                ("p", ("primary key (evaluation_id)",)),
+                ("u", ("unique (claim_id)",)),
+                ("u", ("unique (processing_operation_id)",)),
+                ("u", ("unique (delivery_id)",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+                ("c", ("outcome", "no_work", "silent", "wake")),
+                ("c", ("jsonb_typeof(evaluation_json)", "object")),
+                (
+                    "f",
+                    (
+                        "foreign key (subscription_id, subscription_revision) references ",
+                        "cayu_agent_recall_subscription_revisions(subscription_id, revision)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (claim_id) references ",
+                        "cayu_agent_recall_subscription_claims(claim_id)",
+                        "on delete restrict",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (delivery_id) references ",
+                        "cayu_agent_recall_deliveries(delivery_id)",
+                        "on delete restrict",
+                    ),
+                ),
+            ),
+        }
+        for table, required in required_constraints.items():
+            await cur.execute(
+                """
+                SELECT constraint_record.contype,
+                       pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = %s
+                """,
+                (table,),
+            )
+            actual = tuple(
+                (str(kind), " ".join(str(definition).lower().split()))
+                for kind, definition in await cur.fetchall()
+            )
+            for expected_kind, fragments in required:
+                if not any(
+                    kind == expected_kind and all(fragment in definition for fragment in fragments)
+                    for kind, definition in actual
+                ):
+                    self._raise_agent_recall_subscription_schema_error(table)
+
+        indexes = {
+            "idx_cayu_agent_recall_subscription_due": (
+                "cayu_agent_recall_subscription_states using btree ",
+                "(agent_id, task_id, knowledge_namespace, access_policy_sha256, ",
+                "next_evaluation_at, subscription_id)",
+            ),
+            "idx_cayu_agent_recall_subscription_evaluations": (
+                "cayu_agent_recall_subscription_evaluations using btree ",
+                "(subscription_id, evaluation_id)",
+            ),
+            "idx_cayu_agent_recall_subscription_wakes": (
+                "cayu_agent_recall_subscription_wake_states using btree ",
+                "(agent_id, task_id, knowledge_namespace, access_policy_sha256, ",
+                "committed_at, wake_id)",
+                "where (state <> 'acknowledged'::text)",
+            ),
+        }
+        for index, fragments in indexes.items():
+            await cur.execute(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname = current_schema() AND indexname = %s",
+                (index,),
+            )
+            row = await cur.fetchone()
+            normalized = "" if row is None else " ".join(str(row[0]).lower().split())
+            if any(fragment not in normalized for fragment in fragments):
+                self._raise_agent_recall_subscription_schema_error(index)
+
+    @staticmethod
+    def _raise_agent_recall_subscription_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's idle recall-subscription contract. "
+            "Run schema_mode=MIGRATE to install revision 73 or recreate the database."
         )
 
     async def _validate_knowledge_index_readiness_schema(self, cur: Any) -> None:
@@ -9703,6 +10573,12 @@ class _PostgresStoreBase:
             await _reject_populated_pre_result_resolver_database(cur)
         if current < 65 and any(revision.revision == 65 for revision in schema.pending(current)):
             await _reject_populated_pre_bounded_knowledge_entry_database(cur)
+        if (
+            current != schema.UNINITIALIZED
+            and current < 73
+            and any(revision.revision == 73 for revision in schema.pending(current))
+        ):
+            await _reject_populated_pre_recall_subscription_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -9711,6 +10587,8 @@ class _PostgresStoreBase:
                 await _reject_revision_43_knowledge_identity_overflow(cur)
             if rev.revision == 65:
                 await _reject_populated_pre_bounded_knowledge_entry_database(cur)
+            if rev.revision == 73:
+                await _reject_populated_pre_recall_subscription_database(cur)
             for statement in _MIGRATION_STEPS.get(rev.revision, ()):
                 await cur.execute(statement)
             # Fresh CREATE owns empty tables under the schema lock, so hot-table
@@ -11434,7 +12312,7 @@ async def _lock_agent_work_context_identity_shared(
 class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
     """PostgreSQL work-context/checkpoint store with transaction-fenced CAS."""
 
-    _min_required_revision = 71
+    _min_required_revision = 73
 
     def __init__(
         self,
@@ -11628,9 +12506,21 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         async with self._mutation_cursor() as cur:
             await _lock_agent_work_context_identity(
                 cur,
-                "checkpoint-operation",
+                "recall-processing-operation",
                 checkpoint.operation_id,
             )
+            await cur.execute(
+                """
+                SELECT 1 FROM cayu_agent_recall_deliveries WHERE operation_id = %s
+                UNION ALL
+                SELECT 1 FROM cayu_agent_recall_subscription_evaluations
+                WHERE processing_operation_id = %s
+                LIMIT 1
+                """,
+                (checkpoint.operation_id, checkpoint.operation_id),
+            )
+            if await cur.fetchone() is not None:
+                raise AgentWorkContextConflict("checkpoint_operation_reused")
             replay = await self._load_checkpoint_by_operation(
                 cur,
                 checkpoint.operation_id,
@@ -11677,9 +12567,16 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         async with self._mutation_cursor() as cur:
             await _lock_agent_work_context_identity(
                 cur,
-                "checkpoint-operation",
+                "recall-processing-operation",
                 delivery.operation_id,
             )
+            await cur.execute(
+                "SELECT 1 FROM cayu_agent_recall_subscription_evaluations "
+                "WHERE processing_operation_id = %s",
+                (delivery.operation_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise AgentRecallDeliveryConflict("delivery_operation_reused")
             await _lock_agent_work_context_identity(cur, "delivery", delivery.delivery_id)
             existing = await self._load_delivery(cur, delivery.delivery_id)
             if existing is not None:
@@ -11693,6 +12590,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 FROM cayu_agent_recall_deliveries
                 WHERE agent_id = %s AND task_id = %s
                   AND knowledge_namespace = %s AND access_policy_sha256 = %s
+                  AND checkpoint_stream_id = %s
                   AND checkpoint_revision = %s
                 """,
                 (*key.sort_key(), delivery.checkpoint.revision),
@@ -11724,10 +12622,12 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 INSERT INTO cayu_agent_recall_deliveries (
                     delivery_id, operation_id, agent_id, task_id,
                     knowledge_namespace, access_policy_sha256,
+                    checkpoint_stream_id,
                     checkpoint_revision, processing_result_sha256,
-                    delivery_json, staged_at
+                    delivery_json, staged_at, processing_schema_version
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s::jsonb, %s, %s
                 )
                 """,
                 (
@@ -11737,10 +12637,12 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                     delivery.task_id,
                     delivery.knowledge_namespace,
                     delivery.access_policy_sha256,
+                    delivery.checkpoint.checkpoint_stream_id,
                     delivery.checkpoint.revision,
                     delivery.processing_result_sha256,
                     _dumps(delivery.model_dump(mode="json")),
                     delivery.staged_at,
+                    str(delivery.processing_result["schema_version"]),
                 ),
             )
             record = AgentRecallDeliveryRecord(
@@ -11808,10 +12710,12 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                        checkpoint.record_json::text,
                        state.delivery_id, state.agent_id, state.task_id,
                        state.knowledge_namespace, state.access_policy_sha256,
-                       state.checkpoint_revision, state.state, state.attempt,
+                       state.checkpoint_stream_id, state.checkpoint_revision,
+                       state.state, state.attempt,
                        state.state_revision, state.lease_expires_at,
                        state.release_id, state.acknowledgement_id,
-                       state.state_json::text, state.updated_at
+                       state.state_json::text, state.updated_at,
+                       delivery.processing_schema_version
                 FROM cayu_agent_recall_delivery_states AS state
                 JOIN cayu_agent_recall_deliveries AS delivery
                   ON delivery.delivery_id = state.delivery_id
@@ -11820,12 +12724,20 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                  AND checkpoint.task_id = delivery.task_id
                  AND checkpoint.knowledge_namespace = delivery.knowledge_namespace
                  AND checkpoint.access_policy_sha256 = delivery.access_policy_sha256
+                 AND checkpoint.checkpoint_stream_id = delivery.checkpoint_stream_id
                  AND checkpoint.revision = delivery.checkpoint_revision
                  AND checkpoint.operation_id = delivery.operation_id
                 WHERE state.agent_id = %s AND state.task_id = %s
                   AND state.knowledge_namespace = %s
                   AND state.access_policy_sha256 = %s
+                  AND state.checkpoint_stream_id = %s
                   AND state.state != 'acknowledged'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM cayu_agent_recall_subscription_wake_states AS wake_state
+                    WHERE wake_state.delivery_id = state.delivery_id
+                      AND wake_state.state != 'acknowledged'
+                  )
                 ORDER BY state.checkpoint_revision, state.delivery_id COLLATE "C"
                 LIMIT 1
                 FOR UPDATE OF state
@@ -11996,6 +12908,828 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 await self._update_delivery_state(cur, current, acknowledged)
             return copy_agent_recall_delivery_record(acknowledged)
 
+    async def publish_recall_subscription(
+        self,
+        subscription: AgentRecallSubscription,
+        *,
+        expected_revision: int | None,
+    ) -> AgentRecallSubscriptionPublicationReceipt:
+        subscription = copy_agent_recall_subscription(subscription)
+        request_sha256 = agent_recall_subscription_publication_request_sha256(
+            subscription,
+            expected_revision,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription-publication-operation",
+                subscription.operation_id,
+            )
+            replay = await self._load_subscription_publication(
+                cur,
+                subscription.operation_id,
+            )
+            if replay is not None:
+                if replay.request_sha256 != request_sha256:
+                    raise AgentRecallSubscriptionConflict("publication_operation_reused")
+                return copy_agent_recall_subscription_publication_receipt(replay)
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription",
+                subscription.subscription_id,
+            )
+            await _lock_agent_work_context_identity_shared(
+                cur,
+                "task",
+                subscription.task_id,
+            )
+            current = await self._load_subscription(
+                cur,
+                subscription.subscription_id,
+                revision=None,
+            )
+            work_context = await self._load_context(
+                cur,
+                subscription.task_id,
+                revision=None,
+            )
+            now = await self._authoritative_delivery_now(cur)
+            if subscription.published_at > now:
+                raise AgentRecallSubscriptionConflict("publication_from_future")
+            validate_agent_recall_subscription_publication(
+                subscription,
+                expected_revision,
+                current,
+                work_context,
+            )
+            receipt = AgentRecallSubscriptionPublicationReceipt(
+                operation_id=subscription.operation_id,
+                request_sha256=request_sha256,
+                expected_revision=expected_revision,
+                subscription=subscription,
+                committed_at=now,
+            )
+            prior_state = await self._load_subscription_state(
+                cur,
+                subscription.subscription_id,
+                for_update=True,
+            )
+            state = AgentRecallSubscriptionRecord(
+                subscription=subscription,
+                state_revision=(0 if prior_state is None else prior_state.state_revision + 1),
+                attempt=0 if prior_state is None else prior_state.attempt,
+                next_evaluation_at=max(now, subscription.published_at),
+                updated_at=now,
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_revisions (
+                    subscription_id, revision, operation_id, agent_id, task_id,
+                    knowledge_namespace, access_policy_sha256,
+                    work_context_revision, work_context_sha256, status, priority,
+                    subscription_json, expires_at, published_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s::jsonb, %s, %s
+                )
+                """,
+                (
+                    subscription.subscription_id,
+                    subscription.revision,
+                    subscription.operation_id,
+                    subscription.agent_id,
+                    subscription.task_id,
+                    subscription.knowledge_namespace,
+                    subscription.access_policy_sha256,
+                    subscription.work_context_revision,
+                    subscription.work_context_sha256,
+                    subscription.status.value,
+                    subscription.priority,
+                    _dumps(subscription.model_dump(mode="json")),
+                    subscription.expires_at,
+                    subscription.published_at,
+                ),
+            )
+            if current is None:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_agent_recall_subscription_heads (
+                        subscription_id, current_revision
+                    ) VALUES (%s, %s)
+                    """,
+                    (subscription.subscription_id, subscription.revision),
+                )
+                await self._insert_subscription_state(cur, state)
+            else:
+                await cur.execute(
+                    """
+                    UPDATE cayu_agent_recall_subscription_heads
+                    SET current_revision = %s
+                    WHERE subscription_id = %s AND current_revision = %s
+                    """,
+                    (
+                        subscription.revision,
+                        subscription.subscription_id,
+                        expected_revision,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise AgentRecallSubscriptionConflict("stale_subscription_revision")
+                if prior_state is None:  # pragma: no cover - foreign key invariant
+                    raise RuntimeError("Postgres subscription head lost its state.")
+                await self._update_subscription_state(cur, prior_state, state)
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_publications (
+                    operation_id, subscription_id, subscription_revision,
+                    request_sha256, receipt_json, committed_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    receipt.operation_id,
+                    subscription.subscription_id,
+                    subscription.revision,
+                    request_sha256,
+                    _dumps(receipt.model_dump(mode="json")),
+                    receipt.committed_at,
+                ),
+            )
+            return copy_agent_recall_subscription_publication_receipt(receipt)
+
+    async def load_recall_subscription(
+        self,
+        subscription_id: str,
+        *,
+        revision: int | None = None,
+    ) -> AgentRecallSubscription | None:
+        subscription_id = _bounded_identity(subscription_id, "subscription_id")
+        if revision is not None:
+            _positive_revision(revision, "revision")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            subscription = await self._load_subscription(
+                cur,
+                subscription_id,
+                revision=revision,
+            )
+            return None if subscription is None else copy_agent_recall_subscription(subscription)
+
+    async def claim_due_recall_subscription(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        runner_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionRecord | None:
+        key = copy_agent_recall_checkpoint_key(key)
+        request_sha256 = agent_recall_subscription_claim_request_sha256(
+            key,
+            claim_id=claim_id,
+            runner_id=runner_id,
+            lease_seconds=lease_seconds,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription-claim",
+                claim_id,
+            )
+            await cur.execute(
+                "SELECT subscription_id, runner_id, request_sha256, attempt "
+                "FROM cayu_agent_recall_subscription_claims WHERE claim_id = %s",
+                (claim_id,),
+            )
+            replay = await cur.fetchone()
+            if replay is not None:
+                if str(replay[2]) != request_sha256:
+                    raise AgentRecallSubscriptionConflict("claim_id_reused")
+                record = await self._load_subscription_state(cur, str(replay[0]))
+                if record is None:  # pragma: no cover - foreign key invariant
+                    raise RuntimeError("Postgres subscription claim lost its state.")
+                current_claim = record.claim
+                now = await self._delivery_now(cur, record.updated_at)
+                if (
+                    record.run_state is not AgentRecallSubscriptionRunState.CLAIMED
+                    or current_claim is None
+                    or current_claim.claim_id != claim_id
+                    or current_claim.runner_id != str(replay[1])
+                    or current_claim.attempt != int(replay[3])
+                ):
+                    raise AgentRecallSubscriptionConflict("claim_replay_superseded")
+                if current_claim.lease_expires_at <= now:
+                    raise AgentRecallSubscriptionConflict("expired_subscription_claim")
+                return copy_agent_recall_subscription_record(record)
+            now = await self._authoritative_delivery_now(cur)
+            await cur.execute(
+                """
+                SELECT revision.subscription_json::text,
+                       state.subscription_id, state.current_revision,
+                       state.agent_id, state.task_id,
+                       state.knowledge_namespace, state.access_policy_sha256,
+                       state.run_state, state.attempt, state.state_revision,
+                       state.lease_expires_at, state.release_id,
+                       state.next_evaluation_at, state.last_evaluation_id,
+                       state.state_json::text, state.updated_at
+                FROM cayu_agent_recall_subscription_states AS state
+                JOIN cayu_agent_recall_subscription_revisions AS revision
+                  ON revision.subscription_id = state.subscription_id
+                 AND revision.revision = state.current_revision
+                JOIN cayu_agent_work_context_heads AS context_head
+                  ON context_head.task_id = revision.task_id
+                 AND context_head.current_revision = revision.work_context_revision
+                JOIN cayu_agent_work_context_revisions AS context_revision
+                  ON context_revision.task_id = context_head.task_id
+                 AND context_revision.revision = context_head.current_revision
+                 AND context_revision.content_sha256 = revision.work_context_sha256
+                WHERE state.agent_id = %s AND state.task_id = %s
+                  AND state.knowledge_namespace = %s
+                  AND state.access_policy_sha256 = %s
+                  AND revision.status = 'active'
+                  AND revision.expires_at > %s
+                  AND state.next_evaluation_at <= %s
+                  AND (
+                    state.run_state = 'due'
+                    OR state.lease_expires_at <= %s
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM cayu_agent_recall_subscription_evaluations AS evaluation
+                    JOIN cayu_agent_recall_subscription_wake_states AS wake_state
+                      ON wake_state.wake_id = evaluation.evaluation_id
+                    WHERE evaluation.subscription_id = state.subscription_id
+                      AND wake_state.state != 'acknowledged'
+                  )
+                ORDER BY state.next_evaluation_at,
+                         revision.priority DESC,
+                         state.subscription_id COLLATE "C"
+                LIMIT 1
+                FOR UPDATE OF state SKIP LOCKED
+                """,
+                (*key.authority_sort_key(), now, now, now),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            current = self._subscription_record_from_row(row)
+            claimed = _claim_agent_recall_subscription_record(
+                current,
+                claim_id=claim_id,
+                runner_id=runner_id,
+                lease_seconds=lease_seconds,
+                now=max(now, current.updated_at),
+            )
+            assert claimed.claim is not None
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_claims (
+                    claim_id, subscription_id, subscription_revision,
+                    runner_id, request_sha256, attempt, claimed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    claimed.claim.claim_id,
+                    claimed.subscription.subscription_id,
+                    claimed.subscription.revision,
+                    claimed.claim.runner_id,
+                    request_sha256,
+                    claimed.claim.attempt,
+                    claimed.claim.claimed_at,
+                ),
+            )
+            await self._update_subscription_state(cur, current, claimed)
+            return copy_agent_recall_subscription_record(claimed)
+
+    async def renew_recall_subscription(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionRecord:
+        claim = copy_agent_recall_subscription_claim(claim)
+        _validate_delivery_lease_seconds(lease_seconds)
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            current = await self._load_subscription_state(
+                cur,
+                claim.subscription_id,
+                for_update=True,
+            )
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_subscription")
+            renewed = _renew_agent_recall_subscription_record(
+                current,
+                claim,
+                lease_seconds=lease_seconds,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            if renewed != current:
+                await self._update_subscription_state(cur, current, renewed)
+            return copy_agent_recall_subscription_record(renewed)
+
+    async def release_recall_subscription(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallSubscriptionRecord:
+        claim = copy_agent_recall_subscription_claim(claim)
+        requested = _agent_recall_subscription_release(
+            claim,
+            release_id=release_id,
+            reason=reason,
+            released_at=released_at,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription-release",
+                release_id,
+            )
+            current = await self._load_subscription_state(
+                cur,
+                claim.subscription_id,
+                for_update=True,
+            )
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_subscription")
+            await cur.execute(
+                "SELECT subscription_id, release_json::text "
+                "FROM cayu_agent_recall_subscription_releases WHERE release_id = %s",
+                (requested.release_id,),
+            )
+            replay = await cur.fetchone()
+            if replay is not None:
+                stored = AgentRecallSubscriptionRelease.model_validate_json(str(replay[1]))
+                if str(replay[0]) != claim.subscription_id or stored != requested:
+                    raise AgentRecallSubscriptionConflict("release_id_reused")
+                if current.release != stored:
+                    raise AgentRecallSubscriptionConflict("release_replay_superseded")
+                return copy_agent_recall_subscription_record(current)
+            released = _release_agent_recall_subscription_record(
+                current,
+                claim,
+                release_id=requested.release_id,
+                reason=requested.reason,
+                released_at=requested.released_at,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_releases (
+                    release_id, subscription_id, claim_id, request_sha256,
+                    release_json, released_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    requested.release_id,
+                    requested.subscription_id,
+                    requested.claim_id,
+                    requested.fingerprint(),
+                    _dumps(requested.model_dump(mode="json")),
+                    requested.released_at,
+                ),
+            )
+            await self._update_subscription_state(cur, current, released)
+            return copy_agent_recall_subscription_record(released)
+
+    async def commit_recall_subscription_evaluation(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        result,
+        *,
+        evaluation_id: str,
+        delivery_id: str | None,
+        staged_by: str,
+        evaluated_at: datetime,
+    ) -> AgentRecallSubscriptionEvaluation:
+        from cayu.recall_processing import AgentRecallProcessingResult
+
+        claim = copy_agent_recall_subscription_claim(claim)
+        if type(result) is not AgentRecallProcessingResult:
+            raise TypeError("result must be an AgentRecallProcessingResult.")
+        request_sha256 = agent_recall_subscription_evaluation_request_sha256(
+            claim,
+            result,
+            evaluation_id=evaluation_id,
+            delivery_id=delivery_id,
+            staged_by=staged_by,
+            evaluated_at=evaluated_at,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription-evaluation",
+                evaluation_id,
+            )
+            replay = await self._load_subscription_evaluation(cur, evaluation_id)
+            if replay is not None:
+                if replay.request_sha256 != request_sha256:
+                    raise AgentRecallSubscriptionConflict("evaluation_id_reused")
+                return copy_agent_recall_subscription_evaluation(replay)
+            await _lock_agent_work_context_identity(
+                cur,
+                "recall-processing-operation",
+                result.operation_id,
+            )
+            await cur.execute(
+                "SELECT evaluation_id "
+                "FROM cayu_agent_recall_subscription_evaluations "
+                "WHERE processing_operation_id = %s",
+                (result.operation_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise AgentRecallSubscriptionConflict("processing_operation_reused")
+            await cur.execute(
+                """
+                SELECT 1 FROM cayu_agent_recall_checkpoints WHERE operation_id = %s
+                UNION ALL
+                SELECT 1 FROM cayu_agent_recall_deliveries WHERE operation_id = %s
+                LIMIT 1
+                """,
+                (result.operation_id, result.operation_id),
+            )
+            if await cur.fetchone() is not None:
+                raise AgentRecallSubscriptionConflict("processing_operation_reused")
+            checkpoint = result.proposed_checkpoint
+            if checkpoint is not None:
+                await _lock_agent_work_context_identity(
+                    cur,
+                    "recall-processing-operation",
+                    checkpoint.operation_id,
+                )
+                if delivery_id is not None:
+                    await _lock_agent_work_context_identity(
+                        cur,
+                        "delivery",
+                        delivery_id,
+                    )
+                await _lock_agent_work_context_identity(
+                    cur,
+                    "checkpoint",
+                    checkpoint.key().fingerprint(),
+                )
+            current = await self._load_subscription_state(
+                cur,
+                claim.subscription_id,
+                for_update=True,
+            )
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_subscription")
+            await _lock_agent_work_context_identity_shared(
+                cur,
+                "task",
+                current.subscription.task_id,
+            )
+            current_work_context = await self._load_context(
+                cur,
+                current.subscription.task_id,
+                revision=None,
+            )
+            now = await self._delivery_now(cur, current.updated_at)
+            evaluation, delivery, updated = _prepare_agent_recall_subscription_evaluation(
+                current,
+                claim,
+                result,
+                current_work_context,
+                evaluation_id=evaluation_id,
+                delivery_id=delivery_id,
+                staged_by=staged_by,
+                evaluated_at=evaluated_at,
+                now=now,
+            )
+            if delivery is not None:
+                await self._insert_subscription_delivery_locked(cur, delivery)
+            elif checkpoint is not None:
+                await self._advance_checkpoint_locked(
+                    cur,
+                    checkpoint,
+                    expected_revision=(
+                        None if checkpoint.revision == 1 else checkpoint.revision - 1
+                    ),
+                )
+            subscription = current.subscription
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_evaluations (
+                    evaluation_id, subscription_id, subscription_revision,
+                    agent_id, task_id, knowledge_namespace,
+                    access_policy_sha256, claim_id, processing_operation_id,
+                    request_sha256, outcome, delivery_id,
+                    evaluation_json, committed_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s::jsonb, %s
+                )
+                """,
+                (
+                    evaluation.evaluation_id,
+                    evaluation.subscription_id,
+                    evaluation.subscription_revision,
+                    subscription.agent_id,
+                    subscription.task_id,
+                    subscription.knowledge_namespace,
+                    subscription.access_policy_sha256,
+                    evaluation.claim_id,
+                    evaluation.processing_operation_id,
+                    evaluation.request_sha256,
+                    evaluation.outcome.value,
+                    evaluation.delivery_id,
+                    _dumps(evaluation.model_dump(mode="json")),
+                    evaluation.committed_at,
+                ),
+            )
+            if delivery is not None:
+                await self._insert_subscription_wake_state(
+                    cur,
+                    AgentRecallSubscriptionWake(
+                        wake_id=evaluation.evaluation_id,
+                        subscription=subscription,
+                        evaluation=evaluation,
+                        delivery=delivery,
+                        updated_at=evaluation.committed_at,
+                    ),
+                )
+            await self._update_subscription_state(cur, current, updated)
+            return copy_agent_recall_subscription_evaluation(evaluation)
+
+    async def load_recall_subscription_evaluation(
+        self,
+        evaluation_id: str,
+    ) -> AgentRecallSubscriptionEvaluation | None:
+        evaluation_id = _bounded_identity(evaluation_id, "evaluation_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            evaluation = await self._load_subscription_evaluation(cur, evaluation_id)
+            return (
+                None
+                if evaluation is None
+                else copy_agent_recall_subscription_evaluation(evaluation)
+            )
+
+    async def claim_recall_subscription_wake(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        runner_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionWake | None:
+        key = copy_agent_recall_checkpoint_key(key)
+        request_sha256 = agent_recall_subscription_wake_claim_request_sha256(
+            key,
+            claim_id=claim_id,
+            runner_id=runner_id,
+            lease_seconds=lease_seconds,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(cur, "subscription-wake-claim", claim_id)
+            await cur.execute(
+                "SELECT wake_id, runner_id, request_sha256, attempt "
+                "FROM cayu_agent_recall_subscription_wake_claims WHERE claim_id = %s",
+                (claim_id,),
+            )
+            replay = await cur.fetchone()
+            if replay is not None:
+                if str(replay[2]) != request_sha256:
+                    raise AgentRecallSubscriptionConflict("wake_claim_id_reused")
+                wake = await self._load_subscription_wake(cur, str(replay[0]))
+                if wake is None:  # pragma: no cover - foreign key invariant
+                    raise RuntimeError("Postgres subscription-wake claim lost its state.")
+                _require_replayable_subscription_wake_claim(
+                    wake,
+                    claim_id=claim_id,
+                    runner_id=str(replay[1]),
+                    attempt=int(replay[3]),
+                    now=await self._delivery_now(cur, wake.updated_at),
+                )
+                return copy_agent_recall_subscription_wake(wake)
+            now = await self._authoritative_delivery_now(cur)
+            await cur.execute(
+                """
+                SELECT revision.subscription_json::text,
+                       evaluation.evaluation_json::text,
+                       delivery.delivery_json::text,
+                       wake_state.wake_id, wake_state.delivery_id,
+                       wake_state.agent_id, wake_state.task_id,
+                       wake_state.knowledge_namespace,
+                       wake_state.access_policy_sha256, wake_state.state,
+                       wake_state.attempt, wake_state.state_revision,
+                       wake_state.claim_id, wake_state.lease_expires_at,
+                       wake_state.release_id, wake_state.acknowledgement_id,
+                       wake_state.state_json::text, wake_state.committed_at,
+                       wake_state.updated_at
+                FROM cayu_agent_recall_subscription_wake_states AS wake_state
+                JOIN cayu_agent_recall_subscription_evaluations AS evaluation
+                  ON evaluation.evaluation_id = wake_state.wake_id
+                JOIN cayu_agent_recall_subscription_revisions AS revision
+                  ON revision.subscription_id = evaluation.subscription_id
+                 AND revision.revision = evaluation.subscription_revision
+                JOIN cayu_agent_recall_deliveries AS delivery
+                  ON delivery.delivery_id = wake_state.delivery_id
+                WHERE wake_state.agent_id = %s AND wake_state.task_id = %s
+                  AND wake_state.knowledge_namespace = %s
+                  AND wake_state.access_policy_sha256 = %s
+                  AND wake_state.state != 'acknowledged'
+                  AND (
+                    wake_state.state = 'pending'
+                    OR wake_state.lease_expires_at <= %s
+                  )
+                ORDER BY wake_state.committed_at,
+                         wake_state.wake_id COLLATE "C"
+                LIMIT 1
+                FOR UPDATE OF wake_state SKIP LOCKED
+                """,
+                (*key.authority_sort_key(), now),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            current = self._subscription_wake_from_row(row)
+            now = max(now, current.updated_at)
+            claimed = _claim_agent_recall_subscription_wake(
+                current,
+                claim_id=claim_id,
+                runner_id=runner_id,
+                lease_seconds=lease_seconds,
+                now=now,
+            )
+            assert claimed.claim is not None
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_wake_claims (
+                    claim_id, wake_id, delivery_id, runner_id, request_sha256,
+                    attempt, claimed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    claimed.claim.claim_id,
+                    claimed.wake_id,
+                    claimed.claim.delivery_id,
+                    claimed.claim.runner_id,
+                    request_sha256,
+                    claimed.claim.attempt,
+                    claimed.claim.claimed_at,
+                ),
+            )
+            await self._update_subscription_wake_state(cur, current, claimed)
+            return copy_agent_recall_subscription_wake(claimed)
+
+    async def load_recall_subscription_wake(
+        self,
+        wake_id: str,
+    ) -> AgentRecallSubscriptionWake | None:
+        wake_id = _bounded_identity(wake_id, "wake_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            wake = await self._load_subscription_wake(cur, wake_id)
+            return None if wake is None else copy_agent_recall_subscription_wake(wake)
+
+    async def renew_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionWake:
+        claim = copy_agent_recall_subscription_wake_claim(claim)
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            current = await self._load_subscription_wake(
+                cur,
+                claim.wake_id,
+                for_update=True,
+            )
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_wake")
+            renewed = _renew_agent_recall_subscription_wake(
+                current,
+                claim,
+                lease_seconds=lease_seconds,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            if renewed != current:
+                await self._update_subscription_wake_state(cur, current, renewed)
+            return copy_agent_recall_subscription_wake(renewed)
+
+    async def release_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallSubscriptionWake:
+        claim = copy_agent_recall_subscription_wake_claim(claim)
+        requested = _agent_recall_subscription_wake_release(
+            claim,
+            release_id=release_id,
+            reason=reason,
+            released_at=released_at,
+        )
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription-wake-release",
+                requested.release_id,
+            )
+            current = await self._load_subscription_wake(
+                cur,
+                claim.wake_id,
+                for_update=True,
+            )
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_wake")
+            await cur.execute(
+                "SELECT wake_id, release_json::text "
+                "FROM cayu_agent_recall_subscription_wake_releases "
+                "WHERE release_id = %s",
+                (requested.release_id,),
+            )
+            replay = await cur.fetchone()
+            if replay is not None:
+                stored = AgentRecallSubscriptionWakeRelease.model_validate_json(str(replay[1]))
+                if str(replay[0]) != claim.wake_id or stored != requested:
+                    raise AgentRecallSubscriptionConflict("wake_release_id_reused")
+                if current.release != stored:
+                    raise AgentRecallSubscriptionConflict("wake_release_replay_superseded")
+                return copy_agent_recall_subscription_wake(current)
+            released = _release_agent_recall_subscription_wake(
+                current,
+                claim,
+                release_id=requested.release_id,
+                reason=requested.reason,
+                released_at=requested.released_at,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            await cur.execute(
+                """
+                INSERT INTO cayu_agent_recall_subscription_wake_releases (
+                    release_id, wake_id, claim_id, request_sha256,
+                    release_json, released_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                """,
+                (
+                    requested.release_id,
+                    requested.wake_id,
+                    requested.claim_id,
+                    requested.fingerprint(),
+                    _dumps(requested.model_dump(mode="json")),
+                    requested.released_at,
+                ),
+            )
+            await self._update_subscription_wake_state(cur, current, released)
+            return copy_agent_recall_subscription_wake(released)
+
+    async def acknowledge_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        acknowledgement_id: str,
+        acknowledged_at: datetime,
+    ) -> AgentRecallSubscriptionWake:
+        claim = copy_agent_recall_subscription_wake_claim(claim)
+        acknowledgement_id = _bounded_identity(acknowledgement_id, "acknowledgement_id")
+        await self._ensure_ready()
+        async with self._mutation_cursor() as cur:
+            await _lock_agent_work_context_identity(
+                cur,
+                "subscription-wake-acknowledgement",
+                acknowledgement_id,
+            )
+            current = await self._load_subscription_wake(
+                cur,
+                claim.wake_id,
+                for_update=True,
+            )
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_wake")
+            await cur.execute(
+                "SELECT wake_id FROM cayu_agent_recall_subscription_wake_states "
+                "WHERE acknowledgement_id = %s",
+                (acknowledgement_id,),
+            )
+            occupied = await cur.fetchone()
+            if occupied is not None and str(occupied[0]) != claim.wake_id:
+                raise AgentRecallSubscriptionConflict("wake_acknowledgement_id_reused")
+            acknowledged = _acknowledge_agent_recall_subscription_wake(
+                current,
+                claim,
+                acknowledgement_id=acknowledgement_id,
+                acknowledged_at=acknowledged_at,
+                now=await self._delivery_now(cur, current.updated_at),
+            )
+            if acknowledged != current:
+                await self._update_subscription_wake_state(cur, current, acknowledged)
+            return copy_agent_recall_subscription_wake(acknowledged)
+
     async def _advance_checkpoint_locked(
         self,
         cur: Any,
@@ -12029,13 +13763,14 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
             """
             INSERT INTO cayu_agent_recall_checkpoints (
                 agent_id, task_id, knowledge_namespace, access_policy_sha256,
-                revision, work_context_revision, work_context_sha256,
+                checkpoint_stream_id, revision,
+                work_context_revision, work_context_sha256,
                 knowledge_sequence, index_readiness_sequence, processing_mode,
                 knowledge_high_water_sequence,
                 index_readiness_high_water_sequence,
                 processing_id, operation_id, record_json, updated_at
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
             )
             """,
@@ -12044,6 +13779,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 checkpoint.task_id,
                 checkpoint.knowledge_namespace,
                 checkpoint.access_policy_sha256,
+                checkpoint.checkpoint_stream_id,
                 checkpoint.revision,
                 checkpoint.work_context_revision,
                 checkpoint.work_context_sha256,
@@ -12063,8 +13799,8 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 """
                 INSERT INTO cayu_agent_recall_checkpoint_heads (
                     agent_id, task_id, knowledge_namespace,
-                    access_policy_sha256, current_revision
-                ) VALUES (%s, %s, %s, %s, %s)
+                    access_policy_sha256, checkpoint_stream_id, current_revision
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (*key.sort_key(), checkpoint.revision),
             )
@@ -12075,6 +13811,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
             SET current_revision = %s
             WHERE agent_id = %s AND task_id = %s
               AND knowledge_namespace = %s AND access_policy_sha256 = %s
+              AND checkpoint_stream_id = %s
               AND current_revision = %s
             """,
             (
@@ -12085,6 +13822,450 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         )
         if cur.rowcount != 1:
             raise AgentWorkContextConflict("stale_checkpoint_revision")
+
+    @staticmethod
+    async def _load_subscription(
+        cur: Any,
+        subscription_id: str,
+        *,
+        revision: int | None,
+    ) -> AgentRecallSubscription | None:
+        if revision is None:
+            await cur.execute(
+                """
+                SELECT revision.subscription_json::text
+                FROM cayu_agent_recall_subscription_heads AS head
+                JOIN cayu_agent_recall_subscription_revisions AS revision
+                  ON revision.subscription_id = head.subscription_id
+                 AND revision.revision = head.current_revision
+                WHERE head.subscription_id = %s
+                """,
+                (subscription_id,),
+            )
+        else:
+            await cur.execute(
+                "SELECT subscription_json::text "
+                "FROM cayu_agent_recall_subscription_revisions "
+                "WHERE subscription_id = %s AND revision = %s",
+                (subscription_id, revision),
+            )
+        row = await cur.fetchone()
+        return None if row is None else AgentRecallSubscription.model_validate_json(str(row[0]))
+
+    @staticmethod
+    async def _load_subscription_publication(
+        cur: Any,
+        operation_id: str,
+    ) -> AgentRecallSubscriptionPublicationReceipt | None:
+        await cur.execute(
+            "SELECT receipt_json::text "
+            "FROM cayu_agent_recall_subscription_publications "
+            "WHERE operation_id = %s",
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else AgentRecallSubscriptionPublicationReceipt.model_validate_json(str(row[0]))
+        )
+
+    @classmethod
+    async def _load_subscription_state(
+        cls,
+        cur: Any,
+        subscription_id: str,
+        *,
+        for_update: bool = False,
+    ) -> AgentRecallSubscriptionRecord | None:
+        lock_clause = "FOR UPDATE OF state" if for_update else ""
+        await cur.execute(
+            f"""
+            SELECT revision.subscription_json::text,
+                   state.subscription_id, state.current_revision,
+                   state.agent_id, state.task_id,
+                   state.knowledge_namespace, state.access_policy_sha256,
+                   state.run_state, state.attempt, state.state_revision,
+                   state.lease_expires_at, state.release_id,
+                   state.next_evaluation_at, state.last_evaluation_id,
+                   state.state_json::text, state.updated_at
+            FROM cayu_agent_recall_subscription_states AS state
+            JOIN cayu_agent_recall_subscription_revisions AS revision
+              ON revision.subscription_id = state.subscription_id
+             AND revision.revision = state.current_revision
+            WHERE state.subscription_id = %s
+            {lock_clause}
+            """,
+            (subscription_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else cls._subscription_record_from_row(row)
+
+    @staticmethod
+    def _subscription_record_from_row(
+        row: Sequence[Any],
+    ) -> AgentRecallSubscriptionRecord:
+        subscription = json.loads(str(row[0]))
+        state = json.loads(str(row[14]))
+        if type(subscription) is not dict or type(state) is not dict:
+            raise RuntimeError("Postgres recall-subscription JSON must contain objects.")
+        state["subscription"] = subscription
+        record = AgentRecallSubscriptionRecord.model_validate_json(_dumps(state))
+        claim = record.claim
+        lease_expires_at = (
+            claim.lease_expires_at
+            if record.run_state is AgentRecallSubscriptionRunState.CLAIMED and claim is not None
+            else None
+        )
+        release_id = None if record.release is None else record.release.release_id
+        if (
+            str(row[1]) != record.subscription.subscription_id
+            or int(row[2]) != record.subscription.revision
+            or tuple(str(value) for value in row[3:7])
+            != record.subscription.checkpoint_key().authority_sort_key()
+            or str(row[7]) != record.run_state.value
+            or int(row[8]) != record.attempt
+            or int(row[9]) != record.state_revision
+            or row[10] != lease_expires_at
+            or row[11] != release_id
+            or row[12] != record.next_evaluation_at
+            or row[13] != record.last_evaluation_id
+            or row[15] != record.updated_at
+        ):
+            raise RuntimeError("Postgres recall-subscription indexes conflict with durable state.")
+        return record
+
+    @staticmethod
+    async def _load_subscription_evaluation(
+        cur: Any,
+        evaluation_id: str,
+    ) -> AgentRecallSubscriptionEvaluation | None:
+        await cur.execute(
+            "SELECT evaluation_json::text "
+            "FROM cayu_agent_recall_subscription_evaluations "
+            "WHERE evaluation_id = %s",
+            (evaluation_id,),
+        )
+        row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else AgentRecallSubscriptionEvaluation.model_validate_json(str(row[0]))
+        )
+
+    @classmethod
+    async def _load_subscription_wake(
+        cls,
+        cur: Any,
+        wake_id: str,
+        *,
+        for_update: bool = False,
+    ) -> AgentRecallSubscriptionWake | None:
+        await cur.execute(
+            """
+            SELECT revision.subscription_json::text,
+                   evaluation.evaluation_json::text,
+                   delivery.delivery_json::text,
+                   wake_state.wake_id, wake_state.delivery_id,
+                   wake_state.agent_id, wake_state.task_id,
+                   wake_state.knowledge_namespace,
+                   wake_state.access_policy_sha256, wake_state.state,
+                   wake_state.attempt, wake_state.state_revision,
+                   wake_state.claim_id, wake_state.lease_expires_at,
+                   wake_state.release_id, wake_state.acknowledgement_id,
+                   wake_state.state_json::text, wake_state.committed_at,
+                   wake_state.updated_at
+            FROM cayu_agent_recall_subscription_wake_states AS wake_state
+            JOIN cayu_agent_recall_subscription_evaluations AS evaluation
+              ON evaluation.evaluation_id = wake_state.wake_id
+            JOIN cayu_agent_recall_subscription_revisions AS revision
+              ON revision.subscription_id = evaluation.subscription_id
+             AND revision.revision = evaluation.subscription_revision
+            JOIN cayu_agent_recall_deliveries AS delivery
+              ON delivery.delivery_id = wake_state.delivery_id
+            WHERE wake_state.wake_id = %s
+            """
+            + (" FOR UPDATE OF wake_state" if for_update else ""),
+            (wake_id,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else cls._subscription_wake_from_row(row)
+
+    @staticmethod
+    def _subscription_wake_from_row(row: Sequence[Any]) -> AgentRecallSubscriptionWake:
+        subscription = json.loads(str(row[0]))
+        evaluation = json.loads(str(row[1]))
+        delivery = json.loads(str(row[2]))
+        state = json.loads(str(row[16]))
+        if any(type(value) is not dict for value in (subscription, evaluation, delivery, state)):
+            raise RuntimeError("Postgres subscription-wake JSON must contain objects.")
+        state.update(
+            subscription=subscription,
+            evaluation=evaluation,
+            delivery=delivery,
+        )
+        wake = AgentRecallSubscriptionWake.model_validate_json(_dumps(state))
+        claim = wake.claim
+        lease_expires_at = (
+            claim.lease_expires_at
+            if wake.state is AgentRecallSubscriptionWakeState.CLAIMED and claim is not None
+            else None
+        )
+        release_id = None if wake.release is None else wake.release.release_id
+        acknowledgement_id = (
+            None if wake.acknowledgement is None else wake.acknowledgement.acknowledgement_id
+        )
+        if (
+            str(row[3]) != wake.wake_id
+            or str(row[4]) != wake.delivery.delivery_id
+            or tuple(str(value) for value in row[5:9])
+            != wake.subscription.checkpoint_key().authority_sort_key()
+            or str(row[9]) != wake.state.value
+            or int(row[10]) != wake.attempt
+            or int(row[11]) != wake.state_revision
+            or row[12] != (None if claim is None else claim.claim_id)
+            or row[13] != lease_expires_at
+            or row[14] != release_id
+            or row[15] != acknowledgement_id
+            or row[17] != wake.evaluation.committed_at
+            or row[18] != wake.updated_at
+        ):
+            raise RuntimeError("Postgres subscription-wake indexes conflict with durable state.")
+        return wake
+
+    @classmethod
+    async def _insert_subscription_wake_state(
+        cls,
+        cur: Any,
+        wake: AgentRecallSubscriptionWake,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_agent_recall_subscription_wake_states (
+                wake_id, delivery_id, agent_id, task_id, knowledge_namespace,
+                access_policy_sha256, state, attempt, state_revision, claim_id,
+                lease_expires_at, release_id, acknowledgement_id, state_json,
+                committed_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s::jsonb, %s, %s
+            )
+            """,
+            cls._subscription_wake_state_values(wake),
+        )
+
+    @classmethod
+    async def _update_subscription_wake_state(
+        cls,
+        cur: Any,
+        current: AgentRecallSubscriptionWake,
+        updated: AgentRecallSubscriptionWake,
+    ) -> None:
+        await cur.execute(
+            """
+            UPDATE cayu_agent_recall_subscription_wake_states
+            SET delivery_id = %s, agent_id = %s, task_id = %s,
+                knowledge_namespace = %s, access_policy_sha256 = %s,
+                state = %s, attempt = %s, state_revision = %s, claim_id = %s,
+                lease_expires_at = %s, release_id = %s, acknowledgement_id = %s,
+                state_json = %s::jsonb, committed_at = %s, updated_at = %s
+            WHERE wake_id = %s AND state_revision = %s
+            """,
+            (
+                *cls._subscription_wake_state_values(updated)[1:],
+                updated.wake_id,
+                current.state_revision,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AgentRecallSubscriptionConflict("stale_wake_state")
+
+    @staticmethod
+    def _subscription_wake_state_values(
+        wake: AgentRecallSubscriptionWake,
+    ) -> tuple[object, ...]:
+        claim = wake.claim
+        lease_expires_at = (
+            claim.lease_expires_at
+            if wake.state is AgentRecallSubscriptionWakeState.CLAIMED and claim is not None
+            else None
+        )
+        state = wake.model_dump(
+            mode="json",
+            exclude={"subscription", "evaluation", "delivery"},
+        )
+        return (
+            wake.wake_id,
+            wake.delivery.delivery_id,
+            wake.subscription.agent_id,
+            wake.subscription.task_id,
+            wake.subscription.knowledge_namespace,
+            wake.subscription.access_policy_sha256,
+            wake.state.value,
+            wake.attempt,
+            wake.state_revision,
+            None if claim is None else claim.claim_id,
+            lease_expires_at,
+            None if wake.release is None else wake.release.release_id,
+            (None if wake.acknowledgement is None else wake.acknowledgement.acknowledgement_id),
+            _dumps(state),
+            wake.evaluation.committed_at,
+            wake.updated_at,
+        )
+
+    @classmethod
+    async def _insert_subscription_state(
+        cls,
+        cur: Any,
+        record: AgentRecallSubscriptionRecord,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_agent_recall_subscription_states (
+                subscription_id, current_revision, agent_id, task_id,
+                knowledge_namespace, access_policy_sha256, run_state,
+                attempt, state_revision, lease_expires_at, release_id,
+                next_evaluation_at, last_evaluation_id, state_json, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s::jsonb, %s
+            )
+            """,
+            cls._subscription_state_values(record),
+        )
+
+    @classmethod
+    async def _update_subscription_state(
+        cls,
+        cur: Any,
+        current: AgentRecallSubscriptionRecord,
+        updated: AgentRecallSubscriptionRecord,
+    ) -> None:
+        await cur.execute(
+            """
+            UPDATE cayu_agent_recall_subscription_states
+            SET current_revision = %s, agent_id = %s, task_id = %s,
+                knowledge_namespace = %s, access_policy_sha256 = %s,
+                run_state = %s, attempt = %s, state_revision = %s,
+                lease_expires_at = %s, release_id = %s,
+                next_evaluation_at = %s, last_evaluation_id = %s,
+                state_json = %s::jsonb, updated_at = %s
+            WHERE subscription_id = %s AND state_revision = %s
+            """,
+            (
+                *cls._subscription_state_values(updated)[1:],
+                updated.subscription.subscription_id,
+                current.state_revision,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AgentRecallSubscriptionConflict("stale_subscription_state")
+
+    @staticmethod
+    def _subscription_state_values(
+        record: AgentRecallSubscriptionRecord,
+    ) -> tuple[object, ...]:
+        claim = record.claim
+        lease_expires_at = (
+            claim.lease_expires_at
+            if record.run_state is AgentRecallSubscriptionRunState.CLAIMED and claim is not None
+            else None
+        )
+        subscription = record.subscription
+        state = record.model_dump(mode="json", exclude={"subscription"})
+        return (
+            subscription.subscription_id,
+            subscription.revision,
+            subscription.agent_id,
+            subscription.task_id,
+            subscription.knowledge_namespace,
+            subscription.access_policy_sha256,
+            record.run_state.value,
+            record.attempt,
+            record.state_revision,
+            lease_expires_at,
+            None if record.release is None else record.release.release_id,
+            record.next_evaluation_at,
+            record.last_evaluation_id,
+            _dumps(state),
+            record.updated_at,
+        )
+
+    async def _insert_subscription_delivery_locked(
+        self,
+        cur: Any,
+        delivery: AgentRecallDelivery,
+    ) -> None:
+        key = delivery.key()
+        await _lock_agent_work_context_identity(
+            cur,
+            "recall-processing-operation",
+            delivery.operation_id,
+        )
+        await _lock_agent_work_context_identity(cur, "delivery", delivery.delivery_id)
+        if await self._load_delivery(cur, delivery.delivery_id) is not None:
+            raise AgentRecallSubscriptionConflict("delivery_id_reused")
+        await _lock_agent_work_context_identity(cur, "checkpoint", key.fingerprint())
+        await cur.execute(
+            """
+            SELECT delivery_id
+            FROM cayu_agent_recall_deliveries
+            WHERE agent_id = %s AND task_id = %s
+              AND knowledge_namespace = %s AND access_policy_sha256 = %s
+              AND checkpoint_stream_id = %s
+              AND checkpoint_revision = %s
+            """,
+            (*key.sort_key(), delivery.checkpoint.revision),
+        )
+        if await cur.fetchone() is not None:
+            raise AgentRecallSubscriptionConflict("checkpoint_delivery_exists")
+        if await self._load_delivery_by_operation(cur, delivery.operation_id) is not None:
+            raise AgentRecallSubscriptionConflict("delivery_operation_reused")
+        if await self._load_checkpoint_by_operation(cur, delivery.operation_id) is not None:
+            raise AgentRecallSubscriptionConflict("checkpoint_committed_without_delivery")
+        if delivery.staged_at > await self._authoritative_delivery_now(cur):
+            raise AgentRecallSubscriptionConflict("delivery_staged_in_future")
+        await _lock_agent_work_context_identity_shared(cur, "task", delivery.task_id)
+        await self._advance_checkpoint_locked(
+            cur,
+            delivery.checkpoint,
+            expected_revision=delivery.expected_checkpoint_revision,
+        )
+        await cur.execute(
+            """
+            INSERT INTO cayu_agent_recall_deliveries (
+                delivery_id, operation_id, agent_id, task_id,
+                knowledge_namespace, access_policy_sha256,
+                checkpoint_stream_id,
+                checkpoint_revision, processing_result_sha256,
+                delivery_json, staged_at, processing_schema_version
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s::jsonb, %s, %s
+            )
+            """,
+            (
+                delivery.delivery_id,
+                delivery.operation_id,
+                delivery.agent_id,
+                delivery.task_id,
+                delivery.knowledge_namespace,
+                delivery.access_policy_sha256,
+                delivery.checkpoint.checkpoint_stream_id,
+                delivery.checkpoint.revision,
+                delivery.processing_result_sha256,
+                _dumps(delivery.model_dump(mode="json")),
+                delivery.staged_at,
+                str(delivery.processing_result["schema_version"]),
+            ),
+        )
+        await self._insert_delivery_state(
+            cur,
+            AgentRecallDeliveryRecord(
+                delivery=delivery,
+                updated_at=delivery.staged_at,
+            ),
+        )
 
     async def _delivery_now(self, cur: Any, floor: datetime) -> datetime:
         return max(await self._authoritative_delivery_now(cur), floor)
@@ -12116,10 +14297,12 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                    checkpoint.record_json::text,
                    state.delivery_id, state.agent_id, state.task_id,
                    state.knowledge_namespace, state.access_policy_sha256,
-                   state.checkpoint_revision, state.state, state.attempt,
+                   state.checkpoint_stream_id, state.checkpoint_revision,
+                   state.state, state.attempt,
                    state.state_revision, state.lease_expires_at,
                    state.release_id, state.acknowledgement_id,
-                   state.state_json::text, state.updated_at
+                   state.state_json::text, state.updated_at,
+                   delivery.processing_schema_version
             FROM cayu_agent_recall_deliveries AS delivery
             JOIN cayu_agent_recall_delivery_states AS state
               ON state.delivery_id = delivery.delivery_id
@@ -12128,6 +14311,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
              AND checkpoint.task_id = delivery.task_id
              AND checkpoint.knowledge_namespace = delivery.knowledge_namespace
              AND checkpoint.access_policy_sha256 = delivery.access_policy_sha256
+             AND checkpoint.checkpoint_stream_id = delivery.checkpoint_stream_id
              AND checkpoint.revision = delivery.checkpoint_revision
              AND checkpoint.operation_id = delivery.operation_id
             WHERE delivery.delivery_id = %s
@@ -12156,7 +14340,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
         if row[4] is None:
             raise RuntimeError("Postgres recall delivery conflicts with its checkpoint.")
         delivery = json.loads(str(row[0]))
-        state = json.loads(str(row[17]))
+        state = json.loads(str(row[18]))
         if type(delivery) is not dict or type(state) is not dict:
             raise RuntimeError("Postgres recall-delivery JSON must contain objects.")
         state["delivery"] = delivery
@@ -12177,15 +14361,16 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
             or str(row[2]) != record.delivery.processing_result_sha256
             or row[3] != record.delivery.staged_at
             or str(row[5]) != record.delivery.delivery_id
-            or tuple(str(value) for value in row[6:10]) != record.delivery.key().sort_key()
-            or int(row[10]) != record.delivery.checkpoint.revision
-            or str(row[11]) != record.state.value
-            or int(row[12]) != record.attempt
-            or int(row[13]) != record.state_revision
-            or row[14] != lease_expires_at
-            or row[15] != release_id
-            or row[16] != acknowledgement_id
-            or row[18] != record.updated_at
+            or tuple(str(value) for value in row[6:11]) != record.delivery.key().sort_key()
+            or int(row[11]) != record.delivery.checkpoint.revision
+            or str(row[12]) != record.state.value
+            or int(row[13]) != record.attempt
+            or int(row[14]) != record.state_revision
+            or row[15] != lease_expires_at
+            or row[16] != release_id
+            or row[17] != acknowledgement_id
+            or row[19] != record.updated_at
+            or str(row[20]) != record.delivery.processing_result["schema_version"]
         ):
             raise RuntimeError("Postgres recall-delivery indexes conflict with durable state.")
         return record
@@ -12200,12 +14385,13 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
             """
             INSERT INTO cayu_agent_recall_delivery_states (
                 delivery_id, agent_id, task_id, knowledge_namespace,
-                access_policy_sha256, checkpoint_revision, state, attempt,
+                access_policy_sha256, checkpoint_stream_id,
+                checkpoint_revision, state, attempt,
                 state_revision, lease_expires_at, release_id,
                 acknowledgement_id, state_json, updated_at
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s::jsonb, %s
+                %s, %s, %s, %s, %s, %s::jsonb, %s
             )
             """,
             cls._delivery_state_values(record),
@@ -12222,7 +14408,8 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
             """
             UPDATE cayu_agent_recall_delivery_states
             SET agent_id = %s, task_id = %s, knowledge_namespace = %s,
-                access_policy_sha256 = %s, checkpoint_revision = %s, state = %s,
+                access_policy_sha256 = %s, checkpoint_stream_id = %s,
+                checkpoint_revision = %s, state = %s,
                 attempt = %s, state_revision = %s, lease_expires_at = %s,
                 release_id = %s, acknowledgement_id = %s,
                 state_json = %s::jsonb, updated_at = %s
@@ -12252,6 +14439,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
             record.delivery.task_id,
             record.delivery.knowledge_namespace,
             record.delivery.access_policy_sha256,
+            record.delivery.checkpoint.checkpoint_stream_id,
             record.delivery.checkpoint.revision,
             record.state.value,
             record.attempt,
@@ -12331,10 +14519,12 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                  AND checkpoint.task_id = head.task_id
                  AND checkpoint.knowledge_namespace = head.knowledge_namespace
                  AND checkpoint.access_policy_sha256 = head.access_policy_sha256
+                 AND checkpoint.checkpoint_stream_id = head.checkpoint_stream_id
                  AND checkpoint.revision = head.current_revision
                 WHERE head.agent_id = %s AND head.task_id = %s
                   AND head.knowledge_namespace = %s
                   AND head.access_policy_sha256 = %s
+                  AND head.checkpoint_stream_id = %s
                 """,
                 key.sort_key(),
             )
@@ -12345,6 +14535,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
                 FROM cayu_agent_recall_checkpoints
                 WHERE agent_id = %s AND task_id = %s
                   AND knowledge_namespace = %s AND access_policy_sha256 = %s
+                  AND checkpoint_stream_id = %s
                   AND revision = %s
                 """,
                 (*key.sort_key(), revision),

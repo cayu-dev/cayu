@@ -1,0 +1,93 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_silent_commit_p50_ms": 15.0,
+    "memory_silent_commit_p95_ms": 30.0,
+    "memory_wake_acknowledgement_p50_ms": 30.0,
+    "memory_wake_acknowledgement_p95_ms": 60.0,
+    "memory_wake_claim_p50_ms": 30.0,
+    "memory_wake_claim_p95_ms": 60.0,
+    "memory_wake_publish_p50_ms": 40.0,
+    "memory_wake_publish_p95_ms": 80.0,
+    "memory_zero_due_p50_ms": 2.5,
+    "memory_zero_due_p95_ms": 5.0,
+    "sqlite_silent_commit_p50_ms": 30.0,
+    "sqlite_silent_commit_p95_ms": 100.0,
+    "sqlite_wake_acknowledgement_p50_ms": 40.0,
+    "sqlite_wake_acknowledgement_p95_ms": 150.0,
+    "sqlite_wake_claim_p50_ms": 40.0,
+    "sqlite_wake_claim_p95_ms": 150.0,
+    "sqlite_wake_publish_p50_ms": 50.0,
+    "sqlite_wake_publish_p95_ms": 200.0,
+    "sqlite_zero_due_p50_ms": 5.0,
+    "sqlite_zero_due_p95_ms": 25.0
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "current_store_with_bounded_claimed_subscriptions"
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "sample_count": 50,
+      "silent_commit_latency": {
+        "p50_ms": 4.992145,
+        "p95_ms": 5.342542
+      },
+      "wake_acknowledgement_latency": {
+        "p50_ms": 11.228312,
+        "p95_ms": 11.679458
+      },
+      "wake_claim_latency": {
+        "p50_ms": 11.32527,
+        "p95_ms": 11.815792
+      },
+      "wake_publish_latency": {
+        "p50_ms": 19.462,
+        "p95_ms": 20.314375
+      },
+      "zero_due_latency": {
+        "p50_ms": 0.07498,
+        "p95_ms": 0.081166
+      }
+    },
+    {
+      "backend": "sqlite",
+      "sample_count": 50,
+      "silent_commit_latency": {
+        "p50_ms": 7.163583,
+        "p95_ms": 7.437084
+      },
+      "wake_acknowledgement_latency": {
+        "p50_ms": 15.166897,
+        "p95_ms": 16.256583
+      },
+      "wake_claim_latency": {
+        "p50_ms": 15.301896,
+        "p95_ms": 16.018833
+      },
+      "wake_publish_latency": {
+        "p50_ms": 21.527209,
+        "p95_ms": 24.254208
+      },
+      "zero_due_latency": {
+        "p50_ms": 0.088875,
+        "p95_ms": 0.09775
+      }
+    }
+  ],
+  "schema_version": "cayu.recall_subscription_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "backends": [
+      "memory",
+      "sqlite"
+    ],
+    "provider_calls": 0,
+    "samples": 50
+  }
+}

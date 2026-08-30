@@ -394,6 +394,11 @@ REVISIONS: tuple[Revision, ...] = (
     # eval-run constraint lets newer writers persist values that older binaries
     # reject, so mixed-version operation is unsafe.
     Revision(revision=72, kind=RevisionKind.BREAKING, compatible_from=72),
+    # Idle-task recall subscriptions bind processing results to their exact
+    # retrieval input and add scheduler-wake authority beside revision 71.
+    # Mixed pre-73 processing-result writers would publish the old contract,
+    # so this is a clean break. No subscription or wake state is inferred.
+    Revision(revision=73, kind=RevisionKind.BREAKING, compatible_from=73),
 )
 
 #: The revision an empty database is initialized to.

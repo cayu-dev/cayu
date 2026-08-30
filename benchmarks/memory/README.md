@@ -141,6 +141,27 @@ without treating pre-feature code as a control. In-memory and SQLite provide the
 credential-free timing matrix; PostgreSQL runs shared conformance, concurrency,
 reopen, migration, and cancellation rollback tests.
 
+## Idle recall-subscription overhead
+
+`recall-subscription-performance-v1.json` is the hermetic 50-sample baseline
+for bounded due lookup, atomic silent/relevant evaluation, and the independent
+scheduler-wake lifecycle. Regenerate it, or check every fixed p50/p95 ceiling
+without provider calls, with:
+
+```bash
+PYTHONPATH=src python scripts/run_recall_subscription_performance.py \
+  --output benchmarks/memory/recall-subscription-performance-v1.json \
+  --check
+```
+
+The lanes measure an indexed zero-due lookup with populated claimed
+subscriptions, silent checkpoint/evaluation commitment, relevant atomic
+checkpoint/delivery/evaluation/wake publication, scheduler claim, and scheduler
+acknowledgement. The acknowledgement lane does not acknowledge the staged
+delivery or create provider-exposure evidence. In-memory and SQLite provide the
+credential-free timing matrix; PostgreSQL runs the shared behavioral and
+failure-recovery contract in integration tests.
+
 ## Revision-bound knowledge-relation overhead
 
 `knowledge-relation-performance-v1.json` is the hermetic baseline for 50 matching

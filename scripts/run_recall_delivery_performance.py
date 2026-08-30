@@ -16,6 +16,7 @@ from statistics import median
 from typing import Any
 
 from cayu import (
+    DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
     AgentRecallDelivery,
     AgentRecallDeliveryEvidenceKind,
     AgentRecallDeliveryState,
@@ -133,6 +134,7 @@ async def _deliveries(samples: int) -> tuple[AgentWorkContext, list[AgentRecallD
                     knowledge_namespace=_NAMESPACE,
                     current_time=_NOW,
                 ),
+                checkpoint_stream_id=DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
                 checkpoint=previous_checkpoint,
                 processing_id=f"processing:{sample:05d}",
                 operation_id=operation_id,

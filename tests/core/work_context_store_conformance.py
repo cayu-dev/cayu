@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from cayu import (
+    DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
     AgentRecallCheckpoint,
     AgentRecallCheckpointMode,
     AgentRecallDelivery,
@@ -76,6 +77,7 @@ async def _process_delivery(
     operation_id: str,
     checkpoint_value: AgentRecallCheckpoint | None,
     agent_id: str = "agent:delivery",
+    checkpoint_stream_id: str = DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
 ) -> AgentRecallProcessingResult:
     return await processor.process(
         AgentRecallProcessingRequest(
@@ -87,6 +89,7 @@ async def _process_delivery(
                 knowledge_namespace=_DELIVERY_NAMESPACE,
                 current_time=_STARTED_AT + timedelta(minutes=40),
             ),
+            checkpoint_stream_id=checkpoint_stream_id,
             checkpoint=checkpoint_value,
             processing_id=f"processing:{operation_id}",
             operation_id=operation_id,

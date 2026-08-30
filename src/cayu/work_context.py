@@ -35,13 +35,30 @@ if TYPE_CHECKING:
 
 AGENT_WORK_CONTEXT_SCHEMA_VERSION = "cayu.agent_work_context.v1"
 AGENT_WORK_CONTEXT_PUBLICATION_SCHEMA_VERSION = "cayu.agent_work_context_publication_receipt.v1"
-AGENT_RECALL_CHECKPOINT_SCHEMA_VERSION = "cayu.agent_recall_checkpoint.v1"
+AGENT_RECALL_CHECKPOINT_SCHEMA_VERSION = "cayu.agent_recall_checkpoint.v2"
+DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID = "cayu.agent_recall.inline.v1"
 AGENT_RECALL_DELIVERY_SCHEMA_VERSION = "cayu.agent_recall_delivery.v1"
 AGENT_RECALL_DELIVERY_RECORD_SCHEMA_VERSION = "cayu.agent_recall_delivery_record.v1"
 AGENT_RECALL_DELIVERY_CLAIM_SCHEMA_VERSION = "cayu.agent_recall_delivery_claim.v1"
 AGENT_RECALL_DELIVERY_RELEASE_SCHEMA_VERSION = "cayu.agent_recall_delivery_release.v1"
 AGENT_RECALL_DELIVERY_ACKNOWLEDGEMENT_SCHEMA_VERSION = (
     "cayu.agent_recall_delivery_acknowledgement.v1"
+)
+AGENT_RECALL_SUBSCRIPTION_SCHEMA_VERSION = "cayu.agent_recall_subscription.v1"
+AGENT_RECALL_SUBSCRIPTION_PUBLICATION_SCHEMA_VERSION = (
+    "cayu.agent_recall_subscription_publication_receipt.v1"
+)
+AGENT_RECALL_SUBSCRIPTION_RECORD_SCHEMA_VERSION = "cayu.agent_recall_subscription_record.v1"
+AGENT_RECALL_SUBSCRIPTION_CLAIM_SCHEMA_VERSION = "cayu.agent_recall_subscription_claim.v1"
+AGENT_RECALL_SUBSCRIPTION_RELEASE_SCHEMA_VERSION = "cayu.agent_recall_subscription_release.v1"
+AGENT_RECALL_SUBSCRIPTION_EVALUATION_SCHEMA_VERSION = "cayu.agent_recall_subscription_evaluation.v1"
+AGENT_RECALL_SUBSCRIPTION_WAKE_SCHEMA_VERSION = "cayu.agent_recall_subscription_wake.v1"
+AGENT_RECALL_SUBSCRIPTION_WAKE_CLAIM_SCHEMA_VERSION = "cayu.agent_recall_subscription_wake_claim.v1"
+AGENT_RECALL_SUBSCRIPTION_WAKE_RELEASE_SCHEMA_VERSION = (
+    "cayu.agent_recall_subscription_wake_release.v1"
+)
+AGENT_RECALL_SUBSCRIPTION_WAKE_ACKNOWLEDGEMENT_SCHEMA_VERSION = (
+    "cayu.agent_recall_subscription_wake_acknowledgement.v1"
 )
 
 MAX_AGENT_WORK_CONTEXT_REVISION = 2_147_483_647
@@ -52,6 +69,10 @@ MAX_AGENT_WORK_CONTEXT_VALUES = 128
 MAX_AGENT_WORK_CONTEXT_BYTES = 256_000
 MAX_AGENT_RECALL_DELIVERY_BYTES = 2_000_000
 MAX_AGENT_RECALL_DELIVERY_LEASE_SECONDS = 86_400.0
+MAX_AGENT_RECALL_SUBSCRIPTION_BYTES = 512_000
+MAX_AGENT_RECALL_SUBSCRIPTION_INTERVAL_SECONDS = 604_800.0
+MAX_AGENT_RECALL_SUBSCRIPTION_QUERY_BYTES = 8_192
+MAX_AGENT_RECALL_SUBSCRIPTION_PRIORITY = 1_000
 
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 _CONTEXT_COLLECTION_FIELDS = (
@@ -62,6 +83,8 @@ _CONTEXT_COLLECTION_FIELDS = (
     "code_symbols",
     "planned_action_ids",
 )
+_AGENT_RECALL_FACET_ASPECT_PREFIX = "cayu.agent_recall_facet.v1"
+_AGENT_RECALL_SUBSCRIPTION_CHECKPOINT_STREAM_PREFIX = "cayu.agent_recall.subscription_checkpoint.v1"
 
 
 class _WorkContextModel(BaseModel):
@@ -136,6 +159,21 @@ def _copy_context_values(value: Sequence[str], field_name: str) -> tuple[str, ..
             f"`{field_name}` cannot contain more than {MAX_AGENT_WORK_CONTEXT_VALUES} values."
         )
     return tuple(value)
+
+
+def agent_recall_facet_aspect(field_name: str, value: str) -> str:
+    """Encode one typed work-context facet as an exact knowledge aspect."""
+
+    if field_name not in _CONTEXT_COLLECTION_FIELDS:
+        raise ValueError(f"Unsupported agent recall facet field {field_name!r}.")
+    value = _bounded_value(value, field_name)
+    digest = sha256(
+        canonical_durable_json_bytes(
+            {"field": field_name, "value": value},
+            "agent recall facet",
+        )
+    ).hexdigest()
+    return f"{_AGENT_RECALL_FACET_ASPECT_PREFIX}:{field_name}:{digest}"
 
 
 def _sha256_hex(value: str, field_name: str) -> str:
@@ -415,8 +453,9 @@ class AgentRecallCheckpointKey(_WorkContextModel):
     task_id: str
     knowledge_namespace: str
     access_policy_sha256: str
+    checkpoint_stream_id: str = DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID
 
-    @field_validator("agent_id", "task_id", "knowledge_namespace")
+    @field_validator("agent_id", "task_id", "knowledge_namespace", "checkpoint_stream_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_identity(value, info.field_name)
@@ -426,7 +465,18 @@ class AgentRecallCheckpointKey(_WorkContextModel):
     def validate_access_policy_sha256(cls, value: str) -> str:
         return _sha256_hex(value, "access_policy_sha256")
 
-    def sort_key(self) -> tuple[str, str, str, str]:
+    def sort_key(self) -> tuple[str, str, str, str, str]:
+        return (
+            self.agent_id,
+            self.task_id,
+            self.knowledge_namespace,
+            self.access_policy_sha256,
+            self.checkpoint_stream_id,
+        )
+
+    def authority_sort_key(self) -> tuple[str, str, str, str]:
+        """Return the selector shared by all checkpoint streams for this authority."""
+
         return (
             self.agent_id,
             self.task_id,
@@ -449,13 +499,14 @@ class AgentRecallCheckpointKey(_WorkContextModel):
 class AgentRecallCheckpoint(_WorkContextModel):
     """Processed freshness frontier for one exact agent/task/access view."""
 
-    schema_version: Literal["cayu.agent_recall_checkpoint.v1"] = (
+    schema_version: Literal["cayu.agent_recall_checkpoint.v2"] = (
         AGENT_RECALL_CHECKPOINT_SCHEMA_VERSION
     )
     agent_id: str
     task_id: str
     knowledge_namespace: str
     access_policy_sha256: str
+    checkpoint_stream_id: str = DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID
     revision: int
     work_context_revision: int
     work_context_sha256: str
@@ -469,7 +520,12 @@ class AgentRecallCheckpoint(_WorkContextModel):
     updated_by: str
     updated_at: datetime
 
-    @field_validator("agent_id", "task_id", "knowledge_namespace")
+    @field_validator(
+        "agent_id",
+        "task_id",
+        "knowledge_namespace",
+        "checkpoint_stream_id",
+    )
     @classmethod
     def validate_key_identity(cls, value: str, info) -> str:
         return _bounded_identity(value, info.field_name)
@@ -529,6 +585,7 @@ class AgentRecallCheckpoint(_WorkContextModel):
             task_id=self.task_id,
             knowledge_namespace=self.knowledge_namespace,
             access_policy_sha256=self.access_policy_sha256,
+            checkpoint_stream_id=self.checkpoint_stream_id,
         )
 
     def fingerprint(self) -> str:
@@ -1086,6 +1143,1003 @@ class AgentRecallDeliveryRecord(_WorkContextModel):
         return self
 
 
+class AgentRecallSubscriptionStatus(StrEnum):
+    """Application-owned subscription lifecycle."""
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+
+
+class AgentRecallSubscriptionRunState(StrEnum):
+    """Whether one active subscription is available or runner-claimed."""
+
+    DUE = "due"
+    CLAIMED = "claimed"
+
+
+class AgentRecallSubscriptionEvaluationOutcome(StrEnum):
+    """Durable result of one bounded subscription evaluation."""
+
+    NO_WORK = "no_work"
+    SILENT = "silent"
+    WAKE = "wake"
+
+
+class AgentRecallSubscriptionWakeState(StrEnum):
+    """Independent task-scheduler handoff state for one admitted wake."""
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    ACKNOWLEDGED = "acknowledged"
+
+
+class AgentRecallSubscription(_WorkContextModel):
+    """One immutable revision of an idle-task recall subscription."""
+
+    schema_version: Literal["cayu.agent_recall_subscription.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_SCHEMA_VERSION
+    )
+    subscription_id: str
+    agent_id: str
+    task_id: str
+    knowledge_namespace: str
+    access_policy_sha256: str
+    work_context_revision: int
+    work_context_sha256: str
+    query: str | None = None
+    scope_ids: tuple[str, ...] = ()
+    entity_ids: tuple[str, ...] = ()
+    artifact_ids: tuple[str, ...] = ()
+    repository_paths: tuple[str, ...] = ()
+    code_symbols: tuple[str, ...] = ()
+    planned_action_ids: tuple[str, ...] = ()
+    admission_policy: Mapping[str, Any]
+    admission_policy_sha256: str
+    priority: int = 0
+    minimum_interval_seconds: float
+    expires_at: datetime
+    status: AgentRecallSubscriptionStatus
+    revision: int
+    operation_id: str
+    published_by: str
+    published_at: datetime
+
+    @field_validator(
+        "subscription_id",
+        "agent_id",
+        "task_id",
+        "knowledge_namespace",
+        "operation_id",
+        "published_by",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator("access_policy_sha256", "work_context_sha256", "admission_policy_sha256")
+    @classmethod
+    def validate_digest(cls, value: str, info) -> str:
+        return _sha256_hex(value, info.field_name)
+
+    @field_validator("work_context_revision", "revision")
+    @classmethod
+    def validate_revision(cls, value: int, info) -> int:
+        return _positive_revision(value, info.field_name)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_durable_clean_nonblank(value, "query")
+        if len(value.encode("utf-8")) > MAX_AGENT_RECALL_SUBSCRIPTION_QUERY_BYTES:
+            raise ValueError(
+                f"`query` must be at most {MAX_AGENT_RECALL_SUBSCRIPTION_QUERY_BYTES} UTF-8 bytes."
+            )
+        return value
+
+    @field_validator(*_CONTEXT_COLLECTION_FIELDS, mode="before")
+    @classmethod
+    def validate_filter_collections(cls, value: object, info) -> tuple[str, ...]:
+        return _ordered_unique_values(value, info.field_name)
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, value: int) -> int:
+        if type(value) is not int or not 0 <= value <= MAX_AGENT_RECALL_SUBSCRIPTION_PRIORITY:
+            raise ValueError(
+                f"`priority` must be between 0 and {MAX_AGENT_RECALL_SUBSCRIPTION_PRIORITY}."
+            )
+        return value
+
+    @field_validator("admission_policy", mode="before")
+    @classmethod
+    def copy_admission_policy(cls, value: object) -> dict[str, Any]:
+        from cayu.memory import AutomaticRecallPolicy
+
+        if type(value) is AutomaticRecallPolicy:
+            value = value.model_dump(mode="json")
+        copied = copy_durable_json_object(value, "admission_policy")
+        policy = AutomaticRecallPolicy.model_validate_json(
+            canonical_durable_json_bytes(copied, "admission_policy")
+        )
+        return policy.model_dump(mode="json")
+
+    @field_validator("admission_policy")
+    @classmethod
+    def freeze_admission_policy(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        frozen = freeze_json_value(dict(value))
+        if type(frozen) is not FrozenJsonDict:  # pragma: no cover - defensive invariant
+            raise AssertionError("Recall subscription policy did not freeze as an object.")
+        return frozen
+
+    @field_serializer("admission_policy")
+    def serialize_admission_policy(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        thawed = thaw_json_value(value)
+        if type(thawed) is not dict:  # pragma: no cover - defensive invariant
+            raise AssertionError("Recall subscription policy did not thaw as an object.")
+        return thawed
+
+    @field_validator("minimum_interval_seconds")
+    @classmethod
+    def validate_minimum_interval(cls, value: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("`minimum_interval_seconds` must be a number.")
+        result = float(value)
+        if not 0 < result <= MAX_AGENT_RECALL_SUBSCRIPTION_INTERVAL_SECONDS:
+            raise ValueError(
+                "`minimum_interval_seconds` must be greater than zero and at most "
+                f"{MAX_AGENT_RECALL_SUBSCRIPTION_INTERVAL_SECONDS}."
+            )
+        return result
+
+    @field_validator("expires_at", "published_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime, info) -> datetime:
+        return _utc(value, info.field_name)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def validate_status(cls, value: object) -> AgentRecallSubscriptionStatus:
+        if isinstance(value, AgentRecallSubscriptionStatus):
+            return value
+        if type(value) is str:
+            return AgentRecallSubscriptionStatus(value)
+        raise ValueError("status must be an AgentRecallSubscriptionStatus.")
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> AgentRecallSubscription:
+        from cayu.memory import AutomaticRecallPolicy
+        from cayu.recall import RECALL_MAX_QUERY_BYTES
+        from cayu.storage.memory import KnowledgeQuery, KnowledgeSearchMode
+
+        policy = AutomaticRecallPolicy.model_validate_json(
+            canonical_durable_json_bytes(self.admission_policy, "admission_policy")
+        )
+        if policy.fingerprint() != self.admission_policy_sha256:
+            raise ValueError("Admission-policy fingerprint does not match its exact payload.")
+        if self.expires_at <= self.published_at:
+            raise ValueError("`expires_at` must follow `published_at`.")
+        has_exact_facets = any(
+            getattr(self, field_name) for field_name in _CONTEXT_COLLECTION_FIELDS
+        )
+        if self.query is None and not has_exact_facets:
+            raise ValueError("A subscription requires a query or at least one exact facet.")
+        if self.query is not None and not has_exact_facets:
+            try:
+                KnowledgeQuery(text=self.query, mode=KnowledgeSearchMode.KEYWORD)
+            except ValueError as exc:
+                raise ValueError(
+                    "A subscription query without exact facets must contain at least one "
+                    "lexical search token."
+                ) from exc
+        if len(self.retrieval_query().encode("utf-8")) > RECALL_MAX_QUERY_BYTES:
+            raise ValueError("Subscription retrieval input exceeds the recall query byte limit.")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "agent recall subscription",
+                )
+            )
+            > MAX_AGENT_RECALL_SUBSCRIPTION_BYTES
+        ):
+            raise ValueError("Subscription exceeds its serialized byte limit.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        subscription_id: str,
+        agent_id: str,
+        work_context: AgentWorkContext,
+        knowledge_namespace: str,
+        access_policy_sha256: str,
+        admission_policy: Any,
+        minimum_interval_seconds: float,
+        expires_at: datetime,
+        revision: int,
+        operation_id: str,
+        published_by: str,
+        published_at: datetime,
+        query: str | None = None,
+        scope_ids: Sequence[str] = (),
+        entity_ids: Sequence[str] = (),
+        artifact_ids: Sequence[str] = (),
+        repository_paths: Sequence[str] = (),
+        code_symbols: Sequence[str] = (),
+        planned_action_ids: Sequence[str] = (),
+        priority: int = 0,
+        status: AgentRecallSubscriptionStatus = AgentRecallSubscriptionStatus.ACTIVE,
+    ) -> AgentRecallSubscription:
+        from cayu.memory import AutomaticRecallPolicy
+
+        context = copy_agent_work_context(work_context)
+        if type(admission_policy) is not AutomaticRecallPolicy:
+            raise TypeError("admission_policy must be an AutomaticRecallPolicy.")
+        policy = AutomaticRecallPolicy.model_validate(admission_policy.model_dump(mode="python"))
+        return cls(
+            subscription_id=subscription_id,
+            agent_id=agent_id,
+            task_id=context.task_id,
+            knowledge_namespace=knowledge_namespace,
+            access_policy_sha256=access_policy_sha256,
+            work_context_revision=context.revision,
+            work_context_sha256=context.content_sha256,
+            query=query,
+            scope_ids=_copy_context_values(scope_ids, "scope_ids"),
+            entity_ids=_copy_context_values(entity_ids, "entity_ids"),
+            artifact_ids=_copy_context_values(artifact_ids, "artifact_ids"),
+            repository_paths=_copy_context_values(repository_paths, "repository_paths"),
+            code_symbols=_copy_context_values(code_symbols, "code_symbols"),
+            planned_action_ids=_copy_context_values(
+                planned_action_ids,
+                "planned_action_ids",
+            ),
+            admission_policy=policy.model_dump(mode="json"),
+            admission_policy_sha256=policy.fingerprint(),
+            priority=priority,
+            minimum_interval_seconds=minimum_interval_seconds,
+            expires_at=expires_at,
+            status=status,
+            revision=revision,
+            operation_id=operation_id,
+            published_by=published_by,
+            published_at=published_at,
+        )
+
+    def checkpoint_key(self) -> AgentRecallCheckpointKey:
+        return AgentRecallCheckpointKey(
+            agent_id=self.agent_id,
+            task_id=self.task_id,
+            knowledge_namespace=self.knowledge_namespace,
+            access_policy_sha256=self.access_policy_sha256,
+            checkpoint_stream_id=self.checkpoint_stream_id(),
+        )
+
+    def checkpoint_stream_id(self) -> str:
+        """Return the cursor identity for this subscription's retrieval definition."""
+
+        digest = sha256(
+            canonical_durable_json_bytes(
+                {
+                    "subscription_id": self.subscription_id,
+                    "situation_sha256": self.situation_sha256(),
+                },
+                "agent recall subscription checkpoint stream",
+            )
+        ).hexdigest()
+        return f"{_AGENT_RECALL_SUBSCRIPTION_CHECKPOINT_STREAM_PREFIX}:{digest}"
+
+    def policy(self):
+        from cayu.memory import AutomaticRecallPolicy
+
+        return AutomaticRecallPolicy.model_validate_json(
+            canonical_durable_json_bytes(self.admission_policy, "admission_policy")
+        )
+
+    def retrieval_query(self) -> str:
+        return self.query or "exact knowledge facet subscription"
+
+    def facet_aspect_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Return OR-within/AND-across indexed aspect groups for this subscription."""
+
+        return tuple(
+            tuple(agent_recall_facet_aspect(field_name, value) for value in values)
+            for field_name in _CONTEXT_COLLECTION_FIELDS
+            if (values := getattr(self, field_name))
+        )
+
+    def recall_situation(self, access_scope: Any, *, current_time: datetime):
+        """Build the exact recurring processor input for this subscription."""
+
+        from cayu.recall import RecallSituation
+        from cayu.storage.memory import (
+            KnowledgeAccessScope,
+            copy_knowledge_access_scope,
+            knowledge_access_scope_sha256,
+        )
+
+        if type(access_scope) is not KnowledgeAccessScope:
+            raise TypeError("access_scope must be a KnowledgeAccessScope.")
+        scope = copy_knowledge_access_scope(access_scope)
+        if (
+            scope.allow_all_namespaces
+            or tuple(scope.allowed_namespaces) != (self.knowledge_namespace,)
+            or knowledge_access_scope_sha256(scope) != self.access_policy_sha256
+        ):
+            raise AgentRecallSubscriptionConflict("subscription_access_scope_mismatch")
+        return RecallSituation(
+            query=self.retrieval_query(),
+            knowledge_access_scope=scope,
+            knowledge_namespace=self.knowledge_namespace,
+            knowledge_aspect_groups=self.facet_aspect_groups(),
+            knowledge_filter_only=self.query is None,
+            current_time=_utc(current_time, "current_time"),
+        )
+
+    def situation_sha256(self) -> str:
+        from cayu.recall import RecallSituation
+        from cayu.recall_processing import agent_recall_situation_input_sha256
+
+        return agent_recall_situation_input_sha256(
+            RecallSituation(
+                query=self.retrieval_query(),
+                knowledge_namespace=self.knowledge_namespace,
+                knowledge_aspect_groups=self.facet_aspect_groups(),
+                knowledge_filter_only=self.query is None,
+                current_time=self.published_at,
+            )
+        )
+
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "agent recall subscription",
+            )
+        ).hexdigest()
+
+
+class AgentRecallSubscriptionPublicationReceipt(_WorkContextModel):
+    """Immutable idempotency evidence for one subscription revision."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_publication_receipt.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_PUBLICATION_SCHEMA_VERSION
+    )
+    operation_id: str
+    request_sha256: str
+    expected_revision: int | None
+    subscription: AgentRecallSubscription
+    committed_at: datetime
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _bounded_identity(value, "operation_id")
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        return _sha256_hex(value, "request_sha256")
+
+    @field_validator("expected_revision")
+    @classmethod
+    def validate_expected_revision(cls, value: int | None) -> int | None:
+        if value is not None:
+            _positive_revision(value, "expected_revision")
+        return value
+
+    @field_validator("subscription", mode="before")
+    @classmethod
+    def copy_subscription(cls, value: object, info) -> AgentRecallSubscription:
+        if type(value) is AgentRecallSubscription:
+            return copy_agent_recall_subscription(value)
+        if info.mode == "json":
+            return AgentRecallSubscription.model_validate_json(
+                canonical_durable_json_bytes(value, "agent recall subscription")
+            )
+        return AgentRecallSubscription.model_validate(value)
+
+    @field_validator("committed_at")
+    @classmethod
+    def validate_committed_at(cls, value: datetime) -> datetime:
+        return _utc(value, "committed_at")
+
+    @model_validator(mode="after")
+    def validate_publication(self) -> AgentRecallSubscriptionPublicationReceipt:
+        expected = 1 if self.expected_revision is None else self.expected_revision + 1
+        if (
+            self.operation_id != self.subscription.operation_id
+            or self.subscription.revision != expected
+        ):
+            raise ValueError("Subscription publication authority is inconsistent.")
+        if self.request_sha256 != agent_recall_subscription_publication_request_sha256(
+            self.subscription,
+            self.expected_revision,
+        ):
+            raise ValueError("Subscription publication request fingerprint is inconsistent.")
+        if self.committed_at < self.subscription.published_at:
+            raise ValueError("Subscription publication cannot commit before it was published.")
+        return self
+
+
+class AgentRecallSubscriptionClaim(_WorkContextModel):
+    """One store-clock lease over a due subscription revision."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_claim.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_CLAIM_SCHEMA_VERSION
+    )
+    subscription_id: str
+    subscription_revision: int
+    subscription_sha256: str
+    claim_id: str
+    runner_id: str
+    attempt: int
+    state_revision: int
+    claimed_at: datetime
+    lease_expires_at: datetime
+
+    @field_validator("subscription_id", "claim_id", "runner_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator("subscription_revision", "attempt", "state_revision")
+    @classmethod
+    def validate_revision(cls, value: int, info) -> int:
+        return _positive_revision(value, info.field_name)
+
+    @field_validator("subscription_sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        return _sha256_hex(value, "subscription_sha256")
+
+    @field_validator("claimed_at", "lease_expires_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime, info) -> datetime:
+        return _utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_lease(self) -> AgentRecallSubscriptionClaim:
+        if self.lease_expires_at <= self.claimed_at:
+            raise ValueError("Subscription claim lease must expire after it is claimed.")
+        return self
+
+
+class AgentRecallSubscriptionRelease(_WorkContextModel):
+    """Immutable evidence returning an evaluation claim for retry."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_release.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_RELEASE_SCHEMA_VERSION
+    )
+    release_id: str
+    subscription_id: str
+    subscription_revision: int
+    subscription_sha256: str
+    claim_id: str
+    runner_id: str
+    attempt: int
+    claim_state_revision: int
+    reason: str
+    released_at: datetime
+
+    @field_validator("release_id", "subscription_id", "claim_id", "runner_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator("subscription_revision", "attempt", "claim_state_revision")
+    @classmethod
+    def validate_revision(cls, value: int, info) -> int:
+        return _positive_revision(value, info.field_name)
+
+    @field_validator("subscription_sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        return _sha256_hex(value, "subscription_sha256")
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return _bounded_value(value, "reason")
+
+    @field_validator("released_at")
+    @classmethod
+    def validate_released_at(cls, value: datetime) -> datetime:
+        return _utc(value, "released_at")
+
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "agent recall subscription release",
+            )
+        ).hexdigest()
+
+
+class AgentRecallSubscriptionRecord(_WorkContextModel):
+    """Current scheduling state for one immutable subscription head."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_record.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_RECORD_SCHEMA_VERSION
+    )
+    subscription: AgentRecallSubscription
+    run_state: AgentRecallSubscriptionRunState = AgentRecallSubscriptionRunState.DUE
+    state_revision: int = 0
+    attempt: int = 0
+    claim: AgentRecallSubscriptionClaim | None = None
+    release: AgentRecallSubscriptionRelease | None = None
+    next_evaluation_at: datetime
+    last_evaluation_id: str | None = None
+    updated_at: datetime
+
+    @field_validator("subscription", mode="before")
+    @classmethod
+    def copy_subscription(cls, value: object, info) -> AgentRecallSubscription:
+        if type(value) is AgentRecallSubscription:
+            return copy_agent_recall_subscription(value)
+        if info.mode == "json":
+            return AgentRecallSubscription.model_validate_json(
+                canonical_durable_json_bytes(value, "agent recall subscription")
+            )
+        return AgentRecallSubscription.model_validate(value)
+
+    @field_validator("run_state", mode="before")
+    @classmethod
+    def validate_run_state(cls, value: object) -> AgentRecallSubscriptionRunState:
+        if isinstance(value, AgentRecallSubscriptionRunState):
+            return value
+        if type(value) is str:
+            return AgentRecallSubscriptionRunState(value)
+        raise ValueError("run_state must be an AgentRecallSubscriptionRunState.")
+
+    @field_validator("state_revision", "attempt")
+    @classmethod
+    def validate_counter(cls, value: int, info) -> int:
+        return _sequence(value, info.field_name)
+
+    @field_validator("claim", mode="before")
+    @classmethod
+    def copy_claim(cls, value: object, info) -> AgentRecallSubscriptionClaim | None:
+        if value is None:
+            return None
+        if type(value) is AgentRecallSubscriptionClaim:
+            return copy_agent_recall_subscription_claim(value)
+        if info.mode == "json":
+            return AgentRecallSubscriptionClaim.model_validate_json(
+                canonical_durable_json_bytes(value, "agent recall subscription claim")
+            )
+        return AgentRecallSubscriptionClaim.model_validate(value)
+
+    @field_validator("release", mode="before")
+    @classmethod
+    def copy_release(cls, value: object, info) -> AgentRecallSubscriptionRelease | None:
+        if value is None:
+            return None
+        if type(value) is AgentRecallSubscriptionRelease:
+            return copy_agent_recall_subscription_release(value)
+        if info.mode == "json":
+            return AgentRecallSubscriptionRelease.model_validate_json(
+                canonical_durable_json_bytes(value, "agent recall subscription release")
+            )
+        return AgentRecallSubscriptionRelease.model_validate(value)
+
+    @field_validator("next_evaluation_at", "updated_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime, info) -> datetime:
+        return _utc(value, info.field_name)
+
+    @field_validator("last_evaluation_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None) -> str | None:
+        return None if value is None else _bounded_identity(value, "last_evaluation_id")
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> AgentRecallSubscriptionRecord:
+        if self.updated_at < self.subscription.published_at:
+            raise ValueError("Subscription state cannot predate its definition.")
+        if self.run_state is AgentRecallSubscriptionRunState.CLAIMED:
+            if self.claim is None or self.release is not None:
+                raise ValueError("Claimed subscription state requires exactly one live claim.")
+        elif self.release is not None:
+            if self.claim is None:
+                raise ValueError("Released subscription state must retain its claim.")
+        elif self.claim is not None:
+            raise ValueError("Due subscription state cannot retain an unreleased claim.")
+        if self.claim is not None and (
+            self.claim.subscription_id != self.subscription.subscription_id
+            or self.claim.subscription_revision != self.subscription.revision
+            or self.claim.subscription_sha256 != self.subscription.fingerprint()
+            or self.claim.attempt != self.attempt
+            or self.claim.claimed_at < self.subscription.published_at
+            or self.updated_at < self.claim.claimed_at
+            or (
+                self.run_state is AgentRecallSubscriptionRunState.CLAIMED
+                and self.claim.state_revision != self.state_revision
+            )
+            or (self.release is not None and self.claim.state_revision + 1 != self.state_revision)
+        ):
+            raise ValueError("Subscription claim conflicts with current durable state.")
+        if self.release is not None and (
+            self.claim is None
+            or self.release.subscription_id != self.claim.subscription_id
+            or self.release.subscription_revision != self.claim.subscription_revision
+            or self.release.subscription_sha256 != self.claim.subscription_sha256
+            or self.release.claim_id != self.claim.claim_id
+            or self.release.runner_id != self.claim.runner_id
+            or self.release.attempt != self.claim.attempt
+            or self.release.claim_state_revision != self.claim.state_revision
+            or self.release.released_at < self.claim.claimed_at
+            or self.release.released_at >= self.claim.lease_expires_at
+            or self.updated_at < self.release.released_at
+        ):
+            raise ValueError("Subscription release conflicts with its retained claim.")
+        return self
+
+
+class AgentRecallSubscriptionEvaluation(_WorkContextModel):
+    """Immutable evidence for one atomic subscription evaluation commit."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_evaluation.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_EVALUATION_SCHEMA_VERSION
+    )
+    evaluation_id: str
+    request_sha256: str
+    subscription_id: str
+    subscription_revision: int
+    subscription_sha256: str
+    claim_id: str
+    runner_id: str
+    attempt: int
+    claim_state_revision: int
+    processing_id: str
+    processing_operation_id: str
+    processing_result_sha256: str
+    contribution_sha256: str | None
+    outcome: AgentRecallSubscriptionEvaluationOutcome
+    checkpoint_sha256: str | None = None
+    checkpoint_revision: int | None = None
+    delivery_id: str | None = None
+    committed_at: datetime
+    next_evaluation_at: datetime
+
+    @field_validator(
+        "evaluation_id",
+        "subscription_id",
+        "claim_id",
+        "runner_id",
+        "processing_id",
+        "processing_operation_id",
+        "delivery_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator(
+        "request_sha256",
+        "subscription_sha256",
+        "processing_result_sha256",
+        "contribution_sha256",
+        "checkpoint_sha256",
+    )
+    @classmethod
+    def validate_digest(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_hex(value, info.field_name)
+
+    @field_validator("subscription_revision", "attempt", "claim_state_revision")
+    @classmethod
+    def validate_positive(cls, value: int, info) -> int:
+        return _positive_revision(value, info.field_name)
+
+    @field_validator("checkpoint_revision")
+    @classmethod
+    def validate_optional_revision(cls, value: int | None) -> int | None:
+        if value is not None:
+            _positive_revision(value, "checkpoint_revision")
+        return value
+
+    @field_validator("outcome", mode="before")
+    @classmethod
+    def validate_outcome(cls, value: object) -> AgentRecallSubscriptionEvaluationOutcome:
+        if isinstance(value, AgentRecallSubscriptionEvaluationOutcome):
+            return value
+        if type(value) is str:
+            return AgentRecallSubscriptionEvaluationOutcome(value)
+        raise ValueError("outcome must be an AgentRecallSubscriptionEvaluationOutcome.")
+
+    @field_validator("committed_at", "next_evaluation_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime, info) -> datetime:
+        return _utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_outcome_evidence(self) -> AgentRecallSubscriptionEvaluation:
+        if self.next_evaluation_at <= self.committed_at:
+            raise ValueError("Next subscription evaluation must follow its commit.")
+        if self.outcome is AgentRecallSubscriptionEvaluationOutcome.NO_WORK:
+            if any(
+                value is not None
+                for value in (
+                    self.contribution_sha256,
+                    self.checkpoint_sha256,
+                    self.checkpoint_revision,
+                    self.delivery_id,
+                )
+            ):
+                raise ValueError("No-work subscription evaluation cannot publish recall state.")
+        elif self.contribution_sha256 is None or self.checkpoint_sha256 is None:
+            raise ValueError("Processed subscription evaluation requires admission and checkpoint.")
+        elif self.checkpoint_revision is None:
+            raise ValueError("Processed subscription evaluation requires checkpoint revision.")
+        elif self.outcome is AgentRecallSubscriptionEvaluationOutcome.WAKE:
+            if self.delivery_id is None:
+                raise ValueError("Wake evaluation requires a staged delivery.")
+        elif self.delivery_id is not None:
+            raise ValueError("Silent evaluation cannot publish a staged delivery.")
+        return self
+
+
+class AgentRecallSubscriptionWakeClaim(_WorkContextModel):
+    """Store-clock lease over one pending task-scheduler wake signal."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_wake_claim.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_WAKE_CLAIM_SCHEMA_VERSION
+    )
+    wake_id: str
+    delivery_id: str
+    claim_id: str
+    runner_id: str
+    attempt: int
+    state_revision: int
+    claimed_at: datetime
+    lease_expires_at: datetime
+
+    @field_validator("wake_id", "delivery_id", "claim_id", "runner_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator("attempt", "state_revision")
+    @classmethod
+    def validate_revision(cls, value: int, info) -> int:
+        return _positive_revision(value, info.field_name)
+
+    @field_validator("claimed_at", "lease_expires_at")
+    @classmethod
+    def validate_datetime(cls, value: datetime, info) -> datetime:
+        return _utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_lease(self) -> AgentRecallSubscriptionWakeClaim:
+        if self.lease_expires_at <= self.claimed_at:
+            raise ValueError("Wake claim lease must expire after it is claimed.")
+        return self
+
+
+class AgentRecallSubscriptionWakeRelease(_WorkContextModel):
+    """Immutable evidence returning one scheduler wake for retry."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_wake_release.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_WAKE_RELEASE_SCHEMA_VERSION
+    )
+    release_id: str
+    wake_id: str
+    delivery_id: str
+    claim_id: str
+    runner_id: str
+    attempt: int
+    claim_state_revision: int
+    reason: str
+    released_at: datetime
+
+    @field_validator("release_id", "wake_id", "delivery_id", "claim_id", "runner_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator("attempt", "claim_state_revision")
+    @classmethod
+    def validate_revision(cls, value: int, info) -> int:
+        return _positive_revision(value, info.field_name)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return _bounded_value(value, "reason")
+
+    @field_validator("released_at")
+    @classmethod
+    def validate_released_at(cls, value: datetime) -> datetime:
+        return _utc(value, "released_at")
+
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                self.model_dump(mode="json"),
+                "agent recall subscription wake release",
+            )
+        ).hexdigest()
+
+
+class AgentRecallSubscriptionWakeAcknowledgement(_WorkContextModel):
+    """Evidence that an application scheduler accepted one wake request."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_wake_acknowledgement.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_WAKE_ACKNOWLEDGEMENT_SCHEMA_VERSION
+    )
+    acknowledgement_id: str
+    wake_id: str
+    delivery_id: str
+    claim_id: str
+    runner_id: str
+    attempt: int
+    acknowledged_at: datetime
+
+    @field_validator(
+        "acknowledgement_id",
+        "wake_id",
+        "delivery_id",
+        "claim_id",
+        "runner_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identity(value, info.field_name)
+
+    @field_validator("attempt")
+    @classmethod
+    def validate_attempt(cls, value: int) -> int:
+        return _positive_revision(value, "attempt")
+
+    @field_validator("acknowledged_at")
+    @classmethod
+    def validate_acknowledged_at(cls, value: datetime) -> datetime:
+        return _utc(value, "acknowledged_at")
+
+
+class AgentRecallSubscriptionWake(_WorkContextModel):
+    """Independent scheduler handoff state beside one exact staged delivery."""
+
+    schema_version: Literal["cayu.agent_recall_subscription_wake.v1"] = (
+        AGENT_RECALL_SUBSCRIPTION_WAKE_SCHEMA_VERSION
+    )
+    wake_id: str
+    subscription: AgentRecallSubscription
+    evaluation: AgentRecallSubscriptionEvaluation
+    delivery: AgentRecallDelivery
+    state: AgentRecallSubscriptionWakeState = AgentRecallSubscriptionWakeState.PENDING
+    state_revision: int = 0
+    attempt: int = 0
+    claim: AgentRecallSubscriptionWakeClaim | None = None
+    release: AgentRecallSubscriptionWakeRelease | None = None
+    acknowledgement: AgentRecallSubscriptionWakeAcknowledgement | None = None
+    updated_at: datetime
+
+    @field_validator("wake_id")
+    @classmethod
+    def validate_wake_id(cls, value: str) -> str:
+        return _bounded_identity(value, "wake_id")
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def validate_state(cls, value: object) -> AgentRecallSubscriptionWakeState:
+        if isinstance(value, AgentRecallSubscriptionWakeState):
+            return value
+        if type(value) is str:
+            return AgentRecallSubscriptionWakeState(value)
+        raise ValueError("state must be an AgentRecallSubscriptionWakeState.")
+
+    @field_validator("state_revision", "attempt")
+    @classmethod
+    def validate_counter(cls, value: int, info) -> int:
+        return _sequence(value, info.field_name)
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_updated_at(cls, value: datetime) -> datetime:
+        return _utc(value, "updated_at")
+
+    @model_validator(mode="after")
+    def validate_linkage_and_lifecycle(self) -> AgentRecallSubscriptionWake:
+        if (
+            self.wake_id != self.evaluation.evaluation_id
+            or self.evaluation.outcome is not AgentRecallSubscriptionEvaluationOutcome.WAKE
+            or self.evaluation.subscription_id != self.subscription.subscription_id
+            or self.evaluation.subscription_revision != self.subscription.revision
+            or self.evaluation.subscription_sha256 != self.subscription.fingerprint()
+            or self.evaluation.delivery_id != self.delivery.delivery_id
+            or self.evaluation.processing_result_sha256 != self.delivery.processing_result_sha256
+            or self.evaluation.checkpoint_sha256 != self.delivery.checkpoint.fingerprint()
+            or self.evaluation.checkpoint_revision != self.delivery.checkpoint.revision
+            or self.delivery.agent_id != self.subscription.agent_id
+            or self.delivery.task_id != self.subscription.task_id
+            or self.delivery.knowledge_namespace != self.subscription.knowledge_namespace
+            or self.delivery.access_policy_sha256 != self.subscription.access_policy_sha256
+            or self.delivery.work_context_revision != self.subscription.work_context_revision
+            or self.delivery.work_context_sha256 != self.subscription.work_context_sha256
+            or self.updated_at < self.evaluation.committed_at
+        ):
+            raise ValueError("Subscription wake conflicts with its evaluation or delivery.")
+        if self.state is AgentRecallSubscriptionWakeState.PENDING:
+            initial = (
+                self.state_revision == 0
+                and self.attempt == 0
+                and self.claim is None
+                and self.release is None
+            )
+            released = (
+                self.state_revision > 0
+                and self.attempt > 0
+                and self.claim is not None
+                and self.release is not None
+            )
+            if self.acknowledgement is not None or not (initial or released):
+                raise ValueError("Pending wake must be initial or retain release evidence.")
+        elif self.state is AgentRecallSubscriptionWakeState.CLAIMED:
+            if self.claim is None or self.release is not None or self.acknowledgement is not None:
+                raise ValueError("Claimed wake requires exactly one live scheduler claim.")
+        elif self.claim is None or self.release is not None or self.acknowledgement is None:
+            raise ValueError("Acknowledged wake requires its final claim and evidence.")
+        if self.claim is not None and (
+            self.claim.wake_id != self.wake_id
+            or self.claim.delivery_id != self.delivery.delivery_id
+            or self.claim.attempt != self.attempt
+            or self.claim.claimed_at < self.evaluation.committed_at
+            or self.updated_at < self.claim.claimed_at
+            or (
+                self.state is AgentRecallSubscriptionWakeState.CLAIMED
+                and self.claim.state_revision != self.state_revision
+            )
+            or (
+                self.state is not AgentRecallSubscriptionWakeState.CLAIMED
+                and self.claim.state_revision + 1 != self.state_revision
+            )
+        ):
+            raise ValueError("Wake claim conflicts with current durable state.")
+        if self.release is not None and (
+            self.claim is None
+            or self.release.wake_id != self.claim.wake_id
+            or self.release.delivery_id != self.claim.delivery_id
+            or self.release.claim_id != self.claim.claim_id
+            or self.release.runner_id != self.claim.runner_id
+            or self.release.attempt != self.claim.attempt
+            or self.release.claim_state_revision != self.claim.state_revision
+            or self.release.released_at < self.claim.claimed_at
+            or self.release.released_at >= self.claim.lease_expires_at
+            or self.updated_at < self.release.released_at
+        ):
+            raise ValueError("Wake release conflicts with its retained claim.")
+        if self.acknowledgement is not None and (
+            self.claim is None
+            or self.acknowledgement.wake_id != self.claim.wake_id
+            or self.acknowledgement.delivery_id != self.claim.delivery_id
+            or self.acknowledgement.claim_id != self.claim.claim_id
+            or self.acknowledgement.runner_id != self.claim.runner_id
+            or self.acknowledgement.attempt != self.claim.attempt
+            or self.acknowledgement.acknowledged_at < self.claim.claimed_at
+            or self.acknowledgement.acknowledged_at >= self.claim.lease_expires_at
+            or self.updated_at < self.acknowledgement.acknowledged_at
+        ):
+            raise ValueError("Wake acknowledgement conflicts with its final claim.")
+        return self
+
+
+class AgentRecallSubscriptionConflict(RuntimeError):
+    """A subscription operation lost or reused exact transition authority."""
+
+    def __init__(self, code: str) -> None:
+        self.code = require_durable_clean_nonblank(code, "code")
+        super().__init__(f"Agent recall subscription conflicted ({self.code}).")
+
+
 class AgentRecallDeliveryConflict(RuntimeError):
     """A staged-delivery operation lost or reused exact transition authority."""
 
@@ -1166,6 +2220,88 @@ def copy_agent_recall_delivery_record(
     if type(value) is not AgentRecallDeliveryRecord:
         raise TypeError("value must be an AgentRecallDeliveryRecord.")
     return AgentRecallDeliveryRecord.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription(
+    value: AgentRecallSubscription,
+) -> AgentRecallSubscription:
+    if type(value) is not AgentRecallSubscription:
+        raise TypeError("value must be an AgentRecallSubscription.")
+    return AgentRecallSubscription.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_publication_receipt(
+    value: AgentRecallSubscriptionPublicationReceipt,
+) -> AgentRecallSubscriptionPublicationReceipt:
+    if type(value) is not AgentRecallSubscriptionPublicationReceipt:
+        raise TypeError("value must be an AgentRecallSubscriptionPublicationReceipt.")
+    return AgentRecallSubscriptionPublicationReceipt.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_claim(
+    value: AgentRecallSubscriptionClaim,
+) -> AgentRecallSubscriptionClaim:
+    if type(value) is not AgentRecallSubscriptionClaim:
+        raise TypeError("value must be an AgentRecallSubscriptionClaim.")
+    return AgentRecallSubscriptionClaim.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_release(
+    value: AgentRecallSubscriptionRelease,
+) -> AgentRecallSubscriptionRelease:
+    if type(value) is not AgentRecallSubscriptionRelease:
+        raise TypeError("value must be an AgentRecallSubscriptionRelease.")
+    return AgentRecallSubscriptionRelease.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_record(
+    value: AgentRecallSubscriptionRecord,
+) -> AgentRecallSubscriptionRecord:
+    if type(value) is not AgentRecallSubscriptionRecord:
+        raise TypeError("value must be an AgentRecallSubscriptionRecord.")
+    return AgentRecallSubscriptionRecord.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_evaluation(
+    value: AgentRecallSubscriptionEvaluation,
+) -> AgentRecallSubscriptionEvaluation:
+    if type(value) is not AgentRecallSubscriptionEvaluation:
+        raise TypeError("value must be an AgentRecallSubscriptionEvaluation.")
+    return AgentRecallSubscriptionEvaluation.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_wake_claim(
+    value: AgentRecallSubscriptionWakeClaim,
+) -> AgentRecallSubscriptionWakeClaim:
+    if type(value) is not AgentRecallSubscriptionWakeClaim:
+        raise TypeError("value must be an AgentRecallSubscriptionWakeClaim.")
+    return AgentRecallSubscriptionWakeClaim.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_wake_release(
+    value: AgentRecallSubscriptionWakeRelease,
+) -> AgentRecallSubscriptionWakeRelease:
+    if type(value) is not AgentRecallSubscriptionWakeRelease:
+        raise TypeError("value must be an AgentRecallSubscriptionWakeRelease.")
+    return AgentRecallSubscriptionWakeRelease.model_validate(value.model_dump(mode="python"))
+
+
+def copy_agent_recall_subscription_wake_acknowledgement(
+    value: AgentRecallSubscriptionWakeAcknowledgement,
+) -> AgentRecallSubscriptionWakeAcknowledgement:
+    if type(value) is not AgentRecallSubscriptionWakeAcknowledgement:
+        raise TypeError("value must be an AgentRecallSubscriptionWakeAcknowledgement.")
+    return AgentRecallSubscriptionWakeAcknowledgement.model_validate(
+        value.model_dump(mode="python")
+    )
+
+
+def copy_agent_recall_subscription_wake(
+    value: AgentRecallSubscriptionWake,
+) -> AgentRecallSubscriptionWake:
+    if type(value) is not AgentRecallSubscriptionWake:
+        raise TypeError("value must be an AgentRecallSubscriptionWake.")
+    return AgentRecallSubscriptionWake.model_validate(value.model_dump(mode="python"))
 
 
 def _validate_delivery_lease_seconds(value: float) -> float:
@@ -1435,6 +2571,679 @@ def _acknowledge_agent_recall_delivery_record(
     )
 
 
+def agent_recall_subscription_publication_request_sha256(
+    subscription: AgentRecallSubscription,
+    expected_revision: int | None,
+) -> str:
+    subscription = copy_agent_recall_subscription(subscription)
+    if expected_revision is not None:
+        _positive_revision(expected_revision, "expected_revision")
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "subscription": subscription.model_dump(mode="json"),
+                "expected_revision": expected_revision,
+            },
+            "agent recall subscription publication request",
+        )
+    ).hexdigest()
+
+
+def validate_agent_recall_subscription_publication(
+    subscription: AgentRecallSubscription,
+    expected_revision: int | None,
+    current: AgentRecallSubscription | None,
+    work_context: AgentWorkContext | None,
+) -> None:
+    subscription = copy_agent_recall_subscription(subscription)
+    if expected_revision is not None:
+        _positive_revision(expected_revision, "expected_revision")
+    expected = 1 if expected_revision is None else expected_revision + 1
+    if subscription.revision != expected:
+        raise AgentRecallSubscriptionConflict("invalid_successor_revision")
+    if (
+        work_context is None
+        or work_context.task_id != subscription.task_id
+        or work_context.revision != subscription.work_context_revision
+        or work_context.content_sha256 != subscription.work_context_sha256
+    ):
+        raise AgentRecallSubscriptionConflict("stale_work_context")
+    if any(
+        not set(getattr(subscription, field_name)).issubset(getattr(work_context, field_name))
+        for field_name in _CONTEXT_COLLECTION_FIELDS
+    ):
+        raise AgentRecallSubscriptionConflict("subscription_facet_outside_work_context")
+    if current is None:
+        if expected_revision is not None:
+            raise AgentRecallSubscriptionConflict("unknown_subscription")
+        return
+    if expected_revision is None or current.revision != expected_revision:
+        raise AgentRecallSubscriptionConflict("stale_subscription_revision")
+    if (
+        current.subscription_id != subscription.subscription_id
+        or current.agent_id != subscription.agent_id
+        or current.task_id != subscription.task_id
+        or current.knowledge_namespace != subscription.knowledge_namespace
+        or current.access_policy_sha256 != subscription.access_policy_sha256
+    ):
+        raise AgentRecallSubscriptionConflict("subscription_authority_changed")
+    if subscription.published_at < current.published_at:
+        raise AgentRecallSubscriptionConflict("subscription_publication_time_regression")
+    if (
+        current.status is AgentRecallSubscriptionStatus.CANCELLED
+        and subscription.status is not AgentRecallSubscriptionStatus.CANCELLED
+    ):
+        raise AgentRecallSubscriptionConflict("cancelled_subscription_is_terminal")
+
+
+def agent_recall_subscription_claim_request_sha256(
+    key: AgentRecallCheckpointKey,
+    *,
+    claim_id: str,
+    runner_id: str,
+    lease_seconds: float,
+) -> str:
+    key = copy_agent_recall_checkpoint_key(key)
+    claim_id = _bounded_identity(claim_id, "claim_id")
+    runner_id = _bounded_identity(runner_id, "runner_id")
+    lease_seconds = _validate_delivery_lease_seconds(lease_seconds)
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "key": key.model_dump(mode="json"),
+                "claim_id": claim_id,
+                "runner_id": runner_id,
+                "lease_seconds": lease_seconds,
+            },
+            "agent recall subscription claim request",
+        )
+    ).hexdigest()
+
+
+def _claim_agent_recall_subscription_record(
+    record: AgentRecallSubscriptionRecord,
+    *,
+    claim_id: str,
+    runner_id: str,
+    lease_seconds: float,
+    now: datetime,
+) -> AgentRecallSubscriptionRecord:
+    record = copy_agent_recall_subscription_record(record)
+    claim_id = _bounded_identity(claim_id, "claim_id")
+    runner_id = _bounded_identity(runner_id, "runner_id")
+    lease_seconds = _validate_delivery_lease_seconds(lease_seconds)
+    now = _utc(now, "now")
+    subscription = record.subscription
+    if subscription.status is not AgentRecallSubscriptionStatus.ACTIVE:
+        raise AgentRecallSubscriptionConflict("subscription_inactive")
+    if subscription.expires_at <= now:
+        raise AgentRecallSubscriptionConflict("subscription_expired")
+    if record.next_evaluation_at > now:
+        raise AgentRecallSubscriptionConflict("subscription_not_due")
+    if record.run_state is AgentRecallSubscriptionRunState.CLAIMED:
+        assert record.claim is not None
+        if record.claim.claim_id == claim_id and record.claim.runner_id == runner_id:
+            return record
+        if record.claim.lease_expires_at > now:
+            raise AgentRecallSubscriptionConflict("subscription_claimed")
+    state_revision = record.state_revision + 1
+    claim = AgentRecallSubscriptionClaim(
+        subscription_id=subscription.subscription_id,
+        subscription_revision=subscription.revision,
+        subscription_sha256=subscription.fingerprint(),
+        claim_id=claim_id,
+        runner_id=runner_id,
+        attempt=record.attempt + 1,
+        state_revision=state_revision,
+        claimed_at=now,
+        lease_expires_at=now + timedelta(seconds=lease_seconds),
+    )
+    return record.model_copy(
+        update={
+            "run_state": AgentRecallSubscriptionRunState.CLAIMED,
+            "state_revision": state_revision,
+            "attempt": claim.attempt,
+            "claim": claim,
+            "release": None,
+            "updated_at": now,
+        }
+    )
+
+
+def _require_current_subscription_claim(
+    record: AgentRecallSubscriptionRecord,
+    claim: AgentRecallSubscriptionClaim,
+    *,
+    now: datetime,
+) -> None:
+    claim = copy_agent_recall_subscription_claim(claim)
+    now = _utc(now, "now")
+    if record.run_state is not AgentRecallSubscriptionRunState.CLAIMED or record.claim != claim:
+        raise AgentRecallSubscriptionConflict("stale_subscription_claim")
+    if claim.lease_expires_at <= now:
+        raise AgentRecallSubscriptionConflict("expired_subscription_claim")
+
+
+def _renew_agent_recall_subscription_record(
+    record: AgentRecallSubscriptionRecord,
+    claim: AgentRecallSubscriptionClaim,
+    *,
+    lease_seconds: float,
+    now: datetime,
+) -> AgentRecallSubscriptionRecord:
+    record = copy_agent_recall_subscription_record(record)
+    claim = copy_agent_recall_subscription_claim(claim)
+    lease_seconds = _validate_delivery_lease_seconds(lease_seconds)
+    now = _utc(now, "now")
+    if (
+        record.run_state is AgentRecallSubscriptionRunState.CLAIMED
+        and record.claim is not None
+        and record.claim.claim_id == claim.claim_id
+        and record.claim.runner_id == claim.runner_id
+        and record.claim.attempt == claim.attempt
+        and record.claim.state_revision == claim.state_revision + 1
+    ):
+        if record.claim.lease_expires_at != record.updated_at + timedelta(seconds=lease_seconds):
+            raise AgentRecallSubscriptionConflict("renewal_reused")
+        if record.claim.lease_expires_at <= now:
+            raise AgentRecallSubscriptionConflict("expired_subscription_claim")
+        return record
+    _require_current_subscription_claim(record, claim, now=now)
+    state_revision = record.state_revision + 1
+    renewed = claim.model_copy(
+        update={
+            "state_revision": state_revision,
+            "lease_expires_at": now + timedelta(seconds=lease_seconds),
+        }
+    )
+    return record.model_copy(
+        update={
+            "state_revision": state_revision,
+            "claim": renewed,
+            "updated_at": now,
+        }
+    )
+
+
+def _agent_recall_subscription_release(
+    claim: AgentRecallSubscriptionClaim,
+    *,
+    release_id: str,
+    reason: str,
+    released_at: datetime,
+) -> AgentRecallSubscriptionRelease:
+    claim = copy_agent_recall_subscription_claim(claim)
+    return AgentRecallSubscriptionRelease(
+        release_id=release_id,
+        subscription_id=claim.subscription_id,
+        subscription_revision=claim.subscription_revision,
+        subscription_sha256=claim.subscription_sha256,
+        claim_id=claim.claim_id,
+        runner_id=claim.runner_id,
+        attempt=claim.attempt,
+        claim_state_revision=claim.state_revision,
+        reason=reason,
+        released_at=released_at,
+    )
+
+
+def _release_agent_recall_subscription_record(
+    record: AgentRecallSubscriptionRecord,
+    claim: AgentRecallSubscriptionClaim,
+    *,
+    release_id: str,
+    reason: str,
+    released_at: datetime,
+    now: datetime,
+) -> AgentRecallSubscriptionRecord:
+    record = copy_agent_recall_subscription_record(record)
+    claim = copy_agent_recall_subscription_claim(claim)
+    now = _utc(now, "now")
+    requested = _agent_recall_subscription_release(
+        claim,
+        release_id=release_id,
+        reason=reason,
+        released_at=released_at,
+    )
+    if record.run_state is AgentRecallSubscriptionRunState.DUE and record.release == requested:
+        return record
+    _require_current_subscription_claim(record, claim, now=now)
+    if requested.released_at < claim.claimed_at:
+        raise AgentRecallSubscriptionConflict("release_predates_claim")
+    if requested.released_at >= claim.lease_expires_at:
+        raise AgentRecallSubscriptionConflict("release_outside_claim_lease")
+    if requested.released_at > now:
+        raise AgentRecallSubscriptionConflict("release_from_future")
+    return record.model_copy(
+        update={
+            "run_state": AgentRecallSubscriptionRunState.DUE,
+            "state_revision": record.state_revision + 1,
+            "release": requested,
+            "updated_at": max(now, requested.released_at),
+        }
+    )
+
+
+def agent_recall_subscription_evaluation_request_sha256(
+    claim: AgentRecallSubscriptionClaim,
+    result: AgentRecallProcessingResult,
+    *,
+    evaluation_id: str,
+    delivery_id: str | None,
+    staged_by: str,
+    evaluated_at: datetime,
+) -> str:
+    from cayu.recall_processing import AgentRecallProcessingResult
+
+    claim = copy_agent_recall_subscription_claim(claim)
+    if type(result) is not AgentRecallProcessingResult:
+        raise TypeError("result must be an AgentRecallProcessingResult.")
+    evaluation_id = _bounded_identity(evaluation_id, "evaluation_id")
+    if delivery_id is not None:
+        delivery_id = _bounded_identity(delivery_id, "delivery_id")
+    staged_by = _bounded_identity(staged_by, "staged_by")
+    evaluated_at = _utc(evaluated_at, "evaluated_at")
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "claim": claim.model_dump(mode="json"),
+                "result": result.model_dump(mode="json"),
+                "evaluation_id": evaluation_id,
+                "delivery_id": delivery_id,
+                "staged_by": staged_by,
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+            "agent recall subscription evaluation request",
+        )
+    ).hexdigest()
+
+
+def _prepare_agent_recall_subscription_evaluation(
+    record: AgentRecallSubscriptionRecord,
+    claim: AgentRecallSubscriptionClaim,
+    result: AgentRecallProcessingResult,
+    current_work_context: AgentWorkContext | None,
+    *,
+    evaluation_id: str,
+    delivery_id: str | None,
+    staged_by: str,
+    evaluated_at: datetime,
+    now: datetime,
+) -> tuple[
+    AgentRecallSubscriptionEvaluation,
+    AgentRecallDelivery | None,
+    AgentRecallSubscriptionRecord,
+]:
+    from cayu.memory import admit_recall
+    from cayu.recall_processing import AgentRecallProcessingMode, AgentRecallProcessingResult
+
+    record = copy_agent_recall_subscription_record(record)
+    claim = copy_agent_recall_subscription_claim(claim)
+    if type(result) is not AgentRecallProcessingResult:
+        raise TypeError("result must be an AgentRecallProcessingResult.")
+    result = result.model_copy(deep=True)
+    evaluation_id = _bounded_identity(evaluation_id, "evaluation_id")
+    staged_by = _bounded_identity(staged_by, "staged_by")
+    evaluated_at = _utc(evaluated_at, "evaluated_at")
+    now = _utc(now, "now")
+    _require_current_subscription_claim(record, claim, now=now)
+    subscription = record.subscription
+    if subscription.status is not AgentRecallSubscriptionStatus.ACTIVE:
+        raise AgentRecallSubscriptionConflict("inactive_subscription")
+    if subscription.expires_at <= now:
+        raise AgentRecallSubscriptionConflict("expired_subscription")
+    if (
+        current_work_context is None
+        or current_work_context.task_id != subscription.task_id
+        or current_work_context.revision != subscription.work_context_revision
+        or current_work_context.content_sha256 != subscription.work_context_sha256
+    ):
+        raise AgentRecallSubscriptionConflict("stale_work_context")
+    if evaluated_at > now:
+        raise AgentRecallSubscriptionConflict("evaluation_from_future")
+    if evaluated_at < claim.claimed_at:
+        raise AgentRecallSubscriptionConflict("evaluation_predates_claim")
+    if (
+        result.agent_id != subscription.agent_id
+        or result.task_id != subscription.task_id
+        or result.knowledge_namespace != subscription.knowledge_namespace
+        or result.access_policy_sha256 != subscription.access_policy_sha256
+        or result.checkpoint_stream_id != subscription.checkpoint_stream_id()
+        or result.work_context_revision != subscription.work_context_revision
+        or result.work_context_sha256 != subscription.work_context_sha256
+        or result.situation_sha256 != subscription.situation_sha256()
+    ):
+        raise AgentRecallSubscriptionConflict("evaluation_authority_mismatch")
+    request_sha256 = agent_recall_subscription_evaluation_request_sha256(
+        claim,
+        result,
+        evaluation_id=evaluation_id,
+        delivery_id=delivery_id,
+        staged_by=staged_by,
+        evaluated_at=evaluated_at,
+    )
+    contribution_sha256: str | None = None
+    checkpoint_sha256: str | None = None
+    checkpoint_revision: int | None = None
+    delivery: AgentRecallDelivery | None = None
+    if result.mode is AgentRecallProcessingMode.NO_WORK:
+        outcome = AgentRecallSubscriptionEvaluationOutcome.NO_WORK
+        if delivery_id is not None:
+            raise AgentRecallSubscriptionConflict("no_work_delivery")
+    else:
+        if result.retry_required or result.proposed_checkpoint is None or result.recall is None:
+            raise AgentRecallSubscriptionConflict("evaluation_retry_required")
+        contribution = admit_recall(result.recall, subscription.policy())
+        contribution_sha256 = sha256(
+            canonical_durable_json_bytes(
+                contribution.model_dump(mode="json"),
+                "agent recall subscription contribution",
+            )
+        ).hexdigest()
+        checkpoint = result.proposed_checkpoint
+        checkpoint_sha256 = checkpoint.fingerprint()
+        checkpoint_revision = checkpoint.revision
+        should_wake = contribution.focus is not None or contribution.offer is not None
+        outcome = (
+            AgentRecallSubscriptionEvaluationOutcome.WAKE
+            if should_wake
+            else AgentRecallSubscriptionEvaluationOutcome.SILENT
+        )
+        if should_wake:
+            if delivery_id is None:
+                raise AgentRecallSubscriptionConflict("wake_delivery_required")
+            expected_checkpoint_revision = (
+                None if checkpoint.revision == 1 else checkpoint.revision - 1
+            )
+            delivery = AgentRecallDelivery.from_processing_result(
+                result,
+                delivery_id=delivery_id,
+                expected_checkpoint_revision=expected_checkpoint_revision,
+                staged_by=staged_by,
+                staged_at=evaluated_at,
+            )
+        elif delivery_id is not None:
+            raise AgentRecallSubscriptionConflict("silent_delivery_forbidden")
+    next_evaluation_at = max(now, evaluated_at) + timedelta(
+        seconds=subscription.minimum_interval_seconds
+    )
+    evaluation = AgentRecallSubscriptionEvaluation(
+        evaluation_id=evaluation_id,
+        request_sha256=request_sha256,
+        subscription_id=subscription.subscription_id,
+        subscription_revision=subscription.revision,
+        subscription_sha256=subscription.fingerprint(),
+        claim_id=claim.claim_id,
+        runner_id=claim.runner_id,
+        attempt=claim.attempt,
+        claim_state_revision=claim.state_revision,
+        processing_id=result.processing_id,
+        processing_operation_id=result.operation_id,
+        processing_result_sha256=result.fingerprint(),
+        contribution_sha256=contribution_sha256,
+        outcome=outcome,
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_revision=checkpoint_revision,
+        delivery_id=None if delivery is None else delivery.delivery_id,
+        committed_at=max(now, evaluated_at),
+        next_evaluation_at=next_evaluation_at,
+    )
+    updated_record = record.model_copy(
+        update={
+            "run_state": AgentRecallSubscriptionRunState.DUE,
+            "state_revision": record.state_revision + 1,
+            "claim": None,
+            "release": None,
+            "next_evaluation_at": next_evaluation_at,
+            "last_evaluation_id": evaluation_id,
+            "updated_at": evaluation.committed_at,
+        }
+    )
+    return evaluation, delivery, updated_record
+
+
+def agent_recall_subscription_wake_claim_request_sha256(
+    key: AgentRecallCheckpointKey,
+    *,
+    claim_id: str,
+    runner_id: str,
+    lease_seconds: float,
+) -> str:
+    key = copy_agent_recall_checkpoint_key(key)
+    claim_id = _bounded_identity(claim_id, "claim_id")
+    runner_id = _bounded_identity(runner_id, "runner_id")
+    lease_seconds = _validate_delivery_lease_seconds(lease_seconds)
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "key": key.model_dump(mode="json"),
+                "claim_id": claim_id,
+                "runner_id": runner_id,
+                "lease_seconds": lease_seconds,
+            },
+            "agent recall subscription wake claim request",
+        )
+    ).hexdigest()
+
+
+def _claim_agent_recall_subscription_wake(
+    wake: AgentRecallSubscriptionWake,
+    *,
+    claim_id: str,
+    runner_id: str,
+    lease_seconds: float,
+    now: datetime,
+) -> AgentRecallSubscriptionWake:
+    wake = copy_agent_recall_subscription_wake(wake)
+    claim_id = _bounded_identity(claim_id, "claim_id")
+    runner_id = _bounded_identity(runner_id, "runner_id")
+    lease_seconds = _validate_delivery_lease_seconds(lease_seconds)
+    now = _utc(now, "now")
+    if wake.state is AgentRecallSubscriptionWakeState.ACKNOWLEDGED:
+        raise AgentRecallSubscriptionConflict("wake_already_acknowledged")
+    if wake.state is AgentRecallSubscriptionWakeState.CLAIMED:
+        assert wake.claim is not None
+        if wake.claim.claim_id == claim_id and wake.claim.runner_id == runner_id:
+            return wake
+        if wake.claim.lease_expires_at > now:
+            raise AgentRecallSubscriptionConflict("wake_claimed")
+    state_revision = wake.state_revision + 1
+    claim = AgentRecallSubscriptionWakeClaim(
+        wake_id=wake.wake_id,
+        delivery_id=wake.delivery.delivery_id,
+        claim_id=claim_id,
+        runner_id=runner_id,
+        attempt=wake.attempt + 1,
+        state_revision=state_revision,
+        claimed_at=now,
+        lease_expires_at=now + timedelta(seconds=lease_seconds),
+    )
+    return wake.model_copy(
+        update={
+            "state": AgentRecallSubscriptionWakeState.CLAIMED,
+            "state_revision": state_revision,
+            "attempt": claim.attempt,
+            "claim": claim,
+            "release": None,
+            "updated_at": now,
+        }
+    )
+
+
+def _require_replayable_subscription_wake_claim(
+    wake: AgentRecallSubscriptionWake,
+    *,
+    claim_id: str,
+    runner_id: str,
+    attempt: int,
+    now: datetime,
+) -> None:
+    claim = wake.claim
+    if (
+        wake.state is not AgentRecallSubscriptionWakeState.CLAIMED
+        or claim is None
+        or claim.claim_id != claim_id
+        or claim.runner_id != runner_id
+        or claim.attempt != attempt
+    ):
+        raise AgentRecallSubscriptionConflict("wake_claim_replay_superseded")
+    if claim.lease_expires_at <= _utc(now, "now"):
+        raise AgentRecallSubscriptionConflict("expired_wake_claim")
+
+
+def _require_current_subscription_wake_claim(
+    wake: AgentRecallSubscriptionWake,
+    claim: AgentRecallSubscriptionWakeClaim,
+    *,
+    now: datetime,
+) -> None:
+    claim = copy_agent_recall_subscription_wake_claim(claim)
+    if wake.state is not AgentRecallSubscriptionWakeState.CLAIMED or wake.claim != claim:
+        raise AgentRecallSubscriptionConflict("stale_wake_claim")
+    if claim.lease_expires_at <= _utc(now, "now"):
+        raise AgentRecallSubscriptionConflict("expired_wake_claim")
+
+
+def _renew_agent_recall_subscription_wake(
+    wake: AgentRecallSubscriptionWake,
+    claim: AgentRecallSubscriptionWakeClaim,
+    *,
+    lease_seconds: float,
+    now: datetime,
+) -> AgentRecallSubscriptionWake:
+    wake = copy_agent_recall_subscription_wake(wake)
+    claim = copy_agent_recall_subscription_wake_claim(claim)
+    lease_seconds = _validate_delivery_lease_seconds(lease_seconds)
+    now = _utc(now, "now")
+    if (
+        wake.state is AgentRecallSubscriptionWakeState.CLAIMED
+        and wake.claim is not None
+        and wake.claim.claim_id == claim.claim_id
+        and wake.claim.runner_id == claim.runner_id
+        and wake.claim.attempt == claim.attempt
+        and wake.claim.state_revision == claim.state_revision + 1
+    ):
+        if wake.claim.lease_expires_at != wake.updated_at + timedelta(seconds=lease_seconds):
+            raise AgentRecallSubscriptionConflict("wake_renewal_reused")
+        if wake.claim.lease_expires_at <= now:
+            raise AgentRecallSubscriptionConflict("expired_wake_claim")
+        return wake
+    _require_current_subscription_wake_claim(wake, claim, now=now)
+    state_revision = wake.state_revision + 1
+    renewed = claim.model_copy(
+        update={
+            "state_revision": state_revision,
+            "lease_expires_at": now + timedelta(seconds=lease_seconds),
+        }
+    )
+    return wake.model_copy(
+        update={
+            "state_revision": state_revision,
+            "claim": renewed,
+            "updated_at": now,
+        }
+    )
+
+
+def _agent_recall_subscription_wake_release(
+    claim: AgentRecallSubscriptionWakeClaim,
+    *,
+    release_id: str,
+    reason: str,
+    released_at: datetime,
+) -> AgentRecallSubscriptionWakeRelease:
+    claim = copy_agent_recall_subscription_wake_claim(claim)
+    return AgentRecallSubscriptionWakeRelease(
+        release_id=release_id,
+        wake_id=claim.wake_id,
+        delivery_id=claim.delivery_id,
+        claim_id=claim.claim_id,
+        runner_id=claim.runner_id,
+        attempt=claim.attempt,
+        claim_state_revision=claim.state_revision,
+        reason=reason,
+        released_at=released_at,
+    )
+
+
+def _release_agent_recall_subscription_wake(
+    wake: AgentRecallSubscriptionWake,
+    claim: AgentRecallSubscriptionWakeClaim,
+    *,
+    release_id: str,
+    reason: str,
+    released_at: datetime,
+    now: datetime,
+) -> AgentRecallSubscriptionWake:
+    wake = copy_agent_recall_subscription_wake(wake)
+    claim = copy_agent_recall_subscription_wake_claim(claim)
+    requested = _agent_recall_subscription_wake_release(
+        claim,
+        release_id=release_id,
+        reason=reason,
+        released_at=released_at,
+    )
+    now = _utc(now, "now")
+    if wake.state is AgentRecallSubscriptionWakeState.PENDING and wake.release == requested:
+        return wake
+    _require_current_subscription_wake_claim(wake, claim, now=now)
+    if requested.released_at < claim.claimed_at:
+        raise AgentRecallSubscriptionConflict("wake_release_predates_claim")
+    if requested.released_at >= claim.lease_expires_at:
+        raise AgentRecallSubscriptionConflict("wake_release_outside_claim_lease")
+    if requested.released_at > now:
+        raise AgentRecallSubscriptionConflict("wake_release_from_future")
+    return wake.model_copy(
+        update={
+            "state": AgentRecallSubscriptionWakeState.PENDING,
+            "state_revision": wake.state_revision + 1,
+            "release": requested,
+            "updated_at": max(now, requested.released_at),
+        }
+    )
+
+
+def _acknowledge_agent_recall_subscription_wake(
+    wake: AgentRecallSubscriptionWake,
+    claim: AgentRecallSubscriptionWakeClaim,
+    *,
+    acknowledgement_id: str,
+    acknowledged_at: datetime,
+    now: datetime,
+) -> AgentRecallSubscriptionWake:
+    wake = copy_agent_recall_subscription_wake(wake)
+    claim = copy_agent_recall_subscription_wake_claim(claim)
+    requested = AgentRecallSubscriptionWakeAcknowledgement(
+        acknowledgement_id=acknowledgement_id,
+        wake_id=claim.wake_id,
+        delivery_id=claim.delivery_id,
+        claim_id=claim.claim_id,
+        runner_id=claim.runner_id,
+        attempt=claim.attempt,
+        acknowledged_at=acknowledged_at,
+    )
+    now = _utc(now, "now")
+    if wake.state is AgentRecallSubscriptionWakeState.ACKNOWLEDGED:
+        if wake.acknowledgement != requested:
+            raise AgentRecallSubscriptionConflict("wake_already_acknowledged")
+        return wake
+    _require_current_subscription_wake_claim(wake, claim, now=now)
+    if requested.acknowledged_at < claim.claimed_at:
+        raise AgentRecallSubscriptionConflict("wake_acknowledgement_predates_claim")
+    if requested.acknowledged_at >= claim.lease_expires_at:
+        raise AgentRecallSubscriptionConflict("wake_acknowledgement_outside_claim_lease")
+    if requested.acknowledged_at > now:
+        raise AgentRecallSubscriptionConflict("wake_acknowledgement_from_future")
+    return wake.model_copy(
+        update={
+            "state": AgentRecallSubscriptionWakeState.ACKNOWLEDGED,
+            "state_revision": wake.state_revision + 1,
+            "acknowledgement": requested,
+            "updated_at": max(now, requested.acknowledged_at),
+        }
+    )
+
+
 def agent_work_context_publication_request_sha256(
     context: AgentWorkContext,
     expected_revision: int | None,
@@ -1650,6 +3459,123 @@ class AgentWorkContextStore(ABC):
     ) -> AgentRecallDeliveryRecord:
         """Acknowledge durable downstream acceptance without claiming exposure."""
 
+    @abstractmethod
+    async def publish_recall_subscription(
+        self,
+        subscription: AgentRecallSubscription,
+        *,
+        expected_revision: int | None,
+    ) -> AgentRecallSubscriptionPublicationReceipt:
+        """Create or replace one exact idle-task subscription revision."""
+
+    @abstractmethod
+    async def load_recall_subscription(
+        self,
+        subscription_id: str,
+        *,
+        revision: int | None = None,
+    ) -> AgentRecallSubscription | None:
+        """Load the current or one exact immutable subscription revision."""
+
+    @abstractmethod
+    async def claim_due_recall_subscription(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        runner_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionRecord | None:
+        """Claim the oldest due subscription in one authorized checkpoint scope."""
+
+    @abstractmethod
+    async def renew_recall_subscription(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionRecord:
+        """Renew one exact live subscription-evaluation claim."""
+
+    @abstractmethod
+    async def release_recall_subscription(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallSubscriptionRecord:
+        """Release one exact evaluation claim without advancing recall progress."""
+
+    @abstractmethod
+    async def commit_recall_subscription_evaluation(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        result: AgentRecallProcessingResult,
+        *,
+        evaluation_id: str,
+        delivery_id: str | None,
+        staged_by: str,
+        evaluated_at: datetime,
+    ) -> AgentRecallSubscriptionEvaluation:
+        """Atomically commit silent progress or progress plus one staged wake."""
+
+    @abstractmethod
+    async def load_recall_subscription_evaluation(
+        self,
+        evaluation_id: str,
+    ) -> AgentRecallSubscriptionEvaluation | None:
+        """Load immutable subscription evaluation evidence."""
+
+    @abstractmethod
+    async def claim_recall_subscription_wake(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        runner_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionWake | None:
+        """Claim the oldest pending task-scheduler wake created by a subscription."""
+
+    @abstractmethod
+    async def load_recall_subscription_wake(
+        self,
+        wake_id: str,
+    ) -> AgentRecallSubscriptionWake | None:
+        """Load one scheduler wake without claiming its staged delivery."""
+
+    @abstractmethod
+    async def renew_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionWake:
+        """Renew one exact live scheduler-wake claim."""
+
+    @abstractmethod
+    async def release_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallSubscriptionWake:
+        """Release a scheduler wake for retry without changing its delivery."""
+
+    @abstractmethod
+    async def acknowledge_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        acknowledgement_id: str,
+        acknowledged_at: datetime,
+    ) -> AgentRecallSubscriptionWake:
+        """Record scheduler acceptance and make the staged delivery claimable."""
+
     async def close(self) -> None:
         """Release store-owned resources, if any."""
 
@@ -1666,17 +3592,33 @@ class InMemoryAgentWorkContextStore(AgentWorkContextStore):
         self._context_heads: dict[str, int] = {}
         self._context_publications: dict[str, AgentWorkContextPublicationReceipt] = {}
         self._checkpoint_revisions: dict[
-            tuple[str, str, str, str], dict[int, AgentRecallCheckpoint]
+            tuple[str, str, str, str, str], dict[int, AgentRecallCheckpoint]
         ] = {}
-        self._checkpoint_operations: dict[str, tuple[tuple[str, str, str, str], int]] = {}
-        self._checkpoint_heads: dict[tuple[str, str, str, str], int] = {}
+        self._checkpoint_operations: dict[str, tuple[tuple[str, str, str, str, str], int]] = {}
+        self._checkpoint_heads: dict[tuple[str, str, str, str, str], int] = {}
         self._recall_deliveries: dict[str, AgentRecallDeliveryRecord] = {}
-        self._delivery_by_checkpoint: dict[tuple[tuple[str, str, str, str], int], str] = {}
+        self._delivery_by_checkpoint: dict[tuple[tuple[str, str, str, str, str], int], str] = {}
         self._delivery_by_operation: dict[str, str] = {}
-        self._delivery_queues: dict[tuple[str, str, str, str], deque[str]] = {}
+        self._delivery_queues: dict[tuple[str, str, str, str, str], deque[str]] = {}
         self._delivery_claims: dict[str, tuple[str, str, str, int]] = {}
         self._delivery_releases: dict[str, AgentRecallDeliveryRelease] = {}
         self._delivery_acknowledgements: dict[str, str] = {}
+        self._subscription_revisions: dict[str, dict[int, AgentRecallSubscription]] = {}
+        self._subscription_heads: dict[str, int] = {}
+        self._subscription_publications: dict[str, AgentRecallSubscriptionPublicationReceipt] = {}
+        self._subscription_states: dict[str, AgentRecallSubscriptionRecord] = {}
+        self._subscription_ids_by_key: dict[tuple[str, str, str, str], set[str]] = {}
+        self._subscription_claims: dict[str, tuple[str, str, str, int]] = {}
+        self._subscription_releases: dict[str, AgentRecallSubscriptionRelease] = {}
+        self._subscription_evaluations: dict[str, AgentRecallSubscriptionEvaluation] = {}
+        self._subscription_evaluation_by_processing_operation: dict[str, str] = {}
+        self._subscription_evaluation_by_delivery: dict[str, str] = {}
+        self._subscription_wakes: dict[str, AgentRecallSubscriptionWake] = {}
+        self._subscription_wake_queues: dict[tuple[str, str, str, str], deque[str]] = {}
+        self._pending_subscription_wake_ids: dict[str, set[str]] = {}
+        self._subscription_wake_claims: dict[str, tuple[str, str, str, int]] = {}
+        self._subscription_wake_releases: dict[str, AgentRecallSubscriptionWakeRelease] = {}
+        self._subscription_wake_acknowledgements: dict[str, str] = {}
 
     async def publish_work_context(
         self,
@@ -1758,6 +3700,11 @@ class InMemoryAgentWorkContextStore(AgentWorkContextStore):
         checkpoint = copy_agent_recall_checkpoint(checkpoint)
         key = checkpoint.key().sort_key()
         async with self._lock:
+            if (
+                checkpoint.operation_id in self._delivery_by_operation
+                or checkpoint.operation_id in self._subscription_evaluation_by_processing_operation
+            ):
+                raise AgentWorkContextConflict("checkpoint_operation_reused")
             replay = self._checkpoint_operations.get(checkpoint.operation_id)
             if replay is not None:
                 replay_key, replay_revision = replay
@@ -1818,6 +3765,8 @@ class InMemoryAgentWorkContextStore(AgentWorkContextStore):
         delivery = copy_agent_recall_delivery(delivery)
         key = delivery.key().sort_key()
         async with self._lock:
+            if delivery.operation_id in self._subscription_evaluation_by_processing_operation:
+                raise AgentRecallDeliveryConflict("delivery_operation_reused")
             existing = self._recall_deliveries.get(delivery.delivery_id)
             if existing is not None:
                 if existing.delivery != delivery:
@@ -2020,7 +3969,572 @@ class InMemoryAgentWorkContextStore(AgentWorkContextStore):
             self._trim_delivery_queue_unlocked(acknowledged.delivery.key().sort_key())
             return copy_agent_recall_delivery_record(acknowledged)
 
-    def _trim_delivery_queue_unlocked(self, key: tuple[str, str, str, str]) -> None:
+    async def publish_recall_subscription(
+        self,
+        subscription: AgentRecallSubscription,
+        *,
+        expected_revision: int | None,
+    ) -> AgentRecallSubscriptionPublicationReceipt:
+        subscription = copy_agent_recall_subscription(subscription)
+        request_sha256 = agent_recall_subscription_publication_request_sha256(
+            subscription,
+            expected_revision,
+        )
+        async with self._lock:
+            replay = self._subscription_publications.get(subscription.operation_id)
+            if replay is not None:
+                if replay.request_sha256 != request_sha256:
+                    raise AgentRecallSubscriptionConflict("publication_operation_reused")
+                return copy_agent_recall_subscription_publication_receipt(replay)
+            revisions = self._subscription_revisions.get(subscription.subscription_id)
+            current_revision = self._subscription_heads.get(subscription.subscription_id)
+            current = (
+                None
+                if revisions is None or current_revision is None
+                else revisions[current_revision]
+            )
+            contexts = self._contexts.get(subscription.task_id)
+            context_revision = self._context_heads.get(subscription.task_id)
+            work_context = (
+                None if contexts is None or context_revision is None else contexts[context_revision]
+            )
+            now = _utc(self._clock(), "clock result")
+            if subscription.published_at > now:
+                raise AgentRecallSubscriptionConflict("publication_from_future")
+            validate_agent_recall_subscription_publication(
+                subscription,
+                expected_revision,
+                current,
+                work_context,
+            )
+            receipt = AgentRecallSubscriptionPublicationReceipt(
+                operation_id=subscription.operation_id,
+                request_sha256=request_sha256,
+                expected_revision=expected_revision,
+                subscription=subscription,
+                committed_at=now,
+            )
+            prior_state = self._subscription_states.get(subscription.subscription_id)
+            state_revision = 0 if prior_state is None else prior_state.state_revision + 1
+            state = AgentRecallSubscriptionRecord(
+                subscription=subscription,
+                state_revision=state_revision,
+                attempt=0 if prior_state is None else prior_state.attempt,
+                next_evaluation_at=max(now, subscription.published_at),
+                updated_at=now,
+            )
+            self._subscription_revisions.setdefault(subscription.subscription_id, {})[
+                subscription.revision
+            ] = subscription
+            self._subscription_heads[subscription.subscription_id] = subscription.revision
+            self._subscription_publications[subscription.operation_id] = receipt
+            self._subscription_states[subscription.subscription_id] = state
+            self._subscription_ids_by_key.setdefault(
+                subscription.checkpoint_key().authority_sort_key(),
+                set(),
+            ).add(subscription.subscription_id)
+            return copy_agent_recall_subscription_publication_receipt(receipt)
+
+    async def load_recall_subscription(
+        self,
+        subscription_id: str,
+        *,
+        revision: int | None = None,
+    ) -> AgentRecallSubscription | None:
+        subscription_id = _bounded_identity(subscription_id, "subscription_id")
+        if revision is not None:
+            _positive_revision(revision, "revision")
+        async with self._lock:
+            revisions = self._subscription_revisions.get(subscription_id)
+            if not revisions:
+                return None
+            resolved = self._subscription_heads[subscription_id] if revision is None else revision
+            subscription = revisions.get(resolved)
+            return None if subscription is None else copy_agent_recall_subscription(subscription)
+
+    async def claim_due_recall_subscription(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        runner_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionRecord | None:
+        key = copy_agent_recall_checkpoint_key(key)
+        request_sha256 = agent_recall_subscription_claim_request_sha256(
+            key,
+            claim_id=claim_id,
+            runner_id=runner_id,
+            lease_seconds=lease_seconds,
+        )
+        async with self._lock:
+            replay = self._subscription_claims.get(claim_id)
+            if replay is not None:
+                replay_request, subscription_id, replay_runner, replay_attempt = replay
+                if replay_request != request_sha256:
+                    raise AgentRecallSubscriptionConflict("claim_id_reused")
+                record = self._subscription_states[subscription_id]
+                current = record.claim
+                now = max(_utc(self._clock(), "clock result"), record.updated_at)
+                if (
+                    record.run_state is not AgentRecallSubscriptionRunState.CLAIMED
+                    or current is None
+                    or current.claim_id != claim_id
+                    or current.runner_id != replay_runner
+                    or current.attempt != replay_attempt
+                ):
+                    raise AgentRecallSubscriptionConflict("claim_replay_superseded")
+                if current.lease_expires_at <= now:
+                    raise AgentRecallSubscriptionConflict("expired_subscription_claim")
+                return copy_agent_recall_subscription_record(record)
+            now = _utc(self._clock(), "clock result")
+            candidates: list[AgentRecallSubscriptionRecord] = []
+            for subscription_id in self._subscription_ids_by_key.get(
+                key.authority_sort_key(),
+                (),
+            ):
+                record = self._subscription_states[subscription_id]
+                subscription = record.subscription
+                contexts = self._contexts.get(subscription.task_id)
+                current_context_revision = self._context_heads.get(subscription.task_id)
+                current_context = (
+                    None
+                    if contexts is None or current_context_revision is None
+                    else contexts[current_context_revision]
+                )
+                if (
+                    current_context is None
+                    or current_context.revision != subscription.work_context_revision
+                    or current_context.content_sha256 != subscription.work_context_sha256
+                    or subscription.status is not AgentRecallSubscriptionStatus.ACTIVE
+                    or subscription.expires_at <= now
+                    or record.next_evaluation_at > now
+                    or self._subscription_has_pending_wake_unlocked(subscription.subscription_id)
+                    or (
+                        record.run_state is AgentRecallSubscriptionRunState.CLAIMED
+                        and record.claim is not None
+                        and record.claim.lease_expires_at > now
+                    )
+                ):
+                    continue
+                candidates.append(record)
+            if not candidates:
+                return None
+            current = min(
+                candidates,
+                key=lambda item: (
+                    item.next_evaluation_at,
+                    -item.subscription.priority,
+                    item.subscription.subscription_id,
+                ),
+            )
+            effective_now = max(now, current.updated_at)
+            claimed = _claim_agent_recall_subscription_record(
+                current,
+                claim_id=claim_id,
+                runner_id=runner_id,
+                lease_seconds=lease_seconds,
+                now=effective_now,
+            )
+            self._subscription_states[current.subscription.subscription_id] = claimed
+            assert claimed.claim is not None
+            self._subscription_claims[claim_id] = (
+                request_sha256,
+                claimed.subscription.subscription_id,
+                claimed.claim.runner_id,
+                claimed.claim.attempt,
+            )
+            return copy_agent_recall_subscription_record(claimed)
+
+    async def renew_recall_subscription(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionRecord:
+        claim = copy_agent_recall_subscription_claim(claim)
+        async with self._lock:
+            current = self._subscription_states.get(claim.subscription_id)
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_subscription")
+            renewed = _renew_agent_recall_subscription_record(
+                current,
+                claim,
+                lease_seconds=lease_seconds,
+                now=max(_utc(self._clock(), "clock result"), current.updated_at),
+            )
+            self._subscription_states[claim.subscription_id] = renewed
+            return copy_agent_recall_subscription_record(renewed)
+
+    async def release_recall_subscription(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallSubscriptionRecord:
+        claim = copy_agent_recall_subscription_claim(claim)
+        release_id = _bounded_identity(release_id, "release_id")
+        requested = _agent_recall_subscription_release(
+            claim,
+            release_id=release_id,
+            reason=reason,
+            released_at=released_at,
+        )
+        async with self._lock:
+            current = self._subscription_states.get(claim.subscription_id)
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_subscription")
+            replay = self._subscription_releases.get(release_id)
+            if replay is not None:
+                if replay != requested:
+                    raise AgentRecallSubscriptionConflict("release_id_reused")
+                if current.release != replay:
+                    raise AgentRecallSubscriptionConflict("release_replay_superseded")
+                return copy_agent_recall_subscription_record(current)
+            released = _release_agent_recall_subscription_record(
+                current,
+                claim,
+                release_id=release_id,
+                reason=reason,
+                released_at=released_at,
+                now=max(_utc(self._clock(), "clock result"), current.updated_at),
+            )
+            self._subscription_states[claim.subscription_id] = released
+            assert released.release is not None
+            self._subscription_releases[release_id] = released.release
+            return copy_agent_recall_subscription_record(released)
+
+    async def commit_recall_subscription_evaluation(
+        self,
+        claim: AgentRecallSubscriptionClaim,
+        result: AgentRecallProcessingResult,
+        *,
+        evaluation_id: str,
+        delivery_id: str | None,
+        staged_by: str,
+        evaluated_at: datetime,
+    ) -> AgentRecallSubscriptionEvaluation:
+        from cayu.recall_processing import AgentRecallProcessingResult
+
+        claim = copy_agent_recall_subscription_claim(claim)
+        if type(result) is not AgentRecallProcessingResult:
+            raise TypeError("result must be an AgentRecallProcessingResult.")
+        request_sha256 = agent_recall_subscription_evaluation_request_sha256(
+            claim,
+            result,
+            evaluation_id=evaluation_id,
+            delivery_id=delivery_id,
+            staged_by=staged_by,
+            evaluated_at=evaluated_at,
+        )
+        async with self._lock:
+            replay = self._subscription_evaluations.get(evaluation_id)
+            if replay is not None:
+                if replay.request_sha256 != request_sha256:
+                    raise AgentRecallSubscriptionConflict("evaluation_id_reused")
+                return copy_agent_recall_subscription_evaluation(replay)
+            occupied_evaluation = self._subscription_evaluation_by_processing_operation.get(
+                result.operation_id
+            )
+            if occupied_evaluation is not None:
+                raise AgentRecallSubscriptionConflict("processing_operation_reused")
+            if (
+                result.operation_id in self._checkpoint_operations
+                or result.operation_id in self._delivery_by_operation
+            ):
+                raise AgentRecallSubscriptionConflict("processing_operation_reused")
+            current = self._subscription_states.get(claim.subscription_id)
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_subscription")
+            evaluation, delivery, updated = _prepare_agent_recall_subscription_evaluation(
+                current,
+                claim,
+                result,
+                (
+                    None
+                    if self._context_heads.get(current.subscription.task_id) is None
+                    else self._contexts[current.subscription.task_id][
+                        self._context_heads[current.subscription.task_id]
+                    ]
+                ),
+                evaluation_id=evaluation_id,
+                delivery_id=delivery_id,
+                staged_by=staged_by,
+                evaluated_at=evaluated_at,
+                now=max(_utc(self._clock(), "clock result"), current.updated_at),
+            )
+            if delivery is not None:
+                key = delivery.key().sort_key()
+                if delivery.delivery_id in self._recall_deliveries:
+                    raise AgentRecallSubscriptionConflict("delivery_id_reused")
+                if (key, delivery.checkpoint.revision) in self._delivery_by_checkpoint:
+                    raise AgentRecallSubscriptionConflict("checkpoint_delivery_exists")
+                if delivery.operation_id in self._delivery_by_operation:
+                    raise AgentRecallSubscriptionConflict("delivery_operation_reused")
+                if delivery.operation_id in self._checkpoint_operations:
+                    raise AgentRecallSubscriptionConflict("checkpoint_committed_without_delivery")
+                self._advance_recall_checkpoint_unlocked(
+                    delivery.checkpoint,
+                    expected_revision=delivery.expected_checkpoint_revision,
+                )
+                delivery_record = AgentRecallDeliveryRecord(
+                    delivery=delivery,
+                    updated_at=delivery.staged_at,
+                )
+                self._recall_deliveries[delivery.delivery_id] = delivery_record
+                self._delivery_by_checkpoint[(key, delivery.checkpoint.revision)] = (
+                    delivery.delivery_id
+                )
+                self._delivery_by_operation[delivery.operation_id] = delivery.delivery_id
+                self._subscription_evaluation_by_delivery[delivery.delivery_id] = evaluation_id
+                self._subscription_wakes[evaluation_id] = AgentRecallSubscriptionWake(
+                    wake_id=evaluation_id,
+                    subscription=current.subscription,
+                    evaluation=evaluation,
+                    delivery=delivery,
+                    updated_at=evaluation.committed_at,
+                )
+                self._subscription_wake_queues.setdefault(
+                    delivery.key().authority_sort_key(),
+                    deque(),
+                ).append(evaluation_id)
+                self._pending_subscription_wake_ids.setdefault(
+                    current.subscription.subscription_id,
+                    set(),
+                ).add(evaluation_id)
+            elif result.proposed_checkpoint is not None:
+                expected_revision = (
+                    None
+                    if result.proposed_checkpoint.revision == 1
+                    else result.proposed_checkpoint.revision - 1
+                )
+                self._advance_recall_checkpoint_unlocked(
+                    result.proposed_checkpoint,
+                    expected_revision=expected_revision,
+                )
+            self._subscription_evaluations[evaluation_id] = evaluation
+            self._subscription_evaluation_by_processing_operation[result.operation_id] = (
+                evaluation_id
+            )
+            self._subscription_states[claim.subscription_id] = updated
+            return copy_agent_recall_subscription_evaluation(evaluation)
+
+    async def load_recall_subscription_evaluation(
+        self,
+        evaluation_id: str,
+    ) -> AgentRecallSubscriptionEvaluation | None:
+        evaluation_id = _bounded_identity(evaluation_id, "evaluation_id")
+        async with self._lock:
+            evaluation = self._subscription_evaluations.get(evaluation_id)
+            return (
+                None
+                if evaluation is None
+                else copy_agent_recall_subscription_evaluation(evaluation)
+            )
+
+    async def claim_recall_subscription_wake(
+        self,
+        key: AgentRecallCheckpointKey,
+        *,
+        claim_id: str,
+        runner_id: str,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionWake | None:
+        key = copy_agent_recall_checkpoint_key(key)
+        request_sha256 = agent_recall_subscription_wake_claim_request_sha256(
+            key,
+            claim_id=claim_id,
+            runner_id=runner_id,
+            lease_seconds=lease_seconds,
+        )
+        async with self._lock:
+            replay = self._subscription_wake_claims.get(claim_id)
+            if replay is not None:
+                replay_request, wake_id, replay_runner, replay_attempt = replay
+                if replay_request != request_sha256:
+                    raise AgentRecallSubscriptionConflict("wake_claim_id_reused")
+                wake = self._subscription_wakes[wake_id]
+                _require_replayable_subscription_wake_claim(
+                    wake,
+                    claim_id=claim_id,
+                    runner_id=replay_runner,
+                    attempt=replay_attempt,
+                    now=max(_utc(self._clock(), "clock result"), wake.updated_at),
+                )
+                return copy_agent_recall_subscription_wake(wake)
+            queue_key = key.authority_sort_key()
+            self._trim_subscription_wake_queue_unlocked(queue_key)
+            queue = self._subscription_wake_queues.get(queue_key)
+            if not queue:
+                return None
+            clock_now = _utc(self._clock(), "clock result")
+            candidates: list[AgentRecallSubscriptionWake] = []
+            for wake_id in queue:
+                wake = self._subscription_wakes[wake_id]
+                if wake.state is AgentRecallSubscriptionWakeState.PENDING or (
+                    wake.state is AgentRecallSubscriptionWakeState.CLAIMED
+                    and wake.claim is not None
+                    and wake.claim.lease_expires_at <= max(clock_now, wake.updated_at)
+                ):
+                    candidates.append(wake)
+            if not candidates:
+                return None
+            current = min(
+                candidates,
+                key=lambda wake: (wake.evaluation.committed_at, wake.wake_id),
+            )
+            now = max(clock_now, current.updated_at)
+            claimed = _claim_agent_recall_subscription_wake(
+                current,
+                claim_id=claim_id,
+                runner_id=runner_id,
+                lease_seconds=lease_seconds,
+                now=now,
+            )
+            self._subscription_wakes[current.wake_id] = claimed
+            assert claimed.claim is not None
+            self._subscription_wake_claims[claim_id] = (
+                request_sha256,
+                current.wake_id,
+                claimed.claim.runner_id,
+                claimed.claim.attempt,
+            )
+            return copy_agent_recall_subscription_wake(claimed)
+
+    async def load_recall_subscription_wake(
+        self,
+        wake_id: str,
+    ) -> AgentRecallSubscriptionWake | None:
+        wake_id = _bounded_identity(wake_id, "wake_id")
+        async with self._lock:
+            wake = self._subscription_wakes.get(wake_id)
+            return None if wake is None else copy_agent_recall_subscription_wake(wake)
+
+    async def renew_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        lease_seconds: float,
+    ) -> AgentRecallSubscriptionWake:
+        claim = copy_agent_recall_subscription_wake_claim(claim)
+        async with self._lock:
+            current = self._subscription_wakes.get(claim.wake_id)
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_wake")
+            renewed = _renew_agent_recall_subscription_wake(
+                current,
+                claim,
+                lease_seconds=lease_seconds,
+                now=max(_utc(self._clock(), "clock result"), current.updated_at),
+            )
+            self._subscription_wakes[claim.wake_id] = renewed
+            return copy_agent_recall_subscription_wake(renewed)
+
+    async def release_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        release_id: str,
+        reason: str,
+        released_at: datetime,
+    ) -> AgentRecallSubscriptionWake:
+        claim = copy_agent_recall_subscription_wake_claim(claim)
+        requested = _agent_recall_subscription_wake_release(
+            claim,
+            release_id=release_id,
+            reason=reason,
+            released_at=released_at,
+        )
+        async with self._lock:
+            current = self._subscription_wakes.get(claim.wake_id)
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_wake")
+            replay = self._subscription_wake_releases.get(requested.release_id)
+            if replay is not None:
+                if replay != requested:
+                    raise AgentRecallSubscriptionConflict("wake_release_id_reused")
+                if current.release != replay:
+                    raise AgentRecallSubscriptionConflict("wake_release_replay_superseded")
+                return copy_agent_recall_subscription_wake(current)
+            released = _release_agent_recall_subscription_wake(
+                current,
+                claim,
+                release_id=requested.release_id,
+                reason=requested.reason,
+                released_at=requested.released_at,
+                now=max(_utc(self._clock(), "clock result"), current.updated_at),
+            )
+            self._subscription_wakes[claim.wake_id] = released
+            self._subscription_wake_releases[requested.release_id] = requested
+            return copy_agent_recall_subscription_wake(released)
+
+    async def acknowledge_recall_subscription_wake(
+        self,
+        claim: AgentRecallSubscriptionWakeClaim,
+        *,
+        acknowledgement_id: str,
+        acknowledged_at: datetime,
+    ) -> AgentRecallSubscriptionWake:
+        claim = copy_agent_recall_subscription_wake_claim(claim)
+        acknowledgement_id = _bounded_identity(acknowledgement_id, "acknowledgement_id")
+        async with self._lock:
+            current = self._subscription_wakes.get(claim.wake_id)
+            if current is None:
+                raise AgentRecallSubscriptionConflict("unknown_wake")
+            occupied = self._subscription_wake_acknowledgements.get(acknowledgement_id)
+            if occupied is not None and occupied != claim.wake_id:
+                raise AgentRecallSubscriptionConflict("wake_acknowledgement_id_reused")
+            acknowledged = _acknowledge_agent_recall_subscription_wake(
+                current,
+                claim,
+                acknowledgement_id=acknowledgement_id,
+                acknowledged_at=acknowledged_at,
+                now=max(_utc(self._clock(), "clock result"), current.updated_at),
+            )
+            self._subscription_wakes[claim.wake_id] = acknowledged
+            self._subscription_wake_acknowledgements[acknowledgement_id] = claim.wake_id
+            delivery_key = acknowledged.delivery.key().sort_key()
+            authority_key = acknowledged.delivery.key().authority_sort_key()
+            if current.state is not AgentRecallSubscriptionWakeState.ACKNOWLEDGED:
+                self._delivery_queues.setdefault(delivery_key, deque()).append(
+                    acknowledged.delivery.delivery_id
+                )
+                pending_wakes = self._pending_subscription_wake_ids[
+                    acknowledged.subscription.subscription_id
+                ]
+                pending_wakes.remove(acknowledged.wake_id)
+                if not pending_wakes:
+                    self._pending_subscription_wake_ids.pop(
+                        acknowledged.subscription.subscription_id,
+                        None,
+                    )
+            self._trim_subscription_wake_queue_unlocked(authority_key)
+            return copy_agent_recall_subscription_wake(acknowledged)
+
+    def _subscription_has_pending_wake_unlocked(self, subscription_id: str) -> bool:
+        return bool(self._pending_subscription_wake_ids.get(subscription_id))
+
+    def _trim_subscription_wake_queue_unlocked(
+        self,
+        key: tuple[str, str, str, str],
+    ) -> None:
+        queue = self._subscription_wake_queues.get(key)
+        if queue is None:
+            return
+        retained = deque(
+            wake_id
+            for wake_id in queue
+            if self._subscription_wakes[wake_id].state
+            is not AgentRecallSubscriptionWakeState.ACKNOWLEDGED
+        )
+        queue.clear()
+        queue.extend(retained)
+        if not queue:
+            self._subscription_wake_queues.pop(key, None)
+
+    def _trim_delivery_queue_unlocked(self, key: tuple[str, str, str, str, str]) -> None:
         queue = self._delivery_queues.get(key)
         if queue is None:
             return
@@ -2058,10 +4572,25 @@ __all__ = [
     "AGENT_RECALL_DELIVERY_RECORD_SCHEMA_VERSION",
     "AGENT_RECALL_DELIVERY_RELEASE_SCHEMA_VERSION",
     "AGENT_RECALL_DELIVERY_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_CLAIM_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_EVALUATION_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_PUBLICATION_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_RECORD_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_RELEASE_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_WAKE_ACKNOWLEDGEMENT_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_WAKE_CLAIM_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_WAKE_RELEASE_SCHEMA_VERSION",
+    "AGENT_RECALL_SUBSCRIPTION_WAKE_SCHEMA_VERSION",
     "AGENT_WORK_CONTEXT_PUBLICATION_SCHEMA_VERSION",
     "AGENT_WORK_CONTEXT_SCHEMA_VERSION",
+    "DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID",
     "MAX_AGENT_RECALL_DELIVERY_BYTES",
     "MAX_AGENT_RECALL_DELIVERY_LEASE_SECONDS",
+    "MAX_AGENT_RECALL_SUBSCRIPTION_BYTES",
+    "MAX_AGENT_RECALL_SUBSCRIPTION_INTERVAL_SECONDS",
+    "MAX_AGENT_RECALL_SUBSCRIPTION_PRIORITY",
+    "MAX_AGENT_RECALL_SUBSCRIPTION_QUERY_BYTES",
     "MAX_AGENT_WORK_CONTEXT_BYTES",
     "MAX_AGENT_WORK_CONTEXT_GOAL_BYTES",
     "MAX_AGENT_WORK_CONTEXT_ID_BYTES",
@@ -2079,9 +4608,25 @@ __all__ = [
     "AgentRecallDeliveryRecord",
     "AgentRecallDeliveryRelease",
     "AgentRecallDeliveryState",
+    "AgentRecallSubscription",
+    "AgentRecallSubscriptionClaim",
+    "AgentRecallSubscriptionConflict",
+    "AgentRecallSubscriptionEvaluation",
+    "AgentRecallSubscriptionEvaluationOutcome",
+    "AgentRecallSubscriptionPublicationReceipt",
+    "AgentRecallSubscriptionRecord",
+    "AgentRecallSubscriptionRelease",
+    "AgentRecallSubscriptionRunState",
+    "AgentRecallSubscriptionStatus",
+    "AgentRecallSubscriptionWake",
+    "AgentRecallSubscriptionWakeAcknowledgement",
+    "AgentRecallSubscriptionWakeClaim",
+    "AgentRecallSubscriptionWakeRelease",
+    "AgentRecallSubscriptionWakeState",
     "AgentWorkContext",
     "AgentWorkContextConflict",
     "AgentWorkContextPublicationReceipt",
     "AgentWorkContextStore",
     "InMemoryAgentWorkContextStore",
+    "agent_recall_facet_aspect",
 ]

@@ -64,7 +64,7 @@ from cayu.work_context import (
     copy_agent_work_context,
 )
 
-AGENT_RECALL_PROCESSING_SCHEMA_VERSION = "cayu.agent_recall_processing.v1"
+AGENT_RECALL_PROCESSING_SCHEMA_VERSION = "cayu.agent_recall_processing.v3"
 
 
 class _AgentRecallModel(BaseModel):
@@ -241,6 +241,7 @@ class AgentRecallProcessingRequest(_AgentRecallModel):
     agent_id: str
     work_context: AgentWorkContext
     situation: RecallSituation
+    checkpoint_stream_id: str
     checkpoint: AgentRecallCheckpoint | None = None
     frontier: AgentRecallFrontier | None = None
     processing_id: str
@@ -248,7 +249,13 @@ class AgentRecallProcessingRequest(_AgentRecallModel):
     updated_by: str
     updated_at: datetime
 
-    @field_validator("agent_id", "processing_id", "operation_id", "updated_by")
+    @field_validator(
+        "agent_id",
+        "checkpoint_stream_id",
+        "processing_id",
+        "operation_id",
+        "updated_by",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_identity(value, info.field_name)
@@ -329,6 +336,7 @@ class AgentRecallProcessingRequest(_AgentRecallModel):
                 or checkpoint.task_id != self.work_context.task_id
                 or checkpoint.knowledge_namespace != self.situation.knowledge_namespace
                 or checkpoint.access_policy_sha256 != access_policy_sha256
+                or checkpoint.checkpoint_stream_id != self.checkpoint_stream_id
             ):
                 raise ValueError("The checkpoint key conflicts with the recall request authority.")
             if checkpoint.work_context_revision > self.work_context.revision:
@@ -361,10 +369,27 @@ class AgentRecallProcessingRequest(_AgentRecallModel):
         return self
 
 
+def agent_recall_situation_input_sha256(situation: RecallSituation) -> str:
+    """Fingerprint retrieval-shaping input, excluding clock and access authority."""
+
+    if type(situation) is not RecallSituation:
+        raise TypeError("situation must be a RecallSituation.")
+    copied = situation.model_copy(deep=True)
+    return sha256(
+        canonical_durable_json_bytes(
+            copied.model_dump(
+                mode="json",
+                exclude={"current_time", "knowledge_access_scope"},
+            ),
+            "agent recall situation input",
+        )
+    ).hexdigest()
+
+
 class AgentRecallProcessingResult(_AgentRecallModel):
     """Immutable retrieval outcome and optional, unapplied checkpoint proposal."""
 
-    schema_version: Literal["cayu.agent_recall_processing.v1"] = (
+    schema_version: Literal["cayu.agent_recall_processing.v3"] = (
         AGENT_RECALL_PROCESSING_SCHEMA_VERSION
     )
     mode: AgentRecallProcessingMode
@@ -377,6 +402,8 @@ class AgentRecallProcessingResult(_AgentRecallModel):
     processing_id: str
     operation_id: str
     access_policy_sha256: str
+    checkpoint_stream_id: str
+    situation_sha256: str
     frontier: AgentRecallFrontier
     processed_frontier: AgentRecallFrontier
     knowledge_event_count: int
@@ -403,6 +430,7 @@ class AgentRecallProcessingResult(_AgentRecallModel):
         "agent_id",
         "task_id",
         "knowledge_namespace",
+        "checkpoint_stream_id",
         "processing_id",
         "operation_id",
     )
@@ -410,15 +438,15 @@ class AgentRecallProcessingResult(_AgentRecallModel):
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_identity(value, info.field_name)
 
-    @field_validator("access_policy_sha256")
+    @field_validator("access_policy_sha256", "situation_sha256")
     @classmethod
-    def validate_access_policy_sha256(cls, value: str) -> str:
+    def validate_sha256(cls, value: str, info) -> str:
         if (
             type(value) is not str
             or len(value) != 64
             or any(character not in "0123456789abcdef" for character in value)
         ):
-            raise ValueError("`access_policy_sha256` must be a lowercase SHA-256 digest.")
+            raise ValueError(f"`{info.field_name}` must be a lowercase SHA-256 digest.")
         return value
 
     @field_validator("work_context_revision")
@@ -626,6 +654,7 @@ class AgentRecallProcessingResult(_AgentRecallModel):
                 or checkpoint.processing_id != self.processing_id
                 or checkpoint.operation_id != self.operation_id
                 or checkpoint.access_policy_sha256 != self.access_policy_sha256
+                or checkpoint.checkpoint_stream_id != self.checkpoint_stream_id
                 or checkpoint.knowledge_high_water_sequence != self.frontier.knowledge_sequence
                 or checkpoint.index_readiness_high_water_sequence
                 != self.frontier.index_readiness_sequence
@@ -795,6 +824,8 @@ class AgentRecallProcessor:
                 processing_id=request.processing_id,
                 operation_id=request.operation_id,
                 access_policy_sha256=knowledge_access_scope_sha256(scope),
+                checkpoint_stream_id=request.checkpoint_stream_id,
+                situation_sha256=agent_recall_situation_input_sha256(request.situation),
                 frontier=frontier,
                 processed_frontier=frontier,
                 knowledge_event_count=0,
@@ -927,6 +958,8 @@ class AgentRecallProcessor:
             processing_id=request.processing_id,
             operation_id=request.operation_id,
             access_policy_sha256=knowledge_access_scope_sha256(scope),
+            checkpoint_stream_id=request.checkpoint_stream_id,
+            situation_sha256=agent_recall_situation_input_sha256(request.situation),
             frontier=frontier,
             processed_frontier=processed_frontier,
             knowledge_event_count=knowledge_events,
@@ -1043,6 +1076,7 @@ class AgentRecallProcessor:
             task_id=request.work_context.task_id,
             knowledge_namespace=request.situation.knowledge_namespace,
             access_policy_sha256=knowledge_access_scope_sha256(scope),
+            checkpoint_stream_id=request.checkpoint_stream_id,
             revision=1 if checkpoint is None else checkpoint.revision + 1,
             work_context_revision=request.work_context.revision,
             work_context_sha256=request.work_context.content_sha256,

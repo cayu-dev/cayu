@@ -16,6 +16,7 @@ from statistics import median
 from typing import Any
 
 from cayu import (
+    DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     AgentRecallProcessingMode,
@@ -109,6 +110,7 @@ def _request(*, checkpoint, operation_id: str) -> AgentRecallProcessingRequest:
             knowledge_namespace=_NAMESPACE,
             current_time=_NOW,
         ),
+        checkpoint_stream_id=DEFAULT_AGENT_RECALL_CHECKPOINT_STREAM_ID,
         checkpoint=checkpoint,
         processing_id=f"processing:{operation_id}",
         operation_id=operation_id,

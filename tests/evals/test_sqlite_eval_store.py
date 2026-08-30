@@ -409,7 +409,9 @@ def test_sqlite_eval_store_requires_and_migrates_revision_seventy_two(
 
         connection = sqlite3.connect(path)
         try:
-            assert connection.execute("PRAGMA user_version").fetchone() == (72,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (
+                schema_migrations.LATEST_REVISION,
+            )
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
             foreign_tables = {
                 row[2]

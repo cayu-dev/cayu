@@ -483,6 +483,23 @@ def test_revision_seventy_two_raises_the_durable_corpus_concurrency_ceiling() ->
     m.validate(state, app_latest=72, app_min_supported=72)
 
 
+def test_revision_seventy_three_requires_input_bound_recall_results() -> None:
+    revision = m.revision(73)
+    state = m.SchemaState(revision=73, compatible_from=73)
+
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 73
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 73"):
+        m.validate(state, app_latest=72, app_min_supported=72)
+    m.validate(state, app_latest=73, app_min_supported=73)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 73"):
+        m.validate(
+            m.SchemaState(revision=72, compatible_from=72),
+            app_latest=73,
+            app_min_supported=73,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(
