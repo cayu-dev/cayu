@@ -23,12 +23,15 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocumentV2,
     EvalSuiteDraftV1,
     EvalSuiteDraftV2,
+    EvalSuiteDraftV3,
+    EvalSuiteTrialRequestDraftV3,
     PublicJudgeReferenceDraftV1,
     StructuredModelJudgeAssertionDraftV1,
     StructuredRubricDraftV1,
     add_eval_case,
     compile_eval_suite_draft,
     compile_eval_suite_draft_v2,
+    compile_eval_suite_draft_v3,
     duplicate_eval_case,
     eval_suite_document_from_json,
     eval_suite_document_to_json,
@@ -124,6 +127,33 @@ def test_tool_json_assertions_survive_authoring_round_trip_duplicate_and_revisio
     assert duplicated.cases[0].assertions == document.cases[0].assertions
     assert duplicated.cases[1].assertions == document.cases[0].assertions
     assert duplicated.cases[1].revision != document.cases[0].revision
+
+
+def test_v3_draft_compiles_revision_free_trial_settings_into_immutable_policy() -> None:
+    draft = EvalSuiteDraftV3(
+        id="reliable-refunds",
+        target_key="assistant.default",
+        name="Reliable refunds",
+        trial_request=EvalSuiteTrialRequestDraftV3(
+            trials=5,
+            minimum_passed_trials=4,
+            max_concurrency=2,
+            timeout_seconds=120,
+        ),
+        cases=(EvalCaseDraftV2.model_validate(_case().model_dump(mode="python")),),
+    )
+
+    document = compile_eval_suite_draft_v3(draft)
+    policy = document.suite.trial_request.trial_policy
+
+    assert document.schema_version == 3
+    assert document.suite.trial_request.trials == 5
+    assert policy is not None
+    assert policy.trial_count == 5
+    assert policy.minimum_passed_trials == 4
+    assert policy.max_concurrency == 2
+    assert EvalSuiteDraftV3.from_document(document) == draft
+    assert eval_suite_document_from_json(eval_suite_document_to_json(document)) == document
 
 
 def test_v2_structured_judge_draft_compiles_server_owned_nested_revisions_and_round_trips() -> None:

@@ -52,7 +52,7 @@ from cayu.evals.promotion import (
     CapturedRunScoreV1,
     PromotionCandidateV1,
 )
-from cayu.evals.result_presentation import EvalResultPresentationV1, present_eval_result
+from cayu.evals.result_presentation import EvalResultPresentationV2, present_eval_result
 from cayu.evals.results import CapturedEvaluationResultV1
 from cayu.evals.scenario import EvalScenarioDocumentV2
 from cayu.evals.scenario_authoring import EvalScenarioDraftV2
@@ -1315,7 +1315,7 @@ class EvalResultComparisonResponse(ApiBaseModel):
 class EvalResultResponse(ApiBaseModel):
     run: EvalRunRecord
     result: CorpusExecutionResult
-    presentation: EvalResultPresentationV1
+    presentation: EvalResultPresentationV2
     baseline: EvalBaselineRecord | None = None
 
     @model_validator(mode="after")
@@ -1905,7 +1905,7 @@ class EvalBaselineSelectionResponse(ApiBaseModel):
 class EvalResultDetailResponse(ApiBaseModel):
     record: EvalResultRecord
     result: CapturedEvaluationResultV1 | CorpusExecutionResult
-    presentation: EvalResultPresentationV1
+    presentation: EvalResultPresentationV2
     baseline: EvalBaselineRecord | None = None
 
     @model_validator(mode="after")

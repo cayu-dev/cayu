@@ -33,6 +33,7 @@ from cayu import (
     EvalRun,
     EvalStatus,
     EvalSuite,
+    EvalSuiteTrialPolicyV1,
     EvalTrialResult,
     Event,
     EventNotOccurred,
@@ -1720,6 +1721,15 @@ def test_run_eval_suite_rejects_invalid_concurrency_and_timeout():
         asyncio.run(run_eval_suite(app, suite, max_concurrency=0))
     with pytest.raises(TypeError, match="max_concurrency"):
         asyncio.run(run_eval_suite(app, suite, max_concurrency=True))
+    with pytest.raises(ValueError, match="exceeds its trial policy"):
+        asyncio.run(
+            run_eval_suite(
+                app,
+                suite,
+                max_concurrency=2,
+                trial_policy=EvalSuiteTrialPolicyV1.create(max_concurrency=1),
+            )
+        )
     with pytest.raises(ValueError, match="case_timeout_seconds"):
         asyncio.run(run_eval_suite(app, suite, case_timeout_seconds=0))
     with pytest.raises(TypeError, match="case_timeout_seconds"):
@@ -2105,7 +2115,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 9
+    assert EVAL_SCHEMA_VERSION == 10
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
     usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {

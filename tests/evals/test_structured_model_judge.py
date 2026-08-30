@@ -588,7 +588,7 @@ def test_structured_judge_comparison_reports_exact_criterion_and_aggregate_regre
     comparison = compare_corpus_execution_results(baseline, current)
     judgment = comparison.structured_judgments[0]
 
-    assert comparison.schema_version == 3
+    assert comparison.schema_version == 4
     assert comparison.structured_judge_comparison_state == "compared"
     assert judgment.case_id == "answer-case"
     assert judgment.trial_number == 1

@@ -22,6 +22,7 @@ from cayu.evals.execution_comparison import (
     CorpusExecutionComparison,
     CorpusExecutionRegression,
     CorpusRegressionKind,
+    CorpusReliabilityDistributionV1,
     EvalStructuredJudgeComparisonV1,
     EvalToolJsonAssertionComparisonV1,
 )
@@ -29,14 +30,15 @@ from cayu.evals.memory_attribution import eval_memory_attribution_summary
 from cayu.evals.result_presentation import (
     EVAL_RESULT_REPORT_MAX_BYTES,
     EvalAssertionPresentationV1,
-    EvalCasePresentationV1,
+    EvalCasePresentationV2,
     EvalResultOutcomeDimensionsV1,
-    EvalResultReportV1,
+    EvalResultReportV2,
     EvalStructuredJudgePresentationV1,
     EvalTrialPresentationV1,
     present_eval_result,
 )
 from cayu.evals.results import CapturedEvaluationResultV1
+from cayu.evals.trial_policy import EvalMaximumCostExposureV1
 
 CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES = 48 << 20
 CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES = 48 << 20
@@ -109,7 +111,7 @@ def eval_result_report_to_json(
         raise TypeError(
             "result must be an exact CorpusExecutionResult or CapturedEvaluationResultV1."
         )
-    report = EvalResultReportV1(
+    report = EvalResultReportV2(
         result=result,
         presentation=present_eval_result(result),
     )
@@ -269,6 +271,26 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
         _case_section(case, presented_case)
         for case, presented_case in zip(run.cases, presentation.cases, strict=True)
     )
+    policy = presentation.trial_policy
+    exposure = presentation.accepted_exposure
+    exposure_html = ""
+    if exposure is not None:
+        exposure_html = (
+            "<p>Accepted maximum work: "
+            f"{exposure.candidate_trials} candidate trial(s), "
+            f"{exposure.maximum_candidate_model_steps} candidate model step(s), "
+            f"{_optional_maximum(exposure.maximum_candidate_total_tokens)} candidate token(s); "
+            f"{exposure.judge_evaluations} judge evaluation(s), concurrency "
+            f"{exposure.max_concurrency}, "
+            f"{_optional_maximum(exposure.maximum_judge_input_tokens)}/"
+            f"{_optional_maximum(exposure.maximum_judge_output_tokens)}/"
+            f"{_optional_maximum(exposure.maximum_judge_total_tokens)} judge "
+            "input/output/total token maximum(s). "
+            "Candidate cost "
+            f"{_maximum_cost_text(exposure.candidate_cost)}; judge cost "
+            f"{_maximum_cost_text(exposure.judge_cost)}. Revision "
+            f"<code>{_escape(exposure.revision)}</code></p>"
+        )
     rendered = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -318,6 +340,8 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
       <p>Application release <code>{_escape(result.target.application_release_id)}</code></p>
       <p>AppManifest schema <code>{_escape(result.target.app_manifest_schema_version)}</code> · fingerprint <code>{_escape(result.target.app_manifest_fingerprint)}</code></p>
       <p>Corpus <code>{_escape(run.corpus_revision)}</code> · suite <code>{_escape(run.suite_revision)}</code> · evidence policy <code>{_escape(run.evidence_policy_revision)}</code></p>
+      <p>Trial policy: {policy.minimum_passed_trials} of {policy.trial_count} must pass · maximum concurrency {policy.max_concurrency} · revision <code>{_escape(policy.revision)}</code>. Runtime errors, evaluator errors, unavailable required evidence, and cancellations fail closed.</p>
+      {exposure_html}
     </section>
     <h2>Cases</h2>
     <table>
@@ -507,13 +531,16 @@ def render_corpus_execution_comparison_html(
         f"<td><code>{_escape(case.case_id)}</code></td>"
         f"<td>{_badge(case.baseline_status)}</td>"
         f"<td>{_badge(case.current_status)}</td>"
+        f"<td>{_escape(_reliability_distribution(case.baseline_reliability))}</td>"
+        f"<td>{_escape(_reliability_distribution(case.current_reliability))}</td>"
+        f"<td>{_escape(case.reliability_change)}</td>"
         f"<td>{_score(case.baseline_score)} → {_score(case.current_score)}</td>"
         "</tr>"
         for case in comparison.cases
     )
     if not case_rows:
         case_rows = (
-            '<tr><td colspan="4">Case outcomes are omitted for incomparable results.</td></tr>'
+            '<tr><td colspan="7">Case outcomes are omitted for incomparable results.</td></tr>'
         )
     structured_comparison = _structured_comparison_html(comparison)
     tool_json_comparison = _tool_json_comparison_html(comparison)
@@ -556,11 +583,13 @@ def render_corpus_execution_comparison_html(
     <section class="notice">
       <p>Target <code>{_escape(comparison.baseline.target_key)}</code> · corpus <code>{_escape(comparison.baseline.corpus_revision)}</code> · suite <code>{_escape(comparison.baseline.suite_id)}</code> at <code>{_escape(comparison.baseline.suite_revision)}</code></p>
       <p>Evidence policy <code>{_escape(comparison.baseline.evidence_policy_revision)}</code> · pricing profile <code>{_escape(comparison.baseline.pricing_profile_fingerprint or "not used")}</code> · external target <code>{_escape(comparison.baseline.external_target_revision or "not used")}</code></p>
+      <p>Baseline trial policy <code>{_escape(comparison.baseline.trial_policy_revision)}</code> · accepted exposure <code>{_escape(comparison.baseline.accepted_exposure_revision or "not applicable")}</code> · exposure comparison contract <code>{_escape(comparison.baseline.accepted_exposure_comparison_revision or "not applicable")}</code></p>
+      <p>Current trial policy <code>{_escape(comparison.current.trial_policy_revision)}</code> · accepted exposure <code>{_escape(comparison.current.accepted_exposure_revision or "not applicable")}</code> · exposure comparison contract <code>{_escape(comparison.current.accepted_exposure_comparison_revision or "not applicable")}</code></p>
     </section>
     <h2>Regressions</h2>
     <table><thead><tr><th>Scope</th><th>Case</th><th>Kind</th><th>Change</th></tr></thead><tbody>{regression_rows}</tbody></table>
     <h2>Cases</h2>
-    <table><thead><tr><th>Case</th><th>Baseline</th><th>Current</th><th>Score</th></tr></thead><tbody>{case_rows}</tbody></table>
+    <table><thead><tr><th>Case</th><th>Baseline</th><th>Current</th><th>Baseline trials</th><th>Current trials</th><th>Reliability</th><th>Score</th></tr></thead><tbody>{case_rows}</tbody></table>
     {structured_comparison}
     {tool_json_comparison}
   </main>
@@ -795,7 +824,7 @@ def write_corpus_execution_html(
     Path(path).write_text(render_corpus_execution_html(result), encoding="utf-8")
 
 
-def _case_section(case: Any, presentation: EvalCasePresentationV1) -> str:
+def _case_section(case: Any, presentation: EvalCasePresentationV2) -> str:
     trials = "\n".join(
         _trial_section(trial, presented_trial)
         for trial, presented_trial in zip(case.trials, presentation.trials, strict=True)
@@ -804,8 +833,37 @@ def _case_section(case: Any, presentation: EvalCasePresentationV1) -> str:
         f'<section class="case"><h3>Case <code>{_escape(case.case_id)}</code> '
         f"{_badge(case.status)}</h3>"
         f"<p>Revision <code>{_escape(case.case_revision)}</code> · score {_score(case.score)} · "
-        f"{case.duration_ms} ms across {len(case.trials)} trial(s)</p>{trials}</section>"
+        f"{case.duration_ms} ms across {len(case.trials)} trial(s)</p>"
+        f"<p>Reliability: {presentation.reliability.passed_trials}/"
+        f"{presentation.reliability.total_trials} passed · "
+        f"{presentation.reliability.candidate_failed_trials} candidate failure(s) · "
+        f"{presentation.reliability.runtime_error_trials} runtime error(s) · "
+        f"{presentation.reliability.evaluator_error_trials} evaluator error(s) · "
+        f"{presentation.reliability.unavailable_trials} unavailable trial(s) · "
+        f"{presentation.reliability.cancelled_trials} cancelled trial(s) · "
+        f"score min/mean/max {_reliability_score_text(presentation.reliability.minimum_score)}/"
+        f"{_reliability_score_text(presentation.reliability.mean_score)}/"
+        f"{_reliability_score_text(presentation.reliability.maximum_score)} across "
+        f"{presentation.reliability.scored_trials} scored trial(s) · "
+        f"variability <code>{_escape(presentation.reliability.variability)}</code></p>"
+        f"{trials}</section>"
     )
+
+
+def _maximum_cost_text(exposure: EvalMaximumCostExposureV1) -> str:
+    if exposure.state == "not_applicable":
+        return "not applicable"
+    if exposure.state == "unavailable":
+        return f"unavailable ({exposure.unavailable_reason})"
+    return " + ".join(f"{item.amount} {item.currency}" for item in exposure.totals)
+
+
+def _optional_maximum(value: int | None) -> str:
+    return "unavailable maximum" if value is None else str(value)
+
+
+def _reliability_score_text(value: float | None) -> str:
+    return "unavailable" if value is None else f"{value:.3f}"
 
 
 def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
@@ -861,6 +919,36 @@ def _assertion_row(
 ) -> str:
     if presentation.structured_judge is not None:
         detail = _structured_judge_html(presentation.structured_judge)
+    elif presentation.model_judge is not None:
+        judge = presentation.model_judge
+        profile = judge.judge_profile
+        usage = judge.usage
+        cost = judge.cost
+        usage_text = (
+            "unavailable"
+            if usage is None
+            else (
+                f"{usage.model_steps} model step(s), {usage.input_tokens} input, "
+                f"{usage.output_tokens} output, {usage.total_tokens} total token(s)"
+            )
+        )
+        cost_text = "unavailable (not observed)"
+        if cost is not None and cost.availability == "unavailable":
+            cost_text = "unavailable (unpriced)"
+        elif cost is not None:
+            cost_text = f"{cost.estimated_cost} {cost.currency}"
+        detail = (
+            '<section class="judge">'
+            f"<p><strong>{_escape(profile.label)}</strong> · profile "
+            f"<code>{_escape(profile.key)}</code> at "
+            f"<code>{_escape(profile.revision)}</code> · provider/model "
+            f"<code>{_escape(profile.provider_name)}/{_escape(profile.model)}</code></p>"
+            f"<p>Evaluator <code>{_escape(judge.diagnostic)}</code> · route "
+            f"<code>{_escape(judge.candidate_route_relation)}</code> · threshold "
+            f"<code>{_escape(judge.threshold)}</code></p>"
+            f"<p>Observed usage: {_escape(usage_text)} · observed cost: "
+            f"{_escape(cost_text)}</p></section>"
+        )
     else:
         public_detail = json.dumps(
             assertion.detail.model_dump(mode="json"),
@@ -985,6 +1073,17 @@ def _score(score: float | None) -> str:
     return "unavailable" if score is None else f"{score:.2f}"
 
 
+def _reliability_distribution(distribution: CorpusReliabilityDistributionV1) -> str:
+    return (
+        f"{distribution.passed_trials} passed, "
+        f"{distribution.candidate_failed_trials} candidate failed, "
+        f"{distribution.runtime_error_trials} runtime error, "
+        f"{distribution.evaluator_error_trials} evaluator error, "
+        f"{distribution.unavailable_trials} unavailable, "
+        f"{distribution.cancelled_trials} cancelled"
+    )
+
+
 def _regression_change(regression: CorpusExecutionRegression) -> str:
     if regression.kind is CorpusRegressionKind.STATUS:
         baseline_status = regression.baseline_status
@@ -998,6 +1097,15 @@ def _regression_change(regression: CorpusExecutionRegression) -> str:
         if baseline_score is None or current_score is None:
             raise ValueError("Score regression is missing its score pair.")
         return f"{baseline_score:.2f} → {current_score:.2f}"
+    if regression.kind is CorpusRegressionKind.RELIABILITY:
+        baseline_reliability = regression.baseline_reliability
+        current_reliability = regression.current_reliability
+        if baseline_reliability is None or current_reliability is None:
+            raise ValueError("Reliability regression is missing its distribution pair.")
+        return (
+            f"{_reliability_distribution(baseline_reliability)} → "
+            f"{_reliability_distribution(current_reliability)}"
+        )
     raise ValueError(f"Unsupported regression kind {regression.kind!r}.")
 
 

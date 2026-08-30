@@ -7,7 +7,7 @@ from decimal import Decimal
 from functools import partial
 from typing import Annotated, Any, Literal, Protocol, TypeAlias, cast, overload
 
-from pydantic import Field, StrictStr, field_validator, model_validator
+from pydantic import Field, StrictInt, StrictStr, field_validator, model_validator
 
 from cayu._validation import (
     durable_json_object_from_pairs,
@@ -24,6 +24,8 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS,
+    EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
+    EVAL_CORPUS_MAX_TRIALS,
     ArtifactAssertionSpec,
     ChildStatusAssertionSpec,
     EvalJudgeEvidenceSelectionV1,
@@ -67,9 +69,11 @@ from cayu.evals.corpus import (
     _unit_interval_decimal_text,
     _validated_assertion_spec,
 )
+from cayu.evals.trial_policy import EVAL_SUITE_MAX_CONCURRENCY, EvalSuiteTrialPolicyV1
 
 EVAL_SUITE_AUTHORING_SCHEMA_VERSION = 1
 EVAL_SUITE_AUTHORING_V2_SCHEMA_VERSION = 2
+EVAL_SUITE_AUTHORING_V3_SCHEMA_VERSION = 3
 EVAL_SUITE_SELECTION_SCHEMA_VERSION = 1
 EVAL_SUITE_AUTHORING_MAX_BYTES = EVAL_CORPUS_MAX_BYTES
 
@@ -839,6 +843,136 @@ class EvalSuiteDraftV2(_PortableModel):
         )
 
 
+class EvalSuiteTrialRequestDraftV3(_PortableModel):
+    """Revision-free trial settings edited by SDK and Control Plane clients."""
+
+    trials: StrictInt = Field(default=1, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    timeout_seconds: StrictInt = Field(default=300, ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    minimum_passed_trials: StrictInt = Field(default=1, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    max_concurrency: StrictInt = Field(default=1, ge=1, le=EVAL_SUITE_MAX_CONCURRENCY)
+
+    @model_validator(mode="after")
+    def validate_policy_bounds(self) -> EvalSuiteTrialRequestDraftV3:
+        if self.minimum_passed_trials > self.trials:
+            raise ValueError("minimum_passed_trials cannot exceed trials.")
+        return self
+
+    @classmethod
+    def from_request(cls, request: TrialRequestSpec) -> EvalSuiteTrialRequestDraftV3:
+        if type(request) is not TrialRequestSpec:
+            raise TypeError("request must be an exact TrialRequestSpec.")
+        policy = request.trial_policy or EvalSuiteTrialPolicyV1.create(trial_count=request.trials)
+        return cls(
+            trials=request.trials,
+            timeout_seconds=request.timeout_seconds,
+            minimum_passed_trials=policy.minimum_passed_trials,
+            max_concurrency=policy.max_concurrency,
+        )
+
+
+class EvalSuiteDraftV3(_PortableModel):
+    """V3 editor material with revision-free suite trial settings."""
+
+    schema_version: Literal[3] = EVAL_SUITE_AUTHORING_V3_SCHEMA_VERSION
+    id: StrictStr
+    target_key: StrictStr
+    name: StrictStr
+    description: StrictStr | None = None
+    trial_request: EvalSuiteTrialRequestDraftV3 = Field(
+        default_factory=EvalSuiteTrialRequestDraftV3
+    )
+    cases: tuple[EvalCaseDraftV2, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 3.")
+        return value
+
+    @field_validator("id", "target_key")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=2_048,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def validate_cases_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @field_validator("trial_request")
+    @classmethod
+    def validate_trial_request(
+        cls,
+        value: EvalSuiteTrialRequestDraftV3,
+    ) -> EvalSuiteTrialRequestDraftV3:
+        if type(value) is not EvalSuiteTrialRequestDraftV3:
+            raise TypeError("trial_request must be an exact EvalSuiteTrialRequestDraftV3.")
+        return EvalSuiteTrialRequestDraftV3.model_validate(_model_python_input(value))
+
+    @field_validator("cases")
+    @classmethod
+    def validate_cases(
+        cls,
+        value: tuple[EvalCaseDraftV2, ...],
+    ) -> tuple[EvalCaseDraftV2, ...]:
+        if any(type(case) is not EvalCaseDraftV2 for case in value):
+            raise TypeError("cases must contain exact EvalCaseDraftV2 values.")
+        return tuple(EvalCaseDraftV2.model_validate(_model_python_input(case)) for case in value)
+
+    @model_validator(mode="after")
+    def validate_case_ids(self) -> EvalSuiteDraftV3:
+        ids = tuple(case.id for case in self.cases)
+        duplicates = sorted(item for item, count in Counter(ids).items() if count > 1)
+        if duplicates:
+            raise ValueError(
+                "Authored eval case IDs must be unique; duplicated: " + ", ".join(duplicates)
+            )
+        return self
+
+    @classmethod
+    def from_document(
+        cls,
+        document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3,
+    ) -> EvalSuiteDraftV3:
+        validated = _validated_eval_suite_document(document)
+        return cls(
+            id=validated.suite.id,
+            target_key=validated.target_key,
+            name=validated.suite.name,
+            description=validated.suite.description,
+            trial_request=EvalSuiteTrialRequestDraftV3.from_request(validated.suite.trial_request),
+            cases=tuple(EvalCaseDraftV2.from_case(case) for case in validated.cases),
+        )
+
+
 class EvalSuiteDocumentV1(_SchemaV1PortableModel):
     """One immutable, authority-free authored suite and its exact case revisions."""
 
@@ -969,8 +1103,28 @@ class EvalSuiteDocumentV2(_PortableModel):
         return self
 
 
-EvalSuiteDocument: TypeAlias = EvalSuiteDocumentV1 | EvalSuiteDocumentV2
-EvalSuiteDraft: TypeAlias = EvalSuiteDraftV1 | EvalSuiteDraftV2
+class EvalSuiteDocumentV3(EvalSuiteDocumentV2):
+    """Immutable V3 suite with an explicit revisioned trial decision policy."""
+
+    schema_version: Literal[3] = EVAL_SUITE_AUTHORING_V3_SCHEMA_VERSION
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 3.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_v3_contract(self) -> EvalSuiteDocumentV3:
+        if self.suite.trial_request.trial_policy is None:
+            raise ValueError("V3 authored suites require an explicit suite trial policy.")
+        _validate_eval_suite_document_contract(self)
+        return self
+
+
+EvalSuiteDocument: TypeAlias = EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3
+EvalSuiteDraft: TypeAlias = EvalSuiteDraftV1 | EvalSuiteDraftV2 | EvalSuiteDraftV3
 EvalCaseDefinition: TypeAlias = EvalCaseDefinitionV1 | EvalCaseDefinitionV2
 
 
@@ -1025,6 +1179,8 @@ def _validated_eval_suite_document(document: EvalSuiteDocument) -> EvalSuiteDocu
         return EvalSuiteDocumentV1.model_validate(_model_python_input(document))
     if type(document) is EvalSuiteDocumentV2:
         return EvalSuiteDocumentV2.model_validate(_model_python_input(document))
+    if type(document) is EvalSuiteDocumentV3:
+        return EvalSuiteDocumentV3.model_validate(_model_python_input(document))
     raise TypeError("document must be an exact authored eval suite document.")
 
 
@@ -1039,6 +1195,7 @@ def compile_eval_suite_draft(draft: EvalSuiteDraftV1) -> EvalSuiteDocumentV1:
         name=validated.name,
         description=validated.description,
         trial_request=validated.trial_request,
+        _preserve_missing_trial_policy=True,
     )
     cases = tuple(
         sorted(
@@ -1069,6 +1226,7 @@ def compile_eval_suite_draft_v2(draft: EvalSuiteDraftV2) -> EvalSuiteDocumentV2:
         name=validated.name,
         description=validated.description,
         trial_request=validated.trial_request,
+        _preserve_missing_trial_policy=True,
     )
     cases = tuple(
         sorted(
@@ -1088,6 +1246,46 @@ def compile_eval_suite_draft_v2(draft: EvalSuiteDraftV2) -> EvalSuiteDocumentV2:
     )
 
 
+def compile_eval_suite_draft_v3(draft: EvalSuiteDraftV3) -> EvalSuiteDocumentV3:
+    """Canonicalize V3 material with its explicit suite trial policy."""
+
+    if type(draft) is not EvalSuiteDraftV3:
+        raise TypeError("draft must be an exact EvalSuiteDraftV3.")
+    validated = EvalSuiteDraftV3.model_validate(_model_python_input(draft))
+    policy = EvalSuiteTrialPolicyV1.create(
+        trial_count=validated.trial_request.trials,
+        minimum_passed_trials=validated.trial_request.minimum_passed_trials,
+        max_concurrency=validated.trial_request.max_concurrency,
+    )
+    trial_request = TrialRequestSpec(
+        trials=validated.trial_request.trials,
+        timeout_seconds=validated.trial_request.timeout_seconds,
+        trial_policy=policy,
+    )
+    suite = EvalSuiteSpec.create(
+        id=validated.id,
+        name=validated.name,
+        description=validated.description,
+        trial_request=trial_request,
+    )
+    cases = tuple(
+        sorted(
+            (EvalCaseDefinitionV2.create(case) for case in validated.cases),
+            key=lambda case: case.id,
+        )
+    )
+    document: dict[str, Any] = {
+        "schema_version": EVAL_SUITE_AUTHORING_V3_SCHEMA_VERSION,
+        "target_key": validated.target_key,
+        "suite": suite.model_dump(mode="json"),
+        "cases": [case.model_dump(mode="json") for case in cases],
+    }
+    return EvalSuiteDocumentV3(
+        revision=_content_revision(document, "authored eval suite"),
+        **document,
+    )
+
+
 def compile_eval_suite_authoring_draft(draft: EvalSuiteDraft) -> EvalSuiteDocument:
     """Compile the exact draft wire version selected by the caller."""
 
@@ -1095,6 +1293,8 @@ def compile_eval_suite_authoring_draft(draft: EvalSuiteDraft) -> EvalSuiteDocume
         return compile_eval_suite_draft(draft)
     if type(draft) is EvalSuiteDraftV2:
         return compile_eval_suite_draft_v2(draft)
+    if type(draft) is EvalSuiteDraftV3:
+        return compile_eval_suite_draft_v3(draft)
     raise TypeError("draft must be an exact authored eval suite draft.")
 
 
@@ -1110,6 +1310,13 @@ def validate_expected_eval_suite_revision(
     document: EvalSuiteDocumentV2,
     expected_revision: str,
 ) -> EvalSuiteDocumentV2: ...
+
+
+@overload
+def validate_expected_eval_suite_revision(
+    document: EvalSuiteDocumentV3,
+    expected_revision: str,
+) -> EvalSuiteDocumentV3: ...
 
 
 def validate_expected_eval_suite_revision(
@@ -1414,6 +1621,8 @@ def eval_suite_document_from_json(source: str) -> EvalSuiteDocument:
         return EvalSuiteDocumentV1.model_validate(decoded)
     if schema_version == 2:
         return EvalSuiteDocumentV2.model_validate(decoded)
+    if schema_version == 3:
+        return EvalSuiteDocumentV3.model_validate(decoded)
     raise ValueError("Unsupported authored eval suite schema version.")
 
 
@@ -1432,9 +1641,12 @@ __all__ = [
     "EvalSimpleInputStimulusV1",
     "EvalSuiteDocumentV1",
     "EvalSuiteDocumentV2",
+    "EvalSuiteDocumentV3",
     "EvalSuiteDraftV1",
     "EvalSuiteDraftV2",
+    "EvalSuiteDraftV3",
     "EvalSuiteSelectionV1",
+    "EvalSuiteTrialRequestDraftV3",
     "PublicJudgeReferenceDraftV1",
     "StructuredModelJudgeAssertionDraftV1",
     "StructuredRubricDraftV1",
@@ -1442,6 +1654,7 @@ __all__ = [
     "compile_eval_suite_authoring_draft",
     "compile_eval_suite_draft",
     "compile_eval_suite_draft_v2",
+    "compile_eval_suite_draft_v3",
     "duplicate_eval_case",
     "eval_suite_document_from_json",
     "eval_suite_document_to_json",

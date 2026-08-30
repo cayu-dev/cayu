@@ -52,13 +52,14 @@ from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_runtime_source,
 )
 from cayu.evals.corpus import (
-    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
+    _MODEL_JUDGE_RESULT_METADATA_KEY,
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
     EvalSuiteSpec,
     EvaluationEvidencePolicySpec,
     EvaluationSourceIdentityV1,
+    JudgeProfileIdentityV1,
     ModelJudgeAssertionSpec,
     RunInputSpec,
     TrialRequestSpec,
@@ -208,6 +209,50 @@ async def _report_fixture(
         )
         for role in _ROLES
     )
+
+    def model_judge_record(implementation_revision: str, *, recorded: bool) -> dict[str, object]:
+        profile_document = {
+            "schema_version": 1,
+            "key": "memory-evaluator",
+            "label": "Memory evaluator",
+            "provider_name": "scripted",
+            "model": "memory-judge",
+            "implementation_revision": implementation_revision,
+            "allowed_evidence": ["final_output"],
+            "timeout_seconds": 60,
+            "max_input_tokens": 1_000,
+            "max_output_tokens": 1_000,
+            "max_total_tokens": 2_000,
+            "max_estimated_cost": None,
+            "cost_currency": None,
+            "pricing_profile_fingerprint": None,
+            "privacy_policy_key": "public-only",
+            "privacy_policy_revision": "sha256:" + "d" * 64,
+            "same_model_use": "forbidden",
+        }
+        profile = JudgeProfileIdentityV1(
+            revision=_eval_content_revision(profile_document, "judge profile identity"),
+            **profile_document,
+        )
+        accounting = (
+            {
+                "usage": {
+                    "model_steps": 1,
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                },
+                "cost": {"availability": "unavailable"},
+            }
+            if recorded
+            else {}
+        )
+        return {
+            "judge_profile": profile.model_dump(mode="json"),
+            "candidate_route_relation": "independent_model",
+            **accounting,
+        }
+
     case = EvalCaseSpec.create(
         id=_CASE_ID,
         suite_id=suite.id,
@@ -410,10 +455,13 @@ async def _report_fixture(
                         score=None if unavailable else score,
                         threshold=0.5,
                         metadata={
-                            _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY: (
-                                candidate_evaluator_revision
-                                if variant.variant_id == "candidate"
-                                else "sha256:" + "b" * 64
+                            _MODEL_JUDGE_RESULT_METADATA_KEY: model_judge_record(
+                                (
+                                    candidate_evaluator_revision
+                                    if variant.variant_id == "candidate"
+                                    else "sha256:" + "b" * 64
+                                ),
+                                recorded=not unavailable,
                             )
                         },
                     )

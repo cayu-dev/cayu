@@ -41,6 +41,7 @@ from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 
 EVAL_EXECUTION_PROFILE_MAX_TEXT_CHARS = 256
 _EVAL_EXECUTION_PROFILE_REVISION_DOMAIN = "eval_execution_profile_v1"
+_EVAL_EXECUTION_PROFILE_COMPARISON_DOMAIN = "eval_execution_profile_comparison_v1"
 _EVAL_EXECUTION_TARGET_MATERIAL_DOMAIN = b"cayu-eval-execution-target-material-v1\0"
 _EVAL_EXECUTION_TARGET_PROCESS_SCOPE_DOMAIN = b"cayu-eval-execution-target-process-scope-v1\0"
 
@@ -301,6 +302,32 @@ class EvalExecutionProfileV1(BaseModel):
         if self.revision != expected:
             raise ValueError("Eval execution profile revision does not match its content.")
         return self
+
+    @property
+    def comparison_revision(self) -> str:
+        """Return the execution-semantic identity used between application releases.
+
+        Admission must use ``revision``, which binds every published byte. Result
+        comparison deliberately excludes release and presentation metadata while
+        retaining the complete candidate, runtime, target-material, isolation,
+        evidence, and resource contract.
+        """
+
+        validated = EvalExecutionProfileV1.model_validate(
+            self.model_dump(mode="python", round_trip=True, warnings="none")
+        )
+        material = validated.model_dump(
+            mode="json",
+            exclude={
+                "revision",
+                "profile_id",
+                "label",
+                "source",
+                "application_release_id",
+                "app_manifest_fingerprint",
+            },
+        )
+        return _revision(material, _EVAL_EXECUTION_PROFILE_COMPARISON_DOMAIN)
 
     @classmethod
     def create(

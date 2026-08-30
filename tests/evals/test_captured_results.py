@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import ValidationError
 from tests.evals.eval_store_conformance import captured_result_for_corpus
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.execution_comparison import (
+    CorpusComparisonReason,
     compare_corpus_execution_results,
     compare_eval_results,
     eval_result_compatibility,
 )
 from cayu.evals.execution_reporting import render_captured_evaluation_html
 from cayu.evals.results import (
+    EVAL_RESULT_PROJECTION_SCHEMA_VERSION,
     CapturedEvaluationResultV1,
     EvalResultOrigin,
     EvalResultTargetIdentityV1,
@@ -50,6 +53,10 @@ def test_captured_and_fresh_results_share_one_comparison_projection() -> None:
     fresh_projection = eval_result_projection(fresh)
     assert captured_projection.origin is EvalResultOrigin.CAPTURED_SESSION
     assert fresh_projection.origin is EvalResultOrigin.FRESH_EXECUTION
+    assert EVAL_RESULT_PROJECTION_SCHEMA_VERSION == 2
+    assert captured_projection.schema_version == 2
+    assert fresh_projection.schema_version == 2
+    assert fresh_projection.trial_policy_revision == fresh.run.trial_policy.revision
     assert captured_projection.target.application_release_id == "captured-release"
     assert fresh_projection.target.application_release_id == "release-2026-08-06"
     assert captured.score.memory_attribution == (fresh.run.cases[0].trials[0].memory_attribution)
@@ -70,6 +77,86 @@ def test_captured_and_fresh_results_share_one_comparison_projection() -> None:
     assert comparison.regressions == ()
     with pytest.raises(TypeError, match="baseline must be an exact CorpusExecutionResult"):
         compare_corpus_execution_results(captured, fresh)  # type: ignore[arg-type]
+
+
+def test_comparison_distinguishes_trial_policy_and_accepted_exposure_contract() -> None:
+    corpus = _corpus(trials=1)
+    fresh = asyncio.run(
+        run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+    )
+    projection = eval_result_projection(fresh)
+
+    policy_changed = projection.model_copy(update={"trial_policy_revision": "sha256:" + "d" * 64})
+    policy_compatibility = eval_result_compatibility(projection, policy_changed)
+    assert policy_compatibility.comparable is False
+    assert policy_compatibility.reasons == (CorpusComparisonReason.TRIAL_POLICY_REVISION_MISMATCH,)
+
+    baseline_exposure = projection.model_copy(
+        update={
+            "accepted_exposure_revision": "sha256:" + "e" * 64,
+            "accepted_exposure_comparison_revision": "sha256:" + "a" * 64,
+        }
+    )
+    release_changed_exposure = projection.model_copy(
+        update={
+            "accepted_exposure_revision": "sha256:" + "f" * 64,
+            "accepted_exposure_comparison_revision": "sha256:" + "a" * 64,
+        }
+    )
+    release_compatibility = eval_result_compatibility(
+        baseline_exposure,
+        release_changed_exposure,
+    )
+    assert release_compatibility.comparable is True
+    assert release_compatibility.reasons == ()
+    release_comparison = compare_eval_results(baseline_exposure, release_changed_exposure)
+    assert release_comparison.baseline.accepted_exposure_revision != (
+        release_comparison.current.accepted_exposure_revision
+    )
+    assert release_comparison.baseline.accepted_exposure_comparison_revision == (
+        release_comparison.current.accepted_exposure_comparison_revision
+    )
+
+    contract_changed_exposure = release_changed_exposure.model_copy(
+        update={"accepted_exposure_comparison_revision": "sha256:" + "b" * 64}
+    )
+    exposure_compatibility = eval_result_compatibility(
+        baseline_exposure,
+        contract_changed_exposure,
+    )
+    assert exposure_compatibility.comparable is False
+    assert exposure_compatibility.reasons == (
+        CorpusComparisonReason.ACCEPTED_EXPOSURE_CONTRACT_MISMATCH,
+    )
+
+    missing_exposure_compatibility = eval_result_compatibility(
+        baseline_exposure,
+        projection,
+    )
+    assert missing_exposure_compatibility.comparable is False
+    assert missing_exposure_compatibility.reasons == (
+        CorpusComparisonReason.ACCEPTED_EXPOSURE_CONTRACT_MISMATCH,
+    )
+
+    captured = captured_result_for_corpus(corpus, fresh)
+    captured_projection = eval_result_projection(captured)
+    cross_origin_compatibility = eval_result_compatibility(
+        captured_projection,
+        baseline_exposure,
+    )
+    assert CorpusComparisonReason.ACCEPTED_EXPOSURE_CONTRACT_MISMATCH not in (
+        cross_origin_compatibility.reasons
+    )
+    forged_captured_projection = captured_projection.model_dump(mode="python")
+    forged_captured_projection["accepted_exposure_revision"] = "sha256:" + "a" * 64
+    forged_captured_projection["accepted_exposure_comparison_revision"] = "sha256:" + "b" * 64
+    with pytest.raises(ValidationError, match="cannot carry accepted work exposure"):
+        type(captured_projection).model_validate(forged_captured_projection)
 
 
 def test_captured_result_rejects_corpus_and_source_drift() -> None:

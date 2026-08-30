@@ -19,6 +19,7 @@ from cayu import (
     EvalRun,
     EvalStatus,
     EvalSuite,
+    EvalSuiteTrialPolicyV1,
     EvalTrialResult,
     Event,
     EventType,
@@ -482,6 +483,33 @@ def test_case_aggregation_precedence_is_error_unavailable_failed_passed():
     assert unavailable.score is None
     assert errored.status == EvalStatus.ERROR
     assert errored.score is None
+
+
+def test_case_aggregation_uses_explicit_minimum_pass_threshold() -> None:
+    policy = EvalSuiteTrialPolicyV1.create(
+        trial_count=3,
+        minimum_passed_trials=2,
+        max_concurrency=2,
+    )
+
+    result = EvalCaseResult.from_trials(
+        case_id="case",
+        trials=(
+            _trial(1, EvalStatus.PASSED),
+            _trial(2, EvalStatus.FAILED),
+            _trial(3, EvalStatus.PASSED),
+        ),
+        trial_policy=policy,
+    )
+
+    assert result.status is EvalStatus.PASSED
+    assert result.score == pytest.approx(2 / 3)
+    assert result.trial_policy == policy
+    assert result.assertions[0].outcome is EvalOutcome.PASSED
+    assert result.assertions[0].score == pytest.approx(2 / 3)
+    assert result.assertions[0].threshold == pytest.approx(2 / 3)
+    assert result.assertions[0].metadata["trial_threshold"] is None
+    assert result.assertions[0].metadata["mean_trial_score"] == pytest.approx(2 / 3)
 
 
 def test_case_model_rejects_forged_aggregate_fields():

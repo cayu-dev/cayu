@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from cayu.artifacts import ArtifactScope
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
-    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
+    _MODEL_JUDGE_RESULT_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
     ArtifactAssertionSpec,
@@ -63,7 +63,7 @@ from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.manifest import AppManifest
 
-MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 1
+MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 2
 
 _ROOT_TERMINAL_PROCESS_EVENTS = frozenset(
     {
@@ -412,6 +412,18 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
         )
         if validated_spec.evaluator_key != binding.key:
             raise ValueError("Portable model judge key does not match its trusted evaluator.")
+        profile = binding.profile
+        policy = binding.privacy_policy
+        if profile is None or policy is None or binding.structured_app is None:
+            raise ValueError("Portable model judges require a complete trusted profile.")
+        if validated_spec.include_transcript and not policy.allow_transcript:
+            raise ValueError("Judge profile does not permit transcript evidence.")
+        if binding.candidate_route_relation == "same_model" and (
+            profile.same_model_use != "allowed_and_labeled"
+        ):
+            raise ValueError(
+                "Model judge uses the candidate model but its profile forbids that route."
+            )
         object.__setattr__(self, "_spec", validated_spec)
         object.__setattr__(self, "_binding", binding)
         object.__setattr__(self, "_app", app)
@@ -425,13 +437,20 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
             self,
             "_judge",
             LLMJudge(
-                binding.app,
+                binding.structured_app,
                 agent_name=binding.agent_name,
                 rubric=validated_spec.rubric,
                 rubric_version=validated_spec.rubric_version,
                 threshold=validated_spec.threshold,
                 include_transcript=validated_spec.include_transcript,
                 name=validated_spec.id,
+                timeout_seconds=profile.timeout_seconds,
+                max_input_tokens=profile.max_input_tokens,
+                max_output_tokens=profile.max_output_tokens,
+                max_total_tokens=profile.max_total_tokens,
+                max_estimated_cost=profile.max_estimated_cost,
+                cost_currency=profile.cost_currency,
+                price_book=binding.price_book,
             ),
         )
 
@@ -446,19 +465,25 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
     def assertion_revision(self) -> str:
         return self._assertion_revision
 
-    def _with_resolved_implementation_revision(
+    def _with_public_contract(
         self,
         result: EvalAssertionResult,
     ) -> EvalAssertionResult:
-        """Preserve the trusted binding for every published judge outcome."""
+        """Preserve the trusted profile and safe accounting for every outcome."""
 
+        profile = self._binding.profile
+        if profile is None:
+            raise RuntimeError("Compiled model judge lost its trusted profile.")
+        raw_accounting = result.metadata.get(_MODEL_JUDGE_RESULT_METADATA_KEY)
+        accounting = dict(raw_accounting) if type(raw_accounting) is dict else {}
         return result.model_copy(
             update={
                 "metadata": {
-                    **result.metadata,
-                    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY: (
-                        self._binding.implementation_revision
-                    ),
+                    _MODEL_JUDGE_RESULT_METADATA_KEY: {
+                        "judge_profile": profile.model_dump(mode="json"),
+                        "candidate_route_relation": self._binding.candidate_route_relation,
+                        **accounting,
+                    }
                 }
             }
         )
@@ -489,15 +514,15 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
                 agent_name=self._binding.agent_name,
             )
         except Exception:
-            return self._with_resolved_implementation_revision(
+            return self._with_public_contract(
                 self.error("Trusted model judge configuration became invalid.")
             )
         if current_revision != self._binding.implementation_revision:
-            return self._with_resolved_implementation_revision(
+            return self._with_public_contract(
                 self.error("Trusted model judge implementation changed after compilation.")
             )
         if evidence.final_output_state != "complete":
-            return self._with_resolved_implementation_revision(
+            return self._with_public_contract(
                 self.unavailable("Final-output evidence was not retained completely.")
             )
         task = _redacted_text(
@@ -506,7 +531,7 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
             "model judge task",
         )
         if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-            return self._with_resolved_implementation_revision(
+            return self._with_public_contract(
                 self.unavailable("Model-judge task evidence exceeded its portable bound.")
             )
         transcript = None
@@ -517,7 +542,7 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
                 "model judge transcript",
             )
             if len(transcript) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
-                return self._with_resolved_implementation_revision(
+                return self._with_public_contract(
                     self.unavailable("Model-judge transcript evidence exceeded its portable bound.")
                 )
         result = await self._judge._evaluate_material(
@@ -525,7 +550,7 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
             final_output=evidence.final_output,
             transcript_text=transcript,
         )
-        return self._with_resolved_implementation_revision(
+        return self._with_public_contract(
             EvalAssertionResult(
                 name=self.name,
                 assertion_revision=self.assertion_revision,

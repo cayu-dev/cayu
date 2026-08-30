@@ -41,6 +41,7 @@ from cayu.evals.memory_attribution import (
     EvalMemoryEvidenceLimitation,
     eval_memory_attribution_fingerprint,
 )
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.memory_attribution import MemoryAttribution
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.sessions import Session, SessionStatus
@@ -59,7 +60,7 @@ from cayu.runtime.usage import (
 # written for a different contract instead of silently misreading it. Version 9
 # binds the portable workspace/artifact assertion result contract; earlier
 # prerelease formats are intentionally not migrated.
-EVAL_SCHEMA_VERSION = 9
+EVAL_SCHEMA_VERSION = 10
 
 # Version of the standalone trajectory JSON document written by
 # write_trajectory_json. Version 5 adds bounded structural workspace/artifact probes;
@@ -591,6 +592,7 @@ class EvalCaseResult(BaseModel):
     # Eval execution never uses this as a concrete session ID.
     authored_session_id: str | None = None
     trials: tuple[EvalTrialResult, ...] = Field(min_length=1)
+    trial_policy: EvalSuiteTrialPolicyV1
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     assertions: tuple[EvalAssertionResult, ...] = Field(default_factory=tuple)
     error: str | None = None
@@ -610,18 +612,32 @@ class EvalCaseResult(BaseModel):
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        trial_policy: EvalSuiteTrialPolicyV1 | None = None,
     ) -> EvalCaseResult:
         retained = tuple(EvalTrialResult.model_validate(trial) for trial in trials)
         if not retained:
             raise ValueError("EvalCaseResult requires at least one trial.")
+        if trial_policy is None:
+            validated_trial_policy = EvalSuiteTrialPolicyV1.create(
+                trial_count=len(retained),
+            )
+        elif type(trial_policy) is EvalSuiteTrialPolicyV1:
+            validated_trial_policy = EvalSuiteTrialPolicyV1.model_validate(
+                trial_policy.model_dump(mode="json")
+            )
+        else:
+            raise TypeError("trial_policy must be an exact EvalSuiteTrialPolicyV1 or None.")
+        if validated_trial_policy.trial_count != len(retained):
+            raise ValueError("trial_policy must match the retained trial count.")
         case_started_at = started_at or retained[0].started_at
         case_completed_at = completed_at or retained[-1].completed_at
-        aggregate = _aggregate_eval_case(retained)
+        aggregate = _aggregate_eval_case(retained, validated_trial_policy)
         return cls(
             case_id=case_id,
             status=aggregate.status,
             authored_session_id=authored_session_id,
             trials=retained,
+            trial_policy=validated_trial_policy,
             score=aggregate.score,
             assertions=aggregate.assertions,
             error=aggregate.error,
@@ -663,6 +679,15 @@ class EvalCaseResult(BaseModel):
     def copy_json_data(cls, value, info):
         return copy_durable_json_object(value, info.field_name)
 
+    @field_validator("trial_policy", mode="before")
+    @classmethod
+    def copy_trial_policy(cls, value: object) -> object:
+        if type(value) is EvalSuiteTrialPolicyV1:
+            return value.model_dump(mode="json")
+        if isinstance(value, BaseModel):
+            raise TypeError("trial_policy must be an exact EvalSuiteTrialPolicyV1 or JSON.")
+        return value
+
     @model_validator(mode="after")
     def validate_aggregate_contract(self) -> EvalCaseResult:
         if self.completed_at < self.started_at:
@@ -686,7 +711,9 @@ class EvalCaseResult(BaseModel):
         )
         if len(session_ids) != len(set(session_ids)):
             raise ValueError("Trials must contain distinct concrete session IDs.")
-        expected = _aggregate_eval_case(self.trials)
+        if self.trial_policy.trial_count != len(self.trials):
+            raise ValueError("Case trial policy must match its retained trials.")
+        expected = _aggregate_eval_case(self.trials, self.trial_policy)
         if self.status != expected.status:
             raise ValueError("Case status does not match its retained trials.")
         if self.score != expected.score:
@@ -789,6 +816,82 @@ class EvalRunContractV1(BaseModel):
         return self
 
 
+class EvalRunContractV2(BaseModel):
+    """Portable execution contract including the immutable suite trial policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: Literal[2] = 2
+    corpus_revision: StrictStr
+    target_key: StrictStr
+    suite_id: StrictStr
+    suite_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None = None
+    trials: StrictInt = Field(ge=1, le=100)
+    timeout_seconds: StrictInt = Field(ge=1, le=3_600)
+    trial_policy: EvalSuiteTrialPolicyV1
+    cases: tuple[EvalCaseContractV1, ...] = Field(
+        min_length=1,
+        max_length=_EVAL_RUN_CONTRACT_MAX_CASES,
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 2.")
+        return value
+
+    @field_validator("target_key", "suite_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if _EVAL_PORTABLE_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{info.field_name} must be a portable lowercase identifier.")
+        return value
+
+    @field_validator(
+        "corpus_revision",
+        "suite_revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, info.field_name)
+        if _EVAL_CONTENT_REVISION_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{info.field_name} must be a lowercase sha256 content revision.")
+        return value
+
+    @field_validator("trial_policy", mode="before")
+    @classmethod
+    def copy_trial_policy(cls, value: object) -> object:
+        if type(value) is EvalSuiteTrialPolicyV1:
+            return value.model_dump(mode="json")
+        if isinstance(value, BaseModel):
+            raise TypeError("trial_policy must be an exact EvalSuiteTrialPolicyV1 or JSON.")
+        return value
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def revalidate_cases(cls, value):
+        if not isinstance(value, list | tuple):
+            raise ValueError("Eval run contract cases must be an ordered array.")
+        return _revalidate_model_iterable(value, EvalCaseContractV1)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> EvalRunContractV2:
+        case_ids = tuple(case.case_id for case in self.cases)
+        if case_ids != tuple(sorted(set(case_ids))):
+            raise ValueError("Eval run contract cases must be unique and sorted by case_id.")
+        if self.trials != self.trial_policy.trial_count:
+            raise ValueError("Eval run contract trials must match its trial policy.")
+        return self
+
+
 class EvalRun(BaseModel):
     model_config = ConfigDict(
         extra="forbid", revalidate_instances="always", hide_input_in_errors=True
@@ -796,7 +899,7 @@ class EvalRun(BaseModel):
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
-    schema_version: Literal[9] = EVAL_SCHEMA_VERSION
+    schema_version: Literal[10] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus
@@ -808,7 +911,7 @@ class EvalRun(BaseModel):
     completed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     duration_ms: StrictInt = Field(default=0, ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    run_contract: EvalRunContractV1 | None = None
+    run_contract: EvalRunContractV1 | EvalRunContractV2 | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -839,7 +942,7 @@ class EvalRun(BaseModel):
                     "dict[str, object]", trial
                 ):
                     raise ValueError(
-                        "EvalRun schema-v9 trial memory_attribution is required "
+                        "EvalRun schema-v10 trial memory_attribution is required "
                         f"at cases[{case_index}].trials[{trial_index}]."
                     )
         return value
@@ -857,7 +960,14 @@ class EvalRun(BaseModel):
     @field_validator("run_contract", mode="before")
     @classmethod
     def revalidate_run_contract(cls, value):
-        return _revalidate_model_instance(value, EvalRunContractV1)
+        if value is None or type(value) in {EvalRunContractV1, EvalRunContractV2}:
+            return value
+        if isinstance(value, dict):
+            if value.get("schema_version") == 1:
+                return EvalRunContractV1.model_validate(value)
+            if value.get("schema_version") == 2:
+                return EvalRunContractV2.model_validate(value)
+        return value
 
     @model_validator(mode="after")
     def validate_aggregate_contract(self) -> EvalRun:
@@ -885,6 +995,10 @@ class EvalRun(BaseModel):
                 raise ValueError("EvalRun cases must match its complete run contract.")
             if any(len(case.trials) != self.run_contract.trials for case in self.cases):
                 raise ValueError("EvalRun trial counts must match its run contract.")
+            if type(self.run_contract) is EvalRunContractV2 and any(
+                case.trial_policy != self.run_contract.trial_policy for case in self.cases
+            ):
+                raise ValueError("EvalRun case trial policies must match its run contract.")
         expected_status = aggregate_eval_status(case.status for case in self.cases)
         expected_score = aggregate_eval_score(case.score for case in self.cases)
         if self.status != expected_status:
@@ -952,19 +1066,27 @@ class _CaseAggregate:
 
 def aggregate_eval_assertions(
     trials: tuple[EvalTrialResult, ...],
+    trial_policy: EvalSuiteTrialPolicyV1 | None = None,
 ) -> tuple[EvalAssertionResult, ...]:
     """Reproduce case-level assertion aggregates from retained trials alone."""
 
-    return _aggregate_eval_assertions(trials).assertions
+    if trial_policy is None:
+        trial_policy = EvalSuiteTrialPolicyV1.create(
+            trial_count=max(1, len(trials)),
+            minimum_passed_trials=max(1, len(trials)),
+            max_concurrency=1,
+        )
+    return _aggregate_eval_assertions(trials, trial_policy).assertions
 
 
 def _aggregate_eval_assertions(
     trials: tuple[EvalTrialResult, ...],
+    trial_policy: EvalSuiteTrialPolicyV1,
 ) -> _AssertionAggregate:
     """Return a deterministic aggregate or an explicit contract diagnostic."""
 
     try:
-        assertions = _aggregate_eval_assertions_strict(trials)
+        assertions = _aggregate_eval_assertions_strict(trials, trial_policy)
     except ValueError as exc:
         return _AssertionAggregate(
             assertions=(),
@@ -975,11 +1097,16 @@ def _aggregate_eval_assertions(
 
 def _aggregate_eval_assertions_strict(
     trials: tuple[EvalTrialResult, ...],
+    trial_policy: EvalSuiteTrialPolicyV1,
 ) -> tuple[EvalAssertionResult, ...]:
     """Aggregate compatible assertion contracts, raising on ambiguous projections."""
 
     if not trials:
         return ()
+    if type(trial_policy) is not EvalSuiteTrialPolicyV1:
+        raise TypeError("trial_policy must be an exact EvalSuiteTrialPolicyV1.")
+    if trial_policy.trial_count != len(trials):
+        raise ValueError("Trial policy count must match retained trials.")
     if len(trials) == 1:
         return tuple(assertion.model_copy(deep=True) for assertion in trials[0].assertions)
     assertion_count = len(trials[0].assertions)
@@ -1001,11 +1128,15 @@ def _aggregate_eval_assertions_strict(
         threshold = next(iter(scored_thresholds), first.threshold)
         outcomes = tuple(assertion.outcome for assertion in group)
         scores = tuple(assertion.score for assertion in group)
+        pass_count = sum(outcome == EvalOutcome.PASSED for outcome in outcomes)
+        trial_threshold = threshold
+        threshold = trial_policy.minimum_passed_trials / len(group)
         metadata = {
             "trials": len(group),
             "trial_outcomes": [outcome.value for outcome in outcomes],
             "trial_scores": list(scores),
-            "pass_count": sum(outcome == EvalOutcome.PASSED for outcome in outcomes),
+            "trial_threshold": trial_threshold,
+            "pass_count": pass_count,
         }
         if EvalOutcome.ERROR in outcomes:
             outcome = EvalOutcome.ERROR
@@ -1019,12 +1150,17 @@ def _aggregate_eval_assertions_strict(
             )
         else:
             numeric_scores = tuple(score for score in scores if score is not None)
-            score = sum(numeric_scores) / len(numeric_scores)
-            bar = threshold if threshold is not None else 1.0
-            outcome = EvalOutcome.PASSED if score >= bar else EvalOutcome.FAILED
+            mean_score = sum(numeric_scores) / len(numeric_scores)
+            score = pass_count / len(group)
+            metadata["mean_trial_score"] = mean_score
+            outcome = (
+                EvalOutcome.PASSED
+                if pass_count >= trial_policy.minimum_passed_trials
+                else EvalOutcome.FAILED
+            )
             message = (
-                f"mean score {score:.3f} over {len(group)} trials "
-                f"({metadata['pass_count']}/{len(group)} passed)"
+                f"{pass_count}/{len(group)} trials passed; minimum required "
+                f"{trial_policy.minimum_passed_trials}; mean score {mean_score:.3f}"
             )
         aggregated.append(
             EvalAssertionResult(
@@ -1040,12 +1176,19 @@ def _aggregate_eval_assertions_strict(
     return tuple(aggregated)
 
 
-def _aggregate_eval_case(trials: tuple[EvalTrialResult, ...]) -> _CaseAggregate:
+def _aggregate_eval_case(
+    trials: tuple[EvalTrialResult, ...],
+    trial_policy: EvalSuiteTrialPolicyV1,
+) -> _CaseAggregate:
     """Derive every case-level result field from retained trials alone."""
 
     if not trials:
         raise ValueError("Cannot aggregate an empty eval trial set.")
-    assertion_aggregate = _aggregate_eval_assertions(trials)
+    if type(trial_policy) is not EvalSuiteTrialPolicyV1:
+        raise TypeError("trial_policy must be an exact EvalSuiteTrialPolicyV1.")
+    if trial_policy.trial_count != len(trials):
+        raise ValueError("Trial policy count must match retained trials.")
+    assertion_aggregate = _aggregate_eval_assertions(trials, trial_policy)
     trial_error = aggregate_trial_error(trials)
     if assertion_aggregate.error is not None:
         error = assertion_aggregate.error
@@ -1058,8 +1201,22 @@ def _aggregate_eval_case(trials: tuple[EvalTrialResult, ...]) -> _CaseAggregate:
             error=error,
             unavailable_reason=None,
         )
+    statuses = tuple(trial.status for trial in trials)
+    if EvalStatus.ERROR in statuses:
+        status = EvalStatus.ERROR
+    elif EvalStatus.UNAVAILABLE in statuses:
+        status = EvalStatus.UNAVAILABLE
+    elif EvalStatus.SKIPPED in statuses:
+        # Cancellation/abandonment remains a distinct terminal state.  It cannot
+        # satisfy the minimum-pass threshold or be collapsed into candidate
+        # failure merely because another trial passed.
+        status = EvalStatus.SKIPPED
+    elif statuses.count(EvalStatus.PASSED) >= trial_policy.minimum_passed_trials:
+        status = EvalStatus.PASSED
+    else:
+        status = EvalStatus.FAILED
     return _CaseAggregate(
-        status=aggregate_eval_status(trial.status for trial in trials),
+        status=status,
         score=aggregate_eval_score(trial.score for trial in trials),
         assertions=assertion_aggregate.assertions,
         error=trial_error,

@@ -73,6 +73,7 @@ from cayu.evals.external import (
 )
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.store import EvalRunStatus
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.providers import ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.providers.operations import (
     ProviderOperationAdapter,
@@ -467,7 +468,14 @@ def test_external_target_runs_through_native_corpus_lifecycle_with_exact_trial_i
     suite = EvalSuiteSpec.create(
         id="external-suite",
         name="External suite",
-        trial_request=TrialRequestSpec(trials=24, timeout_seconds=30),
+        trial_request=TrialRequestSpec(
+            trials=24,
+            timeout_seconds=30,
+            trial_policy=EvalSuiteTrialPolicyV1.create(
+                trial_count=24,
+                max_concurrency=24,
+            ),
+        ),
     )
     case = EvalCaseSpec.create(
         id="external-case",

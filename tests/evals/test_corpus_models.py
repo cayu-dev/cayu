@@ -1059,7 +1059,7 @@ def test_json_loader_rejects_duplicate_keys_unknown_versions_and_nonportable_num
     with pytest.raises(ValueError, match="unsupported schema_version"):
         eval_corpus_from_json('{"schema_version":1}')
     with pytest.raises(ValueError, match="unsupported schema_version"):
-        eval_corpus_from_json('{"schema_version":3}')
+        eval_corpus_from_json('{"schema_version":4}')
     with pytest.raises(ValueError, match="finite"):
         eval_corpus_from_json('{"schema_version":1,"value":NaN}')
     with pytest.raises(ValueError, match="signed 64-bit"):

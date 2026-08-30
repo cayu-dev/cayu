@@ -317,6 +317,7 @@ def test_eval_report_and_compare_accept_dashboard_corpus_results_with_stable_exi
         "score",
         "status",
         "score",
+        "reliability",
     ]
     assert "Cayu Eval Comparison" not in report_path.read_text(encoding="utf-8")
     assert "Cayu Eval Report" in report_path.read_text(encoding="utf-8")

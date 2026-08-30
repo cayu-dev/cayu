@@ -96,6 +96,19 @@ def test_authored_invocation_provenance_is_paired_and_legacy_shape_stays_stable(
 
     with pytest.raises(ValueError, match="both suite and selection"):
         EvalRunInvocation(authored_suite_revision=_REVISION_A)
+    with pytest.raises(ValueError, match="launch revision and lane must be paired"):
+        EvalRunInvocation(
+            authored_suite_revision=_REVISION_A,
+            authored_suite_selection_revision=_REVISION_B,
+            authored_suite_launch_revision=_REVISION_C,
+        )
+    invocation = EvalRunInvocation(
+        authored_suite_revision=_REVISION_A,
+        authored_suite_selection_revision=_REVISION_B,
+        authored_suite_launch_revision=_REVISION_C,
+        authored_suite_launch_lane=0,
+    )
+    assert invocation.authored_suite_launch_lane == 0
     with pytest.raises(ValueError, match="both suite and case"):
         EvalScenarioRunInvocation(
             scenario_revision=_REVISION_A,

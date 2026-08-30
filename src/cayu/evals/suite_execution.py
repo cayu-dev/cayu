@@ -10,6 +10,7 @@ from cayu.evals.corpus import (
     EvaluationSourceIdentityV1,
     MaxEstimatedCostAssertionSpec,
     RunInputSpec,
+    eval_suite_trial_policy,
     pricing_profile_identity,
 )
 from cayu.evals.execution import CorpusTarget, evaluation_target_identity
@@ -33,13 +34,10 @@ def authored_suite_launch_settings(document: EvalSuiteDocument) -> ScenarioLaunc
     """Return the safe PR-02 launch bounds shared by authored scenario cases."""
 
     validated = validate_expected_eval_suite_revision(document, document.revision)
-    if validated.suite.trial_request.trials != 1:
-        raise ValueError(
-            "Authored Control Plane suite launch currently requires exactly one trial."
-        )
+    policy = eval_suite_trial_policy(validated.suite)
     return ScenarioLaunchSettingsV2(
-        trials=1,
-        max_concurrency=1,
+        trials=policy.trial_count,
+        max_concurrency=policy.max_concurrency,
         timeout_seconds=validated.suite.trial_request.timeout_seconds,
     )
 
@@ -103,8 +101,8 @@ def corpus_for_authored_scenario_case(
         or binding.target_key != validated.target_key
         or binding.application_release_id != target_identity.application_release_id
         or binding.app_manifest_fingerprint != target_identity.app_manifest_fingerprint
-        or binding.trials != 1
-        or binding.max_concurrency != 1
+        or binding.trials != eval_suite_trial_policy(validated.suite).trial_count
+        or binding.max_concurrency > eval_suite_trial_policy(validated.suite).max_concurrency
         or binding.timeout_seconds != validated.suite.trial_request.timeout_seconds
     ):
         raise ValueError("The authored scenario case does not match its current launch binding.")

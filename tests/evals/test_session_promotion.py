@@ -1322,7 +1322,12 @@ def test_reviewed_captured_contract_converts_only_with_server_attested_runnable_
     assert runnable.case.assertions == captured.case.assertions
     assert runnable.case.input == baseline.case.input
     assert runnable.source == baseline.source
-    assert runnable.suite.trial_request == TrialRequestSpec(trials=2, timeout_seconds=45)
+    assert runnable.suite.trial_request.trials == 2
+    assert runnable.suite.trial_request.timeout_seconds == 45
+    assert runnable.suite.trial_request.trial_policy is not None
+    assert runnable.suite.trial_request.trial_policy.trial_count == 2
+    assert runnable.suite.trial_request.trial_policy.minimum_passed_trials == 2
+    assert runnable.suite.trial_request.trial_policy.max_concurrency == 1
     corpus = corpus_from_promotion_candidate(runnable)
     assert corpus.cases[0].input == baseline.case.input
     assert (
@@ -1387,7 +1392,7 @@ def test_promotion_rejects_multiple_text_parts_instead_of_changing_replay_input(
         promotable_run_input(app, trajectory, source_agent_name="assistant")
     assert captured.value.code is SessionPromotionErrorCode.INPUT_PART_UNSUPPORTED
     assert str(captured.value) == (
-        "Portable corpus v2 requires exactly one text part per caller-supplied message."
+        "Portable corpus v3 requires exactly one text part per caller-supplied message."
     )
 
 

@@ -151,8 +151,12 @@ perform project discovery.
 contract for a reusable evaluation that may also contain revision-free
 `StructuredModelJudgeAssertionDraftV1` material. The server—not the browser—
 compiles rubric and public-reference drafts into content-addressed immutable
-identities during preview. A draft contains one stable suite ID, a published
-target key, ordinary `TrialRequestSpec` settings, and one or more case drafts.
+identities during preview. `EvalSuiteDraftV3` adds revision-free `trials`,
+`minimum_passed_trials`, and `max_concurrency` editor settings. The server—not
+the browser—compiles those settings into an immutable
+`EvalSuiteTrialPolicyV1` revision during preview. A draft contains one stable
+suite ID, a published target key, bounded trial settings, and one or more case
+drafts.
 Each case selects exactly one stimulus:
 
 - `EvalSimpleInputStimulusV1` carries the existing portable `RunInputSpec`;
@@ -160,7 +164,7 @@ Each case selects exactly one stimulus:
   content revision.
 
 `compile_eval_suite_authoring_draft(...)` preserves the V1 wire contract or
-compiles an explicit V2 draft, sorts cases by stable ID, and computes immutable
+compiles an explicit V2 or V3 draft, sorts cases by stable ID, and computes immutable
 case, suite-spec, rubric, public-reference, and complete suite-document
 revisions. Captured source
 identity is optional for authored cases; Cayu does not fabricate production
@@ -184,11 +188,14 @@ Protected servers with durable Evals expose preview/save/catalog/download at
 execution and reports target or scenario-reference readiness. Save accepts only
 the exact reviewed revision, scans it through the target's credential-redaction
 boundary, and atomically verifies every scenario reference. The authored-suite
-catalog was introduced at storage revision 64; the current SQLite and PostgreSQL
-EvalStore implementations require revision 72. These
-authoring contracts
+ catalog was introduced at storage revision 64; current SQLite and PostgreSQL
+ EvalStore implementations require revision 72 for restart-safe trial
+ checkpoints. Custom EvalStore adapters remain readable but cannot admit fresh
+ eval work unless they implement the fenced terminal-checkpoint contract and
+ declare `trial_checkpointing = True`. These authoring contracts
 do not create provider, tool, environment, fixture, secret, or runtime
-authority, and they do not change the existing one-trial execution default.
+authority. New V3 drafts still default to one trial, one required pass, and
+concurrency one; V1/V2 documents remain readable with that fail-closed policy.
 
 ### Control Plane: create and run an evaluation
 
@@ -197,7 +204,8 @@ Evals-specific Python suite. Select a server-published target on the **Evals**
 page and choose **New evaluation**. The authoring sheet supports the complete
 deterministic and structured-judge workflow:
 
-1. name a reusable suite and set its per-case timeout;
+1. name a reusable suite and set trials per case, required passes, maximum
+   concurrency, and the per-trial timeout;
 2. add, duplicate, remove, and select cases;
 3. enter one or more ordered user messages for a simple fresh session, or build
    and save a controlled multi-stage scenario;
@@ -205,7 +213,9 @@ deterministic and structured-judge workflow:
    and cost assertions, and optionally add a one-to-eight-criterion AI judge
    rubric using a current trusted server-published profile;
 5. check current target and scenario readiness, save the reviewed immutable
-   suite revision, and check either the full suite or an explicit subset;
+   suite revision, and review the exact maximum candidate work, judge work,
+   priced cost (when fully priceable), and execution profiles for either the
+   full suite or an explicit subset;
 6. launch the selected cases and follow the resulting durable run in the normal
    Runs and Results views.
 
@@ -237,15 +247,41 @@ state. One launch response maps every selected case to its resulting run; mixed
 selections therefore remain one user action without pretending that separately
 recoverable scenarios share one runtime state machine.
 
-Control Plane-authored suite launches currently use exactly one trial per case,
-and every admitted run has maximum concurrency one. Simple cases share one run;
-each independently recoverable scenario has its own run, so deployments with
-multiple coordinators may process those durable runs independently. The browser
+Control Plane-authored suite launches execute the complete immutable trial
+policy. Every admitted trial runs; Cayu does not stop early after enough passes
+or failures. A case passes only when it reaches the required pass count and has
+zero runtime errors, evaluator errors, unavailable required evidence, or
+cancellations. The launch request must echo the reviewed exposure revision, so
+changed execution profiles, pricing, selection, or work bounds force another
+readiness check. Repeated assertion aggregates use trial pass rate against the
+same required-pass rate; their metadata retains the mean per-trial graded score.
+Simple cases share one run; each independently recoverable
+scenario has its own run. All runs admitted by one suite launch share a durable
+launch identity. Cayu partitions the reviewed concurrency ceiling across
+durable lanes and leases at most one run in each lane, so the suite-wide cap
+remains true across multiple coordinators without serializing independent work.
+The browser
 can author structured rubric, threshold, permitted evidence, and public or
 server-held private reference identity, but it cannot create a provider,
 credential, judge application, privacy policy, or private-reference content.
 Only profiles and private-reference identities published for the selected
 target are selectable.
+
+Preflight keeps candidate and judge work separate. Candidate trials and maximum
+model steps are always explicit. Runtime token and cost limits are post-observation
+stop thresholds: one provider completion may cross them, so Cayu never presents
+those thresholds as exact candidate maxima. Candidate token exposure remains
+unavailable until the selected execution profile publishes a reservation-backed
+bound, and candidate cost reports `candidate_cost_not_hard_bounded` when a priced
+but non-reserved threshold is configured. Judge token and cost settings are also
+post-observation stop thresholds, so judge maxima remain unavailable even when
+every selected judge profile is priced. Preflight reports
+`judge_cost_not_hard_bounded` for complete pricing and
+`judge_pricing_incomplete` when pricing identity is incomplete rather than
+displaying an unenforceable maximum or zero.
+Completed results retain each trial's observed candidate usage/cost evidence and
+each rubric-string or structured judgment's observed judge usage/cost; unpriced
+observations remain explicitly unavailable.
 
 ### Control Plane: calibrate an AI judge
 
@@ -313,7 +349,8 @@ set of structural assertion specifications. It cannot contain a `CayuApp`,
 provider/model/environment selection, import path, callback, raw session ID, or
 runtime event payload.
 
-Portable corpus schema version 2 covers root and child terminal
+Portable corpus schema version 3 adds an explicit immutable suite trial policy
+to the version 2 assertion surface, which covers root and child terminal
 status, final-output equality/containment, tool presence/order/count, bounded
 tool-argument/result JSON subsets, workspace-file structure, artifact structure
 and explicitly retained public artifact text, model-step
@@ -347,7 +384,7 @@ and publication shapes but are rejected by fresh-run admission until runnable
 input is authored.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
-`load_eval_corpus(...)` enforce schema version 2 and Cayu's durable-JSON rules,
+`load_eval_corpus(...)` enforce schema version 3 and Cayu's durable-JSON rules,
 including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
 validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
@@ -358,7 +395,7 @@ cases and trials, matching the boundary of the one-suite execution result. A
 multi-suite corpus may exceed that aggregate because suites execute and publish
 independently; inspection reports the complete corpus-wide count without
 materializing result graphs.
-Unknown fields and assertion kinds fail closed; schema version 2 has no
+Unknown fields and assertion kinds fail closed; schema version 3 has no
 prior-version compatibility loader.
 
 ### Safe tool argument and result assertions
@@ -1012,7 +1049,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-8 `PublishedEvalRun` containing
+produces a content-addressed schema-version-9 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
@@ -1047,12 +1084,13 @@ decisions are checked against the complete bounded order retained by evaluation;
 only boolean matches and safe counts cross the publishing boundary.
 Scalar model-judge results retain the bounded rubric and rubric version, threshold,
 transcript-selection flag, evaluator key, implementation revision, continuous
-score/outcome, and fixed safe diagnostic. A valid finite score is candidate
-evidence: the threshold decides `passed` versus `failed`. Missing authority,
-judge configuration drift, provider/runtime failure, an attempted tool call,
-an incomplete session, empty output, or an invalid score is `error` with no
-numeric score; judge failure is never converted into a candidate-quality
-failure.
+score/outcome, fixed safe diagnostic, exact admitted judge profile and route,
+and observed judge usage with priced cost or an explicit unpriced state. A valid
+finite score is candidate evidence: the threshold decides `passed` versus
+`failed`. Missing authority, judge configuration drift, provider/runtime failure,
+an attempted tool call, incomplete accounting, an incomplete session, empty
+output, or an invalid score is `error` with no numeric score; judge failure is
+never converted into a candidate-quality failure.
 Structured model-judge results retain the exact safe judge profile, route
 relation, rubric/reference identities, evidence selection, canonical criterion
 weights and scores, bounded explanation publication states, aggregate, threshold,
@@ -1213,18 +1251,20 @@ using the stable `0` / `1` / `2` exit contract: candidate failures and genuine
 regressions return `1`; evaluator/runtime failure, incomplete evidence, and
 incompatible or identity-unmatched comparisons return `2`.
 
-For every structured judgment, the presentation retains the safe judge-profile
-and evaluator-implementation identity, independent/same-model label, rubric and
-reference identity, evidence selection and privacy policy, diagnostic, observed
-usage, priced cost or explicit unpriced state, criterion scores and explanation
-states, exact weights and Cayu-computed contributions, aggregate, threshold,
-and threshold outcome. Private reference content, judge prompts, provider
-credentials/options, and raw judge output are not part of this contract.
+For every AI judgment, the presentation retains the safe judge-profile and
+evaluator-implementation identity, independent/same-model label, diagnostic,
+observed usage, and priced cost or explicit unpriced state. Structured judgments
+add rubric and reference identity, evidence selection and privacy policy,
+criterion scores and explanation states, exact weights and Cayu-computed
+contributions, aggregate, threshold, and threshold outcome. Rubric-string
+judgments retain their bounded rubric revision and threshold. Private reference
+content, judge prompts, provider credentials/options, and raw judge output are
+not part of this contract.
 
 The Control Plane Results and Runs views expose the same projection with
 case/trial drill-down. Users can see why a judgment passed or failed, including
 each bounded explanation and contribution, without opening JSON. Downloaded
-JSON reports use the versioned `EvalResultReportV1` envelope, which binds the
+JSON reports use the versioned `EvalResultReportV2` envelope, which binds the
 complete immutable source document to its canonical presentation. Those reports
 remain valid inputs to `cayu eval report` and `cayu eval compare`; Cayu unwraps
 and revalidates the binding instead of guessing the format. HTML renders the
@@ -1240,15 +1280,23 @@ changes, safe observed-value changes, and outcome regressions. They do not
 mistake a changed extra value for an assertion change. Cayu never pairs a
 captured observation with a fresh trial heuristically and never diffs
 incompatible contracts. The protected comparison API, Control Plane, CLI JSON,
-and HTML comparison all consume this same schema-version-3 comparison document.
+and HTML comparison all consume this same schema-version-4 comparison document.
 
-`run_eval_case(..., trials=N)` executes trials sequentially with a fresh concrete
-session ID each time. `EvalCaseResult.trials` is an ordered tuple of
+`run_eval_case(..., trials=N)` defaults to an all-trials-must-pass policy and
+executes every trial with a fresh concrete session ID. Corpus and authored-suite
+runs retain their exact `EvalSuiteTrialPolicyV1`; work-conserving scheduling may
+fill the policy's bounded concurrency without changing deterministic trial
+numbers or result order. `EvalCaseResult.trials` is an ordered tuple of
 `EvalTrialResult` values; every trial retains its own status, session ID, final
 output, assertion outcomes, exact-snapshot usage, assertion-specific cost
 summary, duration, diagnostic, evidence-completeness flag, and optional
 trajectory. Case and run aggregates are reproducible from those retained tuples.
-There is no representative or implicit “last trial.”
+There is no representative or implicit “last trial.” Published cases also
+retain counts for passes, candidate failures, runtime errors, evaluator errors,
+unavailable/cancelled trials, score range/mean, and an honest variability label.
+When a structured AI judge runs on each trial, the distribution is labelled
+end-to-end evaluation variability because candidate and judge variation cannot
+be separated from those observations alone.
 
 Assertion outcomes are `passed`, `failed`, `unavailable`, or `error`. Cases and
 runs add `skipped` for a direct Python case with no assertions. Aggregate status
@@ -1421,7 +1469,7 @@ with stable `SessionPromotionErrorCode` values. These rules affect automatic
 portable promotion only: normal Cayu sessions and direct Python evals retain all
 of those capabilities, while runtime tool calls, artifacts, and admitted child
 agents remain eligible. Tool calls and child status remain available as portable
-assertion evidence; corpus v2 does not silently infer replay input or an artifact
+assertion evidence; corpus v3 does not silently infer replay input or an artifact
 assertion from uncaptured state. Caller-driven approval, resume, queued-input, and
 later-interaction phases are checked recursively across every admitted descendant,
 not only on the root.
@@ -1443,7 +1491,7 @@ intentionally absent from serialized trajectories, so a detached or older trajec
 cannot guess which
 transcript messages were caller input; it fails closed as
 `input_evidence_unavailable` instead. Multiple text parts reject because their
-provider-specific boundaries cannot be represented exactly by corpus v2's single
+provider-specific boundaries cannot be represented exactly by corpus v3's single
 text field. The resulting sanitized input and redaction fact carry one exact content
 revision.
 
@@ -2229,6 +2277,13 @@ evidence-policy, target-key, or applicable-pricing contracts are explicitly
 incomparable. For compatible runs, status regressions and score drops beyond the
 selected tolerance are reported at run and case scope. The browser never invents
 a baseline or a universal regression score.
+
+Fresh authored-suite results retain both identities required for that decision.
+The exact accepted-exposure revision remains the immutable preview, admission,
+worker, and result identity. Comparison derives a separate compatibility revision
+that excludes application-release and presentation metadata only; candidate and
+runtime identity, target material, isolation, evidence, resource ceilings, selected
+work, and pricing remain comparison-relevant and fail closed on drift.
 
 The SDK, server, dashboard, JSON, HTML, and CLI share that same comparison
 projection. `compare_eval_results(...)` accepts captured and fresh origins;

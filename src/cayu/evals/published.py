@@ -23,7 +23,7 @@ from cayu._validation import (
 from cayu.evals._structural_paths import _validate_portable_structural_workspace_path
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
-    _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
+    _MODEL_JUDGE_RESULT_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_ARTIFACT_EVIDENCE_MAX_ARTIFACTS,
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
@@ -107,9 +107,14 @@ from cayu.evals.result_contract import (
     _EvalTrialPublicData,
 )
 from cayu.evals.revisions import eval_trial_result_revision
+from cayu.evals.trial_policy import (
+    EvalCaseReliabilityV1,
+    EvalSuiteRunExposureV1,
+    EvalSuiteTrialPolicyV1,
+)
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 8
+PUBLISHED_EVAL_SCHEMA_VERSION = 9
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -616,6 +621,76 @@ class PublishedMaxEstimatedCostDetail(_PublishedAssertionDetail):
         return self
 
 
+class _PublishedJudgeUsageV1(_PortableModel):
+    model_steps: StrictInt = Field(ge=1, le=EVIDENCE_MAX_MODEL_STEPS)
+    input_tokens: AggregateCount = Field(ge=0)
+    output_tokens: AggregateCount = Field(ge=0)
+    total_tokens: AggregateCount = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_token_totals(self) -> _PublishedJudgeUsageV1:
+        if self.total_tokens < max(self.input_tokens, self.output_tokens):
+            raise ValueError("Published judge total tokens contradict component usage.")
+        return self
+
+
+class _PublishedJudgeCostV1(_PortableModel):
+    availability: Literal["priced", "unavailable"]
+    currency: StrictStr | None = None
+    estimated_cost: StrictStr | None = None
+    priced_model_steps: StrictInt | None = Field(default=None, ge=0)
+    unpriced_model_steps: StrictInt | None = Field(default=None, ge=0)
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=16,
+            nonblank=True,
+            clean=True,
+        )
+        if _CURRENCY_PATTERN.fullmatch(value) is None:
+            raise ValueError("Judge cost currency must be a portable uppercase identifier.")
+        return value
+
+    @field_validator("estimated_cost")
+    @classmethod
+    def validate_estimated_cost(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _canonical_decimal_text(value, info.field_name, max_chars=64)
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> _PublishedJudgeCostV1:
+        observations = (
+            self.currency,
+            self.estimated_cost,
+            self.priced_model_steps,
+            self.unpriced_model_steps,
+        )
+        if self.availability == "unavailable":
+            if any(item is not None for item in observations):
+                raise ValueError("Unavailable judge cost cannot carry priced observations.")
+            return self
+        if any(item is None for item in observations):
+            raise ValueError("Priced judge cost requires complete observations.")
+        if self.unpriced_model_steps != 0:
+            raise ValueError("Priced judge cost cannot contain unpriced model steps.")
+        return self
+
+
+class PublishedModelJudgeUsageV1(_PublishedJudgeUsageV1):
+    """Observed usage for one successfully recorded rubric-string judgment."""
+
+
+class PublishedModelJudgeCostV1(_PublishedJudgeCostV1):
+    """Observed priced cost, or an explicit unpriced state, for one judgment."""
+
+
 class PublishedModelJudgeDetail(_PublishedAssertionDetail):
     """Bounded public contract and safe outcome evidence for one model judgment."""
 
@@ -627,6 +702,10 @@ class PublishedModelJudgeDetail(_PublishedAssertionDetail):
     threshold: StrictFloat = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     include_transcript: StrictBool
     diagnostic: PublishedModelJudgeDiagnostic
+    judge_profile: JudgeProfileIdentityV1
+    candidate_route_relation: Literal["independent_model", "same_model"]
+    usage: PublishedModelJudgeUsageV1 | None = None
+    cost: PublishedModelJudgeCostV1 | None = None
 
     @field_validator("evaluator_key")
     @classmethod
@@ -659,6 +738,49 @@ class PublishedModelJudgeDetail(_PublishedAssertionDetail):
             nonblank=True,
             clean=True,
         )
+
+    @model_validator(mode="after")
+    def validate_judgment(self) -> PublishedModelJudgeDetail:
+        if (
+            self.evaluator_key != self.judge_profile.key
+            or self.evaluator_implementation_revision != self.judge_profile.implementation_revision
+        ):
+            raise ValueError("Published model-judge identity contradicts its profile.")
+        if (
+            self.candidate_route_relation == "same_model"
+            and self.judge_profile.same_model_use != "allowed_and_labeled"
+        ):
+            raise ValueError("Published model judgment used a forbidden same-model route.")
+        if self.include_transcript and "transcript" not in self.judge_profile.allowed_evidence:
+            raise ValueError("Published model judgment used disallowed transcript evidence.")
+        recorded = self.diagnostic == "judgment_recorded"
+        if recorded != (self.usage is not None) or recorded != (self.cost is not None):
+            raise ValueError("Recorded model judgments require judge usage and cost state.")
+        if not recorded:
+            return self
+        if self.usage is None or self.cost is None:
+            raise RuntimeError("Recorded model judgment lost its observations.")
+        if (
+            self.usage.input_tokens > self.judge_profile.max_input_tokens
+            or self.usage.output_tokens > self.judge_profile.max_output_tokens
+            or self.usage.total_tokens > self.judge_profile.max_total_tokens
+        ):
+            raise ValueError("Published judge usage exceeds its profile ceilings.")
+        priced_profile = self.judge_profile.pricing_profile_fingerprint is not None
+        if priced_profile != (self.cost.availability == "priced"):
+            raise ValueError("Published judge cost contradicts its profile pricing identity.")
+        if self.cost.availability == "priced" and (
+            self.cost.currency != self.judge_profile.cost_currency
+            or self.cost.priced_model_steps != self.usage.model_steps
+        ):
+            raise ValueError("Published judge cost does not match its profile or usage.")
+        if (
+            self.cost.estimated_cost is not None
+            and self.judge_profile.max_estimated_cost is not None
+            and Decimal(self.cost.estimated_cost) > Decimal(self.judge_profile.max_estimated_cost)
+        ):
+            raise ValueError("Published judge cost exceeds its profile ceiling.")
+        return self
 
 
 class PublishedJudgeReferenceIdentityV1(_PortableModel):
@@ -735,66 +857,12 @@ class PublishedStructuredJudgeCriterionV1(_PortableModel):
         return self
 
 
-class PublishedStructuredJudgeUsageV1(_PortableModel):
-    model_steps: StrictInt = Field(ge=1, le=EVIDENCE_MAX_MODEL_STEPS)
-    input_tokens: AggregateCount = Field(ge=0)
-    output_tokens: AggregateCount = Field(ge=0)
-    total_tokens: AggregateCount = Field(ge=0)
-
-    @model_validator(mode="after")
-    def validate_token_totals(self) -> PublishedStructuredJudgeUsageV1:
-        if self.total_tokens < max(self.input_tokens, self.output_tokens):
-            raise ValueError("Published judge total tokens contradict component usage.")
-        return self
+class PublishedStructuredJudgeUsageV1(_PublishedJudgeUsageV1):
+    """Observed usage for one successfully recorded structured judgment."""
 
 
-class PublishedStructuredJudgeCostV1(_PortableModel):
-    availability: Literal["priced", "unavailable"]
-    currency: StrictStr | None = None
-    estimated_cost: StrictStr | None = None
-    priced_model_steps: StrictInt | None = Field(default=None, ge=0)
-    unpriced_model_steps: StrictInt | None = Field(default=None, ge=0)
-
-    @field_validator("currency")
-    @classmethod
-    def validate_currency(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        value = _bounded_durable_text(
-            value,
-            info.field_name,
-            max_chars=16,
-            nonblank=True,
-            clean=True,
-        )
-        if _CURRENCY_PATTERN.fullmatch(value) is None:
-            raise ValueError("Judge cost currency must be a portable uppercase identifier.")
-        return value
-
-    @field_validator("estimated_cost")
-    @classmethod
-    def validate_estimated_cost(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _canonical_decimal_text(value, info.field_name, max_chars=64)
-
-    @model_validator(mode="after")
-    def validate_availability(self) -> PublishedStructuredJudgeCostV1:
-        observations = (
-            self.currency,
-            self.estimated_cost,
-            self.priced_model_steps,
-            self.unpriced_model_steps,
-        )
-        if self.availability == "unavailable":
-            if any(item is not None for item in observations):
-                raise ValueError("Unavailable judge cost cannot carry priced observations.")
-            return self
-        if any(item is None for item in observations):
-            raise ValueError("Priced judge cost requires complete observations.")
-        if self.unpriced_model_steps != 0:
-            raise ValueError("Priced judge cost cannot contain unpriced model steps.")
-        return self
+class PublishedStructuredJudgeCostV1(_PublishedJudgeCostV1):
+    """Observed priced cost, or an explicit unpriced state, for one judgment."""
 
 
 class PublishedStructuredModelJudgeDetail(_PublishedAssertionDetail):
@@ -1119,6 +1187,7 @@ class PublishedEvalCaseResult(_PortableModel):
     case_revision: StrictStr
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    reliability: EvalCaseReliabilityV1
     trials: tuple[PublishedEvalTrialResult, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_TRIALS,
@@ -1146,7 +1215,7 @@ class PublishedEvalCaseResult(_PortableModel):
             range(1, len(self.trials) + 1)
         ):
             raise ValueError("Published trial numbers must be contiguous and ordered.")
-        expected_status = _published_status_from_statuses(trial.status for trial in self.trials)
+        expected_status = self.reliability.outcome
         expected_score = _published_score(trial.score for trial in self.trials)
         if self.status != expected_status or self.score != expected_score:
             raise ValueError("Published case aggregates do not match its trials.")
@@ -1161,7 +1230,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[8]
+    schema_version: Literal[9]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1169,6 +1238,11 @@ class PublishedEvalRun(_PortableModel):
     suite_revision: StrictStr
     evidence_policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
+    trial_policy: EvalSuiteTrialPolicyV1
+    accepted_exposure: EvalSuiteRunExposureV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     cases: tuple[PublishedEvalCaseResult, ...] = Field(
@@ -1334,6 +1408,27 @@ class PublishedEvalRun(_PortableModel):
         trial_counts = {len(case.trials) for case in self.cases}
         if len(trial_counts) != 1:
             raise ValueError("Published cases must share one suite-wide trial count.")
+        if trial_counts != {self.trial_policy.trial_count}:
+            raise ValueError("Published trial counts must match the suite trial policy.")
+        if self.accepted_exposure is not None and (
+            self.accepted_exposure.trial_policy_revision != self.trial_policy.revision
+            or self.accepted_exposure.candidate_trials
+            < len(self.cases) * self.trial_policy.trial_count
+        ):
+            raise ValueError("Published accepted exposure contradicts its result graph.")
+        for case in self.cases:
+            uses_model_judge = any(
+                assertion.detail.kind in {"model_judge", "structured_model_judge"}
+                for trial in case.trials
+                for assertion in trial.assertions
+            )
+            expected_reliability = EvalCaseReliabilityV1.create(
+                policy=self.trial_policy,
+                trials=((trial.status, trial.score, trial.code) for trial in case.trials),
+                uses_model_judge=uses_model_judge,
+            )
+            if case.reliability != expected_reliability:
+                raise ValueError("Published case reliability does not match retained trials.")
         published_assertion_results = sum(
             len(trial.assertions) for case in self.cases for trial in case.trials
         )
@@ -1630,6 +1725,8 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
             detail.kind,
             detail.evaluator_key,
             detail.evaluator_implementation_revision,
+            detail.judge_profile.revision,
+            detail.candidate_route_relation,
             detail.rubric,
             detail.rubric_version,
             detail.threshold,
@@ -2234,24 +2331,40 @@ def _published_detail(
             unpriced_model_steps=unpriced_steps,
         )
     if type(spec) is ModelJudgeAssertionSpec:
-        resolved_revision = result.metadata.get(
-            _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY
-        )
-        if type(resolved_revision) is not str:
-            raise ValueError(
-                "Internal model-judge result did not record its resolved implementation revision."
-            )
+        raw = result.metadata.get(_MODEL_JUDGE_RESULT_METADATA_KEY)
+        if type(raw) is not dict:
+            raise ValueError("Internal model-judge result did not record its public contract.")
+        try:
+            profile = JudgeProfileIdentityV1.model_validate(raw.get("judge_profile"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Internal model-judge profile is invalid.") from exc
+        if profile.key != spec.evaluator_key:
+            raise ValueError("Internal model-judge profile does not match the corpus.")
+        route_relation = raw.get("candidate_route_relation")
+        if route_relation not in {"independent_model", "same_model"}:
+            raise ValueError("Internal model-judge route relation is invalid.")
+        if route_relation == "same_model" and profile.same_model_use != "allowed_and_labeled":
+            raise ValueError("Internal model judge used a forbidden same-model route.")
+        usage = None
+        cost = None
+        if result.outcome.value in {"passed", "failed"}:
+            try:
+                usage = PublishedModelJudgeUsageV1.model_validate(raw.get("usage"))
+                cost = PublishedModelJudgeCostV1.model_validate(raw.get("cost"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Internal model-judge accounting is invalid.") from exc
         return PublishedModelJudgeDetail(
             evaluator_key=spec.evaluator_key,
-            evaluator_implementation_revision=_sha256_revision(
-                resolved_revision,
-                "resolved model-judge implementation revision",
-            ),
+            evaluator_implementation_revision=profile.implementation_revision,
             rubric=spec.rubric,
             rubric_version=spec.rubric_version,
             threshold=spec.threshold,
             include_transcript=spec.include_transcript,
             diagnostic=_model_judge_diagnostic(result.outcome.value),
+            judge_profile=profile,
+            candidate_route_relation=route_relation,
+            usage=usage,
+            cost=cost,
         )
     if type(spec) is StructuredModelJudgeAssertionSpec:
         raw = result.metadata.get(_STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY)
@@ -2422,6 +2535,7 @@ def _published_case(
     case: EvalCaseSpec,
     result,
     *,
+    trial_policy: EvalSuiteTrialPolicyV1,
     trial_public_data: tuple[_EvalTrialPublicData, ...] | None,
 ) -> PublishedEvalCaseResult:
     trials: list[PublishedEvalTrialResult] = []
@@ -2462,12 +2576,21 @@ def _published_case(
                 message=_TRIAL_MESSAGE[public_data.diagnostic_code],
             )
         )
-    status = _published_status_from_statuses(trial.status for trial in trials)
+    uses_model_judge = any(
+        type(assertion) in {ModelJudgeAssertionSpec, StructuredModelJudgeAssertionSpec}
+        for assertion in case.assertions
+    )
+    reliability = EvalCaseReliabilityV1.create(
+        policy=trial_policy,
+        trials=((trial.status, trial.score, trial.code) for trial in trials),
+        uses_model_judge=uses_model_judge,
+    )
     return PublishedEvalCaseResult(
         case_id=case.id,
         case_revision=case.revision,
-        status=status,
+        status=reliability.outcome,
         score=_published_score(trial.score for trial in trials),
+        reliability=reliability,
         trials=tuple(trials),
         duration_ms=sum(trial.duration_ms for trial in trials),
     )
@@ -2488,6 +2611,7 @@ def _publish_eval_run_with_trial_public_data(
     run: EvalRun,
     *,
     trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] | None,
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
 ) -> PublishedEvalRun:
     """Internal execution projection with separately supplied redacted trial data."""
 
@@ -2534,6 +2658,7 @@ def _publish_eval_run_with_trial_public_data(
         _published_case(
             case,
             result_by_id[case.id],
+            trial_policy=expected_run_contract.trial_policy,
             trial_public_data=(
                 None if validated_public_data is None else validated_public_data[case.id]
             ),
@@ -2549,11 +2674,14 @@ def _publish_eval_run_with_trial_public_data(
         "suite_revision": suite.revision,
         "evidence_policy_revision": corpus.evidence_policy.revision,
         "pricing_profile_fingerprint": expected_run_contract.pricing_profile_fingerprint,
+        "trial_policy": expected_run_contract.trial_policy.model_dump(mode="json"),
         "status": status,
         "score": _published_score(case.score for case in cases),
         "cases": cases,
         "duration_ms": sum(case.duration_ms for case in cases),
     }
+    if accepted_exposure is not None:
+        document["accepted_exposure"] = accepted_exposure.model_dump(mode="json")
     revision_document = {
         **document,
         "cases": [case.model_dump(mode="json") for case in cases],

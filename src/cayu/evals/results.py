@@ -49,10 +49,11 @@ from cayu.evals.published import (
     _published_status_from_statuses,
 )
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 
 CAPTURED_EVALUATION_RESULT_SCHEMA_VERSION = 1
 CAPTURED_EVALUATION_RESULT_MAX_BYTES = 4 << 20
-EVAL_RESULT_PROJECTION_SCHEMA_VERSION = 1
+EVAL_RESULT_PROJECTION_SCHEMA_VERSION = 2
 EVAL_RESULT_PROJECTION_MAX_BYTES = 4 << 20
 
 
@@ -293,7 +294,7 @@ class EvalResultCaseProjectionV1(_SchemaV1PortableModel):
 class EvalResultProjectionV1(_SchemaV1PortableModel):
     """The single comparison projection shared by captured and fresh results."""
 
-    schema_version: Literal[1] = EVAL_RESULT_PROJECTION_SCHEMA_VERSION
+    schema_version: Literal[1] = 1
     result_revision: StrictStr
     origin: EvalResultOrigin
     target: EvalResultTargetIdentityV1
@@ -350,6 +351,48 @@ class EvalResultProjectionV1(_SchemaV1PortableModel):
                 "Eval result projection exceeds "
                 f"{EVAL_RESULT_PROJECTION_MAX_BYTES} canonical JSON bytes."
             )
+        return self
+
+
+class EvalResultProjectionV2(EvalResultProjectionV1):
+    """Current comparison projection with exact trial and exposure identity."""
+
+    schema_version: Literal[2] = EVAL_RESULT_PROJECTION_SCHEMA_VERSION
+    trial_policy_revision: StrictStr
+    accepted_exposure_revision: StrictStr | None = None
+    accepted_exposure_comparison_revision: StrictStr | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 2.")
+        return value
+
+    @field_validator(
+        "trial_policy_revision",
+        "accepted_exposure_revision",
+        "accepted_exposure_comparison_revision",
+    )
+    @classmethod
+    def validate_v2_revisions(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_exposure_origin(self) -> EvalResultProjectionV2:
+        if (self.accepted_exposure_revision is None) != (
+            self.accepted_exposure_comparison_revision is None
+        ):
+            raise ValueError(
+                "Accepted work exposure requires exact and comparison revisions together."
+            )
+        if (
+            self.origin == EvalResultOrigin.CAPTURED_SESSION
+            and self.accepted_exposure_revision is not None
+        ):
+            raise ValueError("Captured-session projections cannot carry accepted work exposure.")
         return self
 
 
@@ -430,7 +473,7 @@ def validate_captured_result_for_corpus(
 
 def eval_result_projection(
     result: CorpusExecutionResult | CapturedEvaluationResultV1,
-) -> EvalResultProjectionV1:
+) -> EvalResultProjectionV2:
     """Project either immutable result origin into one comparison contract."""
 
     if type(result) is CorpusExecutionResult:
@@ -447,7 +490,7 @@ def eval_result_projection(
             )
             for case in run.cases
         )
-        return EvalResultProjectionV1(
+        return EvalResultProjectionV2(
             result_revision=validated_fresh.revision,
             origin=EvalResultOrigin.FRESH_EXECUTION,
             target=EvalResultTargetIdentityV1.from_fresh_target(validated_fresh.target),
@@ -461,6 +504,13 @@ def eval_result_projection(
             suite_revision=run.suite_revision,
             evidence_policy_revision=run.evidence_policy_revision,
             pricing_profile_fingerprint=run.pricing_profile_fingerprint,
+            trial_policy_revision=run.trial_policy.revision,
+            accepted_exposure_revision=(
+                None if run.accepted_exposure is None else run.accepted_exposure.revision
+            ),
+            accepted_exposure_comparison_revision=(
+                None if run.accepted_exposure is None else run.accepted_exposure.comparison_revision
+            ),
             uses_pricing=any(
                 assertion.detail.kind == "max_estimated_cost"
                 for case in run.cases
@@ -489,7 +539,7 @@ def eval_result_projection(
                 }[score.status],
             ),
         )
-        return EvalResultProjectionV1(
+        return EvalResultProjectionV2(
             result_revision=validated_captured.revision,
             origin=EvalResultOrigin.CAPTURED_SESSION,
             target=validated_captured.target,
@@ -498,6 +548,7 @@ def eval_result_projection(
             suite_revision=validated_captured.suite_revision,
             evidence_policy_revision=score.evidence_policy_revision,
             pricing_profile_fingerprint=score.pricing_profile_fingerprint,
+            trial_policy_revision=EvalSuiteTrialPolicyV1.create().revision,
             uses_pricing=any(
                 assertion.detail.kind == "max_estimated_cost" for assertion in score.assertions
             ),

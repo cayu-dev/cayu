@@ -44,15 +44,18 @@ from cayu.evals.published import (
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.result_presentation import (
     EvalAssertionPresentationV1,
-    EvalResultPresentationV1,
+    EvalResultPresentationV2,
     EvalStructuredJudgePresentationV1,
     present_eval_result,
 )
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
+    EvalResultOrigin,
     EvalResultProjectionV1,
+    EvalResultProjectionV2,
     eval_result_projection,
 )
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 
 
 class CorpusComparisonReason(StrEnum):
@@ -65,6 +68,8 @@ class CorpusComparisonReason(StrEnum):
     SUITE_REVISION_MISMATCH = "suite_revision_mismatch"
     EVIDENCE_POLICY_REVISION_MISMATCH = "evidence_policy_revision_mismatch"
     PRICING_PROFILE_FINGERPRINT_MISMATCH = "pricing_profile_fingerprint_mismatch"
+    TRIAL_POLICY_REVISION_MISMATCH = "trial_policy_revision_mismatch"
+    ACCEPTED_EXPOSURE_CONTRACT_MISMATCH = "accepted_exposure_contract_mismatch"
     CASE_CONTRACT_MISMATCH = "case_contract_mismatch"
     ASSERTION_CONTRACT_MISMATCH = "assertion_contract_mismatch"
 
@@ -84,6 +89,7 @@ class CorpusRegressionKind(StrEnum):
 
     STATUS = "status"
     SCORE = "score"
+    RELIABILITY = "reliability"
 
 
 _STATUS_SEVERITY: dict[PublishedStatus, int] = {
@@ -126,6 +132,21 @@ EvalToolJsonComparisonState = Literal[
     "source_detail_unavailable",
 ]
 EvalToolJsonObservedValueChange = Literal["changed", "unchanged", "unavailable"]
+CorpusReliabilityChange = Literal["improved", "regressed", "changed", "unchanged"]
+
+
+_UNAVAILABLE_TRIAL_DIAGNOSTICS = frozenset(
+    {
+        EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.INTERRUPTED_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.CHILD_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNAVAILABLE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNKNOWN,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_INCOMPLETE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_IDENTITY_MISMATCH,
+    }
+)
 
 
 def _canonical_signed_decimal(value: Decimal) -> str:
@@ -596,6 +617,9 @@ class CorpusComparisonResultSummary(BaseModel):
     suite_revision: StrictStr
     evidence_policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None
+    trial_policy_revision: StrictStr
+    accepted_exposure_revision: StrictStr | None
+    accepted_exposure_comparison_revision: StrictStr | None
     memory_attribution_support: Literal["unsupported"] = "unsupported"
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
@@ -607,6 +631,9 @@ class CorpusComparisonResultSummary(BaseModel):
         "suite_revision",
         "evidence_policy_revision",
         "pricing_profile_fingerprint",
+        "trial_policy_revision",
+        "accepted_exposure_revision",
+        "accepted_exposure_comparison_revision",
     )
     @classmethod
     def validate_revisions(cls, value: str | None, info) -> str | None:
@@ -634,10 +661,119 @@ class CorpusComparisonResultSummary(BaseModel):
         return value
 
     @model_validator(mode="after")
+    def validate_exposure_revisions(self) -> CorpusComparisonResultSummary:
+        if (self.accepted_exposure_revision is None) != (
+            self.accepted_exposure_comparison_revision is None
+        ):
+            raise ValueError(
+                "Accepted work exposure requires exact and comparison revisions together."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_score(self) -> CorpusComparisonResultSummary:
         if (self.status in {"unavailable", "error"}) != (self.score is None):
             raise ValueError("Comparison result status contradicts its score.")
         return self
+
+
+class CorpusReliabilityDistributionV1(BaseModel):
+    """Lossless trial-outcome counts used for cross-release reliability decisions."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    total_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    passed_trials: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_TRIALS)
+    candidate_failed_trials: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_TRIALS)
+    runtime_error_trials: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_TRIALS)
+    evaluator_error_trials: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_TRIALS)
+    unavailable_trials: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_TRIALS)
+    cancelled_trials: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_TRIALS)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 1.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_distribution(self) -> CorpusReliabilityDistributionV1:
+        classified = (
+            self.passed_trials
+            + self.candidate_failed_trials
+            + self.runtime_error_trials
+            + self.evaluator_error_trials
+            + self.unavailable_trials
+            + self.cancelled_trials
+        )
+        if classified != self.total_trials:
+            raise ValueError("Reliability counts must classify every retained trial once.")
+        return self
+
+    @classmethod
+    def from_diagnostic_codes(
+        cls,
+        codes: tuple[EvalTrialDiagnosticCode, ...],
+    ) -> CorpusReliabilityDistributionV1:
+        if not codes:
+            raise ValueError("Reliability comparison requires retained trial diagnostics.")
+        passed = candidate_failed = runtime_errors = evaluator_errors = unavailable = 0
+        cancelled = 0
+        for code in codes:
+            if type(code) is not EvalTrialDiagnosticCode:
+                raise TypeError("Reliability diagnostics must be EvalTrialDiagnosticCode values.")
+            if code is EvalTrialDiagnosticCode.PASSED:
+                passed += 1
+            elif code is EvalTrialDiagnosticCode.ASSERTION_FAILED:
+                candidate_failed += 1
+            elif code is EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED:
+                evaluator_errors += 1
+            elif code is EvalTrialDiagnosticCode.EXTERNAL_TARGET_CANCELLED:
+                cancelled += 1
+            elif code in _UNAVAILABLE_TRIAL_DIAGNOSTICS:
+                unavailable += 1
+            else:
+                runtime_errors += 1
+        return cls(
+            total_trials=len(codes),
+            passed_trials=passed,
+            candidate_failed_trials=candidate_failed,
+            runtime_error_trials=runtime_errors,
+            evaluator_error_trials=evaluator_errors,
+            unavailable_trials=unavailable,
+            cancelled_trials=cancelled,
+        )
+
+
+def _reliability_severity(
+    distribution: CorpusReliabilityDistributionV1,
+) -> tuple[int, int, int]:
+    hard_errors = distribution.runtime_error_trials + distribution.evaluator_error_trials
+    unavailable = hard_errors + distribution.unavailable_trials + distribution.cancelled_trials
+    return (
+        hard_errors,
+        unavailable,
+        unavailable + distribution.candidate_failed_trials,
+    )
+
+
+def _reliability_change(
+    baseline: CorpusReliabilityDistributionV1,
+    current: CorpusReliabilityDistributionV1,
+) -> CorpusReliabilityChange:
+    if baseline.total_trials != current.total_trials:
+        raise ValueError("Comparable reliability distributions require equal trial counts.")
+    if baseline == current:
+        return "unchanged"
+    baseline_severity = _reliability_severity(baseline)
+    current_severity = _reliability_severity(current)
+    if current_severity > baseline_severity:
+        return "regressed"
+    if current_severity < baseline_severity:
+        return "improved"
+    return "changed"
 
 
 class CorpusCaseComparison(BaseModel):
@@ -660,6 +796,9 @@ class CorpusCaseComparison(BaseModel):
         max_length=EVAL_CORPUS_MAX_TRIALS,
         exclude_if=lambda value: not value,
     )
+    baseline_reliability: CorpusReliabilityDistributionV1
+    current_reliability: CorpusReliabilityDistributionV1
+    reliability_change: CorpusReliabilityChange
 
     @field_validator("case_id")
     @classmethod
@@ -679,6 +818,17 @@ class CorpusCaseComparison(BaseModel):
             raise ValueError("Trial diagnostic codes must be an ordered array.")
         return value
 
+    @field_validator("baseline_reliability", "current_reliability", mode="before")
+    @classmethod
+    def copy_reliability(cls, value: object) -> object:
+        if type(value) is CorpusReliabilityDistributionV1:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "Reliability must be an exact CorpusReliabilityDistributionV1 or JSON object."
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_scores(self) -> CorpusCaseComparison:
         for label, status, score in (
@@ -687,6 +837,19 @@ class CorpusCaseComparison(BaseModel):
         ):
             if (status in {"unavailable", "error"}) != (score is None):
                 raise ValueError(f"{label} case status contradicts its score.")
+        expected_baseline = CorpusReliabilityDistributionV1.from_diagnostic_codes(
+            self.baseline_trial_diagnostic_codes
+        )
+        expected_current = CorpusReliabilityDistributionV1.from_diagnostic_codes(
+            self.current_trial_diagnostic_codes
+        )
+        if self.baseline_reliability != expected_baseline:
+            raise ValueError("Baseline reliability contradicts retained trial diagnostics.")
+        if self.current_reliability != expected_current:
+            raise ValueError("Current reliability contradicts retained trial diagnostics.")
+        expected_change = _reliability_change(expected_baseline, expected_current)
+        if self.reliability_change != expected_change:
+            raise ValueError("Reliability change contradicts retained trial distributions.")
         return self
 
 
@@ -702,12 +865,25 @@ class CorpusExecutionRegression(BaseModel):
     current_status: PublishedStatus | None = None
     baseline_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    baseline_reliability: CorpusReliabilityDistributionV1 | None = None
+    current_reliability: CorpusReliabilityDistributionV1 | None = None
 
     @field_validator("case_id")
     @classmethod
     def validate_case_id(cls, value: str | None) -> str | None:
         if value is not None and (value != value.strip() or not value.isprintable()):
             raise ValueError("case_id must be clean nonblank text.")
+        return value
+
+    @field_validator("baseline_reliability", "current_reliability", mode="before")
+    @classmethod
+    def copy_reliability(cls, value: object) -> object:
+        if type(value) is CorpusReliabilityDistributionV1:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "Reliability must be an exact CorpusReliabilityDistributionV1 or JSON object."
+            )
         return value
 
     @model_validator(mode="after")
@@ -719,15 +895,36 @@ class CorpusExecutionRegression(BaseModel):
                 raise ValueError("Status regressions require both statuses.")
             if self.baseline_score is not None or self.current_score is not None:
                 raise ValueError("Status regressions cannot carry scores.")
+            if self.baseline_reliability is not None or self.current_reliability is not None:
+                raise ValueError("Status regressions cannot carry reliability distributions.")
             if _STATUS_SEVERITY[self.current_status] <= _STATUS_SEVERITY[self.baseline_status]:
                 raise ValueError("A status regression must move to a worse status.")
-        else:
+        elif self.kind is CorpusRegressionKind.SCORE:
             if self.baseline_score is None or self.current_score is None:
                 raise ValueError("Score regressions require both scores.")
             if self.baseline_status is not None or self.current_status is not None:
                 raise ValueError("Score regressions cannot carry statuses.")
+            if self.baseline_reliability is not None or self.current_reliability is not None:
+                raise ValueError("Score regressions cannot carry reliability distributions.")
             if self.current_score >= self.baseline_score:
                 raise ValueError("A score regression must lower the score.")
+        else:
+            baseline = self.baseline_reliability
+            current = self.current_reliability
+            if baseline is None or current is None:
+                raise ValueError("Reliability regressions require both distributions.")
+            if any(
+                value is not None
+                for value in (
+                    self.baseline_status,
+                    self.current_status,
+                    self.baseline_score,
+                    self.current_score,
+                )
+            ):
+                raise ValueError("Reliability regressions cannot carry statuses or scores.")
+            if _reliability_change(baseline, current) != "regressed":
+                raise ValueError("A reliability regression must worsen the trial distribution.")
         return self
 
 
@@ -736,7 +933,7 @@ class CorpusExecutionComparison(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
     compatibility: CorpusComparisonCompatibility
     score_tolerance: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
     baseline: CorpusComparisonResultSummary
@@ -744,7 +941,7 @@ class CorpusExecutionComparison(BaseModel):
     cases: tuple[CorpusCaseComparison, ...] = Field(default_factory=tuple, max_length=1_000)
     regressions: tuple[CorpusExecutionRegression, ...] = Field(
         default_factory=tuple,
-        max_length=2_002,
+        max_length=3_002,
     )
     structured_judge_comparison_state: EvalStructuredJudgeComparisonState
     structured_judgments: tuple[EvalStructuredJudgeComparisonV1, ...] = Field(
@@ -771,7 +968,7 @@ class CorpusExecutionComparison(BaseModel):
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 3.")
+            raise ValueError("schema_version must be the integer 4.")
         return value
 
     @field_validator(
@@ -909,6 +1106,7 @@ class _CaseOutcome:
 @dataclass(frozen=True)
 class _ExecutionProjection:
     result_revision: str
+    origin: EvalResultOrigin
     target_key: str
     external_target_revision: str | None
     corpus_revision: str
@@ -916,6 +1114,9 @@ class _ExecutionProjection:
     suite_revision: str
     evidence_policy_revision: str
     pricing_profile_fingerprint: str | None
+    trial_policy_revision: str
+    accepted_exposure_revision: str | None
+    accepted_exposure_comparison_revision: str | None
     uses_pricing: bool
     case_contract: tuple[tuple[str, str], ...]
     assertion_contract: tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]
@@ -946,7 +1147,7 @@ class _ToolJsonObservation:
 
 
 def _structured_observations(
-    presentation: EvalResultPresentationV1,
+    presentation: EvalResultPresentationV2,
 ) -> tuple[_StructuredObservation, ...]:
     observations = tuple(
         _StructuredObservation(
@@ -966,8 +1167,14 @@ def _structured_observations(
 
 
 def _structured_comparison(
-    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
-    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    baseline: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
+    current: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
     *,
     comparable: bool,
     score_tolerance: float,
@@ -978,7 +1185,10 @@ def _structured_comparison(
 ]:
     if not comparable:
         return "contract_incompatible", (), ()
-    if type(baseline) is EvalResultProjectionV1 or type(current) is EvalResultProjectionV1:
+    if type(baseline) in {EvalResultProjectionV1, EvalResultProjectionV2} or type(current) in {
+        EvalResultProjectionV1,
+        EvalResultProjectionV2,
+    }:
         return "source_detail_unavailable", (), ()
     baseline_presentation = present_eval_result(
         cast("CorpusExecutionResult | CapturedEvaluationResultV1", baseline)
@@ -1094,8 +1304,14 @@ def _tool_json_observations(
 
 
 def _tool_json_comparison(
-    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
-    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    baseline: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
+    current: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
     *,
     comparable: bool,
 ) -> tuple[
@@ -1105,7 +1321,10 @@ def _tool_json_comparison(
 ]:
     if not comparable:
         return "contract_incompatible", (), ()
-    if type(baseline) is EvalResultProjectionV1 or type(current) is EvalResultProjectionV1:
+    if type(baseline) in {EvalResultProjectionV1, EvalResultProjectionV2} or type(current) in {
+        EvalResultProjectionV1,
+        EvalResultProjectionV2,
+    }:
         return "source_detail_unavailable", (), ()
     validated_baseline = cast("CorpusExecutionResult | CapturedEvaluationResultV1", baseline)
     validated_current = cast("CorpusExecutionResult | CapturedEvaluationResultV1", current)
@@ -1178,14 +1397,29 @@ def _tool_json_comparison(
 
 
 def _validated_projection(
-    result: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    result: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
     field_name: str,
 ) -> _ExecutionProjection:
     """Validate one potentially forged graph, then retain only bounded comparison data."""
 
-    if type(result) is EvalResultProjectionV1:
-        projection = EvalResultProjectionV1.model_validate(
+    if type(result) is EvalResultProjectionV2:
+        projection = EvalResultProjectionV2.model_validate(
             result.model_dump(mode="python", round_trip=True, warnings="none")
+        )
+    elif type(result) is EvalResultProjectionV1:
+        v1_projection = EvalResultProjectionV1.model_validate(
+            result.model_dump(mode="python", round_trip=True, warnings="none")
+        )
+        trial_counts = {len(case.trial_diagnostic_codes) for case in v1_projection.cases}
+        if len(trial_counts) != 1:
+            raise ValueError("V1 result projection has inconsistent suite trial counts.")
+        trial_policy = EvalSuiteTrialPolicyV1.create(trial_count=trial_counts.pop())
+        projection = EvalResultProjectionV2(
+            **v1_projection.model_dump(mode="python", exclude={"schema_version"}),
+            trial_policy_revision=trial_policy.revision,
         )
     elif type(result) in {CorpusExecutionResult, CapturedEvaluationResultV1}:
         projection = eval_result_projection(
@@ -1194,7 +1428,7 @@ def _validated_projection(
     else:
         raise TypeError(
             f"{field_name} must be an exact CorpusExecutionResult, "
-            "CapturedEvaluationResultV1, or EvalResultProjectionV1."
+            "CapturedEvaluationResultV1, EvalResultProjectionV1, or EvalResultProjectionV2."
         )
     case_contract = tuple((case.case_id, case.case_revision) for case in projection.cases)
     assertion_contract = tuple(
@@ -1218,6 +1452,9 @@ def _validated_projection(
         suite_revision=projection.suite_revision,
         evidence_policy_revision=projection.evidence_policy_revision,
         pricing_profile_fingerprint=projection.pricing_profile_fingerprint,
+        trial_policy_revision=projection.trial_policy_revision,
+        accepted_exposure_revision=projection.accepted_exposure_revision,
+        accepted_exposure_comparison_revision=(projection.accepted_exposure_comparison_revision),
         memory_attribution_support=projection.memory_attribution_support,
         status=projection.status,
         score=projection.score,
@@ -1233,6 +1470,7 @@ def _validated_projection(
     )
     return _ExecutionProjection(
         result_revision=projection.result_revision,
+        origin=projection.origin,
         target_key=projection.target.target_key,
         external_target_revision=projection.external_target_revision,
         corpus_revision=projection.corpus_revision,
@@ -1240,6 +1478,9 @@ def _validated_projection(
         suite_revision=projection.suite_revision,
         evidence_policy_revision=projection.evidence_policy_revision,
         pricing_profile_fingerprint=projection.pricing_profile_fingerprint,
+        trial_policy_revision=projection.trial_policy_revision,
+        accepted_exposure_revision=projection.accepted_exposure_revision,
+        accepted_exposure_comparison_revision=(projection.accepted_exposure_comparison_revision),
         uses_pricing=projection.uses_pricing,
         case_contract=case_contract,
         assertion_contract=assertion_contract,
@@ -1269,6 +1510,14 @@ def _compatibility_from_projections(
         baseline.pricing_profile_fingerprint != current.pricing_profile_fingerprint
     ):
         reasons.add(CorpusComparisonReason.PRICING_PROFILE_FINGERPRINT_MISMATCH)
+    if baseline.trial_policy_revision != current.trial_policy_revision:
+        reasons.add(CorpusComparisonReason.TRIAL_POLICY_REVISION_MISMATCH)
+    if (
+        baseline.origin == current.origin == EvalResultOrigin.FRESH_EXECUTION
+        and baseline.accepted_exposure_comparison_revision
+        != current.accepted_exposure_comparison_revision
+    ):
+        reasons.add(CorpusComparisonReason.ACCEPTED_EXPOSURE_CONTRACT_MISMATCH)
     if baseline.case_contract != current.case_contract:
         reasons.add(CorpusComparisonReason.CASE_CONTRACT_MISMATCH)
     if baseline.assertion_contract != current.assertion_contract:
@@ -1295,8 +1544,14 @@ def corpus_execution_compatibility(
 
 
 def eval_result_compatibility(
-    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
-    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    baseline: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
+    current: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
 ) -> CorpusComparisonCompatibility:
     """Check compatibility across captured and fresh immutable result origins."""
 
@@ -1374,12 +1629,28 @@ def _regressions_from_summaries(
                 score_tolerance=score_tolerance,
             )
         )
+        if case.reliability_change == "regressed":
+            regressions.append(
+                CorpusExecutionRegression(
+                    scope=CorpusRegressionScope.CASE,
+                    kind=CorpusRegressionKind.RELIABILITY,
+                    case_id=case.case_id,
+                    baseline_reliability=case.baseline_reliability,
+                    current_reliability=case.current_reliability,
+                )
+            )
     return tuple(regressions)
 
 
 def _compare_projected_results(
-    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
-    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    baseline: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
+    current: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
     *,
     score_tolerance: float,
 ) -> CorpusExecutionComparison:
@@ -1417,22 +1688,36 @@ def _compare_projected_results(
             tool_json_assertions=tool_json_assertions,
             tool_json_observation_mismatches=tool_json_mismatches,
         )
-    cases = tuple(
-        CorpusCaseComparison(
-            case_id=baseline_case.case_id,
-            baseline_status=baseline_case.status,
-            current_status=current_case.status,
-            baseline_score=baseline_case.score,
-            current_score=current_case.score,
-            baseline_trial_diagnostic_codes=baseline_case.trial_diagnostic_codes,
-            current_trial_diagnostic_codes=current_case.trial_diagnostic_codes,
+    compared_cases: list[CorpusCaseComparison] = []
+    for baseline_case, current_case in zip(
+        baseline_projection.cases,
+        current_projection.cases,
+        strict=True,
+    ):
+        baseline_reliability = CorpusReliabilityDistributionV1.from_diagnostic_codes(
+            baseline_case.trial_diagnostic_codes
         )
-        for baseline_case, current_case in zip(
-            baseline_projection.cases,
-            current_projection.cases,
-            strict=True,
+        current_reliability = CorpusReliabilityDistributionV1.from_diagnostic_codes(
+            current_case.trial_diagnostic_codes
         )
-    )
+        compared_cases.append(
+            CorpusCaseComparison(
+                case_id=baseline_case.case_id,
+                baseline_status=baseline_case.status,
+                current_status=current_case.status,
+                baseline_score=baseline_case.score,
+                current_score=current_case.score,
+                baseline_trial_diagnostic_codes=baseline_case.trial_diagnostic_codes,
+                current_trial_diagnostic_codes=current_case.trial_diagnostic_codes,
+                baseline_reliability=baseline_reliability,
+                current_reliability=current_reliability,
+                reliability_change=_reliability_change(
+                    baseline_reliability,
+                    current_reliability,
+                ),
+            )
+        )
+    cases = tuple(compared_cases)
     regressions = _regressions_from_summaries(
         baseline_summary,
         current_summary,
@@ -1475,8 +1760,14 @@ def compare_corpus_execution_results(
 
 
 def compare_eval_results(
-    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
-    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    baseline: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
+    current: CorpusExecutionResult
+    | CapturedEvaluationResultV1
+    | EvalResultProjectionV1
+    | EvalResultProjectionV2,
     *,
     score_tolerance: float = 0.0,
 ) -> CorpusExecutionComparison:

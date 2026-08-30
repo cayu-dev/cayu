@@ -16,6 +16,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.evals.assertions import EvalAssertion, _message_text
 from cayu.evals.corpus import (
+    _MODEL_JUDGE_RESULT_METADATA_KEY,
     _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS,
     StructuredRubricV1,
@@ -85,6 +86,13 @@ class LLMJudge(EvalAssertion):
         rubric_version: str | None = None,
         include_transcript: bool = False,
         name: str | None = None,
+        timeout_seconds: int | None = None,
+        max_input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+        max_total_tokens: int | None = None,
+        max_estimated_cost: str | None = None,
+        cost_currency: str | None = None,
+        price_book: PriceBook | None = None,
     ) -> None:
         if not isinstance(app, CayuApp):
             raise TypeError("LLMJudge requires a CayuApp to run the judge model.")
@@ -99,6 +107,45 @@ class LLMJudge(EvalAssertion):
         self._threshold = float(threshold)
         self._include_transcript = bool(include_transcript)
         self._name = None if name is None else require_clean_nonblank(name, "name")
+        limit_values = (
+            timeout_seconds,
+            max_input_tokens,
+            max_output_tokens,
+            max_total_tokens,
+        )
+        if any(value is None for value in limit_values) and any(
+            value is not None for value in limit_values
+        ):
+            raise ValueError("Judge runtime limits must be supplied together.")
+        if timeout_seconds is None:
+            self._timeout_seconds = None
+            self._run_limits = None
+        else:
+            self._timeout_seconds = timeout_seconds
+            self._run_limits = RunLimits(
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+                max_total_tokens=max_total_tokens,
+                max_tool_calls=1,
+                max_elapsed_seconds=timeout_seconds,
+                scope="run",
+            )
+        if max_estimated_cost is None:
+            if price_book is not None or cost_currency is not None:
+                raise ValueError("Judge pricing requires a configured cost ceiling.")
+            self._budget_limit = None
+            self._price_book = None
+        else:
+            if type(price_book) is not PriceBook or cost_currency is None:
+                raise TypeError("A judge cost ceiling requires an exact PriceBook and currency.")
+            self._budget_limit = BudgetLimit(
+                scope="run",
+                max_estimated_cost=Decimal(max_estimated_cost),
+                pricing=copy_price_book(price_book),
+                currency=cost_currency,
+                allow_unpriced=False,
+            )
+            self._price_book = copy_price_book(price_book)
 
     @property
     def name(self) -> str:
@@ -133,25 +180,43 @@ class LLMJudge(EvalAssertion):
         )
         session_id: str | None = None
         tool_call_observed = False
+        events: list[Event] = []
         try:
             try:
-                async for event in self._app.run(
-                    RunRequest(
+                budget_limits = () if self._budget_limit is None else (self._budget_limit,)
+                tool_ceiling = ToolCapabilityCeiling(tool_names=())
+                if self._run_limits is None:
+                    request = RunRequest(
                         agent_name=self._agent_name,
                         messages=[Message.text("user", prompt)],
                         max_steps=1,
-                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                        budget_limits=budget_limits,
+                        tool_capability_ceiling=tool_ceiling,
                     )
-                ):
-                    session_id = session_id or event.session_id
-                    # Defense in depth: the zero-tool ceiling prevents execution; this
-                    # post-hoc check also rejects a provider that fabricated a hidden call.
-                    if str(event.type).startswith("tool.call."):
-                        tool_call_observed = True
-                if session_id is None:
-                    return self.error("Judge run produced no session.")
-                transcript = await self._app.session_store.load_transcript(session_id)
-                session = await self._app.session_store.load(session_id)
+                else:
+                    request = RunRequest(
+                        agent_name=self._agent_name,
+                        messages=[Message.text("user", prompt)],
+                        max_steps=1,
+                        limits=self._run_limits,
+                        budget_limits=budget_limits,
+                        tool_capability_ceiling=tool_ceiling,
+                    )
+                async with asyncio.timeout(self._timeout_seconds):
+                    async for event in self._app.run(request):
+                        events.append(event)
+                        session_id = session_id or event.session_id
+                        # Defense in depth: the zero-tool ceiling prevents execution; this
+                        # post-hoc check also rejects a provider that fabricated a hidden call.
+                        if str(event.type).startswith("tool.call."):
+                            tool_call_observed = True
+                    if session_id is None:
+                        return self.error("Judge run produced no session.")
+                    transcript = await self._app.session_store.load_transcript(session_id)
+                    session = await self._app.session_store.load(session_id)
+            except TimeoutError:
+                audit = await self._failure_audit_metadata(prompt, session_id)
+                return self.error("Judge exceeded its timeout ceiling.", metadata=audit)
             except Exception as exc:
                 audit = await self._failure_audit_metadata(prompt, session_id)
                 return self.error(
@@ -181,12 +246,58 @@ class LLMJudge(EvalAssertion):
                 f"Judge did not return a parseable score: {text[:_ERROR_PREVIEW]!r}",
                 metadata=audit,
             )
+        accounting = self._accounting_metadata(session_id, events)
+        if accounting is None and (self._run_limits is not None or self._budget_limit is not None):
+            return self.error("Judge usage or cost evidence was unavailable.", metadata=audit)
+        if accounting is not None:
+            audit[_MODEL_JUDGE_RESULT_METADATA_KEY] = accounting
         return self.score_result(
             score,
             threshold=self._threshold,
             message=rationale or f"Judge score {score}.",
             metadata={**audit, "score": score, "rationale": rationale},
         )
+
+    def _accounting_metadata(
+        self,
+        session_id: str,
+        events: list[Event],
+    ) -> dict[str, object] | None:
+        usage = session_usage_summary(session_id, events)
+        if usage.model_steps != 1 or not usage.provider_names:
+            return None
+        cost: dict[str, object]
+        if self._price_book is None:
+            cost = {"availability": "unavailable"}
+        else:
+            summary = estimate_session_cost(
+                session_id=session_id,
+                events=events,
+                pricing=self._price_book,
+                currency=self._budget_limit.currency if self._budget_limit is not None else "USD",
+            )
+            if summary.unpriced_model_steps:
+                return None
+            try:
+                estimated_cost = _canonical_unitless_decimal(summary.total_cost)
+            except ValueError:
+                return None
+            cost = {
+                "availability": "priced",
+                "currency": summary.currency,
+                "estimated_cost": estimated_cost,
+                "priced_model_steps": summary.priced_model_steps,
+                "unpriced_model_steps": summary.unpriced_model_steps,
+            }
+        return {
+            "usage": {
+                "model_steps": usage.model_steps,
+                "input_tokens": usage.usage.input_tokens,
+                "output_tokens": usage.usage.output_tokens,
+                "total_tokens": usage.usage.total_tokens,
+            },
+            "cost": cost,
+        }
 
     async def _delete_judge_session(self, session_id: str | None) -> None:
         # The judge session is scratch — one per assertion, so a nightly suite would

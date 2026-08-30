@@ -43,6 +43,7 @@ from cayu.evals.corpus import (
     EvaluationEvidencePolicySpec,
     EvaluationSourceIdentityV1,
     FinalOutputEqualsAssertionSpec,
+    JudgePrivacyPolicyV1,
     MaxEstimatedCostAssertionSpec,
     ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
@@ -61,9 +62,11 @@ from cayu.evals.execution import (
     CorpusExecutionResult,
     CorpusTarget,
     ModelJudgeTarget,
+    _run_compiled_corpus_suite,
     compile_corpus_suite,
     evaluation_target_identity,
     model_judge_implementation_revision,
+    model_judge_profile,
     run_corpus_suite,
 )
 from cayu.evals.execution_comparison import (
@@ -86,6 +89,7 @@ from cayu.evals.execution_reporting import (
 from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
 from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.runner import EvalPlan, run_eval_plan
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.memory import AutomaticRecallPolicy
 from cayu.memory_evidence import ContextExposureState
 from cayu.recall import (
@@ -295,10 +299,20 @@ def _model_judge_target(
     model: str = "judge-model",
     system_prompt: str | None = None,
     provider_options: dict | None = None,
+    **target_options,
 ) -> tuple[ModelJudgeTarget, ScriptedModelProvider]:
     batch = (
         ModelStreamEvent.text_delta(output),
-        ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "total_tokens": 3,
+                },
+            }
+        ),
     )
     provider = ScriptedModelProvider([batch for _ in range(requests)])
     app = CayuApp(enable_logging=False)
@@ -312,7 +326,15 @@ def _model_judge_target(
         ),
         tools=list(tools),
     )
-    return ModelJudgeTarget(key="quality-judge", app=app, agent_name="judge"), provider
+    return (
+        ModelJudgeTarget(
+            key="quality-judge",
+            app=app,
+            agent_name="judge",
+            **target_options,
+        ),
+        provider,
+    )
 
 
 class _DangerousJudgeTool(Tool):
@@ -545,7 +567,7 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
 
     assert result.target == evaluation_target_identity(target)
     assert result.schema_version == 3
-    assert result.run.schema_version == 8
+    assert result.run.schema_version == 9
     assert result.target.application_release_id == "release-2026-08-06"
     assert result.target.app_manifest_fingerprint == target.app.describe().fingerprint
     assert result.run.corpus_revision == corpus.revision
@@ -768,12 +790,62 @@ def test_run_corpus_suite_resolves_trusted_model_judge_and_publishes_its_contrac
     assert assertion.detail.threshold == 0.7
     assert assertion.detail.include_transcript is False
     assert assertion.detail.diagnostic == "judgment_recorded"
+    assert assertion.detail.judge_profile == model_judge_profile(judge)
+    assert assertion.detail.candidate_route_relation == "independent_model"
+    assert assertion.detail.usage.model_steps == 1
+    assert assertion.detail.usage.input_tokens == 2
+    assert assertion.detail.usage.output_tokens == 1
+    assert assertion.detail.usage.total_tokens == 3
+    assert assertion.detail.cost.availability == "unavailable"
+    presented = present_eval_result(result).cases[0].trials[0].assertions[0]
+    assert presented.model_judge == assertion.detail
+    assert "Observed usage: 1 model step(s), 2 input, 1 output, 3 total token(s)" in (
+        render_corpus_execution_html(result)
+    )
     published = result.model_dump_json()
     assert "judge_output" not in published
     assert "judge_provider" not in published
     assert "rationale" not in published
     assert len(candidate_provider.requests) == 1
     assert len(judge_provider.requests) == 1
+
+
+def test_portable_model_judge_publishes_exact_priced_accounting():
+    prices = PriceBook(
+        price_book_version="judge-prices-v1",
+        generated_at="2026-08-30T00:00:00Z",
+        prices=(
+            ModelPrice.fixed(
+                provider_name="scripted",
+                model="judge-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+            ),
+        ),
+    )
+    judge, _ = _model_judge_target(
+        max_estimated_cost="0.1",
+        price_book=prices,
+    )
+    result = asyncio.run(
+        run_corpus_suite(
+            _target(_provider(trials=1), model_judges=(judge,)),
+            _model_judge_corpus(judge),
+            "refund-regressions",
+        )
+    )
+
+    detail = result.run.cases[0].trials[0].assertions[0].detail
+    assert detail.cost.availability == "priced"
+    assert detail.cost.currency == "USD"
+    assert detail.cost.estimated_cost == "0.000004"
+    assert detail.cost.priced_model_steps == detail.usage.model_steps == 1
+    assert detail.cost.unpriced_model_steps == 0
+
+    missing_usage = detail.model_dump(mode="python")
+    missing_usage["usage"] = None
+    with pytest.raises(ValidationError, match="require judge usage and cost"):
+        type(detail).model_validate(missing_usage)
 
 
 def test_compile_corpus_suite_rejects_unknown_model_judge_before_dispatch():
@@ -830,7 +902,12 @@ def test_portable_model_judge_neutralizes_candidate_delimiters_and_has_no_tools(
 
 
 def test_portable_model_judge_uses_redacted_candidate_material():
-    judge, judge_provider = _model_judge_target()
+    judge, judge_provider = _model_judge_target(
+        privacy_policy=JudgePrivacyPolicyV1.create(
+            key="candidate-transcript",
+            allow_transcript=True,
+        )
+    )
     target = _target(
         _provider(trials=1, output="Approved secret-token"),
         model_judges=(judge,),
@@ -849,6 +926,49 @@ def test_portable_model_judge_uses_redacted_candidate_material():
     prompt = judge_provider.requests[0].messages[-1].content[0].text
     assert "secret-token" not in prompt
     assert "Approved [REDACTED_SECRET]" in prompt
+
+
+def test_portable_model_judge_enforces_its_exact_token_profile():
+    judge, _ = _model_judge_target(
+        max_input_tokens=1,
+        max_output_tokens=10,
+        max_total_tokens=10,
+    )
+    target = _target(_provider(trials=1), model_judges=(judge,))
+
+    result = asyncio.run(run_corpus_suite(target, _model_judge_corpus(judge), "refund-regressions"))
+
+    assertion = result.run.cases[0].trials[0].assertions[0]
+    assert assertion.outcome == "error"
+    assert assertion.score is None
+    assert assertion.detail.diagnostic == "evaluator_error"
+
+
+def test_portable_model_judge_enforces_its_exact_cost_profile():
+    prices = PriceBook(
+        price_book_version="judge-prices-v1",
+        generated_at="2026-08-30T00:00:00Z",
+        prices=(
+            ModelPrice.fixed(
+                provider_name="scripted",
+                model="judge-model",
+                input_per_million=Decimal("1000000"),
+                output_per_million=Decimal("1000000"),
+            ),
+        ),
+    )
+    judge, _ = _model_judge_target(
+        max_estimated_cost="0.1",
+        price_book=prices,
+    )
+    target = _target(_provider(trials=1), model_judges=(judge,))
+
+    result = asyncio.run(run_corpus_suite(target, _model_judge_corpus(judge), "refund-regressions"))
+
+    assertion = result.run.cases[0].trials[0].assertions[0]
+    assert assertion.outcome == "error"
+    assert assertion.score is None
+    assert assertion.detail.diagnostic == "evaluator_error"
 
 
 def test_portable_model_judge_is_unavailable_when_output_exceeds_evidence_bound():
@@ -926,6 +1046,43 @@ def test_portable_model_judge_cancellation_propagates_to_external_judge_work():
         await asyncio.wait_for(judge_provider.cancelled.wait(), timeout=2)
 
     asyncio.run(exercise())
+
+
+def test_portable_model_judge_enforces_its_exact_timeout_profile():
+    class HangingJudgeProvider(ModelProvider):
+        name = "hanging-rubric-judge"
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def stream(self, request):
+            del request
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    provider = HangingJudgeProvider()
+    judge_app = CayuApp(enable_logging=False)
+    judge_app.register_provider(provider, default=True)
+    judge_app.register_agent(AgentSpec(name="judge", model="judge-model"))
+    judge = ModelJudgeTarget(
+        key="quality-judge",
+        app=judge_app,
+        agent_name="judge",
+        timeout_seconds=1,
+    )
+    target = _target(_provider(trials=1), model_judges=(judge,))
+
+    result = asyncio.run(run_corpus_suite(target, _model_judge_corpus(judge), "refund-regressions"))
+
+    assertion = result.run.cases[0].trials[0].assertions[0]
+    assert assertion.outcome == "error"
+    assert assertion.score is None
+    assert assertion.detail.diagnostic == "evaluator_error"
+    assert provider.cancelled is True
 
 
 def test_model_judge_contract_changes_make_execution_results_incomparable():
@@ -1076,12 +1233,19 @@ def test_corpus_execution_discards_raw_trial_output_before_publication(monkeypat
     retained_outputs: list[str] = []
     publish = execution_module._publish_eval_run_with_trial_public_data
 
-    def observe_internal_run(corpus, run, *, trial_public_data_by_case):
+    def observe_internal_run(
+        corpus,
+        run,
+        *,
+        trial_public_data_by_case,
+        accepted_exposure=None,
+    ):
         retained_outputs.extend(trial.final_output for case in run.cases for trial in case.trials)
         return publish(
             corpus,
             run,
             trial_public_data_by_case=trial_public_data_by_case,
+            accepted_exposure=accepted_exposure,
         )
 
     monkeypatch.setattr(
@@ -1357,6 +1521,9 @@ def test_published_execution_html_escapes_identity_and_shows_only_redacted_outpu
     assert "Memory attribution: complete" in report
     assert "limitations none" in report
     assert "lifecycle none" in report
+    assert "0 unavailable trial(s)" in report
+    assert "0 cancelled trial(s)" in report
+    assert "score min/mean/max 1.000/1.000/1.000 across 2 scored trial(s)" in report
     assert "record inspection is unsupported in HTML" in report
 
 
@@ -1498,7 +1665,17 @@ def test_concurrent_corpus_execution_keeps_output_projection_bound_to_each_case(
     corpus = EvalCorpusDocument.create(
         target_key=corpus.target_key,
         evidence_policy=corpus.evidence_policy,
-        suites=corpus.suites,
+        suites=(
+            EvalSuiteSpec.create(
+                id=corpus.suites[0].id,
+                name=corpus.suites[0].name,
+                trial_request=TrialRequestSpec(
+                    trials=1,
+                    timeout_seconds=corpus.suites[0].trial_request.timeout_seconds,
+                    trial_policy=EvalSuiteTrialPolicyV1.create(max_concurrency=2),
+                ),
+            ),
+        ),
         cases=(first, second),
     )
 
@@ -1586,6 +1763,11 @@ def test_contract_aware_comparison_reports_typed_regressions_across_releases():
         (CorpusRegressionScope.RUN, CorpusRegressionKind.SCORE, None),
         (CorpusRegressionScope.CASE, CorpusRegressionKind.STATUS, "refund-approval"),
         (CorpusRegressionScope.CASE, CorpusRegressionKind.SCORE, "refund-approval"),
+        (
+            CorpusRegressionScope.CASE,
+            CorpusRegressionKind.RELIABILITY,
+            "refund-approval",
+        ),
     ]
     serialized = corpus_execution_comparison_to_json(comparison)
     assert serialized == corpus_execution_comparison_to_json(comparison)
@@ -1602,7 +1784,117 @@ def test_contract_aware_comparison_reports_typed_regressions_across_releases():
     assert [item.kind for item in tolerant.regressions] == [
         CorpusRegressionKind.STATUS,
         CorpusRegressionKind.STATUS,
+        CorpusRegressionKind.RELIABILITY,
     ]
+
+
+def test_comparison_treats_a_worse_trial_distribution_as_a_regression():
+    trial_policy = EvalSuiteTrialPolicyV1.create(
+        trial_count=3,
+        minimum_passed_trials=2,
+        max_concurrency=1,
+    )
+    corpus = _corpus(trials=3)
+    suite = corpus.suites[0]
+    corpus = EvalCorpusDocument.create(
+        target_key=corpus.target_key,
+        evidence_policy=corpus.evidence_policy,
+        suites=(
+            EvalSuiteSpec.create(
+                id=suite.id,
+                name=suite.name,
+                trial_request=TrialRequestSpec(
+                    trials=3,
+                    timeout_seconds=30,
+                    trial_policy=trial_policy,
+                ),
+            ),
+        ),
+        cases=corpus.cases,
+    )
+
+    def provider(*outputs: str) -> ScriptedModelProvider:
+        return ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta(output),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+                for output in outputs
+            ]
+        )
+
+    baseline = asyncio.run(
+        run_corpus_suite(
+            _target(provider("Approved", "Approved", "Approved")),
+            corpus,
+            "refund-regressions",
+        )
+    )
+    current = asyncio.run(
+        run_corpus_suite(
+            _target(
+                provider("Approved", "Approved", "Denied"),
+                application_release_id="release-with-flake",
+            ),
+            corpus,
+            "refund-regressions",
+        )
+    )
+
+    comparison = compare_corpus_execution_results(baseline, current, score_tolerance=1.0)
+
+    case = comparison.cases[0]
+    assert case.baseline_status == case.current_status == "passed"
+    assert case.baseline_reliability.passed_trials == 3
+    assert case.current_reliability.passed_trials == 2
+    assert case.current_reliability.candidate_failed_trials == 1
+    assert case.reliability_change == "regressed"
+    assert [(item.scope, item.kind, item.case_id) for item in comparison.regressions] == [
+        (
+            CorpusRegressionScope.CASE,
+            CorpusRegressionKind.RELIABILITY,
+            "refund-approval",
+        )
+    ]
+    rendered = render_corpus_execution_comparison_html(comparison)
+    assert "3 passed, 0 candidate failed" in rendered
+    assert "2 passed, 1 candidate failed" in rendered
+
+
+def test_compiled_suite_resumes_only_missing_terminal_trials_after_publication_failure():
+    corpus = _corpus(trials=3)
+    compiled = compile_corpus_suite(corpus, _target(_provider(trials=1)), "refund-regressions")
+    retained = {}
+
+    async def checkpoint(case_id, result, public_data) -> None:
+        retained[(case_id, result.trial_number)] = (result, public_data)
+        raise RuntimeError("simulated process loss after durable checkpoint")
+
+    with pytest.raises(RuntimeError, match="simulated process loss after durable checkpoint"):
+        asyncio.run(
+            _run_compiled_corpus_suite(
+                _target(_provider(trials=1)),
+                compiled,
+                max_concurrency=1,
+                trial_completed=checkpoint,
+            )
+        )
+
+    assert tuple(retained) == (("refund-approval", 1),)
+    resumed_provider = _provider(trials=2)
+    resumed = asyncio.run(
+        _run_compiled_corpus_suite(
+            _target(resumed_provider),
+            compiled,
+            max_concurrency=1,
+            completed_trials=retained,
+        )
+    )
+
+    assert len(resumed_provider.requests) == 2
+    assert [trial.trial_number for trial in resumed.run.cases[0].trials] == [1, 2, 3]
+    assert resumed.run.cases[0].reliability.passed_trials == 3
 
 
 def test_tool_json_comparison_distinguishes_observed_values_from_evidence_state():
@@ -1635,7 +1927,7 @@ def test_tool_json_comparison_distinguishes_observed_values_from_evidence_state(
     comparison = compare_corpus_execution_results(baseline, current)
     presentation = present_eval_result(baseline)
 
-    assert comparison.schema_version == 3
+    assert comparison.schema_version == 4
     assert [
         assertion.tool_json.actual
         for assertion in presentation.cases[0].trials[0].assertions

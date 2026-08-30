@@ -6,8 +6,8 @@ import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -55,6 +55,7 @@ from cayu.evals.corpus import (
     _model_python_input,
     _portable_id,
     _sha256_revision,
+    eval_suite_trial_policy,
     inspect_eval_corpus,
 )
 from cayu.evals.execution import (
@@ -65,7 +66,9 @@ from cayu.evals.execution_profiles import (
     EvalExecutionProfileBindingV1,
     EvalExecutionProfileV1,
 )
+from cayu.evals.models import EvalTrialResult
 from cayu.evals.published import _validate_published_eval_run_for_corpus
+from cayu.evals.result_contract import _EvalTrialPublicData
 from cayu.evals.results import (
     CAPTURED_EVALUATION_RESULT_MAX_BYTES,
     CapturedEvaluationResultV1,
@@ -75,6 +78,7 @@ from cayu.evals.results import (
     eval_result_projection,
     validate_captured_result_for_corpus,
 )
+from cayu.evals.revisions import eval_trial_result_revision
 from cayu.evals.scenario import (
     EVAL_SCENARIO_MAX_ARTIFACT_REQUIREMENTS,
     EVAL_SCENARIO_MAX_BYTES,
@@ -95,6 +99,7 @@ from cayu.evals.suite_authoring import (
     eval_suite_document_from_json,
     validate_expected_eval_suite_revision,
 )
+from cayu.evals.trial_policy import EVAL_SUITE_MAX_CONCURRENCY, EvalSuiteRunExposureV1
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
@@ -114,6 +119,8 @@ EVAL_STORE_MAX_CLAIM_TARGETS = 128
 _EVAL_STORE_MAX_BIGINT = 2**63 - 1
 EVAL_RUN_INVOCATION_MAX_BYTES = 64 << 10
 EVAL_SCENARIO_PROGRESS_MAX_BYTES = 256 << 10
+EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES = CORPUS_EXECUTION_RESULT_MAX_BYTES
+EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS = EVAL_CORPUS_MAX_CASES * EVAL_CORPUS_MAX_TRIALS
 
 _STORE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _CURSOR_VERSION = 1
@@ -1200,6 +1207,168 @@ class EvalScenarioTrialFailureCode(StrEnum):
     EXPECTED_USER_INPUT_UNAVAILABLE = "expected_user_input_unavailable"
 
 
+class EvalRunTrialCheckpoint(_EvalStoreModel):
+    """One bounded terminal trial retained privately until atomic publication."""
+
+    case_id: StrictStr
+    result: EvalTrialResult
+    public_data: _EvalTrialPublicData
+
+    @field_validator("case_id")
+    @classmethod
+    def validate_case_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("result", mode="before")
+    @classmethod
+    def copy_result(cls, value: object) -> object:
+        if type(value) is EvalTrialResult:
+            return value.model_dump(mode="python", warnings=False)
+        if isinstance(value, BaseModel):
+            raise TypeError("result must be an exact EvalTrialResult or JSON object.")
+        return value
+
+    @field_validator("public_data", mode="before")
+    @classmethod
+    def copy_public_data(cls, value: object) -> object:
+        if type(value) is _EvalTrialPublicData:
+            return value.model_dump(mode="python")
+        if isinstance(value, BaseModel):
+            raise TypeError("public_data must be exact trial public data or a JSON object.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_private_checkpoint(self) -> EvalRunTrialCheckpoint:
+        if self.result.trajectory is not None or self.result.final_output:
+            raise ValueError("Durable eval trial checkpoints cannot retain raw trajectory output.")
+        return self
+
+    @property
+    def trial_number(self) -> int:
+        return self.result.trial_number
+
+
+def _validated_trial_checkpoints(
+    values: tuple[EvalRunTrialCheckpoint, ...],
+    *,
+    expected_document_bytes: int | None = None,
+) -> tuple[EvalRunTrialCheckpoint, ...]:
+    if type(values) is not tuple:
+        raise TypeError("trial checkpoints must be a tuple.")
+    if len(values) > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+        raise ValueError("Eval run trial checkpoints exceed their item limit.")
+    copied = tuple(
+        _exact_model(value, EvalRunTrialCheckpoint, "trial checkpoint") for value in values
+    )
+    keys = tuple((item.case_id, item.trial_number) for item in copied)
+    if keys != tuple(sorted(set(keys))):
+        raise ValueError("Eval run trial checkpoints must be unique and sorted by slot.")
+    document_bytes = sum(
+        len(eval_run_trial_checkpoint_to_json(item).encode("utf-8")) for item in copied
+    )
+    if document_bytes > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES:
+        raise ValueError("Eval run trial checkpoints exceed their byte limit.")
+    if expected_document_bytes is not None and document_bytes != expected_document_bytes:
+        raise ValueError("Eval run trial checkpoint byte accounting is inconsistent.")
+    return copied
+
+
+def eval_run_trial_checkpoint_to_json(value: EvalRunTrialCheckpoint) -> str:
+    validated = _exact_model(value, EvalRunTrialCheckpoint, "trial checkpoint")
+    return json.dumps(
+        validated.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def eval_run_trial_checkpoint_from_json(source: str) -> EvalRunTrialCheckpoint:
+    if type(source) is not str:
+        raise TypeError("trial checkpoint JSON must be a string.")
+    raw = source.encode("utf-8")
+    if not 1 <= len(raw) <= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES:
+        raise ValueError("Eval run trial checkpoint JSON exceeds its byte limit.")
+    document = json.loads(source)
+    if type(document) is not dict:
+        raise ValueError("Eval run trial checkpoint JSON must contain an object.")
+    return EvalRunTrialCheckpoint.model_validate(document)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedEvalRunTrialCheckpoint:
+    checkpoint: EvalRunTrialCheckpoint
+    document: str
+    document_bytes: int
+
+
+def _prepare_trial_checkpoint_for_store(
+    checkpoint: EvalRunTrialCheckpoint,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> _PreparedEvalRunTrialCheckpoint:
+    checkpoint = _exact_model(checkpoint, EvalRunTrialCheckpoint, "checkpoint")
+    _require_publication_safe(
+        checkpoint.model_dump(mode="json"),
+        redact_json=redact_json,
+        resource_name="Eval trial checkpoint",
+    )
+    document = eval_run_trial_checkpoint_to_json(checkpoint)
+    document_bytes = len(document.encode("utf-8"))
+    if document_bytes > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES:
+        raise ValueError("Eval run trial checkpoint exceeds its byte limit.")
+    return _PreparedEvalRunTrialCheckpoint(
+        checkpoint=checkpoint,
+        document=document,
+        document_bytes=document_bytes,
+    )
+
+
+def _validate_trial_checkpoint_for_run(
+    checkpoint: EvalRunTrialCheckpoint,
+    request: EvalRunRequest,
+    corpus: EvalCorpusDocument,
+) -> EvalRunTrialCheckpoint:
+    checkpoint = _exact_model(checkpoint, EvalRunTrialCheckpoint, "checkpoint")
+    suite = next((item for item in corpus.suites if item.id == request.suite_id), None)
+    if suite is None:
+        raise EvalRunStateConflict("Eval run suite is unavailable for trial checkpointing.")
+    case_ids = {case.id for case in corpus.cases if case.suite_id == suite.id}
+    if checkpoint.case_id not in case_ids:
+        raise EvalRunStateConflict("Eval trial checkpoint case does not belong to its run.")
+    trial_count = eval_suite_trial_policy(suite).trial_count
+    if checkpoint.trial_number > trial_count:
+        raise EvalRunStateConflict("Eval trial checkpoint number exceeds its immutable policy.")
+    return checkpoint
+
+
+def _validate_trial_checkpoints_for_result(
+    checkpoints: tuple[EvalRunTrialCheckpoint, ...],
+    result: CorpusExecutionResult,
+) -> None:
+    """Bind retained private terminals to the exact public trials being published."""
+
+    checkpoints = _validated_trial_checkpoints(checkpoints)
+    if not checkpoints:
+        return
+    published_by_slot = {
+        (case.case_id, trial.trial_number): trial
+        for case in result.run.cases
+        for trial in case.trials
+    }
+    for checkpoint in checkpoints:
+        published = published_by_slot.get((checkpoint.case_id, checkpoint.trial_number))
+        if (
+            published is None
+            or published.source_trial_revision != eval_trial_result_revision(checkpoint.result)
+            or published.code is not checkpoint.public_data.diagnostic_code
+            or published.output != checkpoint.public_data.output
+        ):
+            raise EvalRunStateConflict(
+                "Published eval result contradicts a durable terminal trial checkpoint."
+            )
+
+
 class EvalScenarioApprovalDecisionRecord(_EvalStoreModel):
     decision: Literal["approve", "deny"]
     reason: StrictStr | None = Field(default=None, max_length=2_048)
@@ -1409,6 +1578,7 @@ def _scenario_progress_for_claim(
     *,
     scenario: EvalScenarioRunInvocation | None,
     attempt: int,
+    terminal_trial_numbers: frozenset[int] = frozenset(),
 ) -> EvalScenarioRunProgress | None:
     """Fence resumable checkpoints into a new claim and reset unsafe work.
 
@@ -1433,6 +1603,10 @@ def _scenario_progress_for_claim(
             EvalScenarioTrialPhase.AWAITING_APPROVAL,
             EvalScenarioTrialPhase.AWAITING_RESUME,
         }
+        or (
+            trial.phase in {EvalScenarioTrialPhase.COMPLETED, EvalScenarioTrialPhase.ERROR}
+            and trial.trial_number in terminal_trial_numbers
+        )
         else EvalScenarioTrialProgress(
             trial_number=trial.trial_number,
             phase=EvalScenarioTrialPhase.PENDING,
@@ -1517,6 +1691,25 @@ class EvalRunInvocation(_EvalStoreModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    authored_suite_launch_revision: StrictStr | None = Field(
+        default=None,
+        description=(
+            "Secret-safe identity shared by every durable run admitted by one "
+            "authored-suite launch."
+        ),
+        exclude_if=lambda value: value is None,
+    )
+    authored_suite_launch_lane: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_SUITE_MAX_CONCURRENCY - 1,
+        description="Concurrency lane shared by serialized runs from one suite launch.",
+        exclude_if=lambda value: value is None,
+    )
+    authored_suite_exposure: EvalSuiteRunExposureV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     scenario: EvalScenarioRunInvocation | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1575,10 +1768,16 @@ class EvalRunInvocation(_EvalStoreModel):
             return EvalScenarioRunInvocation.model_validate(value.model_dump(mode="python"))
         return value
 
+    @field_validator("authored_suite_exposure", mode="before")
+    @classmethod
+    def copy_authored_suite_exposure(cls, value: object) -> object:
+        return revalidate_model_input(value, EvalSuiteRunExposureV1)
+
     @field_validator(
         "admission_request_revision",
         "authored_suite_revision",
         "authored_suite_selection_revision",
+        "authored_suite_launch_revision",
     )
     @classmethod
     def validate_content_revisions(cls, value: str | None, info) -> str | None:
@@ -1621,6 +1820,22 @@ class EvalRunInvocation(_EvalStoreModel):
             raise ValueError(
                 "Authored suite runs require both suite and selection revision identities."
             )
+        if self.authored_suite_exposure is not None and self.authored_suite_revision is None:
+            raise ValueError("Only authored suite runs may carry accepted work exposure.")
+        if self.authored_suite_launch_revision is not None and self.authored_suite_revision is None:
+            raise ValueError("Only authored suite runs may carry a launch revision.")
+        if (self.authored_suite_launch_revision is None) != (
+            self.authored_suite_launch_lane is None
+        ):
+            raise ValueError("Authored suite launch revision and lane must be paired.")
+        if self.authored_suite_exposure is not None and self.authored_suite_launch_revision is None:
+            raise ValueError("Authored suite exposure requires its durable launch revision.")
+        if (
+            self.authored_suite_exposure is not None
+            and self.authored_suite_exposure.selection_revision
+            != self.authored_suite_selection_revision
+        ):
+            raise ValueError("Authored suite exposure must match its immutable selection.")
         if (
             self.scenario is not None
             and self.scenario.authored_suite_revision != self.authored_suite_revision
@@ -2681,6 +2896,7 @@ class EvalStore(ABC):
     captured_results: ClassVar[bool] = False
     scenarios: ClassVar[bool] = False
     scenario_execution: ClassVar[bool] = False
+    trial_checkpointing: ClassVar[bool] = False
     suite_authoring: ClassVar[bool] = False
     judge_calibrations: ClassVar[bool] = False
 
@@ -2905,6 +3121,27 @@ class EvalStore(ABC):
         del claim, trial
         raise NotImplementedError("Scenario execution progress is not supported.")
 
+    async def load_trial_checkpoints(
+        self,
+        claim: EvalRunClaim,
+    ) -> tuple[EvalRunTrialCheckpoint, ...]:
+        """Load terminal trial slots only while the exact run claim remains live."""
+
+        del claim
+        raise NotImplementedError("Durable eval trial checkpoints are not supported.")
+
+    async def save_trial_checkpoint(
+        self,
+        claim: EvalRunClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        """Idempotently retain one terminal slot behind the live publication fence."""
+
+        del claim, checkpoint, redact_json
+        raise NotImplementedError("Durable eval trial checkpoints are not supported.")
+
     async def submit_scenario_approval(
         self,
         run_id: str,
@@ -3031,12 +3268,32 @@ class _MemoryRunState:
     result: CorpusExecutionResult | None = None
     failure_code: EvalRunFailureCode | None = None
     scenario_progress: EvalScenarioRunProgress | None = None
+    trial_checkpoints: dict[tuple[str, int], EvalRunTrialCheckpoint] = field(default_factory=dict)
+    trial_checkpoint_bytes: int = 0
 
 
 @dataclass
 class _MemoryEvalResultState:
     record: EvalResultRecord
     document: bytes
+
+
+def _authored_suite_launch_predecessor_exists(
+    candidate: _MemoryRunState,
+    states: Iterable[_MemoryRunState],
+) -> bool:
+    launch_revision = candidate.request.invocation.authored_suite_launch_revision
+    if launch_revision is None:
+        return False
+    candidate_order = (candidate.created_at, candidate.request.run_id)
+    return any(
+        state.request.invocation.authored_suite_launch_revision == launch_revision
+        and state.request.invocation.authored_suite_launch_lane
+        == candidate.request.invocation.authored_suite_launch_lane
+        and state.status not in TERMINAL_EVAL_RUN_STATUSES
+        and (state.created_at, state.request.run_id) < candidate_order
+        for state in states
+    )
 
 
 class InMemoryEvalStore(EvalStore):
@@ -3046,6 +3303,7 @@ class InMemoryEvalStore(EvalStore):
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
+    trial_checkpointing: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
 
@@ -3547,6 +3805,10 @@ class InMemoryEvalStore(EvalStore):
                         and state.lease_expires_at <= now
                     )
                 )
+                and not _authored_suite_launch_predecessor_exists(
+                    state,
+                    self._runs.values(),
+                )
             ]
             if not eligible:
                 return None
@@ -3565,6 +3827,9 @@ class InMemoryEvalStore(EvalStore):
                 state.scenario_progress,
                 scenario=state.request.invocation.scenario,
                 attempt=state.epoch,
+                terminal_trial_numbers=frozenset(
+                    trial_number for _case_id, trial_number in state.trial_checkpoints
+                ),
             )
             record = self._record(state)
             return EvalRunLease(
@@ -3600,6 +3865,10 @@ class InMemoryEvalStore(EvalStore):
                         and state.lease_expires_at <= now
                     )
                 )
+                and not _authored_suite_launch_predecessor_exists(
+                    state,
+                    self._runs.values(),
+                )
             ]
             if not eligible:
                 return None
@@ -3618,6 +3887,9 @@ class InMemoryEvalStore(EvalStore):
                 state.scenario_progress,
                 scenario=state.request.invocation.scenario,
                 attempt=state.epoch,
+                terminal_trial_numbers=frozenset(
+                    trial_number for _case_id, trial_number in state.trial_checkpoints
+                ),
             )
             record = self._record(state)
             return EvalRunLease(
@@ -3663,6 +3935,8 @@ class InMemoryEvalStore(EvalStore):
                 state.finished_at = now
                 state.claim_id = None
                 state.lease_expires_at = None
+                state.trial_checkpoints.clear()
+                state.trial_checkpoint_bytes = 0
             else:
                 state.status = EvalRunStatus.CANCELLING
             return self._record(state)
@@ -3689,6 +3963,58 @@ class InMemoryEvalStore(EvalStore):
             state.scenario_progress = progress.model_copy(deep=True)
             state.updated_at = self._now()
             return self._record(state)
+
+    async def load_trial_checkpoints(
+        self,
+        claim: EvalRunClaim,
+    ) -> tuple[EvalRunTrialCheckpoint, ...]:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            return _validated_trial_checkpoints(
+                tuple(state.trial_checkpoints[key] for key in sorted(state.trial_checkpoints)),
+                expected_document_bytes=state.trial_checkpoint_bytes,
+            )
+
+    async def save_trial_checkpoint(
+        self,
+        claim: EvalRunClaim,
+        checkpoint: EvalRunTrialCheckpoint,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> None:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        prepared = await asyncio.to_thread(
+            _prepare_trial_checkpoint_for_store,
+            checkpoint,
+            redact_json=redact_json,
+        )
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            corpus = EvalCorpusDocument.model_validate(
+                json.loads(self._corpus_documents[state.request.corpus_revision])
+            )
+            checkpoint = _validate_trial_checkpoint_for_run(
+                prepared.checkpoint,
+                state.request,
+                corpus,
+            )
+            key = (checkpoint.case_id, checkpoint.trial_number)
+            current = state.trial_checkpoints.get(key)
+            if current is not None:
+                if current == checkpoint:
+                    return
+                raise EvalRunStateConflict("Eval trial slot already has another terminal result.")
+            if len(state.trial_checkpoints) >= EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS:
+                raise ValueError("Eval run trial checkpoints exceed their item limit.")
+            if (
+                state.trial_checkpoint_bytes + prepared.document_bytes
+                > EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES
+            ):
+                raise ValueError("Eval run trial checkpoints exceed their byte limit.")
+            state.trial_checkpoints[key] = checkpoint
+            state.trial_checkpoint_bytes += prepared.document_bytes
+            state.updated_at = self._now()
 
     async def update_scenario_trial(
         self,
@@ -3776,6 +4102,10 @@ class InMemoryEvalStore(EvalStore):
             state = self._require_live_claim(claim)
             if state.status is not EvalRunStatus.RUNNING:
                 raise EvalRunStateConflict("Only a running eval may publish a result.")
+            _validate_trial_checkpoints_for_result(
+                tuple(state.trial_checkpoints[key] for key in sorted(state.trial_checkpoints)),
+                validated_result,
+            )
             now = self._now()
             self._save_result_document(
                 validated_result,
@@ -3784,6 +4114,8 @@ class InMemoryEvalStore(EvalStore):
             )
             state.status = EvalRunStatus.COMPLETED
             state.result = validated_result
+            state.trial_checkpoints.clear()
+            state.trial_checkpoint_bytes = 0
             state.updated_at = now
             state.finished_at = now
             state.lease_expires_at = None
@@ -3809,6 +4141,8 @@ class InMemoryEvalStore(EvalStore):
             now = self._now()
             state.status = EvalRunStatus.FAILED
             state.failure_code = code
+            state.trial_checkpoints.clear()
+            state.trial_checkpoint_bytes = 0
             state.updated_at = now
             state.finished_at = now
             state.lease_expires_at = None
@@ -4093,6 +4427,8 @@ class InMemoryEvalStore(EvalStore):
         state.updated_at = now
         state.finished_at = now
         state.lease_expires_at = None
+        state.trial_checkpoints.clear()
+        state.trial_checkpoint_bytes = 0
 
     @staticmethod
     def _record(state: _MemoryRunState) -> EvalRunRecord:

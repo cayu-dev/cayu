@@ -45,22 +45,22 @@ from cayu.evals.json_subset import copy_eval_tool_json_object
 from cayu.evals.models import (
     ARTIFACT_PUBLIC_TEXT_MAX_BYTES,
     EvalCaseContractV1,
-    EvalRunContractV1,
+    EvalRunContractV2,
 )
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.runtime.costs import PriceBook
 
-EVAL_CORPUS_SCHEMA_VERSION = 2
+EVAL_CORPUS_SCHEMA_VERSION = 3
 EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION = 1
 PRICING_PROFILE_IDENTITY_SCHEMA_VERSION = 1
 PRICING_PROFILE_SEMANTICS_VERSION = 1
 EVALUATION_SOURCE_IDENTITY_SCHEMA_VERSION = 1
 
-# This execution-only metadata key crosses from the trusted compiler to the
-# publisher. It is intentionally absent from portable corpus documents: the
-# target, not the corpus author, resolves the concrete judge implementation.
-_MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY = (
-    "cayu.model_judge.resolved_implementation_revision"
-)
+# These execution-only metadata records cross from the trusted compiler to the
+# publisher. They are intentionally absent from portable corpus documents: the
+# target, not the corpus author, resolves the concrete judge implementation and
+# observes its accounting evidence.
+_MODEL_JUDGE_RESULT_METADATA_KEY = "cayu.model_judge.result"
 _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY = "cayu.structured_model_judge.result"
 
 EVAL_CORPUS_MAX_BYTES = 8 << 20
@@ -153,6 +153,19 @@ class _SchemaV2PortableModel(_PortableModel):
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
             raise ValueError("schema_version must be the integer 2.")
+        return value
+
+
+class _SchemaV3PortableModel(_PortableModel):
+    """Portable schema root whose v3 discriminator never coerces JSON types."""
+
+    schema_version: Literal[3] = 3
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 3.")
         return value
 
 
@@ -387,10 +400,29 @@ class RunInputSpec(_PortableModel):
 
 
 class TrialRequestSpec(_PortableModel):
-    """Sequential, bounded fresh-evaluation execution settings."""
+    """Bounded fresh-evaluation settings with an optional versioned policy."""
 
     trials: StrictInt = Field(default=1, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     timeout_seconds: StrictInt = Field(default=300, ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    trial_policy: EvalSuiteTrialPolicyV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+    @field_validator("trial_policy", mode="before")
+    @classmethod
+    def copy_trial_policy(cls, value: object) -> object:
+        if type(value) is EvalSuiteTrialPolicyV1:
+            return value.model_dump(mode="json")
+        if isinstance(value, BaseModel):
+            raise TypeError("trial_policy must be an exact EvalSuiteTrialPolicyV1 or JSON.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_trial_policy(self) -> TrialRequestSpec:
+        if self.trial_policy is not None and self.trial_policy.trial_count != self.trials:
+            raise ValueError("trial_policy.trial_count must match trials.")
+        return self
 
 
 class _AssertionSpecBase(_PortableModel):
@@ -1217,6 +1249,14 @@ class JudgeProfileIdentityV1(_SchemaV1PortableModel):
             raise ValueError("Judge profile revision does not match its content.")
         return self
 
+    @property
+    def comparison_revision(self) -> str:
+        """Return semantic judge-route identity without its presentation label."""
+
+        validated = JudgeProfileIdentityV1.model_validate(_model_python_input(self))
+        material = validated.model_dump(mode="json", exclude={"revision", "label"})
+        return _content_revision(material, "judge profile comparison identity")
+
 
 class StructuredModelJudgeAssertionSpec(_AssertionSpecBase):
     """Typed rubric judgment bound to an exact trusted server profile."""
@@ -1654,6 +1694,11 @@ class EvalSuiteSpec(_PortableModel):
 
     @model_validator(mode="after")
     def validate_revision(self) -> EvalSuiteSpec:
+        if (
+            self.trial_request.trial_policy is not None
+            and self.trial_request.trial_policy.trial_count != self.trial_request.trials
+        ):
+            raise ValueError("Suite trial policy does not match its trial request.")
         expected = _model_content_revision(self, "eval suite spec")
         if self.revision != expected:
             raise ValueError("Eval suite revision does not match its content.")
@@ -1667,7 +1712,10 @@ class EvalSuiteSpec(_PortableModel):
         name: str,
         description: str | None = None,
         trial_request: TrialRequestSpec | None = None,
+        _preserve_missing_trial_policy: bool = False,
     ) -> EvalSuiteSpec:
+        if type(_preserve_missing_trial_policy) is not bool:
+            raise TypeError("_preserve_missing_trial_policy must be a bool.")
         if trial_request is None:
             validated_trial_request = TrialRequestSpec()
         elif type(trial_request) is TrialRequestSpec:
@@ -1676,6 +1724,14 @@ class EvalSuiteSpec(_PortableModel):
             )
         else:
             raise TypeError("trial_request must be an exact TrialRequestSpec.")
+        if validated_trial_request.trial_policy is None and not _preserve_missing_trial_policy:
+            validated_trial_request = TrialRequestSpec(
+                trials=validated_trial_request.trials,
+                timeout_seconds=validated_trial_request.timeout_seconds,
+                trial_policy=EvalSuiteTrialPolicyV1.create(
+                    trial_count=validated_trial_request.trials,
+                ),
+            )
         document: dict[str, Any] = {
             "id": id,
             "name": name,
@@ -1683,6 +1739,22 @@ class EvalSuiteSpec(_PortableModel):
             "trial_request": validated_trial_request.model_dump(mode="json"),
         }
         return cls(revision=_content_revision(document, "eval suite spec"), **document)
+
+
+def eval_suite_trial_policy(suite: EvalSuiteSpec) -> EvalSuiteTrialPolicyV1:
+    """Return the explicit policy or the suite's implicit all-pass policy."""
+
+    if type(suite) is not EvalSuiteSpec:
+        raise TypeError("suite must be an exact EvalSuiteSpec.")
+    validated = EvalSuiteSpec.model_validate(_model_python_input(suite))
+    policy = validated.trial_request.trial_policy
+    if policy is not None:
+        return policy
+    return EvalSuiteTrialPolicyV1.create(
+        trial_count=validated.trial_request.trials,
+        minimum_passed_trials=validated.trial_request.trials,
+        max_concurrency=1,
+    )
 
 
 class EvalCaseSpec(_PortableModel):
@@ -1795,10 +1867,10 @@ class EvalCaseSpec(_PortableModel):
         return cls(revision=_content_revision(document, "eval case spec"), **document)
 
 
-class EvalCorpusDocument(_SchemaV2PortableModel):
+class EvalCorpusDocument(_SchemaV3PortableModel):
     """One canonical, authority-free corpus for exactly one trusted target key."""
 
-    schema_version: Literal[2] = EVAL_CORPUS_SCHEMA_VERSION
+    schema_version: Literal[3] = EVAL_CORPUS_SCHEMA_VERSION
     revision: StrictStr
     target_key: StrictStr
     evidence_policy: EvaluationEvidencePolicySpec
@@ -1997,7 +2069,7 @@ class EvalCorpusDocument(_SchemaV2PortableModel):
 def eval_run_contract_for_corpus(
     corpus: EvalCorpusDocument,
     suite_id: str,
-) -> EvalRunContractV1:
+) -> EvalRunContractV2:
     """Freeze the exact portable contract that must precede suite execution."""
 
     validated, _ = _validated_model_document(
@@ -2011,7 +2083,7 @@ def eval_run_contract_for_corpus(
 def _eval_run_contract_for_validated_corpus(
     corpus: EvalCorpusDocument,
     suite_id: str,
-) -> EvalRunContractV1:
+) -> EvalRunContractV2:
     """Build a run contract from an already validated exact corpus snapshot."""
 
     if type(corpus) is not EvalCorpusDocument:
@@ -2024,7 +2096,7 @@ def _eval_run_contract_for_validated_corpus(
     uses_pricing = any(
         assertion.kind == "max_estimated_cost" for case in cases for assertion in case.assertions
     )
-    return EvalRunContractV1(
+    return EvalRunContractV2(
         corpus_revision=corpus.revision,
         target_key=corpus.target_key,
         suite_id=suite.id,
@@ -2037,6 +2109,7 @@ def _eval_run_contract_for_validated_corpus(
         ),
         trials=suite.trial_request.trials,
         timeout_seconds=suite.trial_request.timeout_seconds,
+        trial_policy=eval_suite_trial_policy(suite),
         cases=tuple(
             EvalCaseContractV1(case_id=case.id, case_revision=case.revision) for case in cases
         ),
@@ -2044,7 +2117,7 @@ def _eval_run_contract_for_validated_corpus(
 
 
 def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
-    """Return deterministic, human-readable corpus v2 JSON."""
+    """Return deterministic, human-readable corpus v3 JSON."""
 
     _, document = _validated_model_document(
         corpus,
@@ -2063,7 +2136,7 @@ def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
 
 
 def eval_corpus_from_json(source: str) -> EvalCorpusDocument:
-    """Load one bounded corpus v2 JSON document from text."""
+    """Load one bounded corpus v3 JSON document from text."""
 
     if type(source) is not str:
         raise TypeError("eval_corpus_from_json requires text.")
@@ -2130,6 +2203,8 @@ class EvalCorpusSuiteInspectionV1(_SchemaV1PortableModel):
     case_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_CASES)
     assertion_count: StrictInt = Field(ge=1)
     trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    minimum_passed_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    max_concurrency: StrictInt = Field(ge=1)
     timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
 
     @field_validator("id")
@@ -2155,6 +2230,8 @@ class EvalCorpusSuiteInspectionV1(_SchemaV1PortableModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> EvalCorpusSuiteInspectionV1:
+        if self.minimum_passed_trials > self.trials:
+            raise ValueError("minimum_passed_trials cannot exceed trials.")
         if (
             not self.case_count
             <= self.assertion_count
@@ -2244,6 +2321,16 @@ def inspect_eval_corpus(corpus: EvalCorpusDocument) -> EvalCorpusInspectionV1:
             case_count=len(cases_by_suite[suite.id]),
             assertion_count=sum(len(case.assertions) for case in cases_by_suite[suite.id]),
             trials=suite.trial_request.trials,
+            minimum_passed_trials=(
+                suite.trial_request.trials
+                if suite.trial_request.trial_policy is None
+                else suite.trial_request.trial_policy.minimum_passed_trials
+            ),
+            max_concurrency=(
+                1
+                if suite.trial_request.trial_policy is None
+                else suite.trial_request.trial_policy.max_concurrency
+            ),
             timeout_seconds=suite.trial_request.timeout_seconds,
         )
         for suite in validated.suites

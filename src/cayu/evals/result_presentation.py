@@ -59,10 +59,15 @@ from cayu.evals.published import (
 )
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.results import CapturedEvaluationResultV1, EvalResultOrigin
+from cayu.evals.trial_policy import (
+    EvalCaseReliabilityV1,
+    EvalSuiteRunExposureV1,
+    EvalSuiteTrialPolicyV1,
+)
 
-EVAL_RESULT_PRESENTATION_SCHEMA_VERSION = 1
+EVAL_RESULT_PRESENTATION_SCHEMA_VERSION = 2
 EVAL_RESULT_PRESENTATION_MAX_BYTES = 32 << 20
-EVAL_RESULT_REPORT_SCHEMA_VERSION = 1
+EVAL_RESULT_REPORT_SCHEMA_VERSION = 2
 EVAL_RESULT_REPORT_MAX_BYTES = 96 << 20
 _EVAL_RESULT_REPORT_UTF8_SCAN_CHARS = 64 << 10
 
@@ -195,6 +200,7 @@ class EvalAssertionPresentationV1(_PortableModel):
     category: EvalAssertionCategory
     outcome: PublishedOutcome
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    model_judge: PublishedModelJudgeDetail | None = None
     structured_judge: EvalStructuredJudgePresentationV1 | None = None
     tool_json: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail | None = None
     process: (
@@ -204,6 +210,15 @@ class EvalAssertionPresentationV1(_PortableModel):
         | None
     ) = None
     structure: PublishedWorkspaceFileDetail | PublishedArtifactDetail | None = None
+
+    @field_validator("model_judge", mode="before")
+    @classmethod
+    def copy_model_judge(cls, value: object) -> object:
+        if type(value) is PublishedModelJudgeDetail:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError("model_judge must be an exact published model-judge detail or object.")
+        return value
 
     @field_validator("tool_json", mode="before")
     @classmethod
@@ -274,6 +289,8 @@ class EvalAssertionPresentationV1(_PortableModel):
         semantic = self.kind in {"model_judge", "structured_model_judge"}
         if (self.category == "semantic") != semantic:
             raise ValueError("Assertion category contradicts its public kind.")
+        if (self.kind == "model_judge") != (self.model_judge is not None):
+            raise ValueError("Only rubric-string model-judge assertions carry model-judge detail.")
         if (self.kind == "structured_model_judge") != (self.structured_judge is not None):
             raise ValueError("Only structured-model-judge assertions carry structured detail.")
         tool_json_kind = self.kind in {"tool_arguments_contain", "tool_result_contains"}
@@ -295,6 +312,18 @@ class EvalAssertionPresentationV1(_PortableModel):
             raise ValueError("Only structural assertions carry safe structure detail.")
         if self.structure is not None and self.structure.kind != self.kind:
             raise ValueError("Structure presentation kind contradicts its retained detail.")
+        if self.model_judge is not None:
+            detail = self.model_judge
+            if detail.diagnostic == "evidence_unavailable":
+                expected_outcome: PublishedOutcome = "unavailable"
+            elif detail.diagnostic == "evaluator_error":
+                expected_outcome = "error"
+            elif self.score is None:
+                raise ValueError("Recorded model judgment requires a presented score.")
+            else:
+                expected_outcome = "passed" if self.score >= detail.threshold else "failed"
+            if self.outcome != expected_outcome:
+                raise ValueError("Model-judge outcome contradicts its admitted judgment.")
         if self.structured_judge is None:
             return self
         detail = self.structured_judge.detail
@@ -402,10 +431,75 @@ class EvalCasePresentationV1(_PortableModel):
         return self
 
 
+class EvalCasePresentationV2(_PortableModel):
+    """Case presentation with an explicit retained-trial reliability decision."""
+
+    case_id: StrictStr
+    case_revision: StrictStr
+    status: PublishedStatus
+    score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    dimensions: EvalResultOutcomeDimensionsV1
+    reliability: EvalCaseReliabilityV1
+    trials: tuple[EvalTrialPresentationV1, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_TRIALS,
+    )
+
+    @field_validator("case_id")
+    @classmethod
+    def validate_case_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("case_revision")
+    @classmethod
+    def validate_case_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("trials", mode="before")
+    @classmethod
+    def validate_trials_order(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_case(self) -> EvalCasePresentationV2:
+        trial_numbers = tuple(
+            item.trial_number for item in self.trials if item.trial_number is not None
+        )
+        if len(trial_numbers) != len(set(trial_numbers)):
+            raise ValueError("Presented case trial identities must be unique.")
+        if self.status != self.reliability.outcome:
+            raise ValueError("Presented case status contradicts its reliability decision.")
+        if self.score != _published_score(trial.score for trial in self.trials):
+            raise ValueError("Presented case score contradicts its retained trials.")
+        if self.dimensions != _combine_dimensions(trial.dimensions for trial in self.trials):
+            raise ValueError("Presented case dimensions contradict its trials.")
+        return self
+
+
+def _presentation_trial_reliability_code(
+    trial: EvalTrialPresentationV1,
+) -> EvalTrialDiagnosticCode:
+    if trial.diagnostic_code is not None:
+        return trial.diagnostic_code
+    if trial.status == "passed":
+        return EvalTrialDiagnosticCode.PASSED
+    if trial.status == "failed":
+        return EvalTrialDiagnosticCode.ASSERTION_FAILED
+    if trial.status == "unavailable":
+        return EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
+    if any(
+        assertion.structured_judge is not None
+        and assertion.structured_judge.detail.diagnostic == "evaluator_error"
+        for assertion in trial.assertions
+    ):
+        return EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED
+    return EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED
+
+
 class EvalResultPresentationV1(_PortableModel):
     """Canonical explainable projection for one immutable public eval result."""
 
-    schema_version: Literal[1] = EVAL_RESULT_PRESENTATION_SCHEMA_VERSION
+    schema_version: Literal[1] = 1
     result_revision: StrictStr
     evaluation_revision: StrictStr
     origin: EvalResultOrigin
@@ -500,10 +594,142 @@ class EvalResultPresentationV1(_PortableModel):
         return self
 
 
+class EvalResultPresentationV2(_PortableModel):
+    """Canonical V2 presentation with reliability policy and accepted exposure."""
+
+    schema_version: Literal[2] = EVAL_RESULT_PRESENTATION_SCHEMA_VERSION
+    result_revision: StrictStr
+    evaluation_revision: StrictStr
+    origin: EvalResultOrigin
+    target_key: StrictStr
+    application_release_id: StrictStr
+    app_manifest_fingerprint: StrictStr
+    corpus_revision: StrictStr
+    suite_id: StrictStr
+    suite_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None
+    trial_policy: EvalSuiteTrialPolicyV1
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None
+    status: PublishedStatus
+    score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    dimensions: EvalResultOutcomeDimensionsV1
+    cases: tuple[EvalCasePresentationV2, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 2.")
+        return value
+
+    @field_validator(
+        "result_revision",
+        "evaluation_revision",
+        "corpus_revision",
+        "suite_revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_revisions(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("target_key", "suite_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("application_release_id")
+    @classmethod
+    def validate_application_release_id(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("app_manifest_fingerprint")
+    @classmethod
+    def validate_app_manifest_fingerprint(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("app_manifest_fingerprint must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def validate_cases_order(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_result(self) -> EvalResultPresentationV2:
+        case_ids = tuple(item.case_id for item in self.cases)
+        if len(case_ids) != len(set(case_ids)):
+            raise ValueError("Presented result case identities must be unique.")
+        if self.origin == EvalResultOrigin.CAPTURED_SESSION:
+            if len(self.cases) != 1 or any(
+                trial.trial_number is not None for case in self.cases for trial in case.trials
+            ):
+                raise ValueError("Captured presentation requires one identity-free retained trial.")
+            if self.accepted_exposure is not None:
+                raise ValueError("Captured presentation cannot carry fresh-run exposure.")
+        elif any(trial.trial_number is None for case in self.cases for trial in case.trials):
+            raise ValueError("Fresh presentation requires every retained trial identity.")
+        if any(
+            case.reliability.trial_policy_revision != self.trial_policy.revision
+            for case in self.cases
+        ):
+            raise ValueError("Presented cases must share the exact suite trial policy.")
+        for case in self.cases:
+            expected_reliability = EvalCaseReliabilityV1.create(
+                policy=self.trial_policy,
+                trials=(
+                    (
+                        trial.status,
+                        trial.score,
+                        _presentation_trial_reliability_code(trial),
+                    )
+                    for trial in case.trials
+                ),
+                uses_model_judge=any(
+                    assertion.kind in {"model_judge", "structured_model_judge"}
+                    for trial in case.trials
+                    for assertion in trial.assertions
+                ),
+            )
+            if case.reliability != expected_reliability:
+                raise ValueError("Presented case reliability contradicts its retained trials.")
+        if self.accepted_exposure is not None and (
+            self.accepted_exposure.trial_policy_revision != self.trial_policy.revision
+            or self.accepted_exposure.candidate_trials
+            < len(self.cases) * self.trial_policy.trial_count
+        ):
+            raise ValueError("Presented work exposure contradicts its result graph.")
+        if self.status != _published_status_from_statuses(case.status for case in self.cases):
+            raise ValueError("Presented result status contradicts its cases.")
+        if self.score != _published_score(case.score for case in self.cases):
+            raise ValueError("Presented result score contradicts its cases.")
+        if self.dimensions != _combine_dimensions(case.dimensions for case in self.cases):
+            raise ValueError("Presented result dimensions contradict its cases.")
+        if not json_utf8_size_within_limit(self, EVAL_RESULT_PRESENTATION_MAX_BYTES):
+            raise ValueError(
+                "Eval result presentation exceeds "
+                f"{EVAL_RESULT_PRESENTATION_MAX_BYTES} canonical JSON bytes."
+            )
+        return self
+
+
 class EvalResultReportV1(_PortableModel):
     """Portable report that binds immutable source evidence to its canonical view."""
 
-    schema_version: Literal[1] = EVAL_RESULT_REPORT_SCHEMA_VERSION
+    schema_version: Literal[1] = 1
     record_type: Literal["cayu.eval-result-report"] = "cayu.eval-result-report"
     result: CorpusExecutionResult | CapturedEvaluationResultV1
     presentation: EvalResultPresentationV1
@@ -531,6 +757,46 @@ class EvalResultReportV1(_PortableModel):
 
     @model_validator(mode="after")
     def validate_report(self) -> EvalResultReportV1:
+        if self.presentation != _present_eval_result_v1(self.result):
+            raise ValueError("Eval result report presentation does not match its result.")
+        if not json_utf8_size_within_limit(self, EVAL_RESULT_REPORT_MAX_BYTES):
+            raise ValueError(
+                f"Eval result report exceeds {EVAL_RESULT_REPORT_MAX_BYTES} canonical JSON bytes."
+            )
+        return self
+
+
+class EvalResultReportV2(_PortableModel):
+    """Current report binding immutable evidence to reliability presentation V2."""
+
+    schema_version: Literal[2] = EVAL_RESULT_REPORT_SCHEMA_VERSION
+    record_type: Literal["cayu.eval-result-report"] = "cayu.eval-result-report"
+    result: CorpusExecutionResult | CapturedEvaluationResultV1
+    presentation: EvalResultPresentationV2
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 2.")
+        return value
+
+    @field_validator("result", mode="before")
+    @classmethod
+    def copy_result(cls, value: object) -> object:
+        if type(value) is CorpusExecutionResult:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if type(value) is CapturedEvaluationResultV1:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "result must be an exact CorpusExecutionResult, "
+                "CapturedEvaluationResultV1, or JSON object."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_report(self) -> EvalResultReportV2:
         if self.presentation != present_eval_result(self.result):
             raise ValueError("Eval result report presentation does not match its result.")
         if not json_utf8_size_within_limit(self, EVAL_RESULT_REPORT_MAX_BYTES):
@@ -736,6 +1002,7 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
         category="semantic" if semantic else "deterministic",
         outcome=validated.outcome,
         score=validated.score,
+        model_judge=(detail if type(detail) is PublishedModelJudgeDetail else None),
         structured_judge=(
             _present_structured_judge(detail)
             if type(detail) is PublishedStructuredModelJudgeDetail
@@ -842,7 +1109,7 @@ def _combine_dimensions(
     )
 
 
-def _present_fresh_result(result: CorpusExecutionResult) -> EvalResultPresentationV1:
+def _present_fresh_result_v1(result: CorpusExecutionResult) -> EvalResultPresentationV1:
     validated = CorpusExecutionResult.model_validate(
         result.model_dump(mode="python", round_trip=True, warnings="none")
     )
@@ -877,10 +1144,10 @@ def _present_fresh_result(result: CorpusExecutionResult) -> EvalResultPresentati
         dimensions=_combine_dimensions(case.dimensions for case in ordered_cases),
         cases=ordered_cases,
     )
-    return _validate_presentation_size(presentation)
+    return _validate_presentation_v1(presentation)
 
 
-def _present_captured_result(result: CapturedEvaluationResultV1) -> EvalResultPresentationV1:
+def _present_captured_result_v1(result: CapturedEvaluationResultV1) -> EvalResultPresentationV1:
     validated = CapturedEvaluationResultV1.model_validate(
         result.model_dump(mode="python", round_trip=True, warnings="none")
     )
@@ -927,10 +1194,10 @@ def _present_captured_result(result: CapturedEvaluationResultV1) -> EvalResultPr
         dimensions=dimensions,
         cases=(case,),
     )
-    return _validate_presentation_size(presentation)
+    return _validate_presentation_v1(presentation)
 
 
-def _validate_presentation_size(
+def _validate_presentation_v1(
     presentation: EvalResultPresentationV1,
 ) -> EvalResultPresentationV1:
     # Revalidate the complete graph so forged nested instances cannot bypass the
@@ -940,9 +1207,151 @@ def _validate_presentation_size(
     )
 
 
-def present_eval_result(
+def _present_eval_result_v1(
     result: CorpusExecutionResult | CapturedEvaluationResultV1,
 ) -> EvalResultPresentationV1:
+    if type(result) is CorpusExecutionResult:
+        return _present_fresh_result_v1(result)
+    if type(result) is CapturedEvaluationResultV1:
+        return _present_captured_result_v1(result)
+    raise TypeError("result must be an exact CorpusExecutionResult or CapturedEvaluationResultV1.")
+
+
+def _present_fresh_result(result: CorpusExecutionResult) -> EvalResultPresentationV2:
+    validated = CorpusExecutionResult.model_validate(
+        result.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+    cases: list[EvalCasePresentationV2] = []
+    for case in validated.run.cases:
+        trials = tuple(_present_fresh_trial(trial) for trial in case.trials)
+        cases.append(
+            EvalCasePresentationV2(
+                case_id=case.case_id,
+                case_revision=case.case_revision,
+                status=case.status,
+                score=case.score,
+                dimensions=_combine_dimensions(trial.dimensions for trial in trials),
+                reliability=case.reliability,
+                trials=trials,
+            )
+        )
+    ordered_cases = tuple(cases)
+    presentation = EvalResultPresentationV2(
+        result_revision=validated.revision,
+        evaluation_revision=validated.run.revision,
+        origin=EvalResultOrigin.FRESH_EXECUTION,
+        target_key=validated.target.target_key,
+        application_release_id=validated.target.application_release_id,
+        app_manifest_fingerprint=validated.target.app_manifest_fingerprint,
+        corpus_revision=validated.run.corpus_revision,
+        suite_id=validated.run.suite_id,
+        suite_revision=validated.run.suite_revision,
+        evidence_policy_revision=validated.run.evidence_policy_revision,
+        pricing_profile_fingerprint=validated.run.pricing_profile_fingerprint,
+        trial_policy=validated.run.trial_policy,
+        accepted_exposure=validated.run.accepted_exposure,
+        status=validated.run.status,
+        score=validated.run.score,
+        dimensions=_combine_dimensions(case.dimensions for case in ordered_cases),
+        cases=ordered_cases,
+    )
+    return _validate_presentation_v2(presentation)
+
+
+def _captured_reliability(
+    result: CapturedEvaluationResultV1,
+) -> tuple[EvalSuiteTrialPolicyV1, EvalCaseReliabilityV1]:
+    policy = EvalSuiteTrialPolicyV1.create()
+    score = result.score
+    if score.status == "passed":
+        code = EvalTrialDiagnosticCode.PASSED
+    elif score.status == "failed":
+        code = EvalTrialDiagnosticCode.ASSERTION_FAILED
+    elif score.status == "unavailable":
+        code = EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
+    elif any(
+        isinstance(assertion.detail, _SEMANTIC_DETAIL_TYPES)
+        and assertion.detail.diagnostic == "evaluator_error"
+        for assertion in score.assertions
+    ):
+        code = EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED
+    else:
+        code = EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED
+    reliability = EvalCaseReliabilityV1.create(
+        policy=policy,
+        trials=((score.status, score.score, code),),
+        uses_model_judge=any(
+            assertion.detail.kind in {"model_judge", "structured_model_judge"}
+            for assertion in score.assertions
+        ),
+    )
+    return policy, reliability
+
+
+def _present_captured_result(result: CapturedEvaluationResultV1) -> EvalResultPresentationV2:
+    validated = CapturedEvaluationResultV1.model_validate(
+        result.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+    score = validated.score
+    assertions = tuple(_present_assertion(assertion) for assertion in score.assertions)
+    evidence: EvalEvidenceState = (
+        "unavailable"
+        if any(assertion.outcome == "unavailable" for assertion in score.assertions)
+        else "complete"
+    )
+    dimensions = _dimensions(
+        score.assertions,
+        runtime="not_executed",
+        evidence=evidence,
+    )
+    trial = EvalTrialPresentationV1(
+        status=score.status,
+        score=score.score,
+        dimensions=dimensions,
+        assertions=assertions,
+    )
+    policy, reliability = _captured_reliability(validated)
+    case = EvalCasePresentationV2(
+        case_id=score.case_id,
+        case_revision=score.case_revision,
+        status=score.status,
+        score=score.score,
+        dimensions=dimensions,
+        reliability=reliability,
+        trials=(trial,),
+    )
+    presentation = EvalResultPresentationV2(
+        result_revision=validated.revision,
+        evaluation_revision=score.revision,
+        origin=EvalResultOrigin.CAPTURED_SESSION,
+        target_key=validated.target.target_key,
+        application_release_id=validated.target.application_release_id,
+        app_manifest_fingerprint=validated.target.app_manifest_fingerprint,
+        corpus_revision=validated.corpus_revision,
+        suite_id=validated.suite_id,
+        suite_revision=validated.suite_revision,
+        evidence_policy_revision=score.evidence_policy_revision,
+        pricing_profile_fingerprint=score.pricing_profile_fingerprint,
+        trial_policy=policy,
+        status=score.status,
+        score=score.score,
+        dimensions=dimensions,
+        cases=(case,),
+    )
+    return _validate_presentation_v2(presentation)
+
+
+def _validate_presentation_v2(
+    presentation: EvalResultPresentationV2,
+) -> EvalResultPresentationV2:
+    return EvalResultPresentationV2.model_validate(
+        presentation.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+
+
+def present_eval_result(
+    result: CorpusExecutionResult | CapturedEvaluationResultV1,
+) -> EvalResultPresentationV2:
     """Compile one immutable public result into its canonical explainable view."""
 
     if type(result) is CorpusExecutionResult:
@@ -968,7 +1377,7 @@ def _validate_report_text_utf8_size(source: str) -> None:
         raise ValueError("Eval result report JSON must contain valid Unicode scalar text.") from exc
 
 
-def eval_result_report_from_json(source: str | bytes | bytearray) -> EvalResultReportV1:
+def eval_result_report_from_json(source: str | bytes | bytearray) -> EvalResultReportV2:
     """Parse one bounded explainable-result report without format guessing."""
 
     if type(source) is str:
@@ -1017,7 +1426,7 @@ def eval_result_report_from_json(source: str | bytes | bytearray) -> EvalResultR
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return EvalResultReportV1.model_validate_json(normalized)
+    return EvalResultReportV2.model_validate_json(normalized)
 
 
 __all__ = [
@@ -1027,9 +1436,12 @@ __all__ = [
     "EVAL_RESULT_REPORT_SCHEMA_VERSION",
     "EvalAssertionPresentationV1",
     "EvalCasePresentationV1",
+    "EvalCasePresentationV2",
     "EvalResultOutcomeDimensionsV1",
     "EvalResultPresentationV1",
+    "EvalResultPresentationV2",
     "EvalResultReportV1",
+    "EvalResultReportV2",
     "EvalStructuredJudgeCriterionPresentationV1",
     "EvalStructuredJudgePresentationV1",
     "EvalTrialPresentationV1",

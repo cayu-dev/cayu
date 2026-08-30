@@ -3818,6 +3818,7 @@ export type ControlPlaneSurfaceCapabilities = {
  * Aggregate outcomes for one case in two contract-compatible results.
  */
 export type CorpusCaseComparison = {
+    baseline_reliability: CorpusReliabilityDistributionV1;
     /**
      * Baseline Score
      */
@@ -3834,6 +3835,7 @@ export type CorpusCaseComparison = {
      * Case Id
      */
     case_id: string;
+    current_reliability: CorpusReliabilityDistributionV1;
     /**
      * Current Score
      */
@@ -3846,6 +3848,10 @@ export type CorpusCaseComparison = {
      * Current Trial Diagnostic Codes
      */
     current_trial_diagnostic_codes?: Array<EvalTrialDiagnosticCode>;
+    /**
+     * Reliability Change
+     */
+    reliability_change: 'improved' | 'regressed' | 'changed' | 'unchanged';
 };
 
 /**
@@ -3881,7 +3887,7 @@ export type CorpusComparisonCompatibility = {
  *
  * Stable reason that two published executions cannot be compared as one contract.
  */
-export type CorpusComparisonReason = 'target_key_mismatch' | 'external_target_revision_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
+export type CorpusComparisonReason = 'target_key_mismatch' | 'external_target_revision_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'trial_policy_revision_mismatch' | 'accepted_exposure_contract_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
 
 /**
  * CorpusComparisonResultSummary
@@ -3889,6 +3895,14 @@ export type CorpusComparisonReason = 'target_key_mismatch' | 'external_target_re
  * Bounded public identity and aggregate outcome for one compared result.
  */
 export type CorpusComparisonResultSummary = {
+    /**
+     * Accepted Exposure Comparison Revision
+     */
+    accepted_exposure_comparison_revision: string | null;
+    /**
+     * Accepted Exposure Revision
+     */
+    accepted_exposure_revision: string | null;
     /**
      * App Manifest Fingerprint
      */
@@ -3941,6 +3955,10 @@ export type CorpusComparisonResultSummary = {
      * Target Key
      */
     target_key: string;
+    /**
+     * Trial Policy Revision
+     */
+    trial_policy_revision: string;
 };
 
 /**
@@ -3963,7 +3981,7 @@ export type CorpusExecutionComparison = {
     /**
      * Schema Version
      */
-    schema_version?: 3;
+    schema_version?: 4;
     /**
      * Score Tolerance
      */
@@ -4000,6 +4018,7 @@ export type CorpusExecutionComparison = {
  * One typed regression derived from compatible published aggregates.
  */
 export type CorpusExecutionRegression = {
+    baseline_reliability?: CorpusReliabilityDistributionV1 | null;
     /**
      * Baseline Score
      */
@@ -4012,6 +4031,7 @@ export type CorpusExecutionRegression = {
      * Case Id
      */
     case_id?: string | null;
+    current_reliability?: CorpusReliabilityDistributionV1 | null;
     /**
      * Current Score
      */
@@ -4051,7 +4071,7 @@ export type CorpusExecutionResult = {
  *
  * Stable dimension on which one compatible result regressed.
  */
-export type CorpusRegressionKind = 'status' | 'score';
+export type CorpusRegressionKind = 'status' | 'score' | 'reliability';
 
 /**
  * CorpusRegressionScope
@@ -4059,6 +4079,46 @@ export type CorpusRegressionKind = 'status' | 'score';
  * Stable location of one compatible-result regression.
  */
 export type CorpusRegressionScope = 'run' | 'case';
+
+/**
+ * CorpusReliabilityDistributionV1
+ *
+ * Lossless trial-outcome counts used for cross-release reliability decisions.
+ */
+export type CorpusReliabilityDistributionV1 = {
+    /**
+     * Cancelled Trials
+     */
+    cancelled_trials: number;
+    /**
+     * Candidate Failed Trials
+     */
+    candidate_failed_trials: number;
+    /**
+     * Evaluator Error Trials
+     */
+    evaluator_error_trials: number;
+    /**
+     * Passed Trials
+     */
+    passed_trials: number;
+    /**
+     * Runtime Error Trials
+     */
+    runtime_error_trials: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Total Trials
+     */
+    total_trials: number;
+    /**
+     * Unavailable Trials
+     */
+    unavailable_trials: number;
+};
 
 /**
  * CorpusUserMessageSpec
@@ -4676,6 +4736,7 @@ export type EvalAssertionPresentationV1 = {
      * Kind
      */
     kind: string;
+    model_judge?: PublishedModelJudgeDetail | null;
     /**
      * Outcome
      */
@@ -5017,6 +5078,22 @@ export type EvalBaselineSelectionResponse = {
 };
 
 /**
+ * EvalCandidateCostBudgetV1
+ *
+ * One configured per-trial observed-cost interruption threshold.
+ */
+export type EvalCandidateCostBudgetV1 = {
+    /**
+     * Amount
+     */
+    amount: string;
+    /**
+     * Currency
+     */
+    currency: string;
+};
+
+/**
  * EvalCaseCatalogEntry
  */
 export type EvalCaseCatalogEntry = {
@@ -5213,9 +5290,11 @@ export type EvalCaseDraftV2 = {
 };
 
 /**
- * EvalCasePresentationV1
+ * EvalCasePresentationV2
+ *
+ * Case presentation with an explicit retained-trial reliability decision.
  */
-export type EvalCasePresentationV1 = {
+export type EvalCasePresentationV2 = {
     /**
      * Case Id
      */
@@ -5225,6 +5304,7 @@ export type EvalCasePresentationV1 = {
      */
     case_revision: string;
     dimensions: EvalResultOutcomeDimensionsV1;
+    reliability: EvalCaseReliabilityV1;
     /**
      * Score
      */
@@ -5237,6 +5317,74 @@ export type EvalCasePresentationV1 = {
      * Trials
      */
     trials: Array<EvalTrialPresentationV1>;
+};
+
+/**
+ * EvalCaseReliabilityV1
+ *
+ * Lossless bounded distribution and policy decision for one published case.
+ */
+export type EvalCaseReliabilityV1 = {
+    /**
+     * Cancelled Trials
+     */
+    cancelled_trials: number;
+    /**
+     * Candidate Failed Trials
+     */
+    candidate_failed_trials: number;
+    /**
+     * Evaluator Error Trials
+     */
+    evaluator_error_trials: number;
+    /**
+     * Maximum Score
+     */
+    maximum_score?: number | null;
+    /**
+     * Mean Score
+     */
+    mean_score?: number | null;
+    /**
+     * Minimum Score
+     */
+    minimum_score?: number | null;
+    /**
+     * Outcome
+     */
+    outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Passed Trials
+     */
+    passed_trials: number;
+    /**
+     * Runtime Error Trials
+     */
+    runtime_error_trials: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Scored Trials
+     */
+    scored_trials: number;
+    /**
+     * Total Trials
+     */
+    total_trials: number;
+    /**
+     * Trial Policy Revision
+     */
+    trial_policy_revision: string;
+    /**
+     * Unavailable Trials
+     */
+    unavailable_trials: number;
+    /**
+     * Variability
+     */
+    variability: 'single_trial' | 'candidate_evaluation_variability' | 'end_to_end_evaluation_variability';
 };
 
 /**
@@ -5370,7 +5518,7 @@ export type EvalCorpusDocument = {
     /**
      * Schema Version
      */
-    schema_version?: 2;
+    schema_version?: 3;
     /**
      * Suites
      */
@@ -5448,6 +5596,27 @@ export type EvalExecutionProfileDiagnostic = {
      * Remediation
      */
     remediation: string;
+};
+
+/**
+ * EvalExecutionProfileExposureV1
+ *
+ * One exact candidate profile bound to the cases it will execute.
+ */
+export type EvalExecutionProfileExposureV1 = {
+    candidate_cost_budget?: EvalCandidateCostBudgetV1 | null;
+    /**
+     * Case Ids
+     */
+    case_ids: Array<string>;
+    /**
+     * Execution Profile Comparison Revision
+     */
+    execution_profile_comparison_revision: string;
+    /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision: string;
 };
 
 /**
@@ -5946,6 +6115,26 @@ export type EvalJudgePrivateReferenceCatalogEntry = {
 };
 
 /**
+ * EvalJudgeProfileExposureV1
+ *
+ * One current judge route accepted for every assertion that names its key.
+ */
+export type EvalJudgeProfileExposureV1 = {
+    /**
+     * Judge Profile Comparison Revision
+     */
+    judge_profile_comparison_revision: string;
+    /**
+     * Judge Profile Revision
+     */
+    judge_profile_revision: string;
+    /**
+     * Profile Key
+     */
+    profile_key: string;
+};
+
+/**
  * EvalJudgeProfileRouteCatalogEntry
  *
  * Server-derived relationship between one judge and the candidate route.
@@ -5963,6 +6152,42 @@ export type EvalJudgeProfileRouteCatalogEntry = {
      * Judge Profile Revision
      */
     judge_profile_revision: string;
+};
+
+/**
+ * EvalMaximumCostExposureV1
+ */
+export type EvalMaximumCostExposureV1 = {
+    /**
+     * Pricing Profile Fingerprints
+     */
+    pricing_profile_fingerprints?: Array<string>;
+    /**
+     * State
+     */
+    state: 'priced' | 'unavailable' | 'not_applicable';
+    /**
+     * Totals
+     */
+    totals?: Array<EvalMaximumCostTotalV1>;
+    /**
+     * Unavailable Reason
+     */
+    unavailable_reason?: 'no_candidate_cost_ceiling' | 'candidate_cost_not_hard_bounded' | 'candidate_pricing_incomplete' | 'judge_cost_not_hard_bounded' | 'judge_pricing_incomplete' | null;
+};
+
+/**
+ * EvalMaximumCostTotalV1
+ */
+export type EvalMaximumCostTotalV1 = {
+    /**
+     * Amount
+     */
+    amount: string;
+    /**
+     * Currency
+     */
+    currency: string;
 };
 
 /**
@@ -6155,7 +6380,7 @@ export type EvalResultComparisonResponse = {
  */
 export type EvalResultDetailResponse = {
     baseline?: EvalBaselineRecord | null;
-    presentation: EvalResultPresentationV1;
+    presentation: EvalResultPresentationV2;
     record: EvalResultRecord;
     /**
      * Result
@@ -6221,11 +6446,12 @@ export type EvalResultPage = {
 };
 
 /**
- * EvalResultPresentationV1
+ * EvalResultPresentationV2
  *
- * Canonical explainable projection for one immutable public eval result.
+ * Canonical V2 presentation with reliability policy and accepted exposure.
  */
-export type EvalResultPresentationV1 = {
+export type EvalResultPresentationV2 = {
+    accepted_exposure?: EvalSuiteRunExposureV1 | null;
     /**
      * App Manifest Fingerprint
      */
@@ -6237,7 +6463,7 @@ export type EvalResultPresentationV1 = {
     /**
      * Cases
      */
-    cases: Array<EvalCasePresentationV1>;
+    cases: Array<EvalCasePresentationV2>;
     /**
      * Corpus Revision
      */
@@ -6263,7 +6489,7 @@ export type EvalResultPresentationV1 = {
     /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     /**
      * Score
      */
@@ -6284,6 +6510,7 @@ export type EvalResultPresentationV1 = {
      * Target Key
      */
     target_key: string;
+    trial_policy: EvalSuiteTrialPolicyV1;
 };
 
 /**
@@ -6333,7 +6560,7 @@ export type EvalResultRecord = {
  */
 export type EvalResultResponse = {
     baseline?: EvalBaselineRecord | null;
-    presentation: EvalResultPresentationV1;
+    presentation: EvalResultPresentationV2;
     result: CorpusExecutionResult;
     run: EvalRunRecord;
 };
@@ -6422,6 +6649,19 @@ export type EvalRunInvocation = {
      * Secret-safe identity of the exact authenticated request that admitted this run.
      */
     admission_request_revision?: string | null;
+    authored_suite_exposure?: EvalSuiteRunExposureV1 | null;
+    /**
+     * Authored Suite Launch Lane
+     *
+     * Concurrency lane shared by serialized runs from one suite launch.
+     */
+    authored_suite_launch_lane?: number | null;
+    /**
+     * Authored Suite Launch Revision
+     *
+     * Secret-safe identity shared by every durable run admitted by one authored-suite launch.
+     */
+    authored_suite_launch_revision?: string | null;
     /**
      * Authored Suite Revision
      */
@@ -7352,6 +7592,31 @@ export type EvalSuiteDocumentV2 = {
 };
 
 /**
+ * EvalSuiteDocumentV3
+ *
+ * Immutable V3 suite with an explicit revisioned trial decision policy.
+ */
+export type EvalSuiteDocumentV3 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseDefinitionV2>;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 3;
+    suite: EvalSuiteSpec;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
  * EvalSuiteDraftV1
  *
  * Revision-free suite material edited by an SDK or Control Plane client.
@@ -7414,6 +7679,39 @@ export type EvalSuiteDraftV2 = {
 };
 
 /**
+ * EvalSuiteDraftV3
+ *
+ * V3 editor material with revision-free suite trial settings.
+ */
+export type EvalSuiteDraftV3 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseDraftV2>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 3;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    trial_request?: EvalSuiteTrialRequestDraftV3;
+};
+
+/**
  * EvalSuitePreviewRequest
  *
  * Authority-free editor material; preview never persists or executes it.
@@ -7422,7 +7720,7 @@ export type EvalSuitePreviewRequest = {
     /**
      * Draft
      */
-    draft: EvalSuiteDraftV1 | EvalSuiteDraftV2;
+    draft: EvalSuiteDraftV1 | EvalSuiteDraftV2 | EvalSuiteDraftV3;
 };
 
 /**
@@ -7441,7 +7739,73 @@ export type EvalSuitePreviewResponse = {
     /**
      * Suite
      */
-    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
+    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3;
+};
+
+/**
+ * EvalSuiteRunExposureV1
+ *
+ * Exact maximum configured work accepted for one authored-suite selection.
+ */
+export type EvalSuiteRunExposureV1 = {
+    candidate_cost: EvalMaximumCostExposureV1;
+    /**
+     * Candidate Trials
+     */
+    candidate_trials: number;
+    /**
+     * Execution Profiles
+     */
+    execution_profiles: Array<EvalExecutionProfileExposureV1>;
+    judge_cost: EvalMaximumCostExposureV1;
+    /**
+     * Judge Evaluations
+     */
+    judge_evaluations: number;
+    /**
+     * Judge Profiles
+     */
+    judge_profiles?: Array<EvalJudgeProfileExposureV1>;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency: number;
+    /**
+     * Maximum Candidate Model Steps
+     */
+    maximum_candidate_model_steps: number;
+    /**
+     * Maximum Candidate Total Tokens
+     */
+    maximum_candidate_total_tokens?: number | null;
+    /**
+     * Maximum Judge Input Tokens
+     */
+    maximum_judge_input_tokens?: number | null;
+    /**
+     * Maximum Judge Output Tokens
+     */
+    maximum_judge_output_tokens?: number | null;
+    /**
+     * Maximum Judge Total Tokens
+     */
+    maximum_judge_total_tokens?: number | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Selection Revision
+     */
+    selection_revision: string;
+    /**
+     * Trial Policy Revision
+     */
+    trial_policy_revision: string;
 };
 
 /**
@@ -7457,7 +7821,7 @@ export type EvalSuiteSaveRequest = {
     /**
      * Suite
      */
-    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
+    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3;
 };
 
 /**
@@ -7469,7 +7833,7 @@ export type EvalSuiteSaveResponse = {
     /**
      * Suite
      */
-    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
+    suite: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3;
 };
 
 /**
@@ -7531,6 +7895,70 @@ export type EvalSuiteSpec = {
      */
     revision: string;
     trial_request?: TrialRequestSpec;
+};
+
+/**
+ * EvalSuiteTrialPolicyV1
+ *
+ * Immutable decision rule for the complete retained trial set of each case.
+ */
+export type EvalSuiteTrialPolicyV1 = {
+    /**
+     * Max Concurrency
+     */
+    max_concurrency: number;
+    /**
+     * Minimum Passed Trials
+     */
+    minimum_passed_trials: number;
+    /**
+     * Require Complete Required Evidence
+     */
+    require_complete_required_evidence?: true;
+    /**
+     * Require Zero Evaluator Errors
+     */
+    require_zero_evaluator_errors?: true;
+    /**
+     * Require Zero Runtime Errors
+     */
+    require_zero_runtime_errors?: true;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Trial Count
+     */
+    trial_count: number;
+};
+
+/**
+ * EvalSuiteTrialRequestDraftV3
+ *
+ * Revision-free trial settings edited by SDK and Control Plane clients.
+ */
+export type EvalSuiteTrialRequestDraftV3 = {
+    /**
+     * Max Concurrency
+     */
+    max_concurrency?: number;
+    /**
+     * Minimum Passed Trials
+     */
+    minimum_passed_trials?: number;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds?: number;
+    /**
+     * Trials
+     */
+    trials?: number;
 };
 
 /**
@@ -11943,6 +12371,7 @@ export type PublishedEvalCaseResult = {
      * Duration Ms
      */
     duration_ms: number;
+    reliability: EvalCaseReliabilityV1;
     /**
      * Score
      */
@@ -11961,6 +12390,7 @@ export type PublishedEvalCaseResult = {
  * PublishedEvalRun
  */
 export type PublishedEvalRun = {
+    accepted_exposure?: EvalSuiteRunExposureV1 | null;
     /**
      * Cases
      */
@@ -11988,7 +12418,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 8;
+    schema_version: 9;
     /**
      * Score
      */
@@ -12009,6 +12439,7 @@ export type PublishedEvalRun = {
      * Target Key
      */
     target_key: string;
+    trial_policy: EvalSuiteTrialPolicyV1;
 };
 
 /**
@@ -12198,11 +12629,44 @@ export type PublishedMaxTotalTokensDetail = {
 };
 
 /**
+ * PublishedModelJudgeCostV1
+ *
+ * Observed priced cost, or an explicit unpriced state, for one judgment.
+ */
+export type PublishedModelJudgeCostV1 = {
+    /**
+     * Availability
+     */
+    availability: 'priced' | 'unavailable';
+    /**
+     * Currency
+     */
+    currency?: string | null;
+    /**
+     * Estimated Cost
+     */
+    estimated_cost?: string | null;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps?: number | null;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps?: number | null;
+};
+
+/**
  * PublishedModelJudgeDetail
  *
  * Bounded public contract and safe outcome evidence for one model judgment.
  */
 export type PublishedModelJudgeDetail = {
+    /**
+     * Candidate Route Relation
+     */
+    candidate_route_relation: 'independent_model' | 'same_model';
+    cost?: PublishedModelJudgeCostV1 | null;
     /**
      * Diagnostic
      */
@@ -12219,6 +12683,7 @@ export type PublishedModelJudgeDetail = {
      * Include Transcript
      */
     include_transcript: boolean;
+    judge_profile: JudgeProfileIdentityV1;
     /**
      * Kind
      */
@@ -12235,6 +12700,31 @@ export type PublishedModelJudgeDetail = {
      * Threshold
      */
     threshold: number;
+    usage?: PublishedModelJudgeUsageV1 | null;
+};
+
+/**
+ * PublishedModelJudgeUsageV1
+ *
+ * Observed usage for one successfully recorded rubric-string judgment.
+ */
+export type PublishedModelJudgeUsageV1 = {
+    /**
+     * Input Tokens
+     */
+    input_tokens: string;
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Output Tokens
+     */
+    output_tokens: string;
+    /**
+     * Total Tokens
+     */
+    total_tokens: string;
 };
 
 /**
@@ -12305,6 +12795,8 @@ export type PublishedRootStatusDetail = {
 
 /**
  * PublishedStructuredJudgeCostV1
+ *
+ * Observed priced cost, or an explicit unpriced state, for one judgment.
  */
 export type PublishedStructuredJudgeCostV1 = {
     /**
@@ -12357,6 +12849,8 @@ export type PublishedStructuredJudgeCriterionV1 = {
 
 /**
  * PublishedStructuredJudgeUsageV1
+ *
+ * Observed usage for one successfully recorded structured judgment.
  */
 export type PublishedStructuredJudgeUsageV1 = {
     /**
@@ -15296,13 +15790,14 @@ export type TranscriptSummary = {
 /**
  * TrialRequestSpec
  *
- * Sequential, bounded fresh-evaluation execution settings.
+ * Bounded fresh-evaluation settings with an optional versioned policy.
  */
 export type TrialRequestSpec = {
     /**
      * Timeout Seconds
      */
     timeout_seconds?: number;
+    trial_policy?: EvalSuiteTrialPolicyV1 | null;
     /**
      * Trials
      */
@@ -18581,7 +19076,7 @@ export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses = {
      *
      * Successful Response
      */
-    200: EvalSuiteDocumentV1 | EvalSuiteDocumentV2;
+    200: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3;
 };
 
 export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponse = GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses[keyof GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses];

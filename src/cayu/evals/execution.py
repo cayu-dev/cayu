@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -39,6 +40,7 @@ from cayu.evals.corpus import (
     JudgePrivacyPolicyV1,
     JudgeProfileIdentityV1,
     MaxEstimatedCostAssertionSpec,
+    ModelJudgeAssertionSpec,
     PricingProfileIdentityV1,
     PrivateJudgeReferenceV1,
     StructuredModelJudgeAssertionSpec,
@@ -58,7 +60,12 @@ from cayu.evals.external import (
     ExternalTrialIdentityV1,
     with_external_trial_envelope,
 )
-from cayu.evals.models import EvalRun, EvalRunContractV1, _model_instance_python_input
+from cayu.evals.models import (
+    EvalRun,
+    EvalRunContractV2,
+    EvalTrialResult,
+    _model_instance_python_input,
+)
 from cayu.evals.portable_assertions import (
     _compile_corpus_assertion_specs,
     _model_judge_implementation_revision,
@@ -72,6 +79,7 @@ from cayu.evals.result_contract import (
     _EvalTrialPublicData,
 )
 from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
+from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
@@ -846,7 +854,7 @@ class CompiledCorpusSuite:
 
     corpus: EvalCorpusDocument
     suite: EvalSuite
-    run_contract: EvalRunContractV1
+    run_contract: EvalRunContractV2
     trials: int
     timeout_seconds: int
 
@@ -969,15 +977,16 @@ def _compile_prepared_corpus_suite(
         len(_bootstrap_message_text(message)) for message in validated_target.bootstrap_messages
     )
     assertion_counts = tuple(len(case.assertions) for case in case_specs)
-    structured_judge_keys = {
-        assertion.judge_profile_key
-        for case in case_specs
-        for assertion in case.assertions
-        if type(assertion) is StructuredModelJudgeAssertionSpec
-    }
+    profiled_judge_keys: set[str] = set()
+    for case in case_specs:
+        for assertion in case.assertions:
+            if type(assertion) is ModelJudgeAssertionSpec:
+                profiled_judge_keys.add(assertion.evaluator_key)
+            elif type(assertion) is StructuredModelJudgeAssertionSpec:
+                profiled_judge_keys.add(assertion.judge_profile_key)
     trusted_model_judges = []
     for judge in validated_target.model_judges:
-        profile = model_judge_profile(judge) if judge.key in structured_judge_keys else None
+        profile = model_judge_profile(judge) if judge.key in profiled_judge_keys else None
         trusted_model_judges.append(
             _trusted_model_judge_binding(
                 key=judge.key,
@@ -1314,6 +1323,11 @@ async def _run_compiled_corpus_suite(
     expected_execution_profile: ExecutionProfileIdentity | None = None,
     native_run_id: str | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
+    | None = None,
+    trial_completed: Callable[[str, EvalTrialResult, _EvalTrialPublicData], Awaitable[None]]
+    | None = None,
 ) -> CorpusExecutionResult:
     """Execute one internally compiled suite without repeating corpus compilation."""
 
@@ -1331,7 +1345,11 @@ async def _run_compiled_corpus_suite(
         raise TypeError(
             "expected_execution_profile must be an exact ExecutionProfileIdentity or None."
         )
+    if accepted_exposure is not None and type(accepted_exposure) is not EvalSuiteRunExposureV1:
+        raise TypeError("accepted_exposure must be an exact EvalSuiteRunExposureV1 or None.")
     _validate_corpus_concurrency(validated_target, max_concurrency)
+    if max_concurrency > compiled.run_contract.trial_policy.max_concurrency:
+        raise ValueError("max_concurrency cannot exceed the immutable suite trial policy.")
 
     target_before = _evaluation_target_identity_from_validated_target(
         validated_target,
@@ -1420,6 +1438,7 @@ async def _run_compiled_corpus_suite(
         max_concurrency=max_concurrency,
         case_timeout_seconds=compiled.timeout_seconds,
         trials=compiled.trials,
+        trial_policy=compiled.run_contract.trial_policy,
         output_preview_bytes=output_preview_bytes,
         run_stream=(
             run_stream
@@ -1430,6 +1449,8 @@ async def _run_compiled_corpus_suite(
         run_id=selected_run_id,
         trial_request_transform=trial_request_transform,
         execution_capacity=execution_capacity,
+        completed_trials=completed_trials,
+        trial_completed=trial_completed,
     )
     return await asyncio.to_thread(
         _finalize_compiled_corpus_result,
@@ -1440,6 +1461,7 @@ async def _run_compiled_corpus_suite(
         trial_public_data_by_case,
         manifest_project_root,
         external_trials,
+        accepted_exposure,
     )
 
 
@@ -1451,6 +1473,7 @@ def _finalize_compiled_corpus_result(
     trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]],
     manifest_project_root: Path | None,
     external_trials: tuple[ExternalTrialIdentityV1, ...] = (),
+    accepted_exposure: EvalSuiteRunExposureV1 | None = None,
 ) -> CorpusExecutionResult:
     """Construct and validate the complete published result off the event loop."""
 
@@ -1477,6 +1500,7 @@ def _finalize_compiled_corpus_result(
             compiled.corpus,
             bound_run,
             trial_public_data_by_case=trial_public_data_by_case,
+            accepted_exposure=accepted_exposure,
         ),
         external_trials=external_trials,
     )

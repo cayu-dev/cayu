@@ -60,6 +60,7 @@ from cayu.evals.result_contract import (
     EvalTrialOutputPreviewV1,
 )
 from cayu.evals.revisions import eval_trial_result_revision
+from cayu.evals.trial_policy import EvalCaseReliabilityV1, EvalSuiteTrialPolicyV1
 from cayu.runtime.costs import CostLineItem, SessionCostSummary
 from cayu.runtime.usage import (
     SessionUsageSummary,
@@ -234,8 +235,8 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     run = _run()
     published = publish_eval_run(corpus, run)
 
-    assert PUBLISHED_EVAL_SCHEMA_VERSION == 8
-    assert published.schema_version == 8
+    assert PUBLISHED_EVAL_SCHEMA_VERSION == 9
+    assert published.schema_version == 9
     assert published.corpus_revision == corpus.revision
     assert published.status == "unavailable"
     assert published.score is None
@@ -299,7 +300,7 @@ def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     with pytest.raises(ValidationError, match="other versions are unsupported"):
         PublishedEvalRun.model_validate(document)
 
-    with pytest.raises(ValidationError, match="schema_version must be the integer 8"):
+    with pytest.raises(ValidationError, match="schema_version must be the integer 9"):
         PublishedEvalRun.model_validate(
             {**published.model_dump(mode="json"), "schema_version": "2"}
         )
@@ -630,12 +631,19 @@ def test_unavailable_cost_observation_requires_unpriced_steps():
 def test_published_run_rejects_variable_suite_trial_counts():
     published = publish_eval_run(_corpus(), _run())
     case = published.cases[0]
+    one_trial_policy = EvalSuiteTrialPolicyV1.create()
+    one_trial_reliability = EvalCaseReliabilityV1.create(
+        policy=one_trial_policy,
+        trials=((case.trials[0].status, case.trials[0].score, case.trials[0].code),),
+        uses_model_judge=False,
+    )
     second_case = case.model_copy(
         update={
             "case_id": "case-two",
             "trials": case.trials[:1],
             "status": case.trials[0].status,
             "score": case.trials[0].score,
+            "reliability": one_trial_reliability,
             "duration_ms": case.trials[0].duration_ms,
         }
     )
@@ -737,12 +745,12 @@ def test_lossless_run_rejects_contracted_trial_mismatch_during_validation_and_lo
     document = json.loads(eval_run_to_json(_run()))
     document["run_contract"]["trials"] = 1
 
-    with pytest.raises(ValidationError, match="trial counts must match its run contract"):
+    with pytest.raises(ValidationError, match="trials must match its trial policy"):
         EvalRun.model_validate(document)
 
     path = tmp_path / "mismatched-contract.json"
     path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(ValidationError, match="trial counts must match its run contract"):
+    with pytest.raises(ValidationError, match="trials must match its trial policy"):
         load_eval_run(path)
 
 

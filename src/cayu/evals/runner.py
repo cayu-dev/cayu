@@ -6,7 +6,7 @@ import inspect
 import math
 import traceback
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -96,6 +96,7 @@ from cayu.evals.trajectory import (
     _validated_terminal_session_evidence,
     final_output_text,
 )
+from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.memory_attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -131,6 +132,10 @@ from cayu.tools._operation_boundary import (
 from cayu.workspaces import WorkspaceReadResult
 
 TrialRequestTransform = Callable[[str, str, int, RunRequest], RunRequest]
+TrialCompletionCallback = Callable[
+    [str, EvalTrialResult, _EvalTrialPublicData],
+    Awaitable[None],
+]
 
 if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
@@ -699,20 +704,22 @@ async def run_eval_suite(
     case_timeout_seconds: float | None = None,
     trials: int = 1,
     execution_capacity: EvalExecutionCapacity | None = None,
+    trial_policy: EvalSuiteTrialPolicyV1 | None = None,
 ) -> EvalRun:
     """Run every case in the suite and aggregate the results.
 
-    `max_concurrency` runs up to that many cases at once (default 1 = sequential).
-    Results always keep suite order. Note: `ScriptedModelProvider` consumes batches
-    by positional request index, so with concurrency > 1 interleaved cases may pull
-    each other's batches — keep the default for scripted multi-case suites.
+    `max_concurrency` runs up to that many concrete case trials at once (default 1 =
+    sequential). Results always keep suite and trial order. Note:
+    `ScriptedModelProvider` consumes batches by positional request index, so with
+    concurrency > 1 interleaved cases may pull each other's batches — keep the
+    default for scripted multi-case suites.
 
     `case_timeout_seconds` bounds each case's run; a case that exceeds it is
     cancelled and recorded as `EvalStatus.ERROR` instead of stalling the suite.
 
-    `trials` runs each case N times and reports the mean per-assertion score, so a
-    stochastic model whose score wobbles (e.g. 0.83 -> 0.82) settles to a stable
-    average instead of flipping a baseline comparison on every run.
+    `trials` runs each case N times and retains every outcome. When supplied,
+    `trial_policy` fixes the minimum-pass decision and concurrency ceiling before
+    execution; otherwise an all-pass policy records the requested concurrency.
 
     `retain_final_output=False` discards raw trial output after assertions have
     evaluated. It cannot be combined with trajectory retention because a retained
@@ -726,6 +733,7 @@ async def run_eval_suite(
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
         trials=trials,
+        trial_policy=trial_policy,
         public_output_preview_bytes=None,
         execution_capacity=execution_capacity,
     )
@@ -739,11 +747,15 @@ async def _run_eval_suite_with_public_projection(
     max_concurrency: int,
     case_timeout_seconds: float | None,
     trials: int,
+    trial_policy: EvalSuiteTrialPolicyV1,
     output_preview_bytes: int,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
     run_id: str | None = None,
     trial_request_transform: TrialRequestTransform | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
+    | None = None,
+    trial_completed: TrialCompletionCallback | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
     """Run a corpus suite and return its separate runner-owned public sidecar."""
 
@@ -755,11 +767,14 @@ async def _run_eval_suite_with_public_projection(
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
         trials=trials,
+        trial_policy=trial_policy,
         public_output_preview_bytes=output_preview_bytes,
         run_stream=run_stream,
         run_id=run_id,
         trial_request_transform=trial_request_transform,
         execution_capacity=execution_capacity,
+        completed_trials=completed_trials,
+        trial_completed=trial_completed,
     )
     if public_data is None:
         raise RuntimeError("Corpus execution lost its runner-owned public projection.")
@@ -775,11 +790,15 @@ async def _run_eval_suite(
     max_concurrency: int,
     case_timeout_seconds: float | None,
     trials: int,
+    trial_policy: EvalSuiteTrialPolicyV1 | None,
     public_output_preview_bytes: int | None,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
     run_id: str | None = None,
     trial_request_transform: TrialRequestTransform | None = None,
     execution_capacity: EvalExecutionCapacity | None = None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]]
+    | None = None,
+    trial_completed: TrialCompletionCallback | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -803,12 +822,35 @@ async def _run_eval_suite(
         "run_eval_suite public_output_preview_bytes",
     )
     _validate_trials(trials, "run_eval_suite trials")
+    if trial_policy is None:
+        validated_trial_policy = EvalSuiteTrialPolicyV1.create(
+            trial_count=trials,
+            max_concurrency=max_concurrency,
+        )
+    elif type(trial_policy) is EvalSuiteTrialPolicyV1:
+        validated_trial_policy = EvalSuiteTrialPolicyV1.model_validate(
+            trial_policy.model_dump(mode="json")
+        )
+    else:
+        raise TypeError("run_eval_suite trial_policy must be an exact policy or None.")
+    if validated_trial_policy.trial_count != trials:
+        raise ValueError("run_eval_suite trial_policy must match trials.")
+    if max_concurrency > validated_trial_policy.max_concurrency:
+        raise ValueError("run_eval_suite max_concurrency exceeds its trial policy.")
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
     run_id = str(uuid4()) if run_id is None else require_durable_clean_nonblank(run_id, "run_id")
     if trial_request_transform is not None and not callable(trial_request_transform):
         raise TypeError("trial_request_transform must be callable or None.")
     if execution_capacity is not None and type(execution_capacity) is not EvalExecutionCapacity:
         raise TypeError("execution_capacity must be an exact EvalExecutionCapacity or None.")
+    if completed_trials is None:
+        completed_trials = {}
+    elif not isinstance(completed_trials, Mapping):
+        raise TypeError("completed_trials must be a mapping.")
+    if trial_completed is not None and not callable(trial_completed):
+        raise TypeError("trial_completed must be callable or None.")
+    if (completed_trials or trial_completed is not None) and public_output_preview_bytes is None:
+        raise ValueError("Durable trial recovery requires the public trial projection.")
     started_at = datetime.now(UTC)
     trial_count = len(suite.cases) * trials
     memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
@@ -828,6 +870,7 @@ async def _run_eval_suite(
             max_concurrency=max_concurrency,
             case_timeout_seconds=case_timeout_seconds,
             trials=trials,
+            trial_policy=validated_trial_policy,
             public_output_preview_bytes=public_output_preview_bytes,
             memory_attribution_bounds=memory_attribution_bounds,
             memory_attribution_source_limit=memory_attribution_source_limit,
@@ -836,8 +879,11 @@ async def _run_eval_suite(
             run_stream=run_stream,
             trial_request_transform=trial_request_transform,
             execution_capacity=execution_capacity,
+            completed_trials=completed_trials,
+            trial_completed=trial_completed,
         )
-    completed_at = datetime.now(UTC)
+    observed_started_at = min(result.started_at for result in results)
+    observed_completed_at = max(result.completed_at for result in results)
     status = aggregate_eval_status(result.status for result in results)
     score = aggregate_eval_score(result.score for result in results)
     return (
@@ -847,9 +893,9 @@ async def _run_eval_suite(
             status=status,
             score=score,
             cases=tuple(results),
-            started_at=started_at,
-            completed_at=completed_at,
-            duration_ms=_duration_ms(started_at, completed_at),
+            started_at=min(started_at, observed_started_at),
+            completed_at=observed_completed_at,
+            duration_ms=_duration_ms(min(started_at, observed_started_at), observed_completed_at),
             metadata=suite.metadata,
             run_contract=None,
         ),
@@ -915,6 +961,7 @@ async def _run_suite_cases(
     max_concurrency: int,
     case_timeout_seconds: float | None,
     trials: int,
+    trial_policy: EvalSuiteTrialPolicyV1,
     public_output_preview_bytes: int | None,
     memory_attribution_bounds: MemoryAttributionBounds,
     memory_attribution_source_limit: int,
@@ -923,53 +970,35 @@ async def _run_suite_cases(
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None,
     trial_request_transform: TrialRequestTransform | None,
     execution_capacity: EvalExecutionCapacity | None,
+    completed_trials: Mapping[tuple[str, int], tuple[EvalTrialResult, _EvalTrialPublicData]],
+    trial_completed: TrialCompletionCallback | None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
 ]:
-    if max_concurrency == 1:
-        executions = []
-        for case in suite.cases:
-            capacity_slot = (
-                nullcontext() if execution_capacity is None else execution_capacity.slot()
-            )
-            async with capacity_slot:
-                executions.append(
-                    await _run_eval_case(
-                        app,
-                        case,
-                        suite_id=suite.id,
-                        retain_trajectory=retain_trajectory,
-                        retain_final_output=retain_final_output,
-                        timeout_seconds=case_timeout_seconds,
-                        trials=trials,
-                        public_output_preview_bytes=public_output_preview_bytes,
-                        memory_attribution_bounds=memory_attribution_bounds,
-                        memory_attribution_source_limit=memory_attribution_source_limit,
-                        memory_attribution_max_bytes=memory_attribution_max_bytes,
-                        memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
-                        run_stream=run_stream,
-                        trial_request_transform=trial_request_transform,
-                    )
-                )
-        results = [result for result, _ in executions]
-        if public_output_preview_bytes is None:
-            return results, None
-        public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] = {}
-        for case, (_, public_data) in zip(suite.cases, executions, strict=True):
-            if public_data is None:
-                raise RuntimeError("Corpus case execution lost its public projection.")
-            public_data_by_case[case.id] = public_data
-        return results, public_data_by_case
-
     # Schedule concrete trials, not whole cases, so one repeated case can consume
     # the configured concurrency. Positional slots preserve authored case order
     # and numeric trial order regardless of completion order.
     slots: list[list[tuple[EvalTrialResult, _EvalTrialPublicData | None] | None]] = [
         [None] * trials for _ in suite.cases
     ]
-    case_started_at: list[datetime | None] = [None] * len(suite.cases)
-    case_completed_at: list[datetime | None] = [None] * len(suite.cases)
+    case_by_id = {case.id: index for index, case in enumerate(suite.cases)}
+    for key, execution in completed_trials.items():
+        if type(key) is not tuple or len(key) != 2:
+            raise ValueError("Completed trial keys must be (case_id, trial_number) pairs.")
+        case_id, trial_number = key
+        index = case_by_id.get(case_id)
+        if index is None or type(trial_number) is not int or not 1 <= trial_number <= trials:
+            raise ValueError("Completed trial slot does not belong to the eval suite.")
+        result, public_data = execution
+        if type(result) is not EvalTrialResult or type(public_data) is not _EvalTrialPublicData:
+            raise TypeError("Completed trials require exact result and public-data values.")
+        if result.trial_number != trial_number:
+            raise ValueError("Completed trial result does not match its slot.")
+        slots[index][trial_number - 1] = (
+            EvalTrialResult.model_validate(result.model_dump(mode="python", warnings=False)),
+            _EvalTrialPublicData.model_validate(public_data.model_dump(mode="python")),
+        )
     semaphore = asyncio.Semaphore(max_concurrency)
 
     async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
@@ -978,9 +1007,7 @@ async def _run_suite_cases(
                 nullcontext() if execution_capacity is None else execution_capacity.slot()
             )
             async with capacity_slot:
-                if case_started_at[index] is None:
-                    case_started_at[index] = datetime.now(UTC)
-                slots[index][trial_number - 1] = await _run_case_once_with_public_projection(
+                execution = await _run_case_once_with_public_projection(
                     app,
                     case,
                     trial_number=trial_number,
@@ -996,27 +1023,44 @@ async def _run_suite_cases(
                     run_stream=run_stream,
                     trial_request_transform=trial_request_transform,
                 )
-                case_completed_at[index] = datetime.now(UTC)
+                result, public_data = execution
+                if trial_completed is not None:
+                    if public_data is None:
+                        raise RuntimeError("Durable trial execution lost its public projection.")
+                    await trial_completed(case.id, result, public_data)
+                slots[index][trial_number - 1] = execution
 
-    async with asyncio.TaskGroup() as group:
-        for index, case in enumerate(suite.cases):
-            for trial_number in range(1, trials + 1):
+    pending_slots = (
+        (index, case, trial_number)
+        for index, case in enumerate(suite.cases)
+        for trial_number in range(1, trials + 1)
+        if slots[index][trial_number - 1] is None
+    )
+    if max_concurrency == 1:
+        # Preserve direct cancellation identity and avoid TaskGroup overhead for
+        # the common sequential policy while still honoring recovered slots.
+        for index, case, trial_number in pending_slots:
+            await _run_slot(index, case, trial_number)
+    else:
+        async with asyncio.TaskGroup() as group:
+            for index, case, trial_number in pending_slots:
                 group.create_task(_run_slot(index, case, trial_number))
 
     results: list[EvalCaseResult] = []
     public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] = {}
     for index, case in enumerate(suite.cases):
         executions = [execution for execution in slots[index] if execution is not None]
-        started_at = case_started_at[index]
-        completed_at = case_completed_at[index]
-        if len(executions) != trials or started_at is None or completed_at is None:
+        if len(executions) != trials:
             raise RuntimeError("Concurrent eval execution lost a trial result.")
+        started_at = min(result.started_at for result, _public_data in executions)
+        completed_at = max(result.completed_at for result, _public_data in executions)
         results.append(
             _aggregate_trials(
                 case,
                 [result for result, _ in executions],
                 started_at=started_at,
                 completed_at=completed_at,
+                trial_policy=trial_policy,
             )
         )
         if public_output_preview_bytes is not None:
@@ -1038,6 +1082,7 @@ async def run_eval_case(
     retain_final_output: bool = True,
     timeout_seconds: float | None = None,
     trials: int = 1,
+    trial_policy: EvalSuiteTrialPolicyV1 | None = None,
 ) -> EvalCaseResult:
     """Run one case one or more times and retain every concrete trial.
 
@@ -1049,6 +1094,17 @@ async def run_eval_case(
     if type(case) is not EvalCase:
         raise TypeError("run_eval_case requires an EvalCase.")
     case = _detach_eval_case(case)
+    _validate_trials(trials, "run_eval_case trials")
+    if trial_policy is None:
+        validated_trial_policy = EvalSuiteTrialPolicyV1.create(trial_count=trials)
+    elif type(trial_policy) is EvalSuiteTrialPolicyV1:
+        validated_trial_policy = EvalSuiteTrialPolicyV1.model_validate(
+            trial_policy.model_dump(mode="json")
+        )
+    else:
+        raise TypeError("run_eval_case trial_policy must be an exact policy or None.")
+    if validated_trial_policy.trial_count != trials:
+        raise ValueError("run_eval_case trial_policy must match trials.")
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(max_operations=1)
     async with memory_attribution_read_lifecycle:
         result, _ = await _run_eval_case(
@@ -1059,6 +1115,7 @@ async def run_eval_case(
             retain_final_output=retain_final_output,
             timeout_seconds=timeout_seconds,
             trials=trials,
+            trial_policy=validated_trial_policy,
             public_output_preview_bytes=None,
             memory_attribution_bounds=eval_memory_attribution_bounds_for_trial_count(trials),
             memory_attribution_source_limit=eval_memory_attribution_source_limit_for_trial_count(
@@ -1079,6 +1136,7 @@ async def _run_eval_case(
     retain_final_output: bool,
     timeout_seconds: float | None,
     trials: int,
+    trial_policy: EvalSuiteTrialPolicyV1,
     public_output_preview_bytes: int | None,
     memory_attribution_bounds: MemoryAttributionBounds,
     memory_attribution_source_limit: int,
@@ -1098,6 +1156,10 @@ async def _run_eval_case(
         "run_eval_case public_output_preview_bytes",
     )
     _validate_trials(trials, "run_eval_case trials")
+    if type(trial_policy) is not EvalSuiteTrialPolicyV1:
+        raise TypeError("run_eval_case trial_policy must be an exact EvalSuiteTrialPolicyV1.")
+    if trial_policy.trial_count != trials:
+        raise ValueError("run_eval_case trial_policy must match trials.")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
     started_at = datetime.now(UTC)
     trial_executions = [
@@ -1135,6 +1197,7 @@ async def _run_eval_case(
             trial_results,
             started_at=started_at,
             completed_at=completed_at,
+            trial_policy=trial_policy,
         ),
         trial_public_data,
     )
@@ -2341,12 +2404,19 @@ def _aggregate_trials(
     *,
     started_at: datetime,
     completed_at: datetime,
+    trial_policy: EvalSuiteTrialPolicyV1 | None = None,
 ) -> EvalCaseResult:
     retained = tuple(results)
+    validated_policy = (
+        EvalSuiteTrialPolicyV1.create(trial_count=len(retained))
+        if trial_policy is None
+        else trial_policy
+    )
     return EvalCaseResult.from_trials(
         case_id=case.id,
         authored_session_id=case.request.session_id,
         trials=retained,
+        trial_policy=validated_policy,
         started_at=started_at,
         completed_at=completed_at,
         metadata=case.metadata,

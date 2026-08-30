@@ -7746,6 +7746,9 @@
         "additionalProperties": false,
         "description": "Aggregate outcomes for one case in two contract-compatible results.",
         "properties": {
+          "baseline_reliability": {
+            "$ref": "#/components/schemas/CorpusReliabilityDistributionV1"
+          },
           "baseline_score": {
             "anyOf": [
               {
@@ -7784,6 +7787,9 @@
             "title": "Case Id",
             "type": "string"
           },
+          "current_reliability": {
+            "$ref": "#/components/schemas/CorpusReliabilityDistributionV1"
+          },
           "current_score": {
             "anyOf": [
               {
@@ -7815,12 +7821,25 @@
             "maxItems": 100,
             "title": "Current Trial Diagnostic Codes",
             "type": "array"
+          },
+          "reliability_change": {
+            "enum": [
+              "improved",
+              "regressed",
+              "changed",
+              "unchanged"
+            ],
+            "title": "Reliability Change",
+            "type": "string"
           }
         },
         "required": [
           "case_id",
           "baseline_status",
-          "current_status"
+          "current_status",
+          "baseline_reliability",
+          "current_reliability",
+          "reliability_change"
         ],
         "title": "CorpusCaseComparison",
         "type": "object"
@@ -7874,6 +7893,8 @@
           "suite_revision_mismatch",
           "evidence_policy_revision_mismatch",
           "pricing_profile_fingerprint_mismatch",
+          "trial_policy_revision_mismatch",
+          "accepted_exposure_contract_mismatch",
           "case_contract_mismatch",
           "assertion_contract_mismatch"
         ],
@@ -7884,6 +7905,28 @@
         "additionalProperties": false,
         "description": "Bounded public identity and aggregate outcome for one compared result.",
         "properties": {
+          "accepted_exposure_comparison_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Exposure Comparison Revision"
+          },
+          "accepted_exposure_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Exposure Revision"
+          },
           "app_manifest_fingerprint": {
             "maxLength": 64,
             "minLength": 64,
@@ -7970,6 +8013,10 @@
           "target_key": {
             "title": "Target Key",
             "type": "string"
+          },
+          "trial_policy_revision": {
+            "title": "Trial Policy Revision",
+            "type": "string"
           }
         },
         "required": [
@@ -7983,6 +8030,9 @@
           "suite_revision",
           "evidence_policy_revision",
           "pricing_profile_fingerprint",
+          "trial_policy_revision",
+          "accepted_exposure_revision",
+          "accepted_exposure_comparison_revision",
           "status"
         ],
         "title": "CorpusComparisonResultSummary",
@@ -8013,13 +8063,13 @@
             "items": {
               "$ref": "#/components/schemas/CorpusExecutionRegression"
             },
-            "maxItems": 2002,
+            "maxItems": 3002,
             "title": "Regressions",
             "type": "array"
           },
           "schema_version": {
-            "const": 3,
-            "default": 3,
+            "const": 4,
+            "default": 4,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -8103,6 +8153,16 @@
         "additionalProperties": false,
         "description": "One typed regression derived from compatible published aggregates.",
         "properties": {
+          "baseline_reliability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorpusReliabilityDistributionV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "baseline_score": {
             "anyOf": [
               {
@@ -8145,6 +8205,16 @@
               }
             ],
             "title": "Case Id"
+          },
+          "current_reliability": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorpusReliabilityDistributionV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "current_score": {
             "anyOf": [
@@ -8232,7 +8302,8 @@
         "description": "Stable dimension on which one compatible result regressed.",
         "enum": [
           "status",
-          "score"
+          "score",
+          "reliability"
         ],
         "title": "CorpusRegressionKind",
         "type": "string"
@@ -8245,6 +8316,71 @@
         ],
         "title": "CorpusRegressionScope",
         "type": "string"
+      },
+      "CorpusReliabilityDistributionV1": {
+        "additionalProperties": false,
+        "description": "Lossless trial-outcome counts used for cross-release reliability decisions.",
+        "properties": {
+          "cancelled_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Cancelled Trials",
+            "type": "integer"
+          },
+          "candidate_failed_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Candidate Failed Trials",
+            "type": "integer"
+          },
+          "evaluator_error_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Evaluator Error Trials",
+            "type": "integer"
+          },
+          "passed_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Passed Trials",
+            "type": "integer"
+          },
+          "runtime_error_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Runtime Error Trials",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "total_trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Total Trials",
+            "type": "integer"
+          },
+          "unavailable_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Unavailable Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_trials",
+          "passed_trials",
+          "candidate_failed_trials",
+          "runtime_error_trials",
+          "evaluator_error_trials",
+          "unavailable_trials",
+          "cancelled_trials"
+        ],
+        "title": "CorpusReliabilityDistributionV1",
+        "type": "object"
       },
       "CorpusUserMessageSpec": {
         "additionalProperties": false,
@@ -9386,6 +9522,16 @@
             "title": "Kind",
             "type": "string"
           },
+          "model_judge": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedModelJudgeDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "outcome": {
             "enum": [
               "passed",
@@ -10074,6 +10220,30 @@
           "mutation"
         ],
         "title": "EvalBaselineSelectionResponse",
+        "type": "object"
+      },
+      "EvalCandidateCostBudgetV1": {
+        "additionalProperties": false,
+        "description": "One configured per-trial observed-cost interruption threshold.",
+        "properties": {
+          "amount": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Amount",
+            "type": "string"
+          },
+          "currency": {
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Currency",
+            "type": "string"
+          }
+        },
+        "required": [
+          "currency",
+          "amount"
+        ],
+        "title": "EvalCandidateCostBudgetV1",
         "type": "object"
       },
       "EvalCaseCatalogEntry": {
@@ -10779,8 +10949,9 @@
         "title": "EvalCaseDraftV2",
         "type": "object"
       },
-      "EvalCasePresentationV1": {
+      "EvalCasePresentationV2": {
         "additionalProperties": false,
+        "description": "Case presentation with an explicit retained-trial reliability decision.",
         "properties": {
           "case_id": {
             "title": "Case Id",
@@ -10792,6 +10963,9 @@
           },
           "dimensions": {
             "$ref": "#/components/schemas/EvalResultOutcomeDimensionsV1"
+          },
+          "reliability": {
+            "$ref": "#/components/schemas/EvalCaseReliabilityV1"
           },
           "score": {
             "anyOf": [
@@ -10831,9 +11005,147 @@
           "case_revision",
           "status",
           "dimensions",
+          "reliability",
           "trials"
         ],
-        "title": "EvalCasePresentationV1",
+        "title": "EvalCasePresentationV2",
+        "type": "object"
+      },
+      "EvalCaseReliabilityV1": {
+        "additionalProperties": false,
+        "description": "Lossless bounded distribution and policy decision for one published case.",
+        "properties": {
+          "cancelled_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Cancelled Trials",
+            "type": "integer"
+          },
+          "candidate_failed_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Candidate Failed Trials",
+            "type": "integer"
+          },
+          "evaluator_error_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Evaluator Error Trials",
+            "type": "integer"
+          },
+          "maximum_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Score"
+          },
+          "mean_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Score"
+          },
+          "minimum_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum Score"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "passed_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Passed Trials",
+            "type": "integer"
+          },
+          "runtime_error_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Runtime Error Trials",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scored_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Scored Trials",
+            "type": "integer"
+          },
+          "total_trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Total Trials",
+            "type": "integer"
+          },
+          "trial_policy_revision": {
+            "title": "Trial Policy Revision",
+            "type": "string"
+          },
+          "unavailable_trials": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Unavailable Trials",
+            "type": "integer"
+          },
+          "variability": {
+            "enum": [
+              "single_trial",
+              "candidate_evaluation_variability",
+              "end_to_end_evaluation_variability"
+            ],
+            "title": "Variability",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trial_policy_revision",
+          "outcome",
+          "total_trials",
+          "passed_trials",
+          "candidate_failed_trials",
+          "runtime_error_trials",
+          "evaluator_error_trials",
+          "unavailable_trials",
+          "cancelled_trials",
+          "scored_trials",
+          "variability"
+        ],
+        "title": "EvalCaseReliabilityV1",
         "type": "object"
       },
       "EvalCaseSpec": {
@@ -11146,8 +11458,8 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 2,
-            "default": 2,
+            "const": 3,
+            "default": 3,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -11292,6 +11604,46 @@
           "remediation"
         ],
         "title": "EvalExecutionProfileDiagnostic",
+        "type": "object"
+      },
+      "EvalExecutionProfileExposureV1": {
+        "additionalProperties": false,
+        "description": "One exact candidate profile bound to the cases it will execute.",
+        "properties": {
+          "candidate_cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalCandidateCostBudgetV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "case_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Case Ids",
+            "type": "array"
+          },
+          "execution_profile_comparison_revision": {
+            "title": "Execution Profile Comparison Revision",
+            "type": "string"
+          },
+          "execution_profile_revision": {
+            "title": "Execution Profile Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_ids",
+          "execution_profile_revision",
+          "execution_profile_comparison_revision"
+        ],
+        "title": "EvalExecutionProfileExposureV1",
         "type": "object"
       },
       "EvalExecutionProfileV1": {
@@ -12151,6 +12503,31 @@
         "title": "EvalJudgePrivateReferenceCatalogEntry",
         "type": "object"
       },
+      "EvalJudgeProfileExposureV1": {
+        "additionalProperties": false,
+        "description": "One current judge route accepted for every assertion that names its key.",
+        "properties": {
+          "judge_profile_comparison_revision": {
+            "title": "Judge Profile Comparison Revision",
+            "type": "string"
+          },
+          "judge_profile_revision": {
+            "title": "Judge Profile Revision",
+            "type": "string"
+          },
+          "profile_key": {
+            "title": "Profile Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile_key",
+          "judge_profile_revision",
+          "judge_profile_comparison_revision"
+        ],
+        "title": "EvalJudgeProfileExposureV1",
+        "type": "object"
+      },
       "EvalJudgeProfileRouteCatalogEntry": {
         "additionalProperties": false,
         "description": "Server-derived relationship between one judge and the candidate route.",
@@ -12184,6 +12561,84 @@
           "candidate_route_relation"
         ],
         "title": "EvalJudgeProfileRouteCatalogEntry",
+        "type": "object"
+      },
+      "EvalMaximumCostExposureV1": {
+        "additionalProperties": false,
+        "properties": {
+          "pricing_profile_fingerprints": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Pricing Profile Fingerprints",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "priced",
+              "unavailable",
+              "not_applicable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "totals": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalMaximumCostTotalV1"
+            },
+            "maxItems": 16,
+            "title": "Totals",
+            "type": "array"
+          },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "no_candidate_cost_ceiling",
+                  "candidate_cost_not_hard_bounded",
+                  "candidate_pricing_incomplete",
+                  "judge_cost_not_hard_bounded",
+                  "judge_pricing_incomplete"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Reason"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "EvalMaximumCostExposureV1",
+        "type": "object"
+      },
+      "EvalMaximumCostTotalV1": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Amount",
+            "type": "string"
+          },
+          "currency": {
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Currency",
+            "type": "string"
+          }
+        },
+        "required": [
+          "currency",
+          "amount"
+        ],
+        "title": "EvalMaximumCostTotalV1",
         "type": "object"
       },
       "EvalMemoryAttributionCapturePolicyV1": {
@@ -12558,7 +13013,7 @@
             ]
           },
           "presentation": {
-            "$ref": "#/components/schemas/EvalResultPresentationV1"
+            "$ref": "#/components/schemas/EvalResultPresentationV2"
           },
           "record": {
             "$ref": "#/components/schemas/EvalResultRecord"
@@ -12702,10 +13157,20 @@
         "title": "EvalResultPage",
         "type": "object"
       },
-      "EvalResultPresentationV1": {
+      "EvalResultPresentationV2": {
         "additionalProperties": false,
-        "description": "Canonical explainable projection for one immutable public eval result.",
+        "description": "Canonical V2 presentation with reliability policy and accepted exposure.",
         "properties": {
+          "accepted_exposure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteRunExposureV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "app_manifest_fingerprint": {
             "title": "App Manifest Fingerprint",
             "type": "string"
@@ -12716,7 +13181,7 @@
           },
           "cases": {
             "items": {
-              "$ref": "#/components/schemas/EvalCasePresentationV1"
+              "$ref": "#/components/schemas/EvalCasePresentationV2"
             },
             "maxItems": 1000,
             "minItems": 1,
@@ -12757,8 +13222,8 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -12796,6 +13261,9 @@
           "target_key": {
             "title": "Target Key",
             "type": "string"
+          },
+          "trial_policy": {
+            "$ref": "#/components/schemas/EvalSuiteTrialPolicyV1"
           }
         },
         "required": [
@@ -12810,11 +13278,12 @@
           "suite_revision",
           "evidence_policy_revision",
           "pricing_profile_fingerprint",
+          "trial_policy",
           "status",
           "dimensions",
           "cases"
         ],
-        "title": "EvalResultPresentationV1",
+        "title": "EvalResultPresentationV2",
         "type": "object"
       },
       "EvalResultRecord": {
@@ -12906,7 +13375,7 @@
             ]
           },
           "presentation": {
-            "$ref": "#/components/schemas/EvalResultPresentationV1"
+            "$ref": "#/components/schemas/EvalResultPresentationV2"
           },
           "result": {
             "$ref": "#/components/schemas/CorpusExecutionResult"
@@ -13039,6 +13508,42 @@
             ],
             "description": "Secret-safe identity of the exact authenticated request that admitted this run.",
             "title": "Admission Request Revision"
+          },
+          "authored_suite_exposure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteRunExposureV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "authored_suite_launch_lane": {
+            "anyOf": [
+              {
+                "maximum": 63.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Concurrency lane shared by serialized runs from one suite launch.",
+            "title": "Authored Suite Launch Lane"
+          },
+          "authored_suite_launch_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Secret-safe identity shared by every durable run admitted by one authored-suite launch.",
+            "title": "Authored Suite Launch Revision"
           },
           "authored_suite_revision": {
             "anyOf": [
@@ -14904,6 +15409,46 @@
         "title": "EvalSuiteDocumentV2",
         "type": "object"
       },
+      "EvalSuiteDocumentV3": {
+        "additionalProperties": false,
+        "description": "Immutable V3 suite with an explicit revisioned trial decision policy.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseDefinitionV2"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 3,
+            "default": 3,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteSpec"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "target_key",
+          "suite",
+          "cases"
+        ],
+        "title": "EvalSuiteDocumentV3",
+        "type": "object"
+      },
       "EvalSuiteDraftV1": {
         "additionalProperties": false,
         "description": "Revision-free suite material edited by an SDK or Control Plane client.",
@@ -15008,6 +15553,61 @@
         "title": "EvalSuiteDraftV2",
         "type": "object"
       },
+      "EvalSuiteDraftV3": {
+        "additionalProperties": false,
+        "description": "V3 editor material with revision-free suite trial settings.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseDraftV2"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 3,
+            "default": 3,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "trial_request": {
+            "$ref": "#/components/schemas/EvalSuiteTrialRequestDraftV3"
+          }
+        },
+        "required": [
+          "id",
+          "target_key",
+          "name",
+          "cases"
+        ],
+        "title": "EvalSuiteDraftV3",
+        "type": "object"
+      },
       "EvalSuitePreviewRequest": {
         "additionalProperties": false,
         "description": "Authority-free editor material; preview never persists or executes it.",
@@ -15019,6 +15619,9 @@
               },
               {
                 "$ref": "#/components/schemas/EvalSuiteDraftV2"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDraftV3"
               }
             ],
             "title": "Draft"
@@ -15055,6 +15658,9 @@
               },
               {
                 "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV3"
               }
             ],
             "title": "Suite"
@@ -15066,6 +15672,139 @@
           "ready"
         ],
         "title": "EvalSuitePreviewResponse",
+        "type": "object"
+      },
+      "EvalSuiteRunExposureV1": {
+        "additionalProperties": false,
+        "description": "Exact maximum configured work accepted for one authored-suite selection.",
+        "properties": {
+          "candidate_cost": {
+            "$ref": "#/components/schemas/EvalMaximumCostExposureV1"
+          },
+          "candidate_trials": {
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Candidate Trials",
+            "type": "integer"
+          },
+          "execution_profiles": {
+            "items": {
+              "$ref": "#/components/schemas/EvalExecutionProfileExposureV1"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Execution Profiles",
+            "type": "array"
+          },
+          "judge_cost": {
+            "$ref": "#/components/schemas/EvalMaximumCostExposureV1"
+          },
+          "judge_evaluations": {
+            "maximum": 6400000.0,
+            "minimum": 0.0,
+            "title": "Judge Evaluations",
+            "type": "integer"
+          },
+          "judge_profiles": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalJudgeProfileExposureV1"
+            },
+            "maxItems": 64,
+            "title": "Judge Profiles",
+            "type": "array"
+          },
+          "max_concurrency": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "maximum_candidate_model_steps": {
+            "minimum": 1.0,
+            "title": "Maximum Candidate Model Steps",
+            "type": "integer"
+          },
+          "maximum_candidate_total_tokens": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Candidate Total Tokens"
+          },
+          "maximum_judge_input_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Judge Input Tokens"
+          },
+          "maximum_judge_output_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Judge Output Tokens"
+          },
+          "maximum_judge_total_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Judge Total Tokens"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "selection_revision": {
+            "title": "Selection Revision",
+            "type": "string"
+          },
+          "trial_policy_revision": {
+            "title": "Trial Policy Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "selection_revision",
+          "trial_policy_revision",
+          "execution_profiles",
+          "candidate_trials",
+          "judge_evaluations",
+          "max_concurrency",
+          "maximum_candidate_model_steps",
+          "candidate_cost",
+          "judge_cost"
+        ],
+        "title": "EvalSuiteRunExposureV1",
         "type": "object"
       },
       "EvalSuiteSaveRequest": {
@@ -15086,6 +15825,9 @@
               },
               {
                 "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV3"
               }
             ],
             "title": "Suite"
@@ -15114,6 +15856,9 @@
               },
               {
                 "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+              },
+              {
+                "$ref": "#/components/schemas/EvalSuiteDocumentV3"
               }
             ],
             "title": "Suite"
@@ -15219,6 +15964,102 @@
           "name"
         ],
         "title": "EvalSuiteSpec",
+        "type": "object"
+      },
+      "EvalSuiteTrialPolicyV1": {
+        "additionalProperties": false,
+        "description": "Immutable decision rule for the complete retained trial set of each case.",
+        "properties": {
+          "max_concurrency": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "minimum_passed_trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Minimum Passed Trials",
+            "type": "integer"
+          },
+          "require_complete_required_evidence": {
+            "const": true,
+            "default": true,
+            "title": "Require Complete Required Evidence",
+            "type": "boolean"
+          },
+          "require_zero_evaluator_errors": {
+            "const": true,
+            "default": true,
+            "title": "Require Zero Evaluator Errors",
+            "type": "boolean"
+          },
+          "require_zero_runtime_errors": {
+            "const": true,
+            "default": true,
+            "title": "Require Zero Runtime Errors",
+            "type": "boolean"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "trial_count": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "trial_count",
+          "minimum_passed_trials",
+          "max_concurrency"
+        ],
+        "title": "EvalSuiteTrialPolicyV1",
+        "type": "object"
+      },
+      "EvalSuiteTrialRequestDraftV3": {
+        "additionalProperties": false,
+        "description": "Revision-free trial settings edited by SDK and Control Plane clients.",
+        "properties": {
+          "max_concurrency": {
+            "default": 1,
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "minimum_passed_trials": {
+            "default": 1,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Minimum Passed Trials",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "default": 300,
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "trials": {
+            "default": 1,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "title": "EvalSuiteTrialRequestDraftV3",
         "type": "object"
       },
       "EvalTargetCatalogEntry": {
@@ -23712,6 +24553,9 @@
             "title": "Duration Ms",
             "type": "integer"
           },
+          "reliability": {
+            "$ref": "#/components/schemas/EvalCaseReliabilityV1"
+          },
           "score": {
             "anyOf": [
               {
@@ -23749,6 +24593,7 @@
           "case_id",
           "case_revision",
           "status",
+          "reliability",
           "trials",
           "duration_ms"
         ],
@@ -23758,6 +24603,16 @@
       "PublishedEvalRun": {
         "additionalProperties": false,
         "properties": {
+          "accepted_exposure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteRunExposureV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cases": {
             "items": {
               "$ref": "#/components/schemas/PublishedEvalCaseResult"
@@ -23797,7 +24652,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 8,
+            "const": 9,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -23835,6 +24690,9 @@
           "target_key": {
             "title": "Target Key",
             "type": "string"
+          },
+          "trial_policy": {
+            "$ref": "#/components/schemas/EvalSuiteTrialPolicyV1"
           }
         },
         "required": [
@@ -23845,6 +24703,7 @@
           "suite_id",
           "suite_revision",
           "evidence_policy_revision",
+          "trial_policy",
           "status",
           "cases",
           "duration_ms"
@@ -24220,10 +25079,93 @@
         "title": "PublishedMaxTotalTokensDetail",
         "type": "object"
       },
+      "PublishedModelJudgeCostV1": {
+        "additionalProperties": false,
+        "description": "Observed priced cost, or an explicit unpriced state, for one judgment.",
+        "properties": {
+          "availability": {
+            "enum": [
+              "priced",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "estimated_cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost"
+          },
+          "priced_model_steps": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priced Model Steps"
+          },
+          "unpriced_model_steps": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Model Steps"
+          }
+        },
+        "required": [
+          "availability"
+        ],
+        "title": "PublishedModelJudgeCostV1",
+        "type": "object"
+      },
       "PublishedModelJudgeDetail": {
         "additionalProperties": false,
         "description": "Bounded public contract and safe outcome evidence for one model judgment.",
         "properties": {
+          "candidate_route_relation": {
+            "enum": [
+              "independent_model",
+              "same_model"
+            ],
+            "title": "Candidate Route Relation",
+            "type": "string"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedModelJudgeCostV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "diagnostic": {
             "enum": [
               "judgment_recorded",
@@ -24245,6 +25187,9 @@
             "title": "Include Transcript",
             "type": "boolean"
           },
+          "judge_profile": {
+            "$ref": "#/components/schemas/JudgeProfileIdentityV1"
+          },
           "kind": {
             "const": "model_judge",
             "default": "model_judge",
@@ -24264,6 +25209,16 @@
             "minimum": 0.0,
             "title": "Threshold",
             "type": "number"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedModelJudgeUsageV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -24273,9 +25228,46 @@
           "rubric_version",
           "threshold",
           "include_transcript",
-          "diagnostic"
+          "diagnostic",
+          "judge_profile",
+          "candidate_route_relation"
         ],
         "title": "PublishedModelJudgeDetail",
+        "type": "object"
+      },
+      "PublishedModelJudgeUsageV1": {
+        "additionalProperties": false,
+        "description": "Observed usage for one successfully recorded rubric-string judgment.",
+        "properties": {
+          "input_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Input Tokens",
+            "type": "string"
+          },
+          "model_steps": {
+            "maximum": 4096.0,
+            "minimum": 1.0,
+            "title": "Model Steps",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Output Tokens",
+            "type": "string"
+          },
+          "total_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Total Tokens",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_steps",
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "title": "PublishedModelJudgeUsageV1",
         "type": "object"
       },
       "PublishedProcessEventDetail": {
@@ -24462,6 +25454,7 @@
       },
       "PublishedStructuredJudgeCostV1": {
         "additionalProperties": false,
+        "description": "Observed priced cost, or an explicit unpriced state, for one judgment.",
         "properties": {
           "availability": {
             "enum": [
@@ -24572,6 +25565,7 @@
       },
       "PublishedStructuredJudgeUsageV1": {
         "additionalProperties": false,
+        "description": "Observed usage for one successfully recorded structured judgment.",
         "properties": {
           "input_tokens": {
             "pattern": "^(0|[1-9]\\d*)$",
@@ -30007,7 +31001,7 @@
       },
       "TrialRequestSpec": {
         "additionalProperties": false,
-        "description": "Sequential, bounded fresh-evaluation execution settings.",
+        "description": "Bounded fresh-evaluation settings with an optional versioned policy.",
         "properties": {
           "timeout_seconds": {
             "default": 300,
@@ -30015,6 +31009,16 @@
             "minimum": 1.0,
             "title": "Timeout Seconds",
             "type": "integer"
+          },
+          "trial_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteTrialPolicyV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "trials": {
             "default": 1,
@@ -34975,6 +35979,9 @@
                     },
                     {
                       "$ref": "#/components/schemas/EvalSuiteDocumentV2"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EvalSuiteDocumentV3"
                     }
                   ],
                   "title": "Response Get Eval Authored Suite Api Evals Suites  Suite Revision  Get"
