@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     FinalOutputContainsAssertionSpec,
+    MemoryAttributionAssertionSpec,
     RootStatusAssertionSpec,
     RunInputSpec,
     StructuredRubricCriterionV1,
@@ -127,6 +128,39 @@ def test_tool_json_assertions_survive_authoring_round_trip_duplicate_and_revisio
     assert duplicated.cases[0].assertions == document.cases[0].assertions
     assert duplicated.cases[1].assertions == document.cases[0].assertions
     assert duplicated.cases[1].revision != document.cases[0].revision
+
+
+def test_memory_attribution_assertion_survives_v3_authoring_round_trip() -> None:
+    eval_case = EvalCaseDraftV2(
+        id="memory-contract",
+        name="Memory contract",
+        stimulus=EvalSimpleInputStimulusV1(
+            input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Use remembered context."),))
+        ),
+        assertions=(
+            MemoryAttributionAssertionSpec(
+                id="memory-structure",
+                min_admitted_items=1,
+                max_admitted_items=4,
+                min_provider_exposures=1,
+                max_provider_exposures=2,
+            ),
+        ),
+    )
+    draft = EvalSuiteDraftV3(
+        id="memory-regressions",
+        target_key="assistant.default",
+        name="Memory regressions",
+        cases=(eval_case,),
+    )
+
+    document = compile_eval_suite_draft_v3(draft)
+    restored = eval_suite_document_from_json(eval_suite_document_to_json(document))
+
+    assert restored == document
+    assertion = restored.cases[0].assertions[0]
+    assert type(assertion) is MemoryAttributionAssertionSpec
+    assert assertion.max_provider_exposures == 2
 
 
 def test_v3_draft_compiles_revision_free_trial_settings_into_immutable_policy() -> None:

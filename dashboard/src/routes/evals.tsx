@@ -22,6 +22,11 @@ import {
 } from "react"
 import { EvalSuiteAuthoringAction } from "@/components/dashboard/eval-suite-authoring"
 import {
+  MemoryAssertionDetails,
+  MemoryEvidencePanel,
+  MemoryExperimentReportAction,
+} from "@/components/dashboard/evals-memory"
+import {
   DataCard,
   Page,
   PageHeader,
@@ -377,6 +382,7 @@ export function EvalsPage() {
                 }}
               />
             )}
+            <MemoryExperimentReportAction disabled={!resultsReady || pendingAction !== null} />
             <input
               ref={fileInputRef}
               type="file"
@@ -1673,7 +1679,7 @@ function CapturedResultInspector({
         description="Canonical public-safe outcome, evaluator, criterion, evidence, usage, and cost facts."
         contentClassName="p-4"
       >
-        <ResultPresentationInspector presentation={detail.presentation} />
+        <ResultPresentationInspector presentation={detail.presentation} result={detail.result} />
         <details className="mt-4 border-t border-border pt-4 text-xs">
           <summary className="cursor-pointer text-primary">Inspect immutable JSON evidence</summary>
           <PayloadViewer value={detail.result} className="mt-3" maxHeight="max-h-[36rem]" />
@@ -2348,10 +2354,6 @@ function ResultInspector({
               label="Evidence"
               value={selectedTrial.evidence_complete ? "complete" : "incomplete"}
             />
-            <RunFact
-              label="Memory evidence"
-              value={`${selectedTrial.memory_attribution.completeness} · ${formatCount(selectedTrial.memory_attribution.retained_source_count)}/${formatCount(selectedTrial.memory_attribution.total_source_count)} sources`}
-            />
             <RunFact label="Diagnostic" value={selectedTrial.code.replaceAll("_", " ")} />
             <RunFact
               label="Usage"
@@ -2368,6 +2370,10 @@ function ResultInspector({
             />
           </div>
           <OutcomeDimensionsGrid dimensions={presentedTrial.dimensions} />
+          <MemoryEvidencePanel
+            evidence={selectedTrial.memory_attribution}
+            assertions={presentedTrial.assertions}
+          />
 
           <div className="text-sm">
             <div className="text-xs font-medium text-muted-foreground">Trial diagnostic</div>
@@ -2453,6 +2459,11 @@ function ResultInspector({
                             className="mt-3"
                             detail={presentedAssertion.structure}
                           />
+                        ) : presentedAssertion?.memory ? (
+                          <MemoryAssertionDetails
+                            className="mt-3"
+                            detail={presentedAssertion.memory}
+                          />
                         ) : (
                           <details className="mt-2 text-xs">
                             <summary className="cursor-pointer text-primary">
@@ -2478,7 +2489,13 @@ function ResultInspector({
   )
 }
 
-function ResultPresentationInspector({ presentation }: { presentation: EvalResultPresentationV2 }) {
+function ResultPresentationInspector({
+  presentation,
+  result,
+}: {
+  presentation: EvalResultPresentationV2
+  result: EvalResultDetail["result"]
+}) {
   const [selection, setSelection] = useState({
     revision: presentation.result_revision,
     caseIndex: 0,
@@ -2492,6 +2509,10 @@ function ResultPresentationInspector({ presentation }: { presentation: EvalResul
   const selectedCase = presentation.cases[caseIndex]
   const trialIndex = selectedCase ? Math.min(current.trialIndex, selectedCase.trials.length - 1) : 0
   const selectedTrial = selectedCase?.trials[trialIndex]
+  const selectedMemory =
+    "score" in result
+      ? result.score.memory_attribution
+      : result.run.cases[caseIndex]?.trials[trialIndex]?.memory_attribution
 
   if (!selectedCase || !selectedTrial) {
     return <StateMessage>No retained case and trial presentation is available.</StateMessage>
@@ -2586,6 +2607,9 @@ function ResultPresentationInspector({ presentation }: { presentation: EvalResul
         <RunFact label="Trial score" value={formatScore(selectedTrial.score)} />
       </div>
       <OutcomeDimensionsGrid dimensions={selectedTrial.dimensions} />
+      {selectedMemory && (
+        <MemoryEvidencePanel evidence={selectedMemory} assertions={selectedTrial.assertions} />
+      )}
       <PresentedAssertions assertions={selectedTrial.assertions} />
     </div>
   )
@@ -2639,6 +2663,9 @@ function PresentedAssertions({ assertions }: { assertions: Array<EvalAssertionPr
           )}
           {assertion.structure && (
             <StructureAssertionDetails className="mt-3" detail={assertion.structure} />
+          )}
+          {assertion.memory && (
+            <MemoryAssertionDetails className="mt-3" detail={assertion.memory} />
           )}
         </div>
       ))}

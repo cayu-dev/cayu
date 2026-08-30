@@ -2115,7 +2115,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 10
+    assert EVAL_SCHEMA_VERSION == 11
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
     usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {

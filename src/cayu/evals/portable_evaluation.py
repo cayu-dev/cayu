@@ -14,6 +14,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    MemoryAttributionAssertionSpec,
     ModelJudgeAssertionSpec,
     ProcessEventAssertionSpec,
     ProcessEventsInOrderAssertionSpec,
@@ -40,6 +41,12 @@ from cayu.evals.evidence import (
     _canonical_decimal,
 )
 from cayu.evals.json_subset import JsonSubsetOutcome, compare_json_subset
+from cayu.evals.memory_attribution import (
+    EvalMemoryAttributionEvidenceV1,
+    EvalMemoryEvidenceCompleteness,
+    eval_memory_attribution_counts,
+    eval_memory_attribution_limitations,
+)
 from cayu.evals.models import EvalAssertionResult, EvalOutcome
 
 
@@ -493,6 +500,65 @@ def _evaluate_artifact(
     )
 
 
+def _memory_attribution_limitations(
+    evidence: EvalMemoryAttributionEvidenceV1,
+) -> tuple[str, ...]:
+    return tuple(item.value for item in eval_memory_attribution_limitations(evidence))
+
+
+def _evaluate_memory_attribution(
+    *,
+    spec: MemoryAttributionAssertionSpec,
+    evidence: EvalMemoryAttributionEvidenceV1,
+) -> EvalAssertionResult:
+    limitations = _memory_attribution_limitations(evidence)
+    base_metadata = {
+        "evidence_area": "memory attribution",
+        "evidence_state": evidence.completeness.value,
+        "evidence_revision": evidence.revision,
+        "limitations": list(limitations),
+    }
+    if evidence.completeness is not EvalMemoryEvidenceCompleteness.COMPLETE:
+        return EvalAssertionResult(
+            name=spec.id,
+            outcome=EvalOutcome.UNAVAILABLE,
+            message=(
+                f"Memory attribution evidence is {evidence.completeness.value.replace('_', ' ')}."
+            ),
+            metadata=base_metadata,
+        )
+    if evidence.has_indeterminate_exposure:
+        return EvalAssertionResult(
+            name=spec.id,
+            outcome=EvalOutcome.UNAVAILABLE,
+            message="Memory provider-exposure evidence is indeterminate.",
+            metadata={**base_metadata, "evidence_state": "indeterminate"},
+        )
+
+    admitted_items, provider_exposures = eval_memory_attribution_counts(evidence)
+    admitted_matches = admitted_items >= spec.min_admitted_items and (
+        spec.max_admitted_items is None or admitted_items <= spec.max_admitted_items
+    )
+    exposure_matches = provider_exposures >= spec.min_provider_exposures and (
+        spec.max_provider_exposures is None or provider_exposures <= spec.max_provider_exposures
+    )
+    passed = admitted_matches and exposure_matches
+    return _result(
+        spec.id,
+        EvalOutcome.PASSED if passed else EvalOutcome.FAILED,
+        (
+            "Memory admission and provider exposure matched the required ranges."
+            if passed
+            else "Memory admission or provider exposure was outside the required range."
+        ),
+        metadata={
+            **base_metadata,
+            "admitted_item_count": admitted_items,
+            "provider_exposure_count": provider_exposures,
+        },
+    )
+
+
 def _evaluate_maximum(
     *,
     name: str,
@@ -689,6 +755,11 @@ def _evaluate_validated_assertion_outcome(
             spec=validated_spec,
             artifacts=evidence.artifacts,
             scope_states={item.scope: item.state for item in evidence.artifact_scopes},
+        )
+    if type(validated_spec) is MemoryAttributionAssertionSpec:
+        return _evaluate_memory_attribution(
+            spec=validated_spec,
+            evidence=evidence.memory_attribution,
         )
     if type(validated_spec) is MaxToolCallsAssertionSpec:
         return _evaluate_maximum(

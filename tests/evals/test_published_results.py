@@ -24,6 +24,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    MemoryAttributionAssertionSpec,
     PricingProfileIdentityV1,
     RootStatusAssertionSpec,
     RunInputSpec,
@@ -31,8 +32,18 @@ from cayu.evals.corpus import (
     ToolsCalledInOrderAssertionSpec,
     TrialRequestSpec,
     UsageRecordedAssertionSpec,
+    _content_revision,
     assertion_spec_revision,
     eval_run_contract_for_corpus,
+)
+from cayu.evals.memory_attribution import (
+    EvalMemoryAttributionEvidenceV1,
+    EvalMemoryAttributionSourceV1,
+    EvalMemoryEvidenceCompleteness,
+    EvalMemoryEvidenceLimitation,
+    EvalMemorySourceReferenceV1,
+    eval_memory_attribution_fingerprint,
+    standard_eval_memory_attribution_bounds,
 )
 from cayu.evals.models import (
     EvalAssertionResult,
@@ -42,6 +53,7 @@ from cayu.evals.models import (
     EvalStatus,
     EvalTrialResult,
 )
+from cayu.evals.promotion import CapturedRunScoreV1
 from cayu.evals.published import (
     PUBLISHED_EVAL_SCHEMA_VERSION,
     PublishedAssertionResult,
@@ -49,6 +61,7 @@ from cayu.evals.published import (
     PublishedEvalTrialResult,
     PublishedFinalOutputEqualsDetail,
     PublishedMaxEstimatedCostDetail,
+    PublishedMemoryAttributionDetail,
     PublishedToolsCalledInOrderDetail,
     PublishedUsageSummaryV1,
     publish_eval_run,
@@ -59,8 +72,10 @@ from cayu.evals.result_contract import (
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
     EvalTrialOutputPreviewV1,
 )
+from cayu.evals.result_presentation import _present_assertion
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.evals.trial_policy import EvalCaseReliabilityV1, EvalSuiteTrialPolicyV1
+from cayu.memory_attribution import MemoryAttribution, MemoryAttributionStatus
 from cayu.runtime.costs import CostLineItem, SessionCostSummary
 from cayu.runtime.usage import (
     SessionUsageSummary,
@@ -141,6 +156,34 @@ def _metadata(kind: str) -> dict:
             "currency": "USD",
         },
     }[kind]
+
+
+def _complete_empty_memory_evidence() -> EvalMemoryAttributionEvidenceV1:
+    attribution = MemoryAttribution(
+        status=MemoryAttributionStatus.COMPLETE,
+        truncated=False,
+        observed_receipt_count=0,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=0,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
+    )
+    source = EvalMemoryAttributionSourceV1(
+        source=EvalMemorySourceReferenceV1(role="root", tree_path=()),
+        terminal_status="completed",
+        expected_receipt_count=0,
+        expected_exposure_count=0,
+        attribution=attribution,
+        attribution_fingerprint=eval_memory_attribution_fingerprint(attribution),
+    )
+    return EvalMemoryAttributionEvidenceV1.create(
+        effective_bounds=standard_eval_memory_attribution_bounds(),
+        completeness=EvalMemoryEvidenceCompleteness.COMPLETE,
+        limitations=(),
+        total_source_count=1,
+        sources=(source,),
+    )
 
 
 def _assertion_results(*, cost_unavailable: bool):
@@ -235,8 +278,8 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     run = _run()
     published = publish_eval_run(corpus, run)
 
-    assert PUBLISHED_EVAL_SCHEMA_VERSION == 9
-    assert published.schema_version == 9
+    assert PUBLISHED_EVAL_SCHEMA_VERSION == 10
+    assert published.schema_version == 10
     assert published.corpus_revision == corpus.revision
     assert published.status == "unavailable"
     assert published.score is None
@@ -300,7 +343,7 @@ def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     with pytest.raises(ValidationError, match="other versions are unsupported"):
         PublishedEvalRun.model_validate(document)
 
-    with pytest.raises(ValidationError, match="schema_version must be the integer 9"):
+    with pytest.raises(ValidationError, match="schema_version must be the integer 10"):
         PublishedEvalRun.model_validate(
             {**published.model_dump(mode="json"), "schema_version": "2"}
         )
@@ -315,6 +358,178 @@ def test_eval_guide_tracks_published_eval_schema_version():
     guide = (Path(__file__).resolve().parents[2] / "docs" / "evals.md").read_text(encoding="utf-8")
 
     assert f"schema-version-{PUBLISHED_EVAL_SCHEMA_VERSION} `PublishedEvalRun`" in guide
+
+
+def test_memory_assertion_publication_retains_bounded_structural_contract() -> None:
+    evidence = _complete_empty_memory_evidence()
+    spec = MemoryAttributionAssertionSpec(
+        id="memory-structure",
+        min_admitted_items=0,
+        max_admitted_items=0,
+        min_provider_exposures=0,
+        max_provider_exposures=0,
+    )
+    result = EvalAssertionResult(
+        name=spec.id,
+        assertion_revision=assertion_spec_revision(spec),
+        outcome=EvalOutcome.PASSED,
+        score=1.0,
+        message="private diagnostic",
+        metadata={
+            "evidence_area": "memory attribution",
+            "evidence_state": "complete",
+            "evidence_revision": evidence.revision,
+            "limitations": [],
+            "admitted_item_count": 0,
+            "provider_exposure_count": 0,
+        },
+    )
+
+    detail = published_module._published_detail(spec, result)
+
+    assert type(detail) is PublishedMemoryAttributionDetail
+    assert detail.observation_state == "complete"
+    assert detail.evidence_revision == evidence.revision
+    assert detail.admitted_item_count == 0
+    assert detail.provider_exposure_count == 0
+    assert "private diagnostic" not in detail.model_dump_json()
+    presented = _present_assertion(
+        PublishedAssertionResult(
+            assertion_id=spec.id,
+            assertion_revision=assertion_spec_revision(spec),
+            outcome="passed",
+            score=1.0,
+            code="passed",
+            message="Assertion passed.",
+            detail=detail,
+        )
+    )
+    assert presented.memory == detail
+    assert presented.structure is None
+
+
+def test_published_memory_assertion_is_bound_to_trial_memory_evidence() -> None:
+    evidence = _complete_empty_memory_evidence()
+    spec = MemoryAttributionAssertionSpec(
+        id="memory-structure",
+        min_admitted_items=0,
+        min_provider_exposures=0,
+    )
+    memory_assertion = PublishedAssertionResult(
+        assertion_id=spec.id,
+        assertion_revision=assertion_spec_revision(spec),
+        outcome="passed",
+        score=1.0,
+        code="passed",
+        message="Assertion passed.",
+        detail=PublishedMemoryAttributionDetail(
+            min_admitted_items=0,
+            min_provider_exposures=0,
+            observation_state="complete",
+            evidence_revision=evidence.revision,
+            admitted_item_count=0,
+            provider_exposure_count=0,
+        ),
+    )
+    document = publish_eval_run(_corpus(), _run()).cases[0].trials[0].model_dump(mode="python")
+    document["memory_attribution"] = evidence.model_dump(mode="python")
+    document["assertions"] = [
+        memory_assertion.model_dump(mode="python"),
+        *document["assertions"][1:],
+    ]
+
+    valid = PublishedEvalTrialResult.model_validate(document)
+
+    assert valid.assertions[0] == memory_assertion
+    wrong_count = deepcopy(document)
+    wrong_count["assertions"][0]["detail"]["provider_exposure_count"] = 1
+    with pytest.raises(ValidationError, match="counts do not match"):
+        PublishedEvalTrialResult.model_validate(wrong_count)
+    wrong_revision = deepcopy(document)
+    wrong_revision["assertions"][0]["detail"]["evidence_revision"] = "sha256:" + "f" * 64
+    with pytest.raises(ValidationError, match="does not match retained memory evidence"):
+        PublishedEvalTrialResult.model_validate(wrong_revision)
+
+
+def _captured_memory_score_document(
+    evidence: EvalMemoryAttributionEvidenceV1,
+    detail: PublishedMemoryAttributionDetail,
+    *,
+    outcome: str,
+) -> dict[str, object]:
+    score = None if outcome == "unavailable" else 1.0
+    message = (
+        "Required evidence was unavailable." if outcome == "unavailable" else "Assertion passed."
+    )
+    assertion = PublishedAssertionResult(
+        assertion_id="memory-structure",
+        assertion_revision="sha256:" + "a" * 64,
+        outcome=outcome,
+        score=score,
+        code=outcome,
+        message=message,
+        detail=detail,
+    )
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "candidate_revision": "sha256:" + "b" * 64,
+        "case_id": "case",
+        "case_revision": "sha256:" + "c" * 64,
+        "evidence_revision": "sha256:" + "d" * 64,
+        "evidence_policy_revision": "sha256:" + "e" * 64,
+        "pricing_profile_fingerprint": None,
+        "memory_attribution": evidence.model_dump(mode="json"),
+        "status": outcome,
+        "score": score,
+        "assertions": [assertion.model_dump(mode="json")],
+    }
+    document["revision"] = _content_revision(document, "captured run score")
+    return document
+
+
+def test_captured_memory_assertion_is_bound_to_retained_score_evidence() -> None:
+    complete = _complete_empty_memory_evidence()
+    valid_detail = PublishedMemoryAttributionDetail(
+        min_admitted_items=0,
+        min_provider_exposures=0,
+        observation_state="complete",
+        evidence_revision=complete.revision,
+        admitted_item_count=0,
+        provider_exposure_count=0,
+    )
+    valid_document = _captured_memory_score_document(
+        complete,
+        valid_detail,
+        outcome="passed",
+    )
+    assert CapturedRunScoreV1.model_validate(valid_document).memory_attribution == complete
+
+    wrong_revision = valid_detail.model_copy(update={"evidence_revision": "sha256:" + "f" * 64})
+    wrong_state = PublishedMemoryAttributionDetail(
+        min_admitted_items=0,
+        min_provider_exposures=0,
+        observation_state="unavailable",
+        evidence_revision=complete.revision,
+    )
+    wrong_counts = valid_detail.model_copy(update={"admitted_item_count": 1})
+    unavailable = EvalMemoryAttributionEvidenceV1.unavailable(EvalMemoryEvidenceLimitation.MISSING)
+    wrong_limitations = PublishedMemoryAttributionDetail(
+        min_admitted_items=0,
+        min_provider_exposures=0,
+        observation_state="unavailable",
+        evidence_revision=unavailable.revision,
+        limitations=(EvalMemoryEvidenceLimitation.STORE_UNSUPPORTED,),
+    )
+
+    for evidence, detail, outcome, match in (
+        (complete, wrong_revision, "passed", "does not match retained memory evidence"),
+        (complete, wrong_state, "unavailable", "does not match retained memory evidence"),
+        (unavailable, wrong_limitations, "unavailable", "does not match retained memory evidence"),
+        (complete, wrong_counts, "passed", "counts do not match retained memory evidence"),
+    ):
+        document = _captured_memory_score_document(evidence, detail, outcome=outcome)
+        with pytest.raises(ValidationError, match=match):
+            CapturedRunScoreV1.model_validate(document)
 
 
 def test_output_preview_rejects_forged_size_digest_and_truncation_metadata():

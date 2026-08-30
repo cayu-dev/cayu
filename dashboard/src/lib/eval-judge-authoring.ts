@@ -47,6 +47,60 @@ export function newStructuredJudgeAssertion(
   }
 }
 
+export function newMemoryUseJudgeAssertion(
+  profile: JudgeProfileIdentityV1,
+  existingIds: readonly string[],
+): StructuredModelJudgeAssertionDraftV1 {
+  if (
+    !profile.allowed_evidence.includes("final_output") ||
+    !profile.allowed_evidence.includes("public_reference")
+  ) {
+    throw new Error(
+      "A memory-use judge profile must permit final-output and public-reference evidence.",
+    )
+  }
+  return {
+    id: nextAssertionId("memory-use", existingIds),
+    kind: "structured_model_judge",
+    description: "Evaluate whether the answer applies trusted memory truth correctly.",
+    judge_profile_key: profile.key,
+    judge_profile_revision: profile.revision,
+    rubric: {
+      schema_version: 1,
+      id: "memory-use",
+      criteria: [
+        {
+          id: "reference-correctness",
+          name: "Reference correctness",
+          description: "The answer agrees with the trusted memory reference truth.",
+          weight: "0.5",
+        },
+        {
+          id: "grounded-use",
+          name: "Grounded use",
+          description: "The answer applies relevant reference facts to the requested task.",
+          weight: "0.3",
+        },
+        {
+          id: "unsupported-memory-avoidance",
+          name: "No unsupported memory claims",
+          description: "The answer does not invent or contradict memory-derived facts.",
+          weight: "0.2",
+        },
+      ],
+    },
+    reference: {
+      schema_version: 1,
+      kind: "public_reference",
+      id: "memory-reference",
+      expected_answer: null,
+      expected_facts: [""],
+    },
+    threshold: "0.8",
+    evidence: { schema_version: 1, include_final_output: true, include_transcript: false },
+  }
+}
+
 export function validateStructuredJudgeAssertion(
   assertion: StructuredModelJudgeAssertionDraftV1,
 ): void {

@@ -37,6 +37,8 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TOOL_NAMES,
     EVAL_CORPUS_MAX_TRIALS,
     EVAL_CORPUS_MAX_WORKSPACE_PATH_CHARS,
+    EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS,
+    EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES,
     EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
     EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
     EVIDENCE_MAX_CHILD_SESSIONS,
@@ -57,6 +59,7 @@ from cayu.evals.corpus import (
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
+    MemoryAttributionAssertionSpec,
     ModelJudgeAssertionSpec,
     PrivateJudgeReferenceV1,
     ProcessEventAssertionSpec,
@@ -93,6 +96,10 @@ from cayu.evals.json_subset import (
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES,
     EvalMemoryAttributionEvidenceV1,
+    EvalMemoryEvidenceCompleteness,
+    EvalMemoryEvidenceLimitation,
+    eval_memory_attribution_counts,
+    eval_memory_attribution_limitations,
 )
 from cayu.evals.models import (
     EvalAssertionResult,
@@ -114,7 +121,7 @@ from cayu.evals.trial_policy import (
 )
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 9
+PUBLISHED_EVAL_SCHEMA_VERSION = 10
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -541,6 +548,85 @@ class PublishedArtifactDetail(_PublishedAssertionDetail):
             raise ValueError("max_count must be greater than or equal to min_count.")
         if (self.observation_state == "available") != (self.matching_count is not None):
             raise ValueError("Available artifact observations require exactly one matching count.")
+        return self
+
+
+MemoryAttributionObservationState: TypeAlias = Literal[
+    "complete",
+    "truncated",
+    "unavailable",
+    "indeterminate",
+]
+
+
+class PublishedMemoryAttributionDetail(_PublishedAssertionDetail):
+    """Bounded structural memory expectation and its conclusive counts, when available."""
+
+    kind: Literal["memory_attribution"] = "memory_attribution"
+    min_admitted_items: StrictInt = Field(
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS,
+    )
+    max_admitted_items: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS,
+    )
+    min_provider_exposures: StrictInt = Field(
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES,
+    )
+    max_provider_exposures: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES,
+    )
+    observation_state: MemoryAttributionObservationState
+    evidence_revision: StrictStr
+    limitations: tuple[EvalMemoryEvidenceLimitation, ...] = ()
+    admitted_item_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS,
+    )
+    provider_exposure_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES,
+    )
+
+    @field_validator("evidence_revision")
+    @classmethod
+    def validate_evidence_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("limitations", mode="before")
+    @classmethod
+    def validate_limitations_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> PublishedMemoryAttributionDetail:
+        if (
+            self.max_admitted_items is not None
+            and self.max_admitted_items < self.min_admitted_items
+        ):
+            raise ValueError("Maximum admitted items cannot be below the minimum.")
+        if (
+            self.max_provider_exposures is not None
+            and self.max_provider_exposures < self.min_provider_exposures
+        ):
+            raise ValueError("Maximum provider exposures cannot be below the minimum.")
+        limitation_values = tuple(item.value for item in self.limitations)
+        if limitation_values != tuple(sorted(set(limitation_values))):
+            raise ValueError("Memory-attribution limitations must be unique and sorted.")
+        observed = self.admitted_item_count is not None
+        if observed != (self.provider_exposure_count is not None):
+            raise ValueError("Memory-attribution counts must be present together.")
+        if observed != (self.observation_state == "complete"):
+            raise ValueError("Only complete memory attribution can carry conclusive counts.")
+        if self.observation_state == "complete" and self.limitations:
+            raise ValueError("Complete memory attribution cannot carry limitations.")
         return self
 
 
@@ -1009,6 +1095,7 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedProcessEventsInOrderDetail
     | PublishedWorkspaceFileDetail
     | PublishedArtifactDetail
+    | PublishedMemoryAttributionDetail
     | PublishedMaxToolCallsDetail
     | PublishedMaxModelStepsDetail
     | PublishedUsageRecordedDetail
@@ -1106,6 +1193,44 @@ class PublishedUsageSummaryV1(_PortableModel):
     total_tokens: AggregateCount = Field(ge=0)
 
 
+def _validate_memory_assertions_for_evidence(
+    assertions: tuple[PublishedAssertionResult, ...],
+    evidence: EvalMemoryAttributionEvidenceV1,
+) -> None:
+    """Bind every published memory assertion to its retained trial evidence."""
+
+    expected_state: MemoryAttributionObservationState = (
+        "indeterminate"
+        if evidence.completeness is EvalMemoryEvidenceCompleteness.COMPLETE
+        and evidence.has_indeterminate_exposure
+        else cast(
+            "MemoryAttributionObservationState",
+            evidence.completeness.value,
+        )
+    )
+    expected_limitations = eval_memory_attribution_limitations(evidence)
+    expected_counts = eval_memory_attribution_counts(evidence)
+    for assertion in assertions:
+        detail = assertion.detail
+        if type(detail) is not PublishedMemoryAttributionDetail:
+            continue
+        if (
+            detail.evidence_revision != evidence.revision
+            or detail.observation_state != expected_state
+            or detail.limitations != expected_limitations
+        ):
+            raise ValueError("Published memory assertion does not match retained memory evidence.")
+        observed_counts = (
+            detail.admitted_item_count,
+            detail.provider_exposure_count,
+        )
+        conclusive_counts = expected_counts if expected_state == "complete" else (None, None)
+        if observed_counts != conclusive_counts:
+            raise ValueError(
+                "Published memory assertion counts do not match retained memory evidence."
+            )
+
+
 class PublishedEvalTrialResult(_PortableModel):
     trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     source_trial_revision: StrictStr = Field(min_length=64, max_length=64)
@@ -1179,6 +1304,10 @@ class PublishedEvalTrialResult(_PortableModel):
             self.usage,
             evidence_complete=self.evidence_complete,
         )
+        _validate_memory_assertions_for_evidence(
+            self.assertions,
+            self.memory_attribution,
+        )
         return self
 
 
@@ -1230,7 +1359,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[9]
+    schema_version: Literal[10]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1497,6 +1626,8 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.observation_state == "available"
     if isinstance(detail, PublishedArtifactDetail):
         return detail.observation_state == "available"
+    if isinstance(detail, PublishedMemoryAttributionDetail):
+        return detail.observation_state == "complete"
     if isinstance(
         detail,
         (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
@@ -1584,6 +1715,21 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         return detail.matching_count >= detail.min_count and (
             detail.max_count is None or detail.matching_count <= detail.max_count
         )
+    if isinstance(detail, PublishedMemoryAttributionDetail):
+        if detail.admitted_item_count is None or detail.provider_exposure_count is None:
+            return None
+        return (
+            detail.admitted_item_count >= detail.min_admitted_items
+            and (
+                detail.max_admitted_items is None
+                or detail.admitted_item_count <= detail.max_admitted_items
+            )
+            and detail.provider_exposure_count >= detail.min_provider_exposures
+            and (
+                detail.max_provider_exposures is None
+                or detail.provider_exposure_count <= detail.max_provider_exposures
+            )
+        )
     return None
 
 
@@ -1621,6 +1767,8 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
             f"digest={detail.digest_required}:text={detail.text_required}:"
             f"{detail.min_count}:{detail.max_count}"
         )
+    if isinstance(detail, PublishedMemoryAttributionDetail):
+        return "memory-attribution"
     if isinstance(detail, PublishedMaxModelStepsDetail):
         return "model-step"
     if isinstance(detail, (PublishedUsageRecordedDetail, PublishedMaxTotalTokensDetail)):
@@ -1712,6 +1860,14 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
             detail.min_count,
             detail.max_count,
         )
+    elif isinstance(detail, PublishedMemoryAttributionDetail):
+        static_detail = (
+            detail.kind,
+            detail.min_admitted_items,
+            detail.max_admitted_items,
+            detail.min_provider_exposures,
+            detail.max_provider_exposures,
+        )
     elif isinstance(detail, (PublishedMaxToolCallsDetail, PublishedMaxModelStepsDetail)):
         static_detail = (detail.kind, detail.maximum)
     elif isinstance(detail, PublishedUsageRecordedDetail):
@@ -1802,6 +1958,14 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
             spec.text_contains is not None,
             spec.min_count,
             spec.max_count,
+        )
+    if type(spec) is MemoryAttributionAssertionSpec:
+        return (
+            *base,
+            spec.min_admitted_items,
+            spec.max_admitted_items,
+            spec.min_provider_exposures,
+            spec.max_provider_exposures,
         )
     if isinstance(spec, (MaxToolCallsAssertionSpec, MaxModelStepsAssertionSpec)):
         return (*base, spec.maximum)
@@ -2106,6 +2270,21 @@ def _safe_metadata_decimal(result: EvalAssertionResult, key: str) -> str | None:
         return None
 
 
+def _safe_memory_limitations(
+    result: EvalAssertionResult,
+) -> tuple[EvalMemoryEvidenceLimitation, ...]:
+    value = result.metadata.get("limitations")
+    if type(value) is not list:
+        return ()
+    try:
+        limitations = tuple(EvalMemoryEvidenceLimitation(item) for item in value)
+    except (TypeError, ValueError):
+        return ()
+    if limitations != tuple(sorted(set(limitations), key=str)):
+        return ()
+    return limitations
+
+
 def _safe_metadata_json_object(result: EvalAssertionResult, key: str) -> dict[str, Any] | None:
     value = result.metadata.get(key)
     if value is None:
@@ -2274,6 +2453,34 @@ def _published_detail(
             min_count=spec.min_count,
             max_count=spec.max_count,
             matching_count=matching_count,
+        )
+    if type(spec) is MemoryAttributionAssertionSpec:
+        raw_state = result.metadata.get("evidence_state")
+        evidence_revision = _safe_metadata_text(
+            result,
+            "evidence_revision",
+            max_chars=71,
+        )
+        if evidence_revision is None:
+            raise ValueError(
+                "Internal memory-attribution result did not retain its evidence revision."
+            )
+        observation_state: MemoryAttributionObservationState = (
+            raw_state
+            if type(raw_state) is str
+            and raw_state in {"complete", "truncated", "unavailable", "indeterminate"}
+            else "unavailable"
+        )
+        return PublishedMemoryAttributionDetail(
+            min_admitted_items=spec.min_admitted_items,
+            max_admitted_items=spec.max_admitted_items,
+            min_provider_exposures=spec.min_provider_exposures,
+            max_provider_exposures=spec.max_provider_exposures,
+            observation_state=observation_state,
+            evidence_revision=evidence_revision,
+            limitations=_safe_memory_limitations(result),
+            admitted_item_count=_safe_metadata_int(result, "admitted_item_count"),
+            provider_exposure_count=_safe_metadata_int(result, "provider_exposure_count"),
         )
     if type(spec) is MaxToolCallsAssertionSpec:
         return PublishedMaxToolCallsDetail(

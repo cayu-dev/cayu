@@ -131,6 +131,18 @@ function capturedCandidate() {
         unpriced_model_steps: 0,
       },
     ],
+    memory_attribution: {
+      completeness: "complete",
+      has_indeterminate_exposure: false,
+      sources: [
+        {
+          attribution: {
+            receipts: [{ admitted_count: 2 }],
+            exposures: [{ provider_exposure_proven: true }],
+          },
+        },
+      ],
+    },
   }
   return source
 }
@@ -217,6 +229,17 @@ test("captured drafts omit replay input and quick-add assertions use observed fa
       kind: "max_estimated_cost",
       maximum: "0.25",
       currency: "USD",
+    },
+  )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "memory_attribution"),
+    {
+      id: "memory_attribution",
+      kind: "memory_attribution",
+      min_admitted_items: 2,
+      max_admitted_items: 2,
+      min_provider_exposures: 1,
+      max_provider_exposures: 1,
     },
   )
   assert.deepEqual(
@@ -312,6 +335,14 @@ test("structural assertions validate canonical paths, bounds, digests, and text"
       min_count: 1,
       max_count: 1,
     },
+    {
+      id: "memory",
+      kind: "memory_attribution",
+      min_admitted_items: 0,
+      max_admitted_items: 1_000,
+      min_provider_exposures: 0,
+      max_provider_exposures: 100,
+    },
   ]
   assert.deepEqual(validatePromotionDraft(valid), { ok: true, draft: valid })
 
@@ -348,12 +379,21 @@ test("structural assertions validate canonical paths, bounds, digests, and text"
   const oversizedUtf8Text = structuredClone(valid)
   oversizedUtf8Text.case.assertions[1].text_contains = "😀".repeat(17_000)
   assert.match(validatePromotionDraft(oversizedUtf8Text).error, /65,536 UTF-8 bytes/)
+
+  const oversizedMemoryItems = structuredClone(valid)
+  oversizedMemoryItems.case.assertions[2].max_admitted_items = 1_001
+  assert.match(validatePromotionDraft(oversizedMemoryItems).error, /from 0 to 1000/)
+
+  const oversizedMemoryExposures = structuredClone(valid)
+  oversizedMemoryExposures.case.assertions[2].max_provider_exposures = 101
+  assert.match(validatePromotionDraft(oversizedMemoryExposures).error, /from 0 to 100/)
 })
 
 test("captured structural suggestions require complete observations", () => {
   const evidence = capturedCandidate().evidence
   assert.equal(capturedAssertionSuggestionUnavailable("workspace_file", evidence), false)
   assert.equal(capturedAssertionSuggestionUnavailable("artifact", evidence), false)
+  assert.equal(capturedAssertionSuggestionUnavailable("memory_attribution", evidence), false)
 
   const incomplete = structuredClone(evidence)
   incomplete.workspace_evidence_state = "limit_exceeded"
@@ -367,6 +407,31 @@ test("captured structural suggestions require complete observations", () => {
   assert.equal(
     createCapturedEvaluationAssertionDraft("artifact", [], incomplete).source,
     "expectation",
+  )
+
+  const incompleteMemory = structuredClone(evidence)
+  incompleteMemory.memory_attribution.completeness = "truncated"
+  assert.equal(capturedAssertionSuggestionUnavailable("memory_attribution", incompleteMemory), true)
+  const memoryExpectation = createCapturedEvaluationAssertionDraft(
+    "memory_attribution",
+    [],
+    incompleteMemory,
+  )
+  assert.equal(memoryExpectation.source, "expectation")
+  assert.deepEqual(memoryExpectation.assertion, {
+    id: "memory_attribution",
+    kind: "memory_attribution",
+    min_admitted_items: 1,
+    max_admitted_items: null,
+    min_provider_exposures: 1,
+    max_provider_exposures: null,
+  })
+
+  const indeterminateMemory = structuredClone(evidence)
+  indeterminateMemory.memory_attribution.has_indeterminate_exposure = true
+  assert.equal(
+    capturedAssertionSuggestionUnavailable("memory_attribution", indeterminateMemory),
+    true,
   )
 
   const nonportableWorkspaceSize = structuredClone(evidence)

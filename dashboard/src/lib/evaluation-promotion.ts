@@ -26,6 +26,7 @@ export const PROMOTION_ASSERTION_KINDS = [
   "process_events_in_order",
   "workspace_file",
   "artifact",
+  "memory_attribution",
   "max_tool_calls",
   "max_model_steps",
   "usage_recorded",
@@ -38,6 +39,8 @@ const SHA256_REVISION_PATTERN = /^sha256:[a-f0-9]{64}$/
 const CURRENCY_PATTERN = /^[A-Z][A-Z0-9._-]{0,15}$/
 const MAX_SAFE_COUNTER = Number.MAX_SAFE_INTEGER
 const MAX_PROCESS_EVENT_ORDER = 256
+const MAX_MEMORY_ADMITTED_ITEMS = 1_000
+const MAX_MEMORY_PROVIDER_EXPOSURES = 100
 
 export const PROCESS_EVENT_OPTIONS = [
   ["session_started", "Session started"],
@@ -126,6 +129,10 @@ export function capturedAssertionSuggestionUnavailable(
       (item) => completeScopes.has(item.scope) && isPortableObservedByteCount(item.size_bytes),
     )
   }
+  if (kind === "memory_attribution") {
+    const memory = evidence.memory_attribution
+    return memory == null || memory.completeness !== "complete" || memory.has_indeterminate_exposure
+  }
   return false
 }
 
@@ -147,6 +154,7 @@ export const PROMOTION_ASSERTION_LABELS: Record<PromotionAssertionKind, string> 
   process_events_in_order: "Process events in order",
   workspace_file: "Workspace file structure",
   artifact: "Artifact structure or text",
+  memory_attribution: "Memory admission and exposure",
   max_tool_calls: "Maximum tool calls",
   max_model_steps: "Maximum model steps",
   usage_recorded: "Usage recorded",
@@ -434,6 +442,20 @@ function validateAssertion(assertion: PromotionAssertion): void {
       }
       requireRange(assertion.min_count ?? 1, assertion.max_count, "Artifact count", 256)
       return
+    case "memory_attribution":
+      requireRange(
+        assertion.min_admitted_items ?? 1,
+        assertion.max_admitted_items,
+        "Admitted memory item count",
+        MAX_MEMORY_ADMITTED_ITEMS,
+      )
+      requireRange(
+        assertion.min_provider_exposures ?? 1,
+        assertion.max_provider_exposures,
+        "Memory provider exposure count",
+        MAX_MEMORY_PROVIDER_EXPOSURES,
+      )
+      return
     case "max_tool_calls":
       requireInteger(assertion.maximum, "Maximum tool calls", 0, 4_096)
       return
@@ -517,6 +539,15 @@ export function createPromotionAssertion(
         text_contains: null,
         min_count: 1,
         max_count: null,
+      }
+    case "memory_attribution":
+      return {
+        id,
+        kind,
+        min_admitted_items: 1,
+        max_admitted_items: null,
+        min_provider_exposures: 1,
+        max_provider_exposures: null,
       }
     case "max_tool_calls":
       return { id, kind, maximum: 1 }
@@ -679,6 +710,21 @@ export function createCapturedEvaluationAssertion(
         max_count: exactMatches,
       }
     }
+    case "memory_attribution": {
+      if (capturedAssertionSuggestionUnavailable(assertion.kind, evidence)) {
+        throw new Error(
+          "Complete captured memory attribution without indeterminate exposure is required for this assertion.",
+        )
+      }
+      const counts = memoryAttributionCounts(evidence.memory_attribution)
+      return {
+        ...assertion,
+        min_admitted_items: counts.admittedItems,
+        max_admitted_items: counts.admittedItems,
+        min_provider_exposures: counts.providerExposures,
+        max_provider_exposures: counts.providerExposures,
+      }
+    }
     case "max_tool_calls":
       return evidence.tool_calls_started == null
         ? assertion
@@ -703,6 +749,26 @@ export function createCapturedEvaluationAssertion(
     }
   }
   throw new Error(`Unsupported captured assertion kind: ${String(kind)}`)
+}
+
+function memoryAttributionCounts(evidence: CapturedAssertionEvidence["memory_attribution"]): {
+  admittedItems: number
+  providerExposures: number
+} {
+  let admittedItems = 0
+  let providerExposures = 0
+  for (const source of evidence.sources ?? []) {
+    const attribution = source.attribution
+    if (attribution == null) continue
+    for (const receipt of attribution.receipts ?? []) admittedItems += receipt.admitted_count
+    for (const exposure of attribution.exposures ?? []) {
+      if (exposure.provider_exposure_proven) providerExposures += 1
+    }
+  }
+  if (!Number.isSafeInteger(admittedItems) || !Number.isSafeInteger(providerExposures)) {
+    throw new Error("Captured memory counts exceed the portable browser integer range.")
+  }
+  return { admittedItems, providerExposures }
 }
 
 function safeEvidenceInteger(value: string | null | undefined): number | null {

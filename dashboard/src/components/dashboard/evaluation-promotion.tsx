@@ -1739,6 +1739,42 @@ function AssertionFields({
         </div>
       )
     }
+    case "memory_attribution":
+      return (
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <IntegerField
+              label="Minimum admitted items"
+              id={id("minimum-admitted-items")}
+              value={assertion.min_admitted_items ?? 1}
+              onChange={(value) => update({ ...assertion, min_admitted_items: value })}
+            />
+            <NullableIntegerField
+              label="Maximum admitted items"
+              id={id("maximum-admitted-items")}
+              value={assertion.max_admitted_items}
+              onChange={(value) => update({ ...assertion, max_admitted_items: value })}
+            />
+            <IntegerField
+              label="Minimum provider exposures"
+              id={id("minimum-provider-exposures")}
+              value={assertion.min_provider_exposures ?? 1}
+              onChange={(value) => update({ ...assertion, min_provider_exposures: value })}
+            />
+            <NullableIntegerField
+              label="Maximum provider exposures"
+              id={id("maximum-provider-exposures")}
+              value={assertion.max_provider_exposures}
+              onChange={(value) => update({ ...assertion, max_provider_exposures: value })}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            This proves bounded memory admission and provider exposure only. Complete evidence is
+            required; correct use needs a reference-backed judge, and causal impact needs a paired
+            experiment.
+          </p>
+        </div>
+      )
     case "max_tool_calls":
       return (
         <IntegerField

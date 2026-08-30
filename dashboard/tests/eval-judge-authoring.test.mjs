@@ -5,6 +5,7 @@ import {
   judgeProfileForAssertion,
   judgeRouteForAssertion,
   newJudgeCalibrationDraft,
+  newMemoryUseJudgeAssertion,
   newStructuredJudgeAssertion,
   structuredAssertionFromReviewedSuite,
   validateJudgeCalibrationDraft,
@@ -58,6 +59,27 @@ test("structured judge helpers create revision-free, locally valid rubric materi
 
   assertion.rubric.criteria[1].weight = "0.29"
   assert.throws(() => validateStructuredJudgeAssertion(assertion), /sum exactly to 1/)
+})
+
+test("memory-use judge starts with an explicit trusted-reference requirement", () => {
+  const assertion = newMemoryUseJudgeAssertion(profile(), ["memory-use"])
+
+  assert.equal(assertion.id, "memory-use-2")
+  assert.equal(assertion.rubric.id, "memory-use")
+  assert.deepEqual(
+    assertion.rubric.criteria.map((criterion) => criterion.weight),
+    ["0.5", "0.3", "0.2"],
+  )
+  assert.throws(() => validateStructuredJudgeAssertion(assertion), /Expected fact 1/)
+
+  assertion.reference.expected_facts = ["The customer is enrolled in the premium plan."]
+  assert.doesNotThrow(() => validateStructuredJudgeAssertion(assertion))
+
+  const incompatibleProfile = { ...profile(), allowed_evidence: ["final_output"] }
+  assert.throws(
+    () => newMemoryUseJudgeAssertion(incompatibleProfile, []),
+    /must permit final-output and public-reference evidence/,
+  )
 })
 
 test("reviewed assertion matching requires a compiled rubric revision", () => {

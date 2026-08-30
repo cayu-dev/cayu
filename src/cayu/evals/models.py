@@ -57,10 +57,10 @@ from cayu.runtime.usage import (
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
 # saved structure changes incompatibly so load_eval_run can reject a baseline
-# written for a different contract instead of silently misreading it. Version 9
-# binds the portable workspace/artifact assertion result contract; earlier
+# written for a different contract instead of silently misreading it. Version
+# 11 binds the portable memory-attribution assertion result contract; earlier
 # prerelease formats are intentionally not migrated.
-EVAL_SCHEMA_VERSION = 10
+EVAL_SCHEMA_VERSION = 11
 
 # Version of the standalone trajectory JSON document written by
 # write_trajectory_json. Version 5 adds bounded structural workspace/artifact probes;
@@ -899,7 +899,7 @@ class EvalRun(BaseModel):
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
-    schema_version: Literal[10] = EVAL_SCHEMA_VERSION
+    schema_version: Literal[11] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus
@@ -916,7 +916,7 @@ class EvalRun(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def require_versioned_memory_evidence(cls, value: object) -> object:
-        """Reject schema-v9 mappings that silently omit the required section.
+        """Reject versioned mappings that silently omit required memory evidence.
 
         Standalone Python ``EvalTrialResult`` construction retains its explicit
         typed-unavailable default for extension boundaries.  A durable EvalRun
@@ -942,7 +942,7 @@ class EvalRun(BaseModel):
                     "dict[str, object]", trial
                 ):
                     raise ValueError(
-                        "EvalRun schema-v10 trial memory_attribution is required "
+                        "EvalRun schema-v11 trial memory_attribution is required "
                         f"at cases[{case_index}].trials[{trial_index}]."
                     )
         return value

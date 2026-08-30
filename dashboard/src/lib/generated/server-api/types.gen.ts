@@ -2822,7 +2822,7 @@ export type CapturedEvaluationCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4740,6 +4740,7 @@ export type EvalAssertionPresentationV1 = {
      * Kind
      */
     kind: string;
+    memory?: PublishedMemoryAttributionDetail | null;
     model_judge?: PublishedModelJudgeDetail | null;
     /**
      * Outcome
@@ -5167,7 +5168,7 @@ export type EvalCaseDefinitionV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5204,7 +5205,7 @@ export type EvalCaseDefinitionV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5241,7 +5242,7 @@ export type EvalCaseDraftV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5274,7 +5275,7 @@ export type EvalCaseDraftV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
     /**
      * Description
      */
@@ -5410,7 +5411,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5527,7 +5528,7 @@ export type EvalCorpusDocument = {
     /**
      * Schema Version
      */
-    schema_version?: 3;
+    schema_version?: 4;
     /**
      * Suites
      */
@@ -8320,7 +8321,7 @@ export type EvaluationPromotionCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -9265,6 +9266,42 @@ export type MemoryAttribution = {
      * Truncated
      */
     truncated: boolean;
+};
+
+/**
+ * MemoryAttributionAssertionSpec
+ *
+ * Require complete bounded memory admission and provider-exposure evidence.
+ */
+export type MemoryAttributionAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'memory_attribution';
+    /**
+     * Max Admitted Items
+     */
+    max_admitted_items?: number | null;
+    /**
+     * Max Provider Exposures
+     */
+    max_provider_exposures?: number | null;
+    /**
+     * Min Admitted Items
+     */
+    min_admitted_items?: number;
+    /**
+     * Min Provider Exposures
+     */
+    min_provider_exposures?: number;
 };
 
 /**
@@ -11958,7 +11995,7 @@ export type PromotionCaseV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | WorkspaceFileAssertionSpec | ArtifactAssertionSpec | MemoryAttributionAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -12311,6 +12348,8 @@ export type PublishedAssertionResult = {
     } & PublishedWorkspaceFileDetail) | ({
         kind: 'artifact';
     } & PublishedArtifactDetail) | ({
+        kind: 'memory_attribution';
+    } & PublishedMemoryAttributionDetail) | ({
         kind: 'max_tool_calls';
     } & PublishedMaxToolCallsDetail) | ({
         kind: 'max_model_steps';
@@ -12428,7 +12467,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 9;
+    schema_version: 10;
     /**
      * Score
      */
@@ -12636,6 +12675,54 @@ export type PublishedMaxTotalTokensDetail = {
      * Maximum
      */
     maximum: number;
+};
+
+/**
+ * PublishedMemoryAttributionDetail
+ *
+ * Bounded structural memory expectation and its conclusive counts, when available.
+ */
+export type PublishedMemoryAttributionDetail = {
+    /**
+     * Admitted Item Count
+     */
+    admitted_item_count?: number | null;
+    /**
+     * Evidence Revision
+     */
+    evidence_revision: string;
+    /**
+     * Kind
+     */
+    kind?: 'memory_attribution';
+    /**
+     * Limitations
+     */
+    limitations?: Array<EvalMemoryEvidenceLimitation>;
+    /**
+     * Max Admitted Items
+     */
+    max_admitted_items?: number | null;
+    /**
+     * Max Provider Exposures
+     */
+    max_provider_exposures?: number | null;
+    /**
+     * Min Admitted Items
+     */
+    min_admitted_items: number;
+    /**
+     * Min Provider Exposures
+     */
+    min_provider_exposures: number;
+    /**
+     * Observation State
+     */
+    observation_state: 'complete' | 'truncated' | 'unavailable' | 'indeterminate';
+    /**
+     * Provider Exposure Count
+     */
+    provider_exposure_count?: number | null;
 };
 
 /**

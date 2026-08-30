@@ -64,6 +64,7 @@ from cayu.evals.published import (
     _published_assertion,
     _published_score,
     _published_status_from_outcomes,
+    _validate_memory_assertions_for_evidence,
 )
 from cayu.evals.suite_authoring import EvalSuiteAuthoringAssertionSpecV1
 from cayu.runtime.app import CayuApp
@@ -690,6 +691,10 @@ class CapturedRunScoreV1(_SchemaV1PortableModel):
         assertion_ids = tuple(assertion.assertion_id for assertion in self.assertions)
         if len(assertion_ids) != len(set(assertion_ids)):
             raise ValueError("Captured score assertion IDs must be unique.")
+        _validate_memory_assertions_for_evidence(
+            self.assertions,
+            self.memory_attribution,
+        )
         if not json_utf8_size_within_limit(self, CAPTURED_RUN_SCORE_MAX_BYTES):
             raise ValueError(
                 f"Captured score exceeds {CAPTURED_RUN_SCORE_MAX_BYTES} canonical JSON bytes."
@@ -819,19 +824,19 @@ _PROMOTION_ERROR_MESSAGES = {
         "Promotion requires a complete completed/failed descendant tree."
     ),
     SessionPromotionErrorCode.APPROVAL_CONTINUATION_UNSUPPORTED: (
-        "Portable corpus v3 does not support approval continuations."
+        "Portable corpus v4 does not support approval continuations."
     ),
     SessionPromotionErrorCode.SESSION_RESUME_UNSUPPORTED: (
-        "Portable corpus v3 does not support resumed sessions."
+        "Portable corpus v4 does not support resumed sessions."
     ),
     SessionPromotionErrorCode.QUEUED_INPUT_UNSUPPORTED: (
-        "Portable corpus v3 does not support queued later input."
+        "Portable corpus v4 does not support queued later input."
     ),
     SessionPromotionErrorCode.LATER_INTERACTION_UNSUPPORTED: (
-        "Portable corpus v3 requires exactly one initial interaction."
+        "Portable corpus v4 requires exactly one initial interaction."
     ),
     SessionPromotionErrorCode.STRUCTURED_OUTPUT_UNSUPPORTED: (
-        "Portable corpus v3 does not support structured-output runs."
+        "Portable corpus v4 does not support structured-output runs."
     ),
     SessionPromotionErrorCode.INPUT_EVIDENCE_UNAVAILABLE: (
         "The session has no runtime-attested fresh-input boundary."
@@ -840,16 +845,16 @@ _PROMOTION_ERROR_MESSAGES = {
         "The runtime promotion attestation does not match the captured trajectory."
     ),
     SessionPromotionErrorCode.INPUT_MESSAGE_COUNT_UNSUPPORTED: (
-        "Portable corpus v3 requires one or more bounded initial user messages."
+        "Portable corpus v4 requires one or more bounded initial user messages."
     ),
     SessionPromotionErrorCode.INPUT_ROLE_UNSUPPORTED: (
-        "Portable corpus v3 accepts only caller-supplied user messages."
+        "Portable corpus v4 accepts only caller-supplied user messages."
     ),
     SessionPromotionErrorCode.INPUT_PART_UNSUPPORTED: (
-        "Portable corpus v3 requires exactly one text part per caller-supplied message."
+        "Portable corpus v4 requires exactly one text part per caller-supplied message."
     ),
     SessionPromotionErrorCode.INPUT_LIMIT_EXCEEDED: (
-        "The initial input exceeds a portable corpus v3 limit."
+        "The initial input exceeds a portable corpus v4 limit."
     ),
     SessionPromotionErrorCode.INPUT_REDACTION_FAILED: (
         "The initial input could not cross the application redaction boundary."

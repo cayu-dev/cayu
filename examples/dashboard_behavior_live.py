@@ -1735,6 +1735,31 @@ async def _exercise_captured_evaluation(
     await expect(authoring.get_by_test_id("judge-profile-summary")).to_contain_text(
         re.compile(r"same model as candidate", re.IGNORECASE)
     )
+    memory_authoring = authoring.get_by_test_id("eval-memory-authoring")
+    await memory_authoring.get_by_role("button", name="Require memory exposure", exact=True).click()
+    memory_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await memory_assertion.get_by_label("Minimum admitted items", exact=True).fill("0")
+    await memory_assertion.get_by_label("Maximum admitted items", exact=True).fill("0")
+    await memory_assertion.get_by_label("Minimum provider exposures", exact=True).fill("0")
+    await memory_assertion.get_by_label("Maximum provider exposures", exact=True).fill("0")
+    await memory_authoring.get_by_role(
+        "button", name="Add reference-backed judge", exact=True
+    ).click()
+    memory_judge = authoring.get_by_test_id("structured-judge-editor").last
+    await expect(memory_judge.get_by_label("Criterion 1 ID", exact=True)).to_have_value(
+        "reference-correctness"
+    )
+    await memory_judge.get_by_label("Expected facts (one per line)", exact=True).fill(
+        "The fresh run should finish without admitting memory."
+    )
+    await expect(
+        memory_authoring.get_by_text(
+            "Replace the blank expected fact in the memory-use judge with trusted reference "
+            "truth before checking or saving the suite.",
+            exact=True,
+        )
+    ).to_have_count(0)
+    await memory_judge.get_by_role("button", name="Remove AI judge", exact=True).click()
     assertion_kind = authoring.get_by_label("Assertion quick-add type", exact=True)
     await assertion_kind.select_option("tool_arguments_contain")
     await authoring.get_by_role("button", name="Add expectation", exact=True).click()
@@ -1978,6 +2003,7 @@ async def _exercise_captured_evaluation(
     await expect(page.get_by_text("process_events_in_order", exact=True)).to_be_visible()
     await expect(page.get_by_text("workspace_file", exact=True)).to_be_visible()
     await expect(page.get_by_title("artifact", exact=True)).to_be_visible()
+    await expect(page.get_by_text("memory_attribution", exact=True)).to_be_visible()
     await expect(page.get_by_text("Dashboard quality judge", exact=False)).to_be_visible()
     await expect(page.get_by_text("same model · explicitly allowed", exact=True)).to_be_visible()
     await expect(page.get_by_text("correctness", exact=True)).to_be_visible()
@@ -2056,6 +2082,22 @@ async def _exercise_captured_evaluation(
         '"artifact_id"' not in structural_result_json,
         "published structural details must omit private artifact identities",
     )
+    authored_memory_assertion = next(
+        item for item in authored_assertions if item["detail"]["kind"] == "memory_attribution"
+    )
+    require_equal(
+        authored_memory_assertion["outcome"],
+        "passed",
+        "fresh zero-memory evidence must satisfy the explicit zero-count expectation",
+    )
+    require_equal(
+        (
+            authored_memory_assertion["detail"]["admitted_item_count"],
+            authored_memory_assertion["detail"]["provider_exposure_count"],
+        ),
+        (0, 0),
+        "published memory detail must retain exact complete structural counts",
+    )
     authored_presentation = authored_result_body["presentation"]
     authored_tool_presentations = [
         item["tool_json"]
@@ -2074,6 +2116,12 @@ async def _exercise_captured_evaluation(
         "Session started → Tool call started → Tool call completed → Session completed"
     )
     await expect(page.get_by_test_id("eval-structure-detail")).to_have_count(2)
+    await expect(page.get_by_test_id("eval-memory-evidence")).to_be_visible()
+    await expect(page.get_by_test_id("eval-memory-assertion-detail")).to_be_visible()
+    await page.get_by_text("Inspect bounded structural source evidence", exact=True).click()
+    await expect(page.get_by_text("Recall receipts", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Exposure states", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Causal contribution", exact=True)).to_be_visible()
     authored_structural_presentations = [
         item["structure"]
         for item in authored_presentation["cases"][0]["trials"][0]["assertions"]
@@ -2156,6 +2204,8 @@ async def _exercise_captured_evaluation(
     authored_html = Path(authored_html_path).read_text(encoding="utf-8")
     require(
         "The known output satisfies the fixed task." in authored_html
+        and "0 item(s) admitted" in authored_html
+        and "0 provider exposure(s)" in authored_html
         and "weighted_contribution" not in authored_html
         and "judge_output" not in authored_html,
         "HTML must render readable structured evidence without raw judge payload fields",

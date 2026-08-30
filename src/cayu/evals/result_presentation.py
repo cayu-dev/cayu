@@ -44,6 +44,7 @@ from cayu.evals.published import (
     PublishedAssertionResult,
     PublishedChildStatusDetail,
     PublishedEvalTrialResult,
+    PublishedMemoryAttributionDetail,
     PublishedModelJudgeDetail,
     PublishedOutcome,
     PublishedProcessEventDetail,
@@ -210,6 +211,7 @@ class EvalAssertionPresentationV1(_PortableModel):
         | None
     ) = None
     structure: PublishedWorkspaceFileDetail | PublishedArtifactDetail | None = None
+    memory: PublishedMemoryAttributionDetail | None = None
 
     @field_validator("model_judge", mode="before")
     @classmethod
@@ -263,6 +265,17 @@ class EvalAssertionPresentationV1(_PortableModel):
             raise TypeError("structure must be an exact published structure detail or JSON object.")
         return value
 
+    @field_validator("memory", mode="before")
+    @classmethod
+    def copy_memory(cls, value: object) -> object:
+        if type(value) is PublishedMemoryAttributionDetail:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "memory must be an exact published memory-attribution detail or JSON object."
+            )
+        return value
+
     @field_validator("assertion_id")
     @classmethod
     def validate_assertion_id(cls, value: str, info) -> str:
@@ -312,6 +325,9 @@ class EvalAssertionPresentationV1(_PortableModel):
             raise ValueError("Only structural assertions carry safe structure detail.")
         if self.structure is not None and self.structure.kind != self.kind:
             raise ValueError("Structure presentation kind contradicts its retained detail.")
+        memory_kind = self.kind == "memory_attribution"
+        if memory_kind != (self.memory is not None):
+            raise ValueError("Only memory-attribution assertions carry safe memory detail.")
         if self.model_judge is not None:
             detail = self.model_judge
             if detail.diagnostic == "evidence_unavailable":
@@ -1011,6 +1027,7 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
         tool_json=tool_json,
         process=process,
         structure=structure,
+        memory=(detail if type(detail) is PublishedMemoryAttributionDetail else None),
     )
 
 

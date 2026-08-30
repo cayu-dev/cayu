@@ -4,6 +4,7 @@ import test from "node:test"
 globalThis.window = { __CAYU_DASHBOARD_CONFIG__: { apiBaseUrl: "/api" } }
 
 const {
+  buildMemoryExperimentReport,
   compareEvalResults,
   compareEvalRuns,
   createEvalRun,
@@ -11,6 +12,7 @@ const {
   downloadCatalogEvalResultJson,
   downloadEvalResultJson,
   downloadEvalScenario,
+  downloadMemoryExperimentReportHtml,
   downloadEvalAuthoredSuite,
   fetchEvalAuthoredSuite,
   fetchEvalAuthoredSuites,
@@ -171,6 +173,53 @@ test("captured and fresh result adapters compare and download by immutable revis
   assert.equal(calls[2].input, `/api/evals/results/${encodeURIComponent(current)}/report.html`)
 })
 
+test("memory report adapters preserve the exact campaign request for JSON and HTML", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const controller = new AbortController()
+  const request = {
+    schema_version: 1,
+    experiment_id: "memory-campaign",
+    cases: [{ case_id: "case", case_revision: `sha256:${"a".repeat(64)}` }],
+    repetitions: 1,
+    baseline_variant_id: "baseline",
+    variants: [{ variant_id: "baseline" }, { variant_id: "candidate" }],
+  }
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init })
+    if (String(input).endsWith("report.html")) {
+      return new Response("<html></html>", { headers: { "content-type": "text/html" } })
+    }
+    return new Response(
+      JSON.stringify({
+        schema_version: 1,
+        experiment_id: "memory-campaign",
+        revision: `sha256:${"b".repeat(64)}`,
+      }),
+      { headers: { "content-type": "application/json" } },
+    )
+  }
+
+  try {
+    await buildMemoryExperimentReport(request, controller.signal)
+    const html = await downloadMemoryExperimentReportHtml(request, controller.signal)
+    assert.equal(html.filename, "cayu-memory-experiment-report.html")
+    assert.equal(await html.blob.text(), "<html></html>")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.deepEqual(
+    calls.map((call) => call.input),
+    ["/api/evals/memory-reports", "/api/evals/memory-reports/report.html"],
+  )
+  for (const call of calls) {
+    assert.equal(call.init.method, "POST")
+    assert.equal(call.init.signal, controller.signal)
+    assert.deepEqual(JSON.parse(call.init.body), request)
+  }
+})
+
 test("eval catalog adapters select only server-published target keys", async () => {
   const originalFetch = globalThis.fetch
   const calls = []
@@ -198,7 +247,7 @@ test("eval catalog adapters select only server-published target keys", async () 
 test("eval corpus imports preserve the selected file bytes for strict server validation", async () => {
   const originalFetch = globalThis.fetch
   const prefix = new TextEncoder().encode(
-    '{"schema_version":1,"schema_version":3,"revision":"sha256:corpus",' +
+    '{"schema_version":1,"schema_version":4,"revision":"sha256:corpus",' +
       '"target_key":"target","evidence_policy":{},"description":"',
   )
   const suffix = new TextEncoder().encode('","suites":[],"cases":[]}')

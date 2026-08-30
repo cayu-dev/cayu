@@ -5689,6 +5689,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -5738,6 +5739,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -9538,6 +9542,16 @@
             "title": "Kind",
             "type": "string"
           },
+          "memory": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedMemoryAttributionDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model_judge": {
             "anyOf": [
               {
@@ -10391,6 +10405,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -10440,6 +10455,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10544,6 +10562,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -10594,6 +10613,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10701,6 +10723,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -10750,6 +10773,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10849,6 +10875,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -10899,6 +10926,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -11200,6 +11230,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -11250,6 +11281,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -11494,8 +11528,8 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 3,
-            "default": 3,
+            "const": 4,
+            "default": 4,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -16786,6 +16820,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -16835,6 +16870,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -18525,6 +18563,78 @@
           "omitted_item_count_at_least"
         ],
         "title": "MemoryAttribution",
+        "type": "object"
+      },
+      "MemoryAttributionAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require complete bounded memory admission and provider-exposure evidence.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "memory_attribution",
+            "default": "memory_attribution",
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_admitted_items": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Admitted Items"
+          },
+          "max_provider_exposures": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Provider Exposures"
+          },
+          "min_admitted_items": {
+            "default": 1,
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Min Admitted Items",
+            "type": "integer"
+          },
+          "min_provider_exposures": {
+            "default": 1,
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Min Provider Exposures",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "MemoryAttributionAssertionSpec",
         "type": "object"
       },
       "MemoryAttributionBounds": {
@@ -23759,6 +23869,7 @@
                   "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "memory_attribution": "#/components/schemas/MemoryAttributionAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "process_event": "#/components/schemas/ProcessEventAssertionSpec",
                   "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
@@ -23808,6 +23919,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ArtifactAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MemoryAttributionAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -24404,6 +24518,7 @@
                 "max_model_steps": "#/components/schemas/PublishedMaxModelStepsDetail",
                 "max_tool_calls": "#/components/schemas/PublishedMaxToolCallsDetail",
                 "max_total_tokens": "#/components/schemas/PublishedMaxTotalTokensDetail",
+                "memory_attribution": "#/components/schemas/PublishedMemoryAttributionDetail",
                 "model_judge": "#/components/schemas/PublishedModelJudgeDetail",
                 "process_event": "#/components/schemas/PublishedProcessEventDetail",
                 "process_events_in_order": "#/components/schemas/PublishedProcessEventsInOrderDetail",
@@ -24454,6 +24569,9 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedArtifactDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedMemoryAttributionDetail"
               },
               {
                 "$ref": "#/components/schemas/PublishedMaxToolCallsDetail"
@@ -24692,7 +24810,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 9,
+            "const": 10,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -25117,6 +25235,112 @@
           "maximum"
         ],
         "title": "PublishedMaxTotalTokensDetail",
+        "type": "object"
+      },
+      "PublishedMemoryAttributionDetail": {
+        "additionalProperties": false,
+        "description": "Bounded structural memory expectation and its conclusive counts, when available.",
+        "properties": {
+          "admitted_item_count": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admitted Item Count"
+          },
+          "evidence_revision": {
+            "title": "Evidence Revision",
+            "type": "string"
+          },
+          "kind": {
+            "const": "memory_attribution",
+            "default": "memory_attribution",
+            "title": "Kind",
+            "type": "string"
+          },
+          "limitations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalMemoryEvidenceLimitation"
+            },
+            "title": "Limitations",
+            "type": "array"
+          },
+          "max_admitted_items": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Admitted Items"
+          },
+          "max_provider_exposures": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Provider Exposures"
+          },
+          "min_admitted_items": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Min Admitted Items",
+            "type": "integer"
+          },
+          "min_provider_exposures": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Min Provider Exposures",
+            "type": "integer"
+          },
+          "observation_state": {
+            "enum": [
+              "complete",
+              "truncated",
+              "unavailable",
+              "indeterminate"
+            ],
+            "title": "Observation State",
+            "type": "string"
+          },
+          "provider_exposure_count": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Exposure Count"
+          }
+        },
+        "required": [
+          "min_admitted_items",
+          "min_provider_exposures",
+          "observation_state",
+          "evidence_revision"
+        ],
+        "title": "PublishedMemoryAttributionDetail",
         "type": "object"
       },
       "PublishedModelJudgeCostV1": {
@@ -28021,7 +28245,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "39",
+            "default": "40",
             "title": "Contract Version",
             "type": "string"
           },
@@ -32530,7 +32754,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "39",
+            "default": "40",
             "title": "Contract Version",
             "type": "string"
           }

@@ -209,9 +209,9 @@ deterministic and structured-judge workflow:
 2. add, duplicate, remove, and select cases;
 3. enter one or more ordered user messages for a simple fresh session, or build
    and save a controlled multi-stage scenario;
-4. define expected behavior with status, output, tool, model-step, usage, token,
-   and cost assertions, and optionally add a one-to-eight-criterion AI judge
-   rubric using a current trusted server-published profile;
+4. define expected behavior with status, output, tool, memory, model-step, usage,
+   token, and cost assertions, and optionally add a one-to-eight-criterion AI
+   judge rubric using a current trusted server-published profile;
 5. check current target and scenario readiness, save the reviewed immutable
    suite revision, and review the exact maximum candidate work, judge work,
    priced cost (when fully priceable), and execution profiles for either the
@@ -349,20 +349,22 @@ set of structural assertion specifications. It cannot contain a `CayuApp`,
 provider/model/environment selection, import path, callback, raw session ID, or
 runtime event payload.
 
-Portable corpus schema version 3 adds an explicit immutable suite trial policy
-to the version 2 assertion surface, which covers root and child terminal
-status, final-output equality/containment, tool presence/order/count, bounded
+Portable corpus schema version 4 adds bounded memory-attribution assertions to
+the version 3 surface, which introduced the explicit immutable suite trial
+policy. The assertion surface covers root and child terminal status,
+final-output equality/containment, tool presence/order/count, bounded
 tool-argument/result JSON subsets, workspace-file structure, artifact structure
-and explicitly retained public artifact text, model-step
-and token limits, recorded usage, estimated-cost limits, and trusted model
-judgments. Cost assertions require a `PricingProfileIdentityV1`; the identity
-fingerprints trusted pricing used elsewhere and never embeds or authorizes a
-`PriceBook`. A `ModelJudgeAssertionSpec` remains data-only: it carries a bounded
-rubric and rubric version, threshold, transcript-selection flag, trusted
-evaluator key. The target resolves that key to its local trusted judge
-implementation at execution time. Each published result records the resolved
-implementation revision, so the same portable corpus remains reusable across
-trusted evaluator rollouts while comparisons still reject different judges.
+and explicitly retained public artifact text, memory admission/provider-exposure
+ranges, model-step and token limits, recorded usage, estimated-cost limits, and
+trusted model judgments. Cost assertions require a `PricingProfileIdentityV1`;
+the identity fingerprints trusted pricing used elsewhere and never embeds or
+authorizes a `PriceBook`. A `ModelJudgeAssertionSpec` remains data-only: it
+carries a bounded rubric and rubric version, threshold, transcript-selection
+flag, and trusted evaluator key. The target resolves that key to its local
+trusted judge implementation at execution time. Each published result records
+the resolved implementation revision, so the same portable corpus remains
+reusable across trusted evaluator rollouts while comparisons still reject
+different judges.
 
 Corpus documents are definitions, not executable application configuration.
 Parsing one never imports project code or invokes a provider, tool, environment,
@@ -384,7 +386,7 @@ and publication shapes but are rejected by fresh-run admission until runnable
 input is authored.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
-`load_eval_corpus(...)` enforce schema version 3 and Cayu's durable-JSON rules,
+`load_eval_corpus(...)` enforce schema version 4 and Cayu's durable-JSON rules,
 including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
 validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
@@ -395,7 +397,7 @@ cases and trials, matching the boundary of the one-suite execution result. A
 multi-suite corpus may exceed that aggregate because suites execute and publish
 independently; inspection reports the complete corpus-wide count without
 materializing result graphs.
-Unknown fields and assertion kinds fail closed; schema version 3 has no
+Unknown fields and assertion kinds fail closed; schema version 4 has no
 prior-version compatibility loader.
 
 ### Safe tool argument and result assertions
@@ -520,6 +522,59 @@ them as observed drafts, not truth. When a production trajectory did not retain
 a path/scope, or retained it incompletely, Control Plane creates an explicit
 editable expectation instead of inventing an observation. Fresh execution then
 captures exactly the probes required by that reviewed assertion.
+
+### Memory assertions and correct-use judging
+
+`MemoryAttributionAssertionSpec` is the portable deterministic check for
+runtime-proven memory structure. It requires complete bounded attribution and
+can constrain admitted-item and proven provider-exposure counts independently
+within the fixed capture envelope (0–1,000 admitted items and 0–100 exposure
+records per trial).
+Truncated, unavailable, contradictory, or indeterminate exposure evidence is
+`unavailable`; it is never converted into a failed count comparison. Session
+aliases are public-safe correlation aids, not stable case or expectation
+identity, and the assertion never matches on them.
+
+```python
+from cayu import MemoryAttributionAssertionSpec
+
+memory_reached_provider = MemoryAttributionAssertionSpec(
+    id="memory-reached-provider",
+    min_admitted_items=1,
+    min_provider_exposures=1,
+)
+```
+
+Ordinary users do not need this Python form. In **Evals → New evaluation →
+Evaluate memory**, choose **Require memory exposure** to add the same structural
+contract. When promoting a completed production session, quick-add freezes only
+complete observed counts; otherwise it creates no false observed claim.
+
+Structural exposure does not prove correct use. Choose **Add reference-backed
+judge**, replace the deliberately blank fact with trusted reference truth, and
+review the `memory-use` rubric. Its three default criteria score agreement with
+the reference, relevant grounded use, and avoidance of unsupported
+memory-derived claims through the existing structured-judge system. The target
+must publish a trusted judge profile that permits final-output and
+public-reference evidence; the browser cannot create provider, credential,
+privacy-policy, or private-reference authority. A judge score still does not
+prove that memory caused the result—the same answer may have been possible
+without memory.
+
+Results therefore present three explicit claims:
+
+- **Structural** shows admission, provider exposure, completeness, limitations,
+  and bounded source-tree evidence.
+- **Semantic use** shows only an admitted `memory-use` structured judgment bound
+  to trusted reference truth.
+- **Causal contribution** remains not established for an ordinary run and
+  requires a paired memory intervention experiment.
+
+This separation applies equally to a newly authored fresh session and a
+promoted production session. Tool-call, tool-argument/result, process, output,
+and memory assertions can be combined in one case when the expected behavior
+includes searching the right source, calling the right tools, and reaching the
+right end state.
 
 ### Portable lifecycle, approval, and child assertions
 
@@ -950,7 +1005,7 @@ Portable assertions consume one immutable `AssertionEvidenceView`, produced by
 `project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
 contains only terminal statuses, bounded redacted final output, requested tool
 names and counts, model-step/token counts, and optional currency-local cost
-totals. Schema version 2 also carries one versioned
+totals. Schema version 5 also carries one versioned
 `EvalMemoryAttributionEvidenceV1` section. That section retains bounded runtime
 receipt/exposure attribution, exact lifecycle states and fingerprints,
 deterministic root/descendant tree paths, optional HMAC session aliases, and
@@ -1049,7 +1104,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-9 `PublishedEvalRun` containing
+produces a content-addressed schema-version-10 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
@@ -1346,6 +1401,15 @@ distributions, canonical accounting aggregates, gates, and recommendation
 without launching another trial; consumers that require complete retained
 authority use JSON.
 
+The **Paired memory report** action on the Evals page exposes the same protected
+boundary without application code. Select an exact schema-version-1 campaign
+request JSON, review its experiment/case/variant/repetition dimensions, and
+build the report against stored results. The browser shows the selected variant
+and every disposition's comparable, incomparable, and unavailable pair counts,
+then downloads the validated report JSON or server-rendered HTML. This action
+validates and reports an already defined campaign; it does not silently invent
+variants, interventions, reference truth, or missing trials.
+
 ## Capturing terminal session evidence
 
 The built-in in-memory, SQLite, and PostgreSQL session stores expose
@@ -1469,7 +1533,7 @@ with stable `SessionPromotionErrorCode` values. These rules affect automatic
 portable promotion only: normal Cayu sessions and direct Python evals retain all
 of those capabilities, while runtime tool calls, artifacts, and admitted child
 agents remain eligible. Tool calls and child status remain available as portable
-assertion evidence; corpus v3 does not silently infer replay input or an artifact
+assertion evidence; corpus v4 does not silently infer replay input or an artifact
 assertion from uncaptured state. Caller-driven approval, resume, queued-input, and
 later-interaction phases are checked recursively across every admitted descendant,
 not only on the root.
@@ -1491,7 +1555,7 @@ intentionally absent from serialized trajectories, so a detached or older trajec
 cannot guess which
 transcript messages were caller input; it fails closed as
 `input_evidence_unavailable` instead. Multiple text parts reject because their
-provider-specific boundaries cannot be represented exactly by corpus v3's single
+provider-specific boundaries cannot be represented exactly by corpus v4's single
 text field. The resulting sanitized input and redaction fact carry one exact content
 revision.
 
@@ -2451,15 +2515,16 @@ payloads after each trial result is built. When enabled, every trial retains its
 trajectory. Trajectories are **excluded from saved `EvalRun` JSON** and remain separate,
 opt-in exports.
 
-Saved `EvalRun` baselines use schema version `9`. Version 9 preserves the complete
+Saved `EvalRun` baselines use schema version `11`. Version 11 preserves the complete
 ordered trial graph, explicit outcome/null-score contract, conclusive-evidence
 state, the exact portable assertion revision behind each result, and the optional
 portable execution contract a trusted executor fixes before dispatch. It retains
 identity-free aggregate usage for every complete trial, canonical large counters,
 durable-JSON validation, and the structural workspace/artifact assertion result
-contract. A contracted run must retain exactly the requested number of trials for
-every case.
-`load_eval_run(...)` rejects missing versions and versions 1–8;
+contract, including the exact memory-attribution observation used by a portable
+memory assertion. A contracted run must retain exactly the requested number of
+trials for every case.
+`load_eval_run(...)` rejects missing versions and versions 1–10;
 regenerate those baselines with the current Cayu version. No compatibility loader
 or migration is used.
 

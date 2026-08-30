@@ -185,6 +185,30 @@ This is a pinned modern HTTP core, not a claim of complete MCP 2026 support.
 Automatic fallback, modern stdio, response caching, `subscriptions/listen`, and
 MRTR / `input_required` remain separate work.
 
+### Evals present memory structure, correct use, and causal evidence separately
+
+Portable suites can now assert bounded ranges for memory items admitted to a
+trial and provider exposures proven by its runtime-native attribution evidence.
+Only complete, determinate evidence is scoreable; unavailable, truncated,
+contradictory, changed, or indeterminate attribution remains unavailable rather
+than becoming a false failure. The Control Plane can add this structural check
+directly, add a reference-backed structured-judge template for semantic memory
+use, and display both layers without implying that exposure proves correct use.
+
+Fresh and captured result views now expose bounded memory sources, lifecycle
+states, limitations, exact admitted-item and proven-provider-exposure counts,
+and the matching published assertion detail. Operators can also upload an exact
+stored `MemoryExperimentReportRequest`, validate it server-side against its
+referenced results, inspect causal pair coverage and dispositions, and download
+the validated report JSON or standalone HTML report. This action reports an
+already defined repeated campaign; it does not invent candidates or execute
+trials.
+
+The portable corpus schema advances to version 4, the run schema to version 11,
+and the published-result schema to version 10. The server/dashboard contract
+advances from version 39 to version 40. Upgrade independently deployed servers,
+generated clients, and dashboards together.
+
 ### Evals separate per-run concurrency from shared runtime capacity
 
 Evaluation targets and durable run records no longer impose a universal

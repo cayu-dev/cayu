@@ -39,6 +39,7 @@ import {
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
 import {
+  newMemoryUseJudgeAssertion,
   newStructuredJudgeAssertion,
   structuredAssertionFromReviewedSuite,
 } from "@/lib/eval-judge-authoring"
@@ -61,7 +62,7 @@ import {
   evalTargetCatalogMayBeStale,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
-import type { PromotionAssertion } from "@/lib/evaluation-promotion"
+import { createPromotionAssertion, type PromotionAssertion } from "@/lib/evaluation-promotion"
 import type {
   EvalCaseDraftV2,
   EvalScenarioDraftV2,
@@ -139,6 +140,29 @@ export function EvalSuiteAuthoringAction({
   const defaultJudgeProfile = independentJudgeProfile ?? sameModelJudgeProfile
   const defaultJudgeIsSameModel =
     independentJudgeProfile === undefined && sameModelJudgeProfile !== undefined
+  const memoryJudgeProfiles = target?.judge_profiles?.filter(
+    (profile) =>
+      profile.allowed_evidence.includes("final_output") &&
+      profile.allowed_evidence.includes("public_reference"),
+  )
+  const independentMemoryJudgeProfile = memoryJudgeProfiles?.find(
+    (profile) =>
+      target?.judge_profile_routes?.find(
+        (route) =>
+          route.judge_profile_key === profile.key &&
+          route.judge_profile_revision === profile.revision,
+      )?.candidate_route_relation === "independent_model",
+  )
+  const sameModelMemoryJudgeProfile = memoryJudgeProfiles?.find(
+    (profile) =>
+      target?.judge_profile_routes?.find(
+        (route) =>
+          route.judge_profile_key === profile.key &&
+          route.judge_profile_revision === profile.revision,
+      )?.candidate_route_relation === "same_model" &&
+      profile.same_model_use === "allowed_and_labeled",
+  )
+  const defaultMemoryJudgeProfile = independentMemoryJudgeProfile ?? sameModelMemoryJudgeProfile
   const activeCaseIndex = Math.max(0, caseRowKeys.indexOf(activeCaseKey))
   const activeCase = draft.cases[activeCaseIndex] ?? draft.cases[0]
   const activeCaseRowKey = caseRowKeys[activeCaseIndex]
@@ -172,6 +196,17 @@ export function EvalSuiteAuthoringAction({
     activeCase?.assertions.filter(
       (assertion): assertion is PromotionAssertion => assertion.kind !== "structured_model_judge",
     ) ?? []
+  const hasMemoryStructuralAssertion = activeDeterministicAssertions.some(
+    (assertion) => assertion.kind === "memory_attribution",
+  )
+  const memorySemanticJudge = activeStructuredJudges.find(
+    (assertion) => assertion.rubric.id === "memory-use",
+  )
+  const hasMemorySemanticJudge = memorySemanticJudge !== undefined
+  const memorySemanticJudgeNeedsReference =
+    memorySemanticJudge?.reference?.kind === "public_reference" &&
+    memorySemanticJudge.reference.expected_answer == null &&
+    (memorySemanticJudge.reference.expected_facts ?? []).every((fact) => fact.trim().length === 0)
   const reviewedActiveCase =
     suitePreview && previewCurrent
       ? suitePreview.suite.cases.find((item) => item.id === activeCase?.id)
@@ -1059,6 +1094,99 @@ export function EvalSuiteAuthoringAction({
                         })
                       }
                     />
+
+                    <div
+                      className="space-y-3 rounded-lg border border-border bg-muted/20 p-3"
+                      data-testid="eval-memory-authoring"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="max-w-3xl">
+                          <div className="text-sm font-medium">Evaluate memory</div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            Structural evidence proves admission and provider exposure. A trusted
+                            reference lets the judge score correct use. Neither alone proves that
+                            memory caused the result; use a paired memory experiment for that.
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={
+                              authoringLocked ||
+                              hasMemoryStructuralAssertion ||
+                              activeCase.assertions.length >= 64
+                            }
+                            onClick={() =>
+                              editDraft((next) => {
+                                const current = next.cases[activeCaseIndex]
+                                if (current) {
+                                  current.assertions.push(
+                                    createPromotionAssertion(
+                                      "memory_attribution",
+                                      current.assertions.filter(
+                                        (item): item is PromotionAssertion =>
+                                          item.kind !== "structured_model_judge",
+                                      ),
+                                    ),
+                                  )
+                                }
+                              })
+                            }
+                          >
+                            <Plus />
+                            {hasMemoryStructuralAssertion
+                              ? "Memory exposure added"
+                              : "Require memory exposure"}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={
+                              authoringLocked ||
+                              defaultMemoryJudgeProfile === undefined ||
+                              hasMemorySemanticJudge ||
+                              activeCase.assertions.length >= 64
+                            }
+                            onClick={() => {
+                              const profile = defaultMemoryJudgeProfile
+                              if (!profile) return
+                              editDraft((next) => {
+                                const current = next.cases[activeCaseIndex]
+                                if (current) {
+                                  current.assertions.push(
+                                    newMemoryUseJudgeAssertion(
+                                      profile,
+                                      current.assertions.map((item) => item.id),
+                                    ),
+                                  )
+                                }
+                              })
+                            }}
+                          >
+                            <Plus />
+                            {hasMemorySemanticJudge
+                              ? "Memory judge added"
+                              : "Add reference-backed judge"}
+                          </Button>
+                        </div>
+                      </div>
+                      {defaultMemoryJudgeProfile === undefined && (
+                        <div className="text-xs text-muted-foreground">
+                          This target does not publish a trusted judge profile that permits final
+                          output and public-reference evidence, so semantic memory scoring is
+                          unavailable. Structural checks still work.
+                        </div>
+                      )}
+                      {memorySemanticJudgeNeedsReference && (
+                        <div className="text-xs text-amber-700 dark:text-amber-300">
+                          Replace the blank expected fact in the memory-use judge with trusted
+                          reference truth before checking or saving the suite.
+                        </div>
+                      )}
+                    </div>
 
                     <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed border-border p-3">
                       <div>

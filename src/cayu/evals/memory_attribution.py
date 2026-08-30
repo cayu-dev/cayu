@@ -604,15 +604,16 @@ class EvalMemoryAttributionEvidenceV1(BaseModel):
         )
 
 
-def eval_memory_attribution_summary(evidence: EvalMemoryAttributionEvidenceV1) -> str:
-    """Return the bounded classification used by public HTML report surfaces."""
-
+def eval_memory_attribution_limitations(
+    evidence: EvalMemoryAttributionEvidenceV1,
+) -> tuple[EvalMemoryEvidenceLimitation, ...]:
+    """Return the complete, deterministic limitation set across the source tree."""
     if type(evidence) is not EvalMemoryAttributionEvidenceV1:
         raise TypeError("evidence must be an exact EvalMemoryAttributionEvidenceV1.")
-    limitations = tuple(
+    return tuple(
         sorted(
             {
-                limitation.value
+                limitation
                 for limitation in (
                     *evidence.limitations,
                     *(
@@ -621,8 +622,40 @@ def eval_memory_attribution_summary(evidence: EvalMemoryAttributionEvidenceV1) -
                         for limitation in source.limitations
                     ),
                 )
-            }
+            },
+            key=str,
         )
+    )
+
+
+def eval_memory_attribution_counts(
+    evidence: EvalMemoryAttributionEvidenceV1,
+) -> tuple[int, int]:
+    """Return counts retained by the projection, which may be partial if incomplete."""
+
+    if type(evidence) is not EvalMemoryAttributionEvidenceV1:
+        raise TypeError("evidence must be an exact EvalMemoryAttributionEvidenceV1.")
+    admitted_items = sum(
+        receipt.admitted_count
+        for source in evidence.sources
+        if source.attribution is not None
+        for receipt in source.attribution.receipts
+    )
+    provider_exposures = sum(
+        1
+        for source in evidence.sources
+        if source.attribution is not None
+        for exposure in source.attribution.exposures
+        if exposure.provider_exposure_proven
+    )
+    return admitted_items, provider_exposures
+
+
+def eval_memory_attribution_summary(evidence: EvalMemoryAttributionEvidenceV1) -> str:
+    """Return the bounded classification used by public HTML report surfaces."""
+
+    limitations = tuple(
+        limitation.value for limitation in eval_memory_attribution_limitations(evidence)
     )
     lifecycle_states = tuple(
         sorted(
@@ -638,6 +671,16 @@ def eval_memory_attribution_summary(evidence: EvalMemoryAttributionEvidenceV1) -
         f"{evidence.completeness.value} · {evidence.retained_source_count}/"
         f"{evidence.total_source_count} source(s) retained"
     )
+    if (
+        evidence.completeness is EvalMemoryEvidenceCompleteness.COMPLETE
+        and not evidence.has_indeterminate_exposure
+    ):
+        admitted_items, provider_exposures = eval_memory_attribution_counts(evidence)
+        summary += (
+            f" · {admitted_items} item(s) admitted · {provider_exposures} provider exposure(s)"
+        )
+    else:
+        summary += " · admission/exposure counts unavailable"
     if evidence.proves_empty:
         summary += " · proven empty"
     if evidence.has_indeterminate_exposure:
@@ -759,7 +802,9 @@ __all__ = [
     "EvalMemorySourceAliasV1",
     "EvalMemorySourceReferenceV1",
     "eval_memory_attribution_bounds_for_trial_count",
+    "eval_memory_attribution_counts",
     "eval_memory_attribution_fingerprint",
+    "eval_memory_attribution_limitations",
     "eval_memory_attribution_max_bytes_for_trial_count",
     "eval_memory_attribution_source_limit_for_trial_count",
     "eval_memory_attribution_summary",

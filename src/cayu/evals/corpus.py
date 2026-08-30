@@ -48,9 +48,13 @@ from cayu.evals.models import (
     EvalRunContractV2,
 )
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
+from cayu.memory_attribution import (
+    MEMORY_ATTRIBUTION_DEFAULT_MAX_EXPOSURES,
+    MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS,
+)
 from cayu.runtime.costs import PriceBook
 
-EVAL_CORPUS_SCHEMA_VERSION = 3
+EVAL_CORPUS_SCHEMA_VERSION = 4
 EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION = 1
 PRICING_PROFILE_IDENTITY_SCHEMA_VERSION = 1
 PRICING_PROFILE_SEMANTICS_VERSION = 1
@@ -101,6 +105,8 @@ EVIDENCE_MAX_FINAL_OUTPUT_CHARS = 65_536
 EVIDENCE_MAX_CHILD_SESSIONS = 500
 EVIDENCE_MAX_TOOL_CALLS = 4_096
 EVIDENCE_MAX_MODEL_STEPS = 4_096
+EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS = MEMORY_ATTRIBUTION_DEFAULT_MAX_ITEMS
+EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES = MEMORY_ATTRIBUTION_DEFAULT_MAX_EXPOSURES
 # Eval corpora cross browser and other IEEE-754 JSON boundaries. Keep every
 # numeric token counter exactly representable; larger durable usage is reported
 # as limit-exceeded evidence instead of being silently rounded in transit.
@@ -166,6 +172,19 @@ class _SchemaV3PortableModel(_PortableModel):
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
             raise ValueError("schema_version must be the integer 3.")
+        return value
+
+
+class _SchemaV4PortableModel(_PortableModel):
+    """Portable schema root whose v4 discriminator never coerces JSON types."""
+
+    schema_version: Literal[4] = 4
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 4.")
         return value
 
 
@@ -770,6 +789,50 @@ class ArtifactAssertionSpec(_AssertionSpecBase):
         return self
 
 
+class MemoryAttributionAssertionSpec(_AssertionSpecBase):
+    """Require complete bounded memory admission and provider-exposure evidence."""
+
+    kind: Literal["memory_attribution"] = "memory_attribution"
+    min_admitted_items: StrictInt = Field(
+        default=1,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS,
+    )
+    max_admitted_items: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_ADMITTED_ITEMS,
+    )
+    min_provider_exposures: StrictInt = Field(
+        default=1,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES,
+    )
+    max_provider_exposures: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_MEMORY_ATTRIBUTION_MAX_PROVIDER_EXPOSURES,
+    )
+
+    @model_validator(mode="after")
+    def validate_count_ranges(self) -> MemoryAttributionAssertionSpec:
+        if (
+            self.max_admitted_items is not None
+            and self.max_admitted_items < self.min_admitted_items
+        ):
+            raise ValueError(
+                "max_admitted_items must be greater than or equal to min_admitted_items."
+            )
+        if (
+            self.max_provider_exposures is not None
+            and self.max_provider_exposures < self.min_provider_exposures
+        ):
+            raise ValueError(
+                "max_provider_exposures must be greater than or equal to min_provider_exposures."
+            )
+        return self
+
+
 class MaxToolCallsAssertionSpec(_AssertionSpecBase):
     kind: Literal["max_tool_calls"] = "max_tool_calls"
     maximum: StrictInt = Field(ge=0, le=EVIDENCE_MAX_TOOL_CALLS)
@@ -1298,6 +1361,7 @@ AssertionSpec: TypeAlias = Annotated[
     | ProcessEventsInOrderAssertionSpec
     | WorkspaceFileAssertionSpec
     | ArtifactAssertionSpec
+    | MemoryAttributionAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -1321,6 +1385,7 @@ _ASSERTION_SPEC_TYPES = (
     ProcessEventsInOrderAssertionSpec,
     WorkspaceFileAssertionSpec,
     ArtifactAssertionSpec,
+    MemoryAttributionAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxModelStepsAssertionSpec,
     UsageRecordedAssertionSpec,
@@ -1867,10 +1932,10 @@ class EvalCaseSpec(_PortableModel):
         return cls(revision=_content_revision(document, "eval case spec"), **document)
 
 
-class EvalCorpusDocument(_SchemaV3PortableModel):
+class EvalCorpusDocument(_SchemaV4PortableModel):
     """One canonical, authority-free corpus for exactly one trusted target key."""
 
-    schema_version: Literal[3] = EVAL_CORPUS_SCHEMA_VERSION
+    schema_version: Literal[4] = EVAL_CORPUS_SCHEMA_VERSION
     revision: StrictStr
     target_key: StrictStr
     evidence_policy: EvaluationEvidencePolicySpec
@@ -2117,7 +2182,7 @@ def _eval_run_contract_for_validated_corpus(
 
 
 def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
-    """Return deterministic, human-readable corpus v3 JSON."""
+    """Return deterministic, human-readable corpus v4 JSON."""
 
     _, document = _validated_model_document(
         corpus,
@@ -2136,7 +2201,7 @@ def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
 
 
 def eval_corpus_from_json(source: str) -> EvalCorpusDocument:
-    """Load one bounded corpus v3 JSON document from text."""
+    """Load one bounded corpus v4 JSON document from text."""
 
     if type(source) is not str:
         raise TypeError("eval_corpus_from_json requires text.")

@@ -113,6 +113,8 @@ import type {
   ListSessionsApiSessionsGetData,
   ListSessionsApiSessionsGetResponse,
   ListTasksApiTasksGetData,
+  MemoryExperimentReport,
+  MemoryExperimentReportRequest,
   OperationalSnapshotRequest,
   PendingKnowledgeDetailResponse,
   PendingKnowledgeListResponse,
@@ -154,6 +156,8 @@ export function isApiPayloadTooLarge(error: unknown): error is ApiClientError {
 }
 
 export type ServerContract = GetContractApiContractGetResponse
+export type EvalMemoryExperimentReport = MemoryExperimentReport
+export type EvalMemoryExperimentReportRequest = MemoryExperimentReportRequest
 export type AgentSummary = ApiAgentSummary
 export type ToolSummary = ApiToolSummary
 export type AgentsPage = AgentsResponse
@@ -922,6 +926,35 @@ export async function compareEvalResults(
     body: JSON.stringify(body),
     signal,
   })
+}
+
+export async function buildMemoryExperimentReport(
+  request: EvalMemoryExperimentReportRequest,
+  signal?: AbortSignal,
+): Promise<EvalMemoryExperimentReport> {
+  return requestJson<EvalMemoryExperimentReport>("/evals/memory-reports", {
+    method: "POST",
+    body: JSON.stringify(request),
+    signal,
+  })
+}
+
+export async function downloadMemoryExperimentReportHtml(
+  request: EvalMemoryExperimentReportRequest,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  const response = await requestResponse("/evals/memory-reports/report.html", {
+    method: "POST",
+    body: JSON.stringify(request),
+    signal,
+  })
+  return {
+    blob: await response.blob(),
+    filename: responseDownloadFilename(
+      response.headers.get("content-disposition"),
+      "cayu-memory-experiment-report.html",
+    ),
+  }
 }
 
 export async function downloadEvalResultJson(

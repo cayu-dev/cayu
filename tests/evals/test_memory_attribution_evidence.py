@@ -14,6 +14,12 @@ from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_runtime_source,
     eval_memory_attribution_evidence_from_trajectory,
 )
+from cayu.evals.corpus import (
+    EvaluationEvidencePolicySpec,
+    MemoryAttributionAssertionSpec,
+    _content_revision,
+)
+from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_MAX_RETAINED_SOURCES_PER_RUN,
     EVAL_MEMORY_ATTRIBUTION_PROJECTION_BUDGET_BYTES,
@@ -26,6 +32,7 @@ from cayu.evals.memory_attribution import (
     EvalMemoryEvidenceLimitation,
     EvalMemorySourceReferenceV1,
     eval_memory_attribution_bounds_for_trial_count,
+    eval_memory_attribution_counts,
     eval_memory_attribution_fingerprint,
     eval_memory_attribution_max_bytes_for_trial_count,
     eval_memory_attribution_source_limit_for_trial_count,
@@ -33,7 +40,8 @@ from cayu.evals.memory_attribution import (
     eval_memory_source_alias,
     standard_eval_memory_attribution_bounds,
 )
-from cayu.evals.models import Trajectory
+from cayu.evals.models import EvalOutcome, Trajectory
+from cayu.evals.portable_evaluation import evaluate_assertion_spec
 from cayu.memory_attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
@@ -44,6 +52,7 @@ from cayu.memory_attribution import (
     MemoryExposureTransitionAttribution,
 )
 from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
+from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import SessionStatus
 from cayu.runtime.usage import SessionUsageSummary
 
@@ -173,6 +182,22 @@ def _runtime_source_evidence(
     )
 
 
+def _assertion_evidence(
+    memory_attribution: EvalMemoryAttributionEvidenceV1,
+) -> AssertionEvidenceView:
+    base = project_assertion_evidence_view(
+        CayuApp(enable_logging=False),
+        Trajectory(),
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    ).model_dump(mode="json")
+    base["memory_attribution"] = memory_attribution.model_dump(mode="json")
+    base["revision"] = _content_revision(
+        {key: value for key, value in base.items() if key != "revision"},
+        "assertion evidence",
+    )
+    return AssertionEvidenceView.model_validate(base)
+
+
 @pytest.mark.parametrize(
     "state",
     [
@@ -211,9 +236,106 @@ def test_eval_memory_attribution_summary_retains_bounded_lifecycle_evidence() ->
     summary = eval_memory_attribution_summary(evidence)
 
     assert summary.startswith("complete · 1/1 source(s) retained")
+    assert "admission/exposure counts unavailable" in summary
+    assert "item(s) admitted" not in summary
+    assert "provider exposure(s)" not in summary
     assert "indeterminate exposure" in summary
     assert "limitations none" in summary
     assert "lifecycle indeterminate" in summary
+
+
+def test_eval_memory_attribution_summary_never_presents_incomplete_counts_as_conclusive() -> None:
+    evidence = EvalMemoryAttributionEvidenceV1.unavailable()
+
+    summary = eval_memory_attribution_summary(evidence)
+
+    assert summary.startswith("unavailable · 0/0 source(s) retained")
+    assert "admission/exposure counts unavailable" in summary
+    assert "item(s) admitted" not in summary
+    assert "provider exposure(s)" not in summary
+
+
+def test_memory_attribution_assertion_uses_only_complete_structural_counts() -> None:
+    evidence = _runtime_source_evidence(
+        terminal_status="completed",
+        attribution=_attribution(ContextExposureState.ACKNOWLEDGED),
+    )
+    assert eval_memory_attribution_counts(evidence) == (0, 1)
+
+    passed = evaluate_assertion_spec(
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_admitted_items=0,
+            min_provider_exposures=1,
+        ),
+        _assertion_evidence(evidence),
+    )
+    failed = evaluate_assertion_spec(
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_admitted_items=0,
+            min_provider_exposures=0,
+            max_provider_exposures=0,
+        ),
+        _assertion_evidence(evidence),
+    )
+
+    assert passed.outcome is EvalOutcome.PASSED
+    assert passed.metadata["admitted_item_count"] == 0
+    assert passed.metadata["provider_exposure_count"] == 1
+    assert failed.outcome is EvalOutcome.FAILED
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        _runtime_source_evidence(
+            terminal_status="completed",
+            attribution=_attribution(ContextExposureState.INDETERMINATE),
+        ),
+        EvalMemoryAttributionEvidenceV1.unavailable(),
+    ],
+)
+def test_memory_attribution_assertion_never_scores_inconclusive_evidence(
+    evidence: EvalMemoryAttributionEvidenceV1,
+) -> None:
+    result = evaluate_assertion_spec(
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_admitted_items=0,
+            min_provider_exposures=0,
+        ),
+        _assertion_evidence(evidence),
+    )
+
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert "admitted_item_count" not in result.metadata
+    assert "provider_exposure_count" not in result.metadata
+
+
+def test_memory_attribution_assertion_rejects_inverted_ranges() -> None:
+    with pytest.raises(ValidationError, match="max_admitted_items"):
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_admitted_items=2,
+            max_admitted_items=1,
+        )
+    with pytest.raises(ValidationError, match="max_provider_exposures"):
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_provider_exposures=2,
+            max_provider_exposures=1,
+        )
+    with pytest.raises(ValidationError, match="less than or equal to 1000"):
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_admitted_items=1_001,
+        )
+    with pytest.raises(ValidationError, match="less than or equal to 100"):
+        MemoryAttributionAssertionSpec(
+            id="memory-structure",
+            min_provider_exposures=101,
+        )
 
 
 def test_eval_memory_evidence_distinguishes_proven_empty_from_unavailable_states() -> None:
