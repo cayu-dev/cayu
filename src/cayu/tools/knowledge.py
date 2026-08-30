@@ -2623,6 +2623,7 @@ def _search_query_payload(query: KnowledgeQuery) -> dict[str, Any]:
             else None
         ),
         "aspects": list(query.aspects),
+        "aspect_groups": [list(group) for group in query.aspect_groups],
         "impact_targets": list(query.impact_targets),
         "source_type": query.source_type,
         "source_id": query.source_id,

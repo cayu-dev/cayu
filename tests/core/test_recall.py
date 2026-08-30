@@ -11,6 +11,12 @@ import pytest
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.core.messages import Message
+from cayu.embeddings import (
+    TextEmbedding,
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    TextEmbeddingResult,
+)
 from cayu.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
@@ -45,6 +51,7 @@ from cayu.runtime.sessions import (
     TranscriptSearchQuery,
 )
 from cayu.storage.memory import (
+    InMemoryEmbeddingKnowledgeStore,
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
@@ -207,6 +214,13 @@ def test_recall_situation_is_bounded_defensive_and_resolves_short_followups() ->
     default_situation = RecallSituation(query="bounded")
     with pytest.raises(TypeError, match="cannot be mutated"):
         default_situation.continuations["new"] = "cursor"  # type: ignore[index]
+    with pytest.raises(ValueError, match="cannot contain more than 6 groups"):
+        RecallSituation(
+            query="bounded",
+            knowledge_aspect_groups=tuple((f"aspect:{index}",) for index in range(7)),
+        )
+    with pytest.raises(ValueError, match="requires exact aspect groups"):
+        RecallSituation(query="bounded", knowledge_filter_only=True)
 
 
 def test_in_memory_transcript_search_is_cooperatively_cancellable() -> None:
@@ -918,6 +932,66 @@ def test_built_in_sources_fuse_exact_current_knowledge_and_transcript_evidence()
     ]
     assert result.sources[0].failure_code == "semantic_unsupported"
     assert result.truncated is True
+
+
+def test_knowledge_recall_runs_raw_semantic_text_with_exact_facet_fallback() -> None:
+    class RecordingEmbeddingProvider(TextEmbeddingProvider):
+        name = "recording-test"
+
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.calls.append(list(request.texts))
+            return TextEmbeddingResult(
+                model=request.model,
+                embeddings=[
+                    TextEmbedding(index=index, vector=[1.0])
+                    for index, _text in enumerate(request.texts)
+                ],
+            )
+
+    async def run() -> tuple[RecallSourceResult, RecallSourceResult, list[list[str]]]:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        facet = "scope:repository:cayu"
+        plain = InMemoryKnowledgeStore(access_scope=scope)
+        provider = RecordingEmbeddingProvider()
+        embedded = InMemoryEmbeddingKnowledgeStore(
+            access_scope=scope,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=1,
+        )
+        for store in (plain, embedded):
+            await store.create_entry(
+                KnowledgeEntry(
+                    id="facet-target",
+                    text="Exact facet target",
+                    namespace="project:cayu",
+                    aspects=[facet],
+                )
+            )
+        await embedded.process_embedding_changes("raw-semantic-index", "worker:test")
+        provider.calls.clear()
+        situation = _situation(
+            query="!!!",
+            knowledge_access_scope=scope,
+            knowledge_namespace="project:cayu",
+            knowledge_aspect_groups=((facet,),),
+        )
+        return (
+            await KnowledgeRecallSource(plain).retrieve(situation),
+            await KnowledgeRecallSource(embedded).retrieve(situation),
+            provider.calls,
+        )
+
+    plain_result, embedded_result, calls = asyncio.run(run())
+
+    assert [record.locator["entry_id"] for record in plain_result.records] == ["facet-target"]
+    assert plain_result.partial_reason == "semantic_unsupported"
+    assert [record.locator["entry_id"] for record in embedded_result.records] == ["facet-target"]
+    assert embedded_result.partial_reason is None
+    assert calls == [["!!!"]]
 
 
 def test_knowledge_recall_can_explain_supersession_and_unresolved_alternatives() -> None:

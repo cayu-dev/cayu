@@ -2434,7 +2434,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         revision_refs: tuple[KnowledgeRevisionRef, ...],
         *,
         through_change_sequence: int | None,
-        fts_query: str,
+        fts_query: str | None,
         none_fts_query: str | None,
         preview_terms: list[str],
     ) -> KnowledgeSearchResult:
@@ -2535,7 +2535,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
 
     def _count_exact_search_hits_unlocked(
         self,
-        fts_query: str,
+        fts_query: str | None,
         none_fts_query: str | None,
         where_sql: str,
         params: list[object],
@@ -2552,7 +2552,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
     def _search_exact_unique_rows_unlocked(
         self,
         *,
-        fts_query: str,
+        fts_query: str | None,
         none_fts_query: str | None,
         where_sql: str,
         params: list[object],
@@ -2626,7 +2626,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
 
     def _count_search_hits_unlocked(
         self,
-        fts_query: str,
+        fts_query: str | None,
         none_fts_query: str | None,
         where_sql: str,
         params: list[object],
@@ -2634,12 +2634,31 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         fts_table: str = _KNOWLEDGE_FTS_TABLE,
         temporary_fts: bool = False,
     ) -> int:
-        from_table = f"temp.{fts_table}" if temporary_fts else fts_table
         none_sql, none_params = _sqlite_knowledge_none_filter_sql(
             none_fts_query,
             fts_table=fts_table,
             temporary_fts=temporary_fts,
         )
+        if fts_query is None and not temporary_fts:
+            row = self._connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM cayu_knowledge_current_entries AS e
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM cayu_knowledge_chunks AS available_chunk
+                    WHERE available_chunk.entry_id = e.id
+                      AND available_chunk.entry_revision = e.revision
+                )
+                {none_sql}
+                {where_sql}
+                """,
+                [*none_params, *params],
+            ).fetchone()
+            return 0 if row is None else int(row[0])
+        from_table = f"temp.{fts_table}" if temporary_fts else fts_table
+        match_sql = "1 = 1" if fts_query is None else f"{fts_table} MATCH ?"
+        match_params: list[object] = [] if fts_query is None else [fts_query]
         row = self._connection.execute(
             f"""
             SELECT COUNT(DISTINCT e.id)
@@ -2650,18 +2669,18 @@ class SQLiteKnowledgeStore(KnowledgeStore):
              AND c.entry_revision = {fts_table}.entry_revision
             JOIN cayu_knowledge_current_entries AS e
                 ON e.id = c.entry_id AND e.revision = c.entry_revision
-            WHERE {fts_table} MATCH ?
+            WHERE {match_sql}
             {none_sql}
             {where_sql}
             """,
-            [fts_query, *none_params, *params],
+            [*match_params, *none_params, *params],
         ).fetchone()
         return 0 if row is None else int(row[0])
 
     def _search_unique_rows_unlocked(
         self,
         *,
-        fts_query: str,
+        fts_query: str | None,
         none_fts_query: str | None,
         where_sql: str,
         params: list[object],
@@ -2669,22 +2688,58 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         fts_table: str = _KNOWLEDGE_FTS_TABLE,
         temporary_fts: bool = False,
     ) -> list[sqlite3.Row]:
-        from_table = f"temp.{fts_table}" if temporary_fts else fts_table
         none_sql, none_params = _sqlite_knowledge_none_filter_sql(
             none_fts_query,
             fts_table=fts_table,
             temporary_fts=temporary_fts,
         )
+        if fts_query is None and not temporary_fts:
+            return list(
+                self._connection.execute(
+                    f"""
+                    SELECT
+                        e.id AS entry_id,
+                        (
+                            SELECT available_chunk.id
+                            FROM cayu_knowledge_chunks AS available_chunk
+                            WHERE available_chunk.entry_id = e.id
+                              AND available_chunk.entry_revision = e.revision
+                            ORDER BY available_chunk.chunk_index ASC,
+                                     available_chunk.id ASC
+                            LIMIT 1
+                        ) AS chunk_id,
+                        -1.0 AS fts_score
+                    FROM cayu_knowledge_current_entries AS e
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_chunks AS available_chunk
+                        WHERE available_chunk.entry_id = e.id
+                          AND available_chunk.entry_revision = e.revision
+                    )
+                    {none_sql}
+                    {where_sql}
+                    ORDER BY COALESCE(e.importance, 0.0) DESC,
+                             e.updated_at DESC,
+                             e.id ASC
+                    LIMIT ?
+                    """,
+                    [*none_params, *params, limit],
+                ).fetchall()
+            )
+        from_table = f"temp.{fts_table}" if temporary_fts else fts_table
         unique_rows: list[sqlite3.Row] = []
         seen_entry_ids: set[str] = set()
         offset = 0
         while len(unique_rows) < limit:
+            match_sql = "1 = 1" if fts_query is None else f"{fts_table} MATCH ?"
+            match_params: list[object] = [] if fts_query is None else [fts_query]
+            score_sql = "-1.0" if fts_query is None else f"bm25({fts_table})"
             rows = self._connection.execute(
                 f"""
                 SELECT
                     e.id AS entry_id,
                     c.id AS chunk_id,
-                    bm25({fts_table}) AS fts_score
+                    {score_sql} AS fts_score
                 FROM {from_table}
                 JOIN cayu_knowledge_chunks AS c
                   ON c.id = {fts_table}.chunk_id
@@ -2692,7 +2747,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                  AND c.entry_revision = {fts_table}.entry_revision
                 JOIN cayu_knowledge_current_entries AS e
                     ON e.id = c.entry_id AND e.revision = c.entry_revision
-                WHERE {fts_table} MATCH ?
+                WHERE {match_sql}
                 {none_sql}
                 {where_sql}
                 ORDER BY fts_score ASC,
@@ -2702,7 +2757,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                          c.chunk_index ASC
                 LIMIT ? OFFSET ?
                 """,
-                [fts_query, *none_params, *params, _SEARCH_PAGE_SIZE, offset],
+                [*match_params, *none_params, *params, _SEARCH_PAGE_SIZE, offset],
             ).fetchall()
             if not rows:
                 break
@@ -2738,7 +2793,12 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             chunk = chunks.get(str(row["chunk_id"]))
             if entry is None or chunk is None:
                 continue
-            reason, preview_text = _preview_for_match(entry, chunk, terms)
+            filter_only = not terms
+            reason, preview_text = (
+                ("exact aspect filter", chunk.text)
+                if filter_only
+                else _preview_for_match(entry, chunk, terms)
+            )
             preview_bytes = len(preview_text.encode("utf-8"))
             preview = _truncate_text_to_bytes(preview_text, remaining)
             if not preview:
@@ -2754,7 +2814,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     entry=entry,
                     chunk=chunk,
                     score=-float(row["fts_score"]),
-                    score_kind="sqlite_fts5_bm25",
+                    score_kind="exact_metadata" if filter_only else "sqlite_fts5_bm25",
                     rank=len(hits) + 1,
                     reason=reason,
                     text_preview=preview,
@@ -4757,6 +4817,7 @@ def _knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
         statuses=query.statuses,
         visibilities=query.visibilities,
         aspects=query.aspects,
+        aspect_groups=query.aspect_groups,
         impact_targets=query.impact_targets,
         source_type=query.source_type,
         source_id=query.source_id,
@@ -4772,6 +4833,7 @@ def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[obj
         statuses=query.statuses,
         visibilities=query.visibilities,
         aspects=query.aspects,
+        aspect_groups=[],
         impact_targets=query.impact_targets,
         source_type=query.source_type,
         source_id=query.source_id,
@@ -4841,6 +4903,7 @@ def _knowledge_metadata_filter_sql(
     statuses: list[KnowledgeStatus],
     visibilities: list[KnowledgeVisibility] | None,
     aspects: list[str],
+    aspect_groups: list[list[str]],
     impact_targets: list[str],
     source_type: str | None,
     source_id: str | None,
@@ -4900,6 +4963,20 @@ def _knowledge_metadata_filter_sql(
             """
         )
         params.extend(aspects)
+    for group in aspect_groups:
+        placeholders = ", ".join("?" for _ in group)
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_aspects AS grouped_aspect
+                WHERE grouped_aspect.entry_id = e.id
+                  AND grouped_aspect.entry_revision = e.revision
+                  AND grouped_aspect.aspect IN ({placeholders})
+            )
+            """
+        )
+        params.extend(group)
     if impact_targets:
         placeholders = ", ".join("?" for _ in impact_targets)
         clauses.append(
@@ -4922,7 +4999,7 @@ def _knowledge_metadata_filter_sql(
     return " AND " + " AND ".join(clauses), params
 
 
-def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
+def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str | None, list[str]]:
     any_terms = _dedupe_search_tokens(
         [
             *_expand_search_tokens(_tokenize_search_text(query.text or "")),
@@ -4951,7 +5028,7 @@ def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
             "(" + " OR ".join(_sqlite_fts_quote(phrase) for phrase in phrases) + ")"
         )
     if not positive_parts:
-        raise ValueError("Knowledge query requires positive search terms.")
+        return None, []
     fts_query = " AND ".join(positive_parts)
     preview_terms = _dedupe_search_tokens(
         [

@@ -72,6 +72,12 @@ MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES = 16_384
 MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS = 2**31 - 1
 MAX_KNOWLEDGE_INDEX_READINESS_LIMIT = 1_000
 MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT = 10_000
+MAX_KNOWLEDGE_QUERY_ASPECT_GROUPS = 6
+MAX_KNOWLEDGE_QUERY_ASPECTS_PER_GROUP = 128
+MAX_KNOWLEDGE_QUERY_GROUPED_ASPECTS = (
+    MAX_KNOWLEDGE_QUERY_ASPECT_GROUPS * MAX_KNOWLEDGE_QUERY_ASPECTS_PER_GROUP
+)
+MAX_KNOWLEDGE_QUERY_GROUPED_ASPECT_BYTES = 128_000
 _MAX_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_BYTES = 2_048
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -2516,6 +2522,7 @@ class KnowledgeQuery(BaseModel):
     statuses: list[KnowledgeStatus] = Field(default_factory=lambda: [KnowledgeStatus.ACTIVE])
     visibilities: list[KnowledgeVisibility] | None = None
     aspects: list[str] = Field(default_factory=list)
+    aspect_groups: list[list[str]] = Field(default_factory=list)
     impact_targets: list[str] = Field(default_factory=list)
     source_type: str | None = None
     source_id: str | None = None
@@ -2582,6 +2589,61 @@ class KnowledgeQuery(BaseModel):
             result.append(require_clean_nonblank(item, f"{info.field_name}[{index}]"))
         return _dedupe_strings(result)
 
+    @field_validator("aspect_groups", mode="before")
+    @classmethod
+    def copy_aspect_groups(cls, value) -> list[list[str]]:
+        if value is None:
+            return []
+        copied = copy_json_value(value, "aspect_groups")
+        if type(copied) is not list:
+            raise ValueError("`aspect_groups` must be a list.")
+        if len(copied) > MAX_KNOWLEDGE_QUERY_ASPECT_GROUPS:
+            raise ValueError(
+                "`aspect_groups` cannot contain more than "
+                f"{MAX_KNOWLEDGE_QUERY_ASPECT_GROUPS} groups."
+            )
+        groups: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        total_values = 0
+        total_bytes = 0
+        for group_index, group in enumerate(copied):
+            if type(group) is not list or not group:
+                raise ValueError(f"`aspect_groups[{group_index}]` must be a non-empty list.")
+            if len(group) > MAX_KNOWLEDGE_QUERY_ASPECTS_PER_GROUP:
+                raise ValueError(
+                    f"`aspect_groups[{group_index}]` cannot contain more than "
+                    f"{MAX_KNOWLEDGE_QUERY_ASPECTS_PER_GROUP} values."
+                )
+            values: list[str] = []
+            for value_index, item in enumerate(group):
+                if type(item) is not str:
+                    raise ValueError(
+                        f"`aspect_groups[{group_index}][{value_index}]` must be a string."
+                    )
+                normalized_item = require_clean_nonblank(
+                    item,
+                    f"aspect_groups[{group_index}][{value_index}]",
+                )
+                total_bytes += len(normalized_item.encode("utf-8"))
+                values.append(normalized_item)
+            normalized = tuple(_dedupe_strings(values))
+            if normalized in seen:
+                raise ValueError("`aspect_groups` cannot contain duplicate groups.")
+            seen.add(normalized)
+            groups.append(list(normalized))
+            total_values += len(normalized)
+        if total_values > MAX_KNOWLEDGE_QUERY_GROUPED_ASPECTS:
+            raise ValueError(
+                "`aspect_groups` cannot contain more than "
+                f"{MAX_KNOWLEDGE_QUERY_GROUPED_ASPECTS} distinct values."
+            )
+        if total_bytes > MAX_KNOWLEDGE_QUERY_GROUPED_ASPECT_BYTES:
+            raise ValueError(
+                "`aspect_groups` cannot exceed "
+                f"{MAX_KNOWLEDGE_QUERY_GROUPED_ASPECT_BYTES} UTF-8 bytes."
+            )
+        return groups
+
     @field_validator("limit", "max_bytes")
     @classmethod
     def validate_positive_int(cls, value: int, info) -> int:
@@ -2614,9 +2676,20 @@ class KnowledgeQuery(BaseModel):
     @model_validator(mode="after")
     def validate_has_positive_search_terms(self) -> KnowledgeQuery:
         terms = _knowledge_query_terms(self)
-        if _query_terms_have_positive_terms(terms):
+        has_raw_semantic_text = self.mode is KnowledgeSearchMode.SEMANTIC and self.text is not None
+        if (
+            _query_terms_have_positive_terms(terms)
+            or has_raw_semantic_text
+            or (
+                self.aspect_groups
+                and self.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}
+            )
+        ):
             return self
-        raise ValueError("Knowledge query requires `text`, `any_terms`, `all_terms`, or `phrases`.")
+        raise ValueError(
+            "Knowledge query requires positive search terms, raw semantic text, "
+            "or exact aspect groups for auto/keyword search."
+        )
 
 
 class KnowledgeListQuery(BaseModel):
@@ -6232,7 +6305,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if _entry_matches_none_terms(entry, chunks, terms):
                 continue
             score, chunk, reason, preview_text = _score_entry(entry, chunks, knowledge_query)
-            if score <= 0:
+            if not _query_terms_have_positive_terms(terms):
+                chunk = chunks[0] if chunks else None
+                score = 1.0
+                reason = "exact aspect filter"
+                preview_text = entry.text if chunk is None else chunk.text
+            elif score <= 0:
                 continue
             scored.append((score, entry, chunk, reason, preview_text))
         scored.sort(
@@ -6246,7 +6324,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         return _keyword_search_result_from_scored(
             scored,
             knowledge_query,
-            score_kind="inmemory_keyword",
+            score_kind=(
+                "inmemory_keyword" if _query_terms_have_positive_terms(terms) else "exact_metadata"
+            ),
         )
 
     async def list_entries(
@@ -6741,7 +6821,11 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         knowledge_sequence: int | None,
         index_readiness_sequence: int | None,
     ) -> KnowledgeSearchResult:
-        if knowledge_query.mode is KnowledgeSearchMode.KEYWORD:
+        terms = _knowledge_query_terms(knowledge_query)
+        if knowledge_query.mode is KnowledgeSearchMode.KEYWORD or (
+            knowledge_query.mode is KnowledgeSearchMode.AUTO
+            and not _query_terms_have_positive_terms(terms)
+        ):
             return self._keyword_search(
                 knowledge_query,
                 scope,
@@ -6757,7 +6841,6 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 "InMemoryEmbeddingKnowledgeStore supports auto, keyword, semantic, and "
                 "hybrid search modes."
             )
-        terms = _knowledge_query_terms(knowledge_query)
         candidates: list[tuple[KnowledgeEntry, list[KnowledgeChunk]]] = []
         entry_ids = (
             self._entries
@@ -8882,6 +8965,7 @@ def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:
         statuses=list(query.statuses),
         visibilities=list(query.visibilities) if query.visibilities is not None else None,
         aspects=list(query.aspects),
+        aspect_groups=[list(group) for group in query.aspect_groups],
         impact_targets=list(query.impact_targets),
         source_type=query.source_type,
         source_id=query.source_id,
@@ -9172,6 +9256,7 @@ def _entry_matches_query(entry: KnowledgeEntry, query: KnowledgeQuery) -> bool:
         statuses=query.statuses,
         visibilities=query.visibilities,
         aspects=query.aspects,
+        aspect_groups=query.aspect_groups,
         impact_targets=query.impact_targets,
         source_type=query.source_type,
         source_id=query.source_id,
@@ -9188,6 +9273,7 @@ def _entry_matches_list_query(entry: KnowledgeEntry, query: KnowledgeListQuery) 
         statuses=query.statuses,
         visibilities=query.visibilities,
         aspects=query.aspects,
+        aspect_groups=[],
         impact_targets=query.impact_targets,
         source_type=query.source_type,
         source_id=query.source_id,
@@ -9204,6 +9290,7 @@ def _entry_matches_metadata(
     statuses: list[KnowledgeStatus],
     visibilities: list[KnowledgeVisibility] | None,
     aspects: list[str],
+    aspect_groups: list[list[str]],
     impact_targets: list[str],
     source_type: str | None,
     source_id: str | None,
@@ -9225,6 +9312,9 @@ def _entry_matches_metadata(
     if source_id is not None and entry.source_id != source_id:
         return False
     if aspects and not set(aspects).intersection(entry.aspects):
+        return False
+    entry_aspects = set(entry.aspects)
+    if any(not entry_aspects.intersection(group) for group in aspect_groups):
         return False
     if impact_targets and not set(impact_targets).intersection(entry.impact_targets):
         return False

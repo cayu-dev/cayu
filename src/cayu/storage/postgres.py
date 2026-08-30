@@ -730,6 +730,7 @@ from cayu.storage.memory import (
     _knowledge_maintenance_identity,
     _knowledge_maintenance_successors,
     _knowledge_publication_operation_id,
+    _knowledge_query_terms,
     _knowledge_relation_access_snapshot,
     _knowledge_relation_access_snapshot_json,
     _knowledge_relation_change_audiences,
@@ -746,6 +747,7 @@ from cayu.storage.memory import (
     _parse_knowledge_access_snapshot_json,
     _parse_knowledge_maintenance_access_snapshot_json,
     _parse_knowledge_relation_access_snapshot_json,
+    _query_terms_have_positive_terms,
     _require_knowledge_entry_access,
     _require_knowledge_maintenance_current_entries,
     _require_knowledge_maintenance_current_replacement,
@@ -14990,6 +14992,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             search_filter_sql,
             [*search_filter_params, *params],
             where_sql,
+            metadata_only=ts_query is None,
         )
         rows = await self._search_unique_rows(
             cur,
@@ -17009,7 +17012,27 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         search_filter_sql: str,
         params: list[object],
         where_sql: str,
+        *,
+        metadata_only: bool,
     ) -> int:
+        if metadata_only:
+            await cur.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM cayu_knowledge_current_entries AS e
+                WHERE {search_filter_sql}
+                  AND EXISTS (
+                      SELECT 1
+                      FROM cayu_knowledge_chunks AS available_chunk
+                      WHERE available_chunk.entry_id = e.id
+                        AND available_chunk.entry_revision = e.revision
+                  )
+                {where_sql}
+                """,
+                params,
+            )
+            row = await cur.fetchone()
+            return 0 if row is None else int(row[0])
         await cur.execute(
             f"""
             SELECT COUNT(DISTINCT e.id)
@@ -17028,25 +17051,55 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         self,
         cur: Any,
         *,
-        ts_query: str,
+        ts_query: str | None,
         search_filter_sql: str,
         where_sql: str,
         params: list[object],
         limit: int,
     ) -> list[tuple[Any, ...]]:
+        if ts_query is None:
+            await cur.execute(
+                f"""
+                SELECT
+                    e.id AS entry_id,
+                    available_chunk.id AS chunk_id,
+                    1.0 AS score
+                FROM cayu_knowledge_current_entries AS e
+                JOIN LATERAL (
+                    SELECT candidate_chunk.id
+                    FROM cayu_knowledge_chunks AS candidate_chunk
+                    WHERE candidate_chunk.entry_id = e.id
+                      AND candidate_chunk.entry_revision = e.revision
+                    ORDER BY candidate_chunk.chunk_index ASC,
+                             candidate_chunk.id COLLATE "C" ASC
+                    LIMIT 1
+                ) AS available_chunk ON TRUE
+                WHERE {search_filter_sql}
+                {where_sql}
+                ORDER BY COALESCE(e.importance, 0.0) DESC,
+                         e.updated_at DESC,
+                         e.id COLLATE "C" ASC
+                LIMIT %s
+                """,
+                [*params, limit],
+            )
+            return list(await cur.fetchall())
         unique_rows: list[tuple[Any, ...]] = []
         seen_entry_ids: set[str] = set()
         offset = 0
         while len(unique_rows) < limit:
+            score_sql = (
+                "1.0"
+                if ts_query is None
+                else f"ts_rank_cd({_postgres_entry_search_vector_sql()}, to_tsquery('simple', %s))"
+            )
+            score_params: list[object] = [] if ts_query is None else [ts_query]
             await cur.execute(
                 f"""
                 SELECT
                     e.id AS entry_id,
                     c.id AS chunk_id,
-                    ts_rank_cd(
-                        {_postgres_entry_search_vector_sql()},
-                        to_tsquery('simple', %s)
-                    ) AS score
+                    {score_sql} AS score
                 FROM cayu_knowledge_chunks AS c
                 JOIN cayu_knowledge_current_entries AS e
                   ON e.id = c.entry_id AND e.revision = c.entry_revision
@@ -17060,7 +17113,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 LIMIT %s OFFSET %s
                 """,
                 [
-                    ts_query,
+                    *score_params,
                     *params,
                     _KNOWLEDGE_SEARCH_PAGE_SIZE,
                     offset,
@@ -17102,7 +17155,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             chunk = chunks.get(str(row[1]))
             if entry is None or chunk is None:
                 continue
-            reason, preview_text = _knowledge_preview_for_match(entry, chunk, terms)
+            filter_only = not terms
+            reason, preview_text = (
+                ("exact aspect filter", chunk.text)
+                if filter_only
+                else _knowledge_preview_for_match(entry, chunk, terms)
+            )
             preview_bytes = len(preview_text.encode("utf-8"))
             preview = _truncate_knowledge_text_to_bytes(preview_text, remaining)
             if not preview:
@@ -17118,7 +17176,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     entry=entry,
                     chunk=chunk,
                     score=float(row[2]),
-                    score_kind="postgres_full_text",
+                    score_kind=("exact_metadata" if filter_only else "postgres_full_text"),
                     rank=len(hits) + 1,
                     reason=reason,
                     text_preview=preview,
@@ -17517,7 +17575,10 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         knowledge_sequence: int | None,
         index_readiness_sequence: int | None,
     ) -> KnowledgeSearchResult:
-        if query.mode is KnowledgeSearchMode.KEYWORD:
+        terms = _knowledge_query_terms(query)
+        if query.mode is KnowledgeSearchMode.KEYWORD or (
+            query.mode is KnowledgeSearchMode.AUTO and not _query_terms_have_positive_terms(terms)
+        ):
             if revision_refs is not None:
                 return await super().search_revisions(
                     query,
@@ -34134,6 +34195,7 @@ def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[obj
         statuses=query.statuses,
         visibilities=query.visibilities,
         aspects=query.aspects,
+        aspect_groups=query.aspect_groups,
         impact_targets=query.impact_targets,
         source_type=query.source_type,
         source_id=query.source_id,
@@ -34184,6 +34246,7 @@ def _postgres_knowledge_list_filter_sql(
         statuses=query.statuses,
         visibilities=query.visibilities,
         aspects=query.aspects,
+        aspect_groups=[],
         impact_targets=query.impact_targets,
         source_type=query.source_type,
         source_id=query.source_id,
@@ -34486,6 +34549,7 @@ def _postgres_knowledge_metadata_filter_sql(
     statuses: list[KnowledgeStatus],
     visibilities: list[KnowledgeVisibility] | None,
     aspects: list[str],
+    aspect_groups: list[list[str]],
     impact_targets: list[str],
     source_type: str | None,
     source_id: str | None,
@@ -34541,6 +34605,19 @@ def _postgres_knowledge_metadata_filter_sql(
             """
         )
         params.append(aspects)
+    for group in aspect_groups:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_aspects AS grouped_aspect
+                WHERE grouped_aspect.entry_id = e.id
+                  AND grouped_aspect.entry_revision = e.revision
+                  AND grouped_aspect.aspect = ANY(%s)
+            )
+            """
+        )
+        params.append(group)
     if impact_targets:
         clauses.append(
             """
@@ -34562,7 +34639,7 @@ def _postgres_knowledge_metadata_filter_sql(
     return " AND " + " AND ".join(clauses), params
 
 
-def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
+def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str | None, list[str]]:
     any_terms = _dedupe_knowledge_search_tokens(
         [
             *_expand_knowledge_search_tokens(_tokenize_knowledge_search_text(query.text or "")),
@@ -34593,7 +34670,7 @@ def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]
     if phrase_queries:
         positive_parts.append("(" + " | ".join(phrase_queries) + ")")
     if not positive_parts:
-        raise ValueError("Knowledge query requires positive search terms.")
+        return None, []
     ts_query = " & ".join(positive_parts)
     preview_terms = _dedupe_knowledge_search_tokens(
         [*any_terms, *(term for group in all_groups for term in group), *phrase_terms]
@@ -34639,7 +34716,8 @@ def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, l
             params.extend(clause_params)
         clauses.append("(" + " OR ".join(phrase_clauses) + ")")
     if not any_terms and not all_groups and not phrase_queries:
-        raise ValueError("Knowledge query requires positive search terms.")
+        none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
+        return cast("LiteralString", "TRUE" + none_sql), none_params
     none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
     return cast("LiteralString", " AND ".join(clauses) + none_sql), [*params, *none_params]
 

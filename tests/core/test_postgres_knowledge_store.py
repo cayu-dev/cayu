@@ -4102,6 +4102,96 @@ def test_postgres_knowledge_store_structured_keyword_search(postgres_dsn: str) -
     assert [hit.entry.id for hit in result.hits] == ["github_secret"]
 
 
+def test_postgres_knowledge_store_filter_only_exact_aspect_groups(
+    postgres_dsn: str,
+) -> None:
+    scope_a = "scope:a"
+    scope_b = "scope:b"
+    entity_target = "entity:target"
+    entity_other = "entity:other"
+
+    async def ops(store):
+        await store.create_entry(
+            KnowledgeEntry(
+                id="facet_target",
+                text="unrelated target body",
+                aspects=[scope_b, entity_target],
+            )
+        )
+        await store.create_entry(
+            KnowledgeEntry(
+                id="facet_wrong_entity",
+                text="unrelated wrong entity body",
+                aspects=[scope_b, entity_other],
+            )
+        )
+        await store.create_entry(
+            KnowledgeEntry(
+                id="facet_wrong_scope",
+                text="unrelated wrong scope body",
+                aspects=[entity_target],
+            )
+        )
+        return await store.search(
+            KnowledgeQuery(
+                text=None,
+                aspect_groups=[[scope_a, scope_b], [entity_target]],
+                mode=KnowledgeSearchMode.KEYWORD,
+            )
+        )
+
+    result = _run(postgres_dsn, ops)
+
+    assert [hit.entry.id for hit in result.hits] == ["facet_target"]
+    assert result.hits[0].score_kind == "exact_metadata"
+    assert result.hits[0].reason == "exact aspect filter"
+
+
+def test_postgres_embedding_auto_facet_only_search_uses_exact_metadata(
+    postgres_dsn: str,
+) -> None:
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            await store.create_entry(
+                KnowledgeEntry(
+                    id="facet-target",
+                    text="Semantically unrelated target body.",
+                    aspects=["scope:b", "entity:target"],
+                )
+            )
+            await store.create_entry(
+                KnowledgeEntry(
+                    id="facet-other",
+                    text="Semantically unrelated other body.",
+                    aspects=["scope:b", "entity:other"],
+                )
+            )
+            provider.calls.clear()
+            result = await store.search(
+                KnowledgeQuery(
+                    aspect_groups=[["scope:a", "scope:b"], ["entity:target"]],
+                )
+            )
+        finally:
+            await store.close()
+        return result, provider.calls
+
+    try:
+        result, calls = asyncio.run(ops())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+    assert [hit.entry.id for hit in result.hits] == ["facet-target"]
+    assert result.query.mode is KnowledgeSearchMode.AUTO
+    assert result.hits[0].score_kind == "exact_metadata"
+    assert result.hits[0].reason == "exact aspect filter"
+    assert calls == []
+
+
 def test_postgres_knowledge_store_phrase_search_conformance(postgres_dsn: str) -> None:
     async def ops(store) -> None:
         await assert_token_exact_phrase_search_conformance(store)

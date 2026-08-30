@@ -89,6 +89,12 @@ RECALL_MAX_CONTINUATION_BYTES = 4_096
 RECALL_MAX_LINEAGE_LINKS_PER_RECORD = 100
 RECALL_MAX_LINEAGE_CANDIDATES = 100
 RECALL_MAX_LINEAGE_BYTES_PER_RECORD = 64_000
+RECALL_MAX_KNOWLEDGE_ASPECT_GROUPS = 6
+RECALL_MAX_KNOWLEDGE_ASPECTS_PER_GROUP = 128
+RECALL_MAX_KNOWLEDGE_GROUPED_ASPECTS = (
+    RECALL_MAX_KNOWLEDGE_ASPECT_GROUPS * RECALL_MAX_KNOWLEDGE_ASPECTS_PER_GROUP
+)
+RECALL_MAX_KNOWLEDGE_GROUPED_ASPECT_BYTES = 128_000
 _RECALL_MAX_SOURCES = 32
 _RECALL_MAX_CHANNELS = 100
 _RECALL_MAX_NAME_BYTES = 256
@@ -128,6 +134,8 @@ class RecallSituation(BaseModel):
     transcript_session_ids: tuple[str, ...] = ()
     transcript_before_indexes: Mapping[str, int] = Field(default_factory=dict)
     continuations: Mapping[str, str] = Field(default_factory=dict)
+    knowledge_aspect_groups: tuple[tuple[str, ...], ...] = ()
+    knowledge_filter_only: bool = False
     current_time: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @field_validator("query")
@@ -172,6 +180,80 @@ class RecallSituation(BaseModel):
                 f"`work_context` must be at most {RECALL_MAX_WORK_CONTEXT_BYTES} UTF-8 bytes."
             )
         return value
+
+    @field_validator("knowledge_aspect_groups", mode="before")
+    @classmethod
+    def validate_knowledge_aspect_groups(
+        cls,
+        value: object,
+    ) -> tuple[tuple[str, ...], ...]:
+        if isinstance(value, str | bytes) or not isinstance(value, Sequence):
+            raise ValueError("`knowledge_aspect_groups` must be a sequence of groups.")
+        if len(value) > RECALL_MAX_KNOWLEDGE_ASPECT_GROUPS:
+            raise ValueError(
+                "`knowledge_aspect_groups` cannot contain more than "
+                f"{RECALL_MAX_KNOWLEDGE_ASPECT_GROUPS} groups."
+            )
+        groups: list[tuple[str, ...]] = []
+        seen_groups: set[tuple[str, ...]] = set()
+        total_values = 0
+        total_bytes = 0
+        for group_index, group in enumerate(value):
+            if isinstance(group, str | bytes) or not isinstance(group, Sequence) or not group:
+                raise ValueError(
+                    f"`knowledge_aspect_groups[{group_index}]` must be a non-empty sequence."
+                )
+            if len(group) > RECALL_MAX_KNOWLEDGE_ASPECTS_PER_GROUP:
+                raise ValueError(
+                    f"`knowledge_aspect_groups[{group_index}]` cannot contain more than "
+                    f"{RECALL_MAX_KNOWLEDGE_ASPECTS_PER_GROUP} values."
+                )
+            values: list[str] = []
+            seen_values: set[str] = set()
+            for value_index, item in enumerate(group):
+                if type(item) is not str:
+                    raise ValueError(
+                        f"`knowledge_aspect_groups[{group_index}][{value_index}]` must be a string."
+                    )
+                item = require_clean_nonblank(
+                    item,
+                    f"knowledge_aspect_groups[{group_index}][{value_index}]",
+                )
+                if item in seen_values:
+                    raise ValueError("Knowledge aspect groups cannot contain duplicates.")
+                seen_values.add(item)
+                values.append(item)
+                total_bytes += len(item.encode("utf-8"))
+            normalized = tuple(values)
+            if normalized in seen_groups:
+                raise ValueError("`knowledge_aspect_groups` cannot contain duplicate groups.")
+            seen_groups.add(normalized)
+            groups.append(normalized)
+            total_values += len(normalized)
+        if total_values > RECALL_MAX_KNOWLEDGE_GROUPED_ASPECTS:
+            raise ValueError(
+                "`knowledge_aspect_groups` cannot contain more than "
+                f"{RECALL_MAX_KNOWLEDGE_GROUPED_ASPECTS} values."
+            )
+        if total_bytes > RECALL_MAX_KNOWLEDGE_GROUPED_ASPECT_BYTES:
+            raise ValueError(
+                "`knowledge_aspect_groups` cannot exceed "
+                f"{RECALL_MAX_KNOWLEDGE_GROUPED_ASPECT_BYTES} UTF-8 bytes."
+            )
+        return tuple(groups)
+
+    @field_validator("knowledge_filter_only", mode="before")
+    @classmethod
+    def validate_knowledge_filter_only(cls, value: object) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`knowledge_filter_only` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_knowledge_filter(self) -> RecallSituation:
+        if self.knowledge_filter_only and not self.knowledge_aspect_groups:
+            raise ValueError("Filter-only knowledge recall requires exact aspect groups.")
+        return self
 
     @field_validator("knowledge_access_scope", mode="before")
     @classmethod
@@ -1451,10 +1533,11 @@ class KnowledgeRecallSource(RecallSource):
         access_scope = situation.knowledge_access_scope
         if access_scope is None:
             raise ValueError("Knowledge recall requires an explicit KnowledgeAccessScope.")
-        text = situation.retrieval_text()
+        text = None if situation.knowledge_filter_only else situation.retrieval_text()
         lexical_query = KnowledgeQuery(
             text=text,
             namespace=situation.knowledge_namespace,
+            aspect_groups=[list(group) for group in situation.knowledge_aspect_groups],
             mode=KnowledgeSearchMode.KEYWORD,
             limit=self.candidate_limit,
             max_bytes=self._max_bytes,
@@ -1462,8 +1545,9 @@ class KnowledgeRecallSource(RecallSource):
         semantic: KnowledgeSearchResult | None = None
         semantic_failure: str | None = None
         semantic_supported = KnowledgeSearchMode.SEMANTIC in self._store.supported_search_modes()
+        semantic_requested = semantic_supported and text is not None
         semantic_task: asyncio.Task[tuple[KnowledgeSearchResult | None, str | None]] | None = None
-        if semantic_supported:
+        if semantic_requested:
             semantic_query = KnowledgeQuery.model_validate(
                 {
                     **lexical_query.model_dump(mode="python"),
@@ -1513,7 +1597,14 @@ class KnowledgeRecallSource(RecallSource):
         partial_reasons: list[str] = []
         if lexical.truncated:
             partial_reasons.append("lexical_truncated")
-        if semantic is None:
+        if not semantic_requested and text is None:
+            semantic_channel = RankedRetrievalChannel(
+                channel=KNOWLEDGE_SEMANTIC_CHANNEL,
+                index_version="not_applicable",
+                candidate_limit=self.candidate_limit,
+                truncated=False,
+            )
+        elif semantic is None:
             semantic_channel = RankedRetrievalChannel(
                 channel=KNOWLEDGE_SEMANTIC_CHANNEL,
                 index_version=("unsupported" if not semantic_supported else "unavailable"),

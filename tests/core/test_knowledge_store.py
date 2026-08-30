@@ -327,6 +327,47 @@ class KeywordEmbeddingProvider(TextEmbeddingProvider):
         )
 
 
+def test_in_memory_embedding_auto_facet_only_search_uses_exact_metadata() -> None:
+    async def run():
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        await store.create_entry(
+            KnowledgeEntry(
+                id="facet-target",
+                text="Semantically unrelated target body.",
+                aspects=["scope:b", "entity:target"],
+            )
+        )
+        await store.create_entry(
+            KnowledgeEntry(
+                id="facet-other",
+                text="Semantically unrelated other body.",
+                aspects=["scope:b", "entity:other"],
+            )
+        )
+        await store.process_embedding_changes("facet-only-index", "worker")
+        provider.calls.clear()
+        result = await store.search(
+            KnowledgeQuery(
+                aspect_groups=[["scope:a", "scope:b"], ["entity:target"]],
+            )
+        )
+        return result, provider.calls
+
+    result, calls = asyncio.run(run())
+
+    assert [hit.entry.id for hit in result.hits] == ["facet-target"]
+    assert result.query.mode is KnowledgeSearchMode.AUTO
+    assert result.hits[0].score_kind == "exact_metadata"
+    assert result.hits[0].reason == "exact aspect filter"
+    assert calls == []
+
+
 def _test_embedding_vector(text: str) -> list[float]:
     folded = text.casefold()
     return [
@@ -591,6 +632,13 @@ def test_knowledge_entry_and_query_dedupe_list_filters() -> None:
     assert query.aspects == ["finance"]
     assert query.impact_targets == ["refunds"]
 
+    filter_only = KnowledgeQuery(aspect_groups=[["scope:a", "scope:a"]])
+    assert filter_only.aspect_groups == [["scope:a"]]
+    with pytest.raises(ValidationError, match="cannot contain more than 6 groups"):
+        KnowledgeQuery(
+            aspect_groups=[[f"aspect:{index}"] for index in range(7)],
+        )
+
 
 @pytest.mark.parametrize(
     "query_input",
@@ -607,6 +655,13 @@ def test_knowledge_query_rejects_structured_values_without_search_tokens(
 ) -> None:
     with pytest.raises(ValidationError, match="at least one token|requires"):
         KnowledgeQuery(**query_input)
+
+
+def test_semantic_knowledge_query_accepts_raw_text_without_lexical_tokens() -> None:
+    query = KnowledgeQuery(text="---", mode=KnowledgeSearchMode.SEMANTIC)
+
+    assert query.mode is KnowledgeSearchMode.SEMANTIC
+    assert query.text == "---"
 
 
 def test_knowledge_entry_rejects_invalid_identity_labels_and_scores() -> None:
