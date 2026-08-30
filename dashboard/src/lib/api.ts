@@ -69,7 +69,8 @@ import type {
   EvalSuiteCatalogPage,
   EvalSuiteDocumentV1,
   EvalSuiteDocumentV2,
-  EvalSuiteDraftV2,
+  EvalSuiteDocumentV3,
+  EvalSuiteDraftV3,
   EvalSuitePreviewRequest,
   EvalSuitePreviewResponse,
   EvalSuiteSaveRequest,
@@ -259,8 +260,8 @@ export type EvalScenarioRunLaunch = EvalScenarioRunCreateRequest
 export type EvalScenarioApproval = EvalScenarioApprovalRequest
 export type EvalScenarioEntry = EvalScenarioCatalogEntry
 export type EvalScenariosPage = EvalScenarioCatalogPage
-export type EvalAuthoredSuite = EvalSuiteDocumentV1 | EvalSuiteDocumentV2
-export type EvalAuthoredSuiteDraft = EvalSuiteDraftV2
+export type EvalAuthoredSuite = EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3
+export type EvalAuthoredSuiteDraft = EvalSuiteDraftV3
 export type EvalAuthoredSuitePreviewRequestBody = EvalSuitePreviewRequest
 export type EvalAuthoredSuitePreview = EvalSuitePreviewResponse
 export type EvalAuthoredSuiteSave = EvalSuiteSaveRequest

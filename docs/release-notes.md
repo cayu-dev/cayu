@@ -165,6 +165,32 @@ automatically promote generated files into `AgentSnapshot`; applications still
 own the scratch/evidence/anatomy disposition decision. No storage migration is
 required because the protocol uses existing bounded session-operation records.
 
+### Evals publish explicit repeated-trial reliability
+
+Authored suites now freeze trial count, required passes, and maximum concurrency
+as one content-addressed policy. Results retain every trial and classify passes,
+candidate failures, runtime errors, evaluator errors, unavailable evidence, and
+cancellations separately. Comparisons, JSON/HTML reports, the Control Plane, and
+CLI regression exits now treat a worse distribution as a reliability regression,
+even when the aggregate status still passes or score tolerance hides the change.
+
+Preflight exposes exact candidate-trial, model-step, and judge-call counts but no
+longer mislabels post-observation candidate or judge token and cost stop
+thresholds as hard maxima. SQLite and PostgreSQL workers checkpoint each
+terminal trial behind the live claim, resume only missing slots after a restart,
+and partition independently recoverable runs from one authored-suite launch into
+durable concurrency lanes, so its accepted ceiling holds across coordinators
+without serializing all independent work. The exact accepted-exposure revision
+continues to fence preview, admission, and worker execution; cross-release result
+comparison uses a separate content-addressed contract that excludes only release
+and presentation metadata while preserving execution, isolation, evidence, work,
+and pricing drift. Storage revision 72 is therefore a breaking mixed-worker
+boundary: migrate all EvalStore databases and deploy only revision-72-aware eval
+workers. Comparison documents
+advance to schema version 4; the existing server/dashboard contract version 38
+includes these APIs, so upgrade generated clients and dashboards with the
+server.
+
 ### Evals can verify workspace and artifact outputs without Python assertions
 
 Portable suites and Control Plane now author workspace-file presence/absence,

@@ -47,8 +47,14 @@ function authoredDocument() {
 
 test("new suite and case helpers create complete deterministic drafts", () => {
   const draft = newEvalSuiteDraft("assistant.default")
+  assert.equal(draft.schema_version, 3)
   assert.equal(draft.target_key, "assistant.default")
-  assert.equal(draft.trial_request.trials, 1)
+  assert.deepEqual(draft.trial_request, {
+    trials: 1,
+    timeout_seconds: 300,
+    minimum_passed_trials: 1,
+    max_concurrency: 1,
+  })
   assert.deepEqual(validateEvalSuiteDraft(draft), { ok: true, draft })
 
   const added = newSimpleEvalCase(draft.cases)
@@ -137,6 +143,21 @@ test("suite validation mirrors Python Unicode whitespace and immutable scenario 
     opaque_external_case_ref: { id: "private-case", revision: revision("d") },
   }
   assert.match(validateEvalSuiteDraft(opaque).error, /runtime-owned opaque external input/)
+})
+
+test("suite validation enforces bounded threshold and concurrency settings", () => {
+  const threshold = newEvalSuiteDraft("assistant.default")
+  threshold.trial_request = {
+    trials: 3,
+    timeout_seconds: 30,
+    minimum_passed_trials: 4,
+    max_concurrency: 2,
+  }
+  assert.match(validateEvalSuiteDraft(threshold).error, /Required passes/)
+
+  const concurrency = newEvalSuiteDraft("assistant.default")
+  concurrency.trial_request.max_concurrency = 65
+  assert.match(validateEvalSuiteDraft(concurrency).error, /Concurrency/)
 })
 
 test("suite validation enforces the server's 1,000-case ceiling", () => {

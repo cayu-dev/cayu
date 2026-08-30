@@ -198,7 +198,7 @@ test("eval catalog adapters select only server-published target keys", async () 
 test("eval corpus imports preserve the selected file bytes for strict server validation", async () => {
   const originalFetch = globalThis.fetch
   const prefix = new TextEncoder().encode(
-    '{"schema_version":1,"schema_version":2,"revision":"sha256:corpus",' +
+    '{"schema_version":1,"schema_version":3,"revision":"sha256:corpus",' +
       '"target_key":"target","evidence_policy":{},"description":"',
   )
   const suffix = new TextEncoder().encode('","suites":[],"cases":[]}')
@@ -433,7 +433,16 @@ test("authored suite adapters preserve immutable selection and launch idempotenc
     await previewEvalAuthoredSuiteRun(revision, { case_ids: ["case-one"] }, controller.signal)
     await launchEvalAuthoredSuiteRun(
       revision,
-      { case_ids: ["case-one"] },
+      {
+        case_ids: ["case-one"],
+        expected_exposure_revision: revision,
+        expected_execution_profiles: [
+          {
+            case_ids: ["case-one"],
+            execution_profile_revision: revision,
+          },
+        ],
+      },
       "authored-suite-idempotency-key",
       controller.signal,
     )
@@ -457,6 +466,16 @@ test("authored suite adapters preserve immutable selection and launch idempotenc
   assert.equal(calls[5].input, `/api/evals/suites/${encodeURIComponent(revision)}/runs/preview`)
   assert.deepEqual(JSON.parse(calls[5].init.body), { case_ids: ["case-one"] })
   assert.equal(calls[6].input, `/api/evals/suites/${encodeURIComponent(revision)}/runs`)
+  assert.deepEqual(JSON.parse(calls[6].init.body), {
+    case_ids: ["case-one"],
+    expected_exposure_revision: revision,
+    expected_execution_profiles: [
+      {
+        case_ids: ["case-one"],
+        execution_profile_revision: revision,
+      },
+    ],
+  })
   assert.equal(
     new Headers(calls[6].init.headers).get("Idempotency-Key"),
     "authored-suite-idempotency-key",

@@ -13,7 +13,8 @@ import type {
   EvalScenarioDraftV2,
   EvalSuiteDocumentV1,
   EvalSuiteDocumentV2,
-  EvalSuiteDraftV2,
+  EvalSuiteDocumentV3,
+  EvalSuiteDraftV3,
   StructuredModelJudgeAssertionDraftV1,
   StructuredModelJudgeAssertionSpec,
 } from "./generated/server-api"
@@ -23,17 +24,22 @@ const SHA256_REVISION_PATTERN = /^sha256:[a-f0-9]{64}$/
 export const EVAL_SUITE_MAX_CASES = 1_000
 
 export type EvalSuiteDraftValidation =
-  | { ok: true; draft: EvalSuiteDraftV2 }
+  | { ok: true; draft: EvalSuiteDraftV3 }
   | { ok: false; error: string }
 
-export function newEvalSuiteDraft(targetKey: string): EvalSuiteDraftV2 {
+export function newEvalSuiteDraft(targetKey: string): EvalSuiteDraftV3 {
   return {
-    schema_version: 2,
+    schema_version: 3,
     id: "evaluation-suite",
     target_key: targetKey,
     name: "Evaluation suite",
     description: null,
-    trial_request: { trials: 1, timeout_seconds: 300 },
+    trial_request: {
+      trials: 1,
+      timeout_seconds: 300,
+      minimum_passed_trials: 1,
+      max_concurrency: 1,
+    },
     cases: [newSimpleEvalCase([], "case-1")],
   }
 }
@@ -97,15 +103,22 @@ export function blankEvalScenarioDraft(
 }
 
 export function evalSuiteDraftFromDocument(
-  document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2,
-): EvalSuiteDraftV2 {
+  document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3,
+): EvalSuiteDraftV3 {
+  const storedRequest = document.suite.trial_request
+  const trials = storedRequest?.trials ?? 1
   return structuredClone({
-    schema_version: 2,
+    schema_version: 3,
     id: document.suite.id,
     target_key: document.target_key,
     name: document.suite.name,
     description: document.suite.description ?? null,
-    trial_request: document.suite.trial_request ?? { trials: 1, timeout_seconds: 300 },
+    trial_request: {
+      trials,
+      timeout_seconds: storedRequest?.timeout_seconds ?? 300,
+      minimum_passed_trials: storedRequest?.trial_policy?.minimum_passed_trials ?? trials,
+      max_concurrency: storedRequest?.trial_policy?.max_concurrency ?? 1,
+    },
     cases: document.cases.map(({ revision: _revision, ...evalCase }) => ({
       ...evalCase,
       assertions: evalCase.assertions.map((assertion) =>
@@ -134,8 +147,8 @@ export function duplicateEvalSuiteCase(
 }
 
 export function evalSuitePreviewMatchesDraft(
-  document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2,
-  draft: EvalSuiteDraftV2,
+  document: EvalSuiteDocumentV1 | EvalSuiteDocumentV2 | EvalSuiteDocumentV3,
+  draft: EvalSuiteDraftV3,
 ): boolean {
   return JSON.stringify(evalSuiteDraftFromDocument(document)) === JSON.stringify(draft)
 }
@@ -157,14 +170,19 @@ export function scenarioArtifactBindingsRequireMaterialization(
   )
 }
 
-export function validateEvalSuiteDraft(draft: EvalSuiteDraftV2): EvalSuiteDraftValidation {
+export function validateEvalSuiteDraft(draft: EvalSuiteDraftV3): EvalSuiteDraftValidation {
   try {
     requirePortableId(draft.id, "Suite ID")
     requirePortableId(draft.target_key, "Target key")
     requireBoundedCleanText(draft.name, "Suite name", 256)
     requireOptionalCleanText(draft.description, "Suite description", 2_048)
-    if ((draft.trial_request?.trials ?? 1) !== 1) {
-      throw new Error("Control Plane suite launch currently supports exactly one trial.")
+    const trials = draft.trial_request?.trials ?? 1
+    const minimumPassed = draft.trial_request?.minimum_passed_trials ?? 1
+    requireInteger(trials, "Trials", 1, 100)
+    requireInteger(minimumPassed, "Required passes", 1, trials)
+    requireInteger(draft.trial_request?.max_concurrency ?? 1, "Concurrency", 1, 64)
+    if (minimumPassed > trials) {
+      throw new Error("Required passes cannot exceed trials.")
     }
     requireInteger(draft.trial_request?.timeout_seconds ?? 300, "Timeout", 1, 3_600)
     if (draft.cases.length < 1 || draft.cases.length > EVAL_SUITE_MAX_CASES) {

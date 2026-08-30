@@ -159,7 +159,7 @@ test("inactive complete eval results are released from the browser cache immedia
 
 test("eval corpus import preflight bounds work without authorizing normalized content", async () => {
   const corpus = {
-    schema_version: 2,
+    schema_version: 3,
     revision: "sha256:corpus",
     target_key: "support.regressions",
     evidence_policy: { schema_version: 1 },
@@ -171,7 +171,7 @@ test("eval corpus import preflight bounds work without authorizing normalized co
   await assert.rejects(preflightEvalCorpusFile(new Blob(["not json"])), /not valid JSON/)
   await assert.rejects(
     preflightEvalCorpusFile(new Blob([JSON.stringify({ ...corpus, schema_version: 1 })])),
-    /corpus v2/,
+    /corpus v3/,
   )
   await assert.rejects(
     preflightEvalCorpusFile(new Blob([new Uint8Array(MAX_EVAL_CORPUS_FILE_BYTES + 1)])),
@@ -223,20 +223,35 @@ test("scenario launch retry identity binds the scenario, binding, and execution 
   )
 })
 
-test("authored suite retry identity binds the suite, selection, and execution profiles", () => {
+test("authored suite retry identity binds the suite, selection, exposure, and profiles", () => {
   const profiles = [{ case_ids: ["case-a"], execution_profile_revision: "sha256:profile-a" }]
   const identity = authoredSuiteEvalLaunchRequestIdentity(
     "sha256:suite",
     "sha256:selection",
+    "sha256:exposure",
     profiles,
   )
   assert.notEqual(
     identity,
-    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:other-selection", profiles),
+    authoredSuiteEvalLaunchRequestIdentity(
+      "sha256:suite",
+      "sha256:other-selection",
+      "sha256:exposure",
+      profiles,
+    ),
   )
   assert.notEqual(
     identity,
-    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:selection", [
+    authoredSuiteEvalLaunchRequestIdentity(
+      "sha256:suite",
+      "sha256:selection",
+      "sha256:other-exposure",
+      profiles,
+    ),
+  )
+  assert.notEqual(
+    identity,
+    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:selection", "sha256:exposure", [
       { case_ids: ["case-a"], execution_profile_revision: "sha256:new-profile" },
     ]),
   )

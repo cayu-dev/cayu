@@ -106,14 +106,19 @@ import { type EvalsSearch, evalResultRevisionIsValid, evalsSearchWithout } from 
 import { PROCESS_EVENT_OPTIONS } from "@/lib/evaluation-promotion"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
 import type {
+  CorpusReliabilityDistributionV1,
   EvalAssertionPresentationV1,
+  EvalCaseReliabilityV1,
+  EvalMaximumCostExposureV1,
   EvalResultOutcomeDimensionsV1,
-  EvalResultPresentationV1,
+  EvalResultPresentationV2,
   EvalScenarioTrialProgress,
   EvalStructuredJudgeComparisonV1,
   EvalStructuredJudgePresentationV1,
+  EvalSuiteRunExposureV1,
   EvalsReadiness,
   EvalToolJsonAssertionComparisonV1,
+  PublishedModelJudgeDetail,
   PublishedProcessEventsInOrderDetail,
 } from "@/lib/generated/server-api"
 
@@ -2275,7 +2280,15 @@ function ResultInspector({
             }
             title={result.presentation.pricing_profile_fingerprint ?? undefined}
           />
+          <RunFact
+            label="Trial policy"
+            value={`${result.presentation.trial_policy.minimum_passed_trials}/${result.presentation.trial_policy.trial_count} passes · concurrency ${result.presentation.trial_policy.max_concurrency}`}
+            title={result.presentation.trial_policy.revision}
+          />
         </div>
+        {result.presentation.accepted_exposure && (
+          <AcceptedExposureSummary exposure={result.presentation.accepted_exposure} />
+        )}
         <OutcomeDimensionsGrid dimensions={result.presentation.dimensions} />
       </div>
 
@@ -2327,6 +2340,7 @@ function ResultInspector({
           <div className="grid gap-4 rounded-lg border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
             <RunFact label="Case outcome" value={selectedCase.status} />
             <RunFact label="Case score" value={formatScore(selectedCase.score)} />
+            <ReliabilityFacts reliability={presentedCase.reliability} />
             <RunFact label="Trial outcome" value={selectedTrial.status} />
             <RunFact label="Trial score" value={formatScore(selectedTrial.score)} />
             <RunFact label="Trial duration" value={formatDuration(selectedTrial.duration_ms)} />
@@ -2417,7 +2431,12 @@ function ResultInspector({
                       </TableCell>
                       <TableCell className="min-w-64 whitespace-normal">
                         <div>{assertion.message}</div>
-                        {presentedAssertion?.structured_judge ? (
+                        {presentedAssertion?.model_judge ? (
+                          <ModelJudgeDetails
+                            className="mt-3"
+                            detail={presentedAssertion.model_judge}
+                          />
+                        ) : presentedAssertion?.structured_judge ? (
                           <StructuredJudgeDetails
                             className="mt-3"
                             judgment={presentedAssertion.structured_judge}
@@ -2459,7 +2478,7 @@ function ResultInspector({
   )
 }
 
-function ResultPresentationInspector({ presentation }: { presentation: EvalResultPresentationV1 }) {
+function ResultPresentationInspector({ presentation }: { presentation: EvalResultPresentationV2 }) {
   const [selection, setSelection] = useState({
     revision: presentation.result_revision,
     caseIndex: 0,
@@ -2506,7 +2525,15 @@ function ResultPresentationInspector({ presentation }: { presentation: EvalResul
           }
           title={presentation.pricing_profile_fingerprint ?? undefined}
         />
+        <RunFact
+          label="Trial policy"
+          value={`${presentation.trial_policy.minimum_passed_trials}/${presentation.trial_policy.trial_count} passes · concurrency ${presentation.trial_policy.max_concurrency}`}
+          title={presentation.trial_policy.revision}
+        />
       </div>
+      {presentation.accepted_exposure && (
+        <AcceptedExposureSummary exposure={presentation.accepted_exposure} />
+      )}
       <OutcomeDimensionsGrid dimensions={presentation.dimensions} />
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="min-w-0 text-xs font-medium text-muted-foreground">
@@ -2554,6 +2581,7 @@ function ResultPresentationInspector({ presentation }: { presentation: EvalResul
       <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
         <RunFact label="Case outcome" value={selectedCase.status} />
         <RunFact label="Case score" value={formatScore(selectedCase.score)} />
+        <ReliabilityFacts reliability={selectedCase.reliability} />
         <RunFact label="Trial outcome" value={selectedTrial.status} />
         <RunFact label="Trial score" value={formatScore(selectedTrial.score)} />
       </div>
@@ -2599,6 +2627,9 @@ function PresentedAssertions({ assertions }: { assertions: Array<EvalAssertionPr
               <span className="text-xs text-muted-foreground">{formatScore(assertion.score)}</span>
             </div>
           </div>
+          {assertion.model_judge && (
+            <ModelJudgeDetails className="mt-3" detail={assertion.model_judge} />
+          )}
           {assertion.structured_judge && (
             <StructuredJudgeDetails className="mt-3" judgment={assertion.structured_judge} />
           )}
@@ -2925,11 +2956,71 @@ function StructuredJudgeDetails({
   )
 }
 
+function ModelJudgeDetails({
+  detail,
+  className,
+}: {
+  detail: PublishedModelJudgeDetail
+  className?: string
+}) {
+  const profile = detail.judge_profile
+  return (
+    <div
+      className={`rounded-lg border border-border bg-muted/20 p-3 ${className ?? ""}`}
+      data-testid="eval-model-judge-detail"
+    >
+      <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact
+          label="Judge profile"
+          value={`${profile.label} · ${shortEvalIdentity(profile.revision)}`}
+          title={`${profile.key}@${profile.revision}`}
+        />
+        <RunFact label="Provider / model" value={`${profile.provider_name} / ${profile.model}`} />
+        <RunFact
+          label="Candidate route"
+          value={
+            detail.candidate_route_relation === "same_model"
+              ? "same model · explicitly allowed"
+              : "independent model"
+          }
+        />
+        <RunFact label="Evaluator" value={detail.diagnostic.replaceAll("_", " ")} />
+        <RunFact
+          label="Rubric"
+          value={`${detail.rubric_version} · threshold ${detail.threshold}`}
+        />
+        <RunFact label="Observed usage" value={modelJudgeUsageText(detail)} />
+        <RunFact label="Observed cost" value={modelJudgeCostText(detail)} />
+        <RunFact
+          label="Evaluator implementation"
+          value={shortEvalIdentity(detail.evaluator_implementation_revision)}
+          title={detail.evaluator_implementation_revision}
+        />
+      </div>
+    </div>
+  )
+}
+
 function structuredJudgeUsageText(judgment: EvalStructuredJudgePresentationV1): string {
   const usage = judgment.detail.usage
   return usage
     ? `${formatCount(usage.total_tokens)} tokens · ${formatCount(usage.model_steps)} model steps`
     : "unavailable"
+}
+
+function modelJudgeUsageText(detail: PublishedModelJudgeDetail): string {
+  const usage = detail.usage
+  return usage
+    ? `${formatCount(usage.total_tokens)} tokens · ${formatCount(usage.model_steps)} model steps`
+    : "unavailable"
+}
+
+function modelJudgeCostText(detail: PublishedModelJudgeDetail): string {
+  const cost = detail.cost
+  if (!cost) return "unavailable · not observed"
+  return cost.availability === "priced"
+    ? `${cost.estimated_cost} ${cost.currency}`
+    : "unavailable · unpriced"
 }
 
 function structuredJudgeCostText(judgment: EvalStructuredJudgePresentationV1): string {
@@ -3049,6 +3140,7 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
   const { comparison: resultComparison, baseline, current } = comparison
   const { compatibility } = resultComparison
   const regressions = resultComparison.regressions ?? []
+  const caseComparisons = resultComparison.cases ?? []
   const structuredJudgments = resultComparison.structured_judgments ?? []
   const structuredRegressions = structuredJudgments.filter((item) => item.regressed)
   const toolJsonAssertions = resultComparison.tool_json_assertions ?? []
@@ -3113,7 +3205,9 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
                   {regression.scope === "case" ? `Case ${regression.case_id}: ` : "Run: "}
                   {regression.kind === "status"
                     ? `status ${regression.baseline_status} → ${regression.current_status}`
-                    : `score ${formatScore(regression.baseline_score)} → ${formatScore(regression.current_score)}`}
+                    : regression.kind === "score"
+                      ? `score ${formatScore(regression.baseline_score)} → ${formatScore(regression.current_score)}`
+                      : `reliability ${formatComparisonReliability(regression.baseline_reliability)} → ${formatComparisonReliability(regression.current_reliability)}`}
                 </li>
               ))}
             </ul>
@@ -3146,6 +3240,31 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
               ))}
             </ul>
           )}
+        </div>
+      )}
+      {compatibility.comparable && caseComparisons.length > 0 && (
+        <div className="space-y-2" data-testid="eval-comparison-reliability">
+          <div className="font-medium">Case reliability</div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Case</TableHead>
+                <TableHead>Baseline trials</TableHead>
+                <TableHead>Current trials</TableHead>
+                <TableHead>Change</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {caseComparisons.map((item) => (
+                <TableRow key={item.case_id}>
+                  <TableCell className="font-medium">{item.case_id}</TableCell>
+                  <TableCell>{formatComparisonReliability(item.baseline_reliability)}</TableCell>
+                  <TableCell>{formatComparisonReliability(item.current_reliability)}</TableCell>
+                  <TableCell>{item.reliability_change}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         </div>
       )}
       <StructuredJudgeComparison comparison={resultComparison} />
@@ -3503,6 +3622,29 @@ function ComparisonResultSummary({
           }
           title={result.pricing_profile_fingerprint ?? undefined}
         />
+        <RunFact
+          label="Trial policy"
+          value={shortEvalIdentity(result.trial_policy_revision)}
+          title={result.trial_policy_revision}
+        />
+        <RunFact
+          label="Accepted exposure"
+          value={
+            result.accepted_exposure_revision
+              ? shortEvalIdentity(result.accepted_exposure_revision)
+              : "not applicable"
+          }
+          title={result.accepted_exposure_revision ?? undefined}
+        />
+        <RunFact
+          label="Exposure comparison contract"
+          value={
+            result.accepted_exposure_comparison_revision
+              ? shortEvalIdentity(result.accepted_exposure_comparison_revision)
+              : "not applicable"
+          }
+          title={result.accepted_exposure_comparison_revision ?? undefined}
+        />
         <RunFact label="Created" value={formatDateTime(record.created_at)} />
       </div>
     </div>
@@ -3535,6 +3677,80 @@ function RunFact({ label, value, title }: { label: string; value: string; title?
       </div>
     </div>
   )
+}
+
+function ReliabilityFacts({ reliability }: { reliability: EvalCaseReliabilityV1 }) {
+  return (
+    <>
+      <RunFact
+        label="Reliability"
+        value={`${reliability.passed_trials}/${reliability.total_trials} passed`}
+      />
+      <RunFact label="Variability" value={reliability.variability.replaceAll("_", " ")} />
+      <RunFact
+        label="Candidate failures"
+        value={formatCount(reliability.candidate_failed_trials)}
+      />
+      <RunFact label="Runtime errors" value={formatCount(reliability.runtime_error_trials)} />
+      <RunFact label="Evaluator errors" value={formatCount(reliability.evaluator_error_trials)} />
+      <RunFact
+        label="Unavailable / cancelled"
+        value={`${formatCount(reliability.unavailable_trials)} / ${formatCount(reliability.cancelled_trials)}`}
+      />
+      <RunFact label="Score min / mean / max" value={formatReliabilityScores(reliability)} />
+    </>
+  )
+}
+
+function AcceptedExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) {
+  return (
+    <div className="mb-4 grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+      <RunFact
+        label="Accepted candidate maximum"
+        value={`${formatCount(exposure.candidate_trials)} trials · ${formatCount(exposure.maximum_candidate_model_steps)} model steps · ${exposure.maximum_candidate_total_tokens == null ? "token ceiling unavailable" : `${formatCount(exposure.maximum_candidate_total_tokens)} tokens`}`}
+      />
+      <RunFact
+        label="Accepted judge work"
+        value={`${formatCount(exposure.judge_evaluations)} evaluations · ${exposure.maximum_judge_total_tokens == null ? "token ceilings unavailable" : `${formatCount(exposure.maximum_judge_input_tokens ?? 0)} input / ${formatCount(exposure.maximum_judge_output_tokens ?? 0)} output / ${formatCount(exposure.maximum_judge_total_tokens)} total tokens`}`}
+      />
+      <RunFact
+        label="Maximum priced cost"
+        value={`Candidate ${formatMaximumExposureCost(exposure.candidate_cost)} · judge ${formatMaximumExposureCost(exposure.judge_cost)}`}
+      />
+      <RunFact
+        label="Accepted exposure"
+        value={shortEvalIdentity(exposure.revision)}
+        title={exposure.revision}
+      />
+    </div>
+  )
+}
+
+function formatMaximumExposureCost(exposure: EvalMaximumCostExposureV1): string {
+  if (exposure.state === "not_applicable") return "not applicable"
+  if (exposure.state === "unavailable") {
+    return exposure.unavailable_reason?.replaceAll("_", " ") ?? "unavailable"
+  }
+  return (exposure.totals ?? []).map((item) => `${item.amount} ${item.currency}`).join(" + ")
+}
+
+function formatReliabilityScores(reliability: EvalCaseReliabilityV1): string {
+  if (reliability.scored_trials === 0) return "No comparable scores"
+  return `${formatScore(reliability.minimum_score)} / ${formatScore(reliability.mean_score)} / ${formatScore(reliability.maximum_score)} · ${formatCount(reliability.scored_trials)} scored`
+}
+
+function formatComparisonReliability(
+  reliability: CorpusReliabilityDistributionV1 | null | undefined,
+): string {
+  if (!reliability) return "Unavailable"
+  return [
+    `${formatCount(reliability.passed_trials)} passed`,
+    `${formatCount(reliability.candidate_failed_trials)} candidate failed`,
+    `${formatCount(reliability.runtime_error_trials)} runtime error`,
+    `${formatCount(reliability.evaluator_error_trials)} evaluator error`,
+    `${formatCount(reliability.unavailable_trials)} unavailable`,
+    `${formatCount(reliability.cancelled_trials)} cancelled`,
+  ].join(" · ")
 }
 
 function formatScore(score: number | null | undefined): string {

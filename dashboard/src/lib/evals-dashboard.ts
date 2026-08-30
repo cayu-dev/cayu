@@ -240,12 +240,19 @@ export function scenarioEvalLaunchRequestIdentity(
 export function authoredSuiteEvalLaunchRequestIdentity(
   suiteRevision: string,
   selectionRevision: string,
+  exposureRevision: string,
   executionProfiles: ReadonlyArray<{
     case_ids: ReadonlyArray<string>
     execution_profile_revision: string
   }>,
 ): string {
-  return JSON.stringify(["authored-suite-v1", suiteRevision, selectionRevision, executionProfiles])
+  return JSON.stringify([
+    "authored-suite-v2",
+    suiteRevision,
+    selectionRevision,
+    exposureRevision,
+    executionProfiles,
+  ])
 }
 
 export function capturedEvalLaunchRequestIdentity(
@@ -308,6 +315,9 @@ const COMPARISON_REASON_TEXT: Record<CorpusComparisonReason, string> = {
   suite_revision_mismatch: "The suite contract changed between runs.",
   evidence_policy_revision_mismatch: "The evidence policy changed between runs.",
   pricing_profile_fingerprint_mismatch: "The applicable pricing contract changed between runs.",
+  trial_policy_revision_mismatch: "The suite trial decision policy changed between runs.",
+  accepted_exposure_contract_mismatch:
+    "The comparison-relevant execution, maximum work, or cost contract changed between runs.",
   case_contract_mismatch: "At least one case contract changed between runs.",
   assertion_contract_mismatch: "At least one assertion contract changed between runs.",
 }
@@ -332,8 +342,8 @@ export async function preflightEvalCorpusFile(file: Blob): Promise<void> {
     throw new Error("The selected file is not valid JSON.")
   }
 
-  if (!isRecord(parsed) || parsed.schema_version !== 2) {
-    throw new Error("The selected file is not a Cayu eval corpus v2 document.")
+  if (!isRecord(parsed) || parsed.schema_version !== 3) {
+    throw new Error("The selected file is not a Cayu eval corpus v3 document.")
   }
   if (
     typeof parsed.revision !== "string" ||

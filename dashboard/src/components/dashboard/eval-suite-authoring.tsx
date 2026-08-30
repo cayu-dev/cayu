@@ -65,6 +65,7 @@ import type { PromotionAssertion } from "@/lib/evaluation-promotion"
 import type {
   EvalCaseDraftV2,
   EvalScenarioDraftV2,
+  EvalSuiteRunExposureV1,
   StructuredModelJudgeAssertionDraftV1,
 } from "@/lib/generated/server-api"
 
@@ -463,11 +464,13 @@ export function EvalSuiteAuthoringAction({
       authoringLocked ||
       !runPreviewCurrent ||
       !runPreview?.ready ||
+      !runPreview.exposure ||
       savedRevision === null ||
       savedRevision !== suitePreview?.suite.revision
     ) {
       return
     }
+    const reviewedExposure = runPreview.exposure
     const expectedExecutionProfiles = runPreview.launches.flatMap((item) =>
       item.execution_profile_revision
         ? [
@@ -482,6 +485,7 @@ export function EvalSuiteAuthoringAction({
     const requestIdentity = authoredSuiteEvalLaunchRequestIdentity(
       savedRevision,
       runPreview.selection.revision,
+      reviewedExposure.revision,
       expectedExecutionProfiles,
     )
     void run("launch", async (signal) => {
@@ -497,6 +501,7 @@ export function EvalSuiteAuthoringAction({
           {
             ...launchSelection,
             expected_execution_profiles: expectedExecutionProfiles,
+            expected_exposure_revision: reviewedExposure.revision,
           },
           idempotencyKey,
           signal,
@@ -767,7 +772,7 @@ export function EvalSuiteAuthoringAction({
                     <div>
                       <CardTitle>Suite</CardTitle>
                       <p className="mt-1 text-xs text-muted-foreground">
-                        Stable identity and one-trial execution settings.
+                        Stable identity and bounded trial execution settings.
                       </p>
                     </div>
                     {savedRevision && (
@@ -801,7 +806,64 @@ export function EvalSuiteAuthoringAction({
                         }
                       />
                     </Field>
-                    <Field label="Timeout per case" id="authored-suite-timeout">
+                    <Field label="Trials per case" id="authored-suite-trials">
+                      <Input
+                        id="authored-suite-trials"
+                        type="number"
+                        min={1}
+                        max={target?.max_trials ?? 100}
+                        value={draft.trial_request?.trials ?? 1}
+                        onChange={(event) =>
+                          editDraft((next) => {
+                            const trials = Number(event.target.value)
+                            const current = next.trial_request ?? {}
+                            next.trial_request = {
+                              ...current,
+                              trials,
+                              minimum_passed_trials: Math.min(
+                                current.minimum_passed_trials ?? 1,
+                                trials,
+                              ),
+                            }
+                          })
+                        }
+                      />
+                    </Field>
+                    <Field label="Required passes" id="authored-suite-required-passes">
+                      <Input
+                        id="authored-suite-required-passes"
+                        type="number"
+                        min={1}
+                        max={draft.trial_request?.trials ?? 1}
+                        value={draft.trial_request?.minimum_passed_trials ?? 1}
+                        onChange={(event) =>
+                          editDraft((next) => {
+                            next.trial_request = {
+                              ...(next.trial_request ?? {}),
+                              minimum_passed_trials: Number(event.target.value),
+                            }
+                          })
+                        }
+                      />
+                    </Field>
+                    <Field label="Maximum concurrency" id="authored-suite-concurrency">
+                      <Input
+                        id="authored-suite-concurrency"
+                        type="number"
+                        min={1}
+                        max={target?.max_concurrency ?? 64}
+                        value={draft.trial_request?.max_concurrency ?? 1}
+                        onChange={(event) =>
+                          editDraft((next) => {
+                            next.trial_request = {
+                              ...(next.trial_request ?? {}),
+                              max_concurrency: Number(event.target.value),
+                            }
+                          })
+                        }
+                      />
+                    </Field>
+                    <Field label="Timeout per trial" id="authored-suite-timeout">
                       <Input
                         id="authored-suite-timeout"
                         type="number"
@@ -811,7 +873,7 @@ export function EvalSuiteAuthoringAction({
                         onChange={(event) =>
                           editDraft((next) => {
                             next.trial_request = {
-                              trials: 1,
+                              ...(next.trial_request ?? {}),
                               timeout_seconds: Number(event.target.value),
                             }
                           })
@@ -819,8 +881,8 @@ export function EvalSuiteAuthoringAction({
                       />
                     </Field>
                     <div className="self-end rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                      1 trial · concurrency 1. Larger execution profiles arrive in the next V3
-                      slice.
+                      Every admitted trial runs. Runtime, evaluator, or required-evidence errors
+                      fail closed regardless of the pass threshold.
                     </div>
                   </CardContent>
                 </Card>
@@ -1104,16 +1166,19 @@ export function EvalSuiteAuthoringAction({
                 />
               )}
               {runPreview && runPreviewCurrent && (
-                <ReadinessSummary
-                  title={
-                    runPreview.ready
-                      ? `${runPreview.launches.length} durable ${runPreview.launches.length === 1 ? "run" : "runs"} ready`
-                      : "Launch needs attention"
-                  }
-                  ready={runPreview.ready}
-                  diagnostics={runPreview.diagnostics ?? []}
-                  identity={runPreview.selection.revision}
-                />
+                <>
+                  <ReadinessSummary
+                    title={
+                      runPreview.ready
+                        ? `${runPreview.launches.length} durable ${runPreview.launches.length === 1 ? "run" : "runs"} ready`
+                        : "Launch needs attention"
+                    }
+                    ready={runPreview.ready}
+                    diagnostics={runPreview.diagnostics ?? []}
+                    identity={runPreview.selection.revision}
+                  />
+                  {runPreview.exposure && <RunExposureSummary exposure={runPreview.exposure} />}
+                </>
               )}
               {error && (
                 <div
@@ -1177,7 +1242,12 @@ export function EvalSuiteAuthoringAction({
               <Button
                 type="button"
                 data-testid="authored-suite-launch"
-                disabled={authoringLocked || !runPreviewCurrent || !runPreview?.ready}
+                disabled={
+                  authoringLocked ||
+                  !runPreviewCurrent ||
+                  !runPreview?.ready ||
+                  !runPreview.exposure
+                }
                 onClick={launch}
               >
                 {pending === "launch" ? (
@@ -1303,6 +1373,57 @@ function ReadinessSummary({
       </div>
     </div>
   )
+}
+
+function RunExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) {
+  return (
+    <div
+      className="mt-3 grid gap-2 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2"
+      data-testid="authored-suite-exposure"
+    >
+      <div>
+        <span className="text-muted-foreground">Candidate work</span>
+        <div className="font-medium">
+          {exposure.candidate_trials.toLocaleString()} trials · up to{" "}
+          {exposure.maximum_candidate_model_steps.toLocaleString()} model steps ·{" "}
+          {exposure.maximum_candidate_total_tokens == null
+            ? "token ceiling unavailable"
+            : `${exposure.maximum_candidate_total_tokens.toLocaleString()} tokens`}
+        </div>
+      </div>
+      <div>
+        <span className="text-muted-foreground">Judge work</span>
+        <div className="font-medium">
+          {exposure.judge_evaluations.toLocaleString()} evaluations ·{" "}
+          {exposure.maximum_judge_total_tokens == null
+            ? "token ceilings unavailable"
+            : `up to ${exposure.maximum_judge_input_tokens?.toLocaleString()} input / ${exposure.maximum_judge_output_tokens?.toLocaleString()} output / ${exposure.maximum_judge_total_tokens.toLocaleString()} total tokens`}
+        </div>
+      </div>
+      <div>
+        <span className="text-muted-foreground">Maximum concurrency</span>
+        <div className="font-medium">{exposure.max_concurrency.toLocaleString()}</div>
+      </div>
+      <div>
+        <span className="text-muted-foreground">Maximum priced cost</span>
+        <div className="font-medium">
+          Candidate {formatExposureCost(exposure.candidate_cost)} · judge{" "}
+          {formatExposureCost(exposure.judge_cost)}
+        </div>
+      </div>
+      <div className="font-mono text-[11px] text-muted-foreground sm:col-span-2">
+        Accepted exposure {shortEvalIdentity(exposure.revision)}
+      </div>
+    </div>
+  )
+}
+
+function formatExposureCost(exposure: EvalSuiteRunExposureV1["candidate_cost"]): string {
+  if (exposure.state === "not_applicable") return "not applicable"
+  if (exposure.state === "unavailable") {
+    return exposure.unavailable_reason?.replaceAll("_", " ") ?? "unavailable"
+  }
+  return (exposure.totals ?? []).map((item) => `${item.amount} ${item.currency}`).join(" + ")
 }
 
 function Field({
