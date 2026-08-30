@@ -29,15 +29,18 @@ from cayu.vaults import SecretRedactor
 # The protocol version cayu advertises in the initialize request (its preferred,
 # latest-known revision).
 MCP_PROTOCOL_VERSION = "2025-06-18"
-# Every protocol revision cayu can speak. A server negotiates by echoing one of
-# these in its initialize response; anything outside the set is rejected. Older
-# servers that pin an earlier revision are accepted rather than refused outright.
-SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset(
+MCP_MODERN_PROTOCOL_VERSION = "2026-07-28"
+# Revisions that can be negotiated through the legacy initialize handshake.
+SUPPORTED_LEGACY_MCP_PROTOCOL_VERSIONS = frozenset(
     {
         "2024-11-05",
         "2025-03-26",
         "2025-06-18",
     }
+)
+# Every exact MCP revision Cayu can speak across its explicit wire eras.
+SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset(
+    {*SUPPORTED_LEGACY_MCP_PROTOCOL_VERSIONS, MCP_MODERN_PROTOCOL_VERSION}
 )
 DEFAULT_MCP_REQUEST_TIMEOUT_S = 30.0
 DEFAULT_MCP_CLIENT_NAME = "cayu"
@@ -155,6 +158,7 @@ def redact_jsonrpc_response(
     *,
     method: str,
     redactor: SecretRedactor,
+    preserve_modern_control_fields: bool = False,
 ) -> dict[str, Any]:
     """Redact exposable response data while preserving transport authority fields."""
 
@@ -175,6 +179,32 @@ def redact_jsonrpc_response(
             raw_result["protocolVersion"],
             "protocolVersion",
         )
+    if preserve_modern_control_fields and "resultType" in raw_result:
+        redacted_result["resultType"] = copy_json_value(
+            raw_result["resultType"],
+            "resultType",
+        )
+    if preserve_modern_control_fields and method in {
+        "server/discover",
+        "tools/list",
+        "resources/list",
+        "resources/read",
+    }:
+        for field_name in ("ttlMs", "cacheScope"):
+            if field_name in raw_result:
+                redacted_result[field_name] = copy_json_value(
+                    raw_result[field_name],
+                    field_name,
+                )
+    if (
+        preserve_modern_control_fields
+        and method == "server/discover"
+        and "supportedVersions" in raw_result
+    ):
+        redacted_result["supportedVersions"] = copy_json_value(
+            raw_result["supportedVersions"],
+            "supportedVersions",
+        )
     return redacted
 
 
@@ -183,6 +213,7 @@ def safely_redact_jsonrpc_response(
     *,
     method: str,
     redactor: SecretRedactor,
+    preserve_modern_control_fields: bool = False,
 ) -> JsonrpcRedactionResult:
     """Redact without propagating validation frames that retain the response."""
 
@@ -191,6 +222,7 @@ def safely_redact_jsonrpc_response(
             response,
             method=method,
             redactor=redactor,
+            preserve_modern_control_fields=preserve_modern_control_fields,
         )
     except (RecursionError, ValueError):
         return JsonrpcRedactionResult(
@@ -309,7 +341,7 @@ def merge_jsonrpc_authority_mapping(
 
 def validate_negotiated_protocol_version(version: str) -> None:
     """Raise if the server negotiated a protocol revision cayu cannot speak."""
-    if version not in SUPPORTED_MCP_PROTOCOL_VERSIONS:
+    if version not in SUPPORTED_LEGACY_MCP_PROTOCOL_VERSIONS:
         raise McpProtocolError(f"MCP server negotiated unsupported protocol version {version!r}.")
 
 
@@ -727,12 +759,20 @@ def tool_definition_from_payload(payload: object, server_name: str) -> McpToolDe
     )
 
 
-def tool_result_from_payload(payload: object) -> McpToolResult:
+def tool_result_from_payload(
+    payload: object,
+    *,
+    allow_arbitrary_structured_content: bool = False,
+) -> McpToolResult:
     if type(payload) is not dict:
         raise McpProtocolError("MCP tools/call result must be an object.")
     return _consume_model_payload(
         cast("dict[str, Any]", payload),
-        _tool_result_from_payload,
+        (
+            _modern_tool_result_from_payload
+            if allow_arbitrary_structured_content
+            else _tool_result_from_payload
+        ),
         failure_message="MCP tools/call result contained invalid data.",
     )
 
@@ -744,6 +784,30 @@ def _tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
     structured_content = payload.get("structuredContent")
     if structured_content is not None and type(structured_content) is not dict:
         raise McpProtocolError("MCP structuredContent must be an object.")
+    return _validated_tool_result_from_payload(
+        payload,
+        content=content,
+        structured_content=structured_content,
+    )
+
+
+def _modern_tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
+    content = payload.get("content", [])
+    if not isinstance(content, list):
+        raise McpProtocolError("MCP tool result content must be a list.")
+    return _validated_tool_result_from_payload(
+        payload,
+        content=content,
+        structured_content=payload.get("structuredContent"),
+    )
+
+
+def _validated_tool_result_from_payload(
+    payload: dict[str, Any],
+    *,
+    content: list[Any],
+    structured_content: Any,
+) -> McpToolResult:
     is_error = payload.get("isError", False)
     if type(is_error) is not bool:
         raise McpProtocolError("MCP tool result isError must be a bool.")

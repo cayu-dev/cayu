@@ -170,6 +170,21 @@ the canonical CAS/debugging representation; registry, Cloud, browser, and
 desktop integrations can use the documented extension and MIME association
 without being implemented in this release.
 
+### Streamable HTTP can opt into the stateless MCP 2026 protocol era
+
+`HttpMcpClient` now accepts the explicit
+`protocol_era=McpProtocolEra.MODERN_2026_07_28` opt-in. That path uses
+`server/discover` instead of the legacy initialize handshake, sends the required
+per-request `_meta` and HTTP routing headers, validates modern result and cache
+metadata, and never creates or deletes an MCP protocol session. Tool header
+mirroring is derived only from admitted `x-mcp-header` annotations and publishes
+atomically with private tool dispatch authority. The legacy HTTP path remains
+the default and its behavior is unchanged.
+
+This is a pinned modern HTTP core, not a claim of complete MCP 2026 support.
+Automatic fallback, modern stdio, response caching, `subscriptions/listen`, and
+MRTR / `input_required` remain separate work.
+
 ### Evals separate per-run concurrency from shared runtime capacity
 
 Evaluation targets and durable run records no longer impose a universal

@@ -1,11 +1,13 @@
 """MCP integration contracts."""
 
+from cayu.mcp._http_protocol import McpProtocolEra
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
     DEFAULT_MCP_MAX_LIST_ITEMS,
     DEFAULT_MCP_MAX_LIST_PAGES,
     DEFAULT_MCP_REQUEST_TIMEOUT_S,
+    MCP_MODERN_PROTOCOL_VERSION,
     MCP_PROTOCOL_VERSION,
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
     McpProtocolError,
@@ -82,6 +84,7 @@ __all__ = [
     "DEFAULT_MCP_MAX_RESPONSE_BYTES",
     "DEFAULT_MCP_REQUEST_TIMEOUT_S",
     "DEFAULT_MCP_WRITE_TIMEOUT_S",
+    "MCP_MODERN_PROTOCOL_VERSION",
     "MCP_PROTOCOL_VERSION",
     "SUPPORTED_MCP_PROTOCOL_VERSIONS",
     "HttpMcpClient",
@@ -92,6 +95,7 @@ __all__ = [
     "McpInitializeResult",
     "McpMessageTooLargeError",
     "McpPeerClosedError",
+    "McpProtocolEra",
     "McpProtocolError",
     "McpResourceDefinition",
     "McpResourceResult",

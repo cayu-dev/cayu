@@ -123,7 +123,7 @@ def copy_mcp_server_spec(spec: McpServerSpec) -> McpServerSpec:
 
 
 class McpInitializeResult(BaseModel):
-    """Server metadata returned by MCP initialize."""
+    """Validated server metadata established for an MCP connection."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -300,7 +300,7 @@ class McpToolResult(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     content: list[dict[str, Any]] = Field(default_factory=list)
-    structured_content: dict[str, Any] | None = None
+    structured_content: Any = None
     is_error: StrictBool = False
 
     @field_validator("content", "structured_content", mode="before")
@@ -352,7 +352,7 @@ class McpResourceResult(BaseModel):
 
 
 class McpSession(ABC):
-    """Initialized connection to one MCP server."""
+    """Established connection to one MCP server."""
 
     # Default: no injected secrets, so nothing to redact. Concrete sessions that inject
     # secret_env/secret_headers set an instance-level redactor built from the resolved
@@ -372,7 +372,7 @@ class McpSession(ABC):
     @property
     @abstractmethod
     def initialize_result(self) -> McpInitializeResult:
-        """Metadata returned by MCP initialize."""
+        """Validated metadata established for this MCP connection."""
 
     @abstractmethod
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:

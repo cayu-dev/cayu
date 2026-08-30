@@ -878,7 +878,7 @@ class McpToolAdapter(Tool):
 
 
 class McpToolset:
-    """Persistent initialized MCP server connection plus Cayu tool adapters."""
+    """Persistent established MCP server connection plus Cayu tool adapters."""
 
     def __init__(
         self,
@@ -1863,7 +1863,7 @@ def _bounded_text(value: str, max_chars: int) -> str:
 def _mcp_tool_result_text(
     content: list[dict[str, Any]],
     *,
-    structured_content: dict[str, Any] | None = None,
+    structured_content: Any = None,
 ) -> str:
     text_blocks: list[str] = []
     non_text_count = 0
@@ -1918,7 +1918,7 @@ def _redact_mcp_content(
     return redacted
 
 
-def _structured_content_text(structured_content: dict[str, Any] | None) -> str:
+def _structured_content_text(structured_content: Any) -> str:
     if structured_content is None:
         return ""
     encoded = json.dumps(

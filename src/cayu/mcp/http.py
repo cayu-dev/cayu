@@ -4,34 +4,37 @@ JSON-RPC messages are sent as HTTP POST bodies to a single endpoint (`server.url
 The server replies either with `application/json` (one JSON-RPC response) or
 `text/event-stream` (SSE). The SSE stream is consumed incrementally and the matching
 JSON-RPC response is returned the moment it arrives — the call does not wait for the
-server to close the stream. Exact `notifications/tools/list_changed` notifications
-can be consumed both from POST response streams and, when the server supports it,
-from one session-owned GET/SSE listener. Other notifications remain payload-free and
-ignored, but a server-initiated request (which this client cannot answer) fails the
-session with a protocol error rather than being silently dropped. Cayu incrementally
-enforces message/event and aggregate-response byte limits, an inbound idle timeout,
-and an absolute call deadline. Listener activation and later gaps fence catalogue
-dispatch until a stream is established and reconciled; safe SSE cursors are replayed
-with `Last-Event-ID`. Listener exchanges retain cancellation-resistant reads and
-stream cleanup through the same session-wide settlement barrier as POST. A session
-id (`Mcp-Session-Id`) issued on `initialize` is echoed on
-every later request, and `MCP-Protocol-Version` is sent on every request after
-initialization. The JSON<->model parsing is the shared logic in `cayu.mcp._jsonrpc`,
-identical to the stdio transport.
+server to close the stream. The default legacy era performs `initialize`, owns an
+`Mcp-Session-Id`, and can consume exact `notifications/tools/list_changed` signals
+from POST streams or one session-owned GET/SSE listener. The explicit 2026-07-28 era
+is stateless: it uses `server/discover`, sends the required per-request metadata and
+routing headers, and does not create, listen on, or delete a protocol session. Modern
+catalogue changes remain manual until `subscriptions/listen` is implemented.
 
-Two deliberate deviations from the spec's SHOULD/MUST guidance, suited to a
-request/response session: on HTTP 404 (expired session) we raise and mark the session
-unusable rather than transparently re-initializing — the caller/toolset reconnects to
-start a new session; and to cancel we drop the connection rather than sending a
-`CancelledNotification` (a possible future enhancement).
+Cayu incrementally enforces message/event and aggregate-response byte limits, an
+inbound idle timeout, and an absolute call deadline in both eras. The JSON<->model
+parsing is shared with the stdio transport after each era-specific wire boundary.
+On the legacy path, HTTP 404 marks the session unusable rather than transparently
+re-initializing, and cancellation drops the connection instead of sending a
+`CancelledNotification`. On the modern path, HTTP status errors apply to one request
+and cancellation closes that request's response stream.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, aclosing, suppress
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
@@ -49,12 +52,27 @@ from cayu.mcp._exception_handoffs import (
     attach_mcp_http_settlement_task,
     mcp_http_settlement_task,
 )
+from cayu.mcp._http_protocol import (
+    MCP_METHOD_HEADER,
+    MCP_NAME_HEADER,
+    MCP_PARAMETER_HEADER_PREFIX,
+    MCP_PROTOCOL_VERSION_HEADER,
+    MCP_SESSION_ID_HEADER,
+    LegacyHttpMcpWireProtocol,
+    McpHttpToolHeaderContract,
+    McpProtocolEra,
+    ModernHttpMcpWireProtocol,
+    mirrored_mcp_http_tool_headers,
+    modern_discover_result_from_payload,
+    modern_http_tool_header_contract,
+    validate_modern_mcp_result,
+)
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
     DEFAULT_MCP_MAX_LIST_ITEMS,
     DEFAULT_MCP_MAX_LIST_PAGES,
-    SUPPORTED_MCP_PROTOCOL_VERSIONS,
+    SUPPORTED_LEGACY_MCP_PROTOCOL_VERSIONS,
     JsonrpcAuthorityMappingResult,
     McpPaginatedPage,
     McpProtocolError,
@@ -120,8 +138,6 @@ from cayu.vaults import (
 # is 30s). Both are overridable per-server via McpServerSpec.metadata["timeout"].
 DEFAULT_HTTP_MCP_TIMEOUT_S = 120.0
 DEFAULT_HTTP_MCP_CONNECT_TIMEOUT_S = 10.0
-MCP_SESSION_ID_HEADER = "mcp-session-id"
-MCP_PROTOCOL_VERSION_HEADER = "mcp-protocol-version"
 _JSON_CONTENT_TYPE = "application/json"
 _SSE_CONTENT_TYPE = "text/event-stream"
 _ACCEPT_HEADER = f"{_JSON_CONTENT_TYPE}, {_SSE_CONTENT_TYPE}"
@@ -133,6 +149,28 @@ _MCP_SERVER_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
 _MAX_SSE_REPLAY_EVENT_ID_BYTES = 1024
 _LAST_EVENT_ID_HEADER = "last-event-id"
 _T = TypeVar("_T")
+_LOGGER = logging.getLogger(__name__)
+
+
+def _validate_modern_static_http_headers(server: McpServerSpec) -> None:
+    """Keep every modern MCP routing/session header transport-owned."""
+
+    for configured_headers in (server.headers, server.secret_headers):
+        for header_name in configured_headers:
+            normalized_name = header_name.lower()
+            if normalized_name in {
+                "accept",
+                "accept-encoding",
+                "content-type",
+                MCP_PROTOCOL_VERSION_HEADER,
+                MCP_METHOD_HEADER,
+                MCP_NAME_HEADER,
+                MCP_SESSION_ID_HEADER,
+            } or normalized_name.startswith(MCP_PARAMETER_HEADER_PREFIX):
+                raise ValueError(
+                    "MCP 2026 HTTP framing, routing, and session headers are transport-owned; "
+                    "remove them from server headers."
+                )
 
 
 async def _sleep_before_mcp_server_listener_reconnect(delay_s: float) -> None:
@@ -153,6 +191,53 @@ class _McpHttpStatusError(McpProtocolError):
     def __init__(self, message: str, *, status_code: int) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+@dataclass(frozen=True, slots=True)
+class _HttpToolDispatchAuthority:
+    transport_name: str
+    header_contract: McpHttpToolHeaderContract
+
+
+def _filter_invalid_modern_http_tool_headers(
+    response: dict[str, Any],
+) -> tuple[McpHttpToolHeaderContract, ...] | None:
+    """Exclude tools whose ``x-mcp-header`` authority violates the 2026 spec."""
+
+    result = response.get("result")
+    if type(result) is not dict:
+        return None
+    tools = result.get("tools")
+    if type(tools) is not list:
+        return None
+    retained_tools: list[Any] = []
+    contracts: list[McpHttpToolHeaderContract] = []
+    excluded_count = 0
+    for tool in tools:
+        input_schema = tool.get("inputSchema", {}) if type(tool) is dict else None
+        try:
+            contract = modern_http_tool_header_contract(input_schema)
+        except McpProtocolError:
+            excluded_count += 1
+            continue
+        retained_tools.append(tool)
+        contracts.append(contract)
+    tools.clear()
+    tools.extend(retained_tools)
+    retained_tools.clear()
+    if excluded_count:
+        _LOGGER.warning(
+            "Excluded %d MCP tool(s) with invalid x-mcp-header annotations.",
+            excluded_count,
+        )
+    return tuple(contracts)
+
+
+def _modern_http_tool_result_from_payload(payload: object) -> McpToolResult:
+    return tool_result_from_payload(
+        payload,
+        allow_arbitrary_structured_content=True,
+    )
 
 
 def _http_server_listener_status_is_retryable(status_code: int) -> bool:
@@ -232,7 +317,7 @@ def _initialize_cleanup_protocol_version(message: dict[str, Any]) -> str | None:
     if type(result) is not dict:
         return None
     protocol_version = result.get("protocolVersion")
-    if type(protocol_version) is str and protocol_version in SUPPORTED_MCP_PROTOCOL_VERSIONS:
+    if type(protocol_version) is str and protocol_version in SUPPORTED_LEGACY_MCP_PROTOCOL_VERSIONS:
         return protocol_version
     return None
 
@@ -252,6 +337,7 @@ class HttpMcpClient(McpClient):
         client_version: str = DEFAULT_MCP_CLIENT_VERSION,
         max_list_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
         max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
+        protocol_era: McpProtocolEra = McpProtocolEra.LEGACY,
         transport: httpx.AsyncBaseTransport | None = None,
         secret_resolver: SecretResolver | None = None,
     ) -> None:
@@ -276,6 +362,9 @@ class HttpMcpClient(McpClient):
         self.client_version = require_clean_nonblank(client_version, "client_version")
         self.max_list_pages = validate_positive_integer(max_list_pages, "max_list_pages")
         self.max_list_items = validate_positive_integer(max_list_items, "max_list_items")
+        if type(protocol_era) is not McpProtocolEra:
+            raise TypeError("protocol_era must be an McpProtocolEra.")
+        self.protocol_era = protocol_era
         self._transport = transport
         if secret_resolver is not None:
             validate_secret_resolver(secret_resolver)
@@ -292,6 +381,8 @@ class HttpMcpClient(McpClient):
                 "HttpMcpClient does not support MCP secret_env; a remote server's "
                 "process environment cannot be set by the client."
             )
+        if self.protocol_era is McpProtocolEra.MODERN_2026_07_28:
+            _validate_modern_static_http_headers(server)
         if server.secret_headers and self.secret_resolver is None:
             raise ValueError(
                 "HttpMcpClient cannot resolve MCP secret_headers without a secret_resolver. "
@@ -344,6 +435,7 @@ class HttpMcpClient(McpClient):
                 transport_limits=transport_limits,
                 max_list_pages=self.max_list_pages,
                 max_list_items=self.max_list_items,
+                protocol_era=self.protocol_era,
                 secret_redactor=secret_redactor,
             )
         finally:
@@ -418,6 +510,7 @@ class HttpMcpSession(McpSession):
         transport_limits: McpTransportLimits | None = None,
         max_list_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
         max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
+        protocol_era: McpProtocolEra = McpProtocolEra.LEGACY,
         secret_redactor: SecretRedactor | None = None,
     ) -> None:
         server = copy_mcp_server_spec(server)
@@ -434,6 +527,17 @@ class HttpMcpSession(McpSession):
         self.transport_limits = resolved_limits
         self.max_list_pages = validate_positive_integer(max_list_pages, "max_list_pages")
         self.max_list_items = validate_positive_integer(max_list_items, "max_list_items")
+        if type(protocol_era) is not McpProtocolEra:
+            raise TypeError("protocol_era must be an McpProtocolEra.")
+        self.protocol_era = protocol_era
+        self._wire_protocol = (
+            LegacyHttpMcpWireProtocol()
+            if protocol_era is McpProtocolEra.LEGACY
+            else ModernHttpMcpWireProtocol(
+                client_name=client_name,
+                client_version=client_version,
+            )
+        )
         self._http = http_client
         self._url = url
         self._initialize_result: McpInitializeResult | None = None
@@ -451,7 +555,7 @@ class HttpMcpSession(McpSession):
         self._client_close_failure: BaseException | None = None
         self._active_exchange_settlements: set[asyncio.Future[None]] = set()
         self._settlement_tasks: set[asyncio.Task[None]] = set()
-        self._tool_transport_names: dict[str, str] = {}
+        self._tool_dispatch_authority: dict[str, _HttpToolDispatchAuthority] = {}
         self._resource_transport_uris: dict[str, str] = {}
         self._authority_mapping_lock = asyncio.Lock()
         self._tools_list_changed_handler: Callable[[], None] | None = None
@@ -470,10 +574,37 @@ class HttpMcpSession(McpSession):
             raise McpProtocolError("MCP session has not been initialized.")
         return self._initialize_result
 
+    @property
+    def _tool_transport_names(self) -> dict[str, str]:
+        """Private-name projection retained for diagnostics and conformance tests."""
+
+        authority = self._tool_dispatch_authority
+        return {
+            public_name: binding.transport_name
+            for public_name, binding in authority.items()
+            if public_name != binding.transport_name
+        }
+
+    @_tool_transport_names.setter
+    def _tool_transport_names(self, value: dict[str, str]) -> None:
+        """Preserve the private transport-name injection seam without split authority."""
+
+        if type(value) is not dict:
+            raise TypeError("_tool_transport_names must be a dict.")
+        self._tool_dispatch_authority = {
+            public_name: _HttpToolDispatchAuthority(
+                transport_name=transport_name,
+                header_contract=(),
+            )
+            for public_name, transport_name in value.items()
+        }
+
     def _set_tools_list_changed_handler(
         self,
         handler: Callable[[], None] | None,
     ) -> bool:
+        if handler is not None and not self._wire_protocol.supports_legacy_listener:
+            return False
         if handler is not None and self._closed:
             return False
         if handler is not None:
@@ -504,6 +635,8 @@ class HttpMcpSession(McpSession):
         self,
         handler: Callable[[bool], None] | None,
     ) -> bool:
+        if handler is not None and not self._wire_protocol.supports_legacy_listener:
+            return False
         if handler is not None and self._closed:
             return False
         self._tools_list_changed_continuity_handler = handler
@@ -815,6 +948,14 @@ class HttpMcpSession(McpSession):
             await task
 
     async def initialize(self) -> None:
+        """Establish server metadata using the selected protocol era."""
+
+        if self.protocol_era is McpProtocolEra.LEGACY:
+            await self._initialize_legacy()
+        else:
+            await self._discover_modern()
+
+    async def _initialize_legacy(self) -> None:
         def parse_initialize_result(result: Any) -> McpInitializeResult:
             initialize_result = initialize_result_from_payload(result)
             validation_error: McpProtocolError | None = None
@@ -864,6 +1005,28 @@ class HttpMcpSession(McpSession):
         finally:
             self._initializing = False
 
+    async def _discover_modern(self) -> None:
+        if self._initializing:
+            raise McpProtocolError("MCP HTTP session establishment is already in progress.")
+        self._initializing = True
+        try:
+            discover_result = await self._request(
+                "server/discover",
+                {},
+                result_parser=modern_discover_result_from_payload,
+            )
+            if self._closed:
+                raise McpProtocolError("MCP HTTP session was closed during discovery.")
+            self._initialize_result = discover_result
+        except BaseException as error:
+            self._initialize_result = None
+            self._closed = True
+            if _http_settlement_task(error) is None:
+                self._begin_failed_session_close(error)
+            raise
+        finally:
+            self._initializing = False
+
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
         discovery = await self._discover_builtin_tools_for_toolset()
         await discovery.commit()
@@ -876,7 +1039,9 @@ class HttpMcpSession(McpSession):
 
     async def _discover_builtin_tools_for_toolset(self) -> _McpToolDiscovery:
         transport_names: dict[str, str] = {}
+        http_header_contracts: dict[str, McpHttpToolHeaderContract] = {}
         private_contract_hashes: list[str] = []
+        observed_wire_tool_count = [0]
         parsed_tool_count = 0
 
         def parse_tools_page(result: Any) -> dict[str, Any]:
@@ -917,6 +1082,8 @@ class HttpMcpSession(McpSession):
                 params,
                 authority_mapping=transport_names,
                 private_tool_contract_hashes=private_contract_hashes,
+                private_http_tool_header_contracts=http_header_contracts,
+                private_observed_tool_count=observed_wire_tool_count,
                 paginated=True,
                 result_parser=parse_tools_page,
             )
@@ -932,6 +1099,7 @@ class HttpMcpSession(McpSession):
             )
         except BaseException:
             transport_names.clear()
+            http_header_contracts.clear()
             private_contract_hashes.clear()
             raise
         definitions = tuple(tools)
@@ -946,20 +1114,30 @@ class HttpMcpSession(McpSession):
                         "MCP HTTP session closed before tool discovery was published."
                     )
                 validate()
-                self._tool_transport_names = {
-                    public: raw for public, raw in transport_names.items() if public != raw
+                self._tool_dispatch_authority = {
+                    public_name: _HttpToolDispatchAuthority(
+                        transport_name=transport_name,
+                        header_contract=http_header_contracts.get(public_name, ()),
+                    )
+                    for public_name, transport_name in transport_names.items()
                 }
                 transport_names.clear()
+                http_header_contracts.clear()
+
+        def discard_transport_authority() -> None:
+            transport_names.clear()
+            http_header_contracts.clear()
 
         try:
             return _McpToolDiscovery(
                 definitions,
                 private_contract_hashes=private_hashes,
                 commit=commit_transport_names,
-                discard=transport_names.clear,
+                discard=discard_transport_authority,
             )
         except BaseException:
             transport_names.clear()
+            http_header_contracts.clear()
             raise
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
@@ -1010,19 +1188,56 @@ class HttpMcpSession(McpSession):
             if type(copied_arguments) is not dict:
                 raise TypeError("MCP tool arguments must be an object.")
             arguments = copied_arguments
+        dispatch_authority = self._tool_dispatch_authority.get(tool_name)
         request_params = {
-            "name": self._tool_transport_names.get(tool_name, tool_name),
+            "name": (
+                dispatch_authority.transport_name if dispatch_authority is not None else tool_name
+            ),
             "arguments": arguments,
         }
+        mirrored_headers: dict[str, str] | None = None
+        if self._wire_protocol.validates_modern_results:
+            if dispatch_authority is None:
+                request_params.clear()
+                arguments = {}
+                raise McpProtocolError(
+                    "MCP 2026 HTTP tools must be listed before they can be called."
+                )
+            header_error: str | None = None
+            try:
+                mirrored_headers = mirrored_mcp_http_tool_headers(
+                    dispatch_authority.header_contract,
+                    arguments,
+                )
+            except McpProtocolError as error:
+                header_error = str(error)
+            if header_error is not None:
+                request_params.clear()
+                arguments = {}
+                dispatch_authority = None
+                name = ""
+                tool_name = ""
+                raise McpProtocolError(header_error) from None
+        dispatch_authority = None
         name = ""
         tool_name = ""
         arguments = {}
-        return await self._request(
+        call = self._request(
             "tools/call",
             request_params,
-            result_parser=tool_result_from_payload,
+            result_parser=(
+                _modern_http_tool_result_from_payload
+                if self._wire_protocol.validates_modern_results
+                else tool_result_from_payload
+            ),
             dispatch_signal=dispatch_signal,
+            mirrored_headers=mirrored_headers,
         )
+        try:
+            return await call
+        finally:
+            if mirrored_headers is not None:
+                mirrored_headers.clear()
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
         transport_uris: dict[str, str] = {}
@@ -1118,6 +1333,8 @@ class HttpMcpSession(McpSession):
             # revoke the refresh-owned catalogue synchronously.
             self._mark_server_listener_gap()
             self._closed = True
+            self._tool_dispatch_authority = {}
+            self._resource_transport_uris = {}
             self._close_task = asyncio.create_task(self._close_impl())
         sanitized_cancellation: asyncio.CancelledError | None = None
         try:
@@ -1146,6 +1363,8 @@ class HttpMcpSession(McpSession):
         # inherited HTTP request entrances can be fenced immediately.
         self._closed = True
         self._mark_server_listener_gap()
+        self._tool_dispatch_authority = {}
+        self._resource_transport_uris = {}
         self._tools_list_changed_handler = None
         self._tools_list_changed_continuity_handler = None
         self._server_listener_has_connected = False
@@ -1171,6 +1390,8 @@ class HttpMcpSession(McpSession):
         terminate its known server-side session despite the logical fence. An
         uncertain transport exchange must retain its exact settlement instead.
         """
+        self._tool_dispatch_authority = {}
+        self._resource_transport_uris = {}
 
         if not terminate_fenced_session:
             # Ordinary initialization failures retain the historical close owner.
@@ -1516,7 +1737,7 @@ class HttpMcpSession(McpSession):
                 return
             await asyncio.wait(pending)
 
-    def _begin_fenced_settlement(
+    def _begin_uncertain_exchange_settlement(
         self,
         *,
         exchange_owner: _HttpExchangeOwner,
@@ -1526,6 +1747,22 @@ class HttpMcpSession(McpSession):
         initialize_request: bool,
         already_reported_failure_ids: frozenset[int] = frozenset(),
     ) -> None:
+        if not self._wire_protocol.uses_protocol_sessions and self._initialize_result is not None:
+            # Modern HTTP requests are independent. Settle only this request's
+            # response stream; the session-wide active-exchange barrier keeps a
+            # concurrent close from closing the shared client ahead of it.
+            settlement_task = asyncio.create_task(
+                _settle_registered_http_exchange(
+                    exchange_owner=exchange_owner,
+                    abandoned_tasks=abandoned_tasks,
+                    redactor=redactor,
+                    already_reported_failure_ids=already_reported_failure_ids,
+                    defer_client_close_to_parent=True,
+                )
+            )
+            self._retain_settlement_task(settlement_task)
+            _attach_http_settlement_task(error, settlement_task)
+            return
         self._mark_server_listener_gap()
         self._closed = True
         self._fenced = True
@@ -1643,6 +1880,14 @@ class HttpMcpSession(McpSession):
         error = McpCallDeadlineExceededError(
             "MCP HTTP exchange exceeded its total call deadline during response processing."
         )
+        if not self._wire_protocol.uses_protocol_sessions and self._initialize_result is not None:
+            safe_error = credential_safe_mcp_transport_failure(
+                error,
+                redactor=redactor,
+                context=f"MCP {method_name} request timed out",
+                preserve_cause=True,
+            )
+            raise safe_error from None
         self._mark_server_listener_gap()
         self._closed = True
         self._fenced = True
@@ -1671,9 +1916,12 @@ class HttpMcpSession(McpSession):
         *,
         authority_mapping: dict[str, str] | None = None,
         private_tool_contract_hashes: list[str] | None = None,
+        private_http_tool_header_contracts: (dict[str, McpHttpToolHeaderContract] | None) = None,
+        private_observed_tool_count: list[int] | None = None,
         paginated: bool = False,
         result_parser: Callable[[Any], Any] | None = None,
         dispatch_signal: _McpToolDispatchSignal | None = None,
+        mirrored_headers: Mapping[str, str] | None = None,
     ) -> Any:
         budget = _HttpCallBudget(self.transport_limits)
         method_name = require_clean_nonblank(method, "method")
@@ -1686,10 +1934,12 @@ class HttpMcpSession(McpSession):
         self._next_id += 1
         sanitized_error: BaseException | None = None
         response_envelope: _HttpResponseEnvelope | None = None
+        aligned_http_header_contracts: tuple[McpHttpToolHeaderContract, ...] | None = None
         try:
             try:
-                if self._initializing and method_name != "initialize":
+                if self._initializing and method_name != self._wire_protocol.establishment_method:
                     raise McpProtocolError("MCP HTTP session initialization is still in progress.")
+                params = self._wire_protocol.prepare_request_params(method_name, params)
                 request_preflight = mcp_jsonrpc_request_preflight(
                     request_id,
                     method_name,
@@ -1717,12 +1967,21 @@ class HttpMcpSession(McpSession):
                 # owned HTTP exchange. Once this task yields, the request may have
                 # reached the remote target and must be allowed to settle.
                 dispatch_signal.mark_dispatched()
-            send_result = await self._send(
-                payload,
-                request_id,
-                budget=budget,
-                failure_redactor=failure_redactor,
-            )
+            if mirrored_headers is None:
+                send_result = await self._send(
+                    payload,
+                    request_id,
+                    budget=budget,
+                    failure_redactor=failure_redactor,
+                )
+            else:
+                send_result = await self._send(
+                    payload,
+                    request_id,
+                    budget=budget,
+                    failure_redactor=failure_redactor,
+                    mirrored_headers=mirrored_headers,
+                )
             # Preserve the long-standing internal test/extension seam whose
             # injected send doubles return the raw JSON-RPC object.
             if type(send_result) is _HttpResponseEnvelope:
@@ -1801,10 +2060,25 @@ class HttpMcpSession(McpSession):
             raise McpProtocolError(
                 "MCP HTTP JSON-RPC response exceeded the supported JSON nesting."
             ) from None
+        if self._wire_protocol.validates_modern_results and method_name == "tools/list":
+            raw_result = message.get("result")
+            raw_tools = raw_result.get("tools") if type(raw_result) is dict else None
+            if type(raw_tools) is list and private_observed_tool_count is not None:
+                observed_items = private_observed_tool_count[0] + len(raw_tools)
+                if observed_items > self.max_list_items:
+                    message.clear()
+                    response_envelope.clear_private_authority()
+                    raise McpProtocolError(
+                        f"MCP tools/list returned {observed_items} items, exceeding "
+                        f"max_list_items={self.max_list_items}."
+                    ) from None
+                private_observed_tool_count[0] = observed_items
+            aligned_http_header_contracts = _filter_invalid_modern_http_tool_headers(message)
         redaction_result = safely_redact_jsonrpc_response(
             message,
             method=method_name,
             redactor=self._secret_redactor,
+            preserve_modern_control_fields=self._wire_protocol.validates_modern_results,
         )
         redacted_message = redaction_result.response
         mapping_result = JsonrpcAuthorityMappingResult({})
@@ -1837,6 +2111,46 @@ class HttpMcpSession(McpSession):
             private_evidence_error = evidence_result.error
             if private_evidence_error is None:
                 private_tool_contract_hashes.extend(evidence_result.hashes)
+        if (
+            mapping_error is None
+            and private_http_tool_header_contracts is not None
+            and aligned_http_header_contracts is not None
+        ):
+            raw_result = message.get("result")
+            redacted_result = redacted_message.get("result")
+            raw_tools = raw_result.get("tools") if type(raw_result) is dict else None
+            redacted_tools = redacted_result.get("tools") if type(redacted_result) is dict else None
+            if (
+                type(raw_tools) is not list
+                or type(redacted_tools) is not list
+                or len(raw_tools) != len(aligned_http_header_contracts)
+                or len(redacted_tools) != len(aligned_http_header_contracts)
+            ):
+                mapping_error = "MCP tools/list header authority did not match its tools."
+            else:
+                staged_header_contracts = dict(private_http_tool_header_contracts)
+                for redacted_tool, contract in zip(
+                    redacted_tools,
+                    aligned_http_header_contracts,
+                    strict=True,
+                ):
+                    public_name = (
+                        cast("dict[str, Any]", redacted_tool).get("name")
+                        if type(redacted_tool) is dict
+                        else None
+                    )
+                    if type(public_name) is not str:
+                        mapping_error = "MCP tools/list header authority had an invalid tool name."
+                        break
+                    previous = staged_header_contracts.get(public_name)
+                    if previous is not None and previous != contract:
+                        mapping_error = "MCP tool header authority changed within one discovery."
+                        break
+                    staged_header_contracts[public_name] = contract
+                if mapping_error is None:
+                    private_http_tool_header_contracts.clear()
+                    private_http_tool_header_contracts.update(staged_header_contracts)
+                staged_header_contracts.clear()
         if mapping_error is None and authority_mapping is not None:
             merge_result = merge_jsonrpc_authority_mapping(
                 authority_mapping,
@@ -1852,6 +2166,9 @@ class HttpMcpSession(McpSession):
             authority_mapping.clear()
         if mapping_error is not None and private_tool_contract_hashes is not None:
             private_tool_contract_hashes.clear()
+        if mapping_error is not None and private_http_tool_header_contracts is not None:
+            private_http_tool_header_contracts.clear()
+        aligned_http_header_contracts = None
         mapping_result.mapping.clear()
         raw_result = None
         # The redacted response is the only representation needed after
@@ -1883,6 +2200,8 @@ class HttpMcpSession(McpSession):
             result = result_from_jsonrpc_response(redacted_message, method_name)
             redacted_message.clear()
             redaction_result = None
+            if self._wire_protocol.validates_modern_results:
+                result = validate_modern_mcp_result(result, method=method_name)
             if result_parser is not None:
                 result = result_parser(result)
         except BaseException:
@@ -2022,12 +2341,14 @@ class HttpMcpSession(McpSession):
         failure_redactor: SecretRedactor | None = None,
         protocol_version: str | None = None,
         session_id: str | None = None,
+        mirrored_headers: Mapping[str, str] | None = None,
     ) -> _HttpResponseEnvelope:
         # Stream the response so an SSE reply is returned as soon as the matching
         # JSON-RPC event arrives, without waiting for the server to close the stream.
         failure_redactor = failure_redactor or self._secret_redactor
         initialize_request = payload.get("method") == "initialize"
         content = b""
+        request_headers: dict[str, str] = {}
         try:
             if self._closed:
                 listener_failure = self._tools_list_changed_listener_failure_message()
@@ -2044,6 +2365,19 @@ class HttpMcpSession(McpSession):
                     "MCP HTTP JSON-RPC request exceeded "
                     f"{self.transport_limits.max_message_bytes} bytes."
                 )
+            request_headers = self._wire_protocol.request_headers(
+                payload,
+                initialized_protocol_version=(
+                    self._initialize_result.protocol_version
+                    if self._initialize_result is not None
+                    else None
+                ),
+                negotiated_protocol_version=self._negotiated_protocol_version,
+                session_id=self._session_id,
+                protocol_version_override=protocol_version,
+                session_id_override=session_id,
+                mirrored_headers=mirrored_headers,
+            )
             content = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         finally:
             # ``payload`` is the defensive transport copy. Do not retain it when
@@ -2079,10 +2413,7 @@ class HttpMcpSession(McpSession):
                 "POST",
                 self._url,
                 content=content,
-                headers=self._protocol_headers(
-                    protocol_version=protocol_version,
-                    session_id=session_id,
-                ),
+                headers=request_headers,
                 follow_redirects=False,
             )
             exchange_owner = _HttpExchangeOwner(stream_context)
@@ -2108,7 +2439,7 @@ class HttpMcpSession(McpSession):
                 budget=budget,
                 redactor=failure_redactor,
             )
-            staged_session_id = response.headers.get(MCP_SESSION_ID_HEADER)
+            staged_session_id = self._wire_protocol.response_session_id(response.headers)
             if request_id is None:
                 await _consume_http_notification_response(
                     response,
@@ -2249,6 +2580,7 @@ class HttpMcpSession(McpSession):
             exc = None
         finally:
             content = b""
+            request_headers.clear()
             # Response authority is staged above only after the bounded body is
             # accepted. The request owner commits it after semantic validation.
             # Do not retain rejected header values in a body/cleanup traceback.
@@ -2268,7 +2600,7 @@ class HttpMcpSession(McpSession):
                     except asyncio.CancelledError as cancellation:
                         if primary_error is not None:
                             _attach_http_cleanup_failure(cancellation, primary_error)
-                        self._begin_fenced_settlement(
+                        self._begin_uncertain_exchange_settlement(
                             exchange_owner=exchange_owner,
                             abandoned_tasks=budget.take_abandoned_tasks(),
                             error=cancellation,
@@ -2284,7 +2616,7 @@ class HttpMcpSession(McpSession):
                         authoritative_error = primary_error or timeout_error
                         if primary_error is not None:
                             _attach_http_cleanup_failure(primary_error, timeout_error)
-                        self._begin_fenced_settlement(
+                        self._begin_uncertain_exchange_settlement(
                             exchange_owner=exchange_owner,
                             abandoned_tasks=budget.take_abandoned_tasks(),
                             error=authoritative_error,
@@ -2315,7 +2647,7 @@ class HttpMcpSession(McpSession):
                         else:
                             _attach_http_cleanup_failure(primary_error, safe_cleanup_error)
                             authoritative_error = primary_error
-                        self._begin_fenced_settlement(
+                        self._begin_uncertain_exchange_settlement(
                             exchange_owner=exchange_owner,
                             abandoned_tasks=budget.take_abandoned_tasks(),
                             error=authoritative_error,
@@ -2336,7 +2668,7 @@ class HttpMcpSession(McpSession):
                     # The exact entered-or-entering context remains the settlement
                     # owner even when no response handle was available at the public
                     # deadline or cancellation boundary.
-                    self._begin_fenced_settlement(
+                    self._begin_uncertain_exchange_settlement(
                         exchange_owner=exchange_owner,
                         abandoned_tasks=budget.take_abandoned_tasks(),
                         error=primary_error,
@@ -2364,7 +2696,7 @@ class HttpMcpSession(McpSession):
     ) -> None:
         """Record status/session ownership before representation validation."""
 
-        if response.status_code == 404:
+        if response.status_code == 404 and self._wire_protocol.uses_protocol_sessions:
             # Status is authoritative even when representation headers are
             # malformed. Never let a rejected body leave an expired logical
             # session reusable.
@@ -2373,7 +2705,11 @@ class HttpMcpSession(McpSession):
             self._cleanup_session_id = None
             self._cleanup_protocol_version = None
             self._closed = True
-        if initialize_request and 200 <= response.status_code < 300:
+        if (
+            initialize_request
+            and self._wire_protocol.uses_protocol_sessions
+            and 200 <= response.status_code < 300
+        ):
             # A successful initialize response can allocate a server session
             # independently of whether Cayu accepts its body representation.
             # Keep this authority cleanup-only until initialization publishes.
@@ -2395,7 +2731,7 @@ class HttpMcpSession(McpSession):
         json_message = media_type == _JSON_CONTENT_TYPE
         sse_events = media_type == _SSE_CONTENT_TYPE
         media_type = ""
-        if response.status_code == 404:
+        if response.status_code == 404 and self._wire_protocol.uses_protocol_sessions:
             # The session is gone (spec): poison the session so callers can't keep
             # using it, and drop the dead id so close() skips the doomed DELETE.
             self._mark_server_listener_gap()
@@ -2561,20 +2897,22 @@ class HttpMcpSession(McpSession):
         protocol_version: str | None = None,
         session_id: str | None = None,
     ) -> dict[str, str]:
-        headers: dict[str, str] = {"accept-encoding": "identity"}
-        # The spec requires MCP-Protocol-Version on requests AFTER initialization
-        # (the negotiated version); sending it on the initialize request itself can
-        # make a server 400 before version negotiation, so omit it until initialized.
-        if protocol_version is not None:
-            headers[MCP_PROTOCOL_VERSION_HEADER] = protocol_version
-        elif self._initialize_result is not None:
-            headers[MCP_PROTOCOL_VERSION_HEADER] = self._initialize_result.protocol_version
-        elif self._negotiated_protocol_version is not None:
-            headers[MCP_PROTOCOL_VERSION_HEADER] = self._negotiated_protocol_version
-        resolved_session_id = self._session_id if session_id is None else session_id
-        if resolved_session_id is not None:
-            headers[MCP_SESSION_ID_HEADER] = resolved_session_id
-        return headers
+        if not self._wire_protocol.uses_protocol_sessions:
+            raise McpProtocolError(
+                "MCP 2026 HTTP does not support legacy GET/DELETE session control."
+            )
+        return self._wire_protocol.request_headers(
+            {"method": "legacy/control", "params": {}},
+            initialized_protocol_version=(
+                self._initialize_result.protocol_version
+                if self._initialize_result is not None
+                else None
+            ),
+            negotiated_protocol_version=self._negotiated_protocol_version,
+            session_id=self._session_id,
+            protocol_version_override=protocol_version,
+            session_id_override=session_id,
+        )
 
 
 def _validate_optional_proxy(value: object, field_name: str) -> str | None:
