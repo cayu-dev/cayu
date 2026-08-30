@@ -13,7 +13,9 @@ from pydantic import ValidationError
 
 from cayu import (
     AgentSnapshot,
+    AgentSnapshotAccess,
     AgentSnapshotAuthorityRef,
+    AgentSnapshotAuthorizationError,
     AgentSnapshotCaptureError,
     AgentSnapshotCaptureRequest,
     AgentSnapshotCompleteness,
@@ -26,6 +28,7 @@ from cayu import (
     AgentSnapshotCoordinator,
     AgentSnapshotExecutionProfileComponent,
     AgentSnapshotExecutionProfileRef,
+    AgentSnapshotGCRequest,
     AgentSnapshotLearningDisposition,
     AgentSnapshotLogicalRef,
     AgentSnapshotMaterialization,
@@ -240,6 +243,14 @@ def _snapshot(
     )
 
 
+def _access(snapshot: AgentSnapshot) -> AgentSnapshotAccess:
+    return AgentSnapshotAccess(
+        snapshot=snapshot.ref,
+        binding_id=snapshot.identity_binding.binding_id,
+        authority_scope_fingerprint=snapshot.authority_scope_fingerprint,
+    )
+
+
 def test_agent_snapshot_identity_is_deterministic_and_relocation_stable() -> None:
     first = _snapshot()
     recaptured = _snapshot(
@@ -392,16 +403,16 @@ async def test_materialization_rejects_substituted_starting_snapshot() -> None:
     substituted = _snapshot(memory_value="memory-v2")
 
     class SubstitutingStore(InMemoryAgentSnapshotStore):
-        async def load_snapshot(self, fingerprint: str) -> AgentSnapshot | None:
-            if fingerprint == requested.fingerprint:
+        async def get_snapshot(self, access: AgentSnapshotAccess) -> AgentSnapshot:
+            if access.snapshot == requested.ref:
                 return substituted
-            return await super().load_snapshot(fingerprint)
+            return await super().get_snapshot(access)
 
     store = SubstitutingStore()
     await store.save_snapshot(requested)
     coordinator = AgentSnapshotCoordinator(_providers(substituted), store=store)
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=requested.fingerprint,
+        access=_access(requested),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -409,6 +420,26 @@ async def test_materialization_rejects_substituted_starting_snapshot() -> None:
 
     with pytest.raises(AgentSnapshotMaterializationError, match="Starting snapshot"):
         await coordinator.materialize(request)
+
+
+@_async_test
+async def test_materialization_requires_authorized_snapshot_access() -> None:
+    snapshot = _snapshot()
+    providers = _providers(snapshot)
+    store = InMemoryAgentSnapshotStore()
+    await store.save_snapshot(snapshot)
+    coordinator = AgentSnapshotCoordinator(providers, store=store)
+    request = AgentSnapshotMaterializationRequest(
+        access=_access(snapshot).model_copy(update={"binding_id": "0" * 64}),
+        candidate_id="candidate-a",
+        trial_id="trial-1",
+        state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
+    )
+
+    with pytest.raises(AgentSnapshotAuthorizationError):
+        await coordinator.materialize(request)
+
+    assert sum(provider.materialize_calls for provider in providers) == 0
 
 
 @_async_test
@@ -462,7 +493,7 @@ async def test_coordinator_rejects_substituted_store_save_results() -> None:
     coordinator = AgentSnapshotCoordinator(_providers(declared), store=store)
     captured = await coordinator.capture(_capture_request(declared))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -535,8 +566,8 @@ def test_agent_snapshot_round_trip_is_strict_and_stably_ordered() -> None:
         AgentSnapshot.model_validate(forged)
 
     forged = snapshot.model_dump(mode="json")
-    forged["fingerprint"] = _digest("forged")
-    with pytest.raises(ValidationError, match="fingerprint does not match"):
+    forged["snapshot_root"] = _digest("forged")
+    with pytest.raises(ValidationError, match="snapshot_root does not match"):
         AgentSnapshot.model_validate(forged)
 
 
@@ -564,7 +595,7 @@ def test_snapshot_rejects_unsupported_schema_and_nested_memory_scope_broadening(
     snapshot = _snapshot()
     unsupported = json.loads(agent_snapshot_to_json(snapshot))
     unsupported["schema_version"] = 1
-    with pytest.raises(ValidationError, match="Input should be 2"):
+    with pytest.raises(ValidationError, match="Input should be 3"):
         AgentSnapshot.model_validate(unsupported)
 
     assert snapshot.memory_state is not None
@@ -977,7 +1008,7 @@ async def test_requested_unavailable_component_is_explicit_and_can_be_optional()
     assert await restarted.verify(captured) == captured
     materialized = await restarted.materialize(
         AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-a",
             trial_id="trial-1",
             state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1000,7 +1031,7 @@ async def test_candidates_receive_private_memory_and_workspace_overlays() -> Non
 
     first = await coordinator.materialize(
         AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-a",
             trial_id="trial-1",
             state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1008,7 +1039,7 @@ async def test_candidates_receive_private_memory_and_workspace_overlays() -> Non
     )
     second = await coordinator.materialize(
         AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-b",
             trial_id="trial-1",
             state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1054,7 +1085,7 @@ async def test_trial_state_accumulation_is_explicit() -> None:
 
     accumulated_one = await coordinator.materialize(
         AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-a",
             trial_id="trial-1",
             state_mode=AgentSnapshotTrialStateMode.ACCUMULATE_WITHIN_CANDIDATE,
@@ -1062,7 +1093,7 @@ async def test_trial_state_accumulation_is_explicit() -> None:
     )
     accumulated_two = await coordinator.materialize(
         AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-a",
             trial_id="trial-2",
             state_mode=AgentSnapshotTrialStateMode.ACCUMULATE_WITHIN_CANDIDATE,
@@ -1072,7 +1103,7 @@ async def test_trial_state_accumulation_is_explicit() -> None:
     assert sum(provider.recover_calls for provider in providers) == 2 * len(snapshot.components)
     reset_two = await coordinator.materialize(
         AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-a",
             trial_id="trial-2",
             state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1090,7 +1121,7 @@ def test_default_materialization_identity_preserves_base_record_shape() -> None:
     snapshot = _snapshot()
     component = snapshot.component(AgentSnapshotComponentKind.MEMORY)
     legacy_request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=snapshot.fingerprint,
+        access=_access(snapshot),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1137,7 +1168,7 @@ async def test_fresh_process_recovery_and_result_lineage_are_idempotent(tmp_path
     first = AgentSnapshotCoordinator(providers, store=first_store, clock=lambda: now[0])
     captured = await first.capture(_capture_request(snapshot))
     materialization_request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1219,7 +1250,7 @@ async def test_sqlite_store_materializes_distinct_trials_concurrently(tmp_path) 
         *(
             coordinator.materialize(
                 AgentSnapshotMaterializationRequest(
-                    snapshot_fingerprint=captured.fingerprint,
+                    access=_access(captured),
                     candidate_id="candidate-a",
                     trial_id=f"trial-{index}",
                     state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1249,7 +1280,7 @@ async def test_begin_trial_binds_reset_scope_and_declared_evaluator() -> None:
     coordinator = AgentSnapshotCoordinator(_providers(snapshot))
     captured = await coordinator.capture(_capture_request(snapshot))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1287,7 +1318,7 @@ async def test_begin_trial_requires_evaluator_declared_by_snapshot() -> None:
     coordinator = AgentSnapshotCoordinator(_providers(snapshot))
     captured = await coordinator.capture(_capture_request(snapshot))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1353,7 +1384,7 @@ async def test_coordinator_rejects_provider_overlay_kind_mismatch() -> None:
     with pytest.raises(AgentSnapshotMaterializationError, match="invalid memory"):
         await coordinator.materialize(
             AgentSnapshotMaterializationRequest(
-                snapshot_fingerprint=captured.fingerprint,
+                access=_access(captured),
                 candidate_id="candidate-a",
                 trial_id="trial-1",
                 state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1391,7 +1422,7 @@ async def test_materialization_rejects_overlay_baseline_substitution() -> None:
     with pytest.raises(AgentSnapshotMaterializationError, match="Overlay baseline"):
         await coordinator.materialize(
             AgentSnapshotMaterializationRequest(
-                snapshot_fingerprint=captured.fingerprint,
+                access=_access(captured),
                 candidate_id="candidate-a",
                 trial_id="trial-1",
                 state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1427,7 +1458,7 @@ async def test_restart_resumes_after_later_provider_failure_without_replaying_co
     first = AgentSnapshotCoordinator(first_providers, store=SQLiteAgentSnapshotStore(path))
     captured = await first.capture(_capture_request(snapshot))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1435,6 +1466,20 @@ async def test_restart_resumes_after_later_provider_failure_without_replaying_co
 
     with pytest.raises(AgentSnapshotMaterializationError, match="workspace"):
         await first.materialize(request)
+
+    access = AgentSnapshotAccess(
+        snapshot=captured.ref,
+        binding_id=captured.identity_binding.binding_id,
+        authority_scope_fingerprint=captured.authority_scope_fingerprint,
+    )
+    protected_plan = await first.store.plan_snapshot_gc(
+        AgentSnapshotGCRequest(
+            operation_id="failed-materialization-gc",
+            candidates=(access,),
+        )
+    )
+    assert protected_plan.blocked_roots == (captured.snapshot_root,)
+    assert protected_plan.collectable_roots == ()
 
     restarted_providers = _providers(
         snapshot,
@@ -1458,6 +1503,13 @@ async def test_restart_resumes_after_later_provider_failure_without_replaying_co
     assert effect_calls[AgentSnapshotComponentKind.WORKSPACE] == 1
     assert sum(provider.recover_operation_calls for provider in restarted_providers) == 1
     assert sum(provider.materialize_invocations for provider in restarted_providers) == 0
+    released_plan = await restarted.store.plan_snapshot_gc(
+        AgentSnapshotGCRequest(
+            operation_id="recovered-materialization-gc",
+            candidates=(access,),
+        )
+    )
+    assert released_plan.collectable_roots == (captured.snapshot_root,)
 
 
 class _LoseWorkspaceProgressAcknowledgementOnceStore(SQLiteAgentSnapshotStore):
@@ -1500,7 +1552,7 @@ async def test_restart_recovers_effect_completed_before_store_acknowledgement(tm
     )
     captured = await first.capture(_capture_request(snapshot))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1560,7 +1612,7 @@ async def test_same_sqlite_scope_contention_does_not_duplicate_provider_effects(
     )
     captured = await bootstrap.capture(_capture_request(snapshot))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1620,7 +1672,7 @@ async def test_same_in_memory_scope_contention_does_not_duplicate_provider_effec
     bootstrap = AgentSnapshotCoordinator(_providers(snapshot), store=store)
     captured = await bootstrap.capture(_capture_request(snapshot))
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=captured.fingerprint,
+        access=_access(captured),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1688,7 +1740,7 @@ async def test_store_noop_claim_cannot_dispatch_provider_effect() -> None:
     with pytest.raises(AgentSnapshotStoreConflict, match="claim|monotonic"):
         await coordinator.materialize(
             AgentSnapshotMaterializationRequest(
-                snapshot_fingerprint=captured.fingerprint,
+                access=_access(captured),
                 candidate_id="candidate-a",
                 trial_id="trial-1",
                 state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1747,7 +1799,7 @@ async def test_store_rollback_refresh_cannot_redispatch_completed_provider() -> 
     with pytest.raises(AgentSnapshotStoreConflict):
         await coordinator.materialize(
             AgentSnapshotMaterializationRequest(
-                snapshot_fingerprint=captured.fingerprint,
+                access=_access(captured),
                 candidate_id="candidate-a",
                 trial_id="trial-1",
                 state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1765,7 +1817,7 @@ async def test_materialization_progress_cas_rejects_forged_same_revision_state(
 ) -> None:
     snapshot = _snapshot()
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=snapshot.fingerprint,
+        access=_access(snapshot),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1805,7 +1857,7 @@ async def test_materialization_finalization_replay_is_idempotent_in_both_stores(
 ) -> None:
     snapshot = _snapshot()
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=snapshot.fingerprint,
+        access=_access(snapshot),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1904,7 +1956,7 @@ async def test_sqlite_scope_load_rejects_redirected_materialization_pointer(tmp_
         coordinator = AgentSnapshotCoordinator(_providers(snapshot), store=store)
         captured = await coordinator.capture(_capture_request(snapshot))
         first_request = AgentSnapshotMaterializationRequest(
-            snapshot_fingerprint=captured.fingerprint,
+            access=_access(captured),
             candidate_id="candidate-a",
             trial_id="trial-1",
             state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -1960,7 +2012,7 @@ async def test_final_scope_rejects_snapshot_inconsistent_progress_plan(tmp_path)
     store = SQLiteAgentSnapshotStore(tmp_path / "snapshot-inconsistent-plan.db")
     await store.save_snapshot(starting)
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=starting.fingerprint,
+        access=_access(starting),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -2005,7 +2057,7 @@ async def test_final_scope_rejects_snapshot_inconsistent_progress_plan(tmp_path)
 async def test_final_scope_rejects_same_scope_foreign_progress_materialization() -> None:
     snapshot = _snapshot()
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=snapshot.fingerprint,
+        access=_access(snapshot),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -2063,7 +2115,7 @@ async def test_recovery_rejects_snapshot_inconsistent_materialized_components() 
     starting = _snapshot()
     substituted = _snapshot(memory_value="memory-v2")
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=starting.fingerprint,
+        access=_access(starting),
         candidate_id="candidate-a",
         trial_id="trial-1",
         state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -2093,7 +2145,10 @@ async def test_recovery_rejects_snapshot_inconsistent_materialized_components() 
     coordinator = AgentSnapshotCoordinator(_providers(starting), store=store)
 
     with pytest.raises(AgentSnapshotMaterializationError, match="baseline"):
-        await coordinator.recover_materialization(forged.fingerprint)
+        await coordinator.recover_materialization(
+            forged.fingerprint,
+            access=_access(starting),
+        )
 
 
 @_async_test

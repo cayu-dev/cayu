@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from typing import Any
 
 from cayu import (
     AgentSnapshot,
+    AgentSnapshotAccess,
     AgentSnapshotAuthorityRef,
     AgentSnapshotCaptureRequest,
     AgentSnapshotCompleteness,
@@ -75,6 +77,14 @@ def _fingerprint(value: Any) -> str:
         separators=(",", ":"),
     ).encode()
     return sha256(encoded).hexdigest()
+
+
+def _snapshot_access(snapshot: AgentSnapshot) -> AgentSnapshotAccess:
+    return AgentSnapshotAccess(
+        snapshot=snapshot.ref,
+        binding_id=snapshot.identity_binding.binding_id,
+        authority_scope_fingerprint=snapshot.authority_scope_fingerprint,
+    )
 
 
 def _logical_ref(
@@ -662,7 +672,8 @@ async def recover_reference_experiment(database_path: Path) -> dict[str, Any]:
     recovered_results = []
     for item in state["candidates"]:
         materialization = await coordinator.recover_materialization(
-            item["materialization_fingerprint"]
+            item["materialization_fingerprint"],
+            access=_snapshot_access(snapshot),
         )
         result = await store.load_result(item["result_fingerprint"])
         if result is None:
@@ -722,7 +733,7 @@ async def run_reference_experiment(database_path: Path) -> dict[str, Any]:
     for candidate in candidates:
         materialization = await coordinator.materialize(
             AgentSnapshotMaterializationRequest(
-                snapshot_fingerprint=snapshot.fingerprint,
+                access=_snapshot_access(snapshot),
                 candidate_id=candidate["candidate_id"],
                 trial_id=f"trial-{candidate['candidate_id']}",
                 state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
@@ -772,6 +783,12 @@ async def run_reference_experiment(database_path: Path) -> dict[str, Any]:
     if not journal.record_once("phase-state", "reference-experiment", phase_state):
         raise RuntimeError("Reference experiment database must start empty.")
 
+    child_environment = dict(os.environ)
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    inherited_pythonpath = child_environment.get("PYTHONPATH")
+    child_environment["PYTHONPATH"] = (
+        source_root if not inherited_pythonpath else source_root + os.pathsep + inherited_pythonpath
+    )
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         str(Path(__file__).resolve()),
@@ -780,6 +797,7 @@ async def run_reference_experiment(database_path: Path) -> dict[str, Any]:
         "--recover-only",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=child_environment,
     )
     stdout, stderr = await process.communicate()
     if process.returncode != 0:

@@ -167,6 +167,22 @@ dispatch. Prepared-child queue tasks move to the
 authority record. This is a prerelease protocol boundary: stop v1 workers and
 cancel/recreate any remaining unclaimed v1 prepared-child tasks before rollout.
 
+### AgentSnapshot is a Merkle-rooted, lifecycle-managed manifest
+
+`AgentSnapshot` schema version 3 now exposes a content-derived
+`snapshot_root` over a recursively verifiable typed Merkle closure. Logical
+agent registration and authority scope move to a separate immutable
+`AgentSnapshotIdentityBinding`, so identical state can retain one root across
+registrations without treating a digest as permission. In-memory and SQLite
+stores provide authorized closure reads and inspection, exact shared/unique
+size accounting, idempotent pins and releases, lifecycle protections, and
+bounded reachability-based garbage collection. Collection requires authorized
+access to every logical binding it would remove and atomically rechecks that
+binding set. Materialization and recovery require the same authorized access;
+a root digest alone cannot start or recover candidate effects. Existing
+materialization now protects its root before provider effects and releases that
+protection only after verified finalization.
+
 ### Classified transient provider failures retry by default
 
 `RetryPolicy()` now permits five total attempts instead of disabling retries.

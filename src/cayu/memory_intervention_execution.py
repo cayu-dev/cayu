@@ -57,6 +57,7 @@ from cayu._validation import (
 from cayu.agent_snapshots import (
     AGENT_SNAPSHOT_TRIAL_METADATA_KEY,
     AgentSnapshot,
+    AgentSnapshotAccess,
     AgentSnapshotCoordinator,
     AgentSnapshotExecutionProfileRef,
     AgentSnapshotMaterialization,
@@ -2334,6 +2335,7 @@ class MemoryInterventionExecutor:
         materialization, trial, operation, just_bound_trial = await self._trial_lineage(
             request,
             record,
+            snapshot,
         )
         if just_bound_trial:
             desired = self._successor(
@@ -2942,6 +2944,7 @@ class MemoryInterventionExecutor:
         self,
         request: MemoryInterventionTrialRequest,
         record: MemoryInterventionExecutionRecord,
+        snapshot: AgentSnapshot,
     ) -> tuple[
         AgentSnapshotMaterialization,
         AgentSnapshotTrialBinding,
@@ -2951,7 +2954,11 @@ class MemoryInterventionExecutor:
         if record.phase is MemoryInterventionExecutionPhase.PREPARED:
             materialization = await self.snapshots.materialize(
                 AgentSnapshotMaterializationRequest(
-                    snapshot_fingerprint=request.spec.snapshot_fingerprint,
+                    access=AgentSnapshotAccess(
+                        snapshot=snapshot.ref,
+                        binding_id=snapshot.identity_binding.binding_id,
+                        authority_scope_fingerprint=snapshot.authority_scope_fingerprint,
+                    ),
                     candidate_id=request.candidate_id,
                     trial_id=request.trial_id,
                     state_mode=request.spec.trial_state_mode,
@@ -2977,7 +2984,12 @@ class MemoryInterventionExecutor:
         ):
             raise MemoryInterventionExecutionConflict("Execution trial lineage is incomplete.")
         materialization = await self.snapshots.recover_materialization(
-            record.materialization_fingerprint
+            record.materialization_fingerprint,
+            access=AgentSnapshotAccess(
+                snapshot=snapshot.ref,
+                binding_id=snapshot.identity_binding.binding_id,
+                authority_scope_fingerprint=snapshot.authority_scope_fingerprint,
+            ),
         )
         loaded_trial = await self.snapshots.store.load_trial(record.trial_binding_fingerprint)
         if type(loaded_trial) is not AgentSnapshotTrialBinding:

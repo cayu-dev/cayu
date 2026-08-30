@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from cayu._validation import canonical_durable_json_bytes
 from cayu.agent_snapshots import (
     AgentSnapshot,
+    AgentSnapshotAccess,
     AgentSnapshotCompleteness,
     AgentSnapshotComponentKind,
     AgentSnapshotComponentRef,
@@ -233,7 +234,11 @@ def _materialization_and_trial(
     snapshot = _snapshot()
     memory_baseline = memory_baseline_fingerprint or spec.memory_state_fingerprint
     request = AgentSnapshotMaterializationRequest(
-        snapshot_fingerprint=snapshot.fingerprint,
+        access=AgentSnapshotAccess(
+            snapshot=snapshot.ref,
+            binding_id=snapshot.identity_binding.binding_id,
+            authority_scope_fingerprint=snapshot.authority_scope_fingerprint,
+        ),
         candidate_id=candidate_id,
         trial_id=materialization_trial_id,
         state_mode=spec.trial_state_mode,

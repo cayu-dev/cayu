@@ -674,13 +674,13 @@ class MemoryInterventionOperation(_FingerprintRecord):
             or trial.candidate_id != materialization.candidate_id
         ):
             raise ValueError("Intervention trial does not match its materialization.")
-        expected_scope_id = AgentSnapshotMaterializationRequest(
+        expected_scope_id = AgentSnapshotMaterializationRequest.derive_state_scope_id(
             snapshot_fingerprint=spec.snapshot_fingerprint,
             candidate_id=materialization.candidate_id,
             trial_id=trial.trial_id,
             state_mode=spec.trial_state_mode,
             state_partition_fingerprint=spec.fingerprint,
-        ).state_scope_id
+        )
         if (
             materialization.state_scope_id != expected_scope_id
             or materialization.state_partition_fingerprint != spec.fingerprint

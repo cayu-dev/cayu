@@ -10140,21 +10140,50 @@ introducing separate memory, skill, or document-store APIs.
 
 ## Portable agent snapshots
 
-`AgentSnapshot` is Cayu's strict logical reproducibility envelope for a bounded
-agent state. It is not a VM or process snapshot, database export, repository
-copy, hidden evaluator package, provider continuation, or production activation
-request. Its schema-versioned fingerprint binds the continuing agent,
-application, and project identities; the body release; the redacted immutable
-execution profile; the requested memory, session, workspace, artifact,
-environment, and policy component identities; evaluator and promotion-authority
-identities when declared; and every component's provider identity, consistency
-group, consistency, completeness, redaction, materialization capability, and
-limitation codes. Schema version 2 adds provider identity and consistency group
-to the content address, so changing either authority or transactional grouping
-always produces a new fingerprint. Capture time, request identity, and a
-bounded `cayu-ref:` drill-down alias do not participate in the fingerprint, so
-recapture and physical package relocation preserve the same logical identity
-when the exact content and frontiers are equivalent.
+`AgentSnapshot` is Cayu's sole strict logical reproducibility manifest for one
+bounded agent state. It is not a VM or process snapshot, database export,
+repository copy, hidden evaluator package, provider continuation, or production
+activation request. There is no parallel public `AgentStateRoot` model.
+
+Schema version 3 gives the manifest a content-derived `snapshot_root`. The root
+is the digest of one strict `cayu.agent-snapshot.manifest.v3` Merkle node whose
+ordered typed child references point to strict component nodes. Each node
+envelope binds its node kind, schema identity, canonical durable-JSON payload,
+ordered typed children, and digest. Stores verify the complete reachable
+closure, its content-addressed keys, child relations, kinds, schemas, and
+canonical payloads before returning it. Missing, corrupt, cyclic, substituted,
+wrong-kind, wrong-schema, or index-inconsistent closures fail closed. Identical
+nodes are reused across roots; changing one leaf changes that leaf and its
+ancestor path rather than copying every unchanged component.
+
+The content root includes the body/anatomy, execution and role profiles,
+registered tool catalogue and direct-exposure policy, authorized durable
+knowledge view, explicit session disposition or safe Session Graph frontier,
+work context, recall/context-projection/learning policies, workspace and
+retained artifacts, environment closure and external-binding requirements, and
+standing policy. New v3 providers should use those precise component kinds.
+The old aggregate `memory` and `policies` selector values remain source-level
+migration shims for the v2 evaluator pipeline; they are not a new
+`memory_root`. Raw transcripts remain session or evaluation evidence and become
+episodic knowledge only through Cayu's explicit admission or consolidation
+contracts.
+
+Logical registration and content identity are separate. Agent, application,
+and project IDs; authority scope; capture time/request; evaluator and promotion
+authority; parentage; hypotheses; experiment IDs; selection; activation; and
+multi-parent recombination do not participate in `snapshot_root`.
+`AgentSnapshotRef` carries only the validated root. An immutable
+`AgentSnapshotIdentityBinding` separately binds one logical subject and
+authority scope to that exact ref. The same authorized content captured for two
+logical agents therefore produces one root and two bindings. A bounded
+`cayu-ref:` source alias is also excluded, so physical package relocation does
+not change the root. A digest is identity, never permission: public reads,
+inspection, pinning, release, protection, and GC require an already-authorized
+`AgentSnapshotAccess` whose binding, root, and scope agree. Raw store adapter
+loads are trusted implementation SPI and must not be exposed as an untrusted
+hash lookup. As with `KnowledgeAccessScope`, the hosting application derives
+`AgentSnapshotAccess` from its authenticated principal and authorization policy;
+candidate-controlled values are not authority.
 
 Components are application- or subsystem-owned
 `AgentSnapshotComponentProvider` adapters. A provider captures an exact logical
@@ -10170,12 +10199,14 @@ Requests for a stronger class, missing required providers, unavailable required
 components, broadened authority scope, changed provider identity, corrupt
 fingerprints, or failed re-verification fail before candidate execution.
 
-`MemoryStateRef` does not collapse Cayu knowledge and memory into one database
-or `KnowledgeStore` revision. It separately binds the authorized knowledge
-view, transcript and artifact evidence, work context/checkpoint, recall,
-admission and context-projection policies, interaction focus, recall receipts,
-context exposures, index readiness, and reviewed-learning disposition when each
-was requested. Component packages remain provider-owned behind bounded aliases;
+`MemoryStateRef` remains a migration projection for existing stateful-evaluation
+providers; it does not collapse Cayu knowledge and memory into one database or
+`KnowledgeStore` revision. It separately binds the authorized knowledge view,
+transcript and artifact evidence, work context/checkpoint, recall, admission and
+context-projection policies, interaction focus, recall receipts, context
+exposures, index readiness, and reviewed-learning disposition when each was
+requested. New complete v3 captures express those parts as distinct component
+nodes. Component packages remain provider-owned behind bounded aliases;
 portable JSON contains no raw transcript or artifact content, credentials,
 tokens, hidden cases or expected answers, judge prompts, provider-owned
 continuation state, unrelated records, or production activation authority.
@@ -10184,8 +10215,10 @@ continuation state, unrelated records, or production activation authority.
 contracts into this logical identity layer without making physical paths part
 of identity.
 
-`AgentSnapshotCoordinator.materialize()` verifies the immutable starting
-manifest and every required component, derives a stable provider operation for
+`AgentSnapshotCoordinator.materialize()` requires an already-authorized
+`AgentSnapshotAccess`; a snapshot root alone cannot start or recover candidate
+effects. It loads the immutable starting manifest through that exact binding
+and scope, verifies every required component, derives a stable provider operation for
 each component, and durably binds the complete operation plan to the candidate
 state scope before calling any owner. Each component claim is an exact-state
 compare-and-set transition persisted before its provider effect, and each
@@ -10208,17 +10241,50 @@ terminal disposition, runtime and memory evidence, eval result, usage, and cost
 fingerprints. These records recommend or compare successors only; they cannot
 activate code, profiles, policies, knowledge, or permissions.
 
-`SQLiteAgentSnapshotStore` and `InMemoryAgentSnapshotStore` retain manifests,
-materializations, trial bindings, and result bindings by stable fingerprint.
-They also bind each snapshot/candidate/state scope to exactly one immutable
-operation plan and one final materialization identity. In-memory and SQLite
-progress updates compare the entire expected state as well as its revision, so
-a stale or forged same-revision writer cannot replace active or completed
-component evidence. Competing coordinators converge through those durable
-claims rather than relying on an in-process lock. A compare-and-set conflict
-can refresh only to a strictly newer state that preserves every completed
-component, final identity, and active-operation outcome; rollback evidence is
-rejected before another provider call. Retrying an incomplete scope
+`SQLiteAgentSnapshotStore` and `InMemoryAgentSnapshotStore` retain root
+manifests, Merkle nodes, logical bindings, materializations, trial bindings, and
+result bindings. `put_snapshot()` atomically validates and stores one complete
+closure plus one binding; concurrent exact puts converge and conflicting node,
+root, or binding identities fail. `save_snapshot()` returns that canonical
+persisted manifest, so a repeated capture of the same root and logical binding
+cannot report newer unpersisted registration metadata. Authorized closure
+enumeration is deterministic in both stores and survives a fresh SQLite
+process. Inspection reports root-manifest bytes, logical closure bytes, bytes unique to the root,
+bytes shared with other roots, object count, and unresolved external bindings
+from bounded per-root indexes rather than scanning the object store.
+
+`pin_snapshot()` and `release_snapshot_pin()` are durable idempotent operations
+with owner, reason, retention class, and content-derived receipts. Active,
+outcome-unknown, importing, exporting, and materializing work uses an explicit
+`AgentSnapshotProtection`; exact add/release operations also converge. The
+ordinary materialization coordinator installs a durable `materializing`
+protection before provider verification/effects and releases it only after the
+final materialization has been recovered and verified. A failed or crashed
+attempt therefore remains protected until an authorized recovery or operator
+decision resolves it.
+
+GC is an explicit two-step contract. `plan_snapshot_gc()` accepts at most 1,024
+principal-derived candidate accesses, partitions protected and collectable
+roots, and uses bounded root-to-node and node-to-root indexes to identify
+unreachable nodes and still-shared nodes. A root with multiple logical bindings
+is collectable only when the request supplies an authorized access for every
+binding that collection would remove. `execute_snapshot_gc()` rechecks the
+exact durable plan, binding set, every pin/protection, root presence,
+reachability, and byte count in one write transaction. Any new binding,
+protection, or sharing relation fails the plan rather than collecting. Exact
+lifecycle and GC receipt replays remain available after collection. Unpinned
+losing roots and their now-unreachable nodes are removed; nodes reachable from
+any remaining root are preserved.
+
+The stores also bind each snapshot/candidate/state scope to exactly one
+immutable materialization operation plan and one final materialization identity.
+In-memory and SQLite progress updates compare the entire expected state as well
+as its revision, so a stale or forged same-revision writer cannot replace active
+or completed component evidence. Competing coordinators converge through those
+durable claims rather than relying on an in-process lock. A compare-and-set
+conflict can refresh only to a strictly newer state that preserves every
+completed component, final identity, and active-operation outcome; rollback
+evidence is rejected before another provider call. Retrying an incomplete scope
 skips completed components. An operation that was active when an acknowledgement
 or process was lost is passed only to the provider's
 `recover_materialization_operation()` hook with its previously persisted
@@ -10227,13 +10293,13 @@ must durably make that operation id idempotent, safely finish or recover the
 same result, and fail closed when its outcome cannot be proven. A different
 operation plan for an occupied scope fails as a store conflict.
 Every content-addressed load revalidates the document and requires its internal
-fingerprint to match the requested store key. SQLite additionally cross-checks
-the scope, progress id, revision, and final-materialization pointer columns
-against the validated progress document, then binds the final record back to
-that exact scope, progress id, and component plan. Coordinator trust boundaries revalidate
-store save/load and transition results before capture return, provider dispatch,
-trial creation, or result publication; a no-op or substituted claim cannot
-authorize an effect.
+root or fingerprint to match the requested store key. SQLite additionally
+cross-checks closure indexes and byte counts plus materialization scope,
+progress id, revision, and final-materialization pointer columns against the
+validated documents. Coordinator trust boundaries revalidate store save/load
+and transition results before capture return, provider dispatch, trial
+creation, or result publication; a no-op or substituted claim cannot authorize
+an effect.
 After restart, `recover_materialization()` loads the exact durable record and
 uses component recovery hooks rather than dispatching materialization again.
 Recovery rejects missing or extra components, changed baselines or capabilities,
@@ -10242,6 +10308,27 @@ changed recovered overlay identity. Losing and outcome-unknown overlays
 remain the application/provider owner's responsibility to discard or
 quarantine; the snapshot contract never mutates the baseline or production
 state on their behalf.
+
+### Snapshot v2 to v3 migration
+
+- Persist and exchange `AgentSnapshot.snapshot_root` or `AgentSnapshotRef`, not
+  a logical agent ID or a physical pathname. The read-only `.fingerprint`
+  spelling remains temporarily available to the existing evaluator pipeline,
+  but it resolves to the same v3 root and is not a second identity.
+- Create and retain an `AgentSnapshotIdentityBinding` for every logical agent
+  registration. Registration, scope, capture, and experiment provenance must
+  not be copied into a Merkle node merely to preserve the former v2 hash.
+- New component providers use the precise v3 kinds. Existing aggregate
+  `memory`/`policies` providers can migrate behind the compatibility selectors,
+  then split their capture into knowledge, session/evidence, work-context, and
+  policy nodes without changing the snapshot subsystem.
+- Stores migrate forward by creating the v3 node/root/binding/lifecycle tables.
+  V2 documents are not silently reinterpreted as v3 roots: recapture them with
+  current providers, retain the old document as provenance if needed, and use
+  the resulting v3 binding/root from then on.
+- Bundle export/import and production component capture/materialization are the
+  next portable-agent-state layer. They must consume this closure and lifecycle
+  contract rather than create a second snapshot or object store.
 
 Run `uv run python examples/agent_snapshot_stateful_evaluation.py` for the
 credential-free reference workflow. It captures body/profile, typed memory,
