@@ -13843,16 +13843,9 @@ class InMemorySessionStore(SessionStore):
                     ).get(
                         _interaction_transition_storage_key(copied.settlement_transition.event.id)
                     )
-                    retained_settlement_event = self._event_records_by_id.get(
-                        (copied.session_id, copied.settlement_transition.event.id)
-                    )
-                    if settlement_record is None or retained_settlement_event is None:
+                    if settlement_record is None:
                         raise SessionRunFenced(
                             "Invocation release lacks exact durable terminal settlement."
-                        )
-                    if retained_settlement_event.event != copied.settlement_transition.event:
-                        raise RuntimeError(
-                            "Invocation settlement receipt conflicts with retained event history."
                         )
                     _require_invocation_release_settlement_record(
                         settlement_record,

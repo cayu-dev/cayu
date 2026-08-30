@@ -100,6 +100,8 @@ class DurableSubagentPreparedRun:
     request: RunRequest
     provider_name: str
     model: str
+    runtime_name: str
+    runtime_version: str | None
     execution_profile: ExecutionProfileIdentity
 
 
@@ -752,6 +754,8 @@ class DurableSubagentCoordinator:
         request = prepared.request
         child_provider_name = prepared.provider_name
         child_model = prepared.model
+        child_runtime_name = prepared.runtime_name
+        child_runtime_version = prepared.runtime_version
         child_execution_profile = prepared.execution_profile
         # Do not retain the provider-bearing preparation bundle across the durable
         # checkpoint publication below. Store failures may escape with frame locals.
@@ -782,6 +786,8 @@ class DurableSubagentCoordinator:
             agent_name=seed.agent_name,
             child_provider_name=child_provider_name,
             child_model=child_model,
+            child_runtime_name=child_runtime_name,
+            child_runtime_version=child_runtime_version,
             environment_name=seed.environment_name,
             spawn_fingerprint=seed.spawn_fingerprint,
             child_session_id=seed.child_session_id,
@@ -927,6 +933,8 @@ class DurableSubagentCoordinator:
                     identity=SessionIdentity(
                         provider_name=intent.child_provider_name,
                         model=intent.child_model,
+                        runtime_name=intent.child_runtime_name,
+                        runtime_version=intent.child_runtime_version,
                         execution_profile=intent.child_execution_profile,
                     ),
                     checkpoint_transform=persist_child_submission,
@@ -980,6 +988,8 @@ class DurableSubagentCoordinator:
             or child.agent_name != intent.agent_name
             or child.provider_name != intent.child_provider_name
             or child.model != intent.child_model
+            or child.runtime_name != intent.child_runtime_name
+            or child.runtime_version != intent.child_runtime_version
             or child.environment_name != intent.environment_name
             or child.invocation
             != inherited_session_invocation(
@@ -1220,6 +1230,8 @@ class DurableSubagentCoordinator:
             or child_tool_capability_ceiling != intent.request.tool_capability_ceiling
             or session.parent_session_id != intent.parent_session_id
             or session.causal_budget_id != intent.causal_budget_id
+            or session.runtime_name != intent.child_runtime_name
+            or session.runtime_version != intent.child_runtime_version
             or execution_profile_from_session_metadata(session.metadata)
             != intent.child_execution_profile
         ):

@@ -7,7 +7,10 @@ import pytest
 
 import cayu.runtime.execution_profiles as execution_profiles
 from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.events import event_with_runtime_payload_authority
+from cayu.core.events import (
+    event_with_runtime_envelope_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
@@ -62,12 +65,18 @@ from cayu.runtime import (
     UserInputResponse,
 )
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
-from cayu.runtime._invocation_lifecycle import prepare_rebind_invocation_command
+from cayu.runtime._invocation_lifecycle import (
+    ReleaseInvocationCommand,
+    SettleInvocationCommand,
+    _release_invocation_command_with_cleanup_authority,
+    prepare_rebind_invocation_command,
+)
 from cayu.runtime.hooks import (
     BeforeToolCallHookContext,
     RuntimeHook,
     ToolCallHookContext,
 )
+from cayu.runtime.sessions import InteractionTransitionSpec
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.tool_policy import (
     ToolPolicy,
@@ -226,8 +235,50 @@ class _InterleavedCompletedExposureStore(InMemorySessionStore):
                     "profile_id",
                 )
                 await self.append_event(session_id, competing)
-                _ = await self.update_status(session_id, SessionStatus.COMPLETED)
-                await self.release_run_fence(session_id)
+                checkpoint = await self.load_checkpoint(session_id)
+                active_profile = (
+                    execution_profiles.active_invocation_execution_profile_from_checkpoint(
+                        checkpoint
+                    )
+                )
+                assert active_profile is not None
+                terminal = event_with_runtime_envelope_authority(
+                    Event(
+                        type=EventType.INTERACTION_COMPLETED,
+                        session_id=session_id,
+                        interaction_id=active_profile.interaction_id,
+                        agent_name=running.agent_name,
+                        environment_name=running.environment_name,
+                    ),
+                    "session_id",
+                    "interaction_id",
+                )
+                transition = InteractionTransitionSpec(
+                    event=terminal,
+                    from_statuses=(SessionStatus.RUNNING,),
+                    to_status=SessionStatus.COMPLETED,
+                )
+                runtime_store = runtime_checkpoint_session_store(self)
+                completed = await runtime_store.apply_invocation_lifecycle_command(
+                    SettleInvocationCommand(
+                        session_id=session_id,
+                        expected_session_instance_id=running.instance_id,
+                        expected_run_epoch=active_profile.run_epoch,
+                        expected_active_profile=active_profile,
+                        transition=transition,
+                    )
+                )
+                await runtime_store.apply_invocation_lifecycle_command(
+                    _release_invocation_command_with_cleanup_authority(
+                        ReleaseInvocationCommand(
+                            session_id=session_id,
+                            expected_session_instance_id=completed.session.instance_id,
+                            expected_run_epoch=active_profile.run_epoch,
+                            expected_active_profile=active_profile,
+                            settlement_transition=transition,
+                        )
+                    )
+                )
         return await super().admit_session_invocation(session_id, admission=admission)
 
 

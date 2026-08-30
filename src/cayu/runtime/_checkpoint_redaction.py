@@ -378,6 +378,8 @@ _DURABLE_SUBAGENT_STRUCTURE_KEYS = frozenset(
         "child_execution_profile",
         "child_model",
         "child_provider_name",
+        "child_runtime_name",
+        "child_runtime_version",
         "child_session_id",
         "content",
         "dispatch_id",
@@ -532,6 +534,29 @@ _PENDING_TOOL_ROUND_EXECUTION_IDENTITY_FIELDS = frozenset(
         "tool_round_id",
     }
 )
+_FORK_RUNTIME_SESSION_STATUS_PATHS = frozenset(
+    {
+        (
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            "receipts",
+            "result_session",
+            "metadata",
+            "cayu:fork_execution_profile",
+            "source_status",
+        ),
+        (
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            "receipts",
+            "result_session",
+            "metadata",
+            "cayu:fork_group_source_snapshot",
+            "status",
+        ),
+    }
+)
+_FORK_RUNTIME_SESSION_STATUS_VALUES = frozenset(
+    {"pending", "running", "interrupting", "completed", "failed", "interrupted"}
+)
 _COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX = "completion-result-publication:v1:"
 _COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX = "completion-result-owner:v1:"
 
@@ -609,6 +634,16 @@ def durable_value_contains_secret(
             # dynamic identities are already field-scoped keyed aliases;
             # static identities were checked, and exact runtime identities
             # retain structural provenance.
+            return False
+        if (
+            path in _FORK_RUNTIME_SESSION_STATUS_PATHS
+            and value in _FORK_RUNTIME_SESSION_STATUS_VALUES
+        ):
+            # Fork preparation injects these reserved metadata records only after
+            # public metadata redaction. A validated lifecycle ledger authenticates
+            # the exact duplicated result session, and these fields are closed
+            # SessionStatus values. Neighboring fork-authority fields remain subject
+            # to workload-secret rejection.
             return False
         if path and path[-1] in _DURABLE_ENUM_STRING_FIELDS and _path_has_typed_schema(path[:-1]):
             # Typed model validation owns these finite protocol values. A
@@ -839,7 +874,10 @@ def _invocation_lifecycle_receipt_metadata_authority(
             return
         if type(projected) is dict:
             for key, item in projected.items():
-                retain_authenticated_receipt_identities(item, (*projected_path, key))
+                item_path = (*projected_path, key)
+                if _is_invocation_lifecycle_receipt_identity_path(item_path):
+                    trusted_keys.add((projected_path, key))
+                retain_authenticated_receipt_identities(item, item_path)
 
     # Identity-shaped text is trusted only after the complete ledger, every
     # receipt, and their content digests have authenticated it. A malformed

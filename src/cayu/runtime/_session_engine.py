@@ -7111,6 +7111,17 @@ class SessionEngine:
                     ),
                 ),
             )
+            if committed_transition_recorded:
+                interaction_id = interaction_transition.event.interaction_id
+                if interaction_id is None:
+                    raise RuntimeError(
+                        "Committed interaction transition lost its interaction identity."
+                    )
+                _mark_session_interaction_settled(
+                    session.id,
+                    interaction_id,
+                    interaction_transition,
+                )
             if committed_transition_recorded or diagnostic_failures:
                 return
         if transition_settled or _latest_session_invocation_interaction_is_settled(session.id):
@@ -9562,6 +9573,8 @@ class SessionEngine:
                     raise durable_subagent_worker_incompatible()
                 if (
                     intent.child_session_id != current_session.id
+                    or intent.child_runtime_name != current_session.runtime_name
+                    or intent.child_runtime_version != current_session.runtime_version
                     or intent.queue_task_id != prepared_session_authority.queue_task_id
                     or intent.submission_sha256 != prepared_session_authority.submission_sha256
                     or intent.interaction_id != interaction_id

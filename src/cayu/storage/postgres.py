@@ -23993,15 +23993,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                         else:
                             await cur.execute(
-                                "SELECT operation.record, retained.event "
+                                "SELECT operation.record "
                                 "FROM cayu_session_operations AS operation "
-                                "LEFT JOIN cayu_events AS retained "
-                                "ON retained.session_id = operation.session_id "
-                                "AND retained.event_id = %s "
                                 "WHERE operation.session_id = %s "
                                 "AND operation.idempotency_key = %s",
                                 (
-                                    copied.settlement_transition.event.id,
                                     copied.session_id,
                                     _interaction_transition_storage_key(
                                         copied.settlement_transition.event.id
@@ -24009,7 +24005,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 ),
                             )
                             settlement_row = await cur.fetchone()
-                            if settlement_row is None or settlement_row[1] is None:
+                            if settlement_row is None:
                                 raise SessionRunFenced(
                                     "Invocation release lacks exact durable terminal settlement."
                                 )

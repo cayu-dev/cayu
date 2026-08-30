@@ -27,7 +27,7 @@ DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY = "durable_subagent_submission_
 DURABLE_SUBAGENT_SEED_RECORD_TYPE = "cayu.durable-subagent-submission-seed"
 DURABLE_SUBAGENT_SEED_SCHEMA_VERSION = 1
 DURABLE_SUBAGENT_INTENT_RECORD_TYPE = "cayu.durable-subagent-submission"
-DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION = 1
+DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION = 2
 DURABLE_SUBAGENT_RECEIPT_RECORD_TYPE = "cayu.durable-subagent-submission-receipt"
 DURABLE_SUBAGENT_RECEIPT_SCHEMA_VERSION = 1
 
@@ -805,16 +805,29 @@ class DurableSubagentSubmissionIntent(_DurableSubagentAuthorityRecord):
     """Immutable mapping persisted before a durable child queue task is published."""
 
     record_type: Literal["cayu.durable-subagent-submission"] = DURABLE_SUBAGENT_INTENT_RECORD_TYPE
-    schema_version: Literal[1] = DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION
+    schema_version: Literal[2] = DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION
     child_provider_name: str
     child_model: str
+    child_runtime_name: str
+    child_runtime_version: str | None
     seed_sha256: str
     child_execution_profile: ExecutionProfileIdentity
     submission_sha256: str
 
-    @field_validator("child_provider_name", "child_model")
+    @field_validator("child_provider_name", "child_model", "child_runtime_name")
     @classmethod
     def validate_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("child_runtime_version")
+    @classmethod
+    def validate_optional_runtime_version(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
         if value is None:
             return None
         return require_durable_clean_nonblank(value, info.field_name)

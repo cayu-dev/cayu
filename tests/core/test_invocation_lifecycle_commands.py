@@ -1562,6 +1562,42 @@ def test_lifecycle_receipt_metadata_trust_fails_closed_per_receipt() -> None:
                 checkpoint,
                 redactor=SecretRedactor(authenticated_identity),
             )
+
+            runtime_snapshot_receipt = copy.deepcopy(raw_receipt)
+            runtime_snapshot_receipt["result_session"]["metadata"][
+                "cayu:fork_group_source_snapshot"
+            ] = {
+                "source_session_id": "fork-source-secret",
+                "status": "completed",
+            }
+            runtime_snapshot_receipt["result_session"]["metadata"][
+                "cayu:fork_execution_profile"
+            ] = {
+                "source_session_id": "fork-source-secret",
+                "source_status": "completed",
+            }
+            runtime_snapshot_receipt["record_sha256"] = ""
+            validated_runtime_snapshot_receipt = _InvocationLifecycleCommandReceipt.model_validate(
+                runtime_snapshot_receipt
+            )
+            runtime_snapshot_checkpoint = copy.deepcopy(checkpoint)
+            runtime_snapshot_checkpoint[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY] = (
+                _InvocationLifecycleReceiptLedger(
+                    receipts=(validated_runtime_snapshot_receipt,),
+                    release_capacity_command_identity=(
+                        validated_runtime_snapshot_receipt.command_identity
+                    ),
+                ).model_dump(mode="json")
+            )
+            assert not durable_value_contains_secret(
+                runtime_snapshot_checkpoint,
+                redactor=SecretRedactor("completed"),
+            )
+            assert durable_value_contains_secret(
+                runtime_snapshot_checkpoint,
+                redactor=SecretRedactor("fork-source-secret"),
+            )
+
             malformed_identity_ledger = copy.deepcopy(checkpoint)
             malformed_identity_ledger[INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY][
                 "record_sha256"

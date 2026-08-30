@@ -487,7 +487,8 @@ class InlineDispatcher(Dispatcher):
 
 
 DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
-PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v1"
+LEGACY_PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v1"
+PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v2"
 FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX = ".fork-group.v1"
 DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
 
@@ -544,6 +545,7 @@ class TaskStoreDispatcher(Dispatcher):
         self._task_type = require_clean_nonblank(task_type, "task_type")
         if self._task_type.endswith(
             (
+                LEGACY_PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
                 PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
                 FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX,
             )

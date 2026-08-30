@@ -5993,21 +5993,17 @@ class SQLiteSessionStore(SessionStore):
                     )
                 else:
                     settlement_row = connection.execute(
-                        "SELECT operation.record_json, retained.event_id "
+                        "SELECT operation.record_json "
                         "FROM cayu_session_operations AS operation "
-                        "LEFT JOIN cayu_events AS retained "
-                        "ON retained.session_id = operation.session_id "
-                        "AND retained.event_id = ? "
                         "WHERE operation.session_id = ? AND operation.idempotency_key = ?",
                         (
-                            copied.settlement_transition.event.id,
                             copied.session_id,
                             _interaction_transition_storage_key(
                                 copied.settlement_transition.event.id
                             ),
                         ),
                     ).fetchone()
-                    if settlement_row is None or settlement_row["event_id"] is None:
+                    if settlement_row is None:
                         raise SessionRunFenced(
                             "Invocation release lacks exact durable terminal settlement."
                         )

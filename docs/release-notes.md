@@ -154,6 +154,18 @@ clients, and dashboards together. No storage migration is required.
 - This slice is trigger-independent and manual. Cayu still ignores legacy MCP
   list-change notifications, performs no background polling, and does not yet
   negotiate MCP 2026-07-28.
+### Prepared durable children retain exact runtime identity
+
+Durable-subagent submission intent schema 2 now binds the child runtime name
+and version alongside its execution profile and uses that exact identity for
+PENDING child creation, admission, and recovery. This closes a packaged-runtime
+failure where the frozen profile named a versioned Cayu runtime but the prepared
+child defaulted to an unavailable runtime version, causing strict invocation
+lifecycle receipt validation to reject queue admission before provider
+dispatch. Prepared-child queue tasks move to the
+`.prepared-subagent.v2` namespace so older workers cannot claim the expanded
+authority record. This is a prerelease protocol boundary: stop v1 workers and
+cancel/recreate any remaining unclaimed v1 prepared-child tasks before rollout.
 
 ### Classified transient provider failures retry by default
 

@@ -2847,7 +2847,11 @@ the child and task are durable; it does not mean the child has run. The
 authority tuple binds the parent session instance, optional parent task, parent
 run epoch and execution profile, causal budget, model step and attempt, tool
 round and call, effective argument digest, child session, child execution
-profile, dispatch operation, queue task, and idempotency key.
+profile, child runtime name and version, dispatch operation, queue task, and
+idempotency key. The persisted runtime identity is the same identity used to
+create the PENDING child and must still agree with the runtime component in the
+frozen execution profile when a worker admits it; recovery never reconstructs
+that identity from an ambient installation.
 The seed and finalized intent embed that shared authority as one frozen value;
 finalization compares the complete value rather than maintaining a separate
 field allow-list.
@@ -2875,12 +2879,17 @@ Durable children are claimed and reclaimed through the ordinary
 namespace derived from the dispatcher's configured task type, so a pre-durable-
 subagent worker cannot claim and permanently reject their expanded authority
 envelope during a rolling application deployment. The
-`.prepared-subagent.v1` suffix is reserved for this internal namespace, and an
+`.prepared-subagent.v2` suffix is reserved for this internal namespace, and an
 application-defined dispatcher task type cannot end with it; this prevents one
 dispatcher's prepared-child namespace from colliding with another dispatcher's
 public base namespace. Current workers consume both the original resume
-namespace and the prepared-child namespace. A worker must match the frozen child
-execution profile before it can admit the PENDING session; an incompatible
+namespace and the prepared-child namespace. The v2 namespace is a deliberate
+prerelease boundary: stop v1 workers and cancel/recreate any unclaimed v1
+prepared-child tasks rather than running mixed protocol generations. The v1
+suffix remains reserved to prevent application task types from colliding with
+stranded or operator-managed legacy queue rows. A worker
+must match the frozen child execution profile and its explicit runtime identity
+before it can admit the PENDING session; an incompatible
 worker releases the task for a compatible worker without invoking the
 provider. Child terminal evidence is committed before the queue task is
 acknowledged. If the parent loses its worker before publishing the subagent

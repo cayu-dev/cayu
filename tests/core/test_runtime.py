@@ -6710,39 +6710,33 @@ def test_factory_checkpoint_write_failure_reconciles_allocation_ownership(
 
 def test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation(
     tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     async def run() -> tuple[list[EnvironmentFactoryReleaseAction], dict[str, Any]]:
-        store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
         transform_started = threading.Event()
         allow_transform_return = threading.Event()
-        original_transform_checkpoint = store.transform_checkpoint
         invocation_release_started = asyncio.Event()
         invocation_release_completed = asyncio.Event()
-        original_release_session_invocation = store.release_session_invocation
 
-        async def delayed_transform_checkpoint(session_id, checkpoint_transform) -> None:
-            def delayed_transform(session, checkpoint):
-                transformed = checkpoint_transform(session, checkpoint)
-                transform_started.set()
-                if not allow_transform_return.wait(timeout=5):
-                    raise TimeoutError("test did not release the checkpoint transform")
-                return transformed
+        class DelayedSQLiteSessionStore(SQLiteSessionStore):
+            invocation_lifecycle_command_version = 1
 
-            await original_transform_checkpoint(session_id, delayed_transform)
+            async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+                def delayed_transform(session, checkpoint):
+                    transformed = checkpoint_transform(session, checkpoint)
+                    transform_started.set()
+                    if not allow_transform_return.wait(timeout=5):
+                        raise TimeoutError("test did not release the checkpoint transform")
+                    return transformed
 
-        async def observed_release_session_invocation(self, command):
-            invocation_release_started.set()
-            result = await original_release_session_invocation(command)
-            invocation_release_completed.set()
-            return result
+                await super().transform_checkpoint(session_id, delayed_transform)
 
-        monkeypatch.setattr(store, "transform_checkpoint", delayed_transform_checkpoint)
-        monkeypatch.setattr(
-            type(store),
-            "release_session_invocation",
-            observed_release_session_invocation,
-        )
+            async def release_session_invocation(self, command):
+                invocation_release_started.set()
+                result = await super().release_session_invocation(command)
+                invocation_release_completed.set()
+                return result
+
+        store = DelayedSQLiteSessionStore(tmp_path / "sessions.sqlite")
         release_actions: list[EnvironmentFactoryReleaseAction] = []
 
         async def release(action: EnvironmentFactoryReleaseAction) -> None:
@@ -10167,6 +10161,11 @@ def test_cayu_app_default_scope_resume_ignores_prior_session_usage():
 
 def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
     store = InMemorySessionStore()
+    clock_now = datetime.now(UTC)
+
+    def clock() -> datetime:
+        return clock_now
+
     provider = FakeProvider(
         [
             ModelStreamEvent.text_delta("first answer"),
@@ -10178,7 +10177,7 @@ def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
             ),
         ]
     )
-    app = CayuApp(session_store=store)
+    app = CayuApp(session_store=store, clock=clock)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -10194,9 +10193,9 @@ def test_cayu_app_session_scoped_elapsed_limit_measures_session_lifetime():
             ),
         )
     )
-    # Backdate the session so its lifetime already exceeds the cap; the resume
-    # itself starts fresh on the invocation clock.
-    store._sessions["sess_session_elapsed"].created_at = datetime.now(UTC) - timedelta(seconds=120)
+    # Advance the injected application clock so durable session lifetime exceeds
+    # the cap while the resume invocation itself starts on a fresh monotonic clock.
+    clock_now += timedelta(seconds=120)
 
     events = asyncio.run(
         collect_resume_events(

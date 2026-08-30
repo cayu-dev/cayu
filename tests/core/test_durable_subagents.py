@@ -1028,6 +1028,9 @@ def test_durable_subagent_creates_child_before_claimable_task_and_worker_complet
             queued[0].input["dispatch"]["prepared_subagent"]["authority"]["child_session_id"]
             == child.id
         )
+        assert persisted_intent["schema_version"] == 2
+        assert persisted_intent["child_runtime_name"] == child.runtime_name
+        assert persisted_intent["child_runtime_version"] == child.runtime_version
 
         direct_recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(

@@ -4793,6 +4793,8 @@ class CayuApp:
                 request=prepared.request,
                 provider_name=prepared.registered_provider.name,
                 model=prepared.session_identity.model,
+                runtime_name=prepared.session_identity.runtime_name,
+                runtime_version=prepared.session_identity.runtime_version,
                 execution_profile=prepared.execution_profile,
             )
         finally:

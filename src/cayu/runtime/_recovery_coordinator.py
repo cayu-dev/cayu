@@ -12158,6 +12158,8 @@ class RecoveryCoordinator:
             or session.agent_name != intent.agent_name
             or session.provider_name != intent.child_provider_name
             or session.model != intent.child_model
+            or session.runtime_name != intent.child_runtime_name
+            or session.runtime_version != intent.child_runtime_version
             or session.environment_name != intent.environment_name
             or session.invocation
             != inherited_session_invocation(

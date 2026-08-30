@@ -4185,6 +4185,7 @@ def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:
     "task_type",
     [
         "acme.dispatch.prepared-subagent.v1",
+        "acme.dispatch.prepared-subagent.v2",
         "acme.dispatch.fork-group.v1",
     ],
 )
