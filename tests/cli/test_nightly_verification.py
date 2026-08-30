@@ -604,6 +604,25 @@ def test_docker_virtual_egress_is_registered_as_uncredentialed_live_verification
     assert check.requires_structured_evidence is True
 
 
+def test_docker_toolchain_profiles_are_registered_as_uncredentialed_live_verification() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "docker-live-toolchain-profiles")
+
+    assert check.lane == "docker"
+    assert check.command == (
+        "uv",
+        "run",
+        "pytest",
+        "tests/environments/test_docker_toolchain_live.py",
+        "-q",
+    )
+    assert check.env == {"CAYU_RUN_DOCKER_TOOLCHAIN_LIVE": "1"}
+    assert check.requires_docker is True
+    assert check.required_env == ()
+    assert check.required_env_values == {}
+    assert check.unset_env
+    assert check.status_on_success == nightly.STATUS_VERIFIED
+
+
 def test_microsandbox_guest_agent_liveness_is_registered_and_explicitly_gated() -> None:
     check = next(
         check for check in nightly.CHECKS if check.id == "microsandbox-live-guest-agent-liveness"

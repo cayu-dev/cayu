@@ -324,6 +324,26 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_docker=True,
     ),
     VerificationCheck(
+        id="docker-live-toolchain-profiles",
+        capability=(
+            "Docker admitted Python and non-Python toolchain profiles, commands, checks, "
+            "timeouts, and copy-back"
+        ),
+        lane="docker",
+        command=(
+            "uv",
+            "run",
+            "pytest",
+            "tests/environments/test_docker_toolchain_live.py",
+            "-q",
+        ),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("Docker daemon and trusted fixture-build network",),
+        env={"CAYU_RUN_DOCKER_TOOLCHAIN_LIVE": "1"},
+        unset_env=_LIVE_CREDENTIAL_ENV,
+        requires_docker=True,
+    ),
+    VerificationCheck(
         id="docker-live-virtual-egress",
         capability=(
             "Docker container virtual-egress enforcement conformance (not sandbox isolation)"

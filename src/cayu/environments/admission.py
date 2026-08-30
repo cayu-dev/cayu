@@ -269,6 +269,10 @@ class ExecutionCapabilityEvidence(CapabilityEvidence):
         default=None,
         pattern=r"^sha256:[0-9a-f]{64}$",
     )
+    toolchain_profile_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
     tool_requirements: ExecutionToolRequirementEvidence | None = None
 
     @model_validator(mode="after")
@@ -296,6 +300,8 @@ class ExecutionCapabilityEvidence(CapabilityEvidence):
             metadata["environment_fingerprint"] = self.environment_fingerprint
         if self.image_fingerprint is not None:
             metadata["image_fingerprint"] = self.image_fingerprint
+        if self.toolchain_profile_fingerprint is not None:
+            metadata["toolchain_profile_fingerprint"] = self.toolchain_profile_fingerprint
         if self.tool_requirements is not None:
             metadata["tool_requirements"] = self.tool_requirements.model_dump(
                 mode="json",

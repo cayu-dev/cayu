@@ -33,6 +33,8 @@ from cayu.workspaces.base import (
     BoundedTarReader,
     RunnerBoundWorkspace,
     TarWriter,
+    WorkspaceGitEntry,
+    WorkspaceGitEntryListResult,
     WorkspaceListResult,
     WorkspaceMoveResult,
     WorkspaceMutationResult,
@@ -73,6 +75,7 @@ _RUNNER_WORKSPACE_PROGRAM = (
     GUEST_DESCRIPTOR_GUARD_SOURCE
     + r"""
 import base64
+import hashlib
 import io
 import json
 import re
@@ -286,6 +289,123 @@ def list_operation(root_fd):
     sys.stdout.write(payload)
 
 
+def collect_git_entries(
+    dir_fd,
+    prefix,
+    entries,
+    ancestor_directories,
+    excluded_directory_names,
+    limit,
+):
+    if os.listdir not in getattr(os, "supports_fd", ()):
+        raise GuardPathError("unsupported")
+    if os.readlink not in getattr(os, "supports_dir_fd", ()):
+        raise GuardPathError("unsupported")
+    directory_info = os.fstat(dir_fd)
+    identity = (directory_info.st_dev, directory_info.st_ino)
+    if identity in ancestor_directories:
+        raise GuardPathError("escape")
+    ancestor_directories.add(identity)
+    try:
+        for name in sorted(os.listdir(dir_fd)):
+            rel_path = name if not prefix else prefix + "/" + name
+            if name.casefold() in excluded_directory_names:
+                continue
+            try:
+                entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno in MISSING_ERRNOS:
+                    fail("workspace_error", "Workspace changed during Git entry observation.")
+                raise
+            if stat.S_ISLNK(entry.st_mode):
+                target = os.fsencode(os.readlink(name, dir_fd=dir_fd))
+                entries.append({
+                    "path": rel_path,
+                    "git_mode": "120000",
+                    "symlink_target_sha256": hashlib.sha256(target).hexdigest(),
+                    "symlink_target_bytes": len(target),
+                })
+            elif stat.S_ISDIR(entry.st_mode):
+                try:
+                    child_fd = open_guarded_directory(name, dir_fd, False, True)
+                except GuardPathError as exc:
+                    if exc.status in ("enoent", "escape"):
+                        fail("workspace_error", "Workspace changed during Git entry observation.")
+                    raise
+                try:
+                    if collect_git_entries(
+                        child_fd,
+                        rel_path,
+                        entries,
+                        ancestor_directories,
+                        excluded_directory_names,
+                        limit,
+                    ):
+                        return True
+                finally:
+                    close_fd(child_fd)
+                continue
+            elif stat.S_ISREG(entry.st_mode):
+                entries.append({
+                    "path": rel_path,
+                    "git_mode": "100755" if entry.st_mode & 0o111 else "100644",
+                    "symlink_target_sha256": None,
+                    "symlink_target_bytes": None,
+                })
+            else:
+                fail(
+                    "workspace_error",
+                    "Workspace contains an unsupported Git-significant entry type.",
+                )
+            if len(entries) > limit:
+                return True
+        return False
+    finally:
+        ancestor_directories.remove(identity)
+
+
+def git_entries_operation(root_fd):
+    limit = int(sys.argv[2])
+    payload_limit = int(sys.argv[3])
+    excluded_directory_names = frozenset(json.loads(sys.argv[4]))
+    entries = []
+    truncated = collect_git_entries(
+        root_fd,
+        "",
+        entries,
+        set(),
+        excluded_directory_names,
+        limit,
+    )
+    entries.sort(key=lambda item: item["path"])
+    total_count = len(entries)
+
+    def serialize(entry_count):
+        return json.dumps(
+            {
+                "ok": True,
+                "entries": entries[:entry_count],
+                "total_count": total_count,
+                "truncated": truncated or entry_count < total_count,
+            },
+            separators=(",", ":"),
+        )
+
+    low = 0
+    high = min(limit, len(entries))
+    while low < high:
+        candidate = (low + high + 1) // 2
+        encoded = (serialize(candidate) + "\n").encode("utf-8")
+        if len(encoded) <= payload_limit:
+            low = candidate
+        else:
+            high = candidate - 1
+    payload = serialize(low) + "\n"
+    if len(payload.encode("utf-8")) > payload_limit:
+        fail("workspace_error", "Workspace Git entry result exceeds its transfer limit.")
+    sys.stdout.write(payload)
+
+
 def read_tar_operation(root_fd):
     payload = json.loads(sys.stdin.read())
     rel_paths = payload["paths"]
@@ -470,7 +590,7 @@ def main():
     operation = sys.argv[1]
     root_fd = None
     try:
-        root_fd = open_guard_root(".", operation == "list")
+        root_fd = open_guard_root(".", operation in ("list", "git_entries"))
         with workspace_source_lock(root_fd, False):
             if operation == "read":
                 read_operation(root_fd)
@@ -480,6 +600,8 @@ def main():
                 delete_operation(root_fd)
             elif operation == "list":
                 list_operation(root_fd)
+            elif operation == "git_entries":
+                git_entries_operation(root_fd)
             elif operation == "read_tar":
                 read_tar_operation(root_fd)
             elif operation == "write_tar":
@@ -698,7 +820,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             if max_bytes is None
             else _validate_required_limit(max_bytes, "max_bytes")
         )
-        content, total_bytes, revision, digest = await guard_read(
+        content, total_bytes, revision, digest, git_mode = await guard_read(
             self._runner,
             root=self._runner.resolve_cwd(self.cwd),
             rel_path=path,
@@ -715,6 +837,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             offset=offset,
             revision=revision,
             sha256=digest,
+            git_mode=git_mode,
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:
@@ -864,6 +987,25 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         validated = _validate_workspace_list_result(
             result,
             pattern=pattern,
+            effective_limit=effective_limit,
+            excluded_directory_keys=self._excluded_directory_keys,
+        )
+        del result
+        if isinstance(validated, Exception):
+            raise validated from None
+        return validated
+
+    async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
+        effective_limit = _validate_required_limit(limit, "limit")
+        result = await self._run_json_operation(
+            "git_entries",
+            str(effective_limit),
+            str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            json.dumps(tuple(sorted(self._excluded_directory_keys))),
+            output_limit_bytes=_json_list_output_limit(),
+        )
+        validated = _validate_workspace_git_entry_result(
+            result,
             effective_limit=effective_limit,
             excluded_directory_keys=self._excluded_directory_keys,
         )
@@ -1057,6 +1199,57 @@ def _validate_workspace_list_result(
         total_count=total_count,
         truncated=total_count > len(validated_paths),
     )
+
+
+def _validate_workspace_git_entry_result(
+    result: dict[str, Any],
+    *,
+    effective_limit: int,
+    excluded_directory_keys: frozenset[str],
+) -> WorkspaceGitEntryListResult | TypeError | ValueError:
+    raw_entries = result.get("entries")
+    total_count = result.get("total_count")
+    truncated = result.get("truncated")
+    if type(raw_entries) is not list or type(total_count) is not int or type(truncated) is not bool:
+        return TypeError("Runner workspace returned invalid Git entry evidence.")
+    entries: list[WorkspaceGitEntry] = []
+    for raw_entry in raw_entries:
+        if type(raw_entry) is not dict or set(raw_entry) != {
+            "path",
+            "git_mode",
+            "symlink_target_sha256",
+            "symlink_target_bytes",
+        }:
+            return TypeError("Runner workspace returned an invalid Git entry.")
+        path = raw_entry.get("path")
+        if type(path) is not str:
+            return TypeError("Runner workspace returned an invalid Git entry path.")
+        try:
+            path = require_durable_text(path, "Runner workspace Git entry path")
+            normalized = _validate_relative_path(path)
+            entry = WorkspaceGitEntry(
+                path=path,
+                git_mode=raw_entry.get("git_mode"),
+                symlink_target_sha256=raw_entry.get("symlink_target_sha256"),
+                symlink_target_bytes=raw_entry.get("symlink_target_bytes"),
+            )
+        except (TypeError, ValueError):
+            return ValueError("Runner workspace returned invalid Git entry evidence.")
+        if path != normalized or _path_has_excluded_directory(path, excluded_directory_keys):
+            return ValueError("Runner workspace returned an inadmissible Git entry path.")
+        entries.append(entry)
+    if total_count < len(entries) or total_count > effective_limit + 1:
+        return ValueError("Runner workspace returned an invalid Git entry count.")
+    if len(entries) > effective_limit or (not truncated and total_count != len(entries)):
+        return ValueError("Runner workspace returned inconsistent Git entry truncation.")
+    try:
+        return WorkspaceGitEntryListResult(
+            entries=tuple(entries),
+            total_count=total_count,
+            truncated=truncated,
+        )
+    except (TypeError, ValueError) as exc:
+        return type(exc)("Runner workspace returned invalid Git entry evidence.")
 
 
 def _validate_required_limit(value: int, field_name: str) -> int:

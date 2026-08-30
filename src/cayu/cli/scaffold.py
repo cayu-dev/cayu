@@ -3425,6 +3425,15 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
             "named checks in an admitted Docker environment."
         ),
     )
+    parser.add_argument(
+        "--coding-toolchain",
+        choices=("python",),
+        help=(
+            "Explicit admitted profile for Docker coding execution. The generated "
+            "Python profile is the first built-in; applications may register custom "
+            "DockerCodingToolchainProfile values in composition.py."
+        ),
+    )
 
 
 def _installed_cayu_version() -> str:
@@ -3439,6 +3448,7 @@ def project_files(
     template: str = "agent",
     composition: str | None = None,
     coding_execution: str | None = None,
+    coding_toolchain: str | None = None,
 ) -> dict[str, str]:
     resolved_agent_name = name if agent_name is None else agent_name
     reviewer_name = f"{resolved_agent_name}-reviewer"
@@ -3476,6 +3486,8 @@ def project_files(
     }
     if coding_execution is not None and composition != "coding":
         raise ValueError("coding_execution requires composition='coding'.")
+    if coding_toolchain is not None and coding_execution != "docker":
+        raise ValueError("coding_toolchain requires coding_execution='docker'.")
     if composition is not None:
         if composition != "coding":
             raise ValueError("composition must be 'coding'.")
@@ -3488,6 +3500,7 @@ def project_files(
                 files=files,
                 render=render,
                 execution=coding_execution,
+                toolchain=coding_toolchain,
             )
         )
         return files
@@ -3542,9 +3555,16 @@ def run_new(args: argparse.Namespace) -> int:
         return 1
     composition = getattr(args, "composition", None)
     coding_execution = getattr(args, "coding_execution", None)
+    coding_toolchain = getattr(args, "coding_toolchain", None)
     if coding_execution is not None and composition != "coding":
         print(
             "error: --coding-execution requires --composition coding.",
+            file=sys.stderr,
+        )
+        return 1
+    if coding_toolchain is not None and coding_execution != "docker":
+        print(
+            "error: --coding-toolchain requires --coding-execution docker.",
             file=sys.stderr,
         )
         return 1
@@ -3592,6 +3612,7 @@ def run_new(args: argparse.Namespace) -> int:
         template=args.template,
         composition=composition,
         coding_execution=coding_execution,
+        coding_toolchain=coding_toolchain,
     )
     if composition == "coding":
         assert coding_git is not None
@@ -3725,6 +3746,7 @@ def run_new(args: argparse.Namespace) -> int:
         if coding_execution == "docker":
             print("  Configure pinned inputs: docker-coding-build.json")
             print("  Build and record image: uv run python build_coding_image.py")
+            print(f"  Toolchain profile: {coding_toolchain or 'python'}")
     else:
         print("  uv run cayu check --json")
         print("  uv run pytest")
@@ -3735,7 +3757,10 @@ def run_new(args: argparse.Namespace) -> int:
         print("  Operator control plane: http://127.0.0.1:8000/cayu/")
     elif composition == "coding":
         if coding_execution == "docker":
-            print("  Execution: trusted-repository Docker named checks (network disabled)")
+            print(
+                "  Execution: admitted trusted-repository Docker checks and commands "
+                "(network disabled)"
+            )
         print(f'  Live run: uv run python run.py --agent {agent_name} --message "YOUR REQUEST"')
         print("  Local control plane: uv run cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")

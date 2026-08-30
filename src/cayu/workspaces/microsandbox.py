@@ -118,7 +118,7 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
             if max_bytes is None
             else _validate_required_limit(max_bytes, "max_bytes")
         )
-        content, total_bytes, revision, digest = await guard_read(
+        content, total_bytes, revision, digest, git_mode = await guard_read(
             self._runner,
             root=self.root,
             rel_path=rel_path,
@@ -134,6 +134,7 @@ class MicrosandboxWorkspace(RunnerBoundWorkspace):
             offset=offset,
             revision=revision,
             sha256=digest,
+            git_mode=git_mode,
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:

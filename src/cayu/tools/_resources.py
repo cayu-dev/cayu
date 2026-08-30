@@ -24,6 +24,8 @@ from cayu.tools._redaction import (
 )
 from cayu.workspaces import (
     Workspace,
+    WorkspaceGitEntry,
+    WorkspaceGitEntryListResult,
     WorkspaceMoveResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
@@ -448,6 +450,7 @@ class InvocationWorkspaceHandle(Workspace):
             offset=offset,
             revision=captured.revision if complete else None,
             sha256=captured.sha256 if complete else None,
+            git_mode=captured.git_mode if complete else None,
             source_bytes_read=source_bytes_read,
             redaction_truncated=redaction_truncated,
         )
@@ -584,6 +587,26 @@ class InvocationWorkspaceHandle(Workspace):
 
     async def list(self, pattern: str = "**/*", *, limit: int | None = None):
         return await self.__workspace.list(pattern, limit=limit)
+
+    async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
+        result = await self.__workspace.list_git_entries(limit=limit)
+        if type(result) is not WorkspaceGitEntryListResult:
+            raise InvocationResourceReadError(
+                "Workspace Git entry observation returned an invalid result."
+            )
+        return WorkspaceGitEntryListResult(
+            entries=tuple(
+                WorkspaceGitEntry(
+                    path=entry.path,
+                    git_mode=entry.git_mode,
+                    symlink_target_sha256=entry.symlink_target_sha256,
+                    symlink_target_bytes=entry.symlink_target_bytes,
+                )
+                for entry in result.entries
+            ),
+            total_count=result.total_count,
+            truncated=result.truncated,
+        )
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:
@@ -791,6 +814,7 @@ async def _read_workspace_delegate(
             offset=result.offset,
             revision=result.revision,
             sha256=result.sha256,
+            git_mode=result.git_mode,
             source_bytes_read=result.source_bytes_read,
             redaction_truncated=result.redaction_truncated,
         )

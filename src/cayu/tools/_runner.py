@@ -6,8 +6,10 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from math import isfinite
 from pathlib import Path
+from threading import Lock
 from time import monotonic
 from typing import Any, Literal, NoReturn, cast
 
@@ -21,7 +23,9 @@ from cayu._exception_groups import (
 from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
     compact_json_utf8_size,
+    copy_durable_json_object,
     require_durable_nonblank,
 )
 from cayu._workspace_mutation import detached_workspace_mutation_process_signal
@@ -93,6 +97,8 @@ _MAX_RUNNER_CANCELLATION_REASON_BYTES = 2048
 _RUNNER_MUTATION_SETTLEMENT_FOREGROUND_TIMEOUT_SECONDS = 30.0
 _RUNNER_COMMAND_EVIDENCE_MAX_BYTES = 4096
 _RUNNER_COMMAND_EVIDENCE_PREVIEW_MAX_BYTES = 1536
+_DURABLE_RUNNER_OPERATION_SCHEMA = "cayu.durable_runner_operation.v1"
+_DURABLE_RUNNER_OPERATION_LOCK = Lock()
 RunnerExecutionObserver = Callable[
     [Literal["started", "completed"], dict[str, Any], int],
     Awaitable[None],
@@ -104,6 +110,7 @@ class InvocationRunnerHandle:
 
     __slots__ = (
         "__ambiguous_capture_observer",
+        "__durable_operation_identity",
         "__execution_observer",
         "__mutation_owner",
         "__publish_execution_arguments",
@@ -137,6 +144,7 @@ class InvocationRunnerHandle:
         if type(publish_execution_arguments) is not bool:
             raise TypeError("publish_execution_arguments must be a bool.")
         self.__runner = runner
+        self.__durable_operation_identity: dict[str, Any] | None = None
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__ambiguous_capture_observer = ambiguous_capture_observer
         self.__mutation_owner = mutation_owner
@@ -238,7 +246,7 @@ class InvocationRunnerHandle:
                 "ExecutionAdmissionCandidate or None."
             )
         return ExecutionAdmissionCandidate.model_validate(
-            candidate.model_dump(mode="python", warnings=False)
+            candidate.model_dump(mode="python", by_alias=True, warnings=False)
         )
 
     def workload_authority(self, name: str) -> RunnerWorkloadAuthority | None:
@@ -283,6 +291,28 @@ class InvocationRunnerHandle:
         if present is not None and type(present) is not bool:
             raise TypeError("Runner output_secret_values_present() must return bool or None.")
         return present
+
+    def durable_resource_identity(self) -> str | None:
+        """Return a privacy-safe identity for the exact hidden runner allocation."""
+
+        return _durable_runner_resource_identity(self.__runner)
+
+    def bind_durable_command_operation(self, identity: dict[str, Any]) -> None:
+        """Bind the next dispatch to one pre-published durable operation identity."""
+
+        owned = _validate_durable_runner_operation_identity(identity)
+        resource_identity = self.durable_resource_identity()
+        if resource_identity is None or owned["runner_resource_identity"] != resource_identity:
+            raise RuntimeError("Durable runner operation does not match this allocation.")
+        if self.__durable_operation_identity is not None:
+            raise RuntimeError("Invocation runner already has a bound durable operation.")
+        _publish_durable_runner_operation(
+            self.__runner,
+            owned,
+            state="bound",
+            result=None,
+        )
+        self.__durable_operation_identity = owned
 
     async def exec(
         self,
@@ -370,6 +400,15 @@ class InvocationRunnerHandle:
             raise published_failure from None
         if owned_command is None:  # pragma: no cover - preflight construction invariant
             raise AssertionError("Runner preflight completed without an owned command.")
+        durable_operation_identity = self.__durable_operation_identity
+        self.__durable_operation_identity = None
+        if durable_operation_identity is not None:
+            _publish_durable_runner_operation(
+                self.__runner,
+                durable_operation_identity,
+                state="dispatching",
+                result=None,
+            )
         initial = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
         initial_revision = initial.revision
         result: ExecResult | None = None
@@ -713,9 +752,17 @@ class InvocationRunnerHandle:
             output_limit_bytes=owned_output_limit,
         ):
             self.__ambiguous_capture_observer(current.revision)
-        return projected.model_copy(
+        published = projected.model_copy(
             update={"artifacts": sanitize_runner_artifacts(projected.artifacts)}
         )
+        if durable_operation_identity is not None:
+            _publish_durable_runner_operation(
+                self.__runner,
+                durable_operation_identity,
+                state="terminal",
+                result=published.model_dump(mode="json"),
+            )
+        return published
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         """Delegate canonicalization without exposing runner lifecycle methods."""
@@ -743,6 +790,130 @@ class InvocationRunnerHandle:
                 return None
             return str(workspace_root)
         return None
+
+
+def _durable_runner_resource_identity(runner: Runner) -> str | None:
+    """Hash an adapter's exact allocation key without publishing the raw key."""
+
+    try:
+        resource_key = runner.resource_key
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if type(resource_key) is not tuple or not resource_key:
+        return None
+    if any(item is not None and type(item) not in {str, bool, int} for item in resource_key):
+        return None
+    material = {
+        "adapter": type(runner).__module__ + "." + type(runner).__qualname__,
+        "isolation": getattr(runner, "isolation", "unknown"),
+        "resource_key": list(resource_key),
+    }
+    try:
+        encoded = canonical_durable_json_bytes(material, "durable_runner_resource_identity")
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    return "sha256:" + sha256(encoded).hexdigest()
+
+
+def _validate_durable_runner_operation_identity(value: object) -> dict[str, Any]:
+    owned = copy_durable_json_object(value, "durable_runner_operation_identity")
+    expected_fields = {
+        "schema",
+        "operation_id",
+        "runner_resource_identity",
+        "request_identity",
+        "process_identity",
+        "output_identity",
+        "artifact_identity",
+        "cleanup_identity",
+    }
+    if set(owned) != expected_fields or owned.get("schema") != _DURABLE_RUNNER_OPERATION_SCHEMA:
+        raise ValueError("Durable runner operation identity is invalid.")
+    for field in expected_fields - {"schema"}:
+        item = owned.get(field)
+        if (
+            type(item) is not str
+            or len(item) != 71
+            or not item.startswith("sha256:")
+            or any(character not in "0123456789abcdef" for character in item[7:])
+        ):
+            raise ValueError("Durable runner operation identity is invalid.")
+    return owned
+
+
+def _durable_runner_operation_records(runner: Runner) -> dict[str, dict[str, Any]]:
+    namespace = vars(runner)
+    records = namespace.get("_cayu_durable_runner_operations")
+    if type(records) is not dict:
+        records = {}
+        namespace["_cayu_durable_runner_operations"] = records
+    return records
+
+
+def _publish_durable_runner_operation(
+    runner: Runner,
+    identity: dict[str, Any],
+    *,
+    state: Literal["bound", "dispatching", "terminal", "failed"],
+    result: dict[str, Any] | None,
+) -> None:
+    operation_id = identity["operation_id"]
+    record = {
+        "identity": identity,
+        "state": state,
+        "result": result,
+    }
+    with _DURABLE_RUNNER_OPERATION_LOCK:
+        records = _durable_runner_operation_records(runner)
+        previous = records.get(operation_id)
+        if previous is not None and previous.get("identity") != identity:
+            raise RuntimeError("Durable runner operation identity collision.")
+        if previous is not None:
+            previous_state = previous.get("state")
+            transitions = {
+                "bound": {"dispatching", "failed"},
+                "dispatching": {"terminal", "failed"},
+                "terminal": {"terminal"},
+                "failed": {"failed"},
+            }
+            if state not in transitions.get(str(previous_state), set()):
+                raise RuntimeError("Durable runner operation state transition is invalid.")
+        if previous is None and len(records) >= 1024:
+            raise RuntimeError("Durable runner operation registry is full.")
+        records[operation_id] = copy_durable_json_object(
+            record,
+            "durable_runner_operation_record",
+        )
+
+
+def durable_runner_recovery_authority(
+    runner: Runner | None,
+) -> tuple[
+    str | None,
+    Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None,
+]:
+    """Return the narrow exact-allocation observer used by Runtime recovery."""
+
+    if runner is None or not isinstance(runner, Runner):
+        return None, None
+    resource_identity = _durable_runner_resource_identity(runner)
+    if resource_identity is None:
+        return None, None
+
+    async def reconcile(identity: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            owned = _validate_durable_runner_operation_identity(identity)
+        except (TypeError, ValueError):
+            return None
+        if owned["runner_resource_identity"] != resource_identity:
+            return None
+        with _DURABLE_RUNNER_OPERATION_LOCK:
+            record = _durable_runner_operation_records(runner).get(owned["operation_id"])
+            if record is None or record.get("identity") != owned:
+                return None
+            return copy_durable_json_object(record, "durable_runner_operation_observation")
+
+    return resource_identity, reconcile
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,6 +18,12 @@ from cayu.core.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.environments.docker_toolchains import (
+    DockerCodingToolchainError,
+    DockerCodingToolchainProfile,
+    docker_coding_toolchain_runner_admission_failure,
+    verify_docker_coding_toolchain_dependencies,
+)
 from cayu.runners import ExecCommand, RunnerExecutionError
 from cayu.runners.base import runner_workspace_mutation_settlement
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
@@ -170,6 +176,7 @@ class RunCheckTool(Tool):
         checks: Iterable[NamedCheck],
         command_policy: CommandPolicy,
         max_model_output_bytes: int = DEFAULT_CHECK_MODEL_OUTPUT_BYTES,
+        toolchain_profile: DockerCodingToolchainProfile | None = None,
     ) -> None:
         if isinstance(checks, str | bytes):
             raise TypeError("checks must be an iterable of NamedCheck declarations.")
@@ -195,7 +202,37 @@ class RunCheckTool(Tool):
         if owned_model_limit < len(_OUTPUT_TRUNCATION_MARKER.encode("utf-8")):
             raise ValueError("max_model_output_bytes is too small for the truncation marker.")
         ordered_checks = tuple(sorted(owned_checks, key=lambda item: item.name))
-        schema = type(self).spec.input_schema
+        if (
+            toolchain_profile is not None
+            and type(toolchain_profile) is not DockerCodingToolchainProfile
+        ):
+            raise TypeError(
+                "toolchain_profile must be an exact DockerCodingToolchainProfile or None."
+            )
+        owned_toolchain = (
+            None
+            if toolchain_profile is None
+            else DockerCodingToolchainProfile.model_validate(
+                toolchain_profile.model_dump(mode="python", by_alias=True)
+            )
+        )
+        if owned_toolchain is not None:
+            for check in ordered_checks:
+                authority = owned_toolchain.command_authority(
+                    check.name,
+                    exposure="named_check",
+                )
+                if authority is None:
+                    raise ValueError("Every named check must have a matching toolchain authority.")
+                if (
+                    authority.command_argv() != tuple(check.command.argv or ())
+                    or authority.timeout_seconds != check.timeout_s
+                    or authority.max_output_bytes != check.max_output_bytes
+                ):
+                    raise ValueError(
+                        "Named check command and bounds must match its toolchain authority."
+                    )
+        schema = copy_json_value(type(self).spec.input_schema, "run_check.input_schema")
         schema["properties"]["check"]["enum"] = [check.name for check in ordered_checks]
         super().__init__(type(self).spec.model_copy(update={"input_schema": schema}))
         self._checks = ordered_checks
@@ -203,6 +240,7 @@ class RunCheckTool(Tool):
         self._command_policy = command_policy
         self._executor = ExecCommandTool(policy=command_policy)
         self._max_model_output_bytes = owned_model_limit
+        self._toolchain_profile = owned_toolchain
 
     @property
     def checks(self) -> tuple[NamedCheck, ...]:
@@ -216,14 +254,25 @@ class RunCheckTool(Tool):
 
         return self._command_policy
 
+    @property
+    def toolchain_profile(self) -> DockerCodingToolchainProfile | None:
+        if self._toolchain_profile is None:
+            return None
+        return DockerCodingToolchainProfile.model_validate(
+            self._toolchain_profile.model_dump(mode="python", by_alias=True)
+        )
+
     def _execution_profile_material(self) -> dict[str, object]:
         """Return complete built-in behavior inputs; policy is profiled separately."""
 
-        return {
+        material: dict[str, object] = {
             "result_projection_version": RUN_CHECK_RESULT_PROJECTION_VERSION,
             "max_model_output_bytes": self._max_model_output_bytes,
             "checks": [check._profile_material() for check in self._checks],
         }
+        if self._toolchain_profile is not None:
+            material["toolchain_profile_fingerprint"] = self._toolchain_profile.fingerprint
+        return material
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -239,6 +288,91 @@ class RunCheckTool(Tool):
             if check is None:
                 raise ValueError("Tool argument `check` must name a declared check.")
 
+        if self._toolchain_profile is not None:
+            runner_failure = docker_coding_toolchain_runner_admission_failure(
+                ctx.runner,
+                profile=self._toolchain_profile,
+            )
+            if runner_failure is not None:
+                return self._attach_toolchain_evidence(
+                    check,
+                    ToolResult(
+                        content=(
+                            f"Check {check.name!r} requires the exact admitted Docker toolchain."
+                        ),
+                        structured={
+                            **_base_error_evidence(check, status="toolchain_unavailable"),
+                            "error": runner_failure,
+                        },
+                        is_error=True,
+                    ),
+                )
+            if ctx.workspace is None:
+                return self._attach_toolchain_evidence(
+                    check,
+                    ToolResult(
+                        content=f"Check {check.name!r} requires an active admitted workspace.",
+                        structured={
+                            **_base_error_evidence(check, status="toolchain_unavailable"),
+                            "error": "workspace_unavailable",
+                        },
+                        is_error=True,
+                    ),
+                )
+            authority = self._toolchain_profile.command_authority(
+                check.name,
+                exposure="named_check",
+            )
+            if authority is None:  # pragma: no cover - constructor invariant
+                raise AssertionError("Named check toolchain authority was lost.")
+            if authority.dependency_sensitive:
+                try:
+                    await verify_docker_coding_toolchain_dependencies(
+                        self._toolchain_profile,
+                        ctx.workspace,
+                    )
+                except DockerCodingToolchainError as exc:
+                    return self._attach_toolchain_evidence(
+                        check,
+                        ToolResult(
+                            content=str(exc),
+                            structured={
+                                **_base_error_evidence(
+                                    check,
+                                    status=(
+                                        "stale_toolchain"
+                                        if exc.code == "dependency_inputs_changed"
+                                        else "toolchain_unavailable"
+                                    ),
+                                ),
+                                "error": exc.code,
+                                "dependency_path_count": exc.path_count,
+                                "dependency_paths_fingerprint": exc.paths_fingerprint,
+                            },
+                            is_error=True,
+                        ),
+                    )
+
+            runner_failure = docker_coding_toolchain_runner_admission_failure(
+                ctx.runner,
+                profile=self._toolchain_profile,
+            )
+            if runner_failure is not None:
+                return self._attach_toolchain_evidence(
+                    check,
+                    ToolResult(
+                        content=(
+                            f"Check {check.name!r} admission changed before dispatch; "
+                            "no check was run."
+                        ),
+                        structured={
+                            **_base_error_evidence(check, status="toolchain_unavailable"),
+                            "error": runner_failure,
+                        },
+                        is_error=True,
+                    ),
+                )
+
         try:
             raw_result = await self._executor._execute_resolved_command(
                 ctx,
@@ -253,17 +387,41 @@ class RunCheckTool(Tool):
                 include_runner_evidence=True,
             )
         except RunnerExecutionError as exc:
-            return _execution_failure_result(check, exc)
+            return self._attach_toolchain_evidence(check, _execution_failure_result(check, exc))
         except TypeError as exc:
             if str(exc) != "Runner returned invalid result type.":
                 raise
-            return _malformed_execution_result(check)
+            return self._attach_toolchain_evidence(check, _malformed_execution_result(check))
         try:
-            return await self._project_result(ctx, check=check, raw_result=raw_result)
+            projected = await self._project_result(ctx, check=check, raw_result=raw_result)
+            return self._attach_toolchain_evidence(check, projected)
         except TypeError as exc:
             if str(exc) != "Runner returned invalid result type.":
                 raise
-            return _malformed_execution_result(check)
+            return self._attach_toolchain_evidence(check, _malformed_execution_result(check))
+
+    def _attach_toolchain_evidence(
+        self,
+        check: NamedCheck,
+        result: ToolResult,
+    ) -> ToolResult:
+        if self._toolchain_profile is None:
+            return result
+        authority = self._toolchain_profile.command_authority(
+            check.name,
+            exposure="named_check",
+        )
+        if authority is None:  # pragma: no cover - constructor invariant
+            raise AssertionError("Named check toolchain authority was lost.")
+        return result.model_copy(
+            update={
+                "structured": {
+                    **({} if result.structured is None else dict(result.structured)),
+                    **self._toolchain_profile.evidence(),
+                    "toolchain_command_authority_fingerprint": authority.fingerprint,
+                }
+            }
+        )
 
     async def _project_result(
         self,
@@ -332,6 +490,12 @@ class RunCheckTool(Tool):
             else "failed"
         )
         mutation_settlement = _required_mutation_settlement(structured)
+        cleanup_complete = mutation_settlement in {"complete", "runner_quiescent"}
+        if status not in {"cancelled", "timed_out"}:
+            if mutation_settlement == "deferred":
+                status = "partial"
+            elif mutation_settlement == "uncertain":
+                status = "ambiguous"
         projected = {
             "check": check.name,
             "check_profile_fingerprint": check.profile_fingerprint,
@@ -358,6 +522,10 @@ class RunCheckTool(Tool):
             "cleanup_uncertain": mutation_settlement in {"deferred", "uncertain"},
             "artifacts": artifacts,
         }
+        if mutation_settlement == "deferred":
+            projected["error"] = "workspace_cleanup_deferred"
+        elif mutation_settlement == "uncertain":
+            projected["error"] = "workspace_cleanup_uncertain"
         return ToolResult(
             content=_model_content(
                 check=check,
@@ -370,7 +538,7 @@ class RunCheckTool(Tool):
             ),
             structured=projected,
             artifacts=artifacts,
-            is_error=timed_out or cancelled,
+            is_error=timed_out or cancelled or not cleanup_complete,
         )
 
 

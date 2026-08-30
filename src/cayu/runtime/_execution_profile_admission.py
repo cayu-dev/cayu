@@ -988,6 +988,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
     from cayu.tools.named_checks import RunCheckTool
     from cayu.tools.patches import ApplyPatchTool
     from cayu.tools.search import SearchTextTool
+    from cayu.tools.structured_commands import RunCommandTool
     from cayu.tools.user_input import UserInputTool
     from cayu.tools.web import WebFetchTool
     from cayu.tools.web_access import WebAccessRoutingTool
@@ -996,6 +997,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
         ExecCommandTool,
         RunCheckTool,
         ApplyPatchTool,
+        RunCommandTool,
         DeleteFileTool,
         EditFileTool,
         ListArtifactsTool,
@@ -1061,6 +1063,7 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
     )
     from cayu.tools.command_policy import ProcessCommandPolicy
     from cayu.tools.git_command_policy import GitCommandPolicy
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     policy_types = (
         AllowAllToolPolicy,
@@ -1070,6 +1073,7 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
         TaintAwareToolPolicy,
         ProcessCommandPolicy,
         GitCommandPolicy,
+        StructuredCommandToolPolicy,
         AllRegisteredToolsExposurePolicy,
         StaticToolExposurePolicy,
     )

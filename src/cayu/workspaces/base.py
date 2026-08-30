@@ -20,6 +20,9 @@ if TYPE_CHECKING:
         WorkspaceBranchRequest,
     )
 
+WorkspaceGitMode = Literal["100644", "100755"]
+WorkspaceGitEntryMode = Literal["100644", "100755", "120000"]
+
 
 @dataclass(frozen=True)
 class WorkspaceReadResult:
@@ -29,6 +32,7 @@ class WorkspaceReadResult:
     offset: int = 0
     revision: str | None = None
     sha256: str | None = None
+    git_mode: WorkspaceGitMode | None = None
     source_bytes_read: int | None = None
     redaction_truncated: bool = False
 
@@ -82,11 +86,13 @@ class WorkspaceReadResult:
             raise ValueError(
                 "WorkspaceReadResult sha256 must be a lowercase SHA-256 digest or None."
             )
-        if (self.revision is not None or self.sha256 is not None) and (
+        if self.git_mode is not None and self.git_mode not in {"100644", "100755"}:
+            raise ValueError("WorkspaceReadResult git_mode must be 100644, 100755, or None.")
+        if (self.revision is not None or self.sha256 is not None or self.git_mode is not None) and (
             self.offset != 0 or self.truncated
         ):
             raise ValueError(
-                "WorkspaceReadResult revision metadata requires a complete offset-zero snapshot."
+                "WorkspaceReadResult identity metadata requires a complete offset-zero snapshot."
             )
         object.__setattr__(self, "source_bytes_read", source_bytes_read)
 
@@ -97,6 +103,82 @@ class WorkspaceReadResult:
             if self.truncated and self.source_bytes_read
             else None
         )
+
+
+@dataclass(frozen=True)
+class WorkspaceGitEntry:
+    """One Git-significant workspace entry observed without following symlinks."""
+
+    path: str
+    git_mode: WorkspaceGitEntryMode
+    symlink_target_sha256: str | None = None
+    symlink_target_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        path = _validate_workspace_relative_path(self.path)
+        if self.git_mode not in {"100644", "100755", "120000"}:
+            raise ValueError("WorkspaceGitEntry git_mode is invalid.")
+        if self.git_mode == "120000":
+            if (
+                type(self.symlink_target_sha256) is not str
+                or len(self.symlink_target_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef" for character in self.symlink_target_sha256
+                )
+            ):
+                raise ValueError(
+                    "WorkspaceGitEntry symlink_target_sha256 must be a lowercase SHA-256 digest."
+                )
+            if type(self.symlink_target_bytes) is not int or self.symlink_target_bytes < 0:
+                raise ValueError(
+                    "WorkspaceGitEntry symlink_target_bytes must be non-negative for symlinks."
+                )
+        elif self.symlink_target_sha256 is not None or self.symlink_target_bytes is not None:
+            raise ValueError("Regular WorkspaceGitEntry values cannot define a symlink target.")
+        object.__setattr__(self, "path", path)
+
+
+@dataclass(frozen=True)
+class WorkspaceGitEntryListResult:
+    """Bounded complete-or-truncated Git-significant entry observation."""
+
+    entries: tuple[WorkspaceGitEntry, ...]
+    total_count: int
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.entries, str | bytes):
+            raise TypeError("WorkspaceGitEntryListResult entries must be an iterable.")
+        try:
+            entries = tuple(self.entries)
+        except TypeError as exc:
+            raise TypeError("WorkspaceGitEntryListResult entries must be an iterable.") from exc
+        if any(type(entry) is not WorkspaceGitEntry for entry in entries):
+            raise TypeError(
+                "WorkspaceGitEntryListResult entries must be exact WorkspaceGitEntry values."
+            )
+        if tuple(sorted(entries, key=lambda entry: entry.path)) != entries:
+            raise ValueError("WorkspaceGitEntryListResult entries must be sorted by path.")
+        paths = tuple(entry.path for entry in entries)
+        if len(paths) != len(set(paths)):
+            raise ValueError("WorkspaceGitEntryListResult entries must have unique paths.")
+        if type(self.total_count) is not int or self.total_count < 0:
+            raise ValueError("WorkspaceGitEntryListResult total_count must be non-negative.")
+        if type(self.truncated) is not bool:
+            raise TypeError("WorkspaceGitEntryListResult truncated must be a bool.")
+        if self.total_count < len(entries):
+            raise ValueError(
+                "WorkspaceGitEntryListResult total_count cannot be smaller than entries."
+            )
+        if not self.truncated and self.total_count != len(entries):
+            raise ValueError(
+                "WorkspaceGitEntryListResult total_count must equal entries when complete."
+            )
+        object.__setattr__(self, "entries", entries)
+
+
+class WorkspaceGitEntryObservationUnsupportedError(RuntimeError):
+    """A workspace cannot enumerate every Git-significant entry without following links."""
 
 
 class WorkspaceReadOffsetError(ValueError):
@@ -518,6 +600,14 @@ class Workspace(ABC):
         Every backend must match ``pattern`` against workspace-relative POSIX
         file paths with the normative semantics of ``matches_list_pattern``.
         """
+
+    async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
+        """List regular files and symlinks without following either entry type."""
+
+        del limit
+        raise WorkspaceGitEntryObservationUnsupportedError(
+            f"{type(self).__name__} does not support Git-significant entry observation."
+        )
 
     @property
     def resource_key(self) -> tuple[object, ...] | None:

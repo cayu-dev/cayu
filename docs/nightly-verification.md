@@ -159,7 +159,7 @@ high level:
 | first-party tool, workspace, context, knowledge, subagent, usage, and budget eval workflows | hermetic | `internal-evals-hermetic` |
 | real project discovery, IPython startup, top-level await, loop reuse, namespace aliases, and EOF exit | hermetic | `console-pty` |
 | Postgres stores, migrations, pgvector, real dispatch claim path | verified when Postgres is available | `postgres-required` |
-| real explicitly selected Docker container exec, timeout cleanup, bounded workspace search, sync binding, and virtual-egress enforcement (not sandbox isolation) | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync`, `docker-live-virtual-egress` |
+| real explicitly selected Docker container exec, timeout cleanup, bounded workspace search, sync binding, admitted Python/non-Python toolchain profiles, and virtual-egress enforcement (not sandbox isolation) | verified when Docker is available | `docker-runner`, `docker-live-exec`, `docker-live-sync`, `docker-live-toolchain-profiles`, `docker-live-virtual-egress` |
 | real microsandbox runner, portable workspace round-trip/path safety, runtime, sync binding, deny-by-default networking with explicit-open compatibility, and opt-in guest-agent liveness | verified when microsandbox is available | `microsandbox-live-*` |
 | real E2B runner, irreversible hardened guest handoff, portable workspace round-trip/path safety, and sync binding | verified when E2B is available and security-sensitive checks are explicitly enabled | `e2b-live-*` |
 | real Microsandbox virtual-egress enforcement and secret non-possession | verified when the runtime and explicit opt-in are available | `microsandbox-live-virtual-egress` |

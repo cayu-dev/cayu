@@ -120,7 +120,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
     ) -> WorkspaceReadResult:
         rel_path = self._contained_rel_path(path)
         offset = _validate_workspace_offset(offset, owner="E2BWorkspace")
-        content, total_bytes, revision, digest = await guard_read(
+        content, total_bytes, revision, digest, git_mode = await guard_read(
             self._runner,
             root=self.root,
             rel_path=rel_path,
@@ -137,6 +137,7 @@ class E2BWorkspace(RunnerBoundWorkspace):
             offset=offset,
             revision=revision,
             sha256=digest,
+            git_mode=git_mode,
         )
 
     async def write_bytes(self, path: str, content: bytes) -> None:

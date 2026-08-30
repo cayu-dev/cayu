@@ -79,6 +79,12 @@ from cayu.tools.shared_artifacts import (
     authorize_shared_artifact_materialization,
     revoke_shared_artifact_grant,
 )
+from cayu.tools.structured_commands import (
+    RUN_COMMAND_RESULT_SCHEMA,
+    STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA,
+    RunCommandTool,
+    StructuredCommandToolPolicy,
+)
 from cayu.tools.subagents import (
     BackgroundSubagentTaskRegistry,
     SubagentContextMode,
@@ -149,8 +155,10 @@ __all__ = [
     "MAX_SHARED_ARTIFACT_GRANT_TTL_SECONDS",
     "MAX_SHARED_ARTIFACT_PUBLICATIONS",
     "PUBLISH_WORKSPACE_ARTIFACT_TOOL_NAME",
+    "RUN_COMMAND_RESULT_SCHEMA",
     "SHARED_ARTIFACT_REFERENCE_PREFIX",
     "SHARED_ARTIFACT_SCHEMA_VERSION",
+    "STRUCTURED_COMMAND_TOOL_POLICY_SCHEMA",
     "ApplyPatchTool",
     "ArtifactReadRequest",
     "ArtifactReader",
@@ -184,6 +192,7 @@ __all__ = [
     "RememberKnowledgePolicy",
     "RememberKnowledgeTool",
     "RunCheckTool",
+    "RunCommandTool",
     "ScreenshotPageTool",
     "SearchKnowledgeTool",
     "SearchTextTool",
@@ -195,6 +204,7 @@ __all__ = [
     "SharedArtifactPolicy",
     "SharedArtifactPublicationReceipt",
     "SharedArtifactRef",
+    "StructuredCommandToolPolicy",
     "SubagentContextMode",
     "SubagentExecutionMode",
     "SubagentResultTool",

@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from cayu import (
+    DockerCodingCommandAuthority,
+    DockerCodingDependencyInput,
     DockerCodingEnvironmentFactory,
+    DockerCodingToolchainError,
+    DockerCodingToolchainProfile,
     DockerCodingWorkspaceBinding,
     DockerImageIdentity,
     DockerWorkloadRestrictions,
@@ -39,6 +44,41 @@ _IMAGE_REFERENCE = "cayu/coding@sha256:" + ("c" * 64)
 
 def _image_identity() -> DockerImageIdentity:
     return DockerImageIdentity(reference=_IMAGE_REFERENCE)
+
+
+def _custom_toolchain_profile(
+    *,
+    dependency_content: bytes | None = None,
+) -> DockerCodingToolchainProfile:
+    dependencies = (
+        ()
+        if dependency_content is None
+        else (
+            DockerCodingDependencyInput(
+                path="Cargo.lock",
+                content_sha256="sha256:" + sha256(dependency_content).hexdigest(),
+            ),
+        )
+    )
+    return DockerCodingToolchainProfile(
+        profile_id="custom-rust",
+        revision="1",
+        image_identity=_image_identity(),
+        platform_architecture="amd64",
+        command_authorities=(
+            DockerCodingCommandAuthority(
+                selector="cargo-check",
+                revision="1",
+                description="Run the admitted Rust check.",
+                exposure="named_check",
+                executable="/usr/bin/cargo",
+                fixed_arguments=("check",),
+                max_arguments=0,
+                timeout_seconds=120,
+            ),
+        ),
+        dependency_inputs=dependencies,
+    )
 
 
 def _inspection(
@@ -127,6 +167,8 @@ def test_strict_docker_runner_uses_typed_restrictions_and_exact_live_evidence(
     assert run_argv[run_argv.index("--network") + 1] == "none"
     assert run_argv[run_argv.index("--cap-drop") + 1] == "ALL"
     assert "--mount" not in run_argv
+    assert run_argv[run_argv.index("--entrypoint") + 1] == "sleep"
+    assert run_argv[-2:] == [_IMAGE_REFERENCE, "infinity"]
     assert evidence.environment_fingerprint is not None
     assert evidence.image_fingerprint == _image_identity().fingerprint
     assert evidence.claim_for("untrusted_code_isolation").state == "unsupported"  # type: ignore[union-attr]
@@ -402,6 +444,85 @@ def test_docker_coding_factory_rejects_untrusted_before_docker_allocation(
         refusal.capability == "untrusted_code_isolation"
         for refusal in caught.value.decision.refusals
     )
+
+
+def test_toolchain_dependency_drift_refuses_before_docker_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "Cargo.lock").write_bytes(b"changed\n")
+    allocation_attempted = False
+
+    async def unexpected_create(*args: Any, **kwargs: Any) -> DockerRunner:
+        nonlocal allocation_attempted
+        del args, kwargs
+        allocation_attempted = True
+        raise AssertionError("Docker allocation must not start for a stale toolchain.")
+
+    monkeypatch.setattr(DockerRunner, "create", unexpected_create)
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        toolchain_profile=_custom_toolchain_profile(dependency_content=b"locked\n"),
+    )
+
+    with pytest.raises(DockerCodingToolchainError) as caught:
+        asyncio.run(
+            factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="stale",
+                    agent_name="agent",
+                    environment_name="coding",
+                )
+            )
+        )
+
+    assert caught.value.code == "dependency_inputs_changed"
+    assert allocation_attempted is False
+
+
+def test_explicit_toolchain_platform_drift_cleans_exact_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    restrictions = DockerWorkloadRestrictions()
+    calls: list[list[str]] = []
+
+    async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        del kwargs
+        calls.append(command.argv)
+        docker_args = command.argv[1:]
+        if docker_args[0] == "run":
+            return ExecResult(stdout=_CONTAINER_ID)
+        if docker_args[0] == "inspect":
+            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+        if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
+            return ExecResult(stdout=restrictions.user)
+        if docker_args[:2] == ["exec", _CONTAINER_ID] and any(
+            "platform.system" in item for item in docker_args
+        ):
+            return ExecResult(stdout="linux/arm64\n")
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        toolchain_profile=_custom_toolchain_profile(),
+        docker_path="/usr/bin/docker",
+    )
+
+    with pytest.raises(DockerCodingToolchainError) as caught:
+        asyncio.run(
+            factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="platform-drift",
+                    agent_name="agent",
+                    environment_name="coding",
+                )
+            )
+        )
+
+    assert caught.value.code == "platform_mismatch"
+    assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
 
 
 def test_docker_coding_factory_declares_bounded_tools_and_immutable_identity(

@@ -153,6 +153,7 @@ class _DockerRuntimeEvidence:
     seccomp_profile_sha256: str | None
     restrictions: DockerWorkloadRestrictions
     image_identity: DockerImageIdentity
+    toolchain_profile_fingerprint: str | None
     required_executables: tuple[str, ...]
     executable_availability: tuple[tuple[str, bool], ...]
     observed_at: datetime
@@ -169,6 +170,7 @@ class _DockerRuntimeEvidence:
             "runtime": self.runtime,
             "seccomp_profile_sha256": self.seccomp_profile_sha256,
             "restrictions": self.restrictions.model_dump(mode="json"),
+            "toolchain_profile_fingerprint": self.toolchain_profile_fingerprint,
             "required_executables": list(self.required_executables),
         }
         return (
@@ -507,6 +509,7 @@ def _build_docker_exec_argv(
     env_file: str | None,
     has_stdin: bool,
     pid_file: str,
+    direct_process_supervisor: bool = False,
 ) -> list[str]:
     argv: list[str] = [docker_path, "exec"]
     if has_stdin:
@@ -518,6 +521,17 @@ def _build_docker_exec_argv(
         # model-controlled env could otherwise use to hijack the CLI, e.g. DOCKER_HOST).
         argv += ["--env-file", env_file]
     argv.append(name)
+    if command.kind == "process" and direct_process_supervisor:
+        if command.argv is None:
+            raise ValueError("Process commands require argv.")
+        argv += [
+            "python3",
+            "-c",
+            _PYTHON_PROCESS_SUPERVISOR,
+            pid_file,
+            *command.argv,
+        ]
+        return argv
     if command.kind == "process":
         if command.argv is None:
             raise ValueError("Process commands require argv.")
@@ -528,6 +542,124 @@ def _build_docker_exec_argv(
         command_script = command.shell
     argv += ["sh", "-c", _supervised_command_script(command_script, pid_file)]
     return argv
+
+
+_PYTHON_PROCESS_SUPERVISOR = """\
+import ctypes
+import os
+import signal
+import sys
+import time
+
+state_path = sys.argv[1]
+command = sys.argv[2:]
+if not command:
+    raise SystemExit(125)
+PR_SET_CHILD_SUBREAPER = 36
+if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    raise SystemExit(125)
+os.makedirs(os.path.dirname(state_path), mode=0o700, exist_ok=True)
+child = os.fork()
+if child == 0:
+    try:
+        os.setsid()
+        os.execvp(command[0], command)
+    except BaseException:
+        os._exit(127)
+
+def unlink_state():
+    try:
+        os.unlink(state_path)
+    except FileNotFoundError:
+        pass
+
+def direct_children():
+    task_path = f"/proc/{os.getpid()}/task/{os.getpid()}/children"
+    try:
+        with open(task_path, encoding="ascii") as handle:
+            values = handle.read().split()
+    except OSError:
+        return None
+    if any(not value.isdigit() for value in values):
+        return None
+    return tuple(int(value) for value in values)
+
+def reap_available():
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+def terminate_descendants(signum, _frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        os.killpg(child, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 1.0
+    complete = False
+    while True:
+        reap_available()
+        children = direct_children()
+        if children is None:
+            break
+        if not children:
+            complete = True
+            break
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if complete:
+        unlink_state()
+    os._exit(128 + signum if complete else 125)
+
+signal.signal(signal.SIGTERM, terminate_descendants)
+signal.signal(signal.SIGINT, terminate_descendants)
+signal.signal(signal.SIGHUP, terminate_descendants)
+try:
+    descriptor = os.open(state_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, f"{os.getpid()} 2\\n".encode("ascii"))
+    finally:
+        os.close(descriptor)
+except BaseException:
+    try:
+        os.killpg(child, 9)
+    except ProcessLookupError:
+        pass
+    os.waitpid(child, 0)
+    raise
+try:
+    direct_status = None
+    while True:
+        try:
+            pid, status = os.waitpid(-1, 0)
+            if pid == child:
+                direct_status = status
+        except ChildProcessError:
+            break
+        except InterruptedError:
+            continue
+finally:
+    unlink_state()
+if direct_status is None:
+    raise SystemExit(125)
+if os.WIFEXITED(direct_status):
+    raise SystemExit(os.WEXITSTATUS(direct_status))
+if os.WIFSIGNALED(direct_status):
+    raise SystemExit(128 + os.WTERMSIG(direct_status))
+raise SystemExit(125)
+"""
 
 
 async def _run_docker(
@@ -591,6 +723,16 @@ def _kill_supervised_command_script(pid_file: str) -> str:
         f"if ! test -f {quoted_pid_file}; then exit 1; fi; "
         f"read pid process_group < {quoted_pid_file} 2>/dev/null || exit 1; "
         "case \"$pid\" in ''|*[!0-9]*) exit 1 ;; esac; "
+        'if test "$process_group" = 2; then '
+        'kill -TERM "$pid" 2>/dev/null || true; '
+        "attempts=0; "
+        f'while test -f {quoted_pid_file} && test "$attempts" -lt 20; do '
+        "attempts=$((attempts + 1)); sleep 0.1; "
+        "done; "
+        f"if ! test -f {quoted_pid_file}; then exit 0; fi; "
+        'kill -KILL "$pid" 2>/dev/null || true; '
+        "exit 1; "
+        "fi; "
         'if test "$process_group" = 1; then '
         'kill -TERM "-$pid" 2>/dev/null || kill -TERM -- "-$pid" 2>/dev/null || '
         'kill -TERM "$pid" 2>/dev/null || true; '
@@ -702,6 +844,11 @@ class DockerRunner(Runner):
                 "cancellation_cleanup": self.cancellation_cleanup,
                 "timeout_cleanup": self.timeout_cleanup,
                 "required_executables": list(evidence.required_executables),
+                "process_transport": (
+                    "python_subreaper_supervisor_v2"
+                    if "python3" in evidence.required_executables
+                    else "shell_supervisor"
+                ),
             }
         return {
             "name": self.name,
@@ -821,6 +968,7 @@ class DockerRunner(Runner):
         image_identity: DockerImageIdentity | None = None,
         workload_restrictions: DockerWorkloadRestrictions | None = None,
         required_executables: Sequence[str] = (),
+        toolchain_profile_fingerprint: str | None = None,
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -871,6 +1019,17 @@ class DockerRunner(Runner):
             )
         )
         executable_requirements = _normalize_required_executables(required_executables)
+        if toolchain_profile_fingerprint is not None and (
+            type(toolchain_profile_fingerprint) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", toolchain_profile_fingerprint) is None
+        ):
+            raise ValueError(
+                "toolchain_profile_fingerprint must be a lowercase SHA-256 identity or None."
+            )
+        if toolchain_profile_fingerprint is not None and not strict_mode:
+            raise ValueError(
+                "toolchain_profile_fingerprint requires strict evidence-bearing Docker creation."
+            )
         if executable_requirements and not strict_mode:
             raise ValueError(
                 "required_executables require image_identity and workload_restrictions."
@@ -973,7 +1132,12 @@ class DockerRunner(Runner):
                     "--mount",
                     f"type=bind,source={ca_host},target={ca_guest},readonly",
                 ]
-            run_argv += [image, "sleep", "infinity"]
+            if strict_mode:
+                # Ignore image-authored ENTRYPOINT/CMD startup hooks. The exact
+                # admitted command path starts only through later docker exec.
+                run_argv += ["--entrypoint", "sleep", image, "infinity"]
+            else:
+                run_argv += [image, "sleep", "infinity"]
             started = await _run_docker(
                 docker,
                 run_argv,
@@ -1076,6 +1240,7 @@ class DockerRunner(Runner):
                     seccomp_profile_sha256=seccomp_profile_sha256,
                     restrictions=owned_restrictions,
                     image_identity=owned_image_identity,
+                    toolchain_profile_fingerprint=toolchain_profile_fingerprint,
                     required_executables=executable_requirements,
                     executable_availability=executable_availability,
                     observed_at=observed_at,
@@ -1283,6 +1448,7 @@ class DockerRunner(Runner):
             subject="docker",
             environment_fingerprint=evidence.environment_fingerprint,
             image_fingerprint=evidence.image_fingerprint,
+            toolchain_profile_fingerprint=evidence.toolchain_profile_fingerprint,
             claims=(
                 live_claim("real_credential_non_possession", observation="supported"),
                 live_claim(
@@ -1568,6 +1734,11 @@ class DockerRunner(Runner):
                 env_file=env_file,
                 has_stdin=standard_input is not None,
                 pid_file=pid_file,
+                direct_process_supervisor=(
+                    self._runtime_evidence is not None
+                    and "python3" in self._runtime_evidence.required_executables
+                    and owned_command.kind == "process"
+                ),
             )
             # The trusted host docker process receives only the bounded operational
             # allowlist. Container env values ride in --env-file,

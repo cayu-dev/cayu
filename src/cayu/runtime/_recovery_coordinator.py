@@ -366,6 +366,7 @@ from cayu.runtime.workspace_observation_recovery import (
 )
 from cayu.tools._operation_boundary import BoundedInvocationOperationRegistry
 from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import durable_runner_recovery_authority
 from cayu.vaults import SecretRedactor
 
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
@@ -11464,6 +11465,14 @@ class RecoveryCoordinator:
                     if registered_environment is None
                     else registered_environment.environment.artifact_store
                 )
+                recovery_runner = (
+                    None
+                    if registered_environment is None
+                    else registered_environment.environment.runner
+                )
+                runner_resource_identity, reconcile_runner_operation = (
+                    durable_runner_recovery_authority(recovery_runner)
+                )
                 recovery_authority = DurableToolRecoveryAuthority(
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
@@ -11478,6 +11487,8 @@ class RecoveryCoordinator:
                         else _DurableArtifactRecoveryReader(recovery_artifact_store)
                     ),
                     compare_and_set_operation=compare_and_set_durable_tool_operation,
+                    runner_resource_identity=runner_resource_identity,
+                    reconcile_runner_operation=reconcile_runner_operation,
                 )
 
                 result = await registered_tool.durable_tool_recovery.reconcile_durable_tool_call(

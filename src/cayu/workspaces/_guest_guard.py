@@ -42,10 +42,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from cayu.runners import ExecCommand
 from cayu.workspaces.base import (
+    WorkspaceGitMode,
     WorkspaceMoveAmbiguousError,
     WorkspaceMoveResult,
     WorkspaceMoveUnsupportedError,
@@ -753,7 +754,14 @@ def main():
                     if offset == 0 and len(content) == info.st_size
                     else ("-", "-")
                 )
-                print(f"ok {info.st_size} {revision} {digest}")
+                git_mode = (
+                    "100755"
+                    if revision != "-" and stat.S_IMODE(os.fstat(leaf_fd).st_mode) & 0o111
+                    else "100644"
+                    if revision != "-"
+                    else "-"
+                )
+                print(f"ok {info.st_size} {revision} {digest} {git_mode}")
                 sys.stdout.write(base64.b64encode(content).decode("ascii"))
                 sys.stdout.flush()
                 return
@@ -818,7 +826,7 @@ async def guard_read(
     backend: str,
     timeout_s: int | None = None,
     python_executable: str = GUEST_PYTHON,
-) -> tuple[bytes, int, str | None, str | None]:
+) -> tuple[bytes, int, str | None, str | None, WorkspaceGitMode | None]:
     """Atomically resolve-and-read a contained file and complete-snapshot identity."""
 
     output_limit = 4 * ((limit + 2) // 3) + _READ_OUTPUT_HEADROOM_BYTES
@@ -843,7 +851,7 @@ async def guard_read(
         if total_bytes.isdigit():
             raise WorkspaceReadOffsetError(offset, int(total_bytes))
     _raise_common_status(status, mode="read", backend=backend, original_path=original_path)
-    total_bytes, revision, digest = _parse_ok_read(
+    total_bytes, revision, digest, git_mode = _parse_ok_read(
         status, backend=backend, original_path=original_path
     )
     try:
@@ -852,7 +860,7 @@ async def guard_read(
         raise RuntimeError(
             f"{backend} workspace guard returned an invalid read payload: {original_path}"
         ) from exc
-    return content, total_bytes, revision, digest
+    return content, total_bytes, revision, digest, git_mode
 
 
 async def guard_write(
@@ -1209,12 +1217,18 @@ def _raise_common_status(status: str, *, mode: str, backend: str, original_path:
 
 def _parse_ok_read(
     status: str, *, backend: str, original_path: str
-) -> tuple[int, str | None, str | None]:
+) -> tuple[int, str | None, str | None, WorkspaceGitMode | None]:
     parts = status.split()
-    if len(parts) == 4 and parts[0] == _STATUS_OK and parts[1].isdigit():
+    if len(parts) == 5 and parts[0] == _STATUS_OK and parts[1].isdigit():
         revision = None if parts[2] == "-" else parts[2]
         digest = None if parts[3] == "-" else parts[3]
-        return int(parts[1]), revision, digest
+        git_mode = None if parts[4] == "-" else parts[4]
+        if git_mode not in {None, "100644", "100755"}:
+            raise RuntimeError(
+                f"Failed to read {backend} workspace file: "
+                f"{original_path}: unexpected guard status {status!r}"
+            )
+        return int(parts[1]), revision, digest, cast("WorkspaceGitMode | None", git_mode)
     raise RuntimeError(
         f"Failed to read {backend} workspace file: "
         f"{original_path}: unexpected guard status {status!r}"

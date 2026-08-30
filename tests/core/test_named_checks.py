@@ -338,6 +338,30 @@ def test_run_check_classifies_completed_and_interrupted_results(
         assert result.structured["cleanup_uncertain"] is True
 
 
+def test_run_check_refuses_success_with_uncertain_cleanup() -> None:
+    result = _run(
+        RunCheckTool(checks=[_check()], command_policy=_policy()),
+        RecordingRunner(
+            ExecResult(
+                exit_code=0,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "docker",
+                        "action": "kill_command",
+                        "status": "failed",
+                    }
+                ],
+            )
+        ),
+    )
+
+    assert result.structured["status"] == "ambiguous"
+    assert result.structured["error"] == "workspace_cleanup_uncertain"
+    assert result.structured["cleanup_uncertain"] is True
+    assert result.is_error is True
+
+
 def test_run_check_distinguishes_unavailable_failed_and_malformed_runners() -> None:
     unavailable = RunnerUnavailableError(
         "Runner unavailable.",

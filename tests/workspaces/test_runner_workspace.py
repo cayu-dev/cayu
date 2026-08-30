@@ -160,6 +160,33 @@ def test_runner_workspace_reads_writes_and_lists_through_runner(tmp_path) -> Non
     assert list_result.truncated is False
 
 
+def test_runner_workspace_lists_regular_files_and_symlinks_without_following(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "regular.txt").write_bytes(b"regular\n")
+    (tmp_path / "directory").mkdir()
+    (tmp_path / "directory" / "nested.txt").write_bytes(b"nested\n")
+    os.symlink("regular.txt", tmp_path / "file-link")
+    os.symlink("directory", tmp_path / "directory-link")
+    workspace = _workspace(tmp_path)
+
+    result = asyncio.run(workspace.list_git_entries(limit=10))
+
+    assert [(entry.path, entry.git_mode) for entry in result.entries] == [
+        ("directory-link", "120000"),
+        ("directory/nested.txt", "100644"),
+        ("file-link", "120000"),
+        ("regular.txt", "100644"),
+    ]
+    assert all(
+        entry.symlink_target_sha256 is not None
+        for entry in result.entries
+        if entry.git_mode == "120000"
+    )
+    assert result.total_count == 4
+    assert result.truncated is False
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_paths", "expected_total", "expected_truncated"),
     (

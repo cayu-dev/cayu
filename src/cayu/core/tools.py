@@ -569,6 +569,10 @@ class DurableToolRecoveryAuthority:
         [str, dict[str, Any] | None, dict[str, Any], Mapping[str, dict[str, Any]]],
         Awaitable[dict[str, Any]],
     ]
+    runner_resource_identity: str | None = None
+    reconcile_runner_operation: (
+        Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None
+    ) = None
 
 
 @dataclass(frozen=True, slots=True)

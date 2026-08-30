@@ -11,10 +11,12 @@ from cayu.runners import BROWSER_FETCH_WORKLOAD_NAME, PINNED_BROWSER_FETCH_WORKL
 from cayu.runners._docker_cli import docker_cli_env
 from cayu.runners.base import ExecCommand, ExecResult
 from cayu.runners.docker import (
+    _PYTHON_PROCESS_SUPERVISOR,
     DEFAULT_DOCKER_CWD,
     DOCKER_COMMAND_STATE_DIR,
     DockerRunner,
     _build_docker_exec_argv,
+    _kill_supervised_command_script,
     _require_docker,
     _validate_mount_path,
 )
@@ -340,6 +342,46 @@ def test_build_exec_argv_process():
     assert "whois x.ai" in argv[7]
     assert " & " not in argv[7]
     assert "> /tmp/cayu-docker-commands/cmd.pid || exit 1" in argv[7]
+
+
+def test_build_exec_argv_strict_process_uses_fixed_python_supervisor() -> None:
+    argv = _build_docker_exec_argv(
+        "/usr/bin/docker",
+        "a1",
+        ExecCommand.process("/opt/tools/pytest", "-q", "tests/test_unit.py;echo"),
+        cwd="/workspace",
+        env_file=None,
+        has_stdin=False,
+        pid_file="/tmp/cayu-docker-commands/cmd.pid",
+        direct_process_supervisor=True,
+    )
+
+    assert argv[:6] == [
+        "/usr/bin/docker",
+        "exec",
+        "-w",
+        "/workspace",
+        "a1",
+        "python3",
+    ]
+    assert argv[6] == "-c"
+    assert "os.execvp(command[0], command)" in argv[7]
+    assert "PR_SET_CHILD_SUBREAPER = 36" in argv[7]
+    assert "prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)" in argv[7]
+    assert "os.waitpid(-1, 0)" in argv[7]
+    assert 'f"{os.getpid()} 2' in argv[7]
+    assert argv[-3:] == ["/opt/tools/pytest", "-q", "tests/test_unit.py;echo"]
+    assert "sh" not in argv[:6]
+
+
+def test_python_supervisor_cleanup_requires_descendant_settlement() -> None:
+    script = _kill_supervised_command_script("/tmp/cayu-docker-commands/cmd.pid")
+
+    assert 'process_group" = 2' in script
+    assert "while test -f" in script
+    assert "kill -KILL" in script
+    assert "exit 1" in script
+    assert "PR_SET_CHILD_SUBREAPER" in _PYTHON_PROCESS_SUPERVISOR
 
 
 def test_build_exec_argv_shell_env_stdin():

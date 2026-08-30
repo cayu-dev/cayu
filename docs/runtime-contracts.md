@@ -7558,6 +7558,9 @@ The first built-in tools are:
 - `materialize_shared_artifact`: verify one explicitly passed ancestor reference and grant, then create or revision-replace the approved destination in the current workspace
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
 - `run_check`: select one immutable application-owned process check by a finite name; argv, cwd, environment, stdin, limits, runner, image, and network are not model input
+- `run_command`: select one profile-owned direct-process authority and supply only
+  arguments admitted by its closed flag/path grammar; executable, image, environment,
+  stdin, network, mounts, runtime user, and upper bounds are not model input
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, background mode returns after in-process startup, and durable mode returns after child-first task-queue publication
 - `subagent_result`: fetch one background or durable subagent result by `child_session_id`, or wait for all asynchronous subagents started by the current parent session; a configured task store adds verified durable queue status
 - `list_knowledge`: discover active knowledge entries and facets without requiring a lexical search term
@@ -7850,6 +7853,72 @@ image; drift or ambiguous ownership fails closed. The configured and live
 read-only-root, no-new-privileges, and an empty capability add-back set. A
 weakened restriction value reports both capabilities as unsupported so matching
 admission requirements fail closed.
+
+An explicit `DockerCodingToolchainProfile` binds that Docker allocation to a
+versioned profile ID, immutable image identity, Linux architecture, numeric
+runtime user, `/workspace` copy contract, read-only support paths, exact command
+authorities, dependency-input hashes, bounded probes, publication/redaction
+versions, and the complete prohibited-capability set. Unknown fields are
+rejected and every material field contributes to the profile fingerprint. A
+tagged local image is valid only with an authoritative content digest; mutable
+tags alone are invalid. The legacy image-only factory constructor remains a
+compatibility path but exposes no structured selectors.
+
+Factory admission verifies declared dependency inputs before Docker allocation,
+then admits the exact final container, its image and executable evidence, and an
+implementation-owned platform probe before exposing the environment. Profile
+probes execute as direct bounded process argv against that same final container.
+Probe timeout, truncation, non-admitted exit, output mismatch, missing executable,
+image drift, or platform drift fails creation and cleans the exact container.
+The factory metadata and its execution-profile fingerprint retain the profile,
+image, platform, dependency, and selector-authority identities. `RunCheckTool`
+and `RunCommandTool` repeat exact runner/image/executable and dependency freshness
+admission immediately before dispatch, including the live evidence expiry bound,
+so expired final-container proof or a changed lockfile refuses before execution
+and never triggers an install, network fallback, or host execution.
+
+`RunCommandTool` is additive to named checks and the unrestricted compatibility
+`ExecCommandTool`; it does not reinterpret or replace either contract. Its public
+schema is selector plus string-array arguments, an optional contained working
+directory, a timeout that may only narrow the authority ceiling, and an output
+retention mode. Selector authorities bind exact executable and fixed argv,
+allowed flags/literals/path scopes, effect and mutation scope, fixed non-secret
+environment, exit semantics, limits, idempotency, and approval classification.
+Shell syntax, response files, glob expansion, arbitrary executable paths,
+environment input, stdin, TTY/background controls, and protected or escaping
+paths are rejected before dispatch. Arguments are quarantined from event
+publication; durable results retain a working-directory digest rather than the
+repository-relative path. A runner-truncated stream, a requested/required output
+artifact that cannot be retained, or deferred/uncertain cleanup produces an
+explicit non-success result even when the admitted process exits zero.
+
+Every structured selector runs inside the conservative workspace-mutation fence.
+Immediately before dispatch and after runner settlement, `RunCommandTool` captures
+a complete content-and-Git-mode manifest under the Docker coding copy bounds: at
+most 10,000 paths, 8 MiB per file, and 64 MiB total. A read-only selector that changes any
+path, or a mutating selector that changes a path outside its declared prefixes,
+returns `unexpected_workspace_mutation` even when the process exits zero. If the
+post-command manifest cannot be completed, the result is `partial`; it cannot
+claim an admitted mutation. Receipts publish only manifest/path-set identities
+and counts, not repository paths or contents. Runtime-owned mutation capture
+remains an independent durable before/after evidence layer.
+
+The direct Docker process transport is a Linux subreaper. It retains its command
+state record until the direct child and every adopted descendant settle, including
+children that create a new session. Timeout/cancellation signals the supervisor,
+which terminates and reaps its complete owned descendant set; inability to prove
+that settlement leaves the state record intact and the runner exec lane fenced.
+
+Applications attach `StructuredCommandToolPolicy` as the agent policy, optionally
+wrapping an existing policy. It resolves the same immutable selector grammar
+before execution and emits only bounded safe approval metadata: selector and
+profile identities, final argv and working-directory digests, effect, limits,
+environment identity, mutation-scope identity, and dependency/image evidence.
+An authority marked `approval="required"` creates the runtime's durable
+`ToolPolicyDecision.REQUIRE_APPROVAL` checkpoint; the ordinary internal command
+policy remains a separate direct-argv defense. Approved calls are still
+revalidated by tool policy after hook changes and by the tool plus live Docker
+admission immediately before dispatch.
 
 Repository input reaches the container only through
 `DockerCodingWorkspaceBinding`. The host `.git`, `.cayu`, and `.runtime`

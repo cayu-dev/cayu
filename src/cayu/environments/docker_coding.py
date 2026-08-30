@@ -22,6 +22,12 @@ from cayu.environments.admission import (
 )
 from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.bindings import BoundWorkspace, SyncBinding, WorkspaceSnapshot
+from cayu.environments.docker_toolchains import (
+    DockerCodingToolchainError,
+    DockerCodingToolchainProfile,
+    legacy_docker_coding_toolchain_profile,
+    verify_local_docker_coding_toolchain_dependencies,
+)
 from cayu.environments.factory import (
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -165,7 +171,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self,
         *,
         source_workspace: LocalWorkspace,
-        image_identity: DockerImageIdentity,
+        image_identity: DockerImageIdentity | None = None,
+        toolchain_profile: DockerCodingToolchainProfile | None = None,
         restrictions: DockerWorkloadRestrictions | None = None,
         required_executables: tuple[str, ...] = (),
         transfer_limits: DockerWorkspaceTransferLimits | None = None,
@@ -175,8 +182,17 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
-        if not isinstance(image_identity, DockerImageIdentity):
-            raise TypeError("image_identity must be DockerImageIdentity.")
+        if image_identity is not None and not isinstance(image_identity, DockerImageIdentity):
+            raise TypeError("image_identity must be DockerImageIdentity or None.")
+        if (
+            toolchain_profile is not None
+            and type(toolchain_profile) is not DockerCodingToolchainProfile
+        ):
+            raise TypeError(
+                "toolchain_profile must be an exact DockerCodingToolchainProfile or None."
+            )
+        if image_identity is None and toolchain_profile is None:
+            raise ValueError("image_identity or toolchain_profile is required.")
         if restrictions is not None and not isinstance(restrictions, DockerWorkloadRestrictions):
             raise TypeError("restrictions must be DockerWorkloadRestrictions or None.")
         if transfer_limits is not None and not isinstance(
@@ -184,20 +200,57 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         ):
             raise TypeError("transfer_limits must be DockerWorkspaceTransferLimits or None.")
         self.source_workspace = source_workspace
-        self.image_identity = DockerImageIdentity.model_validate(
-            image_identity.model_dump(mode="python")
+        selected_restrictions = restrictions or (
+            DockerWorkloadRestrictions()
+            if toolchain_profile is None
+            else toolchain_profile.restrictions
         )
         self.restrictions = DockerWorkloadRestrictions.model_validate(
-            (restrictions or DockerWorkloadRestrictions()).model_dump(mode="python")
+            selected_restrictions.model_dump(mode="python")
         )
+        selected_image = image_identity or (
+            None if toolchain_profile is None else toolchain_profile.image_identity
+        )
+        if selected_image is None:  # pragma: no cover - guarded above
+            raise AssertionError("Docker coding image selection was lost.")
+        self.image_identity = DockerImageIdentity.model_validate(
+            selected_image.model_dump(mode="python")
+        )
+        if toolchain_profile is not None:
+            owned_profile = DockerCodingToolchainProfile.model_validate(
+                toolchain_profile.model_dump(mode="python", by_alias=True)
+            )
+            if owned_profile.image_identity != self.image_identity:
+                raise ValueError("toolchain_profile image_identity must match image_identity.")
+            if owned_profile.restrictions != self.restrictions:
+                raise ValueError("toolchain_profile restrictions must match restrictions.")
+        else:
+            owned_profile = None
+        self._explicit_toolchain_profile = owned_profile is not None
         if isinstance(required_executables, str | bytes):
             raise TypeError("required_executables must be an iterable of strings.")
-        required = tuple(sorted(set((*required_executables, *_DOCKER_CODING_RUNTIME_EXECUTABLES))))
+        profile_executables = () if owned_profile is None else owned_profile.required_executables
+        required = tuple(
+            sorted(
+                set(
+                    (
+                        *required_executables,
+                        *profile_executables,
+                        *_DOCKER_CODING_RUNTIME_EXECUTABLES,
+                    )
+                )
+            )
+        )
         if any(type(value) is not str or not value.strip() for value in required):
             raise ValueError("required_executables must contain nonblank strings.")
         if len(required) > 64:
             raise ValueError("required_executables must contain at most 64 entries.")
         self.required_executables = required
+        self.toolchain_profile = owned_profile or legacy_docker_coding_toolchain_profile(
+            image_identity=self.image_identity,
+            restrictions=self.restrictions,
+            required_executables=(),
+        )
         self.transfer_limits = transfer_limits or DockerWorkspaceTransferLimits()
         self.runtime = runtime
         self.seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
@@ -210,10 +263,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             transfer_limits=self.transfer_limits,
             runtime=self.runtime,
             seccomp_sha256=self._seccomp_sha256,
+            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="1",
+            behavior_version="2",
             implementation_version=self._configuration_fingerprint,
         )
 
@@ -251,6 +305,10 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             evidence=self._configured_candidate().evidence,
             stage="pre_create",
         ).require_admitted()
+        verify_local_docker_coding_toolchain_dependencies(
+            self.toolchain_profile,
+            self.source_workspace.root,
+        )
         if _read_seccomp_sha256(self.seccomp_profile) != self._seccomp_sha256:
             raise RuntimeError("Docker coding seccomp profile changed after factory admission.")
 
@@ -271,6 +329,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             image_identity=self.image_identity,
             workload_restrictions=self.restrictions,
             required_executables=self.required_executables,
+            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
         )
         try:
             final_candidate = runner.execution_admission_candidate()
@@ -278,6 +337,8 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             if (
                 final_evidence.environment_fingerprint is None
                 or final_evidence.image_fingerprint != self.image_identity.fingerprint
+                or final_evidence.toolchain_profile_fingerprint
+                != self.toolchain_profile.fingerprint
                 or final_evidence.tool_requirements is None
                 or tuple(claim.executable for claim in final_evidence.tool_requirements.executables)
                 != self.required_executables
@@ -293,6 +354,11 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             ).require_admitted()
             if final_decision.evidence is None:
                 raise RuntimeError("Docker coding admission returned no final evidence.")
+            await _run_toolchain_admission_probes(
+                runner,
+                self.toolchain_profile,
+                verify_platform=self._explicit_toolchain_profile,
+            )
             workspace = RunnerWorkspace(
                 runner,
                 cwd=None,
@@ -312,6 +378,16 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 "container_id": runner.container_id,
                 "image_fingerprint": self.image_identity.fingerprint,
                 "configuration_fingerprint": self._configuration_fingerprint,
+                **self.toolchain_profile.evidence(),
+                "toolchain_command_authorities": [
+                    {
+                        "selector": authority.selector,
+                        "revision": authority.revision,
+                        "exposure": authority.exposure,
+                        "fingerprint": authority.fingerprint,
+                    }
+                    for authority in self.toolchain_profile.command_authorities
+                ],
                 "execution_capabilities": evidence_metadata,
                 "execution_requirements": effective_requirements.model_dump(mode="json"),
                 "protected_directory_names": list(DOCKER_CODING_PROTECTED_DIRECTORY_NAMES),
@@ -399,6 +475,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             subject="docker",
             environment_fingerprint=environment_fingerprint,
             image_fingerprint=image_fingerprint,
+            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
             claims=(
                 ExecutionCapabilityClaim.declared("real_credential_non_possession"),
                 ExecutionCapabilityClaim.declared("deny_by_default_network"),
@@ -500,6 +577,7 @@ def _docker_coding_configuration_fingerprint(
     transfer_limits: DockerWorkspaceTransferLimits,
     runtime: str | None,
     seccomp_sha256: str | None,
+    toolchain_profile_fingerprint: str,
 ) -> str:
     material = {
         "schema": "cayu.docker_coding_environment.v1",
@@ -509,6 +587,7 @@ def _docker_coding_configuration_fingerprint(
         "transfer_limits": transfer_limits.model_dump(mode="json"),
         "runtime": runtime,
         "seccomp_sha256": seccomp_sha256,
+        "toolchain_profile_fingerprint": toolchain_profile_fingerprint,
         "network": "none",
         "default_cwd": "/workspace",
         "host_mounts": False,
@@ -521,3 +600,106 @@ def _docker_coding_configuration_fingerprint(
         "sha256:"
         + sha256(canonical_durable_json_bytes(material, "docker_coding_configuration")).hexdigest()
     )
+
+
+async def _run_toolchain_admission_probes(
+    runner: DockerRunner,
+    profile: DockerCodingToolchainProfile,
+    *,
+    verify_platform: bool,
+) -> None:
+    """Run bounded probes only after exact final-container admission."""
+
+    if verify_platform:
+        expected_uid, expected_gid = profile.runtime_user.split(":", 1)
+        try:
+            platform_result = await runner.exec(
+                ExecCommand.process(
+                    "python3",
+                    "-c",
+                    (
+                        "import os,platform,sys; "
+                        "expected_cwd,uid,gid=sys.argv[1:4]; support=sys.argv[4:]; "
+                        "ok=(os.getcwd()==expected_cwd and os.getuid()==int(uid) and "
+                        "os.getgid()==int(gid) and all(os.path.exists(path) and "
+                        "os.access(path,os.R_OK) for path in support)); "
+                        "probe=os.path.join(expected_cwd,'.cayu-toolchain-write-probe'); "
+                        "fd=os.open(probe,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600) if ok else -1; "
+                        "os.close(fd) if fd>=0 else None; "
+                        "os.unlink(probe) if fd>=0 else None; "
+                        "sys.exit(73) if not ok else None; "
+                        "machine={'x86_64':'amd64','aarch64':'arm64'}.get("
+                        "platform.machine().lower(),platform.machine().lower()); "
+                        "print(platform.system().lower()+'/'+machine)"
+                    ),
+                    profile.working_directory,
+                    expected_uid,
+                    expected_gid,
+                    *profile.read_only_support_paths,
+                ),
+                cwd=profile.working_directory,
+                env=None,
+                timeout_s=10,
+                stdin=None,
+                output_limit_bytes=4096,
+            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise DockerCodingToolchainError(
+                "platform_probe_unavailable",
+                "Docker coding toolchain platform could not be verified.",
+            ) from None
+        expected_platform = f"{profile.platform_os}/{profile.platform_architecture}\n"
+        if (
+            platform_result.exit_code != 0
+            or platform_result.timed_out
+            or platform_result.cancelled
+            or platform_result.stdout_truncated
+            or platform_result.stderr_truncated
+            or platform_result.stdout != expected_platform
+        ):
+            raise DockerCodingToolchainError(
+                "platform_mismatch",
+                "Docker coding toolchain platform does not match its admitted profile.",
+            )
+
+    for probe in profile.admission_probes:
+        try:
+            result = await runner.exec(
+                ExecCommand.process(*probe.argv),
+                cwd=profile.working_directory,
+                env=None,
+                timeout_s=probe.timeout_seconds,
+                stdin=None,
+                output_limit_bytes=probe.max_output_bytes,
+            )
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise DockerCodingToolchainError(
+                "admission_probe_unavailable",
+                "Docker coding toolchain admission probe could not settle.",
+            ) from None
+        if result.timed_out:
+            raise DockerCodingToolchainError(
+                "admission_probe_timeout",
+                "Docker coding toolchain admission probe timed out.",
+            )
+        if (
+            result.cancelled
+            or result.stdout_truncated
+            or result.stderr_truncated
+            or result.exit_code not in probe.expected_exit_codes
+        ):
+            raise DockerCodingToolchainError(
+                "admission_probe_mismatch",
+                "Docker coding toolchain admission probe did not match its declaration.",
+            )
+        if probe.stdout_sha256 is not None:
+            observed = "sha256:" + sha256(result.stdout.encode("utf-8")).hexdigest()
+            if observed != probe.stdout_sha256:
+                raise DockerCodingToolchainError(
+                    "admission_probe_mismatch",
+                    "Docker coding toolchain admission probe did not match its declaration.",
+                )

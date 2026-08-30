@@ -27,6 +27,7 @@ from cayu import (
     ModelStreamEvent,
     RunRequest,
     ScriptedModelProvider,
+    StructuredCommandToolPolicy,
     load_eval_run,
     run_to_completion,
 )
@@ -363,6 +364,8 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
                 "coding",
                 "--coding-execution",
                 "docker",
+                "--coding-toolchain",
+                "python",
                 "--dir",
                 str(tmp_path),
             ]
@@ -398,9 +401,13 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "DockerCodingEnvironmentFactory" in composition_source
     assert "DockerWorkspaceTransferLimits" in composition_source
     assert "RunCheckTool" in composition_source
+    assert "RunCommandTool" in composition_source
+    assert "StructuredCommandToolPolicy" in composition_source
+    assert "DockerCodingToolchainProfile" in composition_source
     assert "NamedCheck" in composition_source
     assert "_ExactCheckCommandPolicy" in composition_source
-    assert "values=list(_CHECK_NAMES)" in composition_source
+    assert "values=list(check_names)" in composition_source
+    assert "values=list(command_selectors)" in composition_source
     assert 'code_trust="untrusted"' not in composition_source
     assert "ExecutionRequirements.untrusted" not in composition_source
     assert "ExecCommandTool" not in composition_source
@@ -426,7 +433,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert build_configuration["debian_suite"] is None
     scaffold_output = capsys.readouterr().out
     assert "Build and record image" in scaffold_output
-    assert "trusted-repository Docker named checks" in scaffold_output
+    assert "admitted trusted-repository Docker checks and commands" in scaffold_output
 
     check_cli = importlib.import_module("cayu.cli.check")
 
@@ -492,6 +499,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert set(reviewer.tools) == set()
     assert "run_check" in primary.tools
     assert "apply_patch" in primary.tools
+    assert "run_command" in primary.tools
     assert "exec_command" not in primary.tools
     assert primary.execution_requirements.code_trust == "trusted"
     assert primary.execution_requirements.network_access == "deny_by_default"
@@ -500,6 +508,32 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         "lint",
         "test",
     ]
+    assert primary.tools["run_command"].publish_arguments is False
+    assert isinstance(primary.tool_policy, StructuredCommandToolPolicy)
+    assert primary.tools["run_command"].tool.schema["properties"]["selector"]["enum"] == [
+        "focused-test",
+        "lint-file",
+        "python-version",
+    ]
+
+    generated_environment = dict(os.environ)
+    source_root = str(Path(__file__).resolve().parents[2] / "src")
+    inherited_pythonpath = generated_environment.get("PYTHONPATH")
+    generated_environment["PYTHONPATH"] = (
+        source_root
+        if inherited_pythonpath is None
+        else os.pathsep.join((source_root, inherited_pythonpath))
+    )
+    generated_suite = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_coding_composition.py"],
+        cwd=project,
+        env=generated_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert generated_suite.returncode == 0, generated_suite.stdout + generated_suite.stderr
 
 
 def test_coding_execution_requires_the_coding_composition(
@@ -521,6 +555,29 @@ def test_coding_execution_requires_the_coding_composition(
     )
     assert not (tmp_path / "invalid-docker").exists()
     assert "requires --composition coding" in capsys.readouterr().err
+
+
+def test_coding_toolchain_requires_docker_execution(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            [
+                "new",
+                "invalid-toolchain",
+                "--composition",
+                "coding",
+                "--coding-toolchain",
+                "python",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / "invalid-toolchain").exists()
+    assert "requires --coding-execution docker" in capsys.readouterr().err
 
 
 def test_cayu_new_coding_rejects_unsupported_local_workspace_before_creation(

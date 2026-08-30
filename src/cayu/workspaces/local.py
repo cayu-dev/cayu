@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
+from bisect import insort
 from collections.abc import Iterable
+from hashlib import sha256
 from os import PathLike
 from pathlib import Path
 
@@ -28,6 +31,9 @@ from cayu.workspaces._mutations import (
 )
 from cayu.workspaces.base import (
     Workspace,
+    WorkspaceGitEntry,
+    WorkspaceGitEntryListResult,
+    WorkspaceGitEntryObservationUnsupportedError,
     WorkspaceListResult,
     WorkspaceMoveResult,
     WorkspaceMutationResult,
@@ -345,6 +351,17 @@ class LocalWorkspace(Workspace):
             self._excluded_directory_keys,
         )
 
+    async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
+        validated_limit = _validate_limit(limit, "limit")
+        if validated_limit is None:
+            raise TypeError("Workspace Git entry limit must be an integer.")
+        return await asyncio.to_thread(
+            _list_git_entries,
+            self.root,
+            validated_limit,
+            self._excluded_directory_keys,
+        )
+
     def resolve(self, path: str) -> Path:
         relative_path = _validate_workspace_relative_path(path)
         self._require_path_allowed(relative_path)
@@ -432,6 +449,7 @@ def _read_file(
             raise WorkspaceReadOffsetError(offset, total_bytes)
         file.seek(offset)
         content = file.read() if max_bytes is None else file.read(max_bytes)
+        file_mode = os.fstat(file.fileno()).st_mode
     complete = offset == 0 and len(content) == total_bytes
     revision, digest = content_identity(content) if complete else (None, None)
     return WorkspaceReadResult(
@@ -441,6 +459,7 @@ def _read_file(
         offset=offset,
         revision=revision,
         sha256=digest,
+        git_mode=("100755" if file_mode & 0o111 else "100644") if complete else None,
     )
 
 
@@ -533,6 +552,75 @@ def _list_files(
                 continue
             collector.add(relative_path)
         return collector.result(exact_total_when_truncated=False)
+
+
+def _list_git_entries(
+    root: Path,
+    limit: int,
+    excluded_directory_keys: frozenset[str],
+) -> WorkspaceGitEntryListResult:
+    retained: list[tuple[str, WorkspaceGitEntry]] = []
+    total_count = 0
+
+    def add(path: Path, info: os.stat_result) -> None:
+        nonlocal total_count
+        relative_path = path.relative_to(root).as_posix()
+        if stat.S_ISLNK(info.st_mode):
+            target = os.fsencode(os.readlink(path))
+            entry = WorkspaceGitEntry(
+                path=relative_path,
+                git_mode="120000",
+                symlink_target_sha256=sha256(target).hexdigest(),
+                symlink_target_bytes=len(target),
+            )
+        elif stat.S_ISREG(info.st_mode):
+            entry = WorkspaceGitEntry(
+                path=relative_path,
+                git_mode="100755" if info.st_mode & 0o111 else "100644",
+            )
+        else:
+            raise WorkspaceGitEntryObservationUnsupportedError(
+                "Workspace contains a non-file, non-directory, non-symlink entry."
+            )
+        total_count += 1
+        insort(retained, (relative_path, entry), key=lambda item: item[0])
+        if len(retained) > limit:
+            retained.pop()
+
+    with workspace_source_lock(root, exclusive=False):
+        for directory, child_directories, filenames in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+            onerror=_raise_workspace_walk_error,
+        ):
+            parent = Path(directory)
+            traversable: list[str] = []
+            for name in child_directories:
+                if _directory_name_key(name) in excluded_directory_keys:
+                    continue
+                path = parent / name
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    add(path, info)
+                elif stat.S_ISDIR(info.st_mode):
+                    traversable.append(name)
+                else:
+                    raise WorkspaceGitEntryObservationUnsupportedError(
+                        "Workspace directory traversal encountered an unsupported entry."
+                    )
+            child_directories[:] = traversable
+            for name in filenames:
+                path = parent / name
+                relative_path = path.relative_to(root).as_posix()
+                if _path_has_excluded_directory(relative_path, excluded_directory_keys):
+                    continue
+                add(path, path.lstat())
+    return WorkspaceGitEntryListResult(
+        entries=tuple(entry for _path, entry in retained),
+        total_count=total_count,
+        truncated=total_count > len(retained),
+    )
 
 
 def _iter_list_file_candidates(
