@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -40,7 +41,13 @@ from cayu import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
+from cayu.evals.corpus import (
+    CorpusUserMessageSpec,
+    EvalCaseSpec,
+    EvalCorpusDocument,
+    ModelJudgeAssertionSpec,
+    RunInputSpec,
+)
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.memory_reporting import (
     MemoryExperimentReportRequest,
@@ -52,6 +59,11 @@ from cayu.evals.store import (
     EvalRunRequest,
     EvalRunStatus,
     InMemoryEvalStore,
+)
+from cayu.evals.suite_authoring import (
+    EvalCaseDraftV1,
+    EvalSimpleInputStimulusV1,
+    EvalSuiteDraftV1,
 )
 from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
@@ -852,6 +864,7 @@ def test_evals_api_compares_compatible_releases_and_returns_typed_regressions(tm
                 ("run", "score", None),
                 ("case", "status", "refund-approval"),
                 ("case", "score", "refund-approval"),
+                ("case", "reliability", "refund-approval"),
             ]
     finally:
         asyncio.run(current_store.close())
@@ -1330,7 +1343,12 @@ class _RecoveringJudgeProvider(ModelProvider):
                 self.cancelled.set()
                 raise
         yield ModelStreamEvent.text_delta('{"score": 0.9, "rationale": "recovered judgment"}')
-        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+        yield ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
 
 
 class _FailingProvider(ModelProvider):
@@ -1474,6 +1492,182 @@ def test_attached_worker_runs_the_same_trusted_model_judge_contract(tmp_path) ->
         asyncio.run(store.close())
 
 
+def test_authored_suite_exposes_and_executes_rubric_string_model_judge(tmp_path) -> None:
+    judge, judge_provider = _model_judge_target()
+    candidate_provider = _provider(trials=1)
+    target = _target(candidate_provider, model_judges=(judge,))
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    draft = EvalSuiteDraftV1(
+        id="authored-model-judge",
+        target_key=target.key,
+        name="Authored model judge",
+        cases=(
+            EvalCaseDraftV1(
+                id="case-one",
+                name="Case one",
+                stimulus=EvalSimpleInputStimulusV1(
+                    input=RunInputSpec(
+                        messages=(CorpusUserMessageSpec(text="Can I get a refund?"),)
+                    )
+                ),
+                assertions=(
+                    ModelJudgeAssertionSpec(
+                        id="quality",
+                        evaluator_key=judge.key,
+                        rubric="The answer correctly explains the refund policy.",
+                        rubric_version="v1",
+                    ),
+                ),
+            ),
+        ),
+    )
+    try:
+        with TestClient(_server(target, store)) as client:
+            preview = client.post(
+                "/api/evals/suites/preview",
+                headers=_AUTH_HEADERS,
+                json={"draft": draft.model_dump(mode="json")},
+            )
+            assert preview.status_code == 200
+            suite = preview.json()["suite"]
+            saved = client.post(
+                "/api/evals/suites",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_suite_revision": suite["revision"],
+                    "suite": suite,
+                },
+            )
+            assert saved.status_code == 201
+            launch_preview = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs/preview",
+                headers=_AUTH_HEADERS,
+                json={},
+            )
+            assert launch_preview.status_code == 200
+            reviewed = launch_preview.json()
+            assert reviewed["ready"] is True
+            assert reviewed["exposure"]["judge_evaluations"] == 1
+            assert reviewed["exposure"]["judge_profiles"][0]["profile_key"] == judge.key
+
+            launched = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-model-judge"},
+                json={
+                    "expected_exposure_revision": reviewed["exposure"]["revision"],
+                    "expected_execution_profiles": [
+                        {
+                            "case_ids": item["case_ids"],
+                            "execution_profile_revision": item["execution_profile_revision"],
+                        }
+                        for item in reviewed["launches"]
+                    ],
+                },
+            )
+            assert launched.status_code == 202
+            terminal = _wait_for_terminal(
+                client,
+                launched.json()["runs"][0]["run"]["spec"]["run_id"],
+            )
+            assert terminal["status"] == "completed"
+            assert len(candidate_provider.requests) == 1
+            assert len(judge_provider.requests) == 1
+    finally:
+        asyncio.run(store.close())
+
+
+def test_authored_lane_accepts_its_suite_wide_frozen_judge_profiles() -> None:
+    revision_a = "sha256:" + "a" * 64
+    revision_b = "sha256:" + "b" * 64
+    comparison_a = "sha256:" + "c" * 64
+    comparison_b = "sha256:" + "d" * 64
+    exposure = SimpleNamespace(
+        execution_profiles=(
+            SimpleNamespace(
+                case_ids=("case-one",),
+                execution_profile_revision=revision_a,
+                execution_profile_comparison_revision=comparison_a,
+                candidate_cost_budget=None,
+            ),
+        ),
+        judge_profiles=(
+            SimpleNamespace(
+                profile_key="judge-one",
+                judge_profile_revision=revision_a,
+                judge_profile_comparison_revision=comparison_a,
+            ),
+            SimpleNamespace(
+                profile_key="judge-two",
+                judge_profile_revision=revision_b,
+                judge_profile_comparison_revision=comparison_b,
+            ),
+        ),
+    )
+    invocation = SimpleNamespace(
+        authored_suite_exposure=exposure,
+        execution_profile_snapshot=SimpleNamespace(
+            revision=revision_a,
+            comparison_revision=comparison_a,
+        ),
+        cost_budget=None,
+    )
+    lease = SimpleNamespace(run=SimpleNamespace(spec=SimpleNamespace(invocation=invocation)))
+    compiled = SimpleNamespace(
+        run_contract=SimpleNamespace(
+            suite_id="suite-one",
+            cases=(SimpleNamespace(case_id="case-one"),),
+        ),
+        corpus=SimpleNamespace(
+            cases=(
+                SimpleNamespace(
+                    suite_id="suite-one",
+                    assertions=(
+                        ModelJudgeAssertionSpec(
+                            id="quality",
+                            evaluator_key="judge-one",
+                            rubric="The answer is correct.",
+                            rubric_version="v1",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    current_profiles = (
+        SimpleNamespace(
+            key="judge-one",
+            revision=revision_a,
+            comparison_revision=comparison_a,
+        ),
+        SimpleNamespace(
+            key="judge-two",
+            revision=revision_b,
+            comparison_revision=comparison_b,
+        ),
+    )
+    registration = SimpleNamespace(catalog_entry=SimpleNamespace(judge_profiles=current_profiles))
+
+    assert evals_worker_module._accepted_authored_work_matches_runtime(
+        lease,
+        compiled,
+        registration,
+    )
+
+    registration.catalog_entry.judge_profiles = (
+        current_profiles[0],
+        SimpleNamespace(
+            key="judge-two",
+            revision="sha256:" + "e" * 64,
+            comparison_revision=comparison_b,
+        ),
+    )
+    assert not evals_worker_module._accepted_authored_work_matches_runtime(
+        lease,
+        compiled,
+        registration,
+    )
+
+
 def test_attached_worker_recovers_interrupted_model_judge_under_a_new_fence(tmp_path) -> None:
     judge_provider = _RecoveringJudgeProvider()
     judge_app = CayuApp(enable_logging=False)
@@ -1529,6 +1723,27 @@ def test_attached_worker_recovers_interrupted_model_judge_under_a_new_fence(tmp_
             assert terminal["status"] == "completed"
             assert terminal["attempt_count"] == 2
             assert terminal["result"]["status"] == "passed"
+            published = client.get(
+                f"/api/evals/runs/{run_id}/result",
+                headers=_AUTH_HEADERS,
+            )
+            assert published.status_code == 200
+            judge_detail = published.json()["result"]["run"]["cases"][0]["trials"][0]["assertions"][
+                0
+            ]["detail"]
+            assert judge_detail["usage"] == {
+                "model_steps": 1,
+                "input_tokens": "2",
+                "output_tokens": "1",
+                "total_tokens": "3",
+            }
+            assert judge_detail["cost"] == {
+                "availability": "unavailable",
+                "currency": None,
+                "estimated_cost": None,
+                "priced_model_steps": None,
+                "unpriced_model_steps": None,
+            }
 
         assert len(candidate_provider.requests) == 2
         assert judge_provider.request_count == 2

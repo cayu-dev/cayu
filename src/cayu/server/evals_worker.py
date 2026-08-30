@@ -10,7 +10,12 @@ from enum import StrEnum
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
-from cayu.evals.corpus import EvalCorpusDocument
+from cayu.evals.corpus import (
+    EvalCorpusDocument,
+    ModelJudgeAssertionSpec,
+    StructuredModelJudgeAssertionSpec,
+    pricing_profile_identity,
+)
 from cayu.evals.execution import (
     CompiledCorpusSuite,
     CorpusTarget,
@@ -33,10 +38,12 @@ from cayu.evals.store import (
     EvalRunLease,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalRunTrialCheckpoint,
     EvalScenarioTrialFailureCode,
 )
 from cayu.evals.suite_authoring import EvalSuiteDocument
 from cayu.evals.suite_execution import corpus_for_authored_scenario_case
+from cayu.evals.trial_policy import EvalCandidateCostBudgetV1
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     ExecutionProfileMismatchError,
@@ -60,6 +67,75 @@ def _is_execution_profile_failure(error: BaseException) -> bool:
             and candidate.code is EvalScenarioTrialFailureCode.EXECUTION_PROFILE_CHANGED
         )
         for candidate in iter_exception_tree(error)
+    )
+
+
+def _accepted_candidate_pricing_matches_target(lease: EvalRunLease, target: CorpusTarget) -> bool:
+    exposure = lease.run.spec.invocation.authored_suite_exposure
+    if exposure is None:
+        return True
+    current = (
+        ()
+        if target.price_book is None
+        else (pricing_profile_identity(target.price_book).fingerprint,)
+    )
+    return exposure.candidate_cost.pricing_profile_fingerprints == current
+
+
+def _accepted_authored_work_matches_runtime(
+    lease: EvalRunLease,
+    compiled: CompiledCorpusSuite,
+    registration: EvalTargetRegistration,
+) -> bool:
+    """Rebind accepted candidate and judge authority to this exact durable run."""
+
+    exposure = lease.run.spec.invocation.authored_suite_exposure
+    snapshot = lease.run.spec.invocation.execution_profile_snapshot
+    if exposure is None or snapshot is None:
+        return False
+    case_ids = tuple(case.case_id for case in compiled.run_contract.cases)
+    execution_binding = next(
+        (item for item in exposure.execution_profiles if item.case_ids == case_ids),
+        None,
+    )
+    if (
+        execution_binding is None
+        or snapshot.revision != execution_binding.execution_profile_revision
+        or snapshot.comparison_revision != execution_binding.execution_profile_comparison_revision
+    ):
+        return False
+    accepted_budget = execution_binding.candidate_cost_budget
+    current_budget = lease.run.spec.invocation.cost_budget
+    if accepted_budget != (
+        None
+        if current_budget is None
+        else EvalCandidateCostBudgetV1.from_decimal(
+            currency=current_budget.currency,
+            amount=current_budget.max_estimated_cost,
+        )
+    ):
+        return False
+
+    judge_keys: set[str] = set()
+    for case in compiled.corpus.cases:
+        if case.suite_id != compiled.run_contract.suite_id:
+            continue
+        for assertion in case.assertions:
+            if type(assertion) is ModelJudgeAssertionSpec:
+                judge_keys.add(assertion.evaluator_key)
+            elif type(assertion) is StructuredModelJudgeAssertionSpec:
+                judge_keys.add(assertion.judge_profile_key)
+    current_profiles = {
+        profile.key: profile for profile in registration.catalog_entry.judge_profiles
+    }
+    accepted_profiles = {profile.profile_key: profile for profile in exposure.judge_profiles}
+    if not judge_keys.issubset(accepted_profiles):
+        return False
+    return all(
+        (current := current_profiles.get(key)) is not None
+        and accepted_profiles[key].judge_profile_revision == current.revision
+        and accepted_profiles[key].judge_profile_comparison_revision == current.comparison_revision
+        for key in accepted_profiles
     )
 
 
@@ -382,6 +458,18 @@ class EvalRunCoordinator:
                 or compiled.run_contract.suite_revision != lease.run.spec.suite_revision
             ):
                 raise ValueError("Persisted eval run does not match its compiled suite.")
+            exposure = lease.run.spec.invocation.authored_suite_exposure
+            snapshot = lease.run.spec.invocation.execution_profile_snapshot
+            if lease.run.spec.invocation.authored_suite_revision is not None and (
+                exposure is None
+                or snapshot is None
+                or exposure.trial_policy_revision != compiled.run_contract.trial_policy.revision
+                or not _accepted_authored_work_matches_runtime(lease, compiled, registration)
+                or lease.run.spec.max_concurrency
+                > compiled.run_contract.trial_policy.max_concurrency
+                or not _accepted_candidate_pricing_matches_target(lease, target)
+            ):
+                raise ValueError("Persisted authored run lost its accepted work exposure.")
         except Exception:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
         return _PreparedEvalRun(
@@ -443,6 +531,18 @@ class EvalRunCoordinator:
                 or compiled.run_contract.suite_revision != lease.run.spec.suite_revision
             ):
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            exposure = lease.run.spec.invocation.authored_suite_exposure
+            snapshot = lease.run.spec.invocation.execution_profile_snapshot
+            if authored_suite is not None and (
+                exposure is None
+                or snapshot is None
+                or exposure.trial_policy_revision != compiled.run_contract.trial_policy.revision
+                or not _accepted_authored_work_matches_runtime(lease, compiled, registration)
+                or lease.run.spec.max_concurrency
+                > compiled.run_contract.trial_policy.max_concurrency
+                or not _accepted_candidate_pricing_matches_target(lease, target)
+            ):
+                return EvalRunFailureCode.CORPUS_UNAVAILABLE
         except Exception:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
         return _PreparedEvalRun(
@@ -462,6 +562,26 @@ class EvalRunCoordinator:
     ) -> None:
         target = prepared.target
         if prepared.scenario is None:
+            checkpoints = await self._config.store.load_trial_checkpoints(lease.claim)
+            completed_trials = {
+                (checkpoint.case_id, checkpoint.trial_number): (
+                    checkpoint.result,
+                    checkpoint.public_data,
+                )
+                for checkpoint in checkpoints
+            }
+
+            async def save_trial_checkpoint(case_id, result, public_data) -> None:
+                await self._config.store.save_trial_checkpoint(
+                    lease.claim,
+                    EvalRunTrialCheckpoint(
+                        case_id=case_id,
+                        result=result,
+                        public_data=public_data,
+                    ),
+                    redact_json=target.app.redact_json,
+                )
+
             execution_coro = _run_compiled_corpus_suite(
                 target,
                 prepared.compiled,
@@ -473,6 +593,9 @@ class EvalRunCoordinator:
                 expected_execution_profile=prepared.execution_profile,
                 native_run_id=lease.run.id,
                 execution_capacity=self._config.execution_capacity,
+                accepted_exposure=lease.run.spec.invocation.authored_suite_exposure,
+                completed_trials=completed_trials,
+                trial_completed=save_trial_checkpoint,
             )
         else:
             if prepared.scenario_binding is None:
@@ -492,6 +615,7 @@ class EvalRunCoordinator:
                 ),
                 expected_execution_profile=prepared.execution_profile,
                 execution_capacity=self._config.execution_capacity,
+                accepted_exposure=lease.run.spec.invocation.authored_suite_exposure,
             )
         execution = asyncio.create_task(
             execution_coro,

@@ -9840,7 +9840,7 @@
           },
           "code": {
             "enum": [
-              "one_trial_required",
+              "trial_policy_exceeds_execution_profile",
               "execution_profile_unavailable",
               "execution_profile_changed",
               "tool_argument_evidence_unavailable",
@@ -9848,7 +9848,9 @@
               "artifact_text_evidence_unavailable",
               "simple_launch_not_ready",
               "scenario_execution_unavailable",
-              "scenario_launch_not_ready"
+              "trial_checkpointing_unavailable",
+              "scenario_launch_not_ready",
+              "work_exposure_unavailable"
             ],
             "title": "Code",
             "type": "string"
@@ -9957,10 +9959,18 @@
             "minItems": 1,
             "title": "Expected Execution Profiles",
             "type": "array"
+          },
+          "expected_exposure_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Exposure Revision",
+            "type": "string"
           }
         },
         "required": [
-          "expected_execution_profiles"
+          "expected_execution_profiles",
+          "expected_exposure_revision"
         ],
         "title": "EvalAuthoredSuiteRunLaunchRequest",
         "type": "object"
@@ -9998,6 +10008,16 @@
             "maxItems": 1001,
             "title": "Diagnostics",
             "type": "array"
+          },
+          "exposure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalSuiteRunExposureV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "launches": {
             "items": {

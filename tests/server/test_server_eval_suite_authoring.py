@@ -6,6 +6,7 @@ import time
 import pytest
 from tests.server.test_server_eval_scenarios import (
     _AUTH_HEADERS,
+    _authenticate,
     _scenario,
     _server,
     _target,
@@ -16,7 +17,7 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import ModelStreamEvent, ScriptedModelProvider
+from cayu import EvalExecutionProfilePolicyV1, ModelStreamEvent, ScriptedModelProvider
 from cayu.evals.corpus import (
     ArtifactAssertionSpec,
     CorpusUserMessageSpec,
@@ -31,11 +32,16 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.suite_authoring import (
     EvalCaseDraftV1,
+    EvalCaseDraftV2,
     EvalScenarioStimulusV1,
     EvalSimpleInputStimulusV1,
     EvalSuiteDocumentV1,
+    EvalSuiteDocumentV3,
     EvalSuiteDraftV1,
+    EvalSuiteDraftV3,
+    EvalSuiteTrialRequestDraftV3,
 )
+from cayu.server import DashboardConfig, EvalsConfig, ServerConfig, create_server
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 
@@ -70,6 +76,204 @@ def _draft(*cases: EvalCaseDraftV1) -> EvalSuiteDraftV1:
         name="Refund regressions",
         cases=cases or (_simple_case(),),
     )
+
+
+def test_v3_authored_suite_executes_all_trials_and_applies_pass_threshold(tmp_path) -> None:
+    provider = ScriptedModelProvider(
+        [
+            (
+                ModelStreamEvent.text_delta("refund accepted"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ),
+            (
+                ModelStreamEvent.text_delta("request denied"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ),
+            (
+                ModelStreamEvent.text_delta("refund confirmed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ),
+        ]
+    )
+    target, _, _ = _target(tmp_path, provider)
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    draft = EvalSuiteDraftV3(
+        id="reliable-refunds",
+        target_key=target.key,
+        name="Reliable refunds",
+        trial_request=EvalSuiteTrialRequestDraftV3(
+            trials=3,
+            minimum_passed_trials=2,
+            max_concurrency=2,
+            timeout_seconds=30,
+        ),
+        cases=(EvalCaseDraftV2.model_validate(_simple_case().model_dump(mode="python")),),
+    )
+    server = create_server(
+        target.app,
+        config=ServerConfig.protected(
+            _authenticate,
+            dashboard=DashboardConfig(enabled=False),
+            evals=EvalsConfig(
+                target=target,
+                store=store,
+                execution_profile_policy=EvalExecutionProfilePolicyV1(
+                    reset_strategy="application_managed",
+                    isolation_revision="sha256:" + "a" * 64,
+                    max_trials=3,
+                    max_concurrency=2,
+                ),
+                poll_interval_seconds=0.02,
+                lease_seconds=5,
+                shutdown_grace_seconds=2,
+            ),
+        ),
+    )
+    try:
+        with TestClient(server) as client:
+            preview = client.post(
+                "/api/evals/suites/preview",
+                headers=_AUTH_HEADERS,
+                json={"draft": draft.model_dump(mode="json")},
+            )
+            assert preview.status_code == 200
+            suite = preview.json()["suite"]
+            assert suite["schema_version"] == 3
+            policy = suite["suite"]["trial_request"]["trial_policy"]
+            assert policy["minimum_passed_trials"] == 2
+
+            saved = client.post(
+                "/api/evals/suites",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_suite_revision": suite["revision"],
+                    "suite": suite,
+                },
+            )
+            assert saved.status_code == 201
+            launch_preview = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs/preview",
+                headers=_AUTH_HEADERS,
+                json={},
+            )
+            assert launch_preview.status_code == 200
+            reviewed = launch_preview.json()
+            assert reviewed["ready"] is True
+            assert reviewed["exposure"]["candidate_trials"] == 3
+            assert reviewed["exposure"]["max_concurrency"] == 2
+            assert reviewed["exposure"]["maximum_candidate_model_steps"] == 24
+            assert reviewed["exposure"]["maximum_candidate_total_tokens"] is None
+
+            stale_exposure = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "reliable-refunds-stale"},
+                json={
+                    "expected_exposure_revision": "sha256:" + "f" * 64,
+                    "expected_execution_profiles": [
+                        {
+                            "case_ids": item["case_ids"],
+                            "execution_profile_revision": item["execution_profile_revision"],
+                        }
+                        for item in reviewed["launches"]
+                    ],
+                },
+            )
+            assert stale_exposure.status_code == 409
+            assert "exposure changed" in stale_exposure.json()["detail"]
+
+            launched = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "reliable-refunds-1"},
+                json={
+                    "expected_exposure_revision": reviewed["exposure"]["revision"],
+                    "expected_execution_profiles": [
+                        {
+                            "case_ids": item["case_ids"],
+                            "execution_profile_revision": item["execution_profile_revision"],
+                        }
+                        for item in reviewed["launches"]
+                    ],
+                },
+            )
+            assert launched.status_code == 202
+            run_id = launched.json()["runs"][0]["run"]["spec"]["run_id"]
+
+            deadline = time.monotonic() + 5
+            run = None
+            while time.monotonic() < deadline:
+                response = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
+                assert response.status_code == 200
+                run = response.json()
+                if run["status"] in {"completed", "error", "cancelled"}:
+                    break
+                time.sleep(0.02)
+            assert run is not None
+            assert run["status"] == "completed"
+            result = client.get(
+                f"/api/evals/runs/{run_id}/result",
+                headers=_AUTH_HEADERS,
+            )
+            assert result.status_code == 200
+            published = result.json()["result"]["run"]
+            assert [trial["status"] for trial in published["cases"][0]["trials"]] == [
+                "passed",
+                "failed",
+                "passed",
+            ]
+            assert published["cases"][0]["status"] == "passed"
+            assert published["cases"][0]["reliability"]["passed_trials"] == 2
+            assert published["accepted_exposure"]["revision"] == reviewed["exposure"]["revision"]
+    finally:
+        asyncio.run(store.close())
+
+
+def test_authored_suite_run_preview_rejects_scale_above_current_profile(tmp_path) -> None:
+    target, _, _ = _target(tmp_path)
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    draft = EvalSuiteDraftV3(
+        id="repeated-without-isolation",
+        target_key=target.key,
+        name="Repeated without isolation",
+        trial_request=EvalSuiteTrialRequestDraftV3(
+            trials=2,
+            minimum_passed_trials=1,
+            max_concurrency=1,
+            timeout_seconds=30,
+        ),
+        cases=(EvalCaseDraftV2.model_validate(_simple_case().model_dump(mode="python")),),
+    )
+    try:
+        with TestClient(_server(target, store)) as client:
+            preview = client.post(
+                "/api/evals/suites/preview",
+                headers=_AUTH_HEADERS,
+                json={"draft": draft.model_dump(mode="json")},
+            )
+            assert preview.status_code == 200
+            suite = preview.json()["suite"]
+            saved = client.post(
+                "/api/evals/suites",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_suite_revision": suite["revision"],
+                    "suite": suite,
+                },
+            )
+            assert saved.status_code == 201
+
+            launch_preview = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs/preview",
+                headers=_AUTH_HEADERS,
+                json={},
+            )
+            assert launch_preview.status_code == 200
+            assert launch_preview.json()["ready"] is False
+            assert launch_preview.json()["exposure"] is None
+            assert [item["code"] for item in launch_preview.json()["diagnostics"]] == [
+                "trial_policy_exceeds_execution_profile"
+            ]
+    finally:
+        asyncio.run(store.close())
 
 
 def test_authored_suite_run_preview_explains_missing_tool_evidence_authority(tmp_path) -> None:
@@ -400,7 +604,26 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
         ),
     )
     try:
-        with TestClient(_server(target, store)) as client:
+        server = create_server(
+            target.app,
+            config=ServerConfig.protected(
+                _authenticate,
+                dashboard=DashboardConfig(enabled=False),
+                evals=EvalsConfig(
+                    target=target,
+                    store=store,
+                    execution_profile_policy=EvalExecutionProfilePolicyV1(
+                        reset_strategy="application_managed",
+                        isolation_revision="sha256:" + "a" * 64,
+                        max_concurrency=2,
+                    ),
+                    poll_interval_seconds=0.02,
+                    lease_seconds=5,
+                    shutdown_grace_seconds=2,
+                ),
+            ),
+        )
+        with TestClient(server) as client:
             saved_scenario = client.post(
                 "/api/evals/scenarios",
                 headers=_AUTH_HEADERS,
@@ -414,10 +637,28 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
             suite_preview = client.post(
                 "/api/evals/suites/preview",
                 headers=_AUTH_HEADERS,
-                json={"draft": _draft(_simple_case(), scenario_case).model_dump(mode="json")},
+                json={
+                    "draft": EvalSuiteDraftV3(
+                        id="refund-regressions",
+                        target_key="assistant.default",
+                        name="Refund regressions",
+                        trial_request=EvalSuiteTrialRequestDraftV3(
+                            trials=1,
+                            minimum_passed_trials=1,
+                            max_concurrency=2,
+                            timeout_seconds=300,
+                        ),
+                        cases=(
+                            EvalCaseDraftV2.model_validate(
+                                _simple_case().model_dump(mode="python")
+                            ),
+                            EvalCaseDraftV2.model_validate(scenario_case.model_dump(mode="python")),
+                        ),
+                    ).model_dump(mode="json")
+                },
             )
             assert suite_preview.status_code == 200
-            suite = EvalSuiteDocumentV1.model_validate(suite_preview.json()["suite"])
+            suite = EvalSuiteDocumentV3.model_validate(suite_preview.json()["suite"])
             saved_suite = client.post(
                 "/api/evals/suites",
                 headers=_AUTH_HEADERS,
@@ -457,19 +698,29 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
             )
             assert full.status_code == 200
             assert full.json()["ready"] is True
+            assert full.json()["exposure"]["candidate_trials"] == 2
+            assert full.json()["exposure"]["judge_evaluations"] == 0
+            assert full.json()["exposure"]["max_concurrency"] == 2
+            assert full.json()["exposure"]["candidate_cost"] == {
+                "state": "unavailable",
+                "totals": [],
+                "unavailable_reason": "no_candidate_cost_ceiling",
+                "pricing_profile_fingerprints": [],
+            }
             assert full.json()["selection"]["mode"] == "full_suite"
             assert [item["kind"] for item in full.json()["launches"]] == [
                 "simple_input",
                 "scenario",
             ]
             launch_body = {
+                "expected_exposure_revision": full.json()["exposure"]["revision"],
                 "expected_execution_profiles": [
                     {
                         "case_ids": item["case_ids"],
                         "execution_profile_revision": item["execution_profile_revision"],
                     }
                     for item in full.json()["launches"]
-                ]
+                ],
             }
 
             launched = client.post(
@@ -481,6 +732,8 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
             body = launched.json()
             assert body["selection"]["revision"] == full.json()["selection"]["revision"]
             assert [item["kind"] for item in body["runs"]] == ["simple_input", "scenario"]
+            launch_revisions = set()
+            launch_lanes = set()
             for admitted in body["runs"]:
                 invocation = admitted["run"]["spec"]["invocation"]
                 assert invocation["authored_suite_revision"] == suite.revision
@@ -488,6 +741,12 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
                     invocation["authored_suite_selection_revision"]
                     == full.json()["selection"]["revision"]
                 )
+                launch_revisions.add(invocation["authored_suite_launch_revision"])
+                launch_lanes.add(invocation["authored_suite_launch_lane"])
+            assert len(launch_revisions) == 1
+            assert next(iter(launch_revisions)).startswith("sha256:")
+            assert launch_lanes == {0, 1}
+            assert {admitted["run"]["spec"]["max_concurrency"] for admitted in body["runs"]} == {1}
             scenario_invocation = body["runs"][1]["run"]["spec"]["invocation"]["scenario"]
             assert scenario_invocation["scenario_revision"] == scenario.revision
             assert scenario_invocation["authored_suite_revision"] == suite.revision
@@ -509,6 +768,7 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-suite-full-1"},
                 json={
                     "case_ids": ["refund-request"],
+                    "expected_exposure_revision": subset.json()["exposure"]["revision"],
                     "expected_execution_profiles": [
                         {
                             "case_ids": subset_launch["case_ids"],

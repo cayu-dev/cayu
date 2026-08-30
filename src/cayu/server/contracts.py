@@ -79,6 +79,7 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDraft,
     EvalSuiteSelectionV1,
 )
+from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -1717,7 +1718,7 @@ class EvalAuthoredSuiteRunSelectionRequest(ApiBaseModel):
 
 class EvalAuthoredSuiteLaunchDiagnostic(ApiBaseModel):
     code: Literal[
-        "one_trial_required",
+        "trial_policy_exceeds_execution_profile",
         "execution_profile_unavailable",
         "execution_profile_changed",
         "tool_argument_evidence_unavailable",
@@ -1725,7 +1726,9 @@ class EvalAuthoredSuiteLaunchDiagnostic(ApiBaseModel):
         "artifact_text_evidence_unavailable",
         "simple_launch_not_ready",
         "scenario_execution_unavailable",
+        "trial_checkpointing_unavailable",
         "scenario_launch_not_ready",
+        "work_exposure_unavailable",
     ]
     case_id: PromotionPortableId | None = None
     message: StrictStr = Field(min_length=1, max_length=2_048)
@@ -1762,6 +1765,7 @@ class EvalAuthoredSuiteRunPreviewResponse(ApiBaseModel):
         default_factory=tuple,
         max_length=EVAL_CORPUS_MAX_CASES + 1,
     )
+    exposure: EvalSuiteRunExposureV1 | None = None
 
     @model_validator(mode="after")
     def validate_readiness(self) -> EvalAuthoredSuiteRunPreviewResponse:
@@ -1775,6 +1779,13 @@ class EvalAuthoredSuiteRunPreviewResponse(ApiBaseModel):
             raise ValueError(
                 "Authored suite launch readiness contradicts execution-profile bindings."
             )
+        if self.ready != (self.exposure is not None):
+            raise ValueError("Authored suite launch readiness contradicts its work exposure.")
+        if (
+            self.exposure is not None
+            and self.exposure.selection_revision != self.selection.revision
+        ):
+            raise ValueError("Authored suite work exposure does not match its selection.")
         return self
 
 
@@ -1802,6 +1813,7 @@ class EvalAuthoredSuiteRunLaunchRequest(EvalAuthoredSuiteRunSelectionRequest):
         min_length=1,
         max_length=EVAL_CORPUS_MAX_CASES,
     )
+    expected_exposure_revision: EvalRevision
 
     @model_validator(mode="after")
     def validate_profile_expectations(self) -> EvalAuthoredSuiteRunLaunchRequest:

@@ -91,6 +91,8 @@ from cayu.evals.corpus import (
     ToolResultContainsAssertionSpec,
     _canonical_decimal_text,
     eval_corpus_to_json,
+    eval_suite_trial_policy,
+    pricing_profile_identity,
 )
 from cayu.evals.execution import (
     CompiledCorpusSuite,
@@ -102,6 +104,7 @@ from cayu.evals.execution import (
     evaluation_target_identity,
 )
 from cayu.evals.execution_comparison import compare_corpus_execution_results, compare_eval_results
+from cayu.evals.execution_profiles import EvalExecutionProfileV1
 from cayu.evals.execution_reporting import (
     eval_result_report_to_json,
     render_corpus_execution_html,
@@ -210,11 +213,17 @@ from cayu.evals.suite_execution import (
     corpus_for_authored_scenario_case,
     corpus_for_authored_simple_selection,
 )
+from cayu.evals.suite_preflight import (
+    EvalCandidateLaunchExposure,
+    allocate_authored_suite_launch_concurrency,
+    compile_authored_suite_run_exposure,
+)
 from cayu.evals.trajectory import (
     SessionTrajectoryError,
     SessionTrajectoryErrorCode,
     trajectory_from_session,
 )
+from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.project_control_plane import ResolvedProjectControlPlaneContext
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime._event_projection import (
@@ -5514,6 +5523,9 @@ def create_router(
             scenario: EvalScenarioRunInvocation | None = None,
             authored_suite_revision: str | None = None,
             authored_suite_selection_revision: str | None = None,
+            authored_suite_launch_revision: str | None = None,
+            authored_suite_launch_lane: int | None = None,
+            authored_suite_exposure: EvalSuiteRunExposureV1 | None = None,
         ) -> EvalRunInvocation:
             try:
                 origin = (
@@ -5533,6 +5545,9 @@ def create_router(
                     cost_budget=cost_budget,
                     authored_suite_revision=authored_suite_revision,
                     authored_suite_selection_revision=(authored_suite_selection_revision),
+                    authored_suite_launch_revision=authored_suite_launch_revision,
+                    authored_suite_launch_lane=authored_suite_launch_lane,
+                    authored_suite_exposure=authored_suite_exposure,
                     scenario=scenario,
                 )
             except (TypeError, ValueError) as exc:
@@ -5645,6 +5660,11 @@ def create_router(
             eval_target: CorpusTarget,
             compiled: CompiledCorpusSuite,
         ) -> EvalRunRecord:
+            if not eval_store.trial_checkpointing:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Restart-safe eval trial checkpointing is not available.",
+                )
             if eval_target.key != corpus.target_key:
                 raise RuntimeError("Prepared eval target does not match its corpus.")
             if invocation.execution_profile is None:
@@ -5700,6 +5720,14 @@ def create_router(
                 raise HTTPException(
                     status_code=400,
                     detail="Eval run exceeds the published execution-profile trial limit.",
+                )
+            if (
+                suite is not None
+                and max_concurrency > eval_suite_trial_policy(suite).max_concurrency
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run exceeds the immutable suite concurrency policy.",
                 )
             if max_concurrency > policy.max_concurrency:
                 raise HTTPException(
@@ -6349,19 +6377,49 @@ def create_router(
                 if type(case.stimulus) is EvalScenarioStimulusV1
             )
             diagnostics: list[EvalAuthoredSuiteLaunchDiagnostic] = []
-            if suite.suite.trial_request.trials != 1:
+            if not eval_store.trial_checkpointing:
                 diagnostics.append(
                     EvalAuthoredSuiteLaunchDiagnostic(
-                        code="one_trial_required",
+                        code="trial_checkpointing_unavailable",
                         message=(
-                            "Control Plane authored-suite launch currently requires exactly "
-                            "one trial. Revise this suite to one trial before launching."
+                            "Restart-safe terminal trial checkpointing is not available in "
+                            "this deployment."
                         ),
                     )
                 )
+            trial_policy = eval_suite_trial_policy(suite.suite)
+            concurrency_allocations = allocate_authored_suite_launch_concurrency(
+                trial_policy,
+                len(launches),
+            )
+            concurrency_by_case = {
+                case_id: allocation
+                for launch, allocation in zip(
+                    launches,
+                    concurrency_allocations,
+                    strict=True,
+                )
+                for case_id in launch.case_ids
+            }
+            execution_profiles_by_case: dict[str, EvalExecutionProfileV1] = {}
             registration = active_eval_registry.registration(suite.target_key)
             if registration is None:
                 raise HTTPException(status_code=404, detail="Authored eval suite not found.")
+            if (
+                trial_policy.trial_count > registration.execution_profile_policy.max_trials
+                or max(item.max_concurrency for item in concurrency_allocations)
+                > registration.execution_profile_policy.max_concurrency
+            ):
+                diagnostics.append(
+                    EvalAuthoredSuiteLaunchDiagnostic(
+                        code="trial_policy_exceeds_execution_profile",
+                        message=(
+                            "The suite trial count or concurrency exceeds the current "
+                            "server-published execution profile. Select an isolated profile "
+                            "with sufficient ceilings or reduce the policy."
+                        ),
+                    )
+                )
             execution_target = registration.execution_target()
             for case in selected_cases:
                 if (
@@ -6465,11 +6523,32 @@ def create_router(
                             )
                         )
                     else:
-                        launches[0] = launches[0].model_copy(
-                            update={
-                                "execution_profile_revision": prepared_profile.snapshot.revision
-                            }
-                        )
+                        if (
+                            trial_policy.trial_count > prepared_profile.snapshot.ceilings.max_trials
+                            or concurrency_by_case[simple_cases[0].id].max_concurrency
+                            > prepared_profile.snapshot.ceilings.max_concurrency
+                        ):
+                            diagnostics.append(
+                                EvalAuthoredSuiteLaunchDiagnostic(
+                                    code="trial_policy_exceeds_execution_profile",
+                                    message=(
+                                        "The suite trial count or concurrency exceeds the current "
+                                        "server-published execution profile. Select an isolated "
+                                        "profile with sufficient ceilings or reduce the policy."
+                                    ),
+                                )
+                            )
+                        else:
+                            execution_profiles_by_case.update(
+                                (case.id, prepared_profile.snapshot) for case in simple_cases
+                            )
+                            launches[0] = launches[0].model_copy(
+                                update={
+                                    "execution_profile_revision": (
+                                        prepared_profile.snapshot.revision
+                                    )
+                                }
+                            )
             prepared_scenarios: dict[
                 str,
                 tuple[EvalScenarioDocumentV2, ScenarioLaunchBindingV2],
@@ -6488,6 +6567,9 @@ def create_router(
                 async def prepare_scenario(case):
                     stimulus = case.stimulus
                     assert type(stimulus) is EvalScenarioStimulusV1
+                    case_settings = settings.model_copy(
+                        update={"max_concurrency": concurrency_by_case[case.id].max_concurrency}
+                    )
                     async with preflight_limit:
                         try:
                             scenario = await eval_store.load_scenario(stimulus.scenario_revision)
@@ -6496,7 +6578,7 @@ def create_router(
                             preflight = await preflight_eval_scenario(
                                 scenario,
                                 execution_target,
-                                settings,
+                                case_settings,
                                 actor_authorized=True,
                                 project_root=registration.manifest_project_root,
                             )
@@ -6513,7 +6595,7 @@ def create_router(
                                 authored_suite_revision=suite.revision,
                                 authored_case_revision=case.revision,
                                 environment_name=preflight.binding.environment_name,
-                                trials=1,
+                                trials=trial_policy.trial_count,
                                 timeout_seconds=preflight.binding.timeout_seconds,
                                 artifact_references=tuple(
                                     EvalScenarioArtifactReference(
@@ -6540,6 +6622,18 @@ def create_router(
                                 suite.target_key,
                                 effective_target=effective_target,
                             )
+                            if (
+                                trial_policy.trial_count
+                                > prepared_profile.snapshot.ceilings.max_trials
+                                or concurrency_by_case[case.id].max_concurrency
+                                > prepared_profile.snapshot.ceilings.max_concurrency
+                            ):
+                                return (
+                                    case.id,
+                                    None,
+                                    None,
+                                    "The suite trial policy exceeds the current execution profile.",
+                                )
                             corpus = await asyncio.to_thread(
                                 corpus_for_authored_scenario_case,
                                 suite,
@@ -6558,7 +6652,7 @@ def create_router(
                             return (
                                 case.id,
                                 (scenario, preflight.binding),
-                                prepared_profile.snapshot.revision,
+                                prepared_profile.snapshot,
                                 None,
                             )
                         except Exception:
@@ -6572,7 +6666,7 @@ def create_router(
                 prepared = await asyncio.gather(
                     *(prepare_scenario(case) for case in scenario_cases)
                 )
-                for case_id, material, profile_revision, message in prepared:
+                for case_id, material, profile, message in prepared:
                     if material is None:
                         diagnostics.append(
                             EvalAuthoredSuiteLaunchDiagnostic(
@@ -6582,21 +6676,61 @@ def create_router(
                             )
                         )
                     else:
+                        assert profile is not None
                         prepared_scenarios[case_id] = material
+                        execution_profiles_by_case[case_id] = profile
                         launch_index = next(
                             index
                             for index, launch in enumerate(launches)
                             if launch.case_ids == (case_id,)
                         )
                         launches[launch_index] = launches[launch_index].model_copy(
-                            update={"execution_profile_revision": profile_revision}
+                            update={"execution_profile_revision": profile.revision}
                         )
+            exposure = None
+            if not diagnostics:
+                try:
+                    exposure_launches = tuple(
+                        EvalCandidateLaunchExposure(
+                            case_ids=launch.case_ids,
+                            execution_profile=execution_profiles_by_case[launch.case_ids[0]],
+                            cost_budget=(
+                                None
+                                if launch.kind == "simple_input"
+                                else prepared_scenarios[launch.case_ids[0]][1].cost_budget
+                            ),
+                        )
+                        for launch in launches
+                    )
+                    candidate_pricing_fingerprint = (
+                        None
+                        if execution_target.price_book is None
+                        else pricing_profile_identity(execution_target.price_book).fingerprint
+                    )
+                    exposure = compile_authored_suite_run_exposure(
+                        suite,
+                        selection,
+                        exposure_launches,
+                        judge_profiles=registration.catalog_entry.judge_profiles,
+                        candidate_pricing_profile_fingerprint=(candidate_pricing_fingerprint),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    diagnostics.append(
+                        EvalAuthoredSuiteLaunchDiagnostic(
+                            code="work_exposure_unavailable",
+                            message=(
+                                "The exact maximum configured candidate and judge work could "
+                                "not be proven from the current execution profiles."
+                            ),
+                        )
+                    )
             return (
                 EvalAuthoredSuiteRunPreviewResponse(
                     selection=selection,
                     ready=not diagnostics,
                     launches=tuple(launches),
                     diagnostics=tuple(diagnostics),
+                    exposure=exposure,
                 ),
                 prepared_scenarios,
             )
@@ -7220,6 +7354,17 @@ def create_router(
                         else "Authored eval suite launch requirements are not currently ready."
                     ),
                 )
+            if (
+                preview.exposure is None
+                or body.expected_exposure_revision != preview.exposure.revision
+            ):
+                raise HTTPException(
+                    status_code=503 if partial_replay else 409,
+                    detail=(
+                        "The authored-suite maximum work or cost exposure changed after "
+                        "readiness. Check launch readiness again."
+                    ),
+                )
             expected_profiles = tuple(
                 (expectation.case_ids, expectation.execution_profile_revision)
                 for expectation in body.expected_execution_profiles
@@ -7243,9 +7388,23 @@ def create_router(
             if registration is None:
                 raise HTTPException(status_code=404, detail="Authored eval suite not found.")
             execution_target = registration.execution_target()
+            trial_policy = eval_suite_trial_policy(suite.suite)
             cases_by_id = {case.id: case for case in suite.cases}
+            launch_revision = _eval_idempotency_digest(
+                suite.target_key,
+                idempotency_key,
+                namespace="authored-suite-launch",
+            )
+            concurrency_allocations = allocate_authored_suite_launch_concurrency(
+                trial_policy,
+                len(preview.launches),
+            )
             prepared_runs = []
-            for plan in preview.launches:
+            for plan, allocation in zip(
+                preview.launches,
+                concurrency_allocations,
+                strict=True,
+            ):
                 if plan.kind == "simple_input":
                     selection = eval_suite_selection(suite, plan.case_ids)
                     invocation = _eval_run_invocation(
@@ -7255,6 +7414,9 @@ def create_router(
                         cost_budget=None,
                         authored_suite_revision=suite.revision,
                         authored_suite_selection_revision=preview.selection.revision,
+                        authored_suite_launch_revision=launch_revision,
+                        authored_suite_launch_lane=allocation.lane,
+                        authored_suite_exposure=preview.exposure,
                     )
                     effective_target = target_for_eval_invocation(
                         execution_target,
@@ -7277,7 +7439,7 @@ def create_router(
                         authored_suite_revision=suite.revision,
                         authored_case_revision=case.revision,
                         environment_name=binding.environment_name,
-                        trials=1,
+                        trials=trial_policy.trial_count,
                         timeout_seconds=binding.timeout_seconds,
                         artifact_references=tuple(
                             EvalScenarioArtifactReference(
@@ -7295,6 +7457,9 @@ def create_router(
                         scenario=scenario_invocation,
                         authored_suite_revision=suite.revision,
                         authored_suite_selection_revision=preview.selection.revision,
+                        authored_suite_launch_revision=launch_revision,
+                        authored_suite_launch_lane=allocation.lane,
+                        authored_suite_exposure=preview.exposure,
                     )
                     effective_target = target_for_eval_invocation(
                         execution_target,
@@ -7322,7 +7487,7 @@ def create_router(
                     eval_target, compiled, invocation = await _prepare_eval_run(
                         corpus=corpus,
                         suite_id=suite.suite.id,
-                        max_concurrency=1,
+                        max_concurrency=allocation.max_concurrency,
                         invocation=invocation,
                         expected_execution_profile_revision=(plan.execution_profile_revision),
                         expect_exact_execution_profile=True,
@@ -7338,9 +7503,9 @@ def create_router(
                             ),
                         ) from exc
                     raise
-                prepared_runs.append((plan, corpus, invocation, eval_target, compiled))
+                prepared_runs.append((plan, corpus, invocation, eval_target, compiled, allocation))
 
-            for _, corpus, _, eval_target, _ in prepared_runs:
+            for _, corpus, _, eval_target, _, _ in prepared_runs:
                 try:
                     await eval_store.save_corpus(
                         corpus,
@@ -7363,12 +7528,17 @@ def create_router(
                     ) from exc
 
             admitted: list[EvalAuthoredSuiteAdmittedRun] = []
-            for index, (plan, corpus, invocation, eval_target, compiled) in enumerate(
-                prepared_runs
-            ):
+            for index, (
+                plan,
+                corpus,
+                invocation,
+                eval_target,
+                compiled,
+                allocation,
+            ) in enumerate(prepared_runs):
                 run = await _admit_eval_run(
                     corpus=corpus,
-                    max_concurrency=1,
+                    max_concurrency=allocation.max_concurrency,
                     invocation=invocation,
                     idempotency_key=idempotency_key,
                     idempotency_namespace=f"authored-suite-part-{index + 1}",

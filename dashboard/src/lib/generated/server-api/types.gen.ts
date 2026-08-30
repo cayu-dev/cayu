@@ -4882,7 +4882,7 @@ export type EvalAuthoredSuiteLaunchDiagnostic = {
     /**
      * Code
      */
-    code: 'one_trial_required' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'tool_argument_evidence_unavailable' | 'tool_result_evidence_unavailable' | 'artifact_text_evidence_unavailable' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
+    code: 'trial_policy_exceeds_execution_profile' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'tool_argument_evidence_unavailable' | 'tool_result_evidence_unavailable' | 'artifact_text_evidence_unavailable' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'trial_checkpointing_unavailable' | 'scenario_launch_not_ready' | 'work_exposure_unavailable';
     /**
      * Message
      */
@@ -4925,6 +4925,10 @@ export type EvalAuthoredSuiteRunLaunchRequest = {
      * Expected Execution Profiles
      */
     expected_execution_profiles: Array<EvalAuthoredSuiteExecutionProfileExpectation>;
+    /**
+     * Expected Exposure Revision
+     */
+    expected_exposure_revision: string;
 };
 
 /**
@@ -4946,6 +4950,7 @@ export type EvalAuthoredSuiteRunPreviewResponse = {
      * Diagnostics
      */
     diagnostics?: Array<EvalAuthoredSuiteLaunchDiagnostic>;
+    exposure?: EvalSuiteRunExposureV1 | null;
     /**
      * Launches
      */
