@@ -15,7 +15,7 @@ import sqlite3
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
@@ -2516,7 +2516,7 @@ class AgentSnapshotTrialBinding(_SnapshotModel):
 
 class AgentSnapshotResultBinding(_SnapshotModel):
     record_type: Literal["cayu.agent-snapshot-result"] = "cayu.agent-snapshot-result"
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     fingerprint: StrictStr
     trial_fingerprint: StrictStr
     session_id: StrictStr = Field(max_length=512)
@@ -2526,6 +2526,10 @@ class AgentSnapshotResultBinding(_SnapshotModel):
     memory_evidence_fingerprint: StrictStr | None = None
     usage_fingerprint: StrictStr | None = None
     cost_fingerprint: StrictStr | None = None
+    safe_frontier_fingerprint: StrictStr | None = None
+    open_operation_ids: tuple[StrictStr, ...] = ()
+    pending_approval_ids: tuple[StrictStr, ...] = ()
+    provider_continuation_ids: tuple[StrictStr, ...] = ()
     recorded_at: datetime
 
     @field_validator(
@@ -2536,12 +2540,23 @@ class AgentSnapshotResultBinding(_SnapshotModel):
         "memory_evidence_fingerprint",
         "usage_fingerprint",
         "cost_fingerprint",
+        "safe_frontier_fingerprint",
     )
     @classmethod
     def validate_fingerprints(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return _sha256_hex(value, info.field_name)
+
+    @field_validator(
+        "open_operation_ids",
+        "pending_approval_ids",
+        "provider_continuation_ids",
+        mode="before",
+    )
+    @classmethod
+    def validate_terminal_frontier(cls, value: object, info) -> tuple[str, ...]:
+        return _ordered_unique_text(value, info.field_name)
 
     @field_validator("session_id")
     @classmethod
@@ -2571,6 +2586,10 @@ class AgentSnapshotResultBinding(_SnapshotModel):
             "memory_evidence_fingerprint": self.memory_evidence_fingerprint,
             "usage_fingerprint": self.usage_fingerprint,
             "cost_fingerprint": self.cost_fingerprint,
+            "safe_frontier_fingerprint": self.safe_frontier_fingerprint,
+            "open_operation_ids": list(self.open_operation_ids),
+            "pending_approval_ids": list(self.pending_approval_ids),
+            "provider_continuation_ids": list(self.provider_continuation_ids),
         }
 
     @classmethod
@@ -2586,7 +2605,14 @@ class AgentSnapshotResultBinding(_SnapshotModel):
         memory_evidence_fingerprint: str | None = None,
         usage_fingerprint: str | None = None,
         cost_fingerprint: str | None = None,
+        safe_frontier_fingerprint: str | None = None,
+        open_operation_ids: Iterable[str] = (),
+        pending_approval_ids: Iterable[str] = (),
+        provider_continuation_ids: Iterable[str] = (),
     ) -> AgentSnapshotResultBinding:
+        open_operation_ids = tuple(open_operation_ids)
+        pending_approval_ids = tuple(pending_approval_ids)
+        provider_continuation_ids = tuple(provider_continuation_ids)
         provisional = cls.model_construct(
             fingerprint="0" * 64,
             trial_fingerprint=trial.fingerprint,
@@ -2597,6 +2623,10 @@ class AgentSnapshotResultBinding(_SnapshotModel):
             memory_evidence_fingerprint=memory_evidence_fingerprint,
             usage_fingerprint=usage_fingerprint,
             cost_fingerprint=cost_fingerprint,
+            safe_frontier_fingerprint=safe_frontier_fingerprint,
+            open_operation_ids=open_operation_ids,
+            pending_approval_ids=pending_approval_ids,
+            provider_continuation_ids=provider_continuation_ids,
             recorded_at=recorded_at,
         )
         return cls(
@@ -2609,6 +2639,10 @@ class AgentSnapshotResultBinding(_SnapshotModel):
             memory_evidence_fingerprint=memory_evidence_fingerprint,
             usage_fingerprint=usage_fingerprint,
             cost_fingerprint=cost_fingerprint,
+            safe_frontier_fingerprint=safe_frontier_fingerprint,
+            open_operation_ids=open_operation_ids,
+            pending_approval_ids=pending_approval_ids,
+            provider_continuation_ids=provider_continuation_ids,
             recorded_at=recorded_at,
         )
 
@@ -2710,6 +2744,20 @@ class AgentSnapshotStore(ABC):
         binding: AgentSnapshotIdentityBinding,
     ) -> AgentSnapshotPutReceipt:
         """Atomically store one root closure and one authorized logical binding."""
+
+    async def put_snapshot_and_pin(
+        self,
+        snapshot: AgentSnapshot,
+        binding: AgentSnapshotIdentityBinding,
+        pin: AgentSnapshotPinRequest,
+    ) -> tuple[AgentSnapshotPutReceipt, AgentSnapshotPinReceipt]:
+        """Atomically publish and pin a newly imported root.
+
+        Stores that do not implement one-transaction publication must fail
+        closed; bundle import cannot expose an unprotected root between calls.
+        """
+
+        raise NotImplementedError("Store does not support atomic snapshot import publication.")
 
     @abstractmethod
     async def load_identity_binding(self, binding_id: str) -> AgentSnapshotIdentityBinding | None:
@@ -3458,6 +3506,34 @@ class InMemoryAgentSnapshotStore(AgentSnapshotStore):
             self._snapshot_binding_documents[validated_binding.binding_id] = validated_snapshot
             self._snapshot_put_receipts[validated_binding.binding_id] = receipt
             return AgentSnapshotPutReceipt.model_validate(receipt.model_dump(mode="json"))
+
+    async def put_snapshot_and_pin(
+        self,
+        snapshot: AgentSnapshot,
+        binding: AgentSnapshotIdentityBinding,
+        pin: AgentSnapshotPinRequest,
+    ) -> tuple[AgentSnapshotPutReceipt, AgentSnapshotPinReceipt]:
+        validated_snapshot, validated_binding = _validate_snapshot_binding(snapshot, binding)
+        validated_pin = AgentSnapshotPinRequest.model_validate(pin.model_dump(mode="json"))
+        expected_access = AgentSnapshotAccess(
+            snapshot=validated_snapshot.ref,
+            binding_id=validated_binding.binding_id,
+            authority_scope_fingerprint=validated_binding.authority_scope_fingerprint,
+        )
+        if validated_pin.access != expected_access:
+            raise AgentSnapshotAuthorizationError(
+                "Atomic snapshot import pin names another binding or scope."
+            )
+        with self._snapshot_lock:
+            self._snapshot_operation_replay(
+                "pin",
+                validated_pin.operation_id,
+                validated_pin.identity_material(),
+                AgentSnapshotPinReceipt,
+            )
+            put_receipt = await self.put_snapshot(validated_snapshot, validated_binding)
+            pin_receipt = await self.pin_snapshot(validated_pin)
+            return put_receipt, pin_receipt
 
     async def load_identity_binding(self, binding_id: str) -> AgentSnapshotIdentityBinding | None:
         _sha256_hex(binding_id, "binding_id")
@@ -4350,6 +4426,8 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         self,
         snapshot: AgentSnapshot,
         binding: AgentSnapshotIdentityBinding,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> str:
         validated_snapshot, validated_binding = _validate_snapshot_binding(snapshot, binding)
         closure = _verify_snapshot_nodes(
@@ -4371,7 +4449,10 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         closure_bytes = sum(
             len(_snapshot_model_bytes(node, "agent_snapshot_node")) for node in closure
         )
-        with self._write_connection() as connection:
+        connection_context = (
+            self._write_connection() if connection is None else nullcontext(connection)
+        )
+        with connection_context as connection:
             existing_binding_row = connection.execute(
                 "SELECT binding_document, snapshot_document, put_receipt_document "
                 "FROM cayu_agent_snapshot_bindings WHERE binding_id = ?",
@@ -4528,6 +4609,52 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
         document = await asyncio.to_thread(self._put_snapshot_sync, snapshot, binding)
         return AgentSnapshotPutReceipt.model_validate_json(document)
 
+    def _put_snapshot_and_pin_sync(
+        self,
+        snapshot: AgentSnapshot,
+        binding: AgentSnapshotIdentityBinding,
+        pin: AgentSnapshotPinRequest,
+    ) -> tuple[str, str]:
+        validated_snapshot, validated_binding = _validate_snapshot_binding(snapshot, binding)
+        validated_pin = AgentSnapshotPinRequest.model_validate(pin.model_dump(mode="json"))
+        expected_access = AgentSnapshotAccess(
+            snapshot=validated_snapshot.ref,
+            binding_id=validated_binding.binding_id,
+            authority_scope_fingerprint=validated_binding.authority_scope_fingerprint,
+        )
+        if validated_pin.access != expected_access:
+            raise AgentSnapshotAuthorizationError(
+                "Atomic snapshot import pin names another binding or scope."
+            )
+        with self._write_connection() as connection:
+            put_document = self._put_snapshot_sync(
+                validated_snapshot,
+                validated_binding,
+                connection=connection,
+            )
+            pin_document = self._pin_snapshot_sync(
+                validated_pin,
+                connection=connection,
+            )
+            return put_document, pin_document
+
+    async def put_snapshot_and_pin(
+        self,
+        snapshot: AgentSnapshot,
+        binding: AgentSnapshotIdentityBinding,
+        pin: AgentSnapshotPinRequest,
+    ) -> tuple[AgentSnapshotPutReceipt, AgentSnapshotPinReceipt]:
+        put_document, pin_document = await asyncio.to_thread(
+            self._put_snapshot_and_pin_sync,
+            snapshot,
+            binding,
+            pin,
+        )
+        return (
+            AgentSnapshotPutReceipt.model_validate_json(put_document),
+            AgentSnapshotPinReceipt.model_validate_json(pin_document),
+        )
+
     async def load_identity_binding(self, binding_id: str) -> AgentSnapshotIdentityBinding | None:
         binding_id = _sha256_hex(binding_id, "binding_id")
 
@@ -4671,9 +4798,17 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             ),
         )
 
-    def _pin_snapshot_sync(self, request: AgentSnapshotPinRequest) -> str:
+    def _pin_snapshot_sync(
+        self,
+        request: AgentSnapshotPinRequest,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> str:
         validated = AgentSnapshotPinRequest.model_validate(request.model_dump(mode="json"))
-        with self._write_connection() as connection:
+        connection_context = (
+            self._write_connection() if connection is None else nullcontext(connection)
+        )
+        with connection_context as connection:
             replay = self._sqlite_operation_replay(
                 connection,
                 kind="pin",

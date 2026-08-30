@@ -89,6 +89,34 @@ guard.
 
 ## Unreleased
 
+### Complete agents can be exported, copied, imported, and freshly materialized
+
+`AgentBundle` now transports one exact `AgentSnapshotRef` plus its complete
+authorized provider-object closure as an ordinary filesystem directory. Full
+exports contain every restorable object; thin exports consume an explicit
+destination inventory and transfer only missing content-addressed objects.
+Streaming component storage and transfer allow agents larger than process
+memory, while reports separate root, logical closure, shared, incremental, and
+materialized byte counts plus unresolved external bindings.
+
+Import bounds and verifies every index, node, component manifest, and blob before
+atomically publishing and pinning the root. Corrupt, truncated, missing, extra,
+wrong-root/scope, traversal, symlink, oversized, and unsupported-schema inputs
+fail closed. `reusable_agent`, `continuing_agent`, and `evaluation_candidate`
+profiles make session disposition explicit. Fresh materialization rebinds
+credentials, evaluator, budget, leases, scratch, runtime/session/operation
+identities, and starts with no catalogue-discovery grants. Terminal capture
+requires a safe closed frontier and emits a durable descendant-snapshot receipt.
+Known registered secret bytes and structurally private/evaluator payload fields
+are refused on export and again before imported roots are published; secret
+values never enter the portable bundle. Filesystem CAS shards are pinned with
+no-follow descriptors, snapshot access is checked before fresh authority is
+allocated, and restart recovery verifies the exact materialized file closure.
+
+Run `uv run python examples/portable_agent_bundle.py --help` for the public
+three-process export/import/materialization example. This is a prerelease schema
+version 1 contract and adds no remote registry or encrypted archive format.
+
 ### Explicit lineage-scoped parent-to-child artifact handoff
 
 Applications can now register sealed `publish_workspace_artifact` and

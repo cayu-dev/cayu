@@ -10368,8 +10368,10 @@ requires the evaluator identity declared by the snapshot; an absent or changed
 evaluator fails closed.
 `AgentSnapshotResultBinding` then binds the durable trial to its Cayu session,
 terminal disposition, runtime and memory evidence, eval result, usage, and cost
-fingerprints. These records recommend or compare successors only; they cannot
-activate code, profiles, policies, knowledge, or permissions.
+fingerprints, plus the safe frontier and any still-open operations, approvals,
+or provider continuations observed at settlement. These records recommend or
+compare successors only; they cannot activate code, profiles, policies,
+knowledge, or permissions.
 
 `SQLiteAgentSnapshotStore` and `InMemoryAgentSnapshotStore` retain root
 manifests, Merkle nodes, logical bindings, materializations, trial bindings, and
@@ -10438,6 +10440,135 @@ changed recovered overlay identity. Losing and outcome-unknown overlays
 remain the application/provider owner's responsibility to discard or
 quarantine; the snapshot contract never mutates the baseline or production
 state on their behalf.
+
+### Complete portable agent bundles
+
+`AgentBundle` is the transport for an `AgentSnapshot`; it is not another state
+manifest or a public `AgentStateRoot`. The bundle index names the exact
+`AgentSnapshotRef`, the authorized export binding and scope, one strict snapshot
+profile, the complete reachable object inventory, the subset physically
+transferred, non-secret external binding requirements, and an inspectable size
+report. `snapshot_root` remains the sole agent-state content root.
+
+Three profiles make session inheritance explicit:
+
+- `reusable_agent` requires a session component with
+  `fresh_on_materialize` and retains authorized knowledge, profiles, policy,
+  environment, and selected workspace/artifact state;
+- `continuing_agent` requires an exact `safe_frontier`; and
+- `evaluation_candidate` uses the existing reset-each-trial or bounded
+  accumulate-within-candidate state partition.
+
+`AgentSnapshotComponentPackage` is the provider-owned portable object named by
+each complete restorable or replayable component's logical fingerprint. It
+contains canonical durable JSON metadata, relative file references, file modes
+and media types, and typed external-binding requirements. Component files are
+separate SHA-256 objects, so unchanged body, knowledge, workspace, environment,
+and artifact data is structurally shared between snapshot versions. The generic
+`PortableAgentSnapshotComponentProvider` composes those packages with the
+existing capture/verify/materialize protocol. Subsystem and application owners
+still decide which exact frontier and files are authorized; the bundle layer
+does not scrape databases, workspaces, sessions, or artifact stores.
+
+`agent_snapshot_component_package()` is convenient for bounded in-memory
+content. `store_agent_snapshot_component_package()` hashes and copies regular
+files incrementally, allowing a logical agent much larger than process memory.
+`FileSystemAgentSnapshotObjectStore` streams immutable objects through
+cooperative cross-process locks, verifies size and digest before publication
+and after copy, pins each shard with descriptor-relative `O_NOFOLLOW` access,
+rejects symlinks and non-regular paths, and atomically renames completed objects
+within that pinned shard. A full agent can therefore be hundreds of gigabytes
+while its root and index remain small. Platforms without those descriptor
+guards fail closed. Object and total-transfer bounds still apply.
+
+`AgentBundleCoordinator.export()` installs an `exporting` root protection,
+enumerates the authorized snapshot closure, verifies every portable component
+and blob, writes an ordinary filesystem directory through a private staging
+path, and atomically publishes the final directory. A completed lost-
+acknowledgement retry verifies and reuses the exact directory. Concurrent
+exports serialize on the destination path. Failed or cancelled work retains
+its durable protection until the same operation recovers or an authorized
+operator resolves it.
+
+A full bundle transfers the snapshot document, all Merkle nodes, every component
+manifest, and every reachable component blob. It fails closed when a requested
+component is partial, unavailable, reference-only, missing, corrupt, or belongs
+to another profile/provider. A thin bundle consumes an explicit destination
+inventory and carries the snapshot document plus every missing reachable
+object. Unchanged nodes and component objects retain their digests. Size reports
+distinguish root-manifest bytes, complete logical closure bytes, bytes already
+shared with the declared destination, incremental transfer bytes, expected
+materialized file bytes, and unresolved external bindings.
+
+Import validates the canonical index and all declared files under fixed object,
+index, count, and total-byte ceilings. Object paths derive only from lowercase
+digests. Symlinks, traversal, extra files, missing files, truncation, corruption,
+wrong roots, wrong export scopes/bindings, unsupported schemas, and oversized
+claims fail before snapshot publication. Provider objects may be staged first,
+but `AgentSnapshotStore.put_snapshot_and_pin()` publishes the logical binding,
+root closure, and first retention pin atomically. In-memory and SQLite stores
+implement that operation; other stores must implement the same transaction or
+bundle import fails closed. An interrupted import can leave only unreachable
+deduplicated provider objects, never an exposed unpinned snapshot root.
+When the importer has a `SecretRedactor`, it scans both transferred and reused
+portable objects before that atomic publication and refuses a registered secret.
+
+Materialization reuses the ordinary `AgentSnapshotCoordinator` operation plan
+and provider recovery hooks. `AgentBundleMaterializationRequest` declares only
+the requested `materialize`, `fork_as_seed`, or `restore` operation and its
+authorized bundle/snapshot/candidate/trial scope. The snapshot binding and
+component closure are verified before materialization authority is invoked or
+its receipt is stored. Before any provider effect,
+the configured `AgentBundleMaterializationAuthority` must allocate and activate
+new runtime/session/operation/budget/lease/scratch identities, freshly resolve
+every required external binding, and return an exact
+`AgentBundleMaterializationAuthorization`. Caller-supplied identity or authority
+hashes are not accepted. The authorization must begin with an empty
+catalogue-discovery grant view, is bound into the new state partition, and is
+stored before provider effects, then copied into the durable materialization
+receipt without credential values. The authority operation must itself be
+idempotent for the request fingerprint. Portable-provider restart recovery
+reopens the configured materialization destination and proves its exact receipt,
+declared file closure, digests, sizes, and executable modes; a missing,
+alternate, or corrupted destination fails closed instead of returning the
+stored logical materialization alone.
+
+`AgentSnapshotTerminalCaptureRequest` names a durable
+`AgentSnapshotResultBinding`; it does not assert terminal disposition, open
+operations, pending approvals, provider continuations, or a safe frontier. The
+coordinator loads that result, its exact trial, and its parent materialization,
+rejects outcome-unknown or open frontiers, and requires continuing agents to
+carry an exact safe-frontier fingerprint. Before component capture, the
+configured `AgentSnapshotTerminalAuthority` must verify the result's
+runtime/session evidence against its source-owned durable records and return an
+exact authorization receipt, which is stored before component capture.
+Successful capture emits a content-addressed
+`AgentSnapshotTerminalCaptureReceipt` binding both authorizations, the parent
+result/materialization/snapshot, the descendant `AgentSnapshotRef`, and the
+explicit finalization policy. Scratch and run-evidence files remain outside the
+descendant unless the owning application deliberately includes them in a
+promoted workspace or artifact package.
+
+Portable payloads structurally reject credential, secret, hidden-case,
+expected-answer, judge-prompt, and provider-continuation fields. Applications
+should pass their current `SecretRedactor` while capturing/exporting; known
+secret bytes are then detected across streamed file boundaries and refused.
+This is exact-known-value protection, not general DLP or information-flow
+tracking. Evaluator-private stores and application authorization remain the
+authoritative exclusion boundary.
+
+Run the complete credential-free three-process example with:
+
+```bash
+uv run python examples/portable_agent_bundle.py export --root /tmp/cayu-agent-demo
+uv run python examples/portable_agent_bundle.py import --root /tmp/cayu-agent-demo
+uv run python examples/portable_agent_bundle.py materialize --root /tmp/cayu-agent-demo
+```
+
+The commands intentionally use separate SQLite stores and interpreter processes.
+The imported root equals the exported root, while logical registration,
+authority scope, runtime/session/budget/lease/scratch identities, hosted-model
+binding, and discovery grants are fresh.
 
 ### Snapshot v2 to v3 migration
 
