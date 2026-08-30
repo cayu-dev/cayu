@@ -1252,9 +1252,10 @@ no dual-write path, legacy proposal interpretation, or compatibility wrapper.
 
 `KnowledgeCurator` is the provider-neutral, explicitly invoked path from application
 evidence to human-reviewable knowledge. It does not inspect sessions by itself, start a
-worker, choose a model, or write active knowledge. The application decides when a run or
-domain operation is complete, extracts bounded `LearningSignal` values, and calls
-`curate(...)` with a `LearningBatch`.
+worker, choose a model, or grant itself activation authority. The application decides when
+a run or domain operation is complete, extracts bounded `LearningSignal` values, and calls
+`curate(...)` with a `LearningBatch`; only explicit review or the separately configured
+activation policy may make its accepted candidate active.
 
 The lifecycle keeps five concepts separate:
 
@@ -1266,8 +1267,8 @@ The lifecycle keeps five concepts separate:
   `KnowledgeCandidateGenerator`;
 - pending knowledge is an accepted candidate committed for review with immutable,
   revision-bound `KnowledgeEvidence`; and
-- active knowledge is a reviewed revision that normal list, search, recall, and context
-  injection may use.
+- active knowledge is a reviewed or explicitly policy-authorized revision that normal list,
+  search, recall, and context injection may use.
 
 A separately supplied `LearningEvaluator` must explicitly accept each candidate. An
 optional application policy can reject or transform content before evaluation; when it
@@ -1277,13 +1278,23 @@ scheduler, semantic-merging heuristic, or universal secret detector. Application
 validate source authorization and enforce their own domain-specific rejection or
 redaction rules.
 
-Accepted candidates always enter `KnowledgeStatus.PENDING`. The curator uses the same
-atomic revision, chunks, evidence, publication-receipt, change-outbox, and derived-index
+The default reviewed governance routes accepted candidates to
+`KnowledgeStatus.PENDING` without calling an automatic policy. In
+`policy_automatic` or `autonomous` mode, a separately configured application policy may
+activate, route to review, or reject the exact evaluated candidate; generator and evaluator
+identities cannot authorize activation. The policy receives a bounded copy of the candidate,
+evidence, evaluator result, and enforced access scope, while the request fingerprint durably
+binds all of that material. Policy execution keeps timeout and caller-cancellation ownership
+outside the application callback, so a callback that suppresses its own cancellation still
+cannot authorize a late publication. Autonomous mode is still explicitly invoked and does not
+create a background worker.
+The curator uses the same atomic revision, chunks,
+evidence, publication receipt, activation receipt, change-outbox, and derived-index
 readiness contracts as other knowledge writes. Deterministic scoped proposal identities
 make exact retries and concurrent calls converge across processes. A retry of an already
 pending, active, archived, or deleted proposal reports that durable state; it does not
-create a replacement revision or rerun an evaluator after the exact proposal is known to
-be durable.
+create a replacement revision or rerun an evaluator or activation policy after the exact
+proposal is known to be durable.
 
 Activation receipts retain the full bounded request for exact replay and audit, so access
 requires both the immutable publication-time scope and the logical entry's current scope.
@@ -1333,7 +1344,12 @@ reviewer = KnowledgeReviewWorkflow(
     labels={"tenant": "acme"},
 )
 pending = await reviewer.list_pending()
-approved = await reviewer.approve(pending.entries[0].entry.id)
+approved = await reviewer.approve(
+    pending.entries[0].entry.id,
+    operation_id="approve-build-42-knowledge",
+    reviewer_identity="acme.release-reviewer",
+    reviewer_version="2026-08",
+)
 ```
 
 `KnowledgeCurator` and `RememberKnowledgeTool` share the same bounded retained-publication

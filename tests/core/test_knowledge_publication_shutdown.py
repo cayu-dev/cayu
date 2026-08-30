@@ -70,6 +70,7 @@ class StalledStore(InMemoryKnowledgeStore):
         access_scope=None,
         operation_id,
         expected_revision=None,
+        activation_authority=None,
     ):
         if STALLS_RECONCILIATION:
             receipt = await super().publish_entry_revision(
@@ -79,6 +80,7 @@ class StalledStore(InMemoryKnowledgeStore):
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             self.publication_returned = True
             return receipt
@@ -92,6 +94,7 @@ class StalledStore(InMemoryKnowledgeStore):
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
         finally:
             self.stopped.set()

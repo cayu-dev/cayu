@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import asyncio
+import base64
+import hashlib
 import inspect
 import logging
 from collections.abc import AsyncIterator
@@ -18,9 +20,13 @@ from fastapi.testclient import TestClient
 from cayu import (
     AgentSpec,
     CayuApp,
+    InMemoryKnowledgeStore,
     InMemorySessionStore,
     InMemoryTaskStore,
     InvocationOriginTrust,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
+    KnowledgeStatus,
     SessionExecutionSource,
 )
 from cayu.core.events import Event, EventType
@@ -120,6 +126,153 @@ def _make_client(*, expose_docs: bool | None = None) -> TestClient:
             ),
         )
     )
+
+
+def test_authenticated_knowledge_approval_records_and_binds_reviewer_identity() -> None:
+    def authenticate(request: Request) -> AuthContext:
+        subject = request.headers.get("X-Reviewer")
+        if subject is None:
+            raise HTTPException(status_code=401, detail="Reviewer identity is required.")
+        return AuthContext(subject=subject, tenant="tenant-a")
+
+    scope = KnowledgeAccessScope.privileged()
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="authenticated-review",
+                text="Only authenticated reviewers may activate this knowledge.",
+                status=KnowledgeStatus.PENDING,
+            )
+        ],
+        access_scope=scope,
+    )
+    app = CayuApp(knowledge_store=store, knowledge_access_scope=scope)
+    client = TestClient(create_server(app, config=ServerConfig.protected(authenticate)))
+    headers = {
+        "Idempotency-Key": "authenticated-knowledge-review",
+        "X-Reviewer": "reviewer-alice",
+    }
+
+    approved = client.post("/api/knowledge/authenticated-review/approve", headers=headers)
+
+    assert approved.status_code == 200
+    activation = asyncio.run(
+        store.load_activation_receipt(
+            "authenticated-knowledge-review",
+            access_scope=scope,
+        )
+    )
+    assert activation is not None
+    assert activation.authority.decision.policy_identity == "reviewer-alice"
+    assert activation.authority.decision.annotations == {
+        "channel": "protected-http",
+        "identity_source": "http_auth",
+        "tenant": "tenant-a",
+    }
+
+    conflicting_reviewer = client.post(
+        "/api/knowledge/authenticated-review/approve",
+        headers={**headers, "X-Reviewer": "reviewer-bob"},
+    )
+
+    assert conflicting_reviewer.status_code == 409
+
+
+def test_authenticated_knowledge_approval_preserves_oversized_and_nul_provenance() -> None:
+    subject = "reviewer-" + ("é" * 300)
+    tenant = "tenant\x00a"
+
+    def authenticate(_request: Request) -> AuthContext:
+        return AuthContext(subject=subject, tenant=tenant)
+
+    scope = KnowledgeAccessScope.privileged()
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="encoded-authenticated-review",
+                text="Every valid authenticated subject must retain exact review provenance.",
+                status=KnowledgeStatus.PENDING,
+            )
+        ],
+        access_scope=scope,
+    )
+    app = CayuApp(knowledge_store=store, knowledge_access_scope=scope)
+    client = TestClient(create_server(app, config=ServerConfig.protected(authenticate)))
+
+    response = client.post(
+        "/api/knowledge/encoded-authenticated-review/approve",
+        headers={"Idempotency-Key": "encoded-authenticated-knowledge-review"},
+    )
+
+    assert response.status_code == 200
+    activation = asyncio.run(
+        store.load_activation_receipt(
+            "encoded-authenticated-knowledge-review",
+            access_scope=scope,
+        )
+    )
+    assert activation is not None
+    expected_digest = hashlib.sha256(
+        b"cayu-knowledge-review-auth-subject-v1\0" + subject.encode("utf-8")
+    ).hexdigest()
+    assert (
+        activation.authority.decision.policy_identity
+        == f"cayu:http-auth-subject-sha256:{expected_digest}"
+    )
+    annotations = activation.authority.decision.annotations
+    assert annotations == {
+        "channel": "protected-http",
+        "identity_source": "http_auth",
+        "subject_encoding": "base64-utf8",
+        "subject_b64": base64.b64encode(subject.encode("utf-8")).decode("ascii"),
+        "tenant_encoding": "base64-utf8",
+        "tenant_b64": base64.b64encode(tenant.encode("utf-8")).decode("ascii"),
+    }
+    assert base64.b64decode(annotations["subject_b64"]).decode("utf-8") == subject
+    assert base64.b64decode(annotations["tenant_b64"]).decode("utf-8") == tenant
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "candidate-author",
+        "cayu:http-auth-subject-sha256:" + ("a" * 64),
+    ],
+)
+def test_authenticated_knowledge_reviewer_cannot_authorize_itself(subject: str) -> None:
+    def authenticate(_request: Request) -> AuthContext:
+        return AuthContext(subject=subject)
+
+    scope = KnowledgeAccessScope.privileged()
+    store = InMemoryKnowledgeStore(
+        [
+            KnowledgeEntry(
+                id="self-authored-review",
+                text="A candidate author cannot approve its own knowledge.",
+                status=KnowledgeStatus.PENDING,
+                created_by=subject,
+            )
+        ],
+        access_scope=scope,
+    )
+    app = CayuApp(knowledge_store=store, knowledge_access_scope=scope)
+    client = TestClient(create_server(app, config=ServerConfig.protected(authenticate)))
+
+    response = client.post(
+        "/api/knowledge/self-authored-review/approve",
+        headers={"Idempotency-Key": "self-authored-knowledge-review"},
+    )
+
+    assert response.status_code == 409
+    entry = asyncio.run(store.get_entry("self-authored-review", access_scope=scope))
+    activation = asyncio.run(
+        store.load_activation_receipt(
+            "self-authored-knowledge-review",
+            access_scope=scope,
+        )
+    )
+    assert entry is not None and entry.status is KnowledgeStatus.PENDING
+    assert activation is None
 
 
 def test_auth_context_cache_is_bound_to_the_originating_dependency() -> None:

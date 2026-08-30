@@ -500,6 +500,7 @@ from cayu.server.sse import (
     sse_message_data_bytes,
 )
 from cayu.storage import (
+    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
     KnowledgeActivationConflict,
     KnowledgeChunk,
     KnowledgeEntry,
@@ -1116,6 +1117,8 @@ _ARTIFACT_UNSAFE_FILENAME_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"
 _KNOWLEDGE_REVIEW_PREVIEW_CHARS = 1200
 _KNOWLEDGE_PENDING_DETAIL_MAX_CHUNKS = 50
 _KNOWLEDGE_PENDING_DETAIL_MAX_BYTES = 128_000
+_KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_DOMAIN = b"cayu-knowledge-review-auth-subject-v1\0"
+_KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_PREFIX = "cayu:http-auth-subject-sha256:"
 _CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS = 500
 _CAUSAL_BUDGET_SUMMARY_MAX_EVENTS = 10_000
 _CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES = 4 * 1024 * 1024
@@ -3936,6 +3939,47 @@ def _serialize_knowledge_entry_base(entry: KnowledgeEntry) -> dict[str, Any]:
         "importance_source": entry.importance_source,
         "confidence": entry.confidence,
     }
+
+
+def _authenticated_knowledge_reviewer_attribution(
+    auth_context: AuthContext,
+) -> tuple[str, dict[str, object]]:
+    """Return durable reviewer identity and lossless authenticated provenance."""
+
+    subject_bytes = auth_context.subject.encode("utf-8")
+    annotations: dict[str, object] = {
+        "channel": "protected-http",
+        "identity_source": "http_auth",
+    }
+    if (
+        len(subject_bytes) <= MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES
+        and "\x00" not in auth_context.subject
+    ):
+        reviewer_identity = auth_context.subject
+    else:
+        digest = hashlib.sha256(
+            _KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_DOMAIN + subject_bytes
+        ).hexdigest()
+        reviewer_identity = f"{_KNOWLEDGE_REVIEW_AUTH_SUBJECT_DIGEST_PREFIX}{digest}"
+        annotations.update(
+            {
+                "subject_encoding": "base64-utf8",
+                "subject_b64": base64.b64encode(subject_bytes).decode("ascii"),
+            }
+        )
+    if auth_context.tenant is not None:
+        if "\x00" in auth_context.tenant:
+            annotations.update(
+                {
+                    "tenant_encoding": "base64-utf8",
+                    "tenant_b64": base64.b64encode(auth_context.tenant.encode("utf-8")).decode(
+                        "ascii"
+                    ),
+                }
+            )
+        else:
+            annotations["tenant"] = auth_context.tenant
+    return reviewer_identity, annotations
 
 
 def _serialize_knowledge_list_item(item: KnowledgeListItem) -> dict[str, Any]:
@@ -11514,7 +11558,6 @@ def create_router(
 
     @router.post(
         "/knowledge/{entry_id}/approve",
-        dependencies=protected,
         response_model=ApiReviewedKnowledgeEntry,
     )
     async def approve_knowledge(
@@ -11523,16 +11566,28 @@ def create_router(
             str | None,
             Header(alias="Idempotency-Key", min_length=1, max_length=256),
         ] = None,
+        auth_context: AuthContext | None = optional_auth_context,
     ):
         workflow = _knowledge_review_workflow()
         operation_id = idempotency_key or f"server-knowledge-review-{uuid4().hex}"
+        reviewer_annotations: dict[str, object]
+        if auth_context is None:
+            reviewer_identity = "cayu:trusted-local-development"
+            reviewer_annotations = {
+                "channel": "trusted-local-http",
+                "identity_source": "local_development",
+            }
+        else:
+            reviewer_identity, reviewer_annotations = _authenticated_knowledge_reviewer_attribution(
+                auth_context
+            )
         return await _apply_knowledge_review_action(
             lambda item_id: workflow.approve(
                 item_id,
                 operation_id=operation_id,
-                reviewer_identity="cayu.server.knowledge-review",
+                reviewer_identity=reviewer_identity,
                 reviewer_version="1",
-                annotations={"channel": "protected-http"},
+                annotations=reviewer_annotations,
             ),
             entry_id,
         )

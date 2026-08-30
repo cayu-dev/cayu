@@ -1,10 +1,9 @@
 """Governed, explicitly invoked knowledge curation.
 
-The curator turns bounded application evidence into reviewable knowledge.  It
-does not schedule itself, choose a model, activate knowledge, or replace the
-knowledge store and review workflow.  Candidate generation, independent
-evaluation, application policy, and atomic revision publication remain distinct
-boundaries.
+The curator turns bounded application evidence into governed knowledge. It does
+not schedule itself, choose a model, or grant activation authority. Candidate
+generation, independent evaluation, application activation policy, explicit
+review, and atomic revision publication remain distinct boundaries.
 """
 
 from __future__ import annotations
@@ -47,6 +46,13 @@ from cayu._validation import (
     revalidate_model_input,
     revalidate_model_inputs,
 )
+from cayu.knowledge_governance import (
+    REVIEWED_ROUTING_POLICY_IDENTITY,
+    REVIEWED_ROUTING_POLICY_VERSION,
+    KnowledgeActivationPolicy,
+    KnowledgeActivationPolicyError,
+    decide_knowledge_activation,
+)
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     DEFAULT_KNOWLEDGE_CHUNK_TARGET_BYTES,
@@ -57,20 +63,36 @@ from cayu.storage.knowledge_indexer import (
 from cayu.storage.memory import (
     BUILTIN_KNOWLEDGE_KINDS,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
+    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
     MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES,
     KnowledgeAccessScope,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeEvidence,
     KnowledgeEvidenceDisposition,
+    KnowledgeEvidenceResult,
     KnowledgeEvidenceRole,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeRevisionConflict,
     KnowledgeStatus,
     KnowledgeVisibility,
     copy_knowledge_access_scope,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
+    copy_knowledge_chunk,
+    copy_knowledge_entry,
+    copy_knowledge_evidence,
+    knowledge_access_scope_sha256,
+    prepare_knowledge_activation_request,
     prepare_knowledge_publication,
 )
 
@@ -83,7 +105,6 @@ MAX_LEARNING_BATCH_BYTES = 4 * 1024 * 1024
 MAX_LEARNING_METADATA_BYTES = 64 * 1024
 MAX_LEARNING_NOTES_BYTES = 64 * 1024
 
-_IDENTITY_MAX_BYTES = 256
 _SOURCE_URI_MAX_BYTES = 2_048
 _CURATOR_METADATA_KEY = "cayu_curator"
 
@@ -98,7 +119,12 @@ class _CuratorModel(BaseModel):
     )
 
 
-def _clean(value: str, field_name: str, *, max_bytes: int = _IDENTITY_MAX_BYTES) -> str:
+def _clean(
+    value: str,
+    field_name: str,
+    *,
+    max_bytes: int = MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
+) -> str:
     value = require_durable_clean_nonblank(value, field_name)
     if len(value.encode("utf-8")) > max_bytes:
         raise ValueError(f"`{field_name}` must be at most {max_bytes} UTF-8 bytes.")
@@ -568,6 +594,7 @@ class KnowledgeCuratorConfig(_CuratorModel):
     visibility: KnowledgeVisibility = KnowledgeVisibility.GLOBAL
     allowed_kinds: tuple[StrictStr, ...] = BUILTIN_KNOWLEDGE_KINDS
     created_by: StrictStr = "knowledge_curator"
+    governance: KnowledgeGovernanceConfig = Field(default_factory=KnowledgeGovernanceConfig)
     max_signals: StrictInt = 50
     max_signal_bytes: StrictInt = 16 * 1024
     max_batch_bytes: StrictInt = 256 * 1024
@@ -612,6 +639,13 @@ class KnowledgeCuratorConfig(_CuratorModel):
     @classmethod
     def copy_labels(cls, value: Any) -> dict[str, str]:
         return copy_label_map(value, "labels")
+
+    @field_validator("governance", mode="before")
+    @classmethod
+    def copy_governance(cls, value: object) -> object:
+        if type(value) is KnowledgeGovernanceConfig:
+            return value.model_copy(deep=True)
+        return value
 
     @field_validator("allowed_kinds", mode="before")
     @classmethod
@@ -707,6 +741,17 @@ class KnowledgeCuratorConfig(_CuratorModel):
             raise ValueError("`chunk_overlap_bytes` must be less than `chunk_target_bytes`.")
         if self.chunk_overlap_bytes > self.chunk_target_bytes // 2:
             raise ValueError("`chunk_overlap_bytes` must be at most half `chunk_target_bytes`.")
+        activation_identity = self.governance.policy_identity
+        if activation_identity is not None and activation_identity in {
+            self.candidate_generator_identity,
+            self.evaluator_identity,
+            self.policy_identity,
+            self.created_by,
+        }:
+            raise ValueError(
+                "Activation policy identity must be separate from generation, evaluation, "
+                "candidate policy, and curator identities."
+            )
         return self
 
     @property
@@ -718,12 +763,14 @@ class LearningCandidateOutcome(StrEnum):
     """Durable or fail-closed outcome for one generated candidate."""
 
     PENDING_PERSISTED = "pending_persisted"
+    ACTIVE_PERSISTED = "active_persisted"
     EXISTING_PENDING = "existing_pending"
     EXISTING_ACTIVE = "existing_active"
     EXISTING_ARCHIVED = "existing_archived"
     EXISTING_DELETED = "existing_deleted"
     EVALUATOR_REJECTED = "evaluator_rejected"
     POLICY_REJECTED = "policy_rejected"
+    ACTIVATION_REJECTED = "activation_rejected"
     INVALID = "invalid"
     FAILED = "failed"
     CONFLICT = "conflict"
@@ -748,6 +795,7 @@ class LearningSignalOutcome(StrEnum):
 
 _ENTRY_STATUS_BY_CANDIDATE_OUTCOME = {
     LearningCandidateOutcome.PENDING_PERSISTED: KnowledgeStatus.PENDING,
+    LearningCandidateOutcome.ACTIVE_PERSISTED: KnowledgeStatus.ACTIVE,
     LearningCandidateOutcome.EXISTING_PENDING: KnowledgeStatus.PENDING,
     LearningCandidateOutcome.EXISTING_ACTIVE: KnowledgeStatus.ACTIVE,
     LearningCandidateOutcome.EXISTING_ARCHIVED: KnowledgeStatus.ARCHIVED,
@@ -867,13 +915,21 @@ class LearningCandidateResult(_CuratorModel):
         elif self.decision is not None and self.decision.verdict is not LearningVerdict.ACCEPTED:
             raise ValueError("Only an evaluator-rejected outcome can carry a rejected decision.")
 
-        if self.outcome is LearningCandidateOutcome.PENDING_PERSISTED and self.decision is None:
-            raise ValueError("A persisted pending outcome requires an accepted decision.")
         if (
-            self.warning_code is not None
-            and self.outcome is not LearningCandidateOutcome.PENDING_PERSISTED
+            self.outcome
+            in {
+                LearningCandidateOutcome.PENDING_PERSISTED,
+                LearningCandidateOutcome.ACTIVE_PERSISTED,
+                LearningCandidateOutcome.ACTIVATION_REJECTED,
+            }
+            and self.decision is None
         ):
-            raise ValueError("Only a persisted pending outcome can carry a warning code.")
+            raise ValueError("A post-evaluation activation outcome requires an accepted decision.")
+        if self.warning_code is not None and self.outcome not in {
+            LearningCandidateOutcome.PENDING_PERSISTED,
+            LearningCandidateOutcome.ACTIVE_PERSISTED,
+        }:
+            raise ValueError("Only a persisted activation outcome can carry a warning code.")
         return self
 
 
@@ -1021,6 +1077,7 @@ class _CuratorStore(Protocol):
         access_scope: KnowledgeAccessScope | None = None,
         operation_id: str,
         expected_revision: int | None = None,
+        activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> KnowledgePublicationReceipt: ...
 
     async def load_entry_publication_receipt(
@@ -1029,6 +1086,33 @@ class _CuratorStore(Protocol):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None: ...
+
+    async def load_activation_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeActivationReceipt | None: ...
+
+    async def read_chunks(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+        max_chunks: int,
+        max_bytes: int,
+    ) -> list[KnowledgeChunk]: ...
+
+    async def read_evidence(
+        self,
+        entry_id: str,
+        *,
+        revision: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+        max_records: int,
+        max_bytes: int,
+    ) -> KnowledgeEvidenceResult | None: ...
 
 
 class _EvaluationState(_CuratorModel):
@@ -1053,7 +1137,7 @@ class _PublicationCapacityExhausted(RuntimeError):
 
 
 class KnowledgeCurator:
-    """Explicit reviewed-mode knowledge curation over Cayu's revision store."""
+    """Explicit governed knowledge curation over Cayu's revision store."""
 
     def __init__(
         self,
@@ -1064,6 +1148,7 @@ class KnowledgeCurator:
         config: KnowledgeCuratorConfig,
         access_scope: KnowledgeAccessScope | None = None,
         candidate_policy: KnowledgeCandidatePolicy | None = None,
+        activation_policy: KnowledgeActivationPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         _validate_curator_store(store)
@@ -1087,6 +1172,15 @@ class KnowledgeCurator:
                 raise ValueError("A candidate policy requires an explicit `policy_identity`.")
         elif copied_config.policy_identity is not None:
             raise ValueError("`policy_identity` requires a candidate policy.")
+        decide_activation = None
+        if activation_policy is not None:
+            decide_activation = getattr(activation_policy, "decide_activation", None)
+            if not callable(decide_activation):
+                raise TypeError("activation_policy must implement `decide_activation`.")
+            if copied_config.governance.mode is KnowledgeGovernanceMode.REVIEWED:
+                raise ValueError("Reviewed governance cannot configure an activation policy.")
+        elif copied_config.governance.mode is not KnowledgeGovernanceMode.REVIEWED:
+            raise ValueError("Automatic and autonomous governance require activation_policy.")
         if access_scope is None:
             access_scope = store.bound_access_scope()
         if access_scope is None:
@@ -1095,6 +1189,7 @@ class KnowledgeCurator:
         self._generate = generate
         self._evaluate = evaluate
         self._apply_policy = apply_policy
+        self._activation_policy = activation_policy
         self._config = copied_config
         self._access_scope = copy_knowledge_access_scope(access_scope)
         _validate_curator_access_scope(self._config, self._access_scope)
@@ -1120,7 +1215,7 @@ class KnowledgeCurator:
         await self.aclose()
 
     async def curate(self, batch: LearningBatch) -> LearningBatchResult:
-        """Generate, independently evaluate, and persist pending knowledge."""
+        """Generate, independently evaluate, govern, and persist knowledge."""
 
         if type(batch) is not LearningBatch:
             raise TypeError("batch must be a LearningBatch.")
@@ -1469,30 +1564,33 @@ class KnowledgeCurator:
                 outcome=LearningCandidateOutcome.CONFLICT,
                 code="publication_receipt_identity_conflict",
             )
-        try:
-            historical = await self._store.get_entry(
-                receipt.entry_id,
-                revision=receipt.entry_revision,
-                access_scope=self._access_scope,
-            )
-            current = await self._store.get_entry(
-                receipt.entry_id,
-                access_scope=self._access_scope,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        activation, activation_error = await self._load_bound_activation_receipt(receipt)
+        if activation_error is not None:
             return _candidate_result(
                 candidate,
-                outcome=LearningCandidateOutcome.FAILED,
-                code="published_entry_read_failed",
+                outcome=(
+                    LearningCandidateOutcome.CONFLICT
+                    if activation_error == "activation_receipt_conflict"
+                    else LearningCandidateOutcome.FAILED
+                ),
+                code=activation_error,
             )
-        if historical is None or current is None:
+        assert activation is not None
+        historical, current, material_error = await self._load_bound_publication_material(
+            receipt,
+            activation,
+        )
+        if material_error is not None:
             return _candidate_result(
                 candidate,
-                outcome=LearningCandidateOutcome.FAILED,
-                code="published_entry_unavailable",
+                outcome=(
+                    LearningCandidateOutcome.CONFLICT
+                    if material_error == "published_material_conflict"
+                    else LearningCandidateOutcome.FAILED
+                ),
+                code=material_error,
             )
+        assert historical is not None and current is not None
         audit = historical.metadata.get(_CURATOR_METADATA_KEY)
         if (
             type(audit) is not dict
@@ -1500,7 +1598,7 @@ class KnowledgeCurator:
             or historical.namespace != self._config.namespace
             or historical.labels != self._config.labels
             or historical.visibility is not self._config.visibility
-            or historical.status is not KnowledgeStatus.PENDING
+            or historical.status is not _activation_publication_status(activation)
         ):
             return _candidate_result(
                 candidate,
@@ -1514,6 +1612,100 @@ class KnowledgeCurator:
             code=outcome.value,
             entry=current,
         )
+
+    async def _load_bound_activation_receipt(
+        self,
+        publication: KnowledgePublicationReceipt,
+    ) -> tuple[KnowledgeActivationReceipt | None, str | None]:
+        try:
+            activation = await self._store.load_activation_receipt(
+                publication.operation_id,
+                access_scope=self._access_scope,
+            )
+        except asyncio.CancelledError:
+            raise
+        except NotImplementedError:
+            return None, "owned_publication_unsupported"
+        except Exception:
+            return None, "activation_receipt_read_failed"
+        if activation is None:
+            return None, "activation_receipt_missing"
+        try:
+            activation = copy_knowledge_activation_receipt(activation)
+        except (TypeError, ValueError):
+            return None, "activation_receipt_invalid"
+        if not _curator_activation_receipt_matches(
+            activation,
+            publication=publication,
+            config=self._config,
+            access_scope=self._access_scope,
+        ):
+            return None, "activation_receipt_conflict"
+        return activation, None
+
+    async def _load_bound_publication_material(
+        self,
+        publication: KnowledgePublicationReceipt,
+        activation: KnowledgeActivationReceipt,
+    ) -> tuple[KnowledgeEntry | None, KnowledgeEntry | None, str | None]:
+        request = activation.authority.request
+        try:
+            historical = await self._store.get_entry(
+                publication.entry_id,
+                revision=publication.entry_revision,
+                access_scope=self._access_scope,
+            )
+            current = await self._store.get_entry(
+                publication.entry_id,
+                access_scope=self._access_scope,
+            )
+            chunks = await self._store.read_chunks(
+                publication.entry_id,
+                revision=publication.entry_revision,
+                access_scope=self._access_scope,
+                max_chunks=len(request.chunks) + 1,
+                max_bytes=MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+            )
+            evidence_result = await self._store.read_evidence(
+                publication.entry_id,
+                revision=publication.entry_revision,
+                access_scope=self._access_scope,
+                max_records=len(request.evidence) + 1,
+                max_bytes=MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None, None, "published_material_read_failed"
+        if historical is None or current is None or evidence_result is None:
+            return None, None, "published_material_unavailable"
+        if (
+            len(chunks) != len(request.chunks)
+            or evidence_result.truncated
+            or evidence_result.total_evidence_known != len(evidence_result.evidence)
+            or len(evidence_result.evidence) != len(request.evidence)
+        ):
+            return None, None, "published_material_conflict"
+        try:
+            _, entry, _, _, request_sha256 = prepare_knowledge_publication(
+                historical,
+                chunks,
+                evidence=evidence_result.evidence,
+                operation_id=publication.operation_id,
+                expected_revision=publication.expected_revision,
+                activation_authority=activation.authority,
+            )
+        except (TypeError, ValueError):
+            return None, None, "published_material_conflict"
+        if (
+            publication.entry_id != entry.id
+            or publication.entry_revision != entry.revision
+            or publication.request_sha256 != request_sha256
+            or publication.entry_created_at != entry.created_at
+            or publication.entry_updated_at != entry.updated_at
+        ):
+            return None, None, "published_material_conflict"
+        return historical, current, None
 
     async def _persist_candidate(
         self,
@@ -1616,6 +1808,60 @@ class KnowledgeCurator:
                 decision=decision,
             )
         try:
+            activation_request = prepare_knowledge_activation_request(
+                indexed.entry,
+                indexed.chunks,
+                evidence=evidence,
+                access_scope=self._access_scope,
+                operation_id=operation_id,
+                governance_mode=self._config.governance.mode,
+                source=KnowledgeActivationSource.CURATOR,
+                expected_revision=None,
+                evaluator_identity=self._config.evaluator_identity,
+                evaluator_result=decision.model_dump(mode="json"),
+                evaluator_decision_sha256=_sha256(
+                    decision.model_dump(mode="json"),
+                    "learning evaluator decision",
+                ),
+                forbidden_authority_identities=_curator_forbidden_activation_identities(
+                    self._config
+                ),
+            )
+            activation_authority = await decide_knowledge_activation(
+                activation_request,
+                config=self._config.governance,
+                policy=self._activation_policy,
+            )
+        except asyncio.CancelledError:
+            raise
+        except KnowledgeActivationPolicyError as exc:
+            return _candidate_result(
+                candidate,
+                outcome=LearningCandidateOutcome.FAILED,
+                code=exc.code,
+                decision=decision,
+            )
+        except (TypeError, ValueError):
+            return _candidate_result(
+                candidate,
+                outcome=LearningCandidateOutcome.INVALID,
+                code="activation_request_invalid",
+                decision=decision,
+            )
+        if activation_authority.decision.disposition is KnowledgeActivationDisposition.REJECT:
+            return _candidate_result(
+                candidate,
+                outcome=LearningCandidateOutcome.ACTIVATION_REJECTED,
+                code=activation_authority.decision.code,
+                decision=decision,
+            )
+        final_status = (
+            KnowledgeStatus.ACTIVE
+            if activation_authority.decision.disposition is KnowledgeActivationDisposition.ACTIVATE
+            else KnowledgeStatus.PENDING
+        )
+        governed_entry = indexed.entry.model_copy(update={"status": final_status})
+        try:
             (
                 operation_id,
                 publication_entry,
@@ -1623,11 +1869,12 @@ class KnowledgeCurator:
                 publication_evidence,
                 request_sha256,
             ) = prepare_knowledge_publication(
-                indexed.entry,
+                governed_entry,
                 indexed.chunks,
                 evidence=evidence,
                 operation_id=operation_id,
                 expected_revision=None,
+                activation_authority=activation_authority,
             )
         except (TypeError, ValueError):
             return _candidate_result(
@@ -1652,6 +1899,7 @@ class KnowledgeCurator:
                 entry=publication_entry,
                 chunks=publication_chunks,
                 evidence=publication_evidence,
+                activation_authority=activation_authority,
             )
         except asyncio.CancelledError:
             raise
@@ -1694,6 +1942,7 @@ class KnowledgeCurator:
                 entry_id=entry_id,
                 proposal_fingerprint=proposal_fingerprint,
                 expectation=expectation,
+                expected_activation_authority=activation_authority,
                 conflict=False,
             )
         if not _publication_receipt_matches_expectation(receipt, expectation):
@@ -1704,13 +1953,37 @@ class KnowledgeCurator:
                 entry_id=entry_id,
                 proposal_fingerprint=proposal_fingerprint,
                 expectation=expectation,
+                expected_activation_authority=activation_authority,
                 conflict=False,
             )
-        outcome = (
-            LearningCandidateOutcome.EXISTING_PENDING
-            if receipt.replayed
-            else LearningCandidateOutcome.PENDING_PERSISTED
-        )
+        activation, activation_error = await self._load_bound_activation_receipt(receipt)
+        if activation_error is not None:
+            return _candidate_result(
+                candidate,
+                outcome=(
+                    LearningCandidateOutcome.CONFLICT
+                    if activation_error == "activation_receipt_conflict"
+                    else LearningCandidateOutcome.FAILED
+                ),
+                code=activation_error,
+                decision=decision,
+            )
+        assert activation is not None
+        if activation.authority != activation_authority:
+            return _candidate_result(
+                candidate,
+                outcome=LearningCandidateOutcome.CONFLICT,
+                code="activation_receipt_conflict",
+                decision=decision,
+            )
+        if receipt.replayed:
+            outcome = _existing_candidate_outcome(publication_entry.status)
+        else:
+            outcome = (
+                LearningCandidateOutcome.ACTIVE_PERSISTED
+                if publication_entry.status is KnowledgeStatus.ACTIVE
+                else LearningCandidateOutcome.PENDING_PERSISTED
+            )
         return _candidate_result(
             candidate,
             outcome=outcome,
@@ -1727,18 +2000,32 @@ class KnowledgeCurator:
         entry: KnowledgeEntry,
         chunks: list[KnowledgeChunk],
         evidence: list[KnowledgeEvidence],
+        activation_authority: KnowledgeActivationAuthority,
     ) -> KnowledgePublicationReceipt:
+        publication_fingerprint = _sha256(
+            {
+                "proposal_fingerprint": proposal_fingerprint,
+                "activation_authority": activation_authority.model_dump(mode="json"),
+            },
+            "governed curator publication",
+        )
+        store_entry = copy_knowledge_entry(entry)
+        store_chunks = [copy_knowledge_chunk(chunk) for chunk in chunks]
+        store_evidence = [copy_knowledge_evidence(item) for item in evidence]
+        store_authority = copy_knowledge_activation_authority(activation_authority)
+        store_scope = copy_knowledge_access_scope(self._access_scope)
         try:
             publication = await self._publication_owner.run(
                 operation_id,
-                proposal_fingerprint,
+                publication_fingerprint,
                 lambda: self._store.publish_entry_revision(
-                    entry,
-                    chunks,
-                    evidence=evidence,
-                    access_scope=self._access_scope,
+                    store_entry,
+                    store_chunks,
+                    evidence=store_evidence,
+                    access_scope=store_scope,
                     operation_id=operation_id,
                     expected_revision=None,
+                    activation_authority=store_authority,
                 ),
             )
         except KnowledgePublicationCapacityExhausted:
@@ -1760,6 +2047,7 @@ class KnowledgeCurator:
         proposal_fingerprint: str,
         expectation: _PublicationExpectation,
         conflict: bool,
+        expected_activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> LearningCandidateResult:
         try:
             receipt = await self._store.load_entry_publication_receipt(
@@ -1805,16 +2093,26 @@ class KnowledgeCurator:
             expected_operation_id=operation_id,
             expected_entry_id=entry_id,
             proposal_fingerprint=proposal_fingerprint,
+            expected_activation_authority=expected_activation_authority,
         )
         if (
             not conflict
-            and reconciled.outcome is LearningCandidateOutcome.EXISTING_PENDING
+            and reconciled.outcome
+            in {
+                LearningCandidateOutcome.EXISTING_ACTIVE,
+                LearningCandidateOutcome.EXISTING_PENDING,
+            }
             and _publication_receipt_matches_expectation(receipt, expectation)
         ):
+            persisted_outcome = (
+                LearningCandidateOutcome.ACTIVE_PERSISTED
+                if reconciled.outcome is LearningCandidateOutcome.EXISTING_ACTIVE
+                else LearningCandidateOutcome.PENDING_PERSISTED
+            )
             return reconciled.model_copy(
                 update={
-                    "outcome": LearningCandidateOutcome.PENDING_PERSISTED,
-                    "code": "pending_persisted",
+                    "outcome": persisted_outcome,
+                    "code": persisted_outcome.value,
                     "decision": decision,
                     "warning_code": "publication_acknowledgement_lost",
                 }
@@ -1829,6 +2127,7 @@ class KnowledgeCurator:
         expected_operation_id: str,
         expected_entry_id: str,
         proposal_fingerprint: str,
+        expected_activation_authority: KnowledgeActivationAuthority | None = None,
     ) -> LearningCandidateResult:
         if not _publication_receipt_has_creation_identity(
             receipt,
@@ -1840,30 +2139,42 @@ class KnowledgeCurator:
                 outcome=LearningCandidateOutcome.CONFLICT,
                 code="publication_receipt_identity_conflict",
             )
-        try:
-            historical = await self._store.get_entry(
-                receipt.entry_id,
-                revision=receipt.entry_revision,
-                access_scope=self._access_scope,
-            )
-            current = await self._store.get_entry(
-                receipt.entry_id,
-                access_scope=self._access_scope,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        activation, activation_error = await self._load_bound_activation_receipt(receipt)
+        if activation_error is not None:
             return _candidate_result(
                 candidate,
-                outcome=LearningCandidateOutcome.FAILED,
-                code="published_entry_read_failed",
+                outcome=(
+                    LearningCandidateOutcome.CONFLICT
+                    if activation_error == "activation_receipt_conflict"
+                    else LearningCandidateOutcome.FAILED
+                ),
+                code=activation_error,
             )
-        if historical is None or current is None:
+        assert activation is not None
+        if (
+            expected_activation_authority is not None
+            and activation.authority != expected_activation_authority
+        ):
             return _candidate_result(
                 candidate,
-                outcome=LearningCandidateOutcome.FAILED,
-                code="published_entry_unavailable",
+                outcome=LearningCandidateOutcome.CONFLICT,
+                code="activation_receipt_conflict",
             )
+        historical, current, material_error = await self._load_bound_publication_material(
+            receipt,
+            activation,
+        )
+        if material_error is not None:
+            return _candidate_result(
+                candidate,
+                outcome=(
+                    LearningCandidateOutcome.CONFLICT
+                    if material_error == "published_material_conflict"
+                    else LearningCandidateOutcome.FAILED
+                ),
+                code=material_error,
+            )
+        assert historical is not None and current is not None
         audit = historical.metadata.get(_CURATOR_METADATA_KEY)
         if (
             type(audit) is not dict
@@ -1871,7 +2182,7 @@ class KnowledgeCurator:
             or historical.namespace != self._config.namespace
             or historical.labels != self._config.labels
             or historical.visibility is not self._config.visibility
-            or historical.status is not KnowledgeStatus.PENDING
+            or historical.status is not _activation_publication_status(activation)
         ):
             return _candidate_result(
                 candidate,
@@ -1922,6 +2233,73 @@ def _copy_publication_receipt(value: object) -> KnowledgePublicationReceipt:
     return KnowledgePublicationReceipt.model_validate(value.model_dump(mode="python"))
 
 
+def _curator_forbidden_activation_identities(
+    config: KnowledgeCuratorConfig,
+) -> tuple[str, ...]:
+    identities: list[str] = []
+    for identity in (
+        config.candidate_generator_identity,
+        config.evaluator_identity,
+        config.policy_identity,
+        config.created_by,
+    ):
+        if identity is not None and identity not in identities:
+            identities.append(identity)
+    return tuple(identities)
+
+
+def _activation_publication_status(
+    receipt: KnowledgeActivationReceipt,
+) -> KnowledgeStatus:
+    return (
+        KnowledgeStatus.ACTIVE
+        if receipt.authority.decision.disposition is KnowledgeActivationDisposition.ACTIVATE
+        else KnowledgeStatus.PENDING
+    )
+
+
+def _curator_activation_receipt_matches(
+    receipt: KnowledgeActivationReceipt,
+    *,
+    publication: KnowledgePublicationReceipt,
+    config: KnowledgeCuratorConfig,
+    access_scope: KnowledgeAccessScope,
+) -> bool:
+    request = receipt.authority.request
+    decision = receipt.authority.decision
+    if (
+        receipt.operation_id != publication.operation_id
+        or receipt.entry_id != publication.entry_id
+        or receipt.entry_revision != publication.entry_revision
+        or receipt.expected_revision != publication.expected_revision
+        or receipt.publication_request_sha256 != publication.request_sha256
+        or receipt.committed_at != publication.committed_at
+        or request.source is not KnowledgeActivationSource.CURATOR
+        or request.mode is not config.governance.mode
+        or request.expected_revision is not None
+        or request.target_revision != 1
+        or request.candidate_entry.id != publication.entry_id
+        or request.candidate_entry.revision != publication.entry_revision
+        or request.access_scope_sha256 != knowledge_access_scope_sha256(access_scope)
+        or request.evaluator_identity != config.evaluator_identity
+        or request.evaluator_decision_sha256 is None
+        or request.forbidden_authority_identities
+        != _curator_forbidden_activation_identities(config)
+        or decision.disposition is KnowledgeActivationDisposition.REJECT
+    ):
+        return False
+    if config.governance.mode is KnowledgeGovernanceMode.REVIEWED:
+        return (
+            decision.disposition is KnowledgeActivationDisposition.ROUTE_TO_REVIEW
+            and decision.policy_identity == REVIEWED_ROUTING_POLICY_IDENTITY
+            and decision.policy_version == REVIEWED_ROUTING_POLICY_VERSION
+        )
+    return (
+        decision.policy_identity == config.governance.policy_identity
+        and decision.policy_version == config.governance.policy_version
+    )
+
+
 def _publication_receipt_has_creation_identity(
     receipt: KnowledgePublicationReceipt,
     *,
@@ -1962,6 +2340,9 @@ def _build_pending_publication(
     proposal_fingerprint: str,
     processed_at: datetime,
 ):
+    # This audit object participates in the activation request fingerprint. Keep
+    # process-local time out of it so identical cross-process publications bind
+    # the same authority; the entry and durable receipts retain the real times.
     audit = {
         "schema_version": LEARNING_SCHEMA_VERSION,
         "batch_id": batch.id,
@@ -1986,7 +2367,6 @@ def _build_pending_publication(
         "policy_identity": config.policy_identity,
         "pipeline_version": config.pipeline_version,
         "configuration_fingerprint": config.fingerprint,
-        "processed_at": processed_at.isoformat(),
     }
     _bounded_json_object(audit, "curation audit metadata", max_bytes=MAX_LEARNING_METADATA_BYTES)
     sources = _candidate_sources(candidate, signals)
@@ -2238,8 +2618,11 @@ def _validate_curator_store(store: object) -> None:
     for method_name in (
         "bound_access_scope",
         "get_entry",
+        "read_chunks",
+        "read_evidence",
         "publish_entry_revision",
         "load_entry_publication_receipt",
+        "load_activation_receipt",
     ):
         if not callable(getattr(store, method_name, None)):
             raise TypeError("store must implement the knowledge curator store methods.")
@@ -2261,6 +2644,13 @@ def _validate_curator_access_scope(
         raise ValueError("Knowledge curator visibility is outside its access scope.")
     if KnowledgeStatus.PENDING not in access_scope.allowed_statuses:
         raise ValueError("Knowledge curator access scope must allow pending knowledge.")
+    if (
+        config.governance.mode is not KnowledgeGovernanceMode.REVIEWED
+        and KnowledgeStatus.ACTIVE not in access_scope.allowed_statuses
+    ):
+        raise ValueError(
+            "Automatic knowledge curator governance requires access to active knowledge."
+        )
 
 
 __all__ = [

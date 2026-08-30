@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -15,9 +15,15 @@ from cayu import (
     InMemoryKnowledgeStore,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
+    KnowledgeActivationDecision,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationRequest,
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
     KnowledgePublicationConflict,
@@ -54,6 +60,25 @@ from cayu.tools import knowledge as knowledge_module
 from cayu.vaults import ResolvedSecret
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+class _TestActivationPolicy:
+    def __init__(self, disposition: KnowledgeActivationDisposition) -> None:
+        self.disposition = disposition
+        self.calls = 0
+
+    async def decide_activation(
+        self,
+        request: KnowledgeActivationRequest,
+    ) -> KnowledgeActivationDecision:
+        self.calls += 1
+        return KnowledgeActivationDecision(
+            request_sha256=request.fingerprint,
+            disposition=self.disposition,
+            policy_identity="test.activation-policy",
+            policy_version="1",
+            code=f"test_{self.disposition.value}",
+        )
 
 
 class _TestKnowledgeStore(InMemoryKnowledgeStore):
@@ -109,12 +134,21 @@ class FailingEmbeddingProvider(TextEmbeddingProvider):
 
 
 class AcknowledgementLossKnowledgeStore(_TestKnowledgeStore):
-    async def publish_entry_revision(self, entry, chunks, *, operation_id, expected_revision=None):
+    async def publish_entry_revision(
+        self,
+        entry,
+        chunks,
+        *,
+        operation_id,
+        expected_revision=None,
+        activation_authority=None,
+    ):
         await super().publish_entry_revision(
             entry,
             chunks,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
         raise RuntimeError("secret canary acknowledgement failure")
 
@@ -124,7 +158,15 @@ class CompetingLegacyKnowledgeStore(_TestKnowledgeStore):
         super().__init__()
         self.legacy_put_calls = 0
 
-    async def publish_entry_revision(self, entry, chunks, *, operation_id, expected_revision=None):
+    async def publish_entry_revision(
+        self,
+        entry,
+        chunks,
+        *,
+        operation_id,
+        expected_revision=None,
+        activation_authority=None,
+    ):
         raise NotImplementedError
 
     async def load_entry_publication_receipt(self, operation_id):
@@ -490,23 +532,41 @@ def test_remember_knowledge_status_is_policy_owned() -> None:
 
     async def run_active():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
-        result = await RememberKnowledgeTool(
+        activation_policy = _TestActivationPolicy(KnowledgeActivationDisposition.ACTIVATE)
+        tool = RememberKnowledgeTool(
             policy=RememberKnowledgePolicy(
-                default_status=KnowledgeStatus.ACTIVE,
-                allow_active_writes=True,
+                governance=KnowledgeGovernanceConfig(
+                    mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                    policy_identity="test.activation-policy",
+                    policy_version="1",
+                ),
                 require_labels={"project": "cayu"},
-            )
-        ).run(
-            ToolContext(session_id="session_2", agent_name="assistant", knowledge_store=store),
+            ),
+            activation_policy=activation_policy,
+        )
+        context = ToolContext(
+            session_id="session_2",
+            agent_name="assistant",
+            idempotency_key="automatic-activation",
+            knowledge_store=store,
+        )
+        result = await tool.run(
+            context,
+            {"text": "Invoice refunds require audit logging.", "kind": "warning"},
+        )
+        replay = await tool.run(
+            context,
             {"text": "Invoice refunds require audit logging.", "kind": "warning"},
         )
         assert result.structured is not None
         entry = await store.get_entry(result.structured["entry"]["entry_id"])
         search = await store.search(KnowledgeQuery(text="invoice refunds audit"))
-        return result, entry, search
+        return result, replay, entry, search, activation_policy.calls
 
     default_result, default_entry = asyncio.run(run_default())
-    active_result, active_entry, active_search = asyncio.run(run_active())
+    active_result, active_replay, active_entry, active_search, policy_calls = asyncio.run(
+        run_active()
+    )
 
     assert default_result.structured["status"] == "pending"
     assert default_entry.status is KnowledgeStatus.PENDING
@@ -520,17 +580,57 @@ def test_remember_knowledge_status_is_policy_owned() -> None:
     assert active_entry.status is KnowledgeStatus.ACTIVE
     assert active_entry.labels == {"project": "cayu"}
     assert [hit.entry.id for hit in active_search.hits] == [active_entry.id]
+    assert active_replay.structured["publication_replayed"] is True
+    assert policy_calls == 1
+
+
+def test_remember_knowledge_replay_rejects_changed_governance() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        context = ToolContext(
+            session_id="session_1",
+            agent_name="assistant",
+            idempotency_key="governance-bound-replay",
+            knowledge_store=store,
+        )
+        arguments = {"text": "Activation governance is part of durable operation intent."}
+        first = await RememberKnowledgeTool().run(context, arguments)
+        activation_policy = _TestActivationPolicy(KnowledgeActivationDisposition.ACTIVATE)
+        changed = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(
+                governance=KnowledgeGovernanceConfig(
+                    mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                    policy_identity="test.activation-policy",
+                    policy_version="1",
+                )
+            ),
+            activation_policy=activation_policy,
+        ).run(context, arguments)
+        return first, changed, activation_policy.calls
+
+    first, changed, policy_calls = asyncio.run(run())
+
+    assert first.is_error is False
+    assert first.structured["status"] == "pending"
+    assert changed.is_error is True
+    assert changed.structured["outcome"] == "receipt_conflict"
+    assert policy_calls == 0
 
 
 def test_remember_knowledge_accepts_policy_dict() -> None:
     async def run():
         store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        activation_policy = _TestActivationPolicy(KnowledgeActivationDisposition.ACTIVATE)
         result = await RememberKnowledgeTool(
             policy={
-                "default_status": "active",
-                "allow_active_writes": True,
+                "governance": {
+                    "mode": "policy_automatic",
+                    "policy_identity": "test.activation-policy",
+                    "policy_version": "1",
+                },
                 "default_namespace": "project:cayu",
-            }
+            },
+            activation_policy=activation_policy,
         ).run(
             ToolContext(session_id="session_1", knowledge_store=store),
             {"text": "Use the brokered Git HTTP proxy for sandbox pushes."},
@@ -715,6 +815,7 @@ def test_remember_knowledge_next_owner_reconciles_commit_cut_off_by_shutdown() -
             *,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             receipt = await super().publish_entry_revision(
@@ -722,6 +823,7 @@ def test_remember_knowledge_next_owner_reconciles_commit_cut_off_by_shutdown() -
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             self.committed.set()
             try:
@@ -776,12 +878,14 @@ def test_remember_knowledge_close_caller_cancellation_preserves_complete_drain()
             *,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             receipt = await super().publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             self.publication_returned = True
             return receipt
@@ -918,7 +1022,13 @@ def test_remember_knowledge_rejects_invalid_operation_id_before_store_dispatch()
             return await super().load_entry_publication_receipt(operation_id)
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publications += 1
             return await super().publish_entry_revision(
@@ -926,6 +1036,7 @@ def test_remember_knowledge_rejects_invalid_operation_id_before_store_dispatch()
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -995,7 +1106,13 @@ def test_remember_knowledge_entry_read_preserves_real_caller_cancellation() -> N
                 self.read_finished.set()
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             return await super().publish_entry_revision(
@@ -1003,6 +1120,7 @@ def test_remember_knowledge_entry_read_preserves_real_caller_cancellation() -> N
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run() -> None:
@@ -1111,7 +1229,13 @@ def test_remember_knowledge_cancellation_retains_opaque_dispatch_and_preserves_r
             return await super().load_entry_publication_receipt(operation_id)
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             if commit_before_release:
@@ -1120,6 +1244,7 @@ def test_remember_knowledge_cancellation_retains_opaque_dispatch_and_preserves_r
                     chunks,
                     operation_id=operation_id,
                     expected_revision=expected_revision,
+                    activation_authority=activation_authority,
                 )
             await asyncio.to_thread(self._blocking_dispatch)
             if commit_before_release:
@@ -1129,6 +1254,7 @@ def test_remember_knowledge_cancellation_retains_opaque_dispatch_and_preserves_r
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
         def _blocking_dispatch(self) -> None:
@@ -1192,7 +1318,13 @@ def test_remember_knowledge_workspace_identity_is_consistent_across_commit() -> 
             self.publish_calls = 0
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             self.publish_started.set()
@@ -1202,6 +1334,7 @@ def test_remember_knowledge_workspace_identity_is_consistent_across_commit() -> 
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1251,7 +1384,13 @@ def test_remember_knowledge_capacity_allows_receipt_reconciliation_but_blocks_ne
             self.published_operations: list[str] = []
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.published_operations.append(operation_id)
             if operation_id == "capacity-active-operation":
@@ -1262,6 +1401,7 @@ def test_remember_knowledge_capacity_allows_receipt_reconciliation_but_blocks_ne
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1323,7 +1463,13 @@ def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -
             self.reconciliation_completed = asyncio.Event()
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_started.set()
             await self.release_publish.wait()
@@ -1332,6 +1478,7 @@ def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
         async def load_entry_publication_receipt(self, operation_id):
@@ -1387,13 +1534,20 @@ def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -
 def test_remember_knowledge_reconciles_grouped_store_failure() -> None:
     class GroupedFailureStore(_TestKnowledgeStore):
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             await super().publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             raise BaseExceptionGroup(
                 "extension failures",
@@ -1433,13 +1587,20 @@ def test_remember_knowledge_keeps_caller_cancellation_authoritative_over_grouped
             self.release_failure = asyncio.Event()
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             await super().publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             self.committed.set()
             await self.release_failure.wait()
@@ -1483,7 +1644,13 @@ def test_remember_knowledge_bounds_grouped_receipt_lookup_failure() -> None:
             self.publish_calls = 0
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             return await super().publish_entry_revision(
@@ -1491,6 +1658,7 @@ def test_remember_knowledge_bounds_grouped_receipt_lookup_failure() -> None:
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
         async def load_entry_publication_receipt(self, operation_id):
@@ -1539,7 +1707,13 @@ def test_remember_knowledge_does_not_report_unverified_replay_as_receipt_conflic
             self.publish_calls = 0
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             return await super().publish_entry_revision(
@@ -1547,6 +1721,7 @@ def test_remember_knowledge_does_not_report_unverified_replay_as_receipt_conflic
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
         async def load_entry_publication_receipt(self, operation_id):
@@ -1628,7 +1803,13 @@ def test_remember_knowledge_concurrent_exact_operation_reconciles_one_receipt() 
             self.ready = asyncio.Event()
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.arrivals += 1
             if self.arrivals == 2:
@@ -1639,6 +1820,7 @@ def test_remember_knowledge_concurrent_exact_operation_reconciles_one_receipt() 
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1685,7 +1867,13 @@ def test_remember_knowledge_concurrent_exact_operation_converges_after_id_collis
             return await super().get_entry(entry_id)
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.arrivals += 1
             if self.arrivals == 2:
@@ -1696,6 +1884,7 @@ def test_remember_knowledge_concurrent_exact_operation_converges_after_id_collis
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1742,7 +1931,7 @@ def test_remember_knowledge_concurrent_exact_operation_converges_after_id_collis
 
 
 @pytest.mark.parametrize("later_state", ["archived", "deleted", "replaced"])
-def test_remember_knowledge_exact_retry_reports_only_historical_commit(
+def test_remember_knowledge_exact_retry_requires_retained_activation_attribution(
     later_state: str,
 ) -> None:
     async def run():
@@ -1780,25 +1969,28 @@ def test_remember_knowledge_exact_retry_reports_only_historical_commit(
     first, replay, current = asyncio.run(run())
 
     assert first.is_error is False
-    assert replay.is_error is False
-    assert replay.content.endswith("Its current lifecycle state was not checked.")
-    assert replay.structured["entry"] == {
-        "entry_id": first.structured["entry"]["entry_id"],
-        "revision": 1,
-    }
-    assert replay.structured["written"] is False
-    assert replay.structured["already_known"] is None
-    assert replay.structured["publication_replayed"] is True
-    assert replay.structured["status"] is None
     if later_state == "archived":
+        assert replay.is_error is False
+        assert replay.content.endswith("Its current lifecycle state was not checked.")
+        assert replay.structured["entry"] == {
+            "entry_id": first.structured["entry"]["entry_id"],
+            "revision": 1,
+        }
+        assert replay.structured["written"] is False
+        assert replay.structured["already_known"] is None
+        assert replay.structured["publication_replayed"] is True
+        assert replay.structured["status"] is None
         assert current is not None
         assert current.status is KnowledgeStatus.ARCHIVED
-    elif later_state == "deleted":
-        assert current is None
     else:
-        assert current is not None
-        assert current.status is KnowledgeStatus.ACTIVE
-        assert current.text == "A different publication now occupies this entry identity."
+        assert replay.is_error is True
+        assert replay.structured["outcome"] == "activation_receipt_missing"
+        if later_state == "deleted":
+            assert current is None
+        else:
+            assert current is not None
+            assert current.status is KnowledgeStatus.ACTIVE
+            assert current.text == "A different publication now occupies this entry identity."
 
 
 def test_remember_knowledge_validates_chunk_configuration() -> None:
@@ -2097,7 +2289,7 @@ def test_search_knowledge_runtime_requires_a_positive_search_field() -> None:
     result = asyncio.run(run())
 
     assert result.is_error is True
-    assert "requires `text`, `any_terms`, `all_terms`, or `phrases`" in result.content
+    assert "requires positive search terms" in result.content
 
 
 def test_search_knowledge_caps_model_facing_preview_per_hit() -> None:
@@ -3157,8 +3349,8 @@ def test_knowledge_tools_name_missing_store_methods() -> None:
     with pytest.raises(
         TypeError,
         match=(
-            r"remember_knowledge: get_entry, publish_entry_revision, "
-            r"load_entry_publication_receipt"
+            r"remember_knowledge: get_entry, load_activation_receipt, "
+            r"publish_entry_revision, load_entry_publication_receipt"
         ),
     ):
         asyncio.run(RememberKnowledgeTool().run(ctx, {"text": "fact"}))
@@ -3483,6 +3675,7 @@ def test_remember_knowledge_preserves_ambiguity_when_receipt_reconciliation_fail
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.committed_receipt = await super().publish_entry_revision(
                 entry,
@@ -3490,6 +3683,7 @@ def test_remember_knowledge_preserves_ambiguity_when_receipt_reconciliation_fail
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             reason = (
                 "operation_mismatch"
@@ -3563,6 +3757,7 @@ def test_remember_knowledge_requires_receipt_evidence_to_reject_success_acknowle
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             self.committed_receipt = await super().publish_entry_revision(
@@ -3571,6 +3766,7 @@ def test_remember_knowledge_requires_receipt_evidence_to_reject_success_acknowle
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             return self.committed_receipt
 
@@ -3601,13 +3797,20 @@ def test_remember_knowledge_requires_receipt_evidence_to_reject_success_acknowle
 def test_remember_knowledge_reports_only_proven_receipt_incompatibility_as_conflict() -> None:
     class IncompatibleReceiptStore(_TestKnowledgeStore):
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             receipt = await super().publish_entry_revision(
                 entry,
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             self._publication_receipts[operation_id] = receipt.model_copy(
                 update={"request_sha256": "0" * 64}
@@ -3638,7 +3841,13 @@ def test_remember_knowledge_reports_only_proven_receipt_incompatibility_as_confl
 def test_remember_knowledge_rejects_incompatible_concurrent_winner() -> None:
     class ConcurrentScopedWinnerStore(_TestKnowledgeStore):
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             winner = KnowledgeEntry.model_validate(
                 entry.model_copy(update={"labels": {"tenant": "other"}}).model_dump()
@@ -3674,7 +3883,13 @@ def test_remember_knowledge_uses_one_policy_snapshot_across_publication() -> Non
             self.release_publish = asyncio.Event()
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_started.set()
             await self.release_publish.wait()
@@ -3720,31 +3935,55 @@ def test_remember_knowledge_revalidates_forged_policy_before_use() -> None:
         RememberKnowledgeTool(policy=forged)
 
 
+def test_remember_knowledge_rejects_oversized_default_author_identity() -> None:
+    with pytest.raises(ValueError, match="default_created_by.*at most"):
+        RememberKnowledgePolicy(default_created_by="a" * 257)
+
+
 def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> None:
     class PublicCanonicalizerStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self._custom_publication_lock = asyncio.Lock()
             self._custom_receipts: dict[str, KnowledgePublicationReceipt] = {}
+            self._custom_activation_receipts: dict[str, KnowledgeActivationReceipt] = {}
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             operation_id, entry, chunks, _, request_sha256 = prepare_knowledge_publication(
                 entry,
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             async with self._custom_publication_lock:
                 receipt = self._custom_receipts.get(operation_id)
                 if receipt is not None:
                     if receipt.entry_id != entry.id or receipt.request_sha256 != request_sha256:
                         raise KnowledgePublicationConflict("operation_mismatch")
+                    activation = self._custom_activation_receipts.get(operation_id)
+                    if activation_authority is None:
+                        if activation is not None:
+                            raise KnowledgePublicationConflict("activation_mismatch")
+                    elif (
+                        activation is None
+                        or activation.authority != activation_authority
+                        or activation.publication_request_sha256 != request_sha256
+                    ):
+                        raise KnowledgePublicationConflict("activation_mismatch")
                     return receipt.model_copy(update={"replayed": True})
                 if await self.get_entry(entry.id) is not None:
                     raise KnowledgePublicationConflict("entry_occupied")
                 await super().create_entry(entry, chunks)
+                committed_at = datetime.now(UTC)
                 receipt = KnowledgePublicationReceipt(
                     operation_id=operation_id,
                     entry_id=entry.id,
@@ -3753,14 +3992,28 @@ def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> No
                     request_sha256=request_sha256,
                     entry_created_at=entry.created_at,
                     entry_updated_at=entry.updated_at,
-                    committed_at=datetime.now(UTC),
+                    committed_at=committed_at,
                 )
                 self._custom_receipts[operation_id] = receipt
+                if activation_authority is not None:
+                    self._custom_activation_receipts[operation_id] = KnowledgeActivationReceipt(
+                        operation_id=operation_id,
+                        entry_id=entry.id,
+                        entry_revision=entry.revision,
+                        expected_revision=expected_revision,
+                        publication_request_sha256=request_sha256,
+                        authority=activation_authority,
+                        committed_at=committed_at,
+                    )
                 return receipt
 
         async def load_entry_publication_receipt(self, operation_id):
             async with self._custom_publication_lock:
                 return self._custom_receipts.get(operation_id)
+
+        async def load_activation_receipt(self, operation_id):
+            async with self._custom_publication_lock:
+                return self._custom_activation_receipts.get(operation_id)
 
     async def run():
         store = PublicCanonicalizerStore()
@@ -3793,14 +4046,21 @@ def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> No
     assert replay.structured["status"] is None
 
 
-def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() -> None:
+def test_remember_knowledge_fails_closed_on_custom_store_input_mutation() -> None:
     class MutatingCanonicalizerStore(_TestKnowledgeStore):
         def __init__(self) -> None:
             super().__init__()
             self._custom_receipts: dict[str, KnowledgePublicationReceipt] = {}
+            self._custom_activation_receipts: dict[str, KnowledgeActivationReceipt] = {}
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             entry.labels.clear()
             entry.labels["tenant"] = "other"
@@ -3811,8 +4071,10 @@ def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() 
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             await super().create_entry(entry, chunks)
+            committed_at = datetime.now(UTC)
             receipt = KnowledgePublicationReceipt(
                 operation_id=operation_id,
                 entry_id=entry.id,
@@ -3821,13 +4083,26 @@ def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() 
                 request_sha256=request_sha256,
                 entry_created_at=entry.created_at,
                 entry_updated_at=entry.updated_at,
-                committed_at=datetime.now(UTC),
+                committed_at=committed_at,
             )
             self._custom_receipts[operation_id] = receipt
+            if activation_authority is not None:
+                self._custom_activation_receipts[operation_id] = KnowledgeActivationReceipt(
+                    operation_id=operation_id,
+                    entry_id=entry.id,
+                    entry_revision=entry.revision,
+                    expected_revision=expected_revision,
+                    publication_request_sha256=request_sha256,
+                    authority=activation_authority,
+                    committed_at=committed_at,
+                )
             return receipt
 
         async def load_entry_publication_receipt(self, operation_id):
             return self._custom_receipts.get(operation_id)
+
+        async def load_activation_receipt(self, operation_id):
+            return self._custom_activation_receipts.get(operation_id)
 
     async def run():
         store = MutatingCanonicalizerStore()
@@ -3849,12 +4124,94 @@ def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() 
     result, stored_entry, stored_chunks = asyncio.run(run())
 
     assert result.is_error is True
-    assert result.structured["outcome"] == "invalid_publication_result"
+    assert result.structured["outcome"] == "ambiguous_publication"
     assert result.structured["cleanup"] == "not_attempted_unowned"
-    assert stored_entry is not None
-    assert stored_entry.labels == {"tenant": "other"}
-    assert stored_entry.metadata["mutated_by_store"] is True
-    assert stored_chunks[0].metadata["mutated_by_store"] is True
+    assert stored_entry is None
+    assert stored_chunks == []
+
+
+def test_remember_knowledge_rejects_store_mutation_of_activation_authority() -> None:
+    class MutatingAuthorityStore(_TestKnowledgeStore):
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
+        ):
+            activation_authority.decision.annotations["store"] = "rewritten"
+            return await super().publish_entry_revision(
+                entry,
+                chunks,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+                activation_authority=activation_authority,
+            )
+
+    async def run():
+        store = MutatingAuthorityStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="mutated-activation-authority",
+                knowledge_store=store,
+            ),
+            {"text": "Activation attribution remains application-owned."},
+        )
+        receipt = await store.load_activation_receipt("mutated-activation-authority")
+        return result, receipt
+
+    result, receipt = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "invalid_publication_result"
+    assert receipt is not None
+    assert receipt.authority.decision.annotations == {"store": "rewritten"}
+
+
+def test_remember_knowledge_rejects_mismatched_receipt_commit_boundary() -> None:
+    class MismatchedCommitBoundaryStore(_TestKnowledgeStore):
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
+        ):
+            receipt = await super().publish_entry_revision(
+                entry,
+                chunks,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+                activation_authority=activation_authority,
+            )
+            activation = self._activation_receipts[operation_id]
+            self._activation_receipts[operation_id] = activation.model_copy(
+                update={"committed_at": activation.committed_at + timedelta(seconds=1)}
+            )
+            return receipt
+
+    async def run():
+        store = MismatchedCommitBoundaryStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="mismatched-receipt-commit-boundary",
+                knowledge_store=store,
+            ),
+            {"text": "Publication and activation receipts share one commit boundary."},
+        )
+        return result, await store.load_activation_receipt("mismatched-receipt-commit-boundary")
+
+    result, activation = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "invalid_publication_result"
+    assert activation is not None
 
 
 def test_remember_knowledge_does_not_dedupe_archived_entry() -> None:
@@ -3939,6 +4296,7 @@ def test_concurrent_remember_reactivation_converges_on_one_successor_revision() 
             operation_id,
             expected_revision=None,
             access_scope=None,
+            activation_authority=None,
         ):
             if expected_revision is not None:
                 self._append_arrivals += 1
@@ -3951,6 +4309,7 @@ def test_concurrent_remember_reactivation_converges_on_one_successor_revision() 
                 operation_id=operation_id,
                 expected_revision=expected_revision,
                 access_scope=access_scope,
+                activation_authority=activation_authority,
             )
 
     async def run():

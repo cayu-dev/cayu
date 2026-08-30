@@ -22,11 +22,19 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
     require_finite,
     require_nonblank,
     require_unicode_scalar_text,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.knowledge_governance import (
+    REVIEWED_ROUTING_POLICY_IDENTITY,
+    REVIEWED_ROUTING_POLICY_VERSION,
+    KnowledgeActivationPolicy,
+    KnowledgeActivationPolicyError,
+    decide_knowledge_activation,
+)
 from cayu.storage.knowledge_indexer import (
     DEFAULT_KNOWLEDGE_CHUNK_OVERLAP_BYTES,
     KnowledgeIndexer,
@@ -39,14 +47,21 @@ from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
     MAX_KNOWLEDGE_REVISION,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
+    KnowledgeActivationAuthority,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationReceipt,
+    KnowledgeActivationSource,
     KnowledgeActorType,
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
     KnowledgeFacet,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
     KnowledgeHit,
     KnowledgeListGroup,
     KnowledgeListItem,
@@ -62,8 +77,13 @@ from cayu.storage.memory import (
     _knowledge_publication_operation_id,
     _next_knowledge_revision,
     copy_knowledge_access_scope,
+    copy_knowledge_activation_authority,
+    copy_knowledge_activation_receipt,
+    copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_publication_receipt,
+    knowledge_access_scope_sha256,
+    prepare_knowledge_activation_request,
     prepare_knowledge_publication,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
@@ -115,6 +135,7 @@ _LIST_KNOWLEDGE_STORE_METHODS = ("list_entries",)
 _READ_KNOWLEDGE_STORE_METHODS = ("read_chunks",)
 _REMEMBER_KNOWLEDGE_STORE_METHODS = (
     "get_entry",
+    "load_activation_receipt",
     "publish_entry_revision",
     "load_entry_publication_receipt",
 )
@@ -190,8 +211,7 @@ class RememberKnowledgePolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    default_status: KnowledgeStatus = KnowledgeStatus.PENDING
-    allow_active_writes: bool = False
+    governance: KnowledgeGovernanceConfig = Field(default_factory=KnowledgeGovernanceConfig)
     default_namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
     default_visibility: KnowledgeVisibility = KnowledgeVisibility.GLOBAL
     allowed_kinds: tuple[str, ...] | None = None
@@ -199,10 +219,23 @@ class RememberKnowledgePolicy(BaseModel):
     default_created_by: str = "model"
     require_labels: dict[str, str] = Field(default_factory=dict)
 
-    @field_validator("default_namespace", "default_kind", "default_created_by")
+    @field_validator("default_namespace", "default_kind")
     @classmethod
     def validate_clean_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("default_created_by", mode="before")
+    @classmethod
+    def validate_default_created_by(cls, value: object) -> str:
+        if type(value) is not str:
+            raise ValueError("`default_created_by` must be a string.")
+        value = require_durable_clean_nonblank(value, "default_created_by")
+        if len(value.encode("utf-8")) > MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES:
+            raise ValueError(
+                "`default_created_by` must be at most "
+                f"{MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES} UTF-8 bytes."
+            )
+        return value
 
     @field_validator("allowed_kinds", mode="before")
     @classmethod
@@ -229,12 +262,17 @@ class RememberKnowledgePolicy(BaseModel):
     def copy_required_labels(cls, value) -> dict[str, str]:
         return copy_label_map(value, "require_labels")
 
+    @field_validator("governance", mode="before")
+    @classmethod
+    def copy_governance(cls, value: object) -> object:
+        if type(value) is KnowledgeGovernanceConfig:
+            return value.model_copy(deep=True)
+        return value
+
     @model_validator(mode="after")
     def validate_status_policy(self) -> RememberKnowledgePolicy:
-        if self.default_status is KnowledgeStatus.ACTIVE and not self.allow_active_writes:
-            raise ValueError("default_status='active' requires allow_active_writes=True.")
-        if self.default_status not in {KnowledgeStatus.PENDING, KnowledgeStatus.ACTIVE}:
-            raise ValueError("default_status must be pending or active.")
+        if self.governance.policy_identity == self.default_created_by:
+            raise ValueError("Model attribution cannot also be activation policy authority.")
         if self.allowed_kinds is not None and self.default_kind not in self.allowed_kinds:
             raise ValueError("default_kind must be included in allowed_kinds.")
         return self
@@ -247,8 +285,7 @@ def _copy_remember_knowledge_policy(
 
     if type(policy) is RememberKnowledgePolicy:
         return RememberKnowledgePolicy(
-            default_status=policy.default_status,
-            allow_active_writes=policy.allow_active_writes,
+            governance=policy.governance,
             default_namespace=policy.default_namespace,
             default_visibility=policy.default_visibility,
             allowed_kinds=policy.allowed_kinds,
@@ -573,7 +610,7 @@ class RememberKnowledgeTool(Tool):
             "for stable facts, preferences, procedures, warnings, decisions, or lessons "
             "that should be reusable beyond the current turn. Model-authored knowledge "
             "is policy-controlled and defaults to pending review unless the application "
-            "explicitly allows active writes. This tool creates logical entries and never "
+            "supplies explicit activation authority. This tool creates logical entries and never "
             "mutates a stored revision; it cannot edit, archive, or delete one. If identical "
             "archived, deleted, or expired knowledge already owns the logical id, it appends "
             "a reviewed successor revision. "
@@ -643,6 +680,7 @@ class RememberKnowledgeTool(Tool):
         spec: ToolSpec | None = None,
         *,
         policy: RememberKnowledgePolicy | dict[str, Any] | None = None,
+        activation_policy: KnowledgeActivationPolicy | None = None,
         max_text_bytes: int = DEFAULT_REMEMBER_KNOWLEDGE_MAX_BYTES,
         chunk_target_bytes: int = DEFAULT_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES,
         max_chunks: int = DEFAULT_REMEMBER_KNOWLEDGE_MAX_CHUNKS,
@@ -651,6 +689,15 @@ class RememberKnowledgeTool(Tool):
         self._policy = (
             RememberKnowledgePolicy() if policy is None else _copy_remember_knowledge_policy(policy)
         )
+        decide_activation = getattr(activation_policy, "decide_activation", None)
+        if activation_policy is not None and not callable(decide_activation):
+            raise TypeError("activation_policy must implement `decide_activation`.")
+        if self._policy.governance.mode is KnowledgeGovernanceMode.REVIEWED:
+            if activation_policy is not None:
+                raise ValueError("Reviewed governance cannot configure an activation policy.")
+        elif activation_policy is None:
+            raise ValueError("Automatic and autonomous governance require activation_policy.")
+        self._activation_policy = activation_policy
         if self._policy.allowed_kinds is not None:
             schema = copy_json_value(self.spec.input_schema, "input_schema")
             schema["properties"]["kind"] = {
@@ -737,7 +784,7 @@ class RememberKnowledgeTool(Tool):
                 labels=policy.require_labels,
                 kind=kind,
                 visibility=policy.default_visibility,
-                status=policy.default_status,
+                governance=policy.governance,
                 created_by=ctx.agent_name or policy.default_created_by,
                 session_id=ctx.session_id,
                 aspects=aspects,
@@ -841,7 +888,7 @@ class RememberKnowledgeTool(Tool):
                 labels=policy.require_labels,
                 kind=kind,
                 visibility=policy.default_visibility,
-                status=policy.default_status,
+                status=KnowledgeStatus.PENDING,
                 created_by_type=KnowledgeActorType.MODEL,
                 created_by=ctx.agent_name or policy.default_created_by,
                 source_type="tool",
@@ -862,11 +909,52 @@ class RememberKnowledgeTool(Tool):
                 raise ValueError("`text` exceeds the configured remember_knowledge chunk capacity.")
         if prior_receipt is not None:
             result = _remember_result_with_receipt_identity(result, prior_receipt)
+            try:
+                activation_receipt = await _remember_load_activation_receipt(
+                    store,
+                    operation_id,
+                    operation_registry=self._read_operations,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return _knowledge_write_failed_result(
+                    entry_id=None,
+                    outcome="activation_receipt_read_failed",
+                )
+            if activation_receipt is None:
+                return _knowledge_write_failed_result(
+                    entry_id=None,
+                    outcome="activation_receipt_missing",
+                )
+            activation_authority = activation_receipt.authority
+            if not _remember_activation_matches_governance(
+                activation_authority,
+                governance=policy.governance,
+                model_identity=ctx.agent_name or policy.default_created_by,
+                access_scope=store.bound_access_scope(),
+            ):
+                return _knowledge_write_failed_result(
+                    entry_id=None,
+                    outcome="receipt_conflict",
+                )
+            status = (
+                KnowledgeStatus.ACTIVE
+                if activation_authority.decision.disposition
+                is KnowledgeActivationDisposition.ACTIVATE
+                else KnowledgeStatus.PENDING
+            )
+            result = copy_knowledge_index_result(
+                result.model_copy(
+                    update={"entry": result.entry.model_copy(update={"status": status})}
+                )
+            )
             observation = await _remember_observe_owned_publication(
                 store,
                 result=result,
                 operation_id=operation_id,
                 receipt=prior_receipt,
+                activation_authority=activation_authority,
                 operation_registry=self._read_operations,
             )
             if observation.confirmed:
@@ -893,6 +981,10 @@ class RememberKnowledgeTool(Tool):
             kind=kind,
             visibility=policy.default_visibility,
             required_labels=policy.require_labels,
+            governance=policy.governance,
+            activation_policy=self._activation_policy,
+            access_scope=store.bound_access_scope(),
+            model_identity=ctx.agent_name or policy.default_created_by,
             intent_sha256=intent_sha256,
         )
 
@@ -907,6 +999,10 @@ class RememberKnowledgeTool(Tool):
         kind: str,
         visibility: KnowledgeVisibility,
         required_labels: dict[str, str],
+        governance: KnowledgeGovernanceConfig,
+        activation_policy: KnowledgeActivationPolicy | None,
+        access_scope: KnowledgeAccessScope,
+        model_identity: str,
         intent_sha256: str,
     ) -> ToolResult:
         try:
@@ -922,6 +1018,10 @@ class RememberKnowledgeTool(Tool):
                     kind=kind,
                     visibility=visibility,
                     required_labels=required_labels,
+                    governance=governance,
+                    activation_policy=activation_policy,
+                    access_scope=access_scope,
+                    model_identity=model_identity,
                     operation_registry=self._read_operations,
                 ),
             )
@@ -974,7 +1074,7 @@ def _remember_request_intent_sha256(
     labels: dict[str, str],
     kind: str,
     visibility: KnowledgeVisibility,
-    status: KnowledgeStatus,
+    governance: KnowledgeGovernanceConfig,
     created_by: str,
     session_id: str,
     aspects: list[str],
@@ -992,7 +1092,7 @@ def _remember_request_intent_sha256(
         "labels": labels,
         "kind": kind,
         "visibility": visibility.value,
-        "status": status.value,
+        "governance": governance.model_dump(mode="json"),
         "created_by_type": KnowledgeActorType.MODEL.value,
         "created_by": created_by,
         "source_type": "tool",
@@ -1049,6 +1149,36 @@ async def _remember_load_publication_receipt(
     return outcome.result
 
 
+async def _remember_load_activation_receipt(
+    store: Any,
+    operation_id: str,
+    *,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> KnowledgeActivationReceipt | None:
+    async def operation_factory(
+        store: Any = store,
+        operation_id: str = operation_id,
+    ) -> KnowledgeActivationReceipt | None:
+        receipt = await store.load_activation_receipt(operation_id)
+        return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    pending = await_invocation_operation(
+        operation_factory,
+        request_child_cancellation=False,
+        abandon_on_caller_cancellation=True,
+        operation_registry=operation_registry,
+    )
+    outcome = await pending
+    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+    if uncontainable_failure is not None:
+        raise uncontainable_failure
+    if outcome.cancellation is not None:
+        raise outcome.cancellation from None
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.result
+
+
 async def _remember_load_entry(
     store: Any,
     entry_id: str,
@@ -1094,6 +1224,8 @@ def _remember_store_supports_owned_publication(store: Any) -> bool:
         is not KnowledgeStore.publish_entry_revision
         and getattr(store_type, "load_entry_publication_receipt", None)
         is not KnowledgeStore.load_entry_publication_receipt
+        and getattr(store_type, "load_activation_receipt", None)
+        is not KnowledgeStore.load_activation_receipt
     )
 
 
@@ -1152,6 +1284,10 @@ async def _remember_publish_owned(
     kind: str,
     visibility: KnowledgeVisibility,
     required_labels: dict[str, str],
+    governance: KnowledgeGovernanceConfig,
+    activation_policy: KnowledgeActivationPolicy | None,
+    access_scope: KnowledgeAccessScope,
+    model_identity: str,
     operation_registry: BoundedInvocationOperationRegistry,
 ) -> ToolResult:
     # Keep reconciliation authority detached from mutable objects handed to an
@@ -1159,18 +1295,61 @@ async def _remember_publish_owned(
     # so in-place adapter normalization cannot redefine the operation Cayu later
     # authenticates from the receipt.
     result = copy_knowledge_index_result(result)
+    try:
+        activation_request = prepare_knowledge_activation_request(
+            result.entry,
+            result.chunks,
+            access_scope=access_scope,
+            operation_id=operation_id,
+            governance_mode=governance.mode,
+            source=KnowledgeActivationSource.MODEL_TOOL,
+            expected_revision=_remember_expected_revision(result.entry),
+            forbidden_authority_identities=(model_identity,),
+        )
+        activation_authority = await decide_knowledge_activation(
+            activation_request,
+            config=governance,
+            policy=activation_policy,
+        )
+    except asyncio.CancelledError:
+        raise
+    except KnowledgeActivationPolicyError as exc:
+        return _knowledge_write_failed_result(entry_id=None, outcome=exc.code)
+    except (TypeError, ValueError):
+        return _knowledge_write_failed_result(
+            entry_id=None,
+            outcome="activation_request_invalid",
+        )
+    if activation_authority.decision.disposition is KnowledgeActivationDisposition.REJECT:
+        return _remember_knowledge_rejected_result(
+            result,
+            code=activation_authority.decision.code,
+        )
+    status = (
+        KnowledgeStatus.ACTIVE
+        if activation_authority.decision.disposition is KnowledgeActivationDisposition.ACTIVATE
+        else KnowledgeStatus.PENDING
+    )
+    result = copy_knowledge_index_result(
+        result.model_copy(update={"entry": result.entry.model_copy(update={"status": status})})
+    )
     _, publication_entry, publication_chunks, _, _ = prepare_knowledge_publication(
         result.entry,
         result.chunks,
         operation_id=operation_id,
         expected_revision=_remember_expected_revision(result.entry),
+        activation_authority=activation_authority,
     )
+    store_entry = copy_knowledge_entry(publication_entry)
+    store_chunks = [copy_knowledge_chunk(chunk) for chunk in publication_chunks]
+    store_activation_authority = copy_knowledge_activation_authority(activation_authority)
 
     async def operation_factory(
         store: Any = store,
-        entry: KnowledgeEntry = publication_entry,
-        chunks: list[KnowledgeChunk] = publication_chunks,
+        entry: KnowledgeEntry = store_entry,
+        chunks: list[KnowledgeChunk] = store_chunks,
         operation_id: str = operation_id,
+        activation_authority: KnowledgeActivationAuthority = store_activation_authority,
     ) -> KnowledgePublicationReceipt:
         return copy_knowledge_publication_receipt(
             await store.publish_entry_revision(
@@ -1178,6 +1357,7 @@ async def _remember_publish_owned(
                 chunks,
                 operation_id=operation_id,
                 expected_revision=_remember_expected_revision(entry),
+                activation_authority=activation_authority,
             )
         )
 
@@ -1228,6 +1408,7 @@ async def _remember_publish_owned(
             result=result,
             operation_id=operation_id,
             receipt=returned_receipt,
+            activation_authority=activation_authority,
             operation_registry=operation_registry,
         )
         confirmed = observation.confirmed
@@ -1254,11 +1435,45 @@ async def _remember_publish_owned(
                     result,
                     durable_receipt,
                 )
+                reconciled_authority = activation_authority
+                try:
+                    durable_activation = await _remember_load_activation_receipt(
+                        store,
+                        operation_id,
+                        operation_registry=operation_registry,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    durable_activation = None
+                if durable_activation is not None:
+                    durable_authority = durable_activation.authority
+                    if _remember_activation_authorities_equivalent(
+                        activation_authority,
+                        durable_authority,
+                    ):
+                        reconciled_authority = durable_authority
+                        durable_status = (
+                            KnowledgeStatus.ACTIVE
+                            if durable_authority.decision.disposition
+                            is KnowledgeActivationDisposition.ACTIVATE
+                            else KnowledgeStatus.PENDING
+                        )
+                        reconciled_result = copy_knowledge_index_result(
+                            reconciled_result.model_copy(
+                                update={
+                                    "entry": reconciled_result.entry.model_copy(
+                                        update={"status": durable_status}
+                                    )
+                                }
+                            )
+                        )
                 observation = await _remember_observe_owned_publication(
                     store,
                     result=reconciled_result,
                     operation_id=operation_id,
                     receipt=durable_receipt,
+                    activation_authority=reconciled_authority,
                     operation_registry=operation_registry,
                 )
                 confirmed = observation.confirmed
@@ -1337,6 +1552,7 @@ async def _remember_confirm_owned_publication(
     *,
     result: Any,
     operation_id: str,
+    activation_authority: KnowledgeActivationAuthority,
     receipt: KnowledgePublicationReceipt | None = None,
     operation_registry: BoundedInvocationOperationRegistry,
 ) -> bool:
@@ -1345,6 +1561,7 @@ async def _remember_confirm_owned_publication(
         result=result,
         operation_id=operation_id,
         receipt=receipt,
+        activation_authority=activation_authority,
         operation_registry=operation_registry,
     )
     return observation.confirmed
@@ -1355,6 +1572,7 @@ async def _remember_observe_owned_publication(
     *,
     result: Any,
     operation_id: str,
+    activation_authority: KnowledgeActivationAuthority,
     receipt: KnowledgePublicationReceipt | None = None,
     operation_registry: BoundedInvocationOperationRegistry,
 ) -> _RememberPublicationObservation:
@@ -1371,6 +1589,21 @@ async def _remember_observe_owned_publication(
     if durable_receipt is None:
         return _RememberPublicationObservation(receipt_absent=True)
     try:
+        activation_receipt = await _remember_load_activation_receipt(
+            store,
+            operation_id,
+            operation_registry=operation_registry,
+        )
+        if (
+            activation_receipt is None
+            or activation_receipt.authority != activation_authority
+            or activation_receipt.publication_request_sha256 != durable_receipt.request_sha256
+            or activation_receipt.committed_at != durable_receipt.committed_at
+        ):
+            return _RememberPublicationObservation(
+                receipt_present=True,
+                receipt_incompatible=True,
+            )
         if receipt is not None and _remember_receipt_identity(
             receipt
         ) != _remember_receipt_identity(durable_receipt):
@@ -1383,6 +1616,7 @@ async def _remember_observe_owned_publication(
             result.chunks,
             operation_id=operation_id,
             expected_revision=_remember_expected_revision(result.entry),
+            activation_authority=activation_authority,
         )
         confirmed = (
             durable_receipt.operation_id == operation_id
@@ -1401,7 +1635,10 @@ async def _remember_observe_owned_publication(
     except asyncio.CancelledError:
         raise
     except Exception:
-        return _RememberPublicationObservation(receipt_present=True)
+        return _RememberPublicationObservation(
+            receipt_present=True,
+            receipt_incompatible=True,
+        )
 
 
 def _remember_uncontainable_store_failure(
@@ -1441,6 +1678,71 @@ def _remember_receipt_identity(receipt: KnowledgePublicationReceipt) -> tuple[ob
         copied.entry_created_at,
         copied.entry_updated_at,
         copied.committed_at,
+    )
+
+
+def _remember_activation_authorities_equivalent(
+    left: KnowledgeActivationAuthority,
+    right: KnowledgeActivationAuthority,
+) -> bool:
+    """Compare exact intent while allowing one operation-bound fallback entry id."""
+
+    left = copy_knowledge_activation_authority(left)
+    right = copy_knowledge_activation_authority(right)
+    left_decision = left.decision.model_dump(mode="json")
+    right_decision = right.decision.model_dump(mode="json")
+    left_decision.pop("request_sha256")
+    right_decision.pop("request_sha256")
+    if left_decision != right_decision:
+        return False
+
+    def request_material(authority: KnowledgeActivationAuthority) -> dict[str, Any]:
+        material = authority.request.model_dump(mode="json")
+        entry = material["candidate_entry"]
+        for key in ("id", "revision", "created_at", "updated_at"):
+            entry.pop(key)
+        for chunk in material["chunks"]:
+            for key in ("id", "entry_id", "entry_revision"):
+                chunk.pop(key)
+        for evidence in material["evidence"]:
+            for key in ("id", "entry_id", "entry_revision", "chunk_id", "created_at"):
+                evidence.pop(key)
+        material.pop("target_revision")
+        return material
+
+    return request_material(left) == request_material(right)
+
+
+def _remember_activation_matches_governance(
+    authority: KnowledgeActivationAuthority,
+    *,
+    governance: KnowledgeGovernanceConfig,
+    model_identity: str,
+    access_scope: KnowledgeAccessScope,
+) -> bool:
+    authority = copy_knowledge_activation_authority(authority)
+    request = authority.request
+    decision = authority.decision
+    if (
+        request.source is not KnowledgeActivationSource.MODEL_TOOL
+        or request.mode is not governance.mode
+        or request.access_scope_sha256 != knowledge_access_scope_sha256(access_scope)
+        or request.evaluator_identity is not None
+        or request.evaluator_result is not None
+        or request.evaluator_decision_sha256 is not None
+        or request.forbidden_authority_identities != (model_identity,)
+        or decision.disposition is KnowledgeActivationDisposition.REJECT
+    ):
+        return False
+    if governance.mode is KnowledgeGovernanceMode.REVIEWED:
+        return (
+            decision.disposition is KnowledgeActivationDisposition.ROUTE_TO_REVIEW
+            and decision.policy_identity == REVIEWED_ROUTING_POLICY_IDENTITY
+            and decision.policy_version == REVIEWED_ROUTING_POLICY_VERSION
+        )
+    return (
+        decision.policy_identity == governance.policy_identity
+        and decision.policy_version == governance.policy_version
     )
 
 
@@ -1588,6 +1890,24 @@ def _remember_knowledge_success_result(
     return ToolResult(
         content=content,
         structured=structured,
+    )
+
+
+def _remember_knowledge_rejected_result(result: Any, *, code: str) -> ToolResult:
+    """Report an intentional policy rejection without claiming a write failure."""
+
+    return ToolResult(
+        content="Knowledge was not stored because application activation policy rejected it.",
+        structured={
+            "entry": None,
+            "chunk_count": result.chunk_count,
+            "written": False,
+            "already_known": False,
+            "source_hash": result.source_hash,
+            "status": None,
+            "activation_disposition": KnowledgeActivationDisposition.REJECT.value,
+            "activation_code": require_clean_nonblank(code, "code"),
+        },
     )
 
 
@@ -2077,6 +2397,9 @@ class _ScopedKnowledgeStoreHandle:
         bound_scope = getattr(store, "bound_access_scope", None)
         self._scope_is_store_bound = callable(bound_scope) and bound_scope() == self._access_scope
 
+    def bound_access_scope(self) -> KnowledgeAccessScope:
+        return copy_knowledge_access_scope(self._access_scope)
+
     def supported_search_modes(self):
         supported = getattr(self._store, "supported_search_modes", None)
         if not callable(supported):
@@ -2118,6 +2441,7 @@ class _ScopedKnowledgeStoreHandle:
         *,
         operation_id,
         expected_revision=None,
+        activation_authority=None,
     ):
         if self._scope_is_store_bound:
             return await self._store.publish_entry_revision(
@@ -2125,6 +2449,7 @@ class _ScopedKnowledgeStoreHandle:
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
         return await self._store.publish_entry_revision(
             entry,
@@ -2132,12 +2457,21 @@ class _ScopedKnowledgeStoreHandle:
             access_scope=self._access_scope,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
 
     async def load_entry_publication_receipt(self, operation_id):
         if self._scope_is_store_bound:
             return await self._store.load_entry_publication_receipt(operation_id)
         return await self._store.load_entry_publication_receipt(
+            operation_id,
+            access_scope=self._access_scope,
+        )
+
+    async def load_activation_receipt(self, operation_id):
+        if self._scope_is_store_bound:
+            return await self._store.load_activation_receipt(operation_id)
+        return await self._store.load_activation_receipt(
             operation_id,
             access_scope=self._access_scope,
         )

@@ -10308,6 +10308,11 @@ to memory or SQLite. Exact replay also requires the publication and activation
 receipts to carry the same store-authored `committed_at`; a mismatched pair is
 not accepted as evidence of one atomic governed write.
 
+Once hard deletion erases activation attribution, a model-tool or curator retry
+must not reconstruct authority or report a governed replay from the content-free
+publication receipt alone. It fails closed unless an independently valid current
+publication can be reconciled through the ordinary governed contract.
+
 The deterministic backend conformance registry lives in
 `tests/core/test_knowledge_store_shared_conformance.py`, with reusable scenarios
 and registration types in `tests/core/knowledge_store_conformance.py`. A
@@ -10328,28 +10333,77 @@ adapter must preserve the same behavior under reopen whenever it declares a
 reopenable lifecycle; a skip or an unimplemented optional hook must be recorded
 as an explicit capability claim instead of being treated as a pass.
 
-`RememberKnowledgePolicy` controls
-the actual stored status, namespace, visibility, required labels, and allowed
-kinds. When `allowed_kinds` is configured, the registered tool instance exposes
+`RememberKnowledgePolicy` controls governance, namespace, visibility, required
+labels, and allowed kinds. When `allowed_kinds` is configured, the registered tool exposes
 those values as the model-facing `kind` enum while still enforcing them at
 runtime. Model-facing inputs are deliberately limited to `text`, optional
 `title`, optional `kind`, and optional topical `aspects`; namespace, labels,
 status, visibility, impact targets, importance, and confidence are app-owned for
-this tool. The default policy stores model-authored entries as `pending`; normal
-search/list queries exclude pending entries, while reviewer/app code can query
-pending entries through the store API. `KnowledgeReviewWorkflow` is the built-in
-app-side helper for this path: it lists pending entries inside a configured
-namespace/label scope, approves pending entries by moving them to `active`, and
-rejects pending entries by moving them to `archived`. It is not a model-facing
-tool. The packaged server/dashboard uses the same workflow when `CayuApp` is
+this tool.
+
+`KnowledgeGovernanceMode` is the application configuration for how generated
+knowledge may advance. The default `reviewed` mode never invokes an automatic
+policy and routes accepted model/curator candidates to `pending`.
+Durable author, evaluator, policy, and reviewer identities use the same
+portable 256-byte UTF-8 bound; invalid author or tool-policy configuration is
+rejected before a pending entry can be stored.
+`policy_automatic` and `autonomous` require an application-supplied
+`KnowledgeActivationPolicy` with an exact configured identity and version. The
+policy receives a copied, size-bounded `KnowledgeActivationRequest`, including
+the exact candidate material and entry/evidence timestamps, applicable evaluator
+result and fingerprint, and a validated copy of the enforced access scope. It
+returns one exact `activate`,
+`route_to_review`, or `reject` decision. The
+scope's canonical fingerprint remains available as
+`request.access_scope_sha256` for stable comparisons. `activate` stores an active
+revision, `route_to_review` stores a pending revision, and `reject` stores no
+revision. A request is capped at 1 MiB, 10,000 chunks, and 10,000 evidence
+records; an evaluator result is capped at 64 KiB and decision annotations are
+capped at 16 KiB. `autonomous` changes
+governance authority only; it does not start a
+scheduler, model call, curator loop, or worker. Missing policies,
+timeouts, exceptions, malformed or oversized output, request-fingerprint
+mismatch, and generator/evaluator/model self-authorization fail closed before
+publication.
+
+These concepts remain separate: lifecycle (`pending`, `active`, `archived`, or
+`deleted`) determines retrieval; enrichment/readiness describes whether a
+derived index is usable; source authority describes who supplied evidence;
+evaluator confidence assesses that evidence; governance mode selects the
+application decision process; and the activation decision records who actually
+authorized the exact outcome. Confidence, similarity, recency, a model tool
+argument, and the presence of a receipt never activate knowledge by themselves.
+
+Normal search/list queries exclude pending entries, while reviewer/app code can
+query pending entries through the store API. `KnowledgeReviewWorkflow` is the
+built-in app-side helper for this path: it lists pending entries inside a
+configured namespace/label scope, approves an exact pending revision with an
+explicit operation ID and reviewer identity/version, and rejects pending entries
+by moving them to `archived`. Approval atomically appends the active successor,
+preserves evidence, and records matching publication and activation receipts with
+immutable reviewer attribution. An exact retry
+returns the original approval without rerunning generation, evaluation, or an
+automatic activation policy. It is not a model-facing tool.
+
+The packaged server/dashboard uses the same workflow when `CayuApp` is
 constructed with `knowledge_store=...`; `knowledge_review_namespace` and
 `knowledge_review_labels` limit which pending entries the dashboard can list or
 approve/reject. The server exposes `GET /api/knowledge/pending` plus
 `GET /api/knowledge/pending/{entry_id}` for scoped detail inspection and
 `POST /api/knowledge/{entry_id}/approve` and `/reject` for that dashboard flow.
-Active writes require `allow_active_writes=True`. The accepted text size is
-configured when the app registers the tool and is not exposed as a
-model-controlled argument. If persistence acknowledgement fails after the store
+On an authenticated server, approval is attributed to the verified
+`AuthContext.subject`, with its tenant retained as provenance but not used as a
+knowledge scope. Subjects that fit the portable 256-byte activation-identity
+bound are recorded directly. A longer or non-portable subject uses a
+domain-separated SHA-256 reviewer identity while the exact UTF-8 subject is
+retained losslessly as a base64 receipt annotation; tenant provenance uses the
+same lossless encoding when required. A local-development server uses the
+explicit `cayu:trusted-local-development` reviewer instead of inventing an operator.
+API clients may send `Idempotency-Key` to make an acknowledgement-loss retry
+exact; the key is bound to that reviewer attribution, so another authenticated
+subject cannot replay the operation as its own. The accepted text size is configured
+when the app registers the tool and is not exposed as a model-controlled argument.
+If persistence acknowledgement fails after the store
 committed a matching receipt, entry, and chunks—including a derived embedding
 hook failure—the tool preserves the knowledge and returns success with a bounded
 structured `post_write_error="publication_acknowledgement_lost"` warning;
@@ -10368,6 +10422,18 @@ both the in-flight intent and durable publication identity. Conflicting reuse
 fails closed, and the bounded retained operation set rejects new mutation
 dispatch before capacity can grow without limit while permitting read-only
 receipt reconciliation.
+
+An out-of-tree store used by `remember_knowledge` must accept the public
+`activation_authority` publication argument and atomically persist a matching
+`KnowledgeActivationReceipt`, then implement `load_activation_receipt(...)`.
+Returning only a legacy publication receipt cannot authenticate a governed
+write and fails closed as an ambiguous publication.
+`KnowledgeCurator` requires the same receipt hook plus exact revision reads through
+`get_entry(...)`, `read_chunks(...)`, and `read_evidence(...)`. Recovery recomputes
+the governed publication fingerprint and verifies that the publication and activation
+receipts bind its configured governance mode, policy identity, evaluator identity,
+access scope, and exact initial lifecycle. A publication receipt without that matching
+activation receipt and durable revision material is not accepted as a curator outcome.
 `remember_knowledge` also disables terminal argument publication. Its raw
 knowledge arguments and stored entry metadata remain in the private
 invocation/store boundary; approval and terminal events, pending-action views,

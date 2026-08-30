@@ -1853,8 +1853,11 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
     )
     assert activation is not None
     assert activation.replayed is False
-    assert activation.authority.decision.policy_identity == "cayu.server.knowledge-review"
-    assert activation.authority.decision.annotations == {"channel": "protected-http"}
+    assert activation.authority.decision.policy_identity == "cayu:trusted-local-development"
+    assert activation.authority.decision.annotations == {
+        "channel": "trusted-local-http",
+        "identity_source": "local_development",
+    }
 
     empty = client.get("/api/knowledge/pending")
     assert empty.status_code == 200

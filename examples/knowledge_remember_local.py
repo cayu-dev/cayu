@@ -8,6 +8,11 @@ from typing import Any
 from cayu import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
+    KnowledgeActivationDecision,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationRequest,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
     KnowledgeReviewWorkflow,
     KnowledgeStatus,
     RememberKnowledgePolicy,
@@ -15,6 +20,29 @@ from cayu import (
     SearchKnowledgeTool,
     ToolContext,
 )
+
+
+class DemoActivationPolicy:
+    async def decide_activation(
+        self,
+        request: KnowledgeActivationRequest,
+    ) -> KnowledgeActivationDecision:
+        disposition = (
+            KnowledgeActivationDisposition.ACTIVATE
+            if request.mode is KnowledgeGovernanceMode.POLICY_AUTOMATIC
+            else KnowledgeActivationDisposition.REJECT
+        )
+        return KnowledgeActivationDecision(
+            request_sha256=request.fingerprint,
+            disposition=disposition,
+            policy_identity="example.invoice-policy",
+            policy_version="1",
+            code=(
+                "trusted_demo_scope"
+                if disposition is KnowledgeActivationDisposition.ACTIVATE
+                else "autonomous_demo_rejected"
+            ),
+        )
 
 
 async def main() -> None:
@@ -93,11 +121,15 @@ async def main() -> None:
 
     async with RememberKnowledgeTool(
         policy=RememberKnowledgePolicy(
-            default_status=KnowledgeStatus.ACTIVE,
-            allow_active_writes=True,
+            governance=KnowledgeGovernanceConfig(
+                mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                policy_identity="example.invoice-policy",
+                policy_version="1",
+            ),
             default_namespace="project:cayu",
             require_labels={"project": "cayu", "tenant": "trusted"},
-        )
+        ),
+        activation_policy=DemoActivationPolicy(),
     ) as remember:
         active_write = await remember.run(
             ctx,
@@ -121,6 +153,29 @@ async def main() -> None:
     )
     print_json("normal_tool_search_after_active_write", _tool_hit_ids(active_search.structured))
 
+    async with RememberKnowledgeTool(
+        policy=RememberKnowledgePolicy(
+            governance=KnowledgeGovernanceConfig(
+                mode=KnowledgeGovernanceMode.AUTONOMOUS,
+                policy_identity="example.invoice-policy",
+                policy_version="1",
+            ),
+            default_namespace="project:cayu",
+            require_labels={"project": "cayu", "tenant": "trusted"},
+        ),
+        activation_policy=DemoActivationPolicy(),
+    ) as remember:
+        rejected_write = await remember.run(
+            ctx,
+            {
+                "text": "Autonomous demo candidates still need application authorization.",
+                "title": "Autonomous governance",
+                "kind": "fact",
+                "aspects": ["governance"],
+            },
+        )
+    print_json("autonomous_rejected_write", _write_summary(rejected_write.structured))
+
 
 def print_json(label: str, value) -> None:
     print(label, json.dumps(value, ensure_ascii=False, sort_keys=True))
@@ -130,6 +185,15 @@ def _write_summary(structured: Mapping[str, Any] | None) -> dict[str, Any]:
     if structured is None:
         return {}
     entry = structured["entry"]
+    if entry is None:
+        return {
+            "entry_id": None,
+            "status": structured["status"],
+            "written": structured["written"],
+            "already_known": structured["already_known"],
+            "activation_disposition": structured["activation_disposition"],
+            "activation_code": structured["activation_code"],
+        }
     return {
         "entry_id": entry["entry_id"],
         "status": structured["status"],

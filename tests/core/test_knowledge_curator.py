@@ -11,9 +11,14 @@ from cayu import (
     CandidatePolicyDisposition,
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
+    KnowledgeActivationDecision,
+    KnowledgeActivationDisposition,
+    KnowledgeActivationRequest,
     KnowledgeCandidatePolicyDecision,
     KnowledgeCurator,
     KnowledgeCuratorConfig,
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
     KnowledgeListQuery,
     KnowledgeQuery,
     KnowledgeReviewWorkflow,
@@ -175,15 +180,180 @@ def _curator(
     evaluator: _Evaluator | None = None,
     config: KnowledgeCuratorConfig | None = None,
     candidate_policy=None,
+    activation_policy=None,
+    clock=None,
 ) -> KnowledgeCurator:
     return KnowledgeCurator(
         store,
         candidate_generator=generator or _Generator(),
         evaluator=evaluator or _Evaluator(),
         candidate_policy=candidate_policy,
+        activation_policy=activation_policy,
         config=config or _config(),
-        clock=lambda: _NOW,
+        clock=(lambda: _NOW) if clock is None else clock,
     )
+
+
+class _ActivationPolicy:
+    def __init__(self, disposition: KnowledgeActivationDisposition) -> None:
+        self.disposition = disposition
+        self.calls = 0
+        self.last_request: KnowledgeActivationRequest | None = None
+
+    async def decide_activation(
+        self,
+        request: KnowledgeActivationRequest,
+    ) -> KnowledgeActivationDecision:
+        self.calls += 1
+        self.last_request = request
+        return KnowledgeActivationDecision(
+            request_sha256=request.fingerprint,
+            disposition=self.disposition,
+            policy_identity="release.activation-policy",
+            policy_version="3",
+            code=f"release_{self.disposition.value}",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "disposition", "expected_status", "expected_outcome"),
+    [
+        (
+            KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+            KnowledgeActivationDisposition.ACTIVATE,
+            KnowledgeStatus.ACTIVE,
+            LearningCandidateOutcome.ACTIVE_PERSISTED,
+        ),
+        (
+            KnowledgeGovernanceMode.AUTONOMOUS,
+            KnowledgeActivationDisposition.ROUTE_TO_REVIEW,
+            KnowledgeStatus.PENDING,
+            LearningCandidateOutcome.PENDING_PERSISTED,
+        ),
+    ],
+)
+def test_curator_uses_explicit_application_activation_policy(
+    mode,
+    disposition,
+    expected_status,
+    expected_outcome,
+) -> None:
+    async def run():
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        policy = _ActivationPolicy(disposition)
+        config = _config().model_copy(
+            update={
+                "governance": KnowledgeGovernanceConfig(
+                    mode=mode,
+                    policy_identity="release.activation-policy",
+                    policy_version="3",
+                )
+            }
+        )
+        curator = _curator(store, config=config, activation_policy=policy)
+        first = await curator.curate(_batch(_signal()))
+        replay = await curator.curate(_batch(_signal()))
+        entry_id = _entry_id(first.candidates[0])
+        entry = await store.get_entry(entry_id)
+        return first, replay, entry, policy.calls, policy.last_request
+
+    first, replay, entry, calls, activation_request = asyncio.run(run())
+
+    assert first.candidates[0].outcome is expected_outcome
+    assert entry is not None and entry.status is expected_status
+    assert replay.candidates[0].outcome in {
+        LearningCandidateOutcome.EXISTING_ACTIVE,
+        LearningCandidateOutcome.EXISTING_PENDING,
+    }
+    assert calls == 1
+    assert activation_request is not None
+    assert activation_request.evaluator_result == _accepted().model_dump(mode="json")
+
+
+def test_curator_activation_rejection_publishes_no_knowledge() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        policy = _ActivationPolicy(KnowledgeActivationDisposition.REJECT)
+        config = _config().model_copy(
+            update={
+                "governance": KnowledgeGovernanceConfig(
+                    mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                    policy_identity="release.activation-policy",
+                    policy_version="3",
+                )
+            }
+        )
+        result = await _curator(
+            store,
+            config=config,
+            activation_policy=policy,
+        ).curate(_batch(_signal()))
+        listed = await store.list_entries(KnowledgeListQuery(statuses=list(KnowledgeStatus)))
+        return result, listed, policy.calls
+
+    result, listed, calls = asyncio.run(run())
+
+    assert result.candidates[0].outcome is LearningCandidateOutcome.ACTIVATION_REJECTED
+    assert result.candidates[0].code == "release_reject"
+    assert listed.entries == []
+    assert calls == 1
+
+
+def test_curator_rejects_store_mutation_of_activation_authority() -> None:
+    class MutatingAuthorityStore(InMemoryKnowledgeStore):
+        operation_id: str | None = None
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            evidence=None,
+            access_scope=None,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
+        ):
+            self.operation_id = operation_id
+            activation_authority.decision.annotations["store"] = "rewritten"
+            return await super().publish_entry_revision(
+                entry,
+                chunks,
+                evidence=evidence,
+                access_scope=access_scope,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+                activation_authority=activation_authority,
+            )
+
+    async def run():
+        store = MutatingAuthorityStore(access_scope=_ACCESS_SCOPE)
+        policy = _ActivationPolicy(KnowledgeActivationDisposition.ACTIVATE)
+        config = _config().model_copy(
+            update={
+                "governance": KnowledgeGovernanceConfig(
+                    mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                    policy_identity="release.activation-policy",
+                    policy_version="3",
+                )
+            }
+        )
+        result = await _curator(
+            store,
+            config=config,
+            activation_policy=policy,
+        ).curate(_batch(_signal()))
+        assert store.operation_id is not None
+        receipt = await store.load_activation_receipt(store.operation_id)
+        return result, receipt
+
+    result, receipt = asyncio.run(run())
+
+    candidate = result.candidates[0]
+    assert candidate.outcome is LearningCandidateOutcome.CONFLICT
+    assert candidate.code == "activation_receipt_conflict"
+    assert receipt is not None
+    assert receipt.authority.decision.annotations == {"store": "rewritten"}
 
 
 def test_curator_persists_pending_revision_with_exact_evidence_and_review_path() -> None:
@@ -362,18 +532,31 @@ def test_curator_reprocessing_preserves_active_and_archived_status() -> None:
 
 
 def test_curator_concurrent_exact_processing_converges_on_one_revision() -> None:
+    class PublicationBarrierStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__(access_scope=_ACCESS_SCOPE)
+            self.publication_count = 0
+            self.publications_ready = asyncio.Event()
+
+        async def publish_entry_revision(self, entry, chunks, **kwargs):
+            self.publication_count += 1
+            if self.publication_count == 2:
+                self.publications_ready.set()
+            await asyncio.wait_for(self.publications_ready.wait(), timeout=1)
+            return await super().publish_entry_revision(entry, chunks, **kwargs)
+
     async def run():
-        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        store = PublicationBarrierStore()
         first, second = await asyncio.gather(
-            _curator(store).curate(_batch(_signal())),
-            _curator(store).curate(_batch(_signal())),
+            _curator(store, clock=lambda: _NOW).curate(_batch(_signal())),
+            _curator(store, clock=lambda: _NOW + timedelta(seconds=1)).curate(_batch(_signal())),
         )
         entry_id = _entry_id(first.candidates[0])
         entry = await store.get_entry(entry_id)
         evidence = await store.read_evidence(entry_id)
-        return first, second, entry, evidence
+        return first, second, entry, evidence, store.publication_count
 
-    first, second, entry, evidence = asyncio.run(run())
+    first, second, entry, evidence, publication_count = asyncio.run(run())
 
     outcomes = {first.candidates[0].outcome, second.candidates[0].outcome}
     assert outcomes == {
@@ -382,6 +565,7 @@ def test_curator_concurrent_exact_processing_converges_on_one_revision() -> None
     }
     assert entry is not None and entry.revision == 1
     assert evidence is not None and evidence.total_evidence_known == 1
+    assert publication_count == 2
 
 
 def test_curator_enforces_evaluator_concurrency_across_concurrent_batches() -> None:
@@ -691,6 +875,7 @@ def test_curator_reconciles_publication_acknowledgement_loss() -> None:
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             await super().publish_entry_revision(
                 entry,
@@ -699,6 +884,7 @@ def test_curator_reconciles_publication_acknowledgement_loss() -> None:
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             raise RuntimeError("private acknowledgement failure")
 
@@ -717,6 +903,116 @@ def test_curator_reconciles_publication_acknowledgement_loss() -> None:
     assert "private acknowledgement failure" not in result.model_dump_json()
 
 
+def test_curator_reconciles_active_publication_acknowledgement_loss() -> None:
+    class AcknowledgementLossStore(InMemoryKnowledgeStore):
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            evidence=None,
+            access_scope=None,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
+        ):
+            await super().publish_entry_revision(
+                entry,
+                chunks,
+                evidence=evidence,
+                access_scope=access_scope,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+                activation_authority=activation_authority,
+            )
+            raise RuntimeError("private acknowledgement failure")
+
+    async def run():
+        store = AcknowledgementLossStore(access_scope=_ACCESS_SCOPE)
+        policy = _ActivationPolicy(KnowledgeActivationDisposition.ACTIVATE)
+        config = _config().model_copy(
+            update={
+                "governance": KnowledgeGovernanceConfig(
+                    mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                    policy_identity="release.activation-policy",
+                    policy_version="3",
+                )
+            }
+        )
+        result = await _curator(
+            store,
+            config=config,
+            activation_policy=policy,
+        ).curate(_batch(_signal()))
+        entry = await store.get_entry(_entry_id(result.candidates[0]))
+        return result, entry, policy.calls
+
+    result, entry, calls = asyncio.run(run())
+
+    candidate = result.candidates[0]
+    assert candidate.outcome is LearningCandidateOutcome.ACTIVE_PERSISTED
+    assert candidate.warning_code == "publication_acknowledgement_lost"
+    assert entry is not None and entry.status is KnowledgeStatus.ACTIVE
+    assert calls == 1
+
+
+def test_curator_recovery_requires_the_matching_activation_receipt() -> None:
+    class MissingActivationReceiptStore(InMemoryKnowledgeStore):
+        omit_activation_receipt = False
+
+        async def load_activation_receipt(self, operation_id, *, access_scope=None):
+            if self.omit_activation_receipt:
+                return None
+            return await super().load_activation_receipt(
+                operation_id,
+                access_scope=access_scope,
+            )
+
+    async def run():
+        store = MissingActivationReceiptStore(access_scope=_ACCESS_SCOPE)
+        first = await _curator(store).curate(_batch(_signal()))
+        store.omit_activation_receipt = True
+        evaluator = _Evaluator()
+        replay = await _curator(store, evaluator=evaluator).curate(_batch(_signal()))
+        return first, replay, evaluator.calls
+
+    first, replay, evaluator_calls = asyncio.run(run())
+
+    assert first.candidates[0].outcome is LearningCandidateOutcome.PENDING_PERSISTED
+    assert replay.candidates[0].outcome is LearningCandidateOutcome.FAILED
+    assert replay.candidates[0].code == "activation_receipt_missing"
+    assert evaluator_calls == []
+
+
+def test_curator_recovery_recomputes_the_exact_durable_publication() -> None:
+    class MismatchedMaterialStore(InMemoryKnowledgeStore):
+        return_mismatched_chunks = False
+
+        async def read_chunks(self, entry_id, **kwargs):
+            chunks = await super().read_chunks(entry_id, **kwargs)
+            if self.return_mismatched_chunks and chunks:
+                return [
+                    chunks[0].model_copy(update={"text": "A different durable chunk."}),
+                    *chunks[1:],
+                ]
+            return chunks
+
+    async def run():
+        store = MismatchedMaterialStore(access_scope=_ACCESS_SCOPE)
+        first = await _curator(store).curate(_batch(_signal()))
+        store.return_mismatched_chunks = True
+        evaluator = _Evaluator()
+        replay = await _curator(store, evaluator=evaluator).curate(_batch(_signal()))
+        return first, replay, evaluator.calls
+
+    first, replay, evaluator_calls = asyncio.run(run())
+
+    assert first.candidates[0].outcome is LearningCandidateOutcome.PENDING_PERSISTED
+    assert replay.candidates[0].outcome is LearningCandidateOutcome.CONFLICT
+    assert replay.candidates[0].code == "published_material_conflict"
+    assert evaluator_calls == []
+
+
 def test_curator_recovers_an_exact_receipt_after_a_mismatched_acknowledgement() -> None:
     class MismatchedAcknowledgementStore(InMemoryKnowledgeStore):
         async def publish_entry_revision(
@@ -728,6 +1024,7 @@ def test_curator_recovers_an_exact_receipt_after_a_mismatched_acknowledgement() 
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             receipt = await super().publish_entry_revision(
                 entry,
@@ -736,6 +1033,7 @@ def test_curator_recovers_an_exact_receipt_after_a_mismatched_acknowledgement() 
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             return receipt.model_copy(update={"request_sha256": "0" * 64})
 
@@ -755,6 +1053,8 @@ def test_curator_recovers_an_exact_receipt_after_a_mismatched_acknowledgement() 
 
 def test_curator_does_not_claim_a_competing_payload_as_its_own_publication() -> None:
     class CompetingPayloadStore(InMemoryKnowledgeStore):
+        competing_entry_id: str | None = None
+
         async def publish_entry_revision(
             self,
             entry,
@@ -764,6 +1064,7 @@ def test_curator_does_not_claim_a_competing_payload_as_its_own_publication() -> 
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             audit = {
                 **entry.metadata["cayu_curator"],
@@ -777,6 +1078,7 @@ def test_curator_does_not_claim_a_competing_payload_as_its_own_publication() -> 
                     }
                 }
             )
+            self.competing_entry_id = competing_entry.id
             await super().publish_entry_revision(
                 competing_entry,
                 chunks,
@@ -790,13 +1092,15 @@ def test_curator_does_not_claim_a_competing_payload_as_its_own_publication() -> 
     async def run():
         store = CompetingPayloadStore(access_scope=_ACCESS_SCOPE)
         result = await _curator(store).curate(_batch(_signal()))
-        entry = await store.get_entry(_entry_id(result.candidates[0]))
+        assert store.competing_entry_id is not None
+        entry = await store.get_entry(store.competing_entry_id)
         return result, entry
 
     result, entry = asyncio.run(run())
 
     candidate = result.candidates[0]
-    assert candidate.outcome is LearningCandidateOutcome.EXISTING_PENDING
+    assert candidate.outcome is LearningCandidateOutcome.FAILED
+    assert candidate.code == "activation_receipt_missing"
     assert candidate.warning_code is None
     assert entry is not None
     assert entry.metadata["cayu_curator"]["batch_id"] == "competing-batch"
@@ -888,6 +1192,7 @@ def test_curator_keeps_an_owned_publication_alive_after_caller_cancellation() ->
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             self.started.set()
@@ -899,6 +1204,7 @@ def test_curator_keeps_an_owned_publication_alive_after_caller_cancellation() ->
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -938,6 +1244,7 @@ def test_curator_next_owner_reconciles_commit_cut_off_by_shutdown() -> None:
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             receipt = await super().publish_entry_revision(
@@ -947,6 +1254,7 @@ def test_curator_next_owner_reconciles_commit_cut_off_by_shutdown() -> None:
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             self.committed.set()
             try:
@@ -1001,6 +1309,7 @@ def test_curator_bounds_publications_that_outlive_their_callers() -> None:
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.started.set()
             await self.release.wait()
@@ -1011,6 +1320,7 @@ def test_curator_bounds_publications_that_outlive_their_callers() -> None:
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1056,6 +1366,7 @@ def test_curator_shutdown_seals_and_bounds_retained_publications() -> None:
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             self.started.set()
@@ -1068,6 +1379,7 @@ def test_curator_shutdown_seals_and_bounds_retained_publications() -> None:
                     access_scope=access_scope,
                     operation_id=operation_id,
                     expected_revision=expected_revision,
+                    activation_authority=activation_authority,
                 )
             finally:
                 self.stopped.set()
@@ -1117,6 +1429,7 @@ def test_curator_shutdown_drains_a_publication_that_settles_within_grace() -> No
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             self.started.set()
             await self.release.wait()
@@ -1127,6 +1440,7 @@ def test_curator_shutdown_drains_a_publication_that_settles_within_grace() -> No
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1156,6 +1470,7 @@ def test_curator_isolates_store_failure_between_candidates() -> None:
             access_scope=None,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             if entry.metadata["cayu_curator"]["proposal_key"] == "store-fails":
                 raise RuntimeError("private store failure")
@@ -1166,6 +1481,7 @@ def test_curator_isolates_store_failure_between_candidates() -> None:
                 access_scope=access_scope,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
 
     async def run():
@@ -1452,3 +1768,27 @@ def test_curator_rejects_fixed_configuration_outside_store_scope() -> None:
 
     with pytest.raises(ValueError, match="namespace is outside"):
         _curator(InMemoryKnowledgeStore(access_scope=scope))
+
+
+def test_automatic_curator_requires_scope_for_active_publication() -> None:
+    scope = KnowledgeAccessScope.for_namespace(
+        "project:cayu",
+        required_labels={"project": "cayu"},
+        allowed_statuses=[KnowledgeStatus.PENDING],
+    )
+    config = _config().model_copy(
+        update={
+            "governance": KnowledgeGovernanceConfig(
+                mode=KnowledgeGovernanceMode.POLICY_AUTOMATIC,
+                policy_identity="release.activation-policy",
+                policy_version="3",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires access to active knowledge"):
+        _curator(
+            InMemoryKnowledgeStore(access_scope=scope),
+            config=config,
+            activation_policy=_ActivationPolicy(KnowledgeActivationDisposition.ACTIVATE),
+        )
