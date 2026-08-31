@@ -12,6 +12,20 @@ The built-in runner evaluates normal `CayuApp.run(...)` sessions and then
 asserts over the durable runtime state Cayu already owns: sessions, events,
 transcripts, tool calls, usage, workspaces, and artifacts.
 
+## Start with the workflow you need
+
+The installed package includes three focused, version-matched guides:
+
+- `cayu guide evals-first` creates a Control Plane suite, runs it, approves a
+  baseline, and compares the next result.
+- `cayu guide evals-ai-quality` adds bounded AI-judge authority, a rubric,
+  reference truth, and calibration.
+- `cayu guide evals-production` promotes retained sessions and covers
+  multi-stage scenarios, tools, process behavior, and memory evaluation.
+
+These are the onboarding paths. The rest of this document is the complete SDK,
+schema, HTTP, storage, embedding, and operational reference.
+
 ## Minimal Example
 
 ```python
@@ -2106,6 +2120,55 @@ target with the automatically assembled store. Arbitrary embedded
 `create_server(...)` and `mount_cayu(...)` integrations continue to provide
 trusted runtime objects explicitly.
 
+A project may also declare one bounded default model judge without writing
+Evals-specific Python:
+
+```toml
+[tool.cayu.evals]
+price_book = "bundled-public"
+
+[tool.cayu.evals.default_judge]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+privacy_policy = "public-only"
+allow_same_model = false
+timeout_seconds = 120
+max_input_tokens = 32768
+max_output_tokens = 4096
+max_total_tokens = 36864
+max_estimated_cost = "0.1"
+cost_currency = "USD"
+```
+
+The named provider must already be registered by the application. Cayu creates
+a separate tool-free judge application, publishes only the declared route and
+ceilings, and uses the provider's normal credential authority. It never infers
+a judge from an API key or candidate route. `public-only` permits final output
+and bounded public reference truth; `public-and-transcript` also permits the
+retained transcript. Neither declaration permits private reference content.
+
+`price_book = "bundled-public"` deliberately selects Cayu's packaged, dated
+public-rate snapshot for generated candidate and judge cost enforcement; it is
+never inferred. Applications with negotiated or gateway pricing must continue
+to publish one complete application-owned `PriceBook` through server
+configuration. A judge cost ceiling requires a configured project price book.
+
+Author-first launch readiness can additionally accept a per-trial candidate
+cost budget from Control Plane when the target publishes compatible pricing.
+That value narrows only the reviewed launch, is retained in its accepted
+exposure, and becomes a fail-closed observed-cost interruption threshold. As
+with other runtime cost budgets, one provider completion can cross the
+threshold before its usage is known, so the exposure remains labeled
+`candidate_cost_not_hard_bounded` rather than misrepresenting it as a strict
+pre-dispatch maximum.
+
+When the declared route equals the candidate route, `allow_same_model = true`
+is required to make that judge selectable for the candidate, and an operator
+must still explicitly choose **Add same-model AI judge**. Cayu labels that
+relation in the catalog, result, and report. Omit the declaration when no
+project-wide judge decision has been made; deterministic evaluation and
+retained-session promotion remain available.
+
 Generated maintained-service factories carry an opaque
 `ProjectControlPlaneContext` into `create_agent_service(...)`. Existing
 factories continue to start unchanged, but `cayu check` reports
@@ -2375,14 +2438,15 @@ uses a different application release ID and must still compare cleanly against
 the downloaded dashboard result.
 
 The focused real-application check starts from a freshly generated project and
-an actual OpenAI or Anthropic model. It runs `cayu serve --dev`, creates a
-session in Control Plane, adds an output-content assertion, launches one current-app
-trial, approves the captured result as baseline, compares captured to the current-app result,
-downloads both result origins and their reports, and proves the stable CLI
-comparison exit. The generated project contains no Evals-specific changes:
+an actual OpenAI or Anthropic model. It adds an explicit project judge
+declaration to `pyproject.toml`—but no Evals-specific Python—then runs `cayu
+serve --dev`. In Control Plane it creates one source session, promotes and
+baselines that retained result, launches one production-first current-app
+trial, authors one same-model judged suite and trial, and verifies their
+results, reports, comparisons, route labels, and stable CLI exits:
 
 ```bash
-# Two agent executions: source capture and one bounded current-app trial.
+# Three candidate executions plus one bounded judge execution.
 CAYU_PROVIDER=openai OPENAI_API_KEY=... \
   uv run python examples/evals_release_acceptance_live.py
 

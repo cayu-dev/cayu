@@ -950,6 +950,9 @@ provider configured, open a completed or failed simple session, choose
 start one bounded fresh trial. The generated target reuses the registered agent
 and its ordinary runtime policy; no Evals-specific Python configuration is
 required.
+Run `uv run --no-sync cayu guide evals-first` for the shortest suite, baseline,
+and comparison workflow. Add `cayu guide evals-ai-quality` only after explicitly
+choosing judge provider, model, privacy, and same-model policy.
 Never mount it with unauthenticated open access on a public listener;
 client-IP checks are not authentication. Public or deployed control-plane
 access requires an authenticated access policy.
@@ -1070,6 +1073,7 @@ __DATABASE_AGENTS_PROOF_GUIDANCE__
 - Local developer/operator control plane: run `uv run --no-sync cayu serve --dev` in a separate
   terminal and open `http://127.0.0.1:8000/cayu/`. This is not the application's
   end-user UI or a production server configuration.
+- First Control Plane evaluation: `uv run --no-sync cayu guide evals-first`.
 - Never mount it with `OpenAccess()` on a public listener.
 - Client-IP and forwarded-header checks are not authentication. Use
   `AuthenticatedAccess(...)` for any public or deployed control-plane surface.

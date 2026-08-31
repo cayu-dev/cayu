@@ -570,7 +570,10 @@ Start with the document that matches the job:
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
 | Let an agent search and read bounded public web evidence | [Web fetch and hosted search](https://github.com/cayu-dev/cayu/blob/main/docs/web-fetch.md) |
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
-| Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
+| Run a first Control Plane evaluation | `cayu guide evals-first` ([source](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-first.md)) |
+| Add rubric-based AI quality evaluation | `cayu guide evals-ai-quality` ([source](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-ai-quality.md)) |
+| Evaluate production sessions, scenarios, tools, and memory | `cayu guide evals-production` ([source](https://github.com/cayu-tech/cayu/blob/main/src/cayu/guides/evals-production.md)) |
+| Look up complete Evals contracts | [Evals reference](https://github.com/cayu-tech/cayu/blob/main/docs/evals.md) |
 | Understand knowledge authorization, retrieval fusion, and memory baselines | [Memory foundation contracts](https://github.com/cayu-dev/cayu/blob/main/docs/memory-foundation.md) |
 | Reproduce bounded stateful agent evaluations | [Portable agent snapshots](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md#portable-agent-snapshots) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |

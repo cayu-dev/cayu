@@ -89,6 +89,28 @@ guard.
 
 ## Unreleased
 
+### Evals ship focused onboarding and declarative project judge authority
+
+Three package-shipped guides now lead operators through a first Control Plane
+suite and baseline, rubric-based AI quality evaluation, and retained production
+sessions, multi-stage scenarios, tool/process behavior, and memory evidence.
+Generated projects continue to need no Evals-specific Python for deterministic
+or captured evaluation. They may now declare one exact default judge in
+`[tool.cayu.evals.default_judge]`, including provider, model, privacy,
+same-model policy, and time/token/cost ceilings. Projects may deliberately
+select the bundled dated public-rate book without Python; it also enables a
+reviewed per-trial candidate interruption budget for author-first launches.
+Cayu publishes judge authority through a separate tool-free application and
+never infers authority, credentials, or pricing from ambient state.
+
+Release acceptance now exercises case duplication, explicit launch subsets,
+structured scenario input, and the complete installed-wheel browser/CLI/report
+journey. The real-provider generated-project check additionally proves both
+production-first and author-first evaluation, a labeled same-model rubric,
+captured/fresh/judged artifacts, explicit candidate/judge work and cost
+thresholds, and stable comparison exits. CI selection now fails open for all
+package guide and Evals live-acceptance inputs.
+
 ### `cayu new` emits the complete Cayu application convention
 
 Normal generated projects now begin with stable homes for configuration,

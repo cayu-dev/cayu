@@ -215,6 +215,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "http://127.0.0.1:8000/cayu/" in readme
     assert "developer/operator control plane" in readme
     assert "no Evals-specific Python configuration" in readme
+    assert "uv run --no-sync cayu guide evals-first" in readme
+    assert "cayu guide evals-ai-quality" in readme
     assert "Fresh Evals execution remains gated" not in readme
     assert "Never mount it with unauthenticated open access on a public listener" in readme
     assert "client-IP checks are not authentication" in readme
@@ -1712,6 +1714,7 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "uv run --no-sync cayu serve --dev" in instructions
     assert "http://127.0.0.1:8000/cayu/" in instructions
     assert "developer/operator control plane" in instructions
+    assert "uv run --no-sync cayu guide evals-first" in instructions
     assert "end-user UI" in instructions
     assert "Never mount it with `OpenAccess()` on a public listener" in instructions
     assert "Client-IP and forwarded-header checks are not authentication" in instructions

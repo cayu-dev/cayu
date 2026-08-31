@@ -38,6 +38,8 @@ _RELEASE_EXACT_PATHS = {
     "README.md",
     "docs/release-notes.md",
     "examples/dashboard_behavior_live.py",
+    "examples/evals_judge_calibration_live.py",
+    "examples/evals_release_acceptance_live.py",
     "pyproject.toml",
     "scripts/check_release_artifacts.py",
     "scripts/build_dashboard_source_bundle.py",
@@ -122,6 +124,7 @@ def _affects_release_artifacts(path: str) -> bool:
             "maintenance/model_catalog/",
             "src/cayu/cli/",
             "src/cayu/data/",
+            "src/cayu/guides/",
         )
     ):
         return True

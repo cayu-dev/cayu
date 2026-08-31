@@ -26,6 +26,9 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     assert "structured-output" in listing
     assert "Credential-free structured-output runtime proof." in listing
     assert "durable-operations" in listing
+    assert "evals-ai-quality" in listing
+    assert "evals-first" in listing
+    assert "evals-production" in listing
     assert "providers" in listing
 
     with pytest.raises(SystemExit) as excinfo:
@@ -35,6 +38,33 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     help_output = capsys.readouterr().out
     assert "TOPIC[#SECTION]" in help_output
     assert "Primary integrations and compatible Chat Completions endpoints." in help_output
+
+
+def test_package_shipped_eval_guides_cover_the_three_user_journeys(capsys) -> None:
+    assert main(["guide", "evals-first"]) == 0
+    first = capsys.readouterr().out
+    assert "# Run your first evaluation" in first
+    assert "New evaluation" in first
+    assert "Check launch" in first
+    assert "Approve baseline" in first
+    assert "cayu eval compare" in first
+
+    assert main(["guide", "evals-ai-quality", "--json"]) == 0
+    quality = json.loads(capsys.readouterr().out)
+    assert quality["package_source"] == "cayu.guides/evals-ai-quality.md"
+    assert quality["related_topics"] == ["evals-first", "evals-production", "authoring"]
+    assert "[tool.cayu.evals.default_judge]" in quality["content"]
+    assert "allow_same_model = true" in quality["content"]
+    assert "Calibrate before gating" in quality["content"]
+
+    assert main(["guide", "evals-production"]) == 0
+    production = capsys.readouterr().out
+    assert "# Evaluate production sessions, scenarios, and memory" in production
+    assert "Evaluate a retained session" in production
+    assert "Build a controlled multi-stage scenario" in production
+    assert "Structural exposure" in production
+    assert "Semantic use" in production
+    assert "Causal contribution" in production
 
 
 def test_guide_accepts_emitted_section_anchors(capsys) -> None:

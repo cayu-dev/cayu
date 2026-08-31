@@ -38,6 +38,19 @@ key carried by the immutable corpus and reject unknown keys. The browser never
 manufactures a live application, credentials, tools, environments, request
 templates, or other execution authority.
 
+A generated project can publish one optional default judge by declaring
+`[tool.cayu.evals.default_judge]` in `pyproject.toml`. The declaration names an
+already-registered provider, exact model, `public-only` or
+`public-and-transcript` privacy, an explicit same-model decision, and bounded
+time/token ceilings. `[tool.cayu.evals].price_book = "bundled-public"` may
+explicitly select Cayu's dated packaged public-rate snapshot; with that
+selection, the judge may also declare a cost threshold and author-first
+launches may narrow candidate spend per trial. Cayu gives the judge a separate
+tool-free application and never infers authority, credentials, or pricing.
+Same-model use remains a separate, labeled operator choice in the suite editor.
+Run `cayu guide evals-ai-quality` for the complete declaration and calibration
+workflow.
+
 New maintained-service factories accept Cayu's opaque project context and pass
 it unchanged to `create_agent_service(...)`. Existing factories remain
 compatible but do not receive automatic assembly until migrated. Use:
@@ -80,6 +93,9 @@ the maintained project-service assembly. Readiness remains a factual gate for
 missing current providers, tools, policies, environments, secrets, fixtures,
 pricing, or execution limits—it is not a requirement to write Evals-specific
 runtime configuration.
+
+For the shortest user paths, run `cayu guide evals-first` or `cayu guide
+evals-production` from the same installed Cayu version as the server.
 
 ## Eject and customize the matching source
 

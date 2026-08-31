@@ -14,7 +14,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Control plane](control-plane.md)
 - [Cost optimization](cost-optimization.md)
 - [Environment factories](environment-factories.md)
-- [Evals](evals.md)
+- Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)
 - [Memory foundation](memory-foundation.md)
 - [Model catalog](model-catalog.md)
 - [Named checks](named-checks.md)

@@ -21,6 +21,18 @@ _GUIDES = {
         "durable-operations.md",
         "Observe, propose, authorize, act once, verify, and recover.",
     ),
+    "evals-ai-quality": (
+        "evals-ai-quality.md",
+        "Rubrics, references, judge authority, calibration, and interpretation.",
+    ),
+    "evals-first": (
+        "evals-first.md",
+        "First Control Plane suite, run, baseline, and comparison.",
+    ),
+    "evals-production": (
+        "evals-production.md",
+        "Production sessions, scenarios, tools, process behavior, and memory.",
+    ),
     "providers": (
         "providers.md",
         "Primary integrations and compatible Chat Completions endpoints.",
@@ -42,9 +54,18 @@ _INCLUDES = {
 _RELATED = {
     "anatomy": ("applications", "authoring", "diagnostics"),
     "applications": ("anatomy", "authoring", "diagnostics", "references"),
-    "authoring": ("anatomy", "tool-effects", "durable-operations", "references"),
+    "authoring": (
+        "anatomy",
+        "tool-effects",
+        "durable-operations",
+        "evals-first",
+        "references",
+    ),
     "diagnostics": ("anatomy", "authoring"),
     "durable-operations": ("tool-effects", "references"),
+    "evals-ai-quality": ("evals-first", "evals-production", "authoring"),
+    "evals-first": ("evals-ai-quality", "evals-production", "authoring"),
+    "evals-production": ("evals-first", "evals-ai-quality", "durable-operations"),
     "providers": ("authoring", "diagnostics"),
     "references": ("authoring", "durable-operations"),
     "structured-output": ("authoring", "diagnostics"),

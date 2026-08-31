@@ -52,7 +52,15 @@ Evals storage before it constructs the server. It reads `[project].name`,
 `[tool.cayu.session_store]` declaration used by session tooling. Development
 may create the project-local `data/cayu.db` default; production without an
 explicit or already-discovered durable store keeps Evals storage gated rather
-than guessing. This does not yet select an executable eval target.
+than guessing. After the application factory returns, Cayu publishes one
+bounded executable eval target per registered agent. An optional
+`[tool.cayu.evals.default_judge]` declaration can also publish one exact,
+tool-free model judge; it must name an already-registered provider, privacy
+policy, same-model decision, and bounded time/token ceilings. An explicit
+`[tool.cayu.evals].price_book = "bundled-public"` selection additionally makes
+the packaged public-rate snapshot available for generated candidate budgets
+and an optional judge cost threshold. Run `cayu guide evals-first` and `cayu
+guide evals-ai-quality` for the operator workflows.
 
 Incomplete-session startup recovery is off by default. Opt in with both a
 bounded status set and an inactivity fence:

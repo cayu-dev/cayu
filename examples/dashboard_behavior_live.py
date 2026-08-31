@@ -1345,7 +1345,8 @@ async def _run_browser_contract(
             "session_detail",
             "captured_evaluation_preview_and_assertion_authoring",
             "scenario_authoring_and_controlled_execution",
-            "authored_eval_suite_creation_and_subset_launch",
+            "authored_eval_suite_creation_duplication_and_subset_launch",
+            "authored_scenario_structured_input",
             "structured_judge_authoring_and_fixed_evidence_calibration",
             "authored_eval_suite_reuse",
             "captured_result_save_and_baseline",
@@ -1825,10 +1826,19 @@ async def _exercise_captured_evaluation(
         "Public artifact text contains (optional)",
         exact=True,
     ).fill('"status":"ready"')
-    await authoring.get_by_role("button", name="Add case", exact=True).click()
     case_list = authoring.get_by_test_id("authored-suite-cases")
     case_id_input = authoring.get_by_test_id("authored-case-id")
     case_name_input = authoring.get_by_test_id("authored-case-name")
+    primary_assertion_count = await authoring.get_by_test_id("promotion-assertion").count()
+    await authoring.get_by_role("button", name="Duplicate", exact=True).click()
+    await expect(case_id_input).to_have_value("authored-primary-copy")
+    await expect(case_name_input).to_have_value("Authored primary behavior copy")
+    await expect(authoring.get_by_test_id("promotion-assertion")).to_have_count(
+        primary_assertion_count
+    )
+    await authoring.get_by_label("Remove case authored-primary-copy", exact=True).click()
+    await expect(case_list.locator('input[type="checkbox"]:checked')).to_have_count(1)
+    await authoring.get_by_role("button", name="Add case", exact=True).click()
     await case_id_input.fill("authored-primary")
     await expect(case_name_input).to_have_value("Case 2")
     await expect(case_list.locator('input[type="checkbox"]:checked')).to_have_count(2)
@@ -1851,6 +1861,11 @@ async def _exercise_captured_evaluation(
     authored_initial_event = authored_scenario.get_by_test_id("scenario-event-0")
     await authored_initial_event.locator("textarea").fill(
         "Exercise one Control Plane-authored multi-stage scenario."
+    )
+    await authored_initial_event.get_by_role("button", name="Add part", exact=True).click()
+    await authored_initial_event.locator("select").last.select_option("json")
+    await authored_initial_event.locator("textarea").last.fill(
+        '{"release":"candidate","structured":true}'
     )
     await authored_scenario.get_by_role("button", name="Check readiness", exact=True).click()
     await expect(
@@ -1880,6 +1895,7 @@ async def _exercise_captured_evaluation(
         "Expected result JSON subset",
         exact=True,
     ).fill('{"structured":{"agent":"dashboard-contract-agent"}}')
+    await authoring.get_by_label("Maximum cost per trial", exact=True).fill("0.1")
     await authoring.get_by_label("Select Case 2 for launch", exact=True).uncheck()
     await authoring.get_by_test_id("authored-suite-preview").click()
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
@@ -1974,6 +1990,10 @@ async def _exercise_captured_evaluation(
         await page.unroute(authored_suite_path, delay_authored_suite_save)
     await authoring.get_by_test_id("authored-suite-run-preview").click()
     await expect(authoring.get_by_text("1 durable run ready", exact=True)).to_be_visible()
+    await expect(authoring.get_by_test_id("authored-suite-exposure")).to_contain_text("0.1 USD")
+    await expect(authoring.get_by_test_id("authored-suite-exposure")).to_contain_text(
+        "candidate cost not hard bounded"
+    )
     await authoring.get_by_test_id("authored-suite-launch").click()
     await expect(
         authoring.get_by_text(
