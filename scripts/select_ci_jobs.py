@@ -7,8 +7,11 @@ from dataclasses import dataclass
 
 _SCOPE_DEFINITION_PATHS = {
     ".github/workflows/ci.yml",
+    "scripts/package_ci_steps.yml",
+    "scripts/run_ci.py",
     "scripts/select_ci_jobs.py",
     "tests/core/test_ci_verification_scope.py",
+    "tests/core/test_local_ci.py",
 }
 _SHARED_DEPENDENCY_PATHS = {
     "pyproject.toml",
@@ -42,9 +45,12 @@ _RELEASE_EXACT_PATHS = {
     "scripts/extract_release_notes.py",
     "scripts/generate_sidecar_manifest.py",
     "scripts/smoke_ejected_dashboard.py",
+    "scripts/smoke_built_wheel_serve.py",
+    "scripts/verify_release_sidecar_artifacts.sh",
     "scripts/verify_release_state.py",
     "src/cayu/_server_contract_version.py",
     "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
+    "tests/cli/test_scaffold_docker_live.py",
     "uv.lock",
 }
 

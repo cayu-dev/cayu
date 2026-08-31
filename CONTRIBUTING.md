@@ -187,6 +187,31 @@ with the command above before it can materially unbalance the shards.
 Release tags rerun every retained gate, add release-only freshness and tag/version checks,
 and may publish the exact artifact validated by that release path.
 
+Run that same retained CI contract locally from a clean tracked checkout:
+
+```bash
+python3 scripts/run_ci.py --base origin/main --head HEAD
+```
+
+The command never fetches, pushes, comments, publishes, or changes remote state. It resolves the
+exact checked-out head, rejects tracked worktree or index changes, and executes that commit in a
+fresh detached worktree. Source untracked paths are recorded but never copied into the execution
+checkout, so they cannot affect imports, test collection, or results attributed to the commit. The
+runner revalidates the detached head and tracked tree before issuing successful proof. It runs the
+hosted lanes with two concurrent general-shard workers and writes
+`/tmp/cayu-local-ci-proof-<sha>.md` with commands, results, durations, pass/skip counts, platform,
+and limitations. Use `--all` to retain every optional PR lane regardless of changed paths. Set
+`--jobs 1` for the lowest local resource usage or increase it up to `--jobs 6` on a dedicated
+machine; specialist, database-conformance, SQLite, dashboard, and package lanes remain serial to
+avoid compounding their resource contention.
+
+Publication policy is intentionally separate from ordinary PR readiness. Only a tagged release
+checkout with exactly one `v*` tag at `HEAD` may add `--publishing`; that mode includes immutable
+tagged-note, source-version, and release-freshness validation. GitHub Actions invokes the same
+canonical lane implementations from `scripts/run_ci.py`. Package commands live in the canonical
+`scripts/package_ci_steps.yml` manifest consumed by that runner; ordinary PR verification records
+the publication-only steps as explicit skips.
+
 ## Pull request process
 
 ### Keep PRs focused

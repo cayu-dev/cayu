@@ -1,0 +1,385 @@
+version: 1
+steps:
+  - name: Verify immutable release state
+    publishing: true
+    run: >-
+      uv run --no-project --offline --no-python-downloads --python 3.11
+      python scripts/verify_release_state.py
+      --notes docs/release-notes.md
+  - name: Check deterministic model catalog
+    run: uv run python -m maintenance.model_catalog.check --skip-staleness
+  - name: Enforce freshness for release artifacts
+    publishing: true
+    run: uv run python -m maintenance.model_catalog.check
+  - name: Check tag matches project version
+    publishing: true
+    run: |
+      uv run --group nightly python - <<'PY'
+      import os
+      import tomllib
+      from pathlib import Path
+
+      from packaging.version import Version
+
+      with Path("pyproject.toml").open("rb") as pyproject:
+          version = tomllib.load(pyproject)["project"]["version"]
+      tag = os.environ["GITHUB_REF_NAME"]
+      if tag != f"v{version}":
+          raise SystemExit(
+              f"tag {tag} does not match pyproject.toml version {version}"
+          )
+      with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+          print(
+              f"prerelease={str(Version(version).is_prerelease).lower()}",
+              file=output,
+          )
+      PY
+  - name: Build first release archive
+    run: uv build --out-dir dist/first
+  - name: Build second release archive
+    run: uv build --out-dir dist/second
+  - name: Check reproducible archives
+    run: |
+      cmp dist/first/*.tar.gz dist/second/*.tar.gz
+      cmp dist/first/*.whl dist/second/*.whl
+  - name: Check release archive contents
+    run: uv run python scripts/check_release_artifacts.py dist/first/*
+  - name: Create base release environment
+    run: uv venv --python 3.11 .release-venv
+  - name: Install built wheel
+    run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+  - name: Check every packaged guide from the built wheel
+    run: |
+      .release-venv/bin/python - <<'PY'
+      import subprocess
+      from cayu.cli.guide import _GUIDES
+
+      for topic in _GUIDES:
+          subprocess.run([".release-venv/bin/cayu", "guide", topic], check=True)
+      PY
+  - name: Create all-extras release environment
+    run: uv venv --python 3.11 .release-all-venv
+  - name: Install and import the built wheel with all runtime extras
+    run: |
+      wheel="$(realpath dist/first/*.whl)"
+      uv pip install --python .release-all-venv/bin/python "cayu[all] @ file://${wheel}"
+      .release-all-venv/bin/python - <<'PY'
+      import awscrt.auth
+      import boto3
+      import microsandbox
+      from cayu.runners.microsandbox import MicrosandboxRunner
+
+      assert boto3 is not None
+      assert awscrt.auth is not None
+      assert microsandbox is not None
+      assert MicrosandboxRunner is not None
+      PY
+  - name: Check built-wheel Cayu Cloud CLI contract
+    run: |
+      .release-venv/bin/cayu cloud --help >/dev/null
+      if output="$(.release-venv/bin/cayu cloud env set --secret 2>&1)"; then
+        echo "invalid Cayu Cloud command unexpectedly succeeded"
+        exit 1
+      fi
+      CAYU_CLOUD_ERROR_JSON="$output" .release-venv/bin/python - <<'PY'
+      import json
+      import os
+
+      payload = json.loads(os.environ["CAYU_CLOUD_ERROR_JSON"])
+      assert payload == {
+          "error": {
+              "category": "invalid_input",
+              "message": (
+                  "the following arguments are required: assignment, --application"
+              ),
+          },
+          "ok": False,
+      }
+      PY
+  - name: Create server release environment
+    run: uv venv --python 3.11 .release-server-venv
+  - name: Install built wheel with server extra
+    run: |
+      for wheel_path in dist/first/*.whl; do
+        uv pip install --python .release-server-venv/bin/python "${wheel_path}[server,browser]"
+      done
+  - name: Install release Playwright Chromium
+    run: .release-server-venv/bin/playwright install --with-deps chromium
+  - name: Smoke-test protected cayu serve from the built wheel
+    run: .release-server-venv/bin/python scripts/smoke_built_wheel_serve.py
+  - name: Verify the installed-wheel dashboard-to-local eval journey
+    run: |
+      unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+      unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+      .release-server-venv/bin/python examples/dashboard_behavior_live.py
+  - name: Verify editable dashboard source from installed release artifacts
+    run: |
+      uv venv --python 3.11 .release-sdist-venv
+      uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
+      proof_root="$(mktemp -d "$RUNNER_TEMP/dashboard-source.XXXXXX")"
+      .release-venv/bin/cayu dashboard eject "$proof_root/wheel-dashboard"
+      .release-sdist-venv/bin/cayu dashboard eject "$proof_root/sdist-dashboard"
+      diff -ru "$proof_root/wheel-dashboard" "$proof_root/sdist-dashboard"
+      cd "$proof_root/wheel-dashboard"
+      node -e 'const scripts = require("./package.json").scripts; if (scripts["build:package"]) process.exit(1)'
+      npm ci
+      npm run lint
+      npm run test
+      npm run typecheck
+      ln -s "$GITHUB_WORKSPACE/.release-server-venv" "$proof_root/python venv with spaces"
+      CAYU_PYTHON="$proof_root/python venv with spaces/bin/python" npm run check:api
+      npm run build
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+        "$GITHUB_WORKSPACE/scripts/check_ejected_dashboard_build.py" dist
+      "$GITHUB_WORKSPACE/.release-server-venv/bin/python" \
+        "$GITHUB_WORKSPACE/scripts/smoke_ejected_dashboard.py" dist
+  - name: Check bundled model catalog and price book from the installed wheel
+    run: |
+      .release-venv/bin/python - <<'PY'
+      import cayu
+
+      catalog = cayu.default_model_catalog()
+      price_book = cayu.default_price_book()
+      assert cayu.__name__ == "cayu"
+      assert catalog.models
+      assert price_book.prices
+      for model in catalog.models:
+          assert catalog.match(
+              provider_name=model.provider_name,
+              model=model.model,
+          ) == model
+          for prefix in model.match_prefixes:
+              assert catalog.resolve(
+                  provider_name=model.provider_name,
+                  model=f"{prefix}fixture",
+              ) == model
+      PY
+  - name: Verify installed wheel and source-distribution sidecar exports
+    run: bash scripts/verify_release_sidecar_artifacts.sh
+  - name: Check built-wheel authoring contract
+    run: |
+      uv pip install --python .release-venv/bin/python pytest
+      .release-venv/bin/python -m cayu version
+      project_root="$(mktemp -d "$RUNNER_TEMP/authoring.XXXXXX")"
+      .release-venv/bin/cayu new proof --dir "$project_root"
+      cd "$project_root/proof"
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" run.py --help >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide anatomy >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide authoring >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" guide tool-effects >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" -c 'from cayu.testing import verify_tool_effect'
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      import run
+      from app import build_app
+      from cayu import ModelStreamEvent, ScriptedModelProvider
+
+      provider = ScriptedModelProvider([
+          ModelStreamEvent.text_delta("ready"),
+          ModelStreamEvent.completed({"finish_reason": "stop"}),
+      ])
+      run.build_app = lambda **_kwargs: build_app(provider=provider)
+      assert run.main(["--message", "Run the agent."]) == 0
+      PY
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      import run
+      from app import build_app
+      from cayu import ModelStreamEvent, ScriptedModelProvider
+
+      provider = ScriptedModelProvider([
+          ModelStreamEvent.text_delta("reviewed"),
+          ModelStreamEvent.completed({"finish_reason": "stop"}),
+      ])
+      run.build_app = lambda **_kwargs: build_app(provider=provider)
+      assert run.main([
+          "--agent", "reviewer", "--message", "Review the change."
+      ]) == 0
+      assert len(provider.requests) == 1
+      PY
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" generate slice reviewer --tool assess_submission --effect none --json > repeated-plan.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      import json
+      from pathlib import Path
+
+      from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
+
+      repeated = json.loads(Path("repeated-plan.json").read_text())
+      assert repeated["schema_version"] == APP_MANIFEST_SCHEMA_VERSION
+      assert repeated["status"] == "already_present"
+      assert repeated["edits"] == []
+
+      agent = Path("agents/reviewer.py")
+      source = agent.read_text()
+      source = source.replace(
+          "when it directly answers the user's request",
+          "to assess the submitted proposal against the domain rubric",
+      )
+      agent.write_text(source)
+      PY
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --agent reviewer --json > unfinished-inspect.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json > unfinished-check.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      import json
+      from pathlib import Path
+
+      from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
+
+      inspect = json.loads(Path("unfinished-inspect.json").read_text())
+      assert inspect["schema_version"] == APP_MANIFEST_SCHEMA_VERSION
+      assert inspect["agents"][0]["authoring_state"] == (
+          "unfinished_generated_tracer_bullet"
+      )
+      check = json.loads(Path("unfinished-check.json").read_text())
+      assert [item["code"] for item in check["diagnostics"]] == [
+          "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"
+      ]
+      PY
+      if "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --fail-on warning --json > warning-gate.json; then
+        echo "unfinished generated slice unexpectedly passed the warning gate"
+        exit 1
+      fi
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run evals.reviewer:build_eval >/dev/null
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      from pathlib import Path
+
+      path = Path("agents/reviewer.py")
+      source = path.read_text()
+      marker = (
+          "    authoring_state="
+          "AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET,\n"
+      )
+      assert marker in source
+      source = source.replace("AgentAuthoringState, ", "").replace(marker, "")
+      source += "\n# Completed source may still mention sample, echo, or tracer bullet.\n"
+      path.write_text(source)
+      PY
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --fail-on warning --json > completed-check.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      import json
+      from pathlib import Path
+
+      check = json.loads(Path("completed-check.json").read_text())
+      assert check["diagnostics"] == []
+      PY
+      coding_root="$(mktemp -d "$RUNNER_TEMP/coding.XXXXXX")"
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-coding \
+        --composition coding --dir "$coding_root"
+      cd "$coding_root/proof-coding"
+      unset CAYU_PROVIDER CAYU_MODEL OPENAI_API_KEY ANTHROPIC_API_KEY \
+        OPENROUTER_API_KEY
+      test -z "$(git status --porcelain)"
+      test "$(git log -1 --format=%s)" = 'Initial Cayu coding composition'
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json > coding-inspect.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json > coding-check.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+      import json
+      from pathlib import Path
+
+      inspect = json.loads(Path("coding-inspect.json").read_text())
+      assert {agent["name"] for agent in inspect["agents"]} == {
+          "proof-coding",
+          "proof-coding-reviewer",
+      }
+      primary = next(
+          agent for agent in inspect["agents"] if agent["name"] == "proof-coding"
+      )
+      assert {tool["name"] for tool in primary["tools"]} >= {
+          "search_text",
+          "git_changes",
+          "remember_knowledge",
+          "subagent",
+          "subagent_result",
+          "ask_user",
+      }
+      assert inspect["defaults"]["environment"] == "coding"
+      assert inspect["stores"]["knowledge"] == "SQLiteKnowledgeStore"
+      check = json.loads(Path("coding-check.json").read_text())
+      assert check["diagnostics"] == []
+      PY
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+        -m pytest -q tests/test_coding_composition.py
+      docker_coding_root="$(mktemp -d "$RUNNER_TEMP/docker-coding.XXXXXX")"
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-docker-coding \
+        --composition coding --coding-execution docker \
+        --dir "$docker_coding_root"
+      cd "$docker_coding_root/proof-docker-coding"
+      unset CAYU_PROVIDER CAYU_MODEL OPENAI_API_KEY ANTHROPIC_API_KEY \
+        OPENROUTER_API_KEY
+      test -z "$(git status --porcelain)"
+      test "$(git log -1 --format=%s)" = 'Initial Cayu coding composition'
+      test -f Dockerfile.coding
+      test -f docker-coding-build.json
+      test -f docker-coding-image.json
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+        -m pytest -q tests/test_coding_composition.py
+      openrouter_root="$(mktemp -d "$RUNNER_TEMP/openrouter.XXXXXX")"
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-openrouter \
+        --provider openrouter --dir "$openrouter_root"
+      cd "$openrouter_root/proof-openrouter"
+      unset CAYU_PROVIDER CAYU_MODEL OPENROUTER_API_KEY \
+        OPENROUTER_HTTP_REFERER OPENROUTER_APP_TITLE \
+        OPENROUTER_ROUTER_METADATA
+      "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
+      "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
+  - name: Check built-wheel generated Docker coding contract
+    run: |
+      wheel="$(realpath dist/first/*.whl)"
+      live_test_root="$(mktemp -d "$RUNNER_TEMP/docker-live.XXXXXX")"
+      cp tests/cli/test_scaffold_docker_live.py "$live_test_root/"
+      cd "$live_test_root"
+      unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY \
+        OPENROUTER_API_KEY
+      CAYU_DOCKER_GENERATED_CODING_WHEEL="$wheel" \
+      CAYU_REQUIRE_GENERATED_DOCKER_CODING=1 \
+        "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+        -m pytest -q test_scaffold_docker_live.py
+  - name: Check built-wheel secure public-service contract
+    run: |
+      uv pip install --python .release-server-venv/bin/python pytest 'ruff>=0.15.15,<0.16'
+      service_root="$(mktemp -d "$RUNNER_TEMP/service.XXXXXX")"
+      .release-server-venv/bin/cayu new proof-service \
+        --template service --dir "$service_root"
+      cd "$service_root/proof-service"
+      unset PYTHONPATH
+      export PRODUCT_AUTH_TOKENS_JSON='{"customer-token":{"tenant_id":"tenant-a","subject_id":"alice"}}'
+      export CAYU_OPERATOR_BEARER_TOKEN='operator-token'
+      "$GITHUB_WORKSPACE/.release-server-venv/bin/cayu" \
+        check --deploy --fail-on warning --json > deployment-check.json
+      "$GITHUB_WORKSPACE/.release-server-venv/bin/python" - <<'PY'
+      import json
+      from pathlib import Path
+
+      report = json.loads(Path("deployment-check.json").read_text())
+      assert report["diagnostics"] == []
+      assert report["service_evidence"] == {
+          "application_security": "generated_suite_required",
+          "configuration": "supported",
+          "control_plane_access": "verified_authenticated",
+          "host_owned_behavior": "unverified_outside_contract",
+          "security_verification_command": (
+              "pytest -q tests/test_public_service_security.py"
+          ),
+          "service_contract": "verified_maintained",
+      }
+      PY
+      "$GITHUB_WORKSPACE/.release-server-venv/bin/python" \
+        -m pytest -q tests/test_public_service_security.py
+      "$GITHUB_WORKSPACE/.release-server-venv/bin/ruff" check .
+      "$GITHUB_WORKSPACE/.release-server-venv/bin/ruff" format --check .
+  - name: Check optional console command
+    run: .release-venv/bin/cayu console --help
+  - name: Check optional console dependency guidance
+    run: |
+      if output="$(.release-venv/bin/cayu console cayu.runtime.app:CayuApp 2>&1)"; then
+        echo "console unexpectedly started without the console extra"
+        exit 1
+      fi
+      test "$output" = 'error: Cayu console requires IPython. Install it with: pip install "cayu[console]"'
+  - name: Check installed CLI version
+    run: |
+      expected_version="$(.release-venv/bin/python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+      test "$(.release-venv/bin/cayu version)" = "cayu ${expected_version}"

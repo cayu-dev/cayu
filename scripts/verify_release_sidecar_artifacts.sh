@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repository_root="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must name the checked-out repository}"
-proof_root="$(mktemp -d)"
+proof_root="$(mktemp -d "$RUNNER_TEMP/sidecar.XXXXXX")"
 cd "$proof_root"
 unset PYTHONPATH
 

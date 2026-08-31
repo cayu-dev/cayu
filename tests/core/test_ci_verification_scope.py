@@ -77,6 +77,9 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
     assert select_pull_request_jobs(["examples/dashboard_behavior_live.py"]) == expected
     assert select_pull_request_jobs(["scripts/extract_release_notes.py"]) == expected
     assert select_pull_request_jobs(["scripts/verify_release_state.py"]) == expected
+    assert select_pull_request_jobs(["scripts/smoke_built_wheel_serve.py"]) == expected
+    assert select_pull_request_jobs(["scripts/verify_release_sidecar_artifacts.sh"]) == expected
+    assert select_pull_request_jobs(["tests/cli/test_scaffold_docker_live.py"]) == expected
     assert select_pull_request_jobs(
         ["src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"]
     ) == VerificationScope(
@@ -104,7 +107,10 @@ def test_dependency_or_scope_changes_fail_open() -> None:
     )
     assert select_pull_request_jobs(["pyproject.toml"]) == all_jobs
     assert select_pull_request_jobs([".github/workflows/ci.yml"]) == all_jobs
+    assert select_pull_request_jobs(["scripts/package_ci_steps.yml"]) == all_jobs
+    assert select_pull_request_jobs(["scripts/run_ci.py"]) == all_jobs
     assert select_pull_request_jobs(["scripts/select_ci_jobs.py"]) == all_jobs
+    assert select_pull_request_jobs(["tests/core/test_local_ci.py"]) == all_jobs
 
 
 def test_github_outputs_are_stable_lowercase_booleans() -> None:

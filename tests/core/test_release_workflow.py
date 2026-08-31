@@ -5,6 +5,8 @@ from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
 _CI_WORKFLOW = _REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+_CI_RUNNER = _REPOSITORY_ROOT / "scripts" / "run_ci.py"
+_PACKAGE_MANIFEST = _REPOSITORY_ROOT / "scripts" / "package_ci_steps.yml"
 _TAG_VERIFIER = _REPOSITORY_ROOT / ".github" / "actions" / "verify-release-tag" / "action.yml"
 _RELEASE_RUNBOOK = _REPOSITORY_ROOT / "docs" / "releasing.md"
 _SIDECAR_VERIFIER = _REPOSITORY_ROOT / "scripts" / "verify_release_sidecar_artifacts.sh"
@@ -86,32 +88,29 @@ def test_pull_requests_and_main_run_the_core_workers_with_selected_high_value_ga
 
 def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     workflow = _CI_WORKFLOW.read_text()
+    runner = _CI_RUNNER.read_text()
     shards = _job_block(workflow, "test_shards")
     specialists = _job_block(workflow, "test_specialists")
 
     assert "github.event_name == 'pull_request'" not in shards
     assert "timeout-minutes: 30" in shards
     assert "shard: [1, 2, 3, 4, 5, 6]" in shards
-    assert "--splits 6" in shards
-    assert '--group "${{ matrix.shard }}"' in shards
-    assert "--splitting-algorithm least_duration" in shards
-    assert "pytest -q" in shards
-    assert "-n 2" not in shards
-    assert '-m "not (stress or process or postgres)"' in shards
-    assert "--cov" not in shards
-    assert "COVERAGE_FILE" not in shards
+    assert 'scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"' in shards
+    assert '"not (stress or process or postgres)"' in runner
+    assert '"--splitting-algorithm",\n            "least_duration"' in runner
+    assert '"--splits",\n            "6"' in runner
+    assert "-n 2" not in runner
+    assert "--cov" not in runner
+    assert "COVERAGE_FILE" not in runner
     assert "uses: actions/upload-artifact@" not in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
     assert "timeout-minutes: 30" in specialists
-    assert "lane: stress-process" in specialists
-    assert 'marker: "stress or process"' in specialists
-    assert specialists.count('marker: "postgres and not (stress or process)"') == 2
-    assert "lane: postgres-conformance-1" in specialists
-    assert "lane: postgres-conformance-2" in specialists
-    assert '-m "${{ matrix.marker }}"' in specialists
-    assert '--splits "${{ matrix.splits }}"' in specialists
-    assert '--group "${{ matrix.group }}"' in specialists
+    assert "lane: [stress-process, postgres-conformance-1, postgres-conformance-2]" in specialists
+    assert "scripts/run_ci.py --lane specialist" in specialists
+    assert '--specialist-lane "${{ matrix.lane }}"' in specialists
+    assert '"stress-process": ("stress or process", 1, 1)' in runner
+    assert runner.count('"postgres and not (stress or process)", 2,') == 2
     assert "--cov" not in specialists
     assert "COVERAGE_FILE" not in specialists
     assert "uses: actions/upload-artifact@" not in specialists
@@ -164,6 +163,7 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
 
 def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     workflow = _CI_WORKFLOW.read_text()
+    package_manifest = _PACKAGE_MANIFEST.read_text()
     package = _job_block(workflow, "package")
     publish = _job_block(workflow, "publish")
     github_release = _job_block(workflow, "github-release")
@@ -182,15 +182,14 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "if: startsWith(github.ref, 'refs/tags/v')" in github_release
     assert "needs: [publish, package]" in github_release
 
-    assert "prerelease: ${{ steps.release-version.outputs.prerelease }}" in package
-    assert "id: release-version" in package
-    assert "Version(version).is_prerelease" in package
-    release_step = package.index("name: Check tag matches project version")
-    release_version = package.index("id: release-version")
-    release_run = package.index("run: |", release_version)
-    assert "if: startsWith(github.ref, 'refs/tags/v')" in package[release_step:release_run]
+    assert "prerelease: ${{ steps.release-package.outputs.prerelease }}" in package
+    assert "id: release-package" in package
+    assert "python3 scripts/run_ci.py --lane package" in package
+    assert "publishing=(--publishing)" in package
+    assert "Version(version).is_prerelease" in package_manifest
+    assert "publishing: true\n    run: |\n      uv run --group nightly" in package_manifest
     upload = package.index("name: Upload release distribution")
-    assert package.index("name: Check installed CLI version") < upload
+    assert package.index("python3 scripts/run_ci.py --lane package") < upload
     assert "if: startsWith(github.ref, 'refs/tags/v')" in package[upload : upload + 160]
     assert "name: release-dist" in package[upload:]
     assert "path: dist/first/" in package[upload:]
@@ -219,20 +218,24 @@ def test_github_release_uses_curated_notes_for_the_exact_tag() -> None:
 
 def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
     package = _job_block(_CI_WORKFLOW.read_text(), "package")
+    package_manifest = _PACKAGE_MANIFEST.read_text()
 
     checkout = package.index("uses: actions/checkout@")
     setup = package.index("uses: astral-sh/setup-uv@")
     assert "fetch-depth: 0" in package[checkout:setup]
-    assert "uv run --no-project" in package
-    assert "--offline" in package
-    assert "--no-python-downloads" in package
-    assert "--python 3.11" in package
-    assert "python scripts/verify_release_state.py" in package
-    assert "--notes docs/release-notes.md" in package
+    assert "python3 scripts/run_ci.py --lane package" in package
+    assert "uv run --no-project" in package_manifest
+    assert "--offline" in package_manifest
+    assert "--no-python-downloads" in package_manifest
+    assert "--python 3.11" in package_manifest
+    assert "python scripts/verify_release_state.py" in package_manifest
+    assert "--notes docs/release-notes.md" in package_manifest
 
 
 def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None:
     workflow = _CI_WORKFLOW.read_text()
+    runner = _CI_RUNNER.read_text()
+    package_manifest = _PACKAGE_MANIFEST.read_text()
     sqlite = _job_block(workflow, "sqlite-cancellation")
     package = _job_block(workflow, "package")
     dashboard = _job_block(workflow, "dashboard")
@@ -244,31 +247,33 @@ def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None
     assert "needs: verification-scope" in dashboard
     assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
 
-    assert "test_final_workspace_observer_restores_caller_cancellation_requests" in sqlite
-    assert "test_delegated_stream_close_counts_checkpoint_cancellation_once" in sqlite
-    assert "test_delegated_stream_close_distinguishes_restored_and_late_cancellation" in sqlite
+    assert "scripts/run_ci.py --lane sqlite-cancellation" in sqlite
+    assert "test_final_workspace_observer_restores_caller_cancellation_requests" in runner
+    assert "test_delegated_stream_close_counts_checkpoint_cancellation_once" in runner
+    assert "test_delegated_stream_close_distinguishes_restored_and_late_cancellation" in runner
     sidecar_verifier_command = "bash scripts/verify_release_sidecar_artifacts.sh"
-    assert package.count(sidecar_verifier_command) == 1
+    assert package_manifest.count(sidecar_verifier_command) == 1
+    assert "docker/setup-qemu-action@" in package
+    assert "python3 scripts/run_ci.py --lane package" in package
 
     sidecar_verifier = _SIDECAR_VERIFIER.read_text()
     assert sidecar_verifier.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
+    assert 'mktemp -d "$RUNNER_TEMP/sidecar.XXXXXX"' in sidecar_verifier
     assert sidecar_verifier.count("lambda-microvm sidecar export") == 3
     assert "docker build --platform linux/arm64" in sidecar_verifier
     assert "docker run --rm --platform linux/arm64" in sidecar_verifier
+    assert "mktemp -d)" not in package_manifest
+    assert package_manifest.count('mktemp -d "$RUNNER_TEMP/') == 7
 
     for preserved_check in (
         "Verify the installed-wheel dashboard-to-local eval journey",
         "Check built-wheel generated Docker coding contract",
         "Check built-wheel secure public-service contract",
     ):
-        check_offset = package.index(preserved_check)
-        assert (
-            "if: github.event_name != 'pull_request'"
-            not in package[check_offset : check_offset + 180]
-        )
+        check_offset = package_manifest.index(preserved_check)
+        assert "publishing: true" not in package_manifest[check_offset : check_offset + 180]
 
-    sidecar_offset = package.index("Verify installed wheel and source-distribution sidecar exports")
-    assert (
-        "if: github.event_name != 'pull_request'"
-        not in package[sidecar_offset : sidecar_offset + 180]
+    sidecar_offset = package_manifest.index(
+        "Verify installed wheel and source-distribution sidecar exports"
     )
+    assert "publishing: true" not in package_manifest[sidecar_offset : sidecar_offset + 180]
