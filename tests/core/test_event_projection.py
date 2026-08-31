@@ -102,6 +102,75 @@ def test_event_equality_uses_only_public_durable_fields() -> None:
     assert event != event.model_copy(update={"payload": {"value": 2}})
 
 
+def test_provider_cancellation_projection_copies_diagnostics_before_validation(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "hostile-provider-cancellation-diagnostic-canary"
+
+    class HostileKey:
+        def __init__(self) -> None:
+            self.armed = False
+
+        def __hash__(self) -> int:
+            if self.armed:
+                raise RuntimeError(canary)
+            return 1
+
+        def __eq__(self, other: object) -> bool:
+            del other
+            if self.armed:
+                raise RuntimeError(canary)
+            return False
+
+        def __repr__(self) -> str:
+            return canary
+
+        def __str__(self) -> str:
+            return canary
+
+    hostile_key = HostileKey()
+    malformed_failure = {hostile_key: "invalid"}
+    hostile_key.armed = True
+    valid = Event(
+        type=EventType.SESSION_INTERRUPTED,
+        session_id="provider-diagnostic-copy-boundary",
+        payload={
+            "interruption_type": "runtime_interrupted",
+            "interruption_request_id": "provider-diagnostic-copy-boundary-request",
+        },
+    )
+    forged = valid.model_copy(
+        update={
+            "payload": {
+                **valid.payload,
+                "provider_cancellation_failures": [malformed_failure],
+            }
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Provider cancellation event diagnostics are invalid",
+    ) as exc_info:
+        prepare_new_runtime_event(forged, redactor=SecretRedactor())
+    projected = project_persisted_runtime_event(
+        forged,
+        sequence=1,
+        redactor=SecretRedactor(),
+    )
+
+    assert "provider_cancellation_failures" not in projected.payload
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(projected.payload)
+    captured = capsys.readouterr()
+    assert canary not in retained
+    assert canary not in caplog.text
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(warning.message) for warning in recwarn)
+
+
 def test_non_secret_turn_interaction_ids_match_public_event_envelopes() -> None:
     interaction_id = "ordinary-interaction"
     event = Event(

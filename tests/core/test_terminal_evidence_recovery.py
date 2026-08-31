@@ -19,12 +19,78 @@ from cayu.runtime import (
     SessionStatus,
     TerminalEventPublicationUncertain,
 )
+from cayu.runtime._terminal_evidence import (
+    require_interruption_event_matches_pending_marker,
+)
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.runtime.sessions import _checkpoint_with_session_run_operation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("interruption_type", "operator_requested"),
+        ("reason", "different reason"),
+        ("abandoned", False),
+    ],
+)
+def test_interrupted_event_readback_requires_every_marker_owned_field(
+    field: str,
+    conflicting_value: object,
+) -> None:
+    marker = {
+        "interruption_request_id": "interrupt-provider-cancellation",
+        "interruption_type": "runtime_interrupted",
+        "reason": "provider cancellation",
+        "abandoned": True,
+        "provider_cancellation_failures": [
+            {
+                "phase": "model_stream",
+                "error": "Model provider stream failed before cancellation.",
+                "error_type": "ModelProviderStreamError",
+            }
+        ],
+    }
+    payload = {**marker, field: conflicting_value, "runtime_owned_extra": True}
+
+    with pytest.raises(RuntimeError, match="conflicts with the pending marker"):
+        require_interruption_event_matches_pending_marker(
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id="sess_conflicting_interrupt_readback",
+                payload=payload,
+            ),
+            marker,
+        )
+
+
+def test_interrupted_event_readback_allows_runtime_owned_payload_extensions() -> None:
+    marker = {
+        "interruption_request_id": "interrupt-provider-cancellation",
+        "interruption_type": "runtime_interrupted",
+        "reason": "provider cancellation",
+        "abandoned": True,
+        "provider_cancellation_failures": [
+            {
+                "phase": "model_stream",
+                "error": "Model provider stream failed before cancellation.",
+                "error_type": "ModelProviderStreamError",
+            }
+        ],
+    }
+
+    require_interruption_event_matches_pending_marker(
+        Event(
+            type=EventType.SESSION_INTERRUPTED,
+            session_id="sess_exact_interrupt_readback",
+            payload={**marker, "runtime_owned_extra": True},
+        ),
+        marker,
+    )
 
 
 def test_terminal_publication_uncertainty_preserves_both_failure_chains(
@@ -400,6 +466,58 @@ def test_cayu_app_terminal_evidence_repair_recognizes_event_before_marker_cleanu
         assert await store.load_checkpoint(session_id) == {
             CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION
         }
+
+    asyncio.run(scenario())
+
+
+def test_provider_cancellation_recovery_rejects_conflicting_marker_owned_payload() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        session_id = "sess_provider_interrupt_conflicting_terminal_evidence"
+        pending_payload = {
+            "reason": "provider cancellation",
+            "abandoned": True,
+            "interruption_type": "runtime_interrupted",
+            "interruption_request_id": "interrupt-provider-conflict",
+            "provider_cancellation_failures": [
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                }
+            ],
+        }
+        await store.create(
+            RunRequest(
+                agent_name="removed_agent",
+                session_id=session_id,
+                messages=[Message.text("user", "finish")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await store.checkpoint(
+            session_id,
+            {"pending_session_interrupt": pending_payload},
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=session_id,
+                payload={**pending_payload, "reason": "conflicting reason"},
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="conflicts with the pending marker"):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["pending_session_interrupt"] == pending_payload
 
     asyncio.run(scenario())
 

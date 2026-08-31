@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_clean_nonblank
 from cayu.core.events import Event, EventType
 
 TERMINAL_EVIDENCE_QUERY_LIMIT = 2
@@ -43,6 +43,26 @@ def interruption_request_id_from_payload(payload: dict[str, Any]) -> str | None:
     if type(request_id) is not str or not request_id.strip():
         raise ValueError("Interruption request ID must be a non-blank string.")
     return request_id
+
+
+def require_interruption_event_matches_pending_marker(
+    event: Event,
+    marker: dict[str, Any],
+) -> None:
+    """Require every marker-owned field to survive terminal publication exactly.
+
+    Terminal publication may add runtime-owned fields, so the event payload can
+    be a strict superset. The pending marker is the durable authority for every
+    field it does own, however, and acknowledgement readback must not clear it
+    after accepting a conflicting sibling value.
+    """
+
+    if event.type is not EventType.SESSION_INTERRUPTED:
+        raise RuntimeError("Published interruption evidence does not match the pending marker.")
+    expected = copy_durable_json_object(marker, "pending session interrupt marker")
+    actual = copy_durable_json_object(event.payload, "published interruption payload")
+    if any(key not in actual or actual[key] != value for key, value in expected.items()):
+        raise RuntimeError("Published interruption evidence conflicts with the pending marker.")
 
 
 def classify_current_terminal_evidence(

@@ -35,6 +35,7 @@ from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
+import cayu.providers._credential_boundary as credential_boundary_module
 import cayu.runtime._environment_lifecycle as environment_lifecycle_module
 import cayu.runtime._model_completion_publication as model_completion_publication_module
 import cayu.runtime._model_step_executor as model_step_executor_module
@@ -49,6 +50,7 @@ import cayu.runtime.context as runtime_context_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
+from cayu._exception_groups import iter_exception_tree
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     FileAttachmentKind,
@@ -12889,7 +12891,9 @@ def test_cayu_app_drops_custom_billing_hook_credentials(
 
 
 @pytest.mark.parametrize("stage", ["request", "completion"])
-def test_cayu_app_drops_custom_billing_hook_cancellation_credentials(stage: str) -> None:
+def test_cayu_app_classifies_provider_created_billing_cancellation_as_failure(
+    stage: str,
+) -> None:
     canary = f"provider-custom-billing-cancel-{stage}-canary-0123456789"
 
     def credential_cancellation() -> asyncio.CancelledError:
@@ -12926,39 +12930,1496 @@ def test_cayu_app_drops_custom_billing_hook_cancellation_credentials(stage: str)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    with pytest.raises(asyncio.CancelledError) as exc_info:
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_custom_billing_cancel_{stage}",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    retained = json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True)
+    assert canary not in retained
+    assert events[-1].type == EventType.SESSION_FAILED
+    if stage == "request":
+        failure_payload = next(
+            event.payload for event in events if event.type == EventType.MODEL_ERROR
+        )
+    else:
+        completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+        failure_payload = completed.payload["completion_error"]
+    assert failure_payload["error"] == "Model provider billing identity resolution failed"
+    assert failure_payload["provider_error_type"] == "BillingIdentityResolutionError"
+
+
+def test_cayu_app_classifies_grouped_provider_cancellation_without_task_request_as_failure() -> (
+    None
+):
+    canary = "provider-grouped-synthetic-cancellation-canary"
+
+    class GroupedCancellingBillingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.cancellation_count: int | None = None
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            del request
+            task = asyncio.current_task()
+            self.cancellation_count = None if task is None else task.cancelling()
+            raise BaseExceptionGroup(
+                "provider group",
+                [asyncio.CancelledError(f"synthetic cancellation near {canary}")],
+            )
+
+    provider = GroupedCancellingBillingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_grouped_synthetic_billing_cancel",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.cancellation_count == 0
+    assert events[-1].type == EventType.SESSION_FAILED
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["error"] == "Model provider billing identity resolution failed"
+    retained = json.dumps(
+        [event.model_dump(mode="json") for event in events],
+        sort_keys=True,
+    )
+    assert canary not in retained
+
+
+def test_cayu_app_does_not_authenticate_historical_cancellation_as_billing_authority() -> None:
+    class CancellingBillingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.child_cancellation_count: int | None = None
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            del request
+            task = asyncio.current_task()
+            self.child_cancellation_count = None if task is None else task.cancelling()
+            raise asyncio.CancelledError("provider-created cancellation")
+
+    provider = CancellingBillingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run() -> tuple[list[Event], int, bool]:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel("already handled")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        assert task.cancelling() == 1
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_historical_billing_cancellation",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+        await asyncio.sleep(0)
+        return events, task.cancelling(), task.cancelled()
+
+    events, cancellation_count, cancelled = asyncio.run(run())
+
+    assert provider.child_cancellation_count == 0
+    assert cancellation_count == 1
+    assert cancelled is False
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
+
+
+def test_cayu_app_preserves_caller_cancellation_during_provider_stream_cleanup(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "provider-stream-cleanup-cancel-canary"
+
+    class FailingCloseIterator:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.close_started = asyncio.Event()
+            self.cleanup_release = threading.Event()
+            self.cleanup_finished = threading.Event()
+
+        def __aiter__(self) -> FailingCloseIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.reads += 1
+            if self.reads == 1:
+                return ModelStreamEvent.text_delta("partial")
+            raise RuntimeError(f"provider stream failed near {canary}")
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+
+            def physical_cleanup() -> None:
+                self.cleanup_release.wait()
+                self.cleanup_finished.set()
+                raise RuntimeError(f"cleanup failed near {canary}")
+
+            await asyncio.to_thread(physical_cleanup)
+
+    class StreamCollisionProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = FailingCloseIterator()
+            self.requests = 0
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            return self.iterator
+
+    async def run() -> None:
+        provider = StreamCollisionProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        live_events: list[Event] = []
+
+        async def consume() -> None:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_stream_cleanup_cancel",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                live_events.append(event)
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=2)
+        task.cancel("caller cancelled provider cleanup")
+        assert task.cancelling() == 1
+        caught = False
+        caught_cancellation: asyncio.CancelledError | None = None
+        try:
+            await task
+        except asyncio.CancelledError as exc:
+            caught = True
+            caught_cancellation = exc
+            assert BaseException.__dict__["args"].__get__(exc, BaseException) == (
+                "Provider stream cleanup cancelled",
+            )
+        assert caught is True
+        assert caught_cancellation is not None
+        assert caught_cancellation.__cause__ is None
+        assert caught_cancellation.__context__ is None
+        retained_cancellation = (
+            str(caught_cancellation) + repr(caught_cancellation) + repr(vars(caught_cancellation))
+        )
+        assert canary not in retained_cancellation
+        captured = traceback.TracebackException.from_exception(
+            caught_cancellation,
+            capture_locals=True,
+        )
+        cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+        assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        assert provider.iterator.cleanup_finished.is_set() is False
+        assert provider.requests == 1
+        assert EventType.MODEL_ERROR not in {event.type for event in live_events}
+        assert EventType.SESSION_FAILED not in {event.type for event in live_events}
+
+        session_id = "sess_stream_cleanup_cancel"
+        session = await app.session_store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        events = [record.event for record in records]
+        event_types = {event.type for event in events}
+        assert EventType.MODEL_ERROR not in event_types
+        assert EventType.SESSION_FAILED not in event_types
+        interrupted_events = [
+            event for event in events if event.type == EventType.SESSION_INTERRUPTED
+        ]
+        assert len(interrupted_events) == 1
+        interrupted = interrupted_events[0]
+        assert interrupted.payload["provider_cancellation_failures"] == [
+            {
+                "phase": "model_stream",
+                "error": "Model provider stream failed before cancellation.",
+                "error_type": "ModelProviderStreamError",
+            },
+            {
+                "phase": "provider_stream_cleanup",
+                "error": "Provider stream cleanup did not complete normally.",
+                "error_type": "ProviderStreamCleanupError",
+            },
+        ]
+        retained = json.dumps(
+            [event.model_dump(mode="json") for event in events],
+            sort_keys=True,
+        )
+        assert canary not in retained
+        captured_output = capsys.readouterr()
+        assert canary not in caplog.text
+        assert canary not in captured_output.out
+        assert canary not in captured_output.err
+        assert all(canary not in str(warning.message) for warning in recwarn)
+
+        provider.iterator.cleanup_release.set()
+        await asyncio.wait_for(
+            asyncio.to_thread(provider.iterator.cleanup_finished.wait),
+            timeout=2,
+        )
+
+    asyncio.run(run())
+
+
+def test_public_stream_abandonment_closes_provider_stream() -> None:
+    class CloseTrackedIterator:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.closed = asyncio.Event()
+
+        def __aiter__(self) -> CloseTrackedIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.reads += 1
+            if self.reads == 1:
+                return ModelStreamEvent.text_delta("partial")
+            await asyncio.Event().wait()
+            raise AssertionError("provider stream unexpectedly resumed")
+
+        async def aclose(self) -> None:
+            self.closed.set()
+
+    class CloseTrackedProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = CloseTrackedIterator()
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            return self.iterator
+
+    async def run() -> tuple[SessionStatus, bool]:
+        provider = CloseTrackedProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_public_abandonment_provider_cleanup",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+
+        while True:
+            event = await anext(stream)
+            if event.type is EventType.MODEL_TEXT_DELTA:
+                break
+        await stream.aclose()
+        await asyncio.wait_for(provider.iterator.closed.wait(), timeout=1)
+
+        session = await app.session_store.load("sess_public_abandonment_provider_cleanup")
+        assert session is not None
+        return session.status, provider.iterator.closed.is_set()
+
+    status, closed = asyncio.run(run())
+
+    assert status is SessionStatus.INTERRUPTED
+    assert closed is True
+
+
+def test_successful_provider_cleanup_race_is_not_published_as_cleanup_failure() -> None:
+    class SuccessfulRacingCloseIterator:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.owner: asyncio.Task[list[Event]] | None = None
+            self.close_finished = asyncio.Event()
+
+        def __aiter__(self) -> SuccessfulRacingCloseIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.reads += 1
+            if self.reads == 1:
+                return ModelStreamEvent.text_delta("partial")
+            raise RuntimeError("authoritative provider failure")
+
+        async def aclose(self) -> None:
+            assert self.owner is not None
+            self.owner.cancel("caller cancelled as provider cleanup completed")
+            self.close_finished.set()
+
+    class SuccessfulRacingCloseProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = SuccessfulRacingCloseIterator()
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            return self.iterator
+
+    async def run() -> tuple[tuple[object, ...], int, bool, list[Event], bool]:
+        provider = SuccessfulRacingCloseProvider()
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_successful_provider_cleanup_race",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        provider.iterator.owner = run_task
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await run_task
+        stored_events = await store.load_events("sess_successful_provider_cleanup_race")
+        return (
+            exc_info.value.args,
+            run_task.cancelling(),
+            run_task.cancelled(),
+            stored_events,
+            provider.iterator.close_finished.is_set(),
+        )
+
+    cancellation_args, cancelling, cancelled, stored_events, close_finished = asyncio.run(run())
+
+    assert cancellation_args == ("Provider operation cancelled",)
+    assert cancelling == 1
+    assert cancelled is True
+    assert close_finished is True
+    assert EventType.MODEL_ERROR not in {event.type for event in stored_events}
+    assert EventType.SESSION_FAILED not in {event.type for event in stored_events}
+    interrupted = [event for event in stored_events if event.type is EventType.SESSION_INTERRUPTED]
+    assert len(interrupted) == 1
+    assert interrupted[0].payload["provider_cancellation_failures"] == [
+        {
+            "phase": "model_stream",
+            "error": "Model provider stream failed before cancellation.",
+            "error_type": "ModelProviderStreamError",
+        }
+    ]
+
+
+def test_provider_cancellation_marker_precedes_operator_terminal_transition() -> None:
+    class MarkerOrderingStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.marker_observed_before_terminal_transition = False
+
+        async def publish_interaction_transition(self, session_id: str, **kwargs: Any):
+            if kwargs.get("to_status") is SessionStatus.INTERRUPTED:
+                checkpoint = await self.load_checkpoint(session_id)
+                marker = None if checkpoint is None else checkpoint.get("pending_session_interrupt")
+                if type(marker) is dict and marker.get("provider_cancellation_failures"):
+                    self.marker_observed_before_terminal_transition = True
+            return await super().publish_interaction_transition(session_id, **kwargs)
+
+    class FailingCloseIterator:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.close_started = asyncio.Event()
+            self.cleanup_release = asyncio.Event()
+            self.cleanup_finished = asyncio.Event()
+
+        def __aiter__(self) -> FailingCloseIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.reads += 1
+            if self.reads == 1:
+                return ModelStreamEvent.text_delta("partial")
+            raise RuntimeError("private provider failure")
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            await self.cleanup_release.wait()
+            self.cleanup_finished.set()
+            raise RuntimeError("private provider cleanup failure") from None
+
+    class FailingCloseProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = FailingCloseIterator()
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            return self.iterator
+
+    async def run() -> None:
+        session_id = "sess_operator_provider_marker_ordering"
+        store = MarkerOrderingStore()
+        provider = FailingCloseProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=2)
+        interrupt_events = await collect_interrupt_events(
+            app,
+            InterruptSessionRequest(session_id=session_id, reason="operator stop"),
+        )
+        run_events = await asyncio.wait_for(run_task, timeout=2)
+
+        assert store.marker_observed_before_terminal_transition is True
+        assert len(interrupt_events) == 1
+        assert interrupt_events[0].type is EventType.SESSION_INTERRUPTED
+        assert run_events[-1].id == interrupt_events[0].id
+        assert interrupt_events[0].payload["provider_cancellation_failures"] == [
+            {
+                "phase": "model_stream",
+                "error": "Model provider stream failed before cancellation.",
+                "error_type": "ModelProviderStreamError",
+            },
+            {
+                "phase": "provider_stream_cleanup",
+                "error": "Provider stream cleanup did not complete normally.",
+                "error_type": "ProviderStreamCleanupError",
+            },
+        ]
+        assert provider.iterator.cleanup_finished.is_set() is False
+        provider.iterator.cleanup_release.set()
+        await asyncio.wait_for(provider.iterator.cleanup_finished.wait(), timeout=2)
+
+    asyncio.run(run())
+
+
+def test_cayu_app_does_not_report_caller_stream_read_cancellation_as_provider_failure() -> None:
+    class BlockingIterator:
+        def __init__(self) -> None:
+            self.read_started = asyncio.Event()
+            self.close_calls = 0
+
+        def __aiter__(self) -> BlockingIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.read_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class BlockingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = BlockingIterator()
+            self.requests = 0
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            return self.iterator
+
+    async def run() -> None:
+        provider = BlockingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def consume() -> None:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_stream_read_cancel",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        task.cancel("caller cancelled provider read")
+        assert task.cancelling() == 1
+        caught_cancellation: asyncio.CancelledError | None = None
+        try:
+            await task
+        except asyncio.CancelledError as exc:
+            caught_cancellation = exc
+        assert provider.requests == 1
+        assert provider.iterator.close_calls == 1
+
+        records = await app.session_store.query_events(
+            EventQuery(session_id="sess_stream_read_cancel", limit=100)
+        )
+        events = [record.event for record in records]
+        interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
+        assert caught_cancellation is not None, [event.model_dump(mode="json") for event in events]
+        assert str(caught_cancellation) == "Provider operation cancelled"
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        assert len(interrupted) == 1
+        failures = interrupted[0].payload.get("provider_cancellation_failures", [])
+        assert failures == []
+
+    asyncio.run(run())
+
+
+def test_cayu_app_rejects_provider_dispatch_when_live_cleanup_capacity_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(
+            credential_boundary_module,
+            "_MAX_OWNED_PROVIDER_STREAM_CLEANUPS",
+            1,
+        )
+        held = credential_boundary_module.reserve_provider_stream_cleanup()
+        provider = FakeProvider([ModelStreamEvent.completed({})])
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        try:
+            events = await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_provider_cleanup_capacity",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        finally:
+            credential_boundary_module.release_provider_stream_cleanup(held)
+
+        assert provider.requests == []
+        assert events[-1].type is EventType.SESSION_FAILED
+
+    asyncio.run(run())
+
+
+def test_cayu_app_does_not_publish_provider_replacement_cancellation_text(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "provider-replaced-caller-cancellation-canary"
+
+    class ReplacingIterator:
+        def __init__(self) -> None:
+            self.read_started = asyncio.Event()
+
+        def __aiter__(self) -> ReplacingIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.read_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise asyncio.CancelledError(canary) from None
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            return None
+
+    class ReplacingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = ReplacingIterator()
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            return self.iterator
+
+    async def run() -> None:
+        provider = ReplacingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def consume() -> None:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_provider_replaced_cancellation",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        task.cancel("caller cancellation")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert raised.value.args == ("Provider operation cancelled",)
+        assert task.cancelling() == 1
+        assert task.cancelled()
+        retained = str(raised.value) + repr(raised.value) + repr(vars(raised.value))
+        assert canary not in retained
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    asyncio.run(run())
+    captured = capsys.readouterr()
+    assert canary not in caplog.text
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(warning.message) for warning in recwarn)
+
+
+@pytest.mark.parametrize("replacement_kind", ["error", "group", "value"])
+def test_cayu_app_preserves_caller_cancellation_when_provider_replaces_its_type(
+    replacement_kind: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = f"provider-replaced-cancellation-type-{replacement_kind}-canary"
+
+    class ReplacingIterator:
+        def __init__(self) -> None:
+            self.read_started = asyncio.Event()
+            self.close_calls = 0
+
+        def __aiter__(self) -> ReplacingIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.read_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if replacement_kind == "value":
+                    return ModelStreamEvent.text_delta(canary)
+                failure = RuntimeError(canary)
+                if replacement_kind == "group":
+                    raise BaseExceptionGroup(canary, [failure]) from None
+                raise failure from None
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    class ReplacingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = ReplacingIterator()
+            self.requests = 0
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            return self.iterator
+
+    async def run() -> None:
+        session_id = f"sess_provider_replaced_cancellation_type_{replacement_kind}"
+        provider = ReplacingProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        live_events: list[Event] = []
+
+        async def consume() -> None:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                live_events.append(event)
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        task.cancel("caller cancellation")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+
+        assert raised.value.args == ("Provider operation cancelled",)
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+        assert task.cancelling() == 1
+        assert task.cancelled()
+        assert provider.requests == 1
+        assert provider.iterator.close_calls == 1
+        assert EventType.MODEL_ERROR not in {event.type for event in live_events}
+        assert EventType.SESSION_FAILED not in {event.type for event in live_events}
+
+        session = await app.session_store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        events = [record.event for record in records]
+        interrupted = [event for event in events if event.type is EventType.SESSION_INTERRUPTED]
+        assert len(interrupted) == 1
+        expected_failures = (
+            []
+            if replacement_kind == "value"
+            else [
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                }
+            ]
+        )
+        assert interrupted[0].payload.get("provider_cancellation_failures", []) == (
+            expected_failures
+        )
+        assert EventType.MODEL_ERROR not in {event.type for event in events}
+        assert EventType.SESSION_FAILED not in {event.type for event in events}
+        assert canary not in json.dumps(
+            [event.model_dump(mode="json") for event in events],
+            sort_keys=True,
+        )
+
+    asyncio.run(run())
+    captured = capsys.readouterr()
+    assert canary not in caplog.text
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(warning.message) for warning in recwarn)
+
+
+def test_cayu_app_preserves_caller_cancellation_across_late_explicit_close_failure(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "provider-late-explicit-close-failure-canary"
+
+    class LateFailingCloseIterator:
+        def __init__(self) -> None:
+            self.read_started = asyncio.Event()
+            self.close_calls = 0
+
+        def __aiter__(self) -> LateFailingCloseIterator:
+            return self
+
+        async def __anext__(self) -> ModelStreamEvent:
+            self.read_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise asyncio.CancelledError(canary) from None
+            raise AssertionError("unreachable")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError(canary)
+
+    class LateFailingCloseProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.iterator = LateFailingCloseIterator()
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            return self.iterator
+
+    async def run() -> None:
+        session_id = "sess_provider_late_explicit_close_failure"
+        provider = LateFailingCloseProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.iterator.read_started.wait(), timeout=2)
+        task.cancel("caller cancellation")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+
+        assert raised.value.args == ("Provider operation cancelled",)
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+        assert task.cancelling() == 1
+        assert task.cancelled()
+        assert provider.iterator.close_calls == 1
+        records = await app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+        events = [record.event for record in records]
+        interrupted = [event for event in events if event.type is EventType.SESSION_INTERRUPTED]
+        assert len(interrupted) == 1
+        assert interrupted[0].payload["provider_cancellation_failures"] == [
+            {
+                "phase": "provider_stream_cleanup",
+                "error": "Provider stream cleanup did not complete normally.",
+                "error_type": "ProviderStreamCleanupError",
+            }
+        ]
+        assert EventType.MODEL_ERROR not in {event.type for event in events}
+        assert EventType.SESSION_FAILED not in {event.type for event in events}
+        assert canary not in json.dumps(
+            [event.model_dump(mode="json") for event in events],
+            sort_keys=True,
+        )
+
+    asyncio.run(run())
+    captured = capsys.readouterr()
+    assert canary not in caplog.text
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(warning.message) for warning in recwarn)
+
+
+@pytest.mark.parametrize("boundary", ["stream", "billing"])
+def test_cayu_app_does_not_authenticate_provider_group_cancellation_without_task_request(
+    boundary: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = f"provider-fatal-group-cancellation-{boundary}-canary"
+
+    class FatalGroupProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.cancellation_count: int | None = None
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            del request
+            if boundary != "billing":
+                return None
+            task = asyncio.current_task()
+            self.cancellation_count = None if task is None else task.cancelling()
+            raise BaseExceptionGroup(
+                canary,
+                [SystemExit(17), asyncio.CancelledError(canary)],
+            )
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            if boundary != "stream":
+                raise AssertionError("billing failure should precede stream dispatch")
+            task = asyncio.current_task()
+            self.cancellation_count = None if task is None else task.cancelling()
+            raise BaseExceptionGroup(
+                canary,
+                [SystemExit(17), asyncio.CancelledError(canary)],
+            )
+            yield  # pragma: no cover
+
+    session_id = f"sess_provider_fatal_group_cancellation_{boundary}"
+    provider = FatalGroupProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(BaseExceptionGroup) as raised:
         asyncio.run(
             collect_events(
                 app,
                 RunRequest(
                     agent_name="assistant",
-                    session_id=f"sess_custom_billing_cancel_{stage}",
+                    session_id=session_id,
                     messages=[Message.text("user", "hello")],
                 ),
             )
         )
 
-    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
-    assert retained == (
-        "Model provider billing identity resolution cancelled"
-        "CancelledError('Model provider billing identity resolution cancelled'){}"
+    leaves = [
+        candidate
+        for candidate in iter_exception_tree(raised.value)
+        if not isinstance(candidate, BaseExceptionGroup)
+    ]
+    system_exits = [candidate for candidate in leaves if isinstance(candidate, SystemExit)]
+    assert len(system_exits) == 1
+    assert system_exits[0].code == 17
+    assert all(not isinstance(candidate, asyncio.CancelledError) for candidate in leaves)
+    assert provider.cancellation_count == 0
+    assert canary not in repr(raised.value)
+
+    session = asyncio.run(app.session_store.load(session_id))
+    assert session is not None
+    assert session.status is not SessionStatus.INTERRUPTED
+    records = asyncio.run(
+        app.session_store.query_events(EventQuery(session_id=session_id, limit=100))
+    )
+    retained = json.dumps(
+        [record.event.model_dump(mode="json") for record in records],
+        sort_keys=True,
+    )
+    assert EventType.SESSION_INTERRUPTED not in {record.event.type for record in records}
+    assert canary not in retained
+    captured = capsys.readouterr()
+    assert canary not in caplog.text
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(warning.message) for warning in recwarn)
+
+
+def test_cayu_app_classifies_nonfatal_provider_group_cancellation_as_failure(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "provider-nonfatal-group-cancellation-canary"
+
+    class GroupCancellingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.cancellation_count: int | None = None
+            self.requests = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            task = asyncio.current_task()
+            self.cancellation_count = None if task is None else task.cancelling()
+            raise BaseExceptionGroup(
+                canary,
+                [
+                    asyncio.CancelledError(canary),
+                    RuntimeError(canary),
+                ],
+            )
+            yield  # pragma: no cover
+
+    session_id = "sess_provider_nonfatal_group_cancellation"
+    provider = GroupCancellingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.requests == 1
+    assert provider.cancellation_count == 0
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
+    retained = json.dumps(
+        [event.model_dump(mode="json") for event in events],
+        sort_keys=True,
     )
     assert canary not in retained
-    captured = traceback.TracebackException.from_exception(
-        exc_info.value,
-        capture_locals=True,
+    captured = capsys.readouterr()
+    assert canary not in caplog.text
+    assert canary not in captured.out
+    assert canary not in captured.err
+    assert all(canary not in str(warning.message) for warning in recwarn)
+
+
+@pytest.mark.parametrize("stage", ["construction", "iterator", "iteration"])
+def test_cayu_app_classifies_provider_created_stream_cancellation_as_failure(
+    stage: str,
+) -> None:
+    canary = "provider-created-stream-cancellation-canary"
+
+    class CancellingIterator:
+        def __aiter__(self) -> CancellingIterator:
+            raise asyncio.CancelledError(canary)
+
+        async def __anext__(self) -> ModelStreamEvent:
+            raise AssertionError("iterator cancellation must occur before iteration")
+
+        async def aclose(self) -> None:
+            return None
+
+    class CancellingProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.requests = 0
+
+        def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            if stage == "construction":
+                raise asyncio.CancelledError(canary)
+            if stage == "iterator":
+                return CancellingIterator()
+
+            async def events() -> AsyncIterator[ModelStreamEvent]:
+                raise asyncio.CancelledError(canary)
+                yield  # pragma: no cover
+
+            return events()
+
+    provider = CancellingProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_provider_created_stream_cancellation",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
     )
-    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
-    leaking_locals = [
-        (frame.name, name)
-        for frame in cayu_frames
-        for name, value in (frame.locals or {}).items()
-        if canary in value
-    ]
-    assert leaking_locals == []
-    assert all(not frame.name.startswith("billing_identity_for_") for frame in captured.stack)
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
+
+    assert provider.requests == 1
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
+    assert events[-1].payload["error"] == "Model provider stream cancelled itself."
+    assert canary not in json.dumps(
+        [event.model_dump(mode="json") for event in events],
+        sort_keys=True,
+    )
+
+
+def test_chat_completions_adapter_preserves_nested_cancellation_diagnostics() -> None:
+    class BlockingRawEvents:
+        def __init__(self) -> None:
+            self.reads = 0
+            self.close_started = asyncio.Event()
+            self.cleanup_release = asyncio.Event()
+            self.cleanup_finished = asyncio.Event()
+
+        def __aiter__(self) -> BlockingRawEvents:
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            self.reads += 1
+            if self.reads == 1:
+                return {
+                    "id": "chatcmpl-cancellation-diagnostics",
+                    "model": "test-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "partial"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            raise RuntimeError("private transport failure")
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            await self.cleanup_release.wait()
+            self.cleanup_finished.set()
+
+    class BlockingTransport:
+        def __init__(self) -> None:
+            self.events = BlockingRawEvents()
+            self.requests = 0
+
+        def stream_chat_completions(self, **_kwargs: Any) -> BlockingRawEvents:
+            self.requests += 1
+            return self.events
+
+    async def run() -> None:
+        transport = BlockingTransport()
+        provider = ChatCompletionsProvider(api_key="test-key", transport=transport)
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="test-model"))
+
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_chat_nested_cancel_diagnostics",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(transport.events.close_started.wait(), timeout=2)
+        task.cancel("caller cancelled chat cleanup")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        records = await app.session_store.query_events(
+            EventQuery(session_id="sess_chat_nested_cancel_diagnostics", limit=100)
+        )
+        interrupted = [
+            record.event for record in records if record.event.type == EventType.SESSION_INTERRUPTED
+        ]
+        assert transport.requests == 1
+        assert len(interrupted) == 1
+        assert interrupted[0].payload["provider_cancellation_failures"] == [
+            {
+                "phase": "model_stream",
+                "error": "Model provider stream failed before cancellation.",
+                "error_type": "ModelProviderStreamError",
+            },
+            {
+                "phase": "provider_stream_cleanup",
+                "error": "Provider stream cleanup did not complete normally.",
+                "error_type": "ProviderStreamCleanupError",
+            },
+        ]
+        assert transport.events.cleanup_finished.is_set() is False
+        transport.events.cleanup_release.set()
+
+    asyncio.run(run())
+
+
+def test_cayu_app_preserves_caller_cancellation_across_billing_task_group_failure(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    canary = "provider-billing-task-group-cancel-canary"
+
+    class BillingCollisionProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.hook_started = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
+            self.cleanup_failed = asyncio.Event()
+            self.requests = 0
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            del request
+
+            async def child() -> None:
+                await self.release_cleanup.wait()
+                self.cleanup_failed.set()
+                raise RuntimeError(f"billing cleanup failed near {canary}") from None
+
+            async with asyncio.TaskGroup() as group:
+                group.create_task(child())
+                self.hook_started.set()
+                await asyncio.Event().wait()
+            return None
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.requests += 1
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        provider = BillingCollisionProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        live_events: list[Event] = []
+
+        async def consume() -> None:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_billing_task_group_cancel",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                live_events.append(event)
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+        task.cancel("caller cancelled billing")
+        provider.release_cleanup.set()
+        assert task.cancelling() == 1
+        caught = False
+        caught_cancellation: asyncio.CancelledError | None = None
+        try:
+            await task
+        except asyncio.CancelledError as exc:
+            caught = True
+            caught_cancellation = exc
+            assert BaseException.__dict__["args"].__get__(exc, BaseException) == (
+                "caller cancelled billing",
+            )
+        assert caught is True
+        assert caught_cancellation is not None
+        assert caught_cancellation.__cause__ is None
+        assert caught_cancellation.__context__ is None
+        retained_cancellation = (
+            str(caught_cancellation) + repr(caught_cancellation) + repr(vars(caught_cancellation))
+        )
+        assert canary not in retained_cancellation
+        captured = traceback.TracebackException.from_exception(
+            caught_cancellation,
+            capture_locals=True,
+        )
+        cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
+        assert canary not in repr([(frame.name, frame.locals) for frame in cayu_frames])
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        assert provider.cleanup_failed.is_set()
+        assert provider.requests == 0
+        assert EventType.MODEL_ERROR not in {event.type for event in live_events}
+        assert EventType.SESSION_FAILED not in {event.type for event in live_events}
+
+        session = await app.session_store.load("sess_billing_task_group_cancel")
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        records = await app.session_store.query_events(EventQuery(session_id=session.id, limit=100))
+        events = [record.event for record in records]
+        event_types = {event.type for event in events}
+        assert EventType.MODEL_ERROR not in event_types
+        assert EventType.SESSION_FAILED not in event_types
+        interrupted_events = [
+            event for event in events if event.type == EventType.SESSION_INTERRUPTED
+        ]
+        assert len(interrupted_events) == 1
+        interrupted = interrupted_events[0]
+        assert interrupted.payload["provider_cancellation_failures"] == [
+            {
+                "phase": "billing_identity_for_request",
+                "error": ("Provider billing identity cleanup failed during caller cancellation."),
+                "error_type": "BillingIdentityCleanupError",
+            }
+        ]
+        retained = json.dumps(
+            [event.model_dump(mode="json") for event in events],
+            sort_keys=True,
+        )
+        assert canary not in retained
+        captured_output = capsys.readouterr()
+        assert canary not in caplog.text
+        assert canary not in captured_output.out
+        assert canary not in captured_output.err
+        assert all(canary not in str(warning.message) for warning in recwarn)
+
+    asyncio.run(run())
+
+
+def test_provider_cancellation_publication_failure_remains_repairable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BillingCleanupFailureProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.hook_started = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            del request
+
+            async def child() -> None:
+                await self.release_cleanup.wait()
+                raise RuntimeError("private billing cleanup failure") from None
+
+            async with asyncio.TaskGroup() as group:
+                group.create_task(child())
+                self.hook_started.set()
+                await asyncio.Event().wait()
+            return None
+
+    async def run() -> None:
+        session_id = "sess_provider_cancel_terminal_repair"
+        provider = BillingCleanupFailureProvider()
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+
+        async def fail_interrupted_publication(request):  # type: ignore[no-untyped-def]
+            if request.event.type == EventType.SESSION_INTERRUPTED:
+                raise RuntimeError("private interrupted publication failure")
+            async for event in original_terminal_stream(request):
+                yield event
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_emit_terminal_event_with_hooks",
+            fail_interrupted_publication,
+        )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+        task.cancel("caller cancelled billing")
+        provider.release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+
+        assert str(raised.value) == "caller cancelled billing"
+        assert type(raised.value.__cause__) is RuntimeError
+        assert str(raised.value.__cause__) == (
+            "Session interruption finalization failed after provider cancellation."
+        )
+        session = await app.session_store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        checkpoint = await app.session_store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        pending = checkpoint["pending_session_interrupt"]
+        assert pending["provider_cancellation_failures"] == [
+            {
+                "phase": "billing_identity_for_request",
+                "error": "Provider billing identity cleanup failed during caller cancellation.",
+                "error_type": "BillingIdentityCleanupError",
+            }
+        ]
+        assert type(pending["interruption_request_id"]) is str
+        assert not any(
+            event.type == EventType.SESSION_INTERRUPTED
+            for event in await app.session_store.load_events(session_id)
+        )
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_emit_terminal_event_with_hooks",
+            original_terminal_stream,
+        )
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        assert any(event.type == EventType.SESSION_INTERRUPTED for event in recovered.events)
+        repaired_checkpoint = await app.session_store.load_checkpoint(session_id)
+        assert repaired_checkpoint is not None
+        assert "pending_session_interrupt" not in repaired_checkpoint
+
+    asyncio.run(run())
+
+
+def test_provider_cancellation_live_readback_rejects_conflicting_marker_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BillingCleanupFailureProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.hook_started = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
+
+        async def billing_identity_for_request(
+            self,
+            request: ModelRequest,
+        ) -> BillingIdentity | None:
+            del request
+
+            async def child() -> None:
+                await self.release_cleanup.wait()
+                raise RuntimeError("private billing cleanup failure") from None
+
+            async with asyncio.TaskGroup() as group:
+                group.create_task(child())
+                self.hook_started.set()
+                await asyncio.Event().wait()
+            return None
+
+    async def run() -> None:
+        session_id = "sess_provider_cancel_conflicting_live_readback"
+        store = InMemorySessionStore()
+        provider = BillingCleanupFailureProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+
+        async def conflicting_readback(request):  # type: ignore[no-untyped-def]
+            async for event in original_terminal_stream(request):
+                if (
+                    event.type is EventType.SESSION_INTERRUPTED
+                    and "provider_cancellation_failures" in event.payload
+                ):
+                    yield event.model_copy(
+                        update={
+                            "payload": {
+                                **event.payload,
+                                "interruption_type": "operator_requested",
+                            }
+                        },
+                        deep=True,
+                    )
+                else:
+                    yield event
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_emit_terminal_event_with_hooks",
+            conflicting_readback,
+        )
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+        task.cancel("caller cancelled billing")
+        provider.release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+
+        assert str(raised.value) == "caller cancelled billing"
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        marker = checkpoint["pending_session_interrupt"]
+        assert marker["interruption_type"] == "runtime_interrupted"
+        assert marker["provider_cancellation_failures"] == [
+            {
+                "phase": "billing_identity_for_request",
+                "error": "Provider billing identity cleanup failed during caller cancellation.",
+                "error_type": "BillingIdentityCleanupError",
+            }
+        ]
+        assert type(raised.value.__cause__) is RuntimeError
+        assert str(raised.value.__cause__) == (
+            "Session interruption finalization failed after provider cancellation."
+        )
+
+    asyncio.run(run())
 
 
 def test_cayu_app_never_persists_bedrock_credential_resolution_failure() -> None:
@@ -13884,61 +15345,49 @@ def test_cayu_app_drops_automatic_compaction_billing_cancellation_credentials(
         ),
     )
 
-    with pytest.raises(asyncio.CancelledError) as exc_info:
-        asyncio.run(
-            collect_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id=f"sess_automatic_compaction_billing_cancel_{stage}",
-                    messages=[
-                        Message.text("user", "old"),
-                        Message.text("assistant", "old answer"),
-                        Message.text("user", "current"),
-                    ],
-                ),
-            )
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_automatic_compaction_billing_cancel_{stage}",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
         )
+    )
 
-    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
-    assert retained == (
-        "Model provider billing identity resolution cancelled"
-        "CancelledError('Model provider billing identity resolution cancelled'){}"
-    )
+    retained = json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True)
     assert canary not in retained
-    captured = traceback.TracebackException.from_exception(
-        exc_info.value,
-        capture_locals=True,
-    )
-    cayu_frames = [frame for frame in captured.stack if is_cayu_source_filename(frame.filename)]
-    leaking_locals = [
-        (frame.name, name)
-        for frame in cayu_frames
-        for name, value in (frame.locals or {}).items()
-        if canary in value
-    ]
-    assert leaking_locals == []
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
+    assert events[-1].payload == {
+        "error": "Model provider billing identity resolution failed",
+        "error_type": "ModelProviderError",
+    }
 
 
 def test_cayu_app_detaches_grouped_compaction_billing_cancellation_credentials() -> None:
-    canary = "automatic-compaction-grouped-cancel-canary-0123456789"
+    provider_canary = "automatic-compaction-grouped-cancel-canary-0123456789"
+    cleanup_marker = "automatic compaction workspace cleanup failed"
 
     class CancellingCompactionProvider(FakeProvider):
         def __repr__(self) -> str:
-            return f"CancellingCompactionProvider(api_key={canary!r})"
+            return f"CancellingCompactionProvider(api_key={provider_canary!r})"
 
         async def billing_identity_for_request(
             self,
             request: ModelRequest,
         ) -> BillingIdentity | None:
-            raise asyncio.CancelledError(f"cancelled near {canary}")
+            raise asyncio.CancelledError(f"cancelled near {provider_canary}")
 
     provider = CancellingCompactionProvider([])
     binding = RecordingWorkspaceBinding(
         fail_finalize=True,
-        finalize_error=RuntimeError(f"cleanup failed near {canary}"),
+        finalize_error=RuntimeError(cleanup_marker),
     )
     app = CayuApp(enable_logging=False)
     app.register_provider(provider, default=True)
@@ -13955,55 +15404,34 @@ def test_cayu_app_detaches_grouped_compaction_billing_cancellation_credentials()
         ),
     )
 
-    with pytest.raises(BaseExceptionGroup) as exc_info:
-        asyncio.run(
-            collect_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="sess_automatic_compaction_grouped_billing_cancel",
-                    messages=[
-                        Message.text("user", "old"),
-                        Message.text("assistant", "old answer"),
-                        Message.text("user", "current"),
-                    ],
-                ),
-            )
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_automatic_compaction_grouped_billing_cancel",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
         )
-
-    def traceback_frames(
-        captured: traceback.TracebackException,
-    ) -> list[traceback.FrameSummary]:
-        frames = list(captured.stack)
-        for child in captured.exceptions or ():
-            frames.extend(traceback_frames(child))
-        return frames
-
-    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
-    assert canary not in retained
-    captured = traceback.TracebackException.from_exception(
-        exc_info.value,
-        capture_locals=True,
     )
-    frames = traceback_frames(captured)
-    leaking_locals = [
-        (frame.name, name)
-        for frame in frames
-        if is_cayu_source_filename(frame.filename)
-        for name, value in (frame.locals or {}).items()
-        if canary in value
-    ]
-    assert leaking_locals == []
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-    flattened = list(exc_info.value.exceptions)
-    assert any(isinstance(error, asyncio.CancelledError) for error in flattened)
-    assert any(isinstance(error, RuntimeError) for error in flattened)
+
+    retained = json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True)
+    assert provider_canary not in retained
+    assert cleanup_marker in retained
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
+    assert events[-1].payload["error"] == "Model provider billing identity resolution failed"
+    assert events[-1].payload["error_type"] == "ModelProviderError"
 
 
 @pytest.mark.parametrize("grouped", [False, True])
 def test_cayu_app_detaches_billing_cancellation_before_fallible_interruption_checks(
     grouped: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     canary = f"billing-cancellation-transition-failure-{grouped}-canary-0123456789"
 
@@ -14015,16 +15443,14 @@ def test_cayu_app_detaches_billing_cancellation_before_fallible_interruption_che
     app = CayuApp(enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    private_cancellation_raised = False
 
     async def failing_session(**kwargs: Any):
+        nonlocal private_cancellation_raised
         del kwargs
+        private_cancellation_raised = True
         cancellation = _BillingIdentityResolutionCancelled(f"cancelled near {canary}")
         if grouped:
-
-            async def fail_load(_session_id: str) -> Session | None:
-                raise RuntimeError(f"store load failed near {canary}")
-
-            app.session_store.load = fail_load  # type: ignore[method-assign]
             raise BaseExceptionGroup(
                 "credential-bearing group",
                 [cancellation, RuntimeError(f"cleanup failed near {canary}")],
@@ -14034,16 +15460,27 @@ def test_cayu_app_detaches_billing_cancellation_before_fallible_interruption_che
 
     app._session_engine._run_session = failing_session  # type: ignore[method-assign]
 
-    if not grouped:
+    if grouped:
 
-        async def fail_interrupt_requested(_session_id: str) -> bool:
-            raise RuntimeError(f"interrupt check failed near {canary}")
+        async def unexpected_load(_store: object, _session_id: str) -> Session | None:
+            if private_cancellation_raised:
+                raise AssertionError("billing detachment must not perform an unauthenticated load")
+            return None
+
+        monkeypatch.setattr(type(app.session_store), "load", unexpected_load)
+    else:
+
+        async def unexpected_interrupt_requested(_session_id: str) -> bool:
+            raise AssertionError(
+                "billing detachment must not perform an unauthenticated interruption check"
+            )
 
         app._session_control.interrupt_requested = (  # type: ignore[method-assign]
-            fail_interrupt_requested
+            unexpected_interrupt_requested
         )
 
-    with pytest.raises(RuntimeError) as exc_info:
+    expected_failure = BaseExceptionGroup if grouped else asyncio.CancelledError
+    with pytest.raises(expected_failure) as exc_info:
         asyncio.run(
             collect_events(
                 app,
@@ -14055,11 +15492,8 @@ def test_cayu_app_detaches_billing_cancellation_before_fallible_interruption_che
             )
         )
 
-    assert str(exc_info.value).startswith(
-        "Session interruption state "
-        + ("load" if grouped else "check")
-        + " failed after provider billing cancellation"
-    )
+    retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
+    assert canary not in retained
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
     captured = traceback.TracebackException.from_exception(
@@ -14099,6 +15533,22 @@ def test_detached_billing_cancellation_group_preserves_fatal_signal_types(
     assert fatal.__traceback__ is None
     assert fatal.__cause__ is None
     assert fatal.__context__ is None
+
+
+def test_detached_billing_cancellation_group_preserves_integer_system_exit_code() -> None:
+    original = BaseExceptionGroup(
+        "outer group",
+        [
+            _BillingIdentityResolutionCancelled("caller cancellation"),
+            SystemExit(17),
+        ],
+    )
+
+    detached = detach_billing_identity_cancellation_group(original)
+
+    assert detached is not None
+    fatal = next(child for child in detached.exceptions if isinstance(child, SystemExit))
+    assert fatal.code == 17
 
 
 @pytest.mark.parametrize("limit_source", ["policy", "request"])

@@ -15,6 +15,7 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
+from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.runtime import (
     CayuApp,
     InMemorySessionStore,
@@ -831,7 +832,7 @@ def test_model_executor_preserves_cancellation_after_non_turn_publication() -> N
         await provider.waiting_after_completion.wait()
         task.cancel("authoritative test cancellation")
         task.cancel("repeated authoritative test cancellation")
-        with pytest.raises(asyncio.CancelledError, match="authoritative test cancellation"):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await task
         return (
             store,
@@ -897,7 +898,13 @@ def test_model_executor_publishes_completion_before_grouped_iteration_failure() 
 
     store, provider, session, user_message, observed, raised = asyncio.run(run())
 
-    assert raised is provider.failure
+    assert raised is not provider.failure
+    leaves = tuple(
+        error for error in iter_exception_tree(raised) if not isinstance(error, BaseExceptionGroup)
+    )
+    assert [type(error) for error in leaves] == [RuntimeError, RuntimeError]
+    assert all(error not in tuple(iter_exception_tree(provider.failure)) for error in leaves)
+    assert "provider iteration" not in repr(raised)
     assert provider.calls == 1
     assert len(observed) == 1
     publication = observed[0]
@@ -953,7 +960,10 @@ def test_model_executor_does_not_forge_caller_cancellation_from_provider_child()
                 pass
 
         task = asyncio.create_task(consume())
-        with pytest.raises(RuntimeError, match="without caller cancellation") as raised:
+        with pytest.raises(
+            ModelProviderError,
+            match="Model provider stream cancelled itself",
+        ) as raised:
             await task
         return (
             store,
@@ -977,7 +987,9 @@ def test_model_executor_does_not_forge_caller_cancellation_from_provider_child()
         cancelled,
     ) = asyncio.run(run())
 
-    assert raised.__cause__ is provider.failure
+    assert raised.__cause__ is None
+    assert raised.error_code == "provider_stream_cancelled_itself"
+    assert "provider child cancellation" not in repr(raised)
     assert cancelling == 0
     assert cancelled is False
     assert provider.calls == 1
@@ -1221,7 +1233,7 @@ def test_model_executor_publishes_completion_before_grouped_aclose_failure() -> 
         task = asyncio.create_task(consume())
         await provider.events.waiting_after_completion.wait()
         task.cancel("authoritative grouped-close cancellation")
-        with pytest.raises(BaseExceptionGroup) as raised:
+        with pytest.raises(asyncio.CancelledError) as raised:
             await task
         return (
             store,
@@ -1246,14 +1258,17 @@ def test_model_executor_publishes_completion_before_grouped_aclose_failure() -> 
     ) = asyncio.run(run())
 
     assert cancelling == 0
-    assert cancelled is False
-    leaves = tuple(iter_exception_tree(raised))
-    assert any(
-        isinstance(error, asyncio.CancelledError)
-        and error.args == ("authoritative grouped-close cancellation",)
-        for error in leaves
+    assert cancelled is True
+    assert raised.args == ("Provider operation cancelled",)
+    assert provider_cancellation_failures(raised) == (
+        {
+            "phase": "provider_stream_cleanup",
+            "error": "Provider stream cleanup did not complete normally.",
+            "error_type": "ProviderStreamCleanupError",
+        },
     )
-    assert provider.events.cleanup_failure in leaves
+    assert provider.events.cleanup_failure is not raised.__cause__
+    assert "provider iterator close" not in repr(raised)
     assert provider.events.close_calls == 1
     assert provider.calls == 1
     assert len(observed) == 1
@@ -1312,7 +1327,7 @@ def test_model_executor_publishes_completion_when_aclose_lookup_fails() -> None:
         task = asyncio.create_task(consume())
         await provider.events.waiting_after_completion.wait()
         task.cancel("authoritative lookup cancellation")
-        with pytest.raises(asyncio.CancelledError, match="authoritative lookup cancellation"):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await task
         return store, provider, session, user_message, observed
 

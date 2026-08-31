@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import copy
 import hashlib
 import io
 import json
@@ -1548,6 +1549,482 @@ def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
         yield postgres_dsn
     finally:
         asyncio.run(_reset_postgres_data(postgres_dsn))
+
+
+def test_session_store_conformance_persists_provider_cancellation_diagnostics(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+
+        class BillingCollisionProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.hook_started = asyncio.Event()
+                self.cleanup_failed = asyncio.Event()
+                self.requests = 0
+
+            async def billing_identity_for_request(
+                self,
+                request: ModelRequest,
+            ) -> BillingIdentity | None:
+                del request
+
+                async def child() -> None:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.cleanup_failed.set()
+                        raise RuntimeError("private billing cleanup diagnostic") from None
+
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(child())
+                    self.hook_started.set()
+                    await asyncio.Event().wait()
+                return None
+
+            async def stream(
+                self,
+                request: ModelRequest,
+            ) -> AsyncIterator[ModelStreamEvent]:
+                del request
+                self.requests += 1
+                yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        try:
+            provider = BillingCollisionProvider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            session_id = f"provider-cancellation-{session_store_case[0]}"
+
+            async def consume() -> None:
+                async for _ in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "hello")],
+                    )
+                ):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+            task.cancel("caller cancellation")
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelling() == 1
+            assert task.cancelled()
+            assert provider.cleanup_failed.is_set()
+            assert provider.requests == 0
+
+            store = await _reopen_store(session_store_case, store)
+            session = await store.load(session_id)
+            assert session is not None
+            assert session.status == SessionStatus.INTERRUPTED
+            records = await store.query_events(EventQuery(session_id=session_id, limit=100))
+            events = [record.event for record in records]
+            assert EventType.MODEL_ERROR not in {event.type for event in events}
+            assert EventType.SESSION_FAILED not in {event.type for event in events}
+            interrupted_events = [
+                event for event in events if event.type == EventType.SESSION_INTERRUPTED
+            ]
+            assert len(interrupted_events) == 1
+            interrupted = interrupted_events[0]
+            assert interrupted.payload["provider_cancellation_failures"] == [
+                {
+                    "phase": "billing_identity_for_request",
+                    "error": (
+                        "Provider billing identity cleanup failed during caller cancellation."
+                    ),
+                    "error_type": "BillingIdentityCleanupError",
+                }
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_repairs_provider_cancellation_terminal_publication(
+    session_store_case,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+
+        class BillingCollisionProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.hook_started = asyncio.Event()
+
+            @property
+            def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+                return ExecutionProfileBehaviorIdentity(
+                    name="tests:provider-cancellation-repair",
+                    behavior_version="1",
+                    implementation_version="1",
+                )
+
+            async def billing_identity_for_request(
+                self,
+                request: ModelRequest,
+            ) -> BillingIdentity | None:
+                del request
+
+                async def child() -> None:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        raise RuntimeError("private billing cleanup diagnostic") from None
+
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(child())
+                    self.hook_started.set()
+                    await asyncio.Event().wait()
+                return None
+
+        try:
+            provider = BillingCollisionProvider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            session_id = f"provider-cancellation-repair-{session_store_case[0]}"
+            original_terminal_stream = app._recovery_coordinator._emit_terminal_event_with_hooks
+
+            async def fail_interrupted_publication(request):  # type: ignore[no-untyped-def]
+                if request.event.type == EventType.SESSION_INTERRUPTED:
+                    raise RuntimeError("private terminal publication failure")
+                async for event in original_terminal_stream(request):
+                    yield event
+
+            monkeypatch.setattr(
+                app._recovery_coordinator,
+                "_emit_terminal_event_with_hooks",
+                fail_interrupted_publication,
+            )
+
+            async def consume() -> None:
+                async for _ in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "hello")],
+                    )
+                ):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+            task.cancel("caller cancellation")
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+            assert type(raised.value.__cause__) is RuntimeError
+
+            store = await _reopen_store(session_store_case, store)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert checkpoint["pending_session_interrupt"]["provider_cancellation_failures"] == [
+                {
+                    "phase": "billing_identity_for_request",
+                    "error": (
+                        "Provider billing identity cleanup failed during caller cancellation."
+                    ),
+                    "error_type": "BillingIdentityCleanupError",
+                }
+            ]
+
+            recovered_app = CayuApp(session_store=store, enable_logging=False)
+            recovered_app.register_provider(BillingCollisionProvider(), default=True)
+            recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            recovered = await recovered_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+            assert any(event.type == EventType.SESSION_INTERRUPTED for event in recovered.events)
+            repaired_checkpoint = await store.load_checkpoint(session_id)
+            assert repaired_checkpoint is not None
+            assert "pending_session_interrupt" not in repaired_checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_recovers_provider_cancellation_after_marker_only_crash(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+
+        class BillingCollisionProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.hook_started = asyncio.Event()
+
+            @property
+            def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+                return ExecutionProfileBehaviorIdentity(
+                    name="tests:provider-cancellation-marker-crash",
+                    behavior_version="1",
+                    implementation_version="1",
+                )
+
+            async def billing_identity_for_request(
+                self,
+                request: ModelRequest,
+            ) -> BillingIdentity | None:
+                del request
+
+                async def child() -> None:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        raise RuntimeError("private billing cleanup diagnostic") from None
+
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(child())
+                    self.hook_started.set()
+                    await asyncio.Event().wait()
+                return None
+
+        try:
+            provider = BillingCollisionProvider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            session_id = f"provider-cancellation-marker-crash-{session_store_case[0]}"
+            original_publish_checkpoint_and_events = store.publish_checkpoint_and_events
+            marker_committed = False
+
+            async def lose_process_after_marker(  # type: ignore[no-untyped-def]
+                session_id_arg,
+                **kwargs,
+            ):
+                nonlocal marker_committed
+                result = await original_publish_checkpoint_and_events(
+                    session_id_arg,
+                    **kwargs,
+                )
+                checkpoint = await store.load_checkpoint(session_id_arg)
+                marker = None if checkpoint is None else checkpoint.get("pending_session_interrupt")
+                if (
+                    not marker_committed
+                    and type(marker) is dict
+                    and "provider_cancellation_failures" in marker
+                ):
+                    marker_committed = True
+                    raise _SimulatedProcessLoss("after provider interruption marker")
+                return result
+
+            async def consume() -> None:
+                async for _ in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "hello")],
+                    )
+                ):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(provider.hook_started.wait(), timeout=2)
+            store.publish_checkpoint_and_events = lose_process_after_marker  # type: ignore[method-assign]
+            try:
+                task.cancel("caller cancellation")
+                with pytest.raises(
+                    _SimulatedProcessLoss,
+                    match="after provider interruption marker",
+                ):
+                    await task
+            finally:
+                delattr(store, "publish_checkpoint_and_events")
+
+            store = await _reopen_store(session_store_case, store)
+            before = await store.load(session_id)
+            assert before is not None
+            assert before.status == SessionStatus.RUNNING
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            marker = checkpoint["pending_session_interrupt"]
+            assert marker["provider_cancellation_failures"] == [
+                {
+                    "phase": "billing_identity_for_request",
+                    "error": (
+                        "Provider billing identity cleanup failed during caller cancellation."
+                    ),
+                    "error_type": "BillingIdentityCleanupError",
+                }
+            ]
+
+            def corrupt_provider_diagnostic(
+                _session: Session,
+                current: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                assert current is not None
+                copied = copy.deepcopy(current)
+                copied["pending_session_interrupt"]["provider_cancellation_failures"][0][
+                    "error"
+                ] = "untrusted reconstructed diagnostic"
+                return copied
+
+            good_checkpoint = copy.deepcopy(checkpoint)
+            await store.transform_checkpoint(session_id, corrupt_provider_diagnostic)
+            malformed_checkpoint = await store.load_checkpoint(session_id)
+            recovered_app = CayuApp(session_store=store, enable_logging=False)
+            recovered_app.register_provider(BillingCollisionProvider(), default=True)
+            recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            with pytest.raises(ValueError, match="failure error is invalid"):
+                await recovered_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session_id,
+                        inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    )
+                )
+            assert await store.load_checkpoint(session_id) == malformed_checkpoint
+
+            def restore_provider_diagnostic(
+                _session: Session,
+                _current: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                return copy.deepcopy(good_checkpoint)
+
+            await store.transform_checkpoint(session_id, restore_provider_diagnostic)
+
+            def corrupt_provider_interruption_type(
+                _session: Session,
+                current: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                assert current is not None
+                copied = copy.deepcopy(current)
+                copied["pending_session_interrupt"]["interruption_type"] = "future-untrusted"
+                return copied
+
+            await store.transform_checkpoint(session_id, corrupt_provider_interruption_type)
+            malformed_checkpoint = await store.load_checkpoint(session_id)
+            with pytest.raises(ValueError, match="interruption type is invalid"):
+                await recovered_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session_id,
+                        inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    )
+                )
+            assert await store.load_checkpoint(session_id) == malformed_checkpoint
+            await store.transform_checkpoint(session_id, restore_provider_diagnostic)
+
+            recovered = await recovered_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+            assert recovered.status == SessionStatus.INTERRUPTED
+            interrupted = [
+                event for event in recovered.events if event.type == EventType.SESSION_INTERRUPTED
+            ]
+            assert len(interrupted) == 1
+            assert (
+                interrupted[0].payload["provider_cancellation_failures"]
+                == marker["provider_cancellation_failures"]
+            )
+            repaired_checkpoint = await store.load_checkpoint(session_id)
+            assert repaired_checkpoint is not None
+            assert "pending_session_interrupt" not in repaired_checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_persists_provider_stream_cancellation_diagnostics(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+
+        class StreamCollisionIterator:
+            def __init__(self) -> None:
+                self.reads = 0
+                self.close_started = asyncio.Event()
+
+            def __aiter__(self) -> StreamCollisionIterator:
+                return self
+
+            async def __anext__(self) -> ModelStreamEvent:
+                self.reads += 1
+                if self.reads == 1:
+                    return ModelStreamEvent.text_delta("partial")
+                raise RuntimeError("private provider stream diagnostic")
+
+            async def aclose(self) -> None:
+                self.close_started.set()
+                await asyncio.Event().wait()
+
+        class StreamCollisionProvider(FakeProvider):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.iterator = StreamCollisionIterator()
+                self.requests = 0
+
+            def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+                del request
+                self.requests += 1
+                return self.iterator
+
+        try:
+            provider = StreamCollisionProvider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            session_id = f"provider-stream-cancellation-{session_store_case[0]}"
+
+            async def consume() -> None:
+                async for _ in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "hello")],
+                    )
+                ):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(provider.iterator.close_started.wait(), timeout=2)
+            task.cancel("caller cancellation")
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelling() == 1
+            assert task.cancelled()
+            assert provider.requests == 1
+
+            store = await _reopen_store(session_store_case, store)
+            session = await store.load(session_id)
+            assert session is not None
+            assert session.status == SessionStatus.INTERRUPTED
+            records = await store.query_events(EventQuery(session_id=session_id, limit=100))
+            events = [record.event for record in records]
+            assert EventType.MODEL_ERROR not in {event.type for event in events}
+            assert EventType.SESSION_FAILED not in {event.type for event in events}
+            interrupted_events = [
+                event for event in events if event.type == EventType.SESSION_INTERRUPTED
+            ]
+            assert len(interrupted_events) == 1
+            interrupted = interrupted_events[0]
+            assert interrupted.payload["provider_cancellation_failures"] == [
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                },
+                {
+                    "phase": "provider_stream_cleanup",
+                    "error": "Provider stream cleanup did not complete normally.",
+                    "error_type": "ProviderStreamCleanupError",
+                },
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_preserves_openrouter_reasoning_details(

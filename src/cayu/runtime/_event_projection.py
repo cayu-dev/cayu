@@ -34,6 +34,7 @@ from cayu.egress.authority import (
     EgressAuthorityCutoverStrategy,
     EgressAuthorityTransitionState,
 )
+from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
@@ -2852,6 +2853,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "manual_recovery_persistence_unknown manual_recovery_required "
         "manual_recovery_stale_live_failure maximum message metadata model_attempt_id "
         "model_step_id persistence_reconciliation_error_type policy_metadata reason "
+        "provider_cancellation_failures "
         "recovered requested_by resolved_by tool_call_id tool_call_metadata_truncated "
         "session_run_operation_id tool_evidence_conflict tool_name tool_round_id "
         "usage_summary user_input " + terminal_finalization_keys,
@@ -2878,6 +2880,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "interaction_transition_failures",
             "metadata",
             "policy_metadata",
+            "provider_cancellation_failures",
             "user_input",
         }
         | terminal_finalization_containers,
@@ -3396,12 +3399,85 @@ def event_payload_policy(event_type: EventType | str) -> EventPayloadPolicy:
     return _INTERNAL_EVENT_PAYLOAD_POLICIES.get(event_type, EventPayloadPolicy())
 
 
+def _validated_provider_cancellation_event_failures(
+    event: Event,
+    *,
+    reject_malformed: bool,
+) -> tuple[tuple[dict[str, Any], ...] | None, bool]:
+    """Validate the exact bounded provider diagnostic event schema."""
+
+    event_type = event.type
+    if event_type is not EventType.SESSION_INTERRUPTED and not (
+        type(event_type) is str and event_type == EventType.SESSION_INTERRUPTED.value
+    ):
+        return None, False
+    raw_payload = event.payload
+    has_diagnostics = False
+    if type(raw_payload) is dict:
+        for key in dict.keys(raw_payload):
+            if type(key) is str and key == "provider_cancellation_failures":
+                has_diagnostics = True
+                break
+    if not has_diagnostics:
+        return None, False
+    try:
+        payload = copy_durable_json_value(raw_payload, "event.payload")
+        if type(payload) is not dict:
+            raise TypeError("Provider cancellation event payload must be an object.")
+        failures = copy_provider_cancellation_failures(payload["provider_cancellation_failures"])
+        if not failures:
+            raise ValueError("Provider cancellation diagnostics cannot be empty.")
+        interruption_type = payload.get("interruption_type")
+        if type(interruption_type) is not str or interruption_type not in (
+            "operator_requested",
+            "runtime_interrupted",
+        ):
+            raise ValueError("Provider cancellation interruption type is invalid.")
+        request_id = payload.get("interruption_request_id")
+        if type(request_id) is not str or not request_id.strip():
+            raise ValueError("Provider cancellation interruption request ID is invalid.")
+    except (TypeError, ValueError):
+        if reject_malformed:
+            raise ValueError("Provider cancellation event diagnostics are invalid.") from None
+        return None, True
+    return failures, True
+
+
+def _event_without_malformed_provider_cancellation_diagnostics(event: Event) -> Event:
+    """Drop an invalid extension/store diagnostic before generic projection."""
+
+    raw_payload = event.payload
+    if type(raw_payload) is not dict:
+        payload: dict[str, Any] = {}
+    else:
+        candidate: dict[str, Any] = {}
+        for key, value in dict.items(raw_payload):
+            if type(key) is not str:
+                candidate = {}
+                break
+            if key != "provider_cancellation_failures":
+                candidate[key] = value
+        try:
+            copied = copy_durable_json_value(candidate, "event.payload")
+        except (TypeError, ValueError):
+            payload = {}
+        else:
+            payload = copied if type(copied) is dict else {}
+    return event.model_copy(update={"payload": payload})
+
+
 def prepare_new_runtime_event(event: Event, *, redactor: SecretRedactor) -> Event:
     """Validate and redact one event before its first durable append."""
 
+    provider_failures, _ = _validated_provider_cancellation_event_failures(
+        event,
+        reject_malformed=True,
+    )
     payload = copy_durable_json_value(event.payload, "event.payload")
     if type(payload) is not dict:
         raise AssertionError("Event payload copy returned a non-object.")
+    if provider_failures is not None:
+        payload["provider_cancellation_failures"] = [dict(item) for item in provider_failures]
     _quarantine_pre_execution_tool_arguments(event, payload=payload)
     _validate_new_terminal_tool_argument_projection(event, payload=payload)
     event = event.model_copy(update={"payload": payload})
@@ -3790,6 +3866,12 @@ def _project_runtime_event(
     """Apply the shared public projection with an internal persisted-record capability."""
 
     _validate_inputs(event, redactor)
+    provider_failures, had_provider_failures = _validated_provider_cancellation_event_failures(
+        event,
+        reject_malformed=False,
+    )
+    if had_provider_failures and provider_failures is None:
+        event = _event_without_malformed_provider_cancellation_diagnostics(event)
     policy = event_payload_policy(event.type)
     tool_event_boundary = _recognized_tool_event_boundary(
         event,
@@ -3815,6 +3897,13 @@ def _project_runtime_event(
         envelope_alias_session_id=event.session_id,
         projection_references=projection_references,
     )
+    if "provider_cancellation_failures" in event.payload:
+        if provider_failures is None:
+            redacted_payload.pop("provider_cancellation_failures", None)
+        else:
+            redacted_payload["provider_cancellation_failures"] = [
+                dict(item) for item in provider_failures
+            ]
     _restore_publication_safe_request_fingerprints(
         event,
         redacted_payload=redacted_payload,

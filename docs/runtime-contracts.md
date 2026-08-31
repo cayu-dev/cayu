@@ -6196,6 +6196,34 @@ same TTL and reasonably synchronized clocks. Custom expiring `BudgetLedger`
 implementations must advertise their TTL and implement `heartbeat`; the base
 custom-ledger contract is non-expiring.
 
+Caller cancellation remains authoritative when it meets a provider-stream
+failure, provider iterator cleanup, or request-billing hook cleanup. The runtime
+authenticates this outcome from a newly delivered `Task.cancel()` request. A
+request-billing hook's provider-created `CancelledError`, including one nested
+in an exception group, and a cleanup-created cancellation without a new task
+request remain ordinary provider failures. Request billing hooks run inside an
+owned child task so a hook's `TaskGroup` cannot consume the caller task's
+cancellation authority while reporting a child cleanup failure. The caller
+receives a fresh provider-free
+`CancelledError`, keeps the original task cancellation count, and the durable
+session terminates as `interrupted` without first publishing `model.error` or
+`session.failed`. The matching `session.interrupted` may contain at most two
+ordered `provider_cancellation_failures` entries. Their phases are limited to
+`model_stream`, `provider_stream_cleanup`, and
+`billing_identity_for_request`; each entry is a fixed, bounded classification
+and never retains provider exception attributes, traceback state, requests,
+credentials, or response bodies. Provider work is not retried merely to collect
+this secondary evidence. Live synchronous model dispatch reserves bounded
+cleanup ownership before invoking `ModelProvider.stream`; if caller
+cancellation meets an unsettled close, the caller stops waiting while that
+exact close remains retained until settlement. This opt-in ownership is not a
+general behavior of `aclosing_provider_stream(...)` and does not extend the
+provider-operation recovery contract. Diagnostic-bearing
+interruption finalization first persists a repair marker; terminal publication
+clears that marker, while a publication failure remains both
+restart-repairable and visible as a fixed cause of the detached caller
+cancellation.
+
 The complete dispatch-fence batch is retried with the same dispatch identity
 and timestamp when its acknowledgement is ambiguous. An exact replay permits
 the provider call to proceed once. If that replay cannot reconstruct the

@@ -7,7 +7,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
-from typing import NoReturn, ParamSpec, TypeVar
+from threading import Lock
+from typing import Any, NoReturn, ParamSpec, TypeVar, cast
+from weakref import WeakKeyDictionary
 
 from cayu._exception_groups import (
     add_exception_note_safely,
@@ -31,6 +33,26 @@ _STREAM_CLEANUP_CANCELLATION_TOKEN = object()
 _STREAM_CLEANUP_CANCELLATION_NOTE = (
     "Provider stream cleanup was cancelled after a provider operation failure."
 )
+_PROVIDER_CANCELLATION_FAILURE_CLASSIFICATIONS = {
+    "model_stream": (
+        "Model provider stream failed before cancellation.",
+        "ModelProviderStreamError",
+    ),
+    "provider_stream_cleanup": (
+        "Provider stream cleanup did not complete normally.",
+        "ProviderStreamCleanupError",
+    ),
+    "billing_identity_for_request": (
+        "Provider billing identity cleanup failed during caller cancellation.",
+        "BillingIdentityCleanupError",
+    ),
+}
+_MAX_OWNED_PROVIDER_STREAM_CLEANUPS = 64
+_PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK = Lock()
+_PROVIDER_STREAM_CLEANUP_REGISTRIES: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    set[_ProviderStreamCleanupOwnership],
+] = WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +61,7 @@ class _CredentialSafeCancellationHandoff:
 
     message: str
     stream_cleanup_cancelled_after_failure: bool
+    provider_cancellation_failures: tuple[dict[str, Any], ...]
     token: object
 
 
@@ -47,6 +70,66 @@ class _StreamCleanupCancellationHandoff:
     """Authenticated evidence that real cancellation interrupted stream cleanup."""
 
     token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderStreamCleanupOutcome:
+    error: BaseException | None = None
+
+
+class _ProviderStreamCleanupOwnership:
+    """Explicit live-model ownership for one possibly opaque stream close."""
+
+    __slots__ = ("_loop", "_released", "_task")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._released = False
+        self._task: asyncio.Task[_ProviderStreamCleanupOutcome] | None = None
+
+    @property
+    def reserved(self) -> bool:
+        return not self._released
+
+    def track(self, task: asyncio.Task[_ProviderStreamCleanupOutcome]) -> None:
+        if self._released or self._task is not None or task.get_loop() is not self._loop:
+            raise RuntimeError("Provider stream cleanup ownership is invalid.")
+        self._task = task
+        task.add_done_callback(lambda _completed: self.release())
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
+            owners = _PROVIDER_STREAM_CLEANUP_REGISTRIES.get(self._loop)
+            if owners is not None:
+                owners.discard(self)
+                if not owners:
+                    _PROVIDER_STREAM_CLEANUP_REGISTRIES.pop(self._loop, None)
+
+
+def reserve_provider_stream_cleanup() -> _ProviderStreamCleanupOwnership:
+    """Reserve bounded cleanup ownership for one live model dispatch."""
+
+    loop = asyncio.get_running_loop()
+    with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
+        owners = _PROVIDER_STREAM_CLEANUP_REGISTRIES.setdefault(loop, set())
+        if len(owners) >= _MAX_OWNED_PROVIDER_STREAM_CLEANUPS:
+            raise RuntimeError("Provider stream cleanup capacity is exhausted.")
+        ownership = _ProviderStreamCleanupOwnership(loop)
+        owners.add(ownership)
+    return ownership
+
+
+def release_provider_stream_cleanup(
+    ownership: _ProviderStreamCleanupOwnership,
+) -> None:
+    """Release an unused live-model cleanup reservation."""
+
+    if type(ownership) is not _ProviderStreamCleanupOwnership:
+        raise TypeError("Provider stream cleanup ownership is invalid.")
+    ownership.release()
 
 
 class ProviderStreamCleanupError(ModelProviderError):
@@ -58,6 +141,7 @@ def credential_safe_provider_cancellation(
     *,
     preserve_empty_artifacts: bool,
     stream_cleanup_cancelled_after_failure: bool = False,
+    provider_cancellation_failures: tuple[dict[str, Any], ...] = (),
 ) -> asyncio.CancelledError:
     """Create a cancellation whose safe projection survives the outer boundary."""
 
@@ -66,9 +150,11 @@ def credential_safe_provider_cancellation(
     except (TypeError, ValueError):
         message = "Provider operation cancelled"
     cancellation = asyncio.CancelledError(message)
+    failures = _copy_provider_cancellation_failures(provider_cancellation_failures)
     handoff = _CredentialSafeCancellationHandoff(
         message=message,
         stream_cleanup_cancelled_after_failure=(stream_cleanup_cancelled_after_failure is True),
+        provider_cancellation_failures=failures,
         token=_CREDENTIAL_SAFE_CANCELLATION_TOKEN,
     )
     if not set_exception_state(
@@ -94,9 +180,92 @@ def _credential_safe_cancellation_handoff(
         or type(handoff.message) is not str
         or not handoff.message.strip()
         or type(handoff.stream_cleanup_cancelled_after_failure) is not bool
+        or type(handoff.provider_cancellation_failures) is not tuple
     ):
         return None
     return handoff
+
+
+def copy_provider_cancellation_failures(
+    failures: object,
+) -> tuple[dict[str, Any], ...]:
+    """Validate reconstructed bounded provider-cancellation diagnostics."""
+
+    if type(failures) not in {list, tuple}:
+        raise ValueError("Provider cancellation failures must be a list or tuple.")
+    copied_source = cast("list[object] | tuple[object, ...]", failures)
+    if len(copied_source) > 2:
+        raise ValueError("Provider cancellation failures must contain at most two entries.")
+    copied: list[dict[str, Any]] = []
+    seen_phases: set[str] = set()
+    for index, failure in enumerate(copied_source):
+        if type(failure) is not dict:
+            raise TypeError(f"Provider cancellation failure {index} must be a dict.")
+        failure = cast("dict[object, object]", failure)
+        if set(failure) != {"phase", "error", "error_type"}:
+            raise ValueError("Provider cancellation failure fields are invalid.")
+        phase = failure.get("phase")
+        error = failure.get("error")
+        error_type = failure.get("error_type")
+        if type(phase) is not str or phase not in _PROVIDER_CANCELLATION_FAILURE_CLASSIFICATIONS:
+            raise ValueError("Provider cancellation failure phase is invalid.")
+        if phase in seen_phases:
+            raise ValueError("Provider cancellation failure phases must be unique.")
+        expected_error, expected_error_type = _PROVIDER_CANCELLATION_FAILURE_CLASSIFICATIONS[phase]
+        if type(error) is not str or error != expected_error:
+            raise ValueError("Provider cancellation failure error is invalid.")
+        if type(error_type) is not str or error_type != expected_error_type:
+            raise ValueError("Provider cancellation failure error_type is invalid.")
+        seen_phases.add(phase)
+        copied.append({"phase": phase, "error": error, "error_type": error_type})
+    return tuple(copied)
+
+
+def _copy_provider_cancellation_failures(
+    failures: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    if type(failures) is not tuple:
+        raise ValueError("Provider cancellation failures must be a tuple.")
+    return copy_provider_cancellation_failures(failures)
+
+
+def _merge_provider_cancellation_failures(
+    *failure_sets: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    merged: list[dict[str, Any]] = []
+    seen_phases: set[str] = set()
+    for failures in failure_sets:
+        for failure in _copy_provider_cancellation_failures(failures):
+            phase = failure["phase"]
+            if phase in seen_phases:
+                continue
+            seen_phases.add(phase)
+            merged.append(failure)
+            if len(merged) == 2:
+                return tuple(merged)
+    return tuple(merged)
+
+
+def provider_cancellation_failures(
+    failure: asyncio.CancelledError,
+) -> tuple[dict[str, Any], ...]:
+    """Return authenticated bounded diagnostics from a provider cancellation."""
+
+    handoff = _credential_safe_cancellation_handoff(failure)
+    if handoff is None:
+        return ()
+    return _copy_provider_cancellation_failures(handoff.provider_cancellation_failures)
+
+
+def detach_credential_safe_provider_cancellation(
+    failure: asyncio.CancelledError,
+) -> asyncio.CancelledError | None:
+    """Return a fresh public cancellation without provider traceback state."""
+
+    handoff = _credential_safe_cancellation_handoff(failure)
+    if handoff is None:
+        return None
+    return asyncio.CancelledError(handoff.message)
 
 
 def _mark_stream_cleanup_cancellation(failure: asyncio.CancelledError) -> None:
@@ -237,6 +406,9 @@ def _contains_fatal_signal(failure: BaseException) -> bool:
 @asynccontextmanager
 async def aclosing_provider_stream(
     source: AsyncIterator[object],
+    *,
+    cancellation_baseline: int | None = None,
+    cleanup_ownership: _ProviderStreamCleanupOwnership | None = None,
 ) -> AsyncIterator[AsyncIterator[object]]:
     """Close a nested provider stream before propagating its outcome.
 
@@ -252,9 +424,19 @@ async def aclosing_provider_stream(
 
     operation_failure: BaseException | None = None
     cleanup_failure: BaseException | None = None
+    cleanup_unsettled = False
+    cleanup_task_tracked = False
     closing = False
     task = asyncio.current_task()
-    cancellation_baseline = task.cancelling() if task is not None else 0
+    if cancellation_baseline is None:
+        cancellation_baseline = task.cancelling() if task is not None else 0
+    elif type(cancellation_baseline) is not int or cancellation_baseline < 0:
+        raise ValueError("cancellation_baseline must be a non-negative int or None.")
+    if cleanup_ownership is not None and (
+        type(cleanup_ownership) is not _ProviderStreamCleanupOwnership
+        or not cleanup_ownership.reserved
+    ):
+        raise TypeError("Provider stream cleanup ownership is invalid.")
     cleanup_cancellation_baseline = cancellation_baseline
     try:
         try:
@@ -269,9 +451,49 @@ async def aclosing_provider_stream(
             cleanup_cancellation_baseline = task.cancelling() if task is not None else 0
             close = getattr(source, "aclose", None)
             if callable(close):
-                await close()
+                close_operation = cast("Callable[[], Awaitable[None]]", close)
+                if cleanup_ownership is None:
+                    await close_operation()
+                else:
+
+                    async def capture_close() -> _ProviderStreamCleanupOutcome:
+                        try:
+                            await close_operation()
+                        except BaseException as exc:
+                            return _ProviderStreamCleanupOutcome(error=exc)
+                        return _ProviderStreamCleanupOutcome()
+
+                    cleanup_task = asyncio.create_task(capture_close())
+                    cleanup_ownership.track(cleanup_task)
+                    cleanup_task_tracked = True
+                    current_count = task.cancelling() if task is not None else 0
+                    if current_count > cancellation_baseline:
+                        # Start the retained close before releasing the live-model
+                        # caller. The child owns any later physical settlement.
+                        await asyncio.sleep(0)
+                        cleanup_unsettled = not cleanup_task.done()
+                        if cleanup_task.done():
+                            cleanup_failure = cleanup_task.result().error
+                    else:
+                        try:
+                            outcome = await asyncio.shield(cleanup_task)
+                        except asyncio.CancelledError as exc:
+                            cleanup_failure = exc
+                            cleanup_unsettled = not cleanup_task.done()
+                            if cleanup_task.done():
+                                cleanup_failure = cleanup_task.result().error
+                        else:
+                            cleanup_failure = outcome.error
+            elif cleanup_ownership is not None:
+                cleanup_ownership.release()
         except BaseException as exc:
             cleanup_failure = exc
+            if (
+                cleanup_ownership is not None
+                and cleanup_ownership.reserved
+                and not cleanup_task_tracked
+            ):
+                cleanup_ownership.release()
         finally:
             close = None
             del source
@@ -285,6 +507,11 @@ async def aclosing_provider_stream(
     cancellation_count = task.cancelling() if task is not None else cancellation_baseline
     if cancellation_count > cancellation_baseline:
         cancellation_during_cleanup = cancellation_count > cleanup_cancellation_baseline
+        inherited_handoff = (
+            _credential_safe_cancellation_handoff(operation_failure)
+            if isinstance(operation_failure, asyncio.CancelledError)
+            else None
+        )
         if isinstance(cleanup_failure, asyncio.CancelledError):
             cancellation = cleanup_failure
         elif isinstance(operation_failure, asyncio.CancelledError):
@@ -295,9 +522,42 @@ async def aclosing_provider_stream(
                 if cancellation_during_cleanup
                 else "Provider operation cancelled"
             )
-        if operation_failure is not None and (
-            cancellation_during_cleanup or cleanup_failure is not None
+        diagnostics: list[dict[str, Any]] = []
+        if operation_failure is not None and not isinstance(
+            operation_failure,
+            asyncio.CancelledError,
         ):
+            diagnostics.append(
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                }
+            )
+        if cleanup_failure is not None or cleanup_unsettled:
+            diagnostics.append(
+                {
+                    "phase": "provider_stream_cleanup",
+                    "error": "Provider stream cleanup did not complete normally.",
+                    "error_type": "ProviderStreamCleanupError",
+                }
+            )
+        cancellation = credential_safe_provider_cancellation(
+            "Provider stream cleanup cancelled"
+            if isinstance(cleanup_failure, asyncio.CancelledError)
+            else "Provider operation cancelled",
+            preserve_empty_artifacts=False,
+            stream_cleanup_cancelled_after_failure=(
+                operation_failure is not None and (cleanup_failure is not None or cleanup_unsettled)
+            ),
+            provider_cancellation_failures=_merge_provider_cancellation_failures(
+                ()
+                if inherited_handoff is None
+                else inherited_handoff.provider_cancellation_failures,
+                tuple(diagnostics),
+            ),
+        )
+        if operation_failure is not None and (cleanup_failure is not None or cleanup_unsettled):
             _mark_stream_cleanup_cancellation(cancellation)
         if operation_failure is cancellation:
             cause = cleanup_failure
@@ -342,11 +602,17 @@ def _detached_provider_failure(failure: BaseException) -> BaseException:
         )
     if isinstance(failure, asyncio.CancelledError):
         handoff = _credential_safe_cancellation_handoff(failure)
-        cancellation = asyncio.CancelledError(
-            handoff.message if handoff is not None else "Provider operation cancelled"
+        if handoff is None:
+            cancellation = asyncio.CancelledError("Provider operation cancelled")
+            if exception_state_contains(failure, "artifacts"):
+                set_exception_state(cancellation, "artifacts", [])
+            return cancellation
+        cancellation = credential_safe_provider_cancellation(
+            handoff.message,
+            preserve_empty_artifacts=exception_state_contains(failure, "artifacts"),
+            stream_cleanup_cancelled_after_failure=(handoff.stream_cleanup_cancelled_after_failure),
+            provider_cancellation_failures=handoff.provider_cancellation_failures,
         )
-        if exception_state_contains(failure, "artifacts"):
-            set_exception_state(cancellation, "artifacts", [])
         if handoff is not None and handoff.stream_cleanup_cancelled_after_failure:
             add_exception_note_safely(cancellation, _STREAM_CLEANUP_CANCELLATION_NOTE)
         return cancellation
@@ -475,8 +741,13 @@ def detach_provider_stream_traceback(
 __all__ = [
     "ProviderStreamCleanupError",
     "aclosing_provider_stream",
+    "copy_provider_cancellation_failures",
     "credential_safe_provider_cancellation",
+    "detach_credential_safe_provider_cancellation",
     "detach_provider_call_traceback",
     "detach_provider_stream_traceback",
+    "provider_cancellation_failures",
+    "release_provider_stream_cleanup",
+    "reserve_provider_stream_cleanup",
     "stream_cleanup_cancelled_after_provider_failure",
 ]

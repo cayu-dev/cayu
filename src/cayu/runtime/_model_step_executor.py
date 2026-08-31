@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import logging
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -31,6 +31,7 @@ from cayu._exception_groups import (
     exception_group_children,
     exception_tree_contains,
     iter_exception_tree,
+    rebuild_exception_group,
     set_exception_cause,
     set_exception_context,
 )
@@ -128,7 +129,16 @@ from cayu.providers import (
     copy_provider_operation_state,
     normalize_model_completion,
 )
-from cayu.providers._credential_boundary import aclosing_provider_stream
+from cayu.providers._credential_boundary import (
+    _ProviderStreamCleanupOwnership,
+    aclosing_provider_stream,
+    credential_safe_provider_cancellation,
+    detach_credential_safe_provider_cancellation,
+    provider_cancellation_failures,
+    release_provider_stream_cleanup,
+    reserve_provider_stream_cleanup,
+    stream_cleanup_cancelled_after_provider_failure,
+)
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
@@ -2184,6 +2194,149 @@ def _combine_post_completion_failures(
         "Model completion encountered multiple terminal failures.",
         [current, subsequent],
     )
+
+
+class _ProviderStreamSelfCancellation(asyncio.CancelledError):
+    """Authenticated handoff for provider-originated stream cancellation."""
+
+
+class _ProviderStreamGeneratorExit(BaseException):
+    """Carry a provider-raised GeneratorExit through context-manager closure."""
+
+    def __init__(self, failure: GeneratorExit) -> None:
+        super().__init__()
+        self.failure = failure
+
+
+def _sanitize_provider_cancellation_group(failure: BaseException) -> BaseException:
+    """Detach a provider-owned group whose cancellation has no caller authority."""
+
+    if isinstance(failure, BaseExceptionGroup):
+        return rebuild_exception_group(
+            failure,
+            group_message="Model provider stream failed",
+            leaf_mapper=_sanitize_provider_cancellation_group,
+            invalid_leaf_factory=lambda: RuntimeError("Model provider stream failed"),
+        )
+    if isinstance(failure, asyncio.CancelledError):
+        return RuntimeError("Model provider stream cancelled itself")
+    if isinstance(failure, GeneratorExit):
+        return GeneratorExit("Model provider stream terminated")
+    if isinstance(failure, KeyboardInterrupt):
+        return KeyboardInterrupt("Model provider stream interrupted")
+    if isinstance(failure, SystemExit):
+        raw_args: object
+        try:
+            raw_args = BaseException.__dict__["args"].__get__(failure, BaseException)
+        except BaseException:
+            raw_args = ()
+        if type(raw_args) is tuple and len(raw_args) == 1:
+            exit_code = cast("tuple[object]", raw_args)[0]
+            if type(exit_code) is int or exit_code is None:
+                return SystemExit(exit_code)
+        return SystemExit("Model provider stream exited")
+    if isinstance(failure, Exception):
+        return RuntimeError("Model provider stream failed")
+    return BaseException("Model provider stream failed")
+
+
+def _raise_model_provider_stream_boundary_failure(
+    failure: BaseException,
+    *,
+    cancellation_baseline: int,
+) -> Never:
+    task = asyncio.current_task()
+    if task is not None and task.cancelling() > cancellation_baseline:
+        inherited_diagnostics = (
+            provider_cancellation_failures(failure)
+            if isinstance(failure, asyncio.CancelledError)
+            else ()
+        )
+        diagnostics = inherited_diagnostics or (
+            ()
+            if isinstance(failure, asyncio.CancelledError)
+            else (
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                },
+            )
+        )
+        raise credential_safe_provider_cancellation(
+            "Provider operation cancelled",
+            preserve_empty_artifacts=False,
+            stream_cleanup_cancelled_after_failure=(
+                isinstance(failure, asyncio.CancelledError)
+                and stream_cleanup_cancelled_after_provider_failure(failure)
+            ),
+            provider_cancellation_failures=diagnostics,
+        ) from None
+    if isinstance(failure, asyncio.CancelledError):
+        raise _ProviderStreamSelfCancellation() from None
+    if isinstance(failure, BaseExceptionGroup) and exception_tree_contains(
+        failure,
+        asyncio.CancelledError,
+    ):
+        raise _sanitize_provider_cancellation_group(failure) from None
+    raise failure
+
+
+async def _owned_model_provider_events(
+    source_factory: Callable[[], AsyncIterator[ModelStreamEvent]],
+    *,
+    cancellation_baseline: int,
+    cleanup_ownership: _ProviderStreamCleanupOwnership | None = None,
+) -> AsyncGenerator[ModelStreamEvent, None]:
+    """Authenticate cancellation at the live model-stream boundary."""
+
+    if cleanup_ownership is None:
+        cleanup_ownership = reserve_provider_stream_cleanup()
+    try:
+        source = source_factory()
+    except BaseException as failure:
+        release_provider_stream_cleanup(cleanup_ownership)
+        _raise_model_provider_stream_boundary_failure(
+            failure,
+            cancellation_baseline=cancellation_baseline,
+        )
+    try:
+        async with aclosing_provider_stream(
+            source,
+            cancellation_baseline=cancellation_baseline,
+            cleanup_ownership=cleanup_ownership,
+        ) as events:
+            try:
+                iterator = aiter(events)
+            except BaseException as failure:
+                _raise_model_provider_stream_boundary_failure(
+                    failure,
+                    cancellation_baseline=cancellation_baseline,
+                )
+            while True:
+                try:
+                    event = cast("ModelStreamEvent", await anext(iterator))
+                except StopAsyncIteration:
+                    return
+                except GeneratorExit as failure:
+                    raise _ProviderStreamGeneratorExit(failure) from None
+                except BaseException as failure:
+                    _raise_model_provider_stream_boundary_failure(
+                        failure,
+                        cancellation_baseline=cancellation_baseline,
+                    )
+                task = asyncio.current_task()
+                if task is not None and task.cancelling() > cancellation_baseline:
+                    # A provider may catch the injected CancelledError and return a
+                    # value instead. Task state remains the positive caller-owned
+                    # authority, so do not let that value resume ordinary execution.
+                    raise credential_safe_provider_cancellation(
+                        "Provider operation cancelled",
+                        preserve_empty_artifacts=False,
+                    )
+                yield event
+    except _ProviderStreamGeneratorExit as failure:
+        raise failure.failure from None
 
 
 @dataclass(frozen=True)
@@ -5935,6 +6088,7 @@ class ModelStepExecutor:
                 )
 
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
+        provider_events_owned = False
         provider_operation_adapter: ProviderOperationAdapter | None = None
         provider_operation_state: ProviderOperationState | None = None
         provider_operation_interaction_id: str | None = None
@@ -5997,7 +6151,11 @@ class ModelStepExecutor:
                     "ModelProvider.provider_operation_mode must return a ProviderOperationMode."
                 )
             if provider_operation_mode is ProviderOperationMode.SYNCHRONOUS:
-                provider_events = provider.stream(model_request)
+                provider_events = _owned_model_provider_events(
+                    lambda: provider.stream(model_request),
+                    cancellation_baseline=provider_cancellation_baseline,
+                )
+                provider_events_owned = True
             else:
                 provider_operation_adapter = provider.provider_operations
                 if not isinstance(provider_operation_adapter, ProviderOperationAdapter):
@@ -7077,7 +7235,82 @@ class ModelStepExecutor:
                 raise
             post_completion_failure = exc
         except asyncio.CancelledError as exc:
-            if model_completion_publisher is None or not model_completed:
+            current_task = asyncio.current_task()
+            caller_cancellation = (
+                current_task is not None
+                and current_task.cancelling() > provider_cancellation_baseline
+            )
+            if caller_cancellation:
+                # The provider executes inside this task and can replace the
+                # injected cancellation with arbitrary text. Task state proves
+                # caller cancellation, but not that the returned exception
+                # object or its arguments are caller-owned.
+                detached_cancellation = detach_credential_safe_provider_cancellation(exc)
+                safe_message = (
+                    "Provider operation cancelled"
+                    if detached_cancellation is None
+                    else detached_cancellation.args[0]
+                )
+                exc = credential_safe_provider_cancellation(
+                    safe_message,
+                    preserve_empty_artifacts=False,
+                    stream_cleanup_cancelled_after_failure=(
+                        stream_cleanup_cancelled_after_provider_failure(exc)
+                    ),
+                    provider_cancellation_failures=provider_cancellation_failures(exc),
+                )
+            elif isinstance(exc, _ProviderStreamSelfCancellation):
+                # Only the exact provider iterator boundary can mint this
+                # marker. Keep provider-created cancellation on the ordinary,
+                # non-retryable provider-failure path without granting it
+                # caller cancellation authority.
+                provider_failure = ModelProviderError(
+                    "Model provider stream cancelled itself.",
+                    provider=registered_provider.name,
+                    error_type="ProviderStreamCancellationError",
+                    error_code="provider_stream_cancelled_itself",
+                    retryable=False,
+                )
+                if model_completion_publisher is None or not model_completed:
+                    durable_stream_failure = ModelAttemptFailed(
+                        message=str(provider_failure),
+                        payload={
+                            "error": str(provider_failure),
+                            "error_type": "ProviderStreamCancellationError",
+                            **provider_failure.error_payload_fields(),
+                        },
+                        emitted_error_event=False,
+                        cause=provider_failure,
+                        provider_effect_observed=provider_effect_observed,
+                        automatic_retry_disabled=True,
+                    )
+                else:
+                    post_completion_failure = provider_failure
+            else:
+                # Provider-originated cancellation is converted at the exact
+                # provider iterator boundary. A raw cancellation reaching this
+                # wider attempt owner came from another child operation (for
+                # example event persistence) and must not be mislabeled as a
+                # provider failure or caller control.
+                operational_failure = unexpected_child_cancellation_error(
+                    exc,
+                    operation="Model attempt operation",
+                )
+                if model_completion_publisher is None or not model_completed:
+                    durable_stream_failure = ModelAttemptFailed(
+                        message=str(operational_failure),
+                        payload={
+                            "error": str(operational_failure),
+                            "error_type": type(operational_failure).__name__,
+                        },
+                        emitted_error_event=False,
+                        cause=operational_failure,
+                        provider_effect_observed=provider_effect_observed,
+                        automatic_retry_disabled=True,
+                    )
+                else:
+                    post_completion_failure = operational_failure
+            if caller_cancellation and (model_completion_publisher is None or not model_completed):
                 cancellation_snapshot = None
                 if (
                     provider_operation_adapter is not None
@@ -7115,8 +7348,9 @@ class ModelStepExecutor:
                     cancellation_snapshot,
                     ambiguous_suffix="cancelled-with-unknown-provider-outcome",
                 )
-                raise
-            post_completion_failure = exc
+                raise exc from None
+            if caller_cancellation:
+                post_completion_failure = exc
         except GeneratorExit as exc:
             if model_completion_publisher is None or not model_completed:
                 if not background_exposure_recovery_pending():
@@ -7290,35 +7524,39 @@ class ModelStepExecutor:
         finally:
             if provider_events is not None and not provider_exhausted:
                 active_failure = sys.exception()
-                if background_dispatch_invoked and model_completed:
-                    try:
+                try:
+                    if provider_events_owned:
+                        # The wrapper owns the one credential-safe provider close.
+                        await cast(
+                            "AsyncGenerator[ModelStreamEvent, None]",
+                            provider_events,
+                        ).aclose()
+                    else:
                         async with aclosing_provider_stream(provider_events):
                             pass
-                    except BaseException as cleanup_failure:
-                        primary_failure = (
-                            post_completion_failure
-                            or provider_control_failure
-                            or durable_stream_failure
-                            or active_failure
+                except BaseException as cleanup_failure:
+                    if isinstance(cleanup_failure, asyncio.CancelledError):
+                        raise
+                    primary_failure = (
+                        post_completion_failure
+                        or provider_control_failure
+                        or durable_stream_failure
+                        or active_failure
+                    )
+                    combined_failure = (
+                        cleanup_failure
+                        if primary_failure is None or primary_failure is cleanup_failure
+                        else _combine_post_completion_failures(
+                            primary_failure,
+                            cleanup_failure,
                         )
-                        post_completion_failure = (
-                            cleanup_failure
-                            if primary_failure is None or primary_failure is cleanup_failure
-                            else _combine_post_completion_failures(
-                                primary_failure,
-                                cleanup_failure,
-                            )
-                        )
-                else:
-                    try:
-                        await _close_async_iterator(provider_events)
-                    except BaseException as exc:
-                        if model_completion_publisher is None or not model_completed:
-                            raise
-                        post_completion_failure = _combine_post_completion_failures(
-                            post_completion_failure,
-                            exc,
-                        )
+                    )
+                    if background_dispatch_invoked and model_completed:
+                        post_completion_failure = combined_failure
+                    elif model_completion_publisher is None or not model_completed:
+                        raise combined_failure from None
+                    else:
+                        post_completion_failure = combined_failure
 
         if (
             not model_completed

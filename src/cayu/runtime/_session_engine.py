@@ -38,7 +38,7 @@ from cayu._exception_groups import (
     rebuild_exception_group,
     set_exception_cause,
 )
-from cayu._exception_state import pop_exception_state, set_exception_state
+from cayu._exception_state import exception_state, pop_exception_state, set_exception_state
 from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
@@ -99,6 +99,11 @@ from cayu.providers import (
     ProviderOperationMode,
     UsageDialect,
     copy_usage_dialect,
+)
+from cayu.providers._credential_boundary import (
+    copy_provider_cancellation_failures,
+    detach_credential_safe_provider_cancellation,
+    provider_cancellation_failures,
 )
 from cayu.providers.base import privacy_safe_provider_option_projection
 from cayu.runtime import _approval_publication as approval_publication
@@ -181,6 +186,7 @@ from cayu.runtime._memory_evidence import (
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._model_errors import (
     _FallbackBillingCancellationStateCheckFailed,
+    billing_identity_cancellation_failures,
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
 )
@@ -257,7 +263,10 @@ from cayu.runtime._task_store_operation_boundary import (
     raise_task_store_operation_failure,
     task_store_work_attempt_admission_capability_is_complete,
 )
-from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
+from cayu.runtime._terminal_evidence import (
+    interruption_request_id_from_payload,
+    require_interruption_event_matches_pending_marker,
+)
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolApprovalRequired,
@@ -1609,6 +1618,12 @@ _INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DEPTH = 8
 
 _INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DESCENDANTS = 32
 
+_PROVIDER_CANCELLATION_FINALIZATION_FAILURE_STATE = (
+    "_cayu_provider_cancellation_finalization_failure"
+)
+
+_PROVIDER_CANCELLATION_FINALIZATION_FAILURE_AUTHORITY = object()
+
 _ExceptionT = TypeVar("_ExceptionT", bound=BaseException)
 
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
@@ -1630,6 +1645,86 @@ class _InteractionTransitionCancellationOutcome:
     transition_settled: bool
     encoded_failure_diagnostics: str
     encoded_transition_spec: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCancellationFinalizationFailure:
+    """Authenticated proof that runtime terminal publication did not finish."""
+
+    authority: object
+
+
+def _mark_provider_cancellation_finalization_failure(
+    cancellation: asyncio.CancelledError,
+) -> None:
+    if not set_exception_state(
+        cancellation,
+        _PROVIDER_CANCELLATION_FINALIZATION_FAILURE_STATE,
+        _ProviderCancellationFinalizationFailure(
+            authority=_PROVIDER_CANCELLATION_FINALIZATION_FAILURE_AUTHORITY,
+        ),
+    ):
+        raise RuntimeError("Could not retain provider cancellation finalization failure.")
+
+
+def _has_provider_cancellation_finalization_failure(
+    cancellation: asyncio.CancelledError,
+) -> bool:
+    handoff = exception_state(
+        cancellation,
+        _PROVIDER_CANCELLATION_FINALIZATION_FAILURE_STATE,
+    )
+    return (
+        type(handoff) is _ProviderCancellationFinalizationFailure
+        and handoff.authority is _PROVIDER_CANCELLATION_FINALIZATION_FAILURE_AUTHORITY
+    )
+
+
+def _detach_provider_cancellation_for_public(
+    cancellation: asyncio.CancelledError,
+) -> asyncio.CancelledError | None:
+    detached = detach_credential_safe_provider_cancellation(cancellation)
+    finalization_failed = _has_provider_cancellation_finalization_failure(cancellation)
+    if detached is None:
+        if not finalization_failed:
+            return None
+        detached = asyncio.CancelledError("Provider operation cancelled")
+    pending_cancellation_requests = workspace_observation_pending_cancellation_requests(
+        cancellation
+    )
+    if pending_cancellation_requests:
+        retain_workspace_observation_pending_cancellation_requests(
+            detached,
+            pending_cancellation_requests,
+        )
+    if finalization_failed:
+        _mark_provider_cancellation_finalization_failure(detached)
+        detached.__cause__ = RuntimeError(
+            "Session interruption finalization failed after provider cancellation."
+        )
+    return detached
+
+
+def _detach_billing_cancellation_for_public(
+    cancellation: asyncio.CancelledError,
+) -> asyncio.CancelledError | None:
+    detached = detach_billing_identity_cancellation(cancellation)
+    if detached is None:
+        return None
+    pending_cancellation_requests = workspace_observation_pending_cancellation_requests(
+        cancellation
+    )
+    if pending_cancellation_requests:
+        retain_workspace_observation_pending_cancellation_requests(
+            detached,
+            pending_cancellation_requests,
+        )
+    if _has_provider_cancellation_finalization_failure(cancellation):
+        _mark_provider_cancellation_finalization_failure(detached)
+        detached.__cause__ = RuntimeError(
+            "Session interruption finalization failed after provider cancellation."
+        )
+    return detached
 
 
 def _interaction_transition_failure_contains_run_fence(error: BaseException) -> bool:
@@ -10180,9 +10275,9 @@ class SessionEngine:
             async for event in forwarded_stream:
                 yield event
         except asyncio.CancelledError as exc:
-            billing_identity_cancellation = detach_billing_identity_cancellation(exc)
+            billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
             if billing_identity_cancellation is None:
-                propagated_cancellation = exc
+                propagated_cancellation = _detach_provider_cancellation_for_public(exc) or exc
         except BaseExceptionGroup as exc:
             billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
             if billing_identity_cancellation_group is None:
@@ -10194,6 +10289,7 @@ class SessionEngine:
             await _close_async_iterator(forwarded_stream)
             raise
 
+        del forwarded_stream, session_stream
         # A registered provider can retain live credentials in its repr. Drop it
         # before any fallible interruption-store work and before raising a fresh
         # provider-free cancellation.
@@ -10201,11 +10297,14 @@ class SessionEngine:
 
         if billing_identity_cancellation is not None:
             interruption_check_failed = False
-            try:
-                interruption_requested = await self._session_control.interrupt_requested(session.id)
-            except Exception:
-                interruption_check_failed = True
-                interruption_requested = False
+            interruption_requested = False
+            if self._session_control.is_interruption_request_active(session.id):
+                try:
+                    interruption_requested = await self._session_control.interrupt_requested(
+                        session.id
+                    )
+                except Exception:
+                    interruption_check_failed = True
             if interruption_check_failed:
                 raise RuntimeError(
                     "Session interruption state check failed after provider billing cancellation"
@@ -10233,11 +10332,12 @@ class SessionEngine:
 
         if billing_identity_cancellation_group is not None:
             interruption_load_failed = False
-            try:
-                persisted_session = await self.session_store.load(session.id)
-            except Exception:
-                interruption_load_failed = True
-                persisted_session = None
+            persisted_session = None
+            if self._session_control.is_interruption_request_active(session.id):
+                try:
+                    persisted_session = await self.session_store.load(session.id)
+                except Exception:
+                    interruption_load_failed = True
             if interruption_load_failed:
                 raise RuntimeError(
                     "Session interruption state load failed after provider billing cancellation"
@@ -10310,13 +10410,17 @@ class SessionEngine:
         )
         billing_identity_cancellation: asyncio.CancelledError | None = None
         billing_identity_cancellation_group: BaseExceptionGroup | None = None
+        propagated_cancellation: asyncio.CancelledError | None = None
         try:
             async for event in forwarded_stream:
                 yield event
         except asyncio.CancelledError as exc:
-            billing_identity_cancellation = detach_billing_identity_cancellation(exc)
+            billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
             if billing_identity_cancellation is None:
-                raise
+                detached_provider_cancellation = _detach_provider_cancellation_for_public(exc)
+                if detached_provider_cancellation is None:
+                    raise
+                propagated_cancellation = detached_provider_cancellation
         except BaseExceptionGroup as exc:
             billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
             if billing_identity_cancellation_group is None:
@@ -10324,10 +10428,13 @@ class SessionEngine:
         except GeneratorExit:
             await _close_async_iterator(forwarded_stream)
             raise
+        del forwarded_stream, session_stream
         if billing_identity_cancellation is not None:
             raise billing_identity_cancellation
         if billing_identity_cancellation_group is not None:
             raise billing_identity_cancellation_group
+        if propagated_cancellation is not None:
+            raise propagated_cancellation
 
     async def compact_session(
         self,
@@ -10363,13 +10470,17 @@ class SessionEngine:
         )
         billing_identity_cancellation: asyncio.CancelledError | None = None
         billing_identity_cancellation_group: BaseExceptionGroup | None = None
+        propagated_cancellation: asyncio.CancelledError | None = None
         try:
             async for event in forwarded_stream:
                 yield event
         except asyncio.CancelledError as exc:
-            billing_identity_cancellation = detach_billing_identity_cancellation(exc)
+            billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
             if billing_identity_cancellation is None:
-                raise
+                detached_provider_cancellation = _detach_provider_cancellation_for_public(exc)
+                if detached_provider_cancellation is None:
+                    raise
+                propagated_cancellation = detached_provider_cancellation
         except BaseExceptionGroup as exc:
             billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
             if billing_identity_cancellation_group is None:
@@ -10377,10 +10488,13 @@ class SessionEngine:
         except GeneratorExit:
             await _close_async_iterator(forwarded_stream)
             raise
+        del forwarded_stream, operation_stream
         if billing_identity_cancellation is not None:
             raise billing_identity_cancellation
         if billing_identity_cancellation_group is not None:
             raise billing_identity_cancellation_group
+        if propagated_cancellation is not None:
+            raise propagated_cancellation
 
     async def enqueue_session_message(
         self,
@@ -19618,6 +19732,10 @@ class SessionEngine:
                 yield event
             return
         except asyncio.CancelledError as cancellation:
+            provider_cancellation_diagnostics = (
+                provider_cancellation_failures(cancellation)
+                + billing_identity_cancellation_failures(cancellation)
+            )[:2]
             if _consume_authenticated_interaction_transition_run_fence(cancellation):
                 # The owned transition attempt proved that this worker lost
                 # authority. Preserve caller cancellation without attempting
@@ -19682,11 +19800,11 @@ class SessionEngine:
                 # recoverable, so abandoned-run cleanup must not rewrite it.
                 raise
             billing_identity_cancellation = detach_billing_identity_cancellation(cancellation)
-            if billing_identity_cancellation is not None:
-                if not preserve_failure_until_initial_provider_dispatch:
-                    # The ordinary outer run boundary owns credential-safe
-                    # detachment and environment finalization.
-                    raise
+            if (
+                billing_identity_cancellation is not None
+                and preserve_failure_until_initial_provider_dispatch
+                and self._session_control.is_interruption_request_active(session.id)
+            ):
                 # Provider-operation fallback recovery has no equivalent outer
                 # run boundary. Drop provider-bearing locals before fallible
                 # interruption work and surface only a detached cancellation.
@@ -19727,6 +19845,7 @@ class SessionEngine:
                             turn_usage_tracker=turn_usage_tracker,
                             active_run=active_run,
                             interaction_transition_failures=tuple(interaction_transition_failures),
+                            provider_cancellation_failures=(provider_cancellation_diagnostics),
                         ):
                             interruption_events.append(event)
                     except Exception:
@@ -19738,6 +19857,10 @@ class SessionEngine:
                         yield event
                     return
                 raise billing_identity_cancellation from None
+            provider_cancellation_authenticated = (
+                billing_identity_cancellation is not None
+                or detach_credential_safe_provider_cancellation(cancellation) is not None
+            )
             if await self._session_control.interrupt_requested(session.id):
                 clear_current_task_cancellation()
                 await materialize_deferred_messages_after_failure()
@@ -19762,6 +19885,7 @@ class SessionEngine:
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
                     interaction_transition_failures=tuple(interaction_transition_failures),
+                    provider_cancellation_failures=provider_cancellation_diagnostics,
                 ):
                     interruption_events.append(event)
                 for event in interruption_events:
@@ -19804,6 +19928,7 @@ class SessionEngine:
                             active_run=active_run,
                             interaction_transition_failures=tuple(interaction_transition_failures),
                             interaction_transition=interaction_transition,
+                            provider_cancellation_failures=(provider_cancellation_diagnostics),
                             execution_profile=execution_profile,
                             invocation_context=invocation_context,
                         )
@@ -19821,17 +19946,21 @@ class SessionEngine:
                 ),
             )
             if interaction_transition_failures:
-                await _run_interaction_transition_cancellation_cleanup_steps(
-                    cancellation,
-                    steps=cancellation_cleanup_steps,
+                cancellation_cleanup_failures = (
+                    await _run_interaction_transition_cancellation_cleanup_steps(
+                        cancellation,
+                        steps=cancellation_cleanup_steps,
+                    )
                 )
             else:
-                await _run_recovery_cleanup_steps(
+                cancellation_cleanup_failures = await _run_recovery_cleanup_steps(
                     authoritative_failure=cancellation,
                     steps=cancellation_cleanup_steps,
                 )
             if cancellation_terminal_event is not None:
                 _mark_session_invocation_terminal_event(cancellation_terminal_event)
+            if provider_cancellation_authenticated and cancellation_cleanup_failures:
+                _mark_provider_cancellation_finalization_failure(cancellation)
             raise
         except GeneratorExit as abandonment:
             if (
@@ -21463,15 +21592,50 @@ class SessionEngine:
             return copy_json_value(default, "interrupt_payload")
         if type(value) is not dict:
             raise ValueError("Pending session interrupt checkpoint must be an object.")
-        return copy_json_value(value, "interrupt_payload")
+        payload = copy_json_value(value, "interrupt_payload")
+        if "provider_cancellation_failures" in payload:
+            failures = copy_provider_cancellation_failures(
+                payload["provider_cancellation_failures"]
+            )
+            if not failures:
+                raise ValueError("Provider cancellation diagnostics cannot be empty.")
+            interruption_type = payload.get("interruption_type")
+            if type(interruption_type) is not str or interruption_type not in (
+                _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+                _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+            ):
+                raise ValueError("Provider cancellation interruption type is invalid.")
+            if interruption_request_id_from_payload(payload) is None:
+                raise ValueError("Provider cancellation interruption request ID is missing.")
+            payload["provider_cancellation_failures"] = [dict(item) for item in failures]
+        return payload
 
-    async def _clear_pending_session_interrupt(self, session_id: str) -> None:
+    async def _clear_pending_session_interrupt(
+        self,
+        session_id: str,
+        *,
+        expected_payload: dict[str, Any] | None = None,
+        expected_run_epoch: int | None = None,
+    ) -> None:
         def transform(_session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
             copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            if expected_payload is not None:
+                current = copied.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+                if current != expected_payload:
+                    raise RuntimeError("Pending session interrupt identity changed before clear.")
             copied.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, None)
             return copied
 
-        await self.session_store.transform_checkpoint(session_id, transform)
+        if expected_run_epoch is None:
+            await self.session_store.transform_checkpoint(session_id, transform)
+            return
+        await self.session_store.publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=transform,
+            events=[],
+            expected_statuses={SessionStatus.INTERRUPTED},
+            expected_run_epoch=expected_run_epoch,
+        )
 
     async def _load_pending_interruption_cascade(
         self,
@@ -21993,6 +22157,7 @@ class SessionEngine:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
         interaction_transition_failures: tuple[dict[str, Any], ...] = (),
+        provider_cancellation_failures: tuple[dict[str, Any], ...] = (),
     ) -> AsyncGenerator[Event, None]:
         clear_current_task_cancellation()
         current_task = asyncio.current_task()
@@ -22003,6 +22168,40 @@ class SessionEngine:
             loaded_interrupted = await self.session_store.load(session.id)
             if loaded_interrupted is None:
                 raise KeyError(f"Session not found: {session.id}") from None
+            payload = await self._load_pending_session_interrupt_payload(session.id, default={})
+            if interaction_transition_failures:
+                copied_failures = copy_durable_json_value(
+                    list(interaction_transition_failures),
+                    "interaction transition cancellation diagnostics",
+                )
+                if type(copied_failures) is not list:
+                    raise TypeError(
+                        "Interaction transition cancellation diagnostics must be a list."
+                    )
+                payload["interaction_transition_failures"] = copied_failures
+            if provider_cancellation_failures:
+                copied_provider_failures = copy_provider_cancellation_failures(
+                    provider_cancellation_failures
+                )
+                payload["provider_cancellation_failures"] = [
+                    dict(item) for item in copied_provider_failures
+                ]
+            payload.setdefault("interruption_type", _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED)
+            payload.setdefault("interruption_request_id", str(uuid4()))
+            if provider_cancellation_failures:
+                # Persist exact repair authority before the status or sibling
+                # interaction changes. A process loss after either mutation
+                # must not leave terminal state with no diagnostic evidence.
+                await self.session_store.publish_checkpoint_and_events(
+                    session.id,
+                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                        payload,
+                        include_interruption_cascade=False,
+                    ),
+                    events=[],
+                    expected_statuses={loaded_interrupted.status},
+                    expected_run_epoch=loaded_interrupted.run_epoch,
+                )
             interaction_event: Event | None = None
             if loaded_interrupted.status != SessionStatus.INTERRUPTED:
                 (
@@ -22019,17 +22218,6 @@ class SessionEngine:
                     execution_profile=execution_profile,
                     finalize_unsettled_cancellation=False,
                 )
-            payload = await self._load_pending_session_interrupt_payload(session.id, default={})
-            if interaction_transition_failures:
-                copied_failures = copy_durable_json_value(
-                    list(interaction_transition_failures),
-                    "interaction transition cancellation diagnostics",
-                )
-                if type(copied_failures) is not list:
-                    raise TypeError(
-                        "Interaction transition cancellation diagnostics must be a list."
-                    )
-                payload["interaction_transition_failures"] = copied_failures
             if (
                 interaction_event is None
                 and _current_session_interaction_id(session.id) is not None
@@ -22053,7 +22241,18 @@ class SessionEngine:
                 interruption_request_id=interruption_request_id,
             )
             if existing_interrupt_event is not None:
-                await self._clear_pending_session_interrupt(session.id)
+                if provider_cancellation_failures:
+                    require_interruption_event_matches_pending_marker(
+                        existing_interrupt_event,
+                        payload,
+                    )
+                await self._clear_pending_session_interrupt(
+                    session.id,
+                    expected_payload=(payload if provider_cancellation_failures else None),
+                    expected_run_epoch=(
+                        loaded_interrupted.run_epoch if provider_cancellation_failures else None
+                    ),
+                )
                 if not interruption_cascade_suppressed():
                     self._schedule_background_interruption_cascade(
                         parent_session_id=session.id,
@@ -22069,8 +22268,6 @@ class SessionEngine:
                     yield turn_completed_event
                 yield existing_interrupt_event
                 return
-            payload.setdefault("interruption_type", _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED)
-            payload.setdefault("interruption_request_id", str(uuid4()))
             if run_started_at is not None and turn_usage_tracker is not None:
                 for event in await self._emit_turn_completed_once(
                     session=loaded_interrupted,
@@ -22107,7 +22304,18 @@ class SessionEngine:
                 missing_message="Session interruption produced no terminal event.",
             )
 
-            await self._clear_pending_session_interrupt(session.id)
+            if provider_cancellation_failures:
+                require_interruption_event_matches_pending_marker(
+                    interrupted_event,
+                    payload,
+                )
+            await self._clear_pending_session_interrupt(
+                session.id,
+                expected_payload=(payload if provider_cancellation_failures else None),
+                expected_run_epoch=(
+                    loaded_interrupted.run_epoch if provider_cancellation_failures else None
+                ),
+            )
             if not interruption_cascade_suppressed():
                 self._schedule_background_interruption_cascade(
                     parent_session_id=session.id,

@@ -29,6 +29,7 @@ from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     aclosing_provider_stream,
     credential_safe_provider_cancellation,
+    provider_cancellation_failures,
     stream_cleanup_cancelled_after_provider_failure,
 )
 from cayu.providers._sse import (
@@ -1116,6 +1117,7 @@ def sanitize_provider_cancellation(
         stream_cleanup_cancelled_after_failure=(
             stream_cleanup_cancelled_after_provider_failure(exc)
         ),
+        provider_cancellation_failures=provider_cancellation_failures(exc),
     )
     safe.__cause__ = None
     safe.__context__ = None

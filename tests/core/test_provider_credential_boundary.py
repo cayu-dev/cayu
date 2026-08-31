@@ -6,12 +6,17 @@ from collections.abc import AsyncIterator
 import pytest
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
+import cayu.providers._credential_boundary as credential_boundary_module
 from cayu._exception_groups import iter_exception_tree
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     aclosing_provider_stream,
+    copy_provider_cancellation_failures,
+    credential_safe_provider_cancellation,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
+    provider_cancellation_failures,
+    stream_cleanup_cancelled_after_provider_failure,
 )
 from cayu.providers._http import sanitize_provider_cancellation
 from cayu.providers.base import ModelProviderError
@@ -32,6 +37,72 @@ class _FailingCloseStream:
 
     async def aclose(self) -> None:
         raise RuntimeError("provider cleanup failure")
+
+
+def test_provider_sanitizer_preserves_authenticated_cancellation_diagnostics() -> None:
+    diagnostics = (
+        {
+            "phase": "model_stream",
+            "error": "Model provider stream failed before cancellation.",
+            "error_type": "ModelProviderStreamError",
+        },
+        {
+            "phase": "provider_stream_cleanup",
+            "error": "Provider stream cleanup did not complete normally.",
+            "error_type": "ProviderStreamCleanupError",
+        },
+    )
+    inner = credential_safe_provider_cancellation(
+        "Provider stream cleanup cancelled",
+        preserve_empty_artifacts=False,
+        stream_cleanup_cancelled_after_failure=True,
+        provider_cancellation_failures=diagnostics,
+    )
+
+    outer = sanitize_provider_cancellation(
+        inner,
+        provider_label="Chat Completions",
+        credential_values=("private-provider-credential",),
+    )
+
+    assert provider_cancellation_failures(outer) == diagnostics
+
+
+@pytest.mark.parametrize(
+    "failures",
+    [
+        pytest.param(
+            [
+                {
+                    "phase": "model_stream",
+                    "error": "provider-owned replacement",
+                    "error_type": "ModelProviderStreamError",
+                }
+            ],
+            id="wrong-message",
+        ),
+        pytest.param(
+            [
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                },
+                {
+                    "phase": "model_stream",
+                    "error": "Model provider stream failed before cancellation.",
+                    "error_type": "ModelProviderStreamError",
+                },
+            ],
+            id="duplicate-phase",
+        ),
+    ],
+)
+def test_provider_cancellation_diagnostic_reconstruction_rejects_malformed_values(
+    failures: object,
+) -> None:
+    with pytest.raises(ValueError):
+        copy_provider_cancellation_failures(failures)
 
 
 class _CancellationGroupCloseStream(_FailingCloseStream):
@@ -141,66 +212,6 @@ async def test_aclosing_provider_stream_fails_closed_and_retains_primary_identit
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "primary",
-    [
-        pytest.param(KeyboardInterrupt("primary interrupt"), id="keyboard-interrupt"),
-        pytest.param(SystemExit("primary exit"), id="system-exit"),
-        pytest.param(
-            BaseExceptionGroup(
-                "primary fatal group",
-                [RuntimeError("ordinary child"), KeyboardInterrupt("fatal child")],
-            ),
-            id="fatal-group",
-        ),
-    ],
-)
-async def test_aclosing_provider_stream_preserves_primary_fatal_signal(
-    primary: BaseException,
-) -> None:
-    source = _FailingCloseStream()
-
-    with pytest.raises(type(primary)) as exc_info:
-        async with aclosing_provider_stream(source):
-            raise primary
-
-    assert exc_info.value is primary
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
-    assert str(exc_info.value.__cause__) == "provider cleanup failure"
-
-
-@pytest.mark.anyio
-async def test_aclosing_provider_stream_preserves_new_task_cancellation() -> None:
-    close_started = asyncio.Event()
-
-    class BlockingCloseStream(_FailingCloseStream):
-        async def aclose(self) -> None:
-            close_started.set()
-            await asyncio.Event().wait()
-
-    primary = RuntimeError("authoritative provider failure")
-
-    async def consume() -> None:
-        async with aclosing_provider_stream(BlockingCloseStream()):
-            raise primary
-
-    task = asyncio.create_task(consume())
-    await close_started.wait()
-    task.cancel()
-    assert task.cancelling() == 1
-
-    cancellation: asyncio.CancelledError | None = None
-    try:
-        await task
-    except asyncio.CancelledError as exc:
-        cancellation = exc
-
-    assert cancellation is not None
-    assert cancellation.__cause__ is primary
-    assert task.cancelled()
-
-
-@pytest.mark.anyio
 async def test_aclosing_provider_stream_reclassifies_cleanup_only_child_cancellation() -> None:
     task = asyncio.current_task()
     assert task is not None
@@ -233,6 +244,154 @@ async def test_aclosing_provider_stream_reclassifies_cleanup_only_failure() -> N
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
     assert_cayu_traceback_does_not_retain(exc_info.value, source)
+
+
+@pytest.mark.anyio
+async def test_explicit_live_model_cleanup_owner_releases_caller_during_opaque_close() -> None:
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseStream(_FailingCloseStream):
+        async def aclose(self) -> None:
+            close_started.set()
+            await close_release.wait()
+            close_finished.set()
+
+    primary = RuntimeError("authoritative provider failure")
+
+    async def consume() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        ownership = credential_boundary_module.reserve_provider_stream_cleanup()
+        async with aclosing_provider_stream(
+            BlockingCloseStream(),
+            cancellation_baseline=task.cancelling(),
+            cleanup_ownership=ownership,
+        ):
+            raise primary
+
+    task = asyncio.create_task(consume())
+    await close_started.wait()
+    task.cancel("caller cancelled provider cleanup")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert task.cancelling() == 1
+    assert task.cancelled()
+    assert not close_finished.is_set()
+    assert provider_cancellation_failures(exc_info.value) == (
+        {
+            "phase": "model_stream",
+            "error": "Model provider stream failed before cancellation.",
+            "error_type": "ModelProviderStreamError",
+        },
+        {
+            "phase": "provider_stream_cleanup",
+            "error": "Provider stream cleanup did not complete normally.",
+            "error_type": "ProviderStreamCleanupError",
+        },
+    )
+
+    close_release.set()
+    await close_finished.wait()
+
+
+@pytest.mark.anyio
+async def test_second_caller_cancellation_does_not_release_tracked_cleanup_owner() -> None:
+    body_started = asyncio.Event()
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    close_finished = asyncio.Event()
+    ownership = credential_boundary_module.reserve_provider_stream_cleanup()
+
+    class BlockingCloseStream(_FailingCloseStream):
+        def __init__(self) -> None:
+            super().__init__()
+            self.owner: asyncio.Task[None] | None = None
+
+        async def aclose(self) -> None:
+            assert self.owner is not None
+            close_started.set()
+            self.owner.cancel("second caller cancellation during cleanup handoff")
+            await close_release.wait()
+            close_finished.set()
+
+    stream = BlockingCloseStream()
+
+    async def consume() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        stream.owner = task
+        async with aclosing_provider_stream(
+            stream,
+            cancellation_baseline=task.cancelling(),
+            cleanup_ownership=ownership,
+        ):
+            body_started.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(consume())
+    await body_started.wait()
+    task.cancel("first caller cancellation")
+    await close_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ownership.reserved
+    assert not close_finished.is_set()
+
+    close_release.set()
+    await close_finished.wait()
+    await asyncio.sleep(0)
+    assert not ownership.reserved
+
+
+@pytest.mark.anyio
+async def test_successful_cleanup_winning_cancellation_race_has_no_cleanup_failure() -> None:
+    close_finished = asyncio.Event()
+
+    class SuccessfulCloseStream:
+        def __init__(self) -> None:
+            self.owner: asyncio.Task[None] | None = None
+
+        def __aiter__(self) -> SuccessfulCloseStream:
+            return self
+
+        async def __anext__(self) -> str:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            assert self.owner is not None
+            self.owner.cancel("caller cancelled as provider cleanup completed")
+            close_finished.set()
+
+    stream = SuccessfulCloseStream()
+    primary = RuntimeError("authoritative provider failure")
+
+    async def consume() -> None:
+        stream.owner = asyncio.current_task()
+        async with aclosing_provider_stream(stream):
+            raise primary
+
+    task = asyncio.create_task(consume())
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert close_finished.is_set()
+    assert provider_cancellation_failures(exc_info.value) == (
+        {
+            "phase": "model_stream",
+            "error": "Model provider stream failed before cancellation.",
+            "error_type": "ModelProviderStreamError",
+        },
+    )
+    assert not stream_cleanup_cancelled_after_provider_failure(exc_info.value)
+    assert exc_info.value.__cause__ is primary
+    assert task.cancelling() == 1
+    assert task.cancelled()
 
 
 @pytest.mark.anyio
@@ -496,7 +655,8 @@ async def test_detached_provider_call_preserves_authenticated_cancellation_messa
     assert type(exc_info.value) is asyncio.CancelledError
     assert exc_info.value.args == (safe_message,)
     assert credential not in repr(exc_info.value)
-    assert vars(exc_info.value) == {}
+    assert provider_cancellation_failures(exc_info.value) == ()
+    assert credential not in repr(vars(exc_info.value))
     _assert_detached_exception_tree(exc_info.value)
     assert_cayu_traceback_does_not_retain(exc_info.value, provider)
 

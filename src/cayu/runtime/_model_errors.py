@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass
-from typing import Any
+from threading import Lock
+from typing import Any, cast
+from weakref import WeakKeyDictionary
 
 from cayu._exception_groups import (
     exception_tree_contains,
     iter_exception_tree,
     rebuild_exception_group,
 )
+from cayu._exception_state import exception_state, set_exception_state
 from cayu._validation import (
     DurableValueError,
     copy_durable_json_object,
@@ -32,6 +35,10 @@ from cayu.providers.base import (
 from cayu.runtime.workspace_observation_recovery import (
     copy_workspace_observation_pending_cancellation_requests,
 )
+from cayu.tools._operation_boundary import (
+    BoundedInvocationOperationRegistry,
+    InvocationOperationCapacityError,
+)
 
 _PROVIDER_ERROR_PAYLOAD_KEYS = frozenset(
     {
@@ -48,6 +55,14 @@ _PROVIDER_ERROR_TYPE_MARKERS = frozenset({"ModelProviderError", "ModelContextOve
 _BILLING_IDENTITY_ERROR_MESSAGE = "Model provider billing identity resolution failed"
 _BILLING_IDENTITY_ERROR_TYPE = "BillingIdentityResolutionError"
 _BILLING_IDENTITY_ERROR_CODE = "billing_identity_resolution_failed"
+_BILLING_CANCELLATION_FAILURES_STATE = "_cayu_billing_cancellation_failures"
+_BILLING_CANCELLATION_FAILURES_TOKEN = object()
+_MAX_RETAINED_BILLING_HOOKS = 1_024
+_BILLING_HOOK_REGISTRIES: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    BoundedInvocationOperationRegistry,
+] = WeakKeyDictionary()
+_BILLING_HOOK_REGISTRIES_LOCK = Lock()
 
 
 class _BillingIdentityResolutionCancelled(asyncio.CancelledError):
@@ -58,6 +73,33 @@ class _FallbackBillingCancellationStateCheckFailed(RuntimeError):
     """Private signal raised after fallback provider state has been released."""
 
 
+@dataclass(frozen=True, slots=True)
+class _BillingCancellationFailures:
+    message: str
+    failures: tuple[dict[str, Any], ...]
+    token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _BillingHookOutcome:
+    result: BillingIdentity | None = None
+    error: BaseException | None = None
+
+
+def _shared_billing_hook_registry() -> BoundedInvocationOperationRegistry:
+    """Return one loop-owned bound for hooks retained after supervisory exit."""
+
+    loop = asyncio.get_running_loop()
+    with _BILLING_HOOK_REGISTRIES_LOCK:
+        registry = _BILLING_HOOK_REGISTRIES.get(loop)
+        if registry is None:
+            registry = BoundedInvocationOperationRegistry(
+                max_operations=_MAX_RETAINED_BILLING_HOOKS,
+            )
+            _BILLING_HOOK_REGISTRIES[loop] = registry
+        return registry
+
+
 def detach_billing_identity_cancellation(
     exc: asyncio.CancelledError,
 ) -> asyncio.CancelledError | None:
@@ -65,7 +107,44 @@ def detach_billing_identity_cancellation(
 
     if not isinstance(exc, _BillingIdentityResolutionCancelled):
         return None
-    return asyncio.CancelledError("Model provider billing identity resolution cancelled")
+    handoff = exception_state(exc, _BILLING_CANCELLATION_FAILURES_STATE)
+    if (
+        type(handoff) is not _BillingCancellationFailures
+        or handoff.token is not _BILLING_CANCELLATION_FAILURES_TOKEN
+        or type(handoff.message) is not str
+    ):
+        return asyncio.CancelledError("Model provider billing identity resolution cancelled")
+    return asyncio.CancelledError(handoff.message)
+
+
+def billing_identity_cancellation_failures(
+    exc: asyncio.CancelledError,
+) -> tuple[dict[str, Any], ...]:
+    """Return authenticated, content-free billing cleanup diagnostics."""
+
+    if not isinstance(exc, _BillingIdentityResolutionCancelled):
+        return ()
+    handoff = exception_state(exc, _BILLING_CANCELLATION_FAILURES_STATE)
+    if (
+        type(handoff) is not _BillingCancellationFailures
+        or handoff.token is not _BILLING_CANCELLATION_FAILURES_TOKEN
+        or type(handoff.message) is not str
+        or type(handoff.failures) is not tuple
+        or len(handoff.failures) > 1
+    ):
+        return ()
+    copied: list[dict[str, Any]] = []
+    for failure in handoff.failures:
+        if type(failure) is not dict or set(failure) != {"phase", "error", "error_type"}:
+            return ()
+        if failure.get("phase") != "billing_identity_for_request":
+            return ()
+        error = failure.get("error")
+        error_type = failure.get("error_type")
+        if type(error) is not str or type(error_type) is not str:
+            return ()
+        copied.append(dict(failure))
+    return tuple(copied)
 
 
 def detach_billing_identity_cancellation_group(
@@ -107,9 +186,11 @@ def _detach_billing_identity_cancellation_tree(
 
 def _detached_concurrent_billing_failure(exc: BaseException) -> BaseException:
     if isinstance(exc, asyncio.CancelledError):
-        detached = detach_billing_identity_cancellation(exc) or asyncio.CancelledError(
-            "Concurrent cancellation during model provider billing identity resolution"
-        )
+        detached = detach_billing_identity_cancellation(exc)
+        if detached is None:
+            return RuntimeError(
+                "Model provider billing identity hook cancelled itself during concurrent failure"
+            )
         copy_workspace_observation_pending_cancellation_requests(exc, detached)
         return detached
     if isinstance(exc, KeyboardInterrupt):
@@ -117,8 +198,9 @@ def _detached_concurrent_billing_failure(exc: BaseException) -> BaseException:
             "Concurrent keyboard interrupt during model provider billing identity resolution"
         )
     if isinstance(exc, SystemExit):
-        return SystemExit(
-            "Concurrent system exit during model provider billing identity resolution"
+        return _detached_system_exit(
+            exc,
+            fallback=("Concurrent system exit during model provider billing identity resolution"),
         )
     if isinstance(exc, GeneratorExit):
         return GeneratorExit(
@@ -143,31 +225,97 @@ async def resolve_request_billing_identity(
     been released.
     """
 
+    owner_task = asyncio.current_task()
+    cancellation_baseline = 0 if owner_task is None else owner_task.cancelling()
     supplied_identity: BillingIdentity | None = None
     cancellation: asyncio.CancelledError | None = None
     failure: ModelProviderError | None = None
     fatal_failure: BaseException | None = None
+    hook_outcome: _BillingHookOutcome | None = None
+    caller_cancellation: asyncio.CancelledError | None = None
+    supervisory_controls: tuple[BaseException, ...] = ()
     hook_returned = False
     try:
-        supplied_identity = await provider.billing_identity_for_request(request)
-        hook_returned = True
-        supplied_identity = copy_billing_identity(supplied_identity)
-    except BaseExceptionGroup as exc:
-        cancellation, failure, fatal_failure = _classify_billing_hook_group(
-            exc,
-            provider_name=provider_name,
-        )
-    except asyncio.CancelledError:
-        cancellation = _billing_identity_cancellation()
-    except Exception as exc:
-        failure = _billing_identity_error(
-            exc,
-            provider_name=provider_name,
-            direct_hook_failure=not hook_returned,
-        )
-    except BaseException as exc:
-        fatal_failure = _detached_billing_hook_failure(exc)
+        # Deliver already-pending cancellation inside the secret-safe cleanup
+        # boundary. A handled historical request may leave ``cancelling()``
+        # non-zero, but must not authenticate a later provider-created signal.
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as exc:
+            cancellation = _billing_identity_cancellation(exc)
+        if cancellation is None:
+            owner_task = asyncio.current_task()
+            cancellation_baseline = 0 if owner_task is None else owner_task.cancelling()
+            (
+                hook_outcome,
+                caller_cancellation,
+                supervisory_controls,
+            ) = await _run_request_billing_hook(
+                provider,
+                request,
+                cancellation_baseline=cancellation_baseline,
+            )
+            hook_returned = hook_outcome.error is None
+        if cancellation is not None:
+            pass
+        elif hook_outcome is None:  # pragma: no cover - assigned by the owned hook runner
+            raise AssertionError("Billing hook outcome was not captured.")
+        elif supervisory_controls:
+            fatal_failure = _billing_supervisory_failure(
+                supervisory_controls,
+                hook_failure=hook_outcome.error,
+                caller_cancellation=caller_cancellation,
+            )
+        elif caller_cancellation is not None:
+            if _billing_hook_contains_process_control(hook_outcome.error):
+                if hook_outcome.error is None:  # pragma: no cover - guarded above
+                    raise AssertionError("Billing process-control evidence was lost.")
+                fatal_failure = _billing_supervisory_failure(
+                    (),
+                    hook_failure=hook_outcome.error,
+                    caller_cancellation=caller_cancellation,
+                )
+            else:
+                cancellation = _billing_identity_cancellation(
+                    caller_cancellation,
+                    failures=_billing_cancellation_failure_diagnostics(hook_outcome.error),
+                )
+        elif hook_outcome.error is None:
+            try:
+                supplied_identity = copy_billing_identity(hook_outcome.result)
+            except Exception as exc:
+                failure = _billing_identity_error(
+                    exc,
+                    provider_name=provider_name,
+                    direct_hook_failure=False,
+                )
+            except BaseException as exc:
+                fatal_failure = _detached_billing_hook_failure(exc)
+        elif isinstance(hook_outcome.error, BaseExceptionGroup):
+            cancellation, failure, fatal_failure = _classify_billing_hook_group(
+                hook_outcome.error,
+                provider_name=provider_name,
+            )
+        elif isinstance(hook_outcome.error, asyncio.CancelledError):
+            # A child/provider-created cancellation is not caller authority.
+            failure = _billing_identity_error(
+                RuntimeError("Provider billing identity hook cancelled itself."),
+                provider_name=provider_name,
+                direct_hook_failure=True,
+            )
+        elif isinstance(hook_outcome.error, Exception):
+            failure = _billing_identity_error(
+                hook_outcome.error,
+                provider_name=provider_name,
+                direct_hook_failure=not hook_returned,
+            )
+        else:
+            fatal_failure = _detached_billing_hook_failure(hook_outcome.error)
     finally:
+        hook_outcome = None
+        caller_cancellation = None
+        supervisory_controls = ()
+        owner_task = None
         del provider
         del request
     if fatal_failure is not None:
@@ -180,6 +328,133 @@ async def resolve_request_billing_identity(
         supplied_identity = None
         raise failure from None
     return supplied_identity
+
+
+async def _run_request_billing_hook(
+    provider: ModelProvider,
+    request: ModelRequest,
+    *,
+    cancellation_baseline: int,
+) -> tuple[
+    _BillingHookOutcome,
+    asyncio.CancelledError | None,
+    tuple[BaseException, ...],
+]:
+    """Run one extension hook in an owned task and authenticate caller cancellation."""
+
+    async def capture_hook_outcome() -> _BillingHookOutcome:
+        try:
+            return _BillingHookOutcome(result=await provider.billing_identity_for_request(request))
+        except BaseException as exc:
+            return _BillingHookOutcome(error=exc)
+        finally:
+            # This child owns the cancellation used to stop its hook. Python's
+            # TaskGroup may retain that request after converting child cleanup
+            # failure into an ExceptionGroup; consume it only on the child so
+            # the caller task's cancellation authority remains untouched.
+            child_task = asyncio.current_task()
+            if child_task is not None:
+                while child_task.cancelling() > 0:
+                    child_task.uncancel()
+
+    registry = _shared_billing_hook_registry()
+    if not registry.reserve():
+        return (
+            _BillingHookOutcome(
+                error=InvocationOperationCapacityError(
+                    "Model provider billing identity hook capacity is exhausted."
+                )
+            ),
+            None,
+            (),
+        )
+    try:
+        hook_task = asyncio.create_task(
+            capture_hook_outcome(),
+            name="cayu-provider-billing-identity-hook",
+        )
+    except BaseException:
+        registry.release_reservation()
+        raise
+    registry.track(hook_task)
+    caller_cancellation: asyncio.CancelledError | None = None
+    try:
+        while True:
+            try:
+                outcome = await asyncio.shield(hook_task)
+                return outcome, caller_cancellation, ()
+            except asyncio.CancelledError as exc:
+                owner_task = asyncio.current_task()
+                if owner_task is None or owner_task.cancelling() <= cancellation_baseline:
+                    raise
+                if caller_cancellation is None:
+                    caller_cancellation = exc
+                if hook_task.done() and not hook_task.cancelled():
+                    return hook_task.result(), caller_cancellation, ()
+                # The billing hook can own structured child cleanup (notably an
+                # asyncio.TaskGroup). Deliver cancellation to that owner, then
+                # keep waiting for its exact terminal outcome so concurrent
+                # cleanup failures remain observable alongside caller authority.
+                hook_task.cancel(*_safe_cancellation_args(exc))
+            except BaseException as control:
+                hook_task.cancel("Model provider billing identity resolution terminated")
+                detached_control = _detached_billing_hook_failure(control)
+                control = None
+                raise detached_control from None
+    finally:
+        hook_task = None
+
+
+def _billing_supervisory_failure(
+    controls: tuple[BaseException, ...],
+    *,
+    hook_failure: BaseException | None,
+    caller_cancellation: asyncio.CancelledError | None,
+) -> BaseException:
+    """Detach retained supervisory control after the provider hook settles."""
+
+    failures = [_detached_billing_hook_failure(control) for control in controls]
+    if hook_failure is not None and not isinstance(hook_failure, asyncio.CancelledError):
+        failures.append(_detached_billing_hook_failure(hook_failure))
+    if caller_cancellation is not None:
+        failures.append(_billing_identity_cancellation(caller_cancellation))
+    if len(failures) == 1:
+        return failures[0]
+    return BaseExceptionGroup(
+        "Model provider billing identity resolution terminated with concurrent failures",
+        failures,
+    )
+
+
+def _billing_cancellation_failure_diagnostics(
+    failure: BaseException | None,
+) -> tuple[dict[str, Any], ...]:
+    if failure is None:
+        return ()
+    saw_ordinary_failure = any(
+        isinstance(candidate, Exception) and not isinstance(candidate, asyncio.CancelledError)
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+    )
+    if not saw_ordinary_failure:
+        return ()
+    return (
+        {
+            "phase": "billing_identity_for_request",
+            "error": "Provider billing identity cleanup failed during caller cancellation.",
+            "error_type": "BillingIdentityCleanupError",
+        },
+    )
+
+
+def _billing_hook_contains_process_control(failure: BaseException | None) -> bool:
+    if failure is None:
+        return False
+    return any(
+        isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+    )
 
 
 def resolve_completion_billing_identity(
@@ -227,7 +502,13 @@ def resolve_completion_billing_identity(
             provider_name=provider_name,
         )
     except asyncio.CancelledError:
-        cancellation = _billing_identity_cancellation()
+        failure = ModelProviderError(
+            _BILLING_IDENTITY_ERROR_MESSAGE,
+            provider=provider_name,
+            error_type=_BILLING_IDENTITY_ERROR_TYPE,
+            error_code=_BILLING_IDENTITY_ERROR_CODE,
+            retryable=False,
+        )
     except Exception as exc:
         failure = _billing_identity_error(
             exc,
@@ -285,19 +566,18 @@ def _classify_billing_hook_group(
             saw_fatal_failure = True
     if saw_fatal_failure:
         return None, None, _detached_billing_hook_failure(exc)
-    if saw_ordinary_failure or not saw_cancellation:
-        return (
-            None,
-            ModelProviderError(
-                _BILLING_IDENTITY_ERROR_MESSAGE,
-                provider=provider_name,
-                error_type=_BILLING_IDENTITY_ERROR_TYPE,
-                error_code=_BILLING_IDENTITY_ERROR_CODE,
-                retryable=False,
-            ),
-            None,
-        )
-    return _billing_identity_cancellation(), None, None
+    del saw_ordinary_failure, saw_cancellation
+    return (
+        None,
+        ModelProviderError(
+            _BILLING_IDENTITY_ERROR_MESSAGE,
+            provider=provider_name,
+            error_type=_BILLING_IDENTITY_ERROR_TYPE,
+            error_code=_BILLING_IDENTITY_ERROR_CODE,
+            retryable=False,
+        ),
+        None,
+    )
 
 
 def _detached_billing_hook_failure(exc: BaseException) -> BaseException:
@@ -313,16 +593,36 @@ def _detached_billing_hook_failure(exc: BaseException) -> BaseException:
             ),
         )
     if isinstance(exc, asyncio.CancelledError):
-        return _billing_identity_cancellation()
+        detached = detach_billing_identity_cancellation(exc)
+        if detached is not None:
+            return detached
+        return RuntimeError("Model provider billing identity hook cancelled itself")
     if isinstance(exc, KeyboardInterrupt):
         return KeyboardInterrupt("Model provider billing identity resolution interrupted")
     if isinstance(exc, SystemExit):
-        return SystemExit("Model provider billing identity resolution exited")
+        return _detached_system_exit(
+            exc,
+            fallback="Model provider billing identity resolution exited",
+        )
     if isinstance(exc, GeneratorExit):
         return GeneratorExit("Model provider billing identity resolution terminated")
     if isinstance(exc, Exception):
         return RuntimeError("Model provider billing identity resolution failed")
     return BaseException("Model provider billing identity resolution failed")
+
+
+def _detached_system_exit(exc: SystemExit, *, fallback: str) -> SystemExit:
+    """Preserve only a process-safe integer/None exit code."""
+
+    try:
+        args = BaseException.__dict__["args"].__get__(exc, BaseException)
+    except BaseException:
+        args = ()
+    if type(args) is tuple and len(args) == 1:
+        (code,) = cast("tuple[object]", args)
+        if type(code) is int or code is None:
+            return SystemExit(code)
+    return SystemExit(fallback)
 
 
 def _billing_identity_error(
@@ -360,10 +660,43 @@ def _billing_identity_error(
     )
 
 
-def _billing_identity_cancellation() -> asyncio.CancelledError:
-    return _BillingIdentityResolutionCancelled(
-        "Model provider billing identity resolution cancelled"
+def _safe_cancellation_args(exc: asyncio.CancelledError) -> tuple[str]:
+    try:
+        args = BaseException.__dict__["args"].__get__(exc, BaseException)
+    except BaseException:
+        args = ()
+    if type(args) is tuple and len(args) == 1:
+        (message,) = cast("tuple[object]", args)
+        if type(message) is str:
+            try:
+                return (require_durable_text(message, "provider cancellation message"),)
+            except (TypeError, ValueError):
+                pass
+    return ("Model provider billing identity resolution cancelled",)
+
+
+def _billing_identity_cancellation(
+    source: asyncio.CancelledError | None = None,
+    *,
+    failures: tuple[dict[str, Any], ...] = (),
+) -> asyncio.CancelledError:
+    cancellation = _BillingIdentityResolutionCancelled(
+        *(
+            _safe_cancellation_args(source)
+            if source is not None
+            else ("Model provider billing identity resolution cancelled",)
+        )
     )
+    set_exception_state(
+        cancellation,
+        _BILLING_CANCELLATION_FAILURES_STATE,
+        _BillingCancellationFailures(
+            message=_safe_cancellation_args(cancellation)[0],
+            failures=tuple(dict(failure) for failure in failures[:1]),
+            token=_BILLING_CANCELLATION_FAILURES_TOKEN,
+        ),
+    )
+    return cancellation
 
 
 _NON_PORTABLE_PROVIDER_ERROR_MESSAGE = "Model provider emitted a non-portable error value."

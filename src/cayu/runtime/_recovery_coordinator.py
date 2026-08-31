@@ -73,6 +73,7 @@ from cayu.providers import (
     ProviderOperationSnapshot,
     ProviderOperationStatus,
 )
+from cayu.providers._credential_boundary import copy_provider_cancellation_failures
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -177,6 +178,7 @@ from cayu.runtime._terminal_evidence import (
     TERMINAL_EVIDENCE_QUERY_LIMIT,
     classify_current_terminal_evidence,
     interruption_request_id_from_payload,
+    require_interruption_event_matches_pending_marker,
 )
 from cayu.runtime._tool_round_executor import (
     DeferredTerminalStager,
@@ -1191,6 +1193,7 @@ class RecoveryAbandonedSessionRequest:
     active_run: ActiveSessionRun[SessionUsageTracker] | None = None
     interaction_transition_failures: tuple[dict[str, Any], ...] = ()
     interaction_transition: InteractionTransitionSpec | None = None
+    provider_cancellation_failures: tuple[dict[str, Any], ...] = ()
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
 
@@ -1220,6 +1223,37 @@ class _IncompleteRecoveryClaimLost(RuntimeError):
 
 class ModelCompletionManualRecoveryRequired(RuntimeError):
     """A model dispatch cannot be reconstructed safely without operator input."""
+
+
+def _provider_cancellation_interrupt_payload(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return one exact reconstructed provider-cancellation interrupt marker."""
+
+    if checkpoint is None:
+        return None
+    marker = checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+    if marker is None:
+        return None
+    if type(marker) is not dict:
+        raise ValueError("Pending session interrupt checkpoint must be an object.")
+    payload = copy_json_value(marker, "pending_session_interrupt")
+    failures = payload.get("provider_cancellation_failures")
+    if failures is None:
+        return None
+    copied_failures = copy_provider_cancellation_failures(failures)
+    if not copied_failures:
+        raise ValueError("Provider cancellation interruption diagnostics cannot be empty.")
+    interruption_type = payload.get("interruption_type")
+    if type(interruption_type) is not str or interruption_type not in (
+        _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+        _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+    ):
+        raise ValueError("Provider cancellation interruption type is invalid.")
+    if interruption_request_id_from_payload(payload) is None:
+        raise ValueError("Provider cancellation interruption request identity is invalid.")
+    payload["provider_cancellation_failures"] = [dict(item) for item in copied_failures]
+    return payload
 
 
 @dataclass(frozen=True)
@@ -11840,6 +11874,78 @@ class RecoveryCoordinator:
             and await self._record_committed_interaction_transition_cancellation(request)
         ):
             return None
+        payload: dict[str, Any] = {
+            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+            "reason": _ABANDONED_RUN_REASON,
+            "abandoned": True,
+        }
+        if request.interaction_transition_failures:
+            copied_failures = copy_durable_json_value(
+                list(request.interaction_transition_failures),
+                "interaction transition cancellation diagnostics",
+            )
+            if type(copied_failures) is not list:
+                raise TypeError("Interaction transition cancellation diagnostics must be a list.")
+            payload["interaction_transition_failures"] = copied_failures
+        if request.provider_cancellation_failures:
+            copied_provider_failures = copy_provider_cancellation_failures(
+                request.provider_cancellation_failures
+            )
+            payload["provider_cancellation_failures"] = [
+                dict(item) for item in copied_provider_failures
+            ]
+            payload["interruption_request_id"] = str(uuid4())
+            # The status transition and terminal-event publication are
+            # separate durable operations. Persist exact repair authority
+            # before either operation so a publication failure or process loss
+            # cannot leave an interrupted session with no diagnostic evidence.
+            await self._session_store.publish_checkpoint_and_events(
+                request.session.id,
+                checkpoint_transform=self._pending_session_interrupt_checkpoint(
+                    payload,
+                    self._clock(),
+                ),
+                events=[],
+                expected_statuses={request.session.status},
+                expected_run_epoch=request.session.run_epoch,
+            )
+
+        async def clear_provider_interrupt_marker(
+            *,
+            require_interrupted: bool,
+        ) -> None:
+            if not request.provider_cancellation_failures:
+                return
+
+            def clear_published_interrupt(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any] | None:
+                if checkpoint is None:
+                    return None
+                updated = copy_json_value(checkpoint, "checkpoint")
+                current = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+                if current is None:
+                    return updated
+                if current != payload:
+                    raise RuntimeError(
+                        "Pending provider cancellation interruption identity changed."
+                    )
+                if require_interrupted and current_session.status is not SessionStatus.INTERRUPTED:
+                    raise RuntimeError(
+                        "Provider cancellation interruption published before terminal status."
+                    )
+                updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+                return updated
+
+            await self._session_store.publish_checkpoint_and_events(
+                request.session.id,
+                checkpoint_transform=clear_published_interrupt,
+                events=[],
+                expected_statuses=({SessionStatus.INTERRUPTED} if require_interrupted else None),
+                expected_run_epoch=request.session.run_epoch,
+            )
+
         try:
             finalized = await self._abandoned_turn_completed(
                 RecoveryAbandonedTurnRequest(
@@ -11885,21 +11991,10 @@ class RecoveryCoordinator:
             except ValueError:
                 loaded = await self._session_store.load(request.session.id)
                 if loaded is None or loaded.status is not SessionStatus.INTERRUPTED:
+                    if loaded is not None:
+                        await clear_provider_interrupt_marker(require_interrupted=False)
                     return
                 finalized = loaded
-        payload: dict[str, Any] = {
-            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-            "reason": _ABANDONED_RUN_REASON,
-            "abandoned": True,
-        }
-        if request.interaction_transition_failures:
-            copied_failures = copy_durable_json_value(
-                list(request.interaction_transition_failures),
-                "interaction transition cancellation diagnostics",
-            )
-            if type(copied_failures) is not list:
-                raise TypeError("Interaction transition cancellation diagnostics must be a list.")
-            payload["interaction_transition_failures"] = copied_failures
 
         terminal_event: Event | None = None
 
@@ -11928,12 +12023,22 @@ class RecoveryCoordinator:
                 ):
                     terminal_event = copy_event(emitted)
 
-        if request.interaction_transition_failures:
+        if request.interaction_transition_failures or request.provider_cancellation_failures:
             # These failures are the only durable explanation for an ambiguous
             # transition that exact readback proved absent. Let the owned
             # cancellation cleanup preserve a publication failure instead of
             # silently discarding both pieces of evidence.
             await emit_interrupted()
+            if request.provider_cancellation_failures:
+                if terminal_event is None:
+                    raise RuntimeError(
+                        "Provider cancellation interruption produced no terminal evidence."
+                    )
+                require_interruption_event_matches_pending_marker(
+                    terminal_event,
+                    payload,
+                )
+            await clear_provider_interrupt_marker(require_interrupted=True)
         else:
             with contextlib.suppress(BaseException):
                 await emit_interrupted()
@@ -12670,6 +12775,7 @@ class RecoveryCoordinator:
             mutation_admitted = True
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending_provider_interrupt = _provider_cancellation_interrupt_payload(checkpoint)
         active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         if active_invocation_profile is None and invocation_lifecycle_receipt_history_present(
             checkpoint
@@ -12868,6 +12974,10 @@ class RecoveryCoordinator:
             or active_model_completion is not None
             or bool(workspace_observations)
             or pending_provider_disposition is not None
+            or (
+                pending_provider_interrupt is not None
+                and session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES
+            )
             or active_invocation_profile is not None
             or (
                 not pre_admission_profiled_session
@@ -13112,6 +13222,9 @@ class RecoveryCoordinator:
             if type(marker) is not dict:
                 raise ValueError("Pending session interrupt checkpoint must be an object.")
             pending_interrupt_payload = copy_json_value(marker, "pending_session_interrupt")
+            provider_interrupt_payload = _provider_cancellation_interrupt_payload(checkpoint)
+            if provider_interrupt_payload is not None:
+                pending_interrupt_payload = provider_interrupt_payload
             if session.status != SessionStatus.INTERRUPTED:
                 raise RuntimeError(
                     "Terminal evidence is contradictory: a non-interrupted session retains "
@@ -13225,6 +13338,15 @@ class RecoveryCoordinator:
             )
 
         existing_event = None if not terminal_events else terminal_events[0].model_copy(deep=True)
+        if (
+            existing_event is not None
+            and pending_interrupt_payload is not None
+            and "provider_cancellation_failures" in pending_interrupt_payload
+        ):
+            require_interruption_event_matches_pending_marker(
+                existing_event,
+                pending_interrupt_payload,
+            )
         return _TerminalEvidenceInspection(
             event=existing_event,
             pending_interrupt_payload=pending_interrupt_payload,
@@ -15468,6 +15590,7 @@ class RecoveryCoordinator:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        provider_interrupt_payload = _provider_cancellation_interrupt_payload(checkpoint)
         pending_approval = approval_support.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -15484,6 +15607,51 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
         )
         environment_name = _environment_name(registered_environment)
+
+        if provider_interrupt_payload is not None:
+            if session.status is SessionStatus.INTERRUPTED:
+                return await self._repair_terminal_evidence(
+                    session=session,
+                    terminal_run_epoch=session_before_fence.run_epoch,
+                    terminal_timestamp=session_before_fence.updated_at,
+                    previous_status=previous_status,
+                    claim_id=claim_id,
+                )
+            if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+                session = await self._session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={session.status},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
+                        provider_interrupt_payload,
+                        self._clock(),
+                    ),
+                )
+            elif session.status is not SessionStatus.INTERRUPTING:
+                raise RuntimeError(
+                    "Provider cancellation interruption marker conflicts with session status."
+                )
+            session = await self._finalize_interrupting_for_recovery(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                events=events,
+                execution_profile=(
+                    None
+                    if execution_profile_snapshot is None
+                    else execution_profile_snapshot.profile
+                ),
+                invocation_context=invocation_context,
+            )
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,),
+                events=tuple(events),
+                message="Finalized a durable provider cancellation interruption.",
+            )
 
         pending_provider_resolution = await load_pending_provider_operation_disposition(
             self._session_store,
