@@ -89,6 +89,30 @@ guard.
 
 ## Unreleased
 
+### `cayu new` emits the complete Cayu application convention
+
+Normal generated projects now begin with stable homes for configuration,
+agents and prompts, tools and policies, environments, workflows, operations,
+knowledge, memory, domain code, integrations, evals, observability, tests, and
+ignored runtime data. `app.py` remains composition-only, while
+`agents/registration.py` is the explicit generator and manifest-provenance seam.
+Generated `AGENTS.md`, the minimal `CLAUDE.md` bridge, ownership docstrings, and
+the source-controlled `[tool.cayu.scaffold]` plan give fresh coding agents the
+architecture and exact proof commands before they write code.
+
+`cayu new` now exposes canonical agent, service, and coding presets; SQLite and
+Postgres database profiles; neutral and maintained provider profiles; optional
+Docker coding execution; truthful capability discovery and selection; minimal,
+interactive, dry-run, and structured JSON modes; and compatibility aliases for
+the prior template/composition flags. Every maintained path stages and publishes
+atomically. Declared convention projects receive read-only actionable layout and
+registration drift findings from `cayu check`; custom projects remain freeform.
+The coding preset populates the same canonical homes instead of concentrating
+implementation in root `composition.py`. The service preset currently supports
+SQLite only: `--preset service --database postgres` fails during planning, before
+writes, until its application-owned product-operation store has a coherent
+shared Postgres implementation.
+
 ### Durable runtime identity is bound to immutable build provenance
 
 Sessions now retain a typed `RuntimeBuildProvenance` manifest and bind its exact

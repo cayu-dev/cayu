@@ -84,8 +84,9 @@ cayu new NAME --composition coding --coding-execution docker --coding-toolchain 
 
 Its trusted image-build script is a separate operator lifecycle. The runtime
 container stays network-disabled and credential-free. Custom applications can
-replace the built-in profile in `composition.py`; profile selection must remain
-application configuration, not repository auto-detection or prompt instructions.
+replace the built-in profile in `environments/coding.py`; profile selection must
+remain application configuration, not repository auto-detection or prompt
+instructions.
 
 Structured commands also capture bounded content-and-Git-mode manifests immediately
 before dispatch and after complete process settlement. Read-only selectors must

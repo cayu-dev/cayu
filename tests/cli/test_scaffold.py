@@ -120,15 +120,33 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     proj = tmp_path / "myproj"
     for filename in (
         "app.py",
-        "configuration.py",
+        "configuration/settings.py",
+        "agents/registration.py",
+        "CLAUDE.md",
         "pyproject.toml",
         "README.md",
         ".gitignore",
     ):
         assert (proj / filename).exists()
-    for dirname in ("agents", "evals", "tests"):
+    for dirname in (
+        "agents",
+        "configuration",
+        "domain",
+        "environments",
+        "evals",
+        "integrations",
+        "knowledge",
+        "memory",
+        "observability",
+        "operations",
+        "policies",
+        "prompts",
+        "tests",
+        "tools",
+        "workflows",
+        "data",
+    ):
         assert (proj / dirname).is_dir()
-    assert not (proj / "tools").exists()
 
     # The generated app.py must import cleanly: every cayu export in the template
     # exists and the syntax is valid. build_app() is not called at import, so no
@@ -158,40 +176,49 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert first_app.task_store is task_store
 
     app_source = (proj / "app.py").read_text(encoding="utf-8")
-    configuration_source = (proj / "configuration.py").read_text(encoding="utf-8")
-    assert "AnthropicProvider" in app_source
-    assert "ChatCompletionsProvider" in app_source
-    assert "OpenAISubscriptionProvider" in app_source
-    assert "CAYU_OPENAI_SUBSCRIPTION" not in app_source
+    configuration_source = (proj / "configuration/settings.py").read_text(encoding="utf-8")
+    provider_source = (proj / "configuration/providers.py").read_text(encoding="utf-8")
+    storage_source = (proj / "configuration/storage.py").read_text(encoding="utf-8")
+    assert "AnthropicProvider" in provider_source
+    assert "ChatCompletionsProvider" in provider_source
+    assert "OpenAISubscriptionProvider" in provider_source
+    assert "CAYU_OPENAI_SUBSCRIPTION" not in provider_source
     assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
     assert 'os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)' in configuration_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'dependencies = ["cayu>={cayu_version}"]' in pyproject
+    assert f'dependencies = ["cayu=={cayu_version}"]' in pyproject
     assert 'console = ["cayu[console]"]' not in pyproject
-    assert f'dev = ["cayu[server]>={cayu_version}", "pytest"]' in pyproject
+    assert f'dev = ["cayu[server]=={cayu_version}", "pytest"]' in pyproject
+    assert '[tool.uv]\ncache-dir = ".cayu/uv-cache"' in pyproject
+    assert (proj / ".gitignore").read_text(encoding="utf-8").startswith(".cayu/\n")
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
-    assert 'else SQLiteSessionStore(\n                "data/cayu.db",' in app_source
-    assert "public_authority_alias_codec_from_environment()" in app_source
-    assert 'SQLiteTaskStore("data/cayu.db")' in app_source
-    assert "sessions.sqlite" not in app_source
+    assert 'else SQLiteSessionStore(\n                "data/cayu.db",' in storage_source
+    assert "public_authority_alias_codec_from_environment()" in storage_source
+    assert 'SQLiteTaskStore("data/cayu.db")' in storage_source
+    assert "sessions.sqlite" not in storage_source
+    assert "def build_app(" in app_source
+    assert "class " not in app_source
+    assert (proj / "CLAUDE.md").read_text(encoding="utf-8") == "@AGENTS.md\n"
     readme = (proj / "README.md").read_text(encoding="utf-8")
-    assert "uv run cayu inspect --json" in readme
-    assert "uv run cayu guide anatomy" in readme
+    assert "uv run --no-sync cayu inspect --json" in readme
+    assert "uv run --no-sync cayu guide anatomy" in readme
     assert readme.index("## Application structure") < readme.index("## Setup and prove the project")
     assert "pip install -e" not in readme
     assert "uv sync --extra dev" in readme
-    assert "uv run cayu eval run" in readme
-    assert "uv run cayu session list" in readme
-    assert "uv run cayu serve --dev" in readme
+    assert "uv run --no-sync cayu eval run" in readme
+    assert "Run setup and proof commands in the listed order" in readme
+    assert "Do not parallelize application-" in (proj / "AGENTS.md").read_text(encoding="utf-8")
+    assert "uv run --no-sync cayu session list" in readme
+    assert "uv run --no-sync cayu serve --dev" in readme
     assert "http://127.0.0.1:8000/cayu/" in readme
     assert "developer/operator control plane" in readme
     assert "no Evals-specific Python configuration" in readme
     assert "Fresh Evals execution remains gated" not in readme
     assert "Never mount it with unauthenticated open access on a public listener" in readme
     assert "client-IP checks are not authentication" in readme
-    assert "uv run cayu auth openai login" in readme
+    assert "uv run --no-sync cayu auth openai login" in readme
     assert "CAYU_PROVIDER=openai-subscription" in readme
     assert "CAYU_PROVIDER=anthropic" in readme
     assert "ANTHROPIC_API_KEY" in readme
@@ -204,15 +231,15 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "not intended for production" in readme
     assert "bypassing plan limits" in readme
     assert "cayu eval run evals.agent:build_eval" not in readme
-    assert "uv run cayu guide authoring#cayu-map" in readme
+    assert "uv run --no-sync cayu guide authoring#cayu-map" in readme
     assert "github.com" not in readme
-    assert 'uv run python run.py --message "YOUR REQUEST"' in readme
+    assert 'uv run --no-sync python run.py --message "YOUR REQUEST"' in readme
     assert "model-only" in readme
     assert "cayu generate slice" not in readme
     output = capsys.readouterr().out
     assert "uv sync --extra dev" in output
-    assert "uv run cayu check --json" in output
-    assert "uv run cayu serve --dev" in output
+    assert "uv run --no-sync cayu check --fail-on warning --json" in output
+    assert "uv run --no-sync cayu serve --dev" in output
     assert "http://127.0.0.1:8000/cayu/" in output
     assert "none selected" in output
 
@@ -227,7 +254,13 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
     project = tmp_path / "coder"
 
     for filename in (
-        "command_probe.py",
+        "environments/command_probe.py",
+        "environments/coding.py",
+        "knowledge/coding.py",
+        "operations/coding.py",
+        "policies/coding.py",
+        "prompts/coding.py",
+        "tools/coding.py",
         "composition.py",
         "agents/reviewer.py",
         "tests/test_coding_composition.py",
@@ -254,28 +287,37 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
         == "Initial Cayu coding composition"
     )
 
-    composition = (project / "composition.py").read_text(encoding="utf-8")
-    command_probe = (project / "command_probe.py").read_text(encoding="utf-8")
+    composition = (project / "operations/coding.py").read_text(encoding="utf-8")
+    compatibility_composition = (project / "composition.py").read_text(encoding="utf-8")
+    command_probe = (project / "environments/command_probe.py").read_text(encoding="utf-8")
     assert (project / ".gitignore").read_text(encoding="utf-8").startswith(".cayu/\n")
-    assert "from command_probe import" in composition
+    assert "from environments.command_probe import" in composition
+    assert "from operations.coding import build_coding_app" in compatibility_composition
+    assert len(compatibility_composition.splitlines()) < 10
     assert "cayu.cli._bounded_command" not in composition
     assert "run_bounded_command" in command_probe
     for public_surface in (
         "LocalWorkspace",
         "LocalRunner",
         "LocalArtifactStore",
-        "SQLiteKnowledgeStore",
         "SearchTextTool",
         "GitChangesTool",
         "SubagentTool",
         "SubagentResultTool",
         "UserInputTool",
-        "AllRegisteredToolsExposurePolicy",
         "ParameterConstrainedToolPolicy",
     ):
         assert public_surface in composition
+    assert "AllRegisteredToolsExposurePolicy" in (project / "agents/registration.py").read_text(
+        encoding="utf-8"
+    )
+    assert "SQLiteKnowledgeStore" in (project / "configuration/coding_storage.py").read_text(
+        encoding="utf-8"
+    )
     assert "mode=SubagentExecutionMode.BACKGROUND" in composition
-    assert 'os.environ.get("CAYU_WORKSPACE_ROOT", ".")' in composition
+    assert 'os.environ.get("CAYU_WORKSPACE_ROOT", ".")' in (
+        project / "environments/coding.py"
+    ).read_text(encoding="utf-8")
     assert "inherit_env=False" in composition
     assert '_STATE_ROOT = _PROJECT_ROOT / ".cayu" / "runtime"' in composition
     assert "excluded_directory_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES" in composition
@@ -393,7 +435,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         == ""
     )
 
-    composition_source = (project / "composition.py").read_text(encoding="utf-8")
+    composition_source = (project / "operations/coding.py").read_text(encoding="utf-8")
     primary_source = (project / "agents" / "agent.py").read_text(encoding="utf-8")
     dockerfile = (project / "Dockerfile.coding").read_text(encoding="utf-8")
     builder = (project / "build_coding_image.py").read_text(encoding="utf-8")
@@ -444,7 +486,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     ) -> CayuApp:
         del command
         assert target == "app:build_app"
-        composition = importlib.import_module("composition")
+        composition = importlib.import_module("operations.coding")
         monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
         app_module = importlib.import_module("app")
         return app_module.build_app()
@@ -554,7 +596,7 @@ def test_coding_execution_requires_the_coding_composition(
         == 1
     )
     assert not (tmp_path / "invalid-docker").exists()
-    assert "requires --composition coding" in capsys.readouterr().err
+    assert "requires --preset coding or --composition coding" in capsys.readouterr().err
 
 
 def test_coding_toolchain_requires_docker_execution(
@@ -577,7 +619,7 @@ def test_coding_toolchain_requires_docker_execution(
         == 1
     )
     assert not (tmp_path / "invalid-toolchain").exists()
-    assert "requires --coding-execution docker" in capsys.readouterr().err
+    assert "requires --execution docker" in capsys.readouterr().err
 
 
 def test_cayu_new_coding_rejects_unsupported_local_workspace_before_creation(
@@ -634,7 +676,7 @@ def test_cayu_new_coding_rejects_service_and_missing_dependencies(
         == 1
     )
     assert not (tmp_path / "service-coder").exists()
-    assert "cannot be combined" in capsys.readouterr().err
+    assert "conflicts with --preset coding" in capsys.readouterr().err
 
     from cayu.cli import scaffold
 
@@ -891,8 +933,7 @@ def test_cayu_new_coding_removes_generated_files_after_git_failure(
 
     monkeypatch.setattr(scaffold, "_run_scaffold_command", fail_target_commit)
     assert main(["new", "broken-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
-    assert (tmp_path / "broken-coder").is_dir()
-    assert list((tmp_path / "broken-coder").iterdir()) == []
+    assert not (tmp_path / "broken-coder").exists()
     assert "forced commit failure" in capsys.readouterr().err
 
 
@@ -960,7 +1001,7 @@ def test_cayu_new_coding_cleanup_does_not_follow_replaced_generated_directory(
     monkeypatch.setattr(scaffold, "_run_scaffold_command", replace_agents_then_fail)
     assert main(["new", "symlink-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
     assert canary.read_text(encoding="utf-8") == "outside-owned\n"
-    assert list((tmp_path / "symlink-coder").iterdir()) == []
+    assert not (tmp_path / "symlink-coder").exists()
     assert "forced commit failure" in capsys.readouterr().err
 
 
@@ -1073,7 +1114,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     ):
         assert (project / filename).is_file()
     pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'dependencies = ["cayu[server]>={cayu_version}"]' in pyproject
+    assert f'dependencies = ["cayu[server]=={cayu_version}"]' in pyproject
     assert 'dev = ["pytest", "ruff>=0.15.15,<0.16"]' in pyproject
     assert 'service_factory = "service:build_service"' in pyproject
     assert 'factory = "app:build_app"' in pyproject
@@ -1646,28 +1687,29 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert not (project / "tools" / "greet.py").exists()
     assert (project / "tests" / "test_agent.py").is_file()
     assert (project / "evals" / "agent.py").is_file()
-    assert not (project / "workflows").exists()
-    assert not (project / "memory").exists()
+    assert (project / "workflows" / "__init__.py").is_file()
+    assert (project / "memory" / "context.py").is_file()
 
     app_source = (project / "app.py").read_text(encoding="utf-8")
     assert "ExecCommandTool" not in app_source
-    assert "# <cayu:generated-imports>" in app_source
-    assert "# <cayu:generated-registrations>" in app_source
+    registration_source = (project / "agents/registration.py").read_text(encoding="utf-8")
+    assert "# <cayu:generated-imports>" in registration_source
+    assert "# <cayu:generated-registrations>" in registration_source
     agent_source = (project / "agents" / "agent.py").read_text(encoding="utf-8")
     eval_source = (project / "evals" / "agent.py").read_text(encoding="utf-8")
     assert 'name="myproj"' in agent_source
-    assert "_SYSTEM_PROMPT_PARTS: list[str] = []" in agent_source
+    assert "_SYSTEM_PROMPT_PARTS: list[str] = list(SYSTEM_PROMPT_PARTS)" in agent_source
     assert "system_prompt=" in agent_source
     assert "workflow_tool_names=" in agent_source
     assert "ToolCalled" not in eval_source
 
     instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
-    assert "uv run cayu guide anatomy" in instructions
-    assert "uv run cayu inspect --json" in instructions
-    assert "uv run cayu check --json" in instructions
-    assert "uv run pytest" in instructions
-    assert "uv run cayu eval run" in instructions
-    assert "uv run cayu serve --dev" in instructions
+    assert "uv run --no-sync cayu guide anatomy" in instructions
+    assert "uv run --no-sync cayu inspect --json" in instructions
+    assert "uv run --no-sync cayu check --fail-on warning --json" in instructions
+    assert "uv run --no-sync pytest" in instructions
+    assert "uv run --no-sync cayu eval run" in instructions
+    assert "uv run --no-sync cayu serve --dev" in instructions
     assert "http://127.0.0.1:8000/cayu/" in instructions
     assert "developer/operator control plane" in instructions
     assert "end-user UI" in instructions
@@ -1676,13 +1718,16 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "cayu eval run evals.agent:build_eval" not in instructions
     assert "Edit the existing agent, test, and eval" in instructions
     assert "Tools are optional" in instructions
-    assert "uv run cayu guide authoring#cayu-map" in instructions
-    assert "uv run cayu guide references" in instructions
+    assert "uv run --no-sync cayu guide authoring#cayu-map" in instructions
+    assert "uv run --no-sync cayu guide references" in instructions
     assert "github.com" not in instructions
     assert "Deployment is a separate task" in instructions
     assert "Clarify users, jobs, triggers" not in instructions
     assert "cayu generate slice" not in instructions
-    assert "uv run cayu generate tool TOOL_NAME --agent myproj --effect EFFECT" in instructions
+    assert (
+        "uv run --no-sync cayu generate tool TOOL_NAME --agent myproj --effect EFFECT"
+        in instructions
+    )
 
 
 def test_cayu_new_routes_provider_questions_to_the_package_compatibility_guide(
@@ -1695,7 +1740,7 @@ def test_cayu_new_routes_provider_questions_to_the_package_compatibility_guide(
         text = " ".join((project / relative_path).read_text(encoding="utf-8").split())
         assert "OpenRouter is a first-class scaffold choice" in text
         assert "other compatible endpoints work through Cayu's generic adapter" in text
-        assert "uv run cayu guide providers#compatible-chat-completions" in text
+        assert "uv run --no-sync cayu guide providers#compatible-chat-completions" in text
         for service in ("OpenRouter", "Fireworks", "Baseten", "OpenCode Go"):
             assert service in text
 
@@ -1708,9 +1753,9 @@ def test_cayu_new_routes_durable_operations_to_the_package_quickstart(tmp_path: 
     agents = " ".join((project / "AGENTS.md").read_text(encoding="utf-8").split())
     assert "For durable operational changes" in readme
     assert "propose, authorize, act once, verify, inspect, and recover" in readme
-    assert "uv run cayu guide durable-operations" in readme
+    assert "uv run --no-sync cayu guide durable-operations" in readme
     assert "If the job observes, proposes, authorizes, executes, verifies, or recovers" in agents
-    assert "uv run cayu guide durable-operations" in agents
+    assert "uv run --no-sync cayu guide durable-operations" in agents
 
 
 def test_cayu_new_uses_supported_hyphenated_project_name_for_the_agent(

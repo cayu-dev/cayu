@@ -194,7 +194,7 @@ For a generated project, verify the public boundary rather than exact prose:
 
 ```bash
 cayu inspect --json
-cayu check --json
+cayu check --fail-on warning --json
 pytest
 ```
 
@@ -202,3 +202,5 @@ Project tests should prove that importing `app.py` does not construct the app,
 two factory calls return distinct `CayuApp` objects, and `[tool.cayu].factory`
 resolves to that callable. These checks prove structure and deterministic runtime
 behavior; they do not claim live provider, environment, or service verification.
+Use `cayu guide applications` for the generated placement convention,
+normalized plan, generator compatibility, and declared-layout diagnostics.

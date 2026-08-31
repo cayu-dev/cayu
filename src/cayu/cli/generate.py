@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import tomllib
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -257,8 +258,8 @@ def plan_service_context() -> ServiceContextMigrationPlan:
     """Plan the narrow generated-service migration without rewriting user code."""
 
     verification = (
-        "uv run cayu check --json",
-        "uv run pytest -q tests/test_public_service_security.py",
+        "uv run --no-sync cayu check --json",
+        "uv run --no-sync pytest -q tests/test_public_service_security.py",
     )
     project = resolve_project(command="cayu generate service-context")
     if project.service_target != "service:build_service":
@@ -472,6 +473,28 @@ def _service_context_contract_present(source: str) -> bool:
     return declared and passed
 
 
+def _registration_target(root: Path) -> tuple[str, Path]:
+    """Select the declared convention seam while preserving legacy scaffolds."""
+
+    convention_relative = "agents/registration.py"
+    convention_path = _generated_path(root, convention_relative)
+    pyproject = _generated_path(root, "pyproject.toml")
+    declared_convention = False
+    minimal_convention = False
+    if pyproject.is_file():
+        try:
+            document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            document = {}
+        scaffold = document.get("tool", {}).get("cayu", {}).get("scaffold", {})
+        declared_convention = scaffold.get("convention") == 1
+        minimal_convention = scaffold.get("minimal") is True
+    if declared_convention and not minimal_convention:
+        return convention_relative, convention_path
+    legacy_relative = "app.py"
+    return legacy_relative, _generated_path(root, legacy_relative)
+
+
 def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
     """Plan the first tool tracer bullet for the updated scaffold starter."""
 
@@ -482,21 +505,27 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
         raise ValueError("effect must be none, idempotent, or external.")
     project = resolve_project(command="cayu generate")
     root = project.root
-    app_path = _generated_path(root, "app.py")
+    registration_relative, registration_path = _registration_target(root)
     agent_path = _generated_path(root, "agents/agent.py")
-    if not app_path.is_file() or not agent_path.is_file():
+    if not registration_path.is_file() or not agent_path.is_file():
         raise ValueError(
-            "First-tool generation requires app.py and agents/agent.py from `cayu new`."
+            "First-tool generation requires the generated registration seam and "
+            "agents/agent.py from `cayu new`."
         )
-    app_source = app_path.read_text(encoding="utf-8")
+    app_source = registration_path.read_text(encoding="utf-8")
     agent_source = agent_path.read_text(encoding="utf-8")
     conflicts: list[dict[str, str]] = []
     edits: list[GeneratorEdit] = []
     preconditions: dict[str, GeneratorPrecondition] = {}
     marker_contracts = (
-        ("app.py", app_source, GENERATED_IMPORTS_START, GENERATED_IMPORTS_END),
         (
-            "app.py",
+            registration_relative,
+            app_source,
+            GENERATED_IMPORTS_START,
+            GENERATED_IMPORTS_END,
+        ),
+        (
+            registration_relative,
             app_source,
             GENERATED_STARTER_TOOLS_START,
             GENERATED_STARTER_TOOLS_END,
@@ -528,7 +557,7 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
             edits=(),
             conflicts=(
                 {
-                    "path": "app.py / agents/agent.py",
+                    "path": f"{registration_relative} / agents/agent.py",
                     "operation": "update_region",
                     "reason": (
                         "first-tool generation requires intact machine-owned starter markers; "
@@ -539,14 +568,24 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
             verification_commands=_tool_verification_commands(tool_name),
         )
 
-    inspection = _inspect_registered_agents(root, app_source)
+    inspection = _normalize_declared_registration_inspection(
+        root,
+        registration_relative,
+        _inspect_registered_agents(
+            root,
+            app_source,
+            source_path=registration_relative,
+        ),
+    )
+    for precondition in inspection.source_preconditions:
+        _record_precondition(preconditions, precondition)
     origins = inspection.origins_by_name.get(agent_name, ())
     expected_origin = ("agents.agent", "AGENT")
     if origins != (expected_origin,):
         rendered = ", ".join(_render_agent_origin(origin) for origin in origins) or "none"
         conflicts.append(
             {
-                "path": "app.py",
+                "path": registration_relative,
                 "operation": "update_region",
                 "reason": (
                     f"agent {agent_name!r} is not the scaffold starter registered from "
@@ -557,13 +596,34 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
     if inspection.unresolved_origins:
         conflicts.append(
             {
-                "path": "app.py",
+                "path": registration_relative,
                 "operation": "update_region",
                 "reason": (
                     "cannot safely attach a first tool while an agent registration has a "
                     "dynamic identity"
                 ),
             }
+        )
+    if not conflicts and effect == "external" and _declared_scaffold_preset(root) == "coding":
+        return GeneratorPlan(
+            status="manual_action_required",
+            slice_name=agent_name,
+            tool_name=tool_name,
+            effect=effect,
+            edits=(),
+            preconditions=tuple(preconditions[path] for path in sorted(preconditions)),
+            conflicts=(
+                {
+                    "path": registration_relative,
+                    "operation": "update_region",
+                    "reason": (
+                        "the maintained coding primary has an existing constrained policy; "
+                        "use `cayu generate slice NAME --tool TOOL --effect external` to "
+                        "create an independent approval boundary"
+                    ),
+                },
+            ),
+            verification_commands=_tool_verification_commands(tool_name),
         )
 
     tool_class = f"{_class_name(tool_name)}Tool"
@@ -575,14 +635,14 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
         app_tool_statements.append(f"starter_external_tool_names.append({tool_constant})")
     agent_imports = [f"from tools.{tool_name} import {tool_constant}"]
     agent_config = [
-        f'_SYSTEM_PROMPT_PARTS.append(f"Use {{{tool_constant}}} when it directly answers '
+        '_SYSTEM_PROMPT_PARTS.append("Use the generated tool when it directly answers '
         "the user's request.\")",
         f"_WORKFLOW_TOOL_NAMES.append({tool_constant})",
         '_AUTHORING_STATE = "unfinished_generated_tracer_bullet"',
     ]
     generated_regions = (
         (
-            "app.py",
+            registration_relative,
             app_source,
             GENERATED_STARTER_TOOLS_START,
             GENERATED_STARTER_TOOLS_END,
@@ -639,7 +699,7 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
         if updated_app != app_source:
             edits.append(
                 _edit(
-                    "app.py",
+                    registration_relative,
                     "update_region",
                     updated_app,
                     anchor=(f"{GENERATED_IMPORTS_START}; {GENERATED_STARTER_TOOLS_START}"),
@@ -647,7 +707,10 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
                 )
             )
         else:
-            _record_precondition(preconditions, _file_precondition(root, "app.py"))
+            _record_precondition(
+                preconditions,
+                _file_precondition(root, registration_relative),
+            )
 
         updated_agent = _update_region(
             agent_source,
@@ -702,20 +765,20 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         raise ValueError("effect must be none, idempotent, or external.")
     project = resolve_project(command="cayu generate")
     root = project.root
-    app_path = _generated_path(root, "app.py")
-    if not app_path.is_file():
-        raise ValueError("Generated registration target is missing: app.py.")
-    app_content = app_path.read_bytes()
+    registration_relative, registration_path = _registration_target(root)
+    if not registration_path.is_file():
+        raise ValueError(f"Generated registration target is missing: {registration_relative}.")
+    app_content = registration_path.read_bytes()
     app_source = app_content.decode("utf-8")
     app_precondition = GeneratorPrecondition(
-        path="app.py",
+        path=registration_relative,
         content_sha256=_sha256(app_content),
     )
     verification = (
-        "uv run cayu inspect --json",
-        "uv run cayu check --json",
-        f"uv run pytest tests/test_{name}.py",
-        f"uv run cayu eval run evals.{name}:build_eval",
+        "uv run --no-sync cayu inspect --json",
+        "uv run --no-sync cayu check --json",
+        f"uv run --no-sync pytest tests/test_{name}.py",
+        f"uv run --no-sync cayu eval run evals.{name}:build_eval",
     )
     independent = _slice_files(name=name, tool_name=tool_name, effect=effect)
     tool_imports = [_class_name(tool_name) + "Tool"]
@@ -725,11 +788,14 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         f"from agents.{name} import {_constant_name(name)}_AGENT",
         f"from tools.{tool_name} import {', '.join(tool_imports)}",
     ]
+    if effect == "external" and registration_relative != "app.py":
+        import_lines.append("from cayu import AlwaysRequireApprovalToolPolicy")
     agent_constant = f"{_constant_name(name)}_AGENT"
     tool_instance = f"{_class_name(tool_name)}Tool()"
+    provider_variable = "provider_override" if registration_relative != "app.py" else "provider"
     registration_lines = [
         "app.register_agent(",
-        f"    {PROVIDER_OVERRIDE_AGENT_HELPER}({agent_constant}, provider),",
+        f"    {PROVIDER_OVERRIDE_AGENT_HELPER}({agent_constant}, {provider_variable}),",
         f"    tools=[{tool_instance}],",
     ]
     if effect == "external":
@@ -743,7 +809,15 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
     edits: list[GeneratorEdit] = []
     preconditions: dict[str, GeneratorPrecondition] = {}
     proposed_origin = (f"agents.{name}", f"{_constant_name(name)}_AGENT")
-    agent_inspection = _inspect_registered_agents(root, app_source)
+    agent_inspection = _normalize_declared_registration_inspection(
+        root,
+        registration_relative,
+        _inspect_registered_agents(
+            root,
+            app_source,
+            source_path=registration_relative,
+        ),
+    )
     registered_origins = list(agent_inspection.origins_by_name.get(name, ()))
     if _region_contains_statement(
         app_source,
@@ -760,7 +834,7 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         )
         conflicts.append(
             {
-                "path": "app.py",
+                "path": registration_relative,
                 "operation": "update_region",
                 "reason": (
                     f"agent name {name!r} is already registered by {rendered_origins}; "
@@ -770,7 +844,7 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
         )
     unresolved_conflicts = [
         {
-            "path": "app.py",
+            "path": registration_relative,
             "operation": "update_region",
             "reason": (
                 "cannot determine the registered agent name for "
@@ -867,7 +941,7 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
     if missing_anchors:
         conflicts.append(
             {
-                "path": "app.py",
+                "path": registration_relative,
                 "operation": "update_region",
                 "anchor": ", ".join(missing_anchors),
                 "reason": "machine-owned registration anchors are missing or duplicated",
@@ -899,7 +973,7 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
     if updated != app_source:
         edits.append(
             _edit(
-                "app.py",
+                registration_relative,
                 "update_region",
                 updated,
                 anchor=(f"{GENERATED_IMPORTS_START}; {GENERATED_REGISTRATIONS_START}"),
@@ -933,14 +1007,16 @@ def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
 def _inspect_registered_agents(
     root: Path,
     app_source: str,
+    *,
+    source_path: str = "app.py",
 ) -> _AgentRegistrationInspection:
     """Inspect registered agent identities without importing or executing project code."""
 
     try:
-        app_tree = ast.parse(app_source, filename="app.py")
+        app_tree = ast.parse(app_source, filename=source_path)
     except SyntaxError as exc:
         raise ValueError(
-            f"Cannot inspect registered agent identities in app.py: {exc.msg}."
+            f"Cannot inspect registered agent identities in {source_path}: {exc.msg}."
         ) from exc
     parents = _ast_parents(app_tree)
 
@@ -971,11 +1047,11 @@ def _inspect_registered_agents(
         assert isinstance(node, ast.Call)
         registered = _registered_agent_argument(node)
         if registered is None:
-            unresolved.add(("app.py", "register_agent"))
+            unresolved.add((source_path, "register_agent"))
             continue
         registered = _unwrap_provider_override_agent(registered)
         if isinstance(registered, ast.Call):
-            origin = ("app.py", "inline AgentSpec")
+            origin = (source_path, "inline AgentSpec")
             agent_name = _literal_agent_spec_name(registered, app_literals)
             if agent_name is None:
                 unresolved.add(origin)
@@ -983,18 +1059,18 @@ def _inspect_registered_agents(
                 registrations.setdefault(agent_name, []).append(origin)
             continue
         if not isinstance(registered, ast.Name):
-            unresolved.add(("app.py", "register_agent"))
+            unresolved.add((source_path, "register_agent"))
             continue
         if _is_shadowed_in_enclosing_scope(
             node,
             registered.id,
             parents=parents,
         ):
-            unresolved.add(("app.py", registered.id))
+            unresolved.add((source_path, registered.id))
             continue
         origin = agent_imports.get(registered.id)
         if origin is None:
-            origin = ("app.py", registered.id)
+            origin = (source_path, registered.id)
             expression = _assigned_expression(app_tree, registered.id)
             agent_name = _literal_agent_spec_name(expression, app_literals)
             if agent_name is None:
@@ -1020,6 +1096,199 @@ def _inspect_registered_agents(
         ),
         unresolved_origins=frozenset(unresolved),
     )
+
+
+def _normalize_declared_registration_inspection(
+    root: Path,
+    source_path: str,
+    inspection: _AgentRegistrationInspection,
+) -> _AgentRegistrationInspection:
+    """Resolve the maintained coding registration's explicit AgentSpec parameters."""
+
+    if source_path != "agents/registration.py" or _declared_scaffold_preset(root) != "coding":
+        return inspection
+    parameter_origins = {
+        (source_path, "primary_agent"),
+        (source_path, "reviewer_agent"),
+    }
+    if not parameter_origins.issubset(inspection.unresolved_origins):
+        return inspection
+    if not _coding_registration_helper_is_canonical(root):
+        return inspection
+    app_precondition = _coding_app_wiring_precondition(root)
+    if app_precondition is None:
+        return inspection
+
+    origins = {name: list(values) for name, values in inspection.origins_by_name.items()}
+    preconditions = {item.path: item for item in inspection.source_preconditions}
+    preconditions[app_precondition.path] = app_precondition
+    module_snapshots: dict[str, _AgentModuleSnapshot | None] = {}
+    for module, symbol in (("agents.agent", "AGENT"), ("agents.reviewer", "REVIEWER")):
+        name, precondition = _literal_agent_name(
+            root,
+            module,
+            symbol,
+            module_snapshots=module_snapshots,
+        )
+        if name is None:
+            return inspection
+        origins.setdefault(name, []).append((module, symbol))
+        if precondition is not None:
+            preconditions[precondition.path] = precondition
+    return _AgentRegistrationInspection(
+        origins_by_name={name: tuple(values) for name, values in origins.items()},
+        source_preconditions=tuple(preconditions[path] for path in sorted(preconditions)),
+        unresolved_origins=inspection.unresolved_origins - parameter_origins,
+    )
+
+
+def _coding_app_wiring_precondition(root: Path) -> GeneratorPrecondition | None:
+    relative = "app.py"
+    path = _generated_path(root, relative)
+    if not path.is_file():
+        return None
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, UnicodeError, SyntaxError):
+        return None
+
+    expected_imports = {
+        "AGENT": ("agents.agent", "AGENT"),
+        "build_coding_app": ("operations.coding", "build_coding_app"),
+        PROVIDER_OVERRIDE_AGENT_HELPER: (
+            "agents.registration",
+            PROVIDER_OVERRIDE_AGENT_HELPER,
+        ),
+        "REVIEWER": ("agents.reviewer", "REVIEWER"),
+    }
+    for local_name, (module, symbol) in expected_imports.items():
+        if _module_binding_count(tree, local_name) != 1 or not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == module
+            and any(
+                imported.name == symbol and (imported.asname or imported.name) == local_name
+                for imported in node.names
+            )
+            for node in tree.body
+        ):
+            return None
+    factories = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build_app"
+    ]
+    if len(factories) != 1:
+        return None
+    calls = [
+        node
+        for node in ast.walk(factories[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_coding_app"
+    ]
+    if len(calls) != 1:
+        return None
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords if keyword.arg}
+    for field, symbol in (("primary_agent", "AGENT"), ("reviewer_agent", "REVIEWER")):
+        value = keywords.get(field)
+        if value is None:
+            return None
+        value = _unwrap_provider_override_agent(value)
+        if not isinstance(value, ast.Name) or value.id != symbol:
+            return None
+    return _file_precondition(root, relative)
+
+
+def _coding_registration_helper_is_canonical(root: Path) -> bool:
+    relative = "agents/registration.py"
+    path = _generated_path(root, relative)
+    if not path.is_file():
+        return False
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, UnicodeError, SyntaxError):
+        return False
+    helpers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == PROVIDER_OVERRIDE_AGENT_HELPER
+    ]
+    if len(helpers) != 1 or _module_binding_count(tree, PROVIDER_OVERRIDE_AGENT_HELPER) != 1:
+        return False
+    helper = helpers[0]
+    arguments = helper.args
+    if (
+        helper.decorator_list
+        or arguments.posonlyargs
+        or [argument.arg for argument in arguments.args] != ["agent", "provider"]
+        or arguments.vararg is not None
+        or arguments.kwonlyargs
+        or arguments.kwarg is not None
+        or arguments.defaults
+        or arguments.kw_defaults
+    ):
+        return False
+    body = helper.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 2 or not isinstance(body[0], ast.If) or not isinstance(body[1], ast.Return):
+        return False
+    guard = body[0]
+    if (
+        not isinstance(guard.test, ast.Compare)
+        or not isinstance(guard.test.left, ast.Name)
+        or guard.test.left.id != "provider"
+        or len(guard.test.ops) != 1
+        or not isinstance(guard.test.ops[0], ast.Is)
+        or len(guard.test.comparators) != 1
+        or not isinstance(guard.test.comparators[0], ast.Constant)
+        or guard.test.comparators[0].value is not None
+        or len(guard.body) != 1
+        or not isinstance(guard.body[0], ast.Return)
+        or not isinstance(guard.body[0].value, ast.Name)
+        or guard.body[0].value.id != "agent"
+        or guard.orelse
+    ):
+        return False
+    returned = body[1].value
+    if (
+        not isinstance(returned, ast.Call)
+        or returned.args
+        or len(returned.keywords) != 1
+        or returned.keywords[0].arg != "update"
+        or not isinstance(returned.func, ast.Attribute)
+        or returned.func.attr != "model_copy"
+        or not isinstance(returned.func.value, ast.Name)
+        or returned.func.value.id != "agent"
+    ):
+        return False
+    update = returned.keywords[0].value
+    return (
+        isinstance(update, ast.Dict)
+        and len(update.keys) == 1
+        and isinstance(update.keys[0], ast.Constant)
+        and update.keys[0].value == "provider_name"
+        and isinstance(update.values[0], ast.Attribute)
+        and update.values[0].attr == "name"
+        and isinstance(update.values[0].value, ast.Name)
+        and update.values[0].value.id == "provider"
+    )
+
+
+def _declared_scaffold_preset(root: Path) -> str | None:
+    pyproject = _generated_path(root, "pyproject.toml")
+    if not pyproject.is_file():
+        return None
+    try:
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return None
+    scaffold = document.get("tool", {}).get("cayu", {}).get("scaffold", {})
+    preset = scaffold.get("preset")
+    return preset if type(preset) is str else None
 
 
 def _registration_aliases(tree: ast.Module) -> frozenset[str]:
@@ -1295,8 +1564,8 @@ def _literal_agent_spec_name(
 
 
 def _render_agent_origin(origin: tuple[str, str]) -> str:
-    if origin[0] == "app.py":
-        return f"app.py:{origin[1]}"
+    if origin[0].endswith(".py"):
+        return f"{origin[0]}:{origin[1]}"
     return f"{origin[0]}.{origin[1]}"
 
 
@@ -1376,7 +1645,11 @@ def apply_slice_plan(plan: GeneratorPlan) -> None:
 
         for edit, target in targets:
             try:
-                _validate_plan_preconditions(plan, root)
+                _validate_plan_preconditions(
+                    plan,
+                    root,
+                    applied_edits={item.path: item for item, _target in applied},
+                )
                 _generated_path(root, edit.path)
                 _validate_edit_preimage(edit, target)
                 _create_missing_parents(root, target.parent, created_directories)
@@ -1430,8 +1703,14 @@ def apply_service_context_plan(plan: ServiceContextMigrationPlan) -> None:
     )
 
 
-def _validate_plan_preconditions(plan: GeneratorPlan, root: Path) -> None:
+def _validate_plan_preconditions(
+    plan: GeneratorPlan,
+    root: Path,
+    *,
+    applied_edits: dict[str, GeneratorEdit] | None = None,
+) -> None:
     seen: set[Path] = set()
+    applied_edits = applied_edits or {}
     for precondition in plan.preconditions:
         path = _generated_path(root, precondition.path)
         if path in seen:
@@ -1439,7 +1718,11 @@ def _validate_plan_preconditions(plan: GeneratorPlan, root: Path) -> None:
                 f"Generator plan contains duplicate precondition: {precondition.path}"
             )
         seen.add(path)
-        if not path.is_file() or _sha256(path.read_bytes()) != precondition.content_sha256:
+        applied = applied_edits.get(precondition.path)
+        expected_sha256 = (
+            applied.content_sha256 if applied is not None else precondition.content_sha256
+        )
+        if not path.is_file() or _sha256(path.read_bytes()) != expected_sha256:
             raise GeneratorApplyError(f"{precondition.path} changed after the plan was created.")
 
 
@@ -1905,10 +2188,10 @@ def _plan_tool_files(
 
 def _tool_verification_commands(tool_name: str) -> tuple[str, ...]:
     return (
-        "uv run cayu inspect --json",
-        "uv run cayu check --json",
-        f"uv run pytest tests/test_{tool_name}.py",
-        f"uv run cayu eval run evals.{tool_name}:build_eval",
+        "uv run --no-sync cayu inspect --json",
+        "uv run --no-sync cayu check --json",
+        f"uv run --no-sync pytest tests/test_{tool_name}.py",
+        f"uv run --no-sync cayu eval run evals.{tool_name}:build_eval",
     )
 
 

@@ -21,12 +21,27 @@ from cayu.cli._bounded_command import (
     BoundedCommandTimeoutError,
     run_bounded_command,
 )
+from cayu.cli.scaffold_convention import (
+    application_guidance,
+    convention_files,
+    scaffold_contract,
+)
+from cayu.cli.scaffold_plan import (
+    ADAPTERS,
+    CAPABILITIES,
+    PRESETS,
+    ApplicationPlan,
+    ScaffoldPlanError,
+    capability_spec,
+    normalize_application_plan,
+)
 from cayu.workspaces import LocalWorkspace
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 _TEMPLATE_TOKEN_RE = re.compile(
     r"__(?:PROJECT_NAME|AGENT_NAME|REVIEWER_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL|"
-    r"PROVIDER_GUIDE_POINTER)__"
+    r"PROVIDER_GUIDE_POINTER|DATABASE_README_PROOF_GUIDANCE|DATABASE_AGENTS_PROOF_GUIDANCE|"
+    r"DATABASE_EVALS_STORAGE_GUIDANCE|CODING_DATABASE_SUMMARY|CODING_STATE_STORAGE)__"
 )
 
 _SCAFFOLD_COMMAND_TIMEOUT_S = 10.0
@@ -857,10 +872,10 @@ _PYPROJECT = """[project]
 name = "__PROJECT_NAME__"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["cayu>=__CAYU_VERSION__"]
+dependencies = ["cayu==__CAYU_VERSION__"]
 
 [project.optional-dependencies]
-dev = ["cayu[server]>=__CAYU_VERSION__", "pytest"]
+dev = ["cayu[server]==__CAYU_VERSION__", "pytest"]
 
 [tool.cayu]
 factory = "app:build_app"
@@ -872,11 +887,14 @@ path = "data/cayu.db"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.uv]
+cache-dir = ".cayu/uv-cache"
 """
 
 _PROVIDER_GUIDE_POINTER = """OpenRouter is a first-class scaffold choice. Fireworks, Baseten, OpenCode Go,
 and other compatible endpoints work through Cayu's generic adapter. Run
-`uv run cayu guide providers#compatible-chat-completions` for exact setup."""
+`uv run --no-sync cayu guide providers#compatible-chat-completions` for exact setup."""
 
 _README = """# __PROJECT_NAME__
 
@@ -890,23 +908,25 @@ Describe the requested job in `agents/agent.py`; update `tests/test_agent.py`
 and `evals/agent.py` to prove that behavior. The project factory is `build_app()`
 in `app.py`. Run `cayu guide anatomy` for its lifecycle contract.
 
-Run `uv run cayu guide authoring#cayu-map` to select another concept only when
+Run `uv run --no-sync cayu guide authoring#cayu-map` to select another concept only when
 the requested behavior requires it. For durable operational changes, start with
-`uv run cayu guide durable-operations`; it covers propose, authorize, act once,
-verify, inspect, and recover. `uv run cayu guide references` contains the
+`uv run --no-sync cayu guide durable-operations`; it covers propose, authorize, act once,
+verify, inspect, and recover. `uv run --no-sync cayu guide references` contains the
 package-shipped offline references.
 
 ## Setup and prove the project
 
 ```bash
 uv sync --extra dev
-uv run cayu guide anatomy
-uv run cayu inspect --json
-uv run cayu check --json
-uv run pytest
-uv run cayu eval run
-uv run cayu session list
+uv run --no-sync cayu guide anatomy
+uv run --no-sync cayu inspect --json
+uv run --no-sync cayu check --fail-on warning --json
+uv run --no-sync pytest
+uv run --no-sync cayu eval run
+uv run --no-sync cayu session list
 ```
+
+__DATABASE_README_PROOF_GUIDANCE__
 
 These commands require no model API key. They prove project construction,
 static wiring, a deterministic model response, and its eval.
@@ -917,14 +937,14 @@ Cayu's packaged developer/operator control plane reads the same durable stores
 as the project commands. Start it in a separate terminal:
 
 ```bash
-uv run cayu serve --dev
+uv run --no-sync cayu serve --dev
 ```
 
 Then open `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag enables
 unauthenticated trusted-local access only. It does not make the control plane
 the application's end-user UI or configure a production deployment.
-Project serving also derives Evals project/release identity and uses this
-project's durable `data/cayu.db` store automatically. With the normal live
+Project serving also derives Evals project/release identity and uses
+__DATABASE_EVALS_STORAGE_GUIDANCE__ automatically. With the normal live
 provider configured, open a completed or failed simple session, choose
 **Evaluate**, review its assertions, save or approve the captured result, and
 start one bounded fresh trial. The generated target reuses the registered agent
@@ -948,7 +968,7 @@ OpenAI Platform API:
 ```bash
 export CAYU_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
-uv run python run.py --message "YOUR REQUEST"
+uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
 
 Anthropic API:
@@ -956,7 +976,7 @@ Anthropic API:
 ```bash
 export CAYU_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
-uv run python run.py --message "YOUR REQUEST"
+uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
 
 OpenRouter (the model slug is always explicit):
@@ -965,7 +985,7 @@ OpenRouter (the model slug is always explicit):
 export CAYU_PROVIDER=openrouter
 export OPENROUTER_API_KEY=sk-or-...
 export CAYU_MODEL=vendor/model
-uv run python run.py --message "YOUR REQUEST"
+uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
 
 Optional `OPENROUTER_HTTP_REFERER` and `OPENROUTER_APP_TITLE` values add
@@ -978,8 +998,8 @@ never persisted. Put OpenRouter routing controls such as `provider.order`,
 Your own ChatGPT subscription for local testing:
 
 ```bash
-uv run cayu auth openai login
-CAYU_PROVIDER=openai-subscription uv run python run.py --message "YOUR REQUEST"
+uv run --no-sync cayu auth openai login
+CAYU_PROVIDER=openai-subscription uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
 
 Subscription mode selects `gpt-5.4` by default. Set `CAYU_MODEL` if your plan
@@ -989,7 +1009,7 @@ This experimental path is intended for the subscription holder's own local
 development and evaluation. It is not intended for production, customer-facing
 or multi-user services, credential sharing, resale, or bypassing plan limits.
 For production, use the OpenAI Platform API or another officially supported
-provider. Run `uv run cayu guide providers#openai-subscription` for the local
+provider. Run `uv run --no-sync cayu guide providers#openai-subscription` for the local
 support boundary.
 `--agent` is optional while this is the only registered agent. The checked-in
 `AGENTS.md` is the local instruction surface for coding agents.
@@ -1024,12 +1044,12 @@ one only for a real capability outside the model, such as reading a repository
 or calling an API. Do not create echo, pass-through, or placeholder tools.
 
 Use the Cayu Map to choose only the concepts the job needs:
-`uv run cayu guide authoring#cayu-map`. If the job observes, proposes, authorizes,
+`uv run --no-sync cayu guide authoring#cayu-map`. If the job observes, proposes, authorizes,
 executes, verifies, or recovers an operational change, read the runnable paved
-path first: `uv run cayu guide durable-operations`.
+path first: `uv run --no-sync cayu guide durable-operations`.
 
 If another capability is required, use the smallest package-shipped reference
-from `uv run cayu guide references`.
+from `uv run --no-sync cayu guide references`.
 
 __PROVIDER_GUIDE_POINTER__
 
@@ -1041,17 +1061,19 @@ do not improvise product authorization around raw Cayu routes.
 ## Project commands
 
 - Setup: `uv sync --extra dev`.
-- Application contract: `uv run cayu guide anatomy`.
-- Authoring details: `uv run cayu guide authoring`.
-- Inspect/check: `uv run cayu inspect --json` and `uv run cayu check --json`.
-- Hermetic proof: `uv run pytest` and `uv run cayu eval run`.
-- Local developer/operator control plane: run `uv run cayu serve --dev` in a separate
+__DATABASE_AGENTS_PROOF_GUIDANCE__
+- Application contract: `uv run --no-sync cayu guide anatomy`.
+- Authoring details: `uv run --no-sync cayu guide authoring`.
+- Inspect/check: `uv run --no-sync cayu inspect --json` and
+  `uv run --no-sync cayu check --fail-on warning --json`.
+- Hermetic proof: `uv run --no-sync pytest` and `uv run --no-sync cayu eval run`.
+- Local developer/operator control plane: run `uv run --no-sync cayu serve --dev` in a separate
   terminal and open `http://127.0.0.1:8000/cayu/`. This is not the application's
   end-user UI or a production server configuration.
 - Never mount it with `OpenAccess()` on a public listener.
 - Client-IP and forwarded-header checks are not authentication. Use
   `AuthenticatedAccess(...)` for any public or deployed control-plane surface.
-- Live execution: `uv run python run.py --message "USER REQUEST"` after configuring a
+- Live execution: `uv run --no-sync python run.py --message "USER REQUEST"` after configuring a
   provider in `app.configured_provider()`.
 
 Use public `cayu` imports and public CLI JSON only. Do not depend on Cayu source,
@@ -1063,7 +1085,7 @@ declare `ToolEffect`, and effect metadata does not authorize execution. A
 comprehension or live model behavior.
 
 For the starter's first real tool, run
-`uv run cayu generate tool TOOL_NAME --agent __AGENT_NAME__ --effect EFFECT`.
+`uv run --no-sync cayu generate tool TOOL_NAME --agent __AGENT_NAME__ --effect EFFECT`.
 Then replace the generated sample schema, implementation, test, and eval with
 domain behavior; `cayu check` keeps the tracer-bullet warning active until the
 explicit authoring marker is removed.
@@ -2760,7 +2782,9 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
         runtime_session_store = runtime_checkpoint_session_store(
             first_service.cayu_app.session_store
         )
-        created_checkpoint = await runtime_session_store.load_checkpoint(created_session.id)
+        created_checkpoint = await runtime_session_store.load_checkpoint(
+            created_session.id
+        )
         interaction_id = "interaction_replacement_continuation"
         interaction_started_at = datetime.now(UTC)
         interaction_started_event_id = "interaction_start_replacement_continuation"
@@ -3309,7 +3333,7 @@ redaction, and cache controls when extending the product API.
 Local development is explicit and loopback-only:
 
 ```bash
-uv run cayu serve --dev
+uv run --no-sync cayu serve --dev
 ```
 
 In another terminal, exercise the customer route with explicit development
@@ -3331,7 +3355,7 @@ For production, configure `PRODUCT_AUTH_TOKENS_JSON` and
 ```bash
 export PRODUCT_AUTH_TOKENS_JSON='{"replace-customer-token":{"tenant_id":"tenant-a","subject_id":"user-a"}}'
 export CAYU_OPERATOR_BEARER_TOKEN='replace-operator-token'
-uv run cayu serve --host 0.0.0.0
+uv run --no-sync cayu serve --host 0.0.0.0
 ```
 
 The `cayu serve` listener uses plain HTTP. Put it behind a trusted
@@ -3344,8 +3368,8 @@ provider. Replace its authentication dependency with your trusted application
 authority while continuing to return server-derived `ProductPrincipal` values.
 
 ```bash
-uv run cayu check --deploy --fail-on warning --json
-uv run pytest -q tests/test_public_service_security.py
+uv run --no-sync cayu check --deploy --fail-on warning --json
+uv run --no-sync pytest -q tests/test_public_service_security.py
 ```
 
 The check verifies the maintained factory, configured exposure posture, and
@@ -3371,11 +3395,11 @@ customers. An arbitrary ASGI route is outside Cayu's verification boundary.
 
 Before declaring production work complete, run:
 
-- `uv run cayu check --deploy --fail-on warning --json`
-- `uv run pytest -q tests/test_public_service_security.py`
+- `uv run --no-sync cayu check --deploy --fail-on warning --json`
+- `uv run --no-sync pytest -q tests/test_public_service_security.py`
 """
 
-_GITIGNORE = "data/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
+_GITIGNORE = ".cayu/\ndata/\n__pycache__/\n*.pyc\n.pytest_cache/\n.venv/\n"
 
 
 def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -3387,7 +3411,11 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
             "and credential-free verification commands next."
         ),
     )
-    parser.add_argument("name", help="Project name (also the directory name).")
+    parser.add_argument(
+        "name",
+        nargs="?",
+        help="Project name (also the directory name); required unless using discovery.",
+    )
     parser.add_argument(
         "--agent-name",
         help="Registered first-agent name (default: project name).",
@@ -3400,17 +3428,83 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=("openai", "anthropic", "openrouter", "openai-subscription"),
+        choices=("neutral", "openai", "anthropic", "openrouter", "openai-subscription"),
         help=(
-            "Explicit live-provider default. Omit for a provider-neutral scaffold; "
+            "Provider adapter (default: neutral). Omit for a provider-neutral scaffold; "
             "CAYU_PROVIDER can select or override it later."
         ),
     )
     parser.add_argument(
+        "--preset",
+        choices=tuple(spec.name for spec in PRESETS),
+        help="Coherent application shape: agent (default), service, or coding.",
+    )
+    parser.add_argument(
+        "--database",
+        choices=tuple(spec.name for spec in ADAPTERS if spec.kind == "database"),
+        default="sqlite",
+        help="Database adapter for maintained generated stores (default: sqlite).",
+    )
+    parser.add_argument(
+        "--execution",
+        choices=tuple(spec.name for spec in ADAPTERS if spec.kind == "execution"),
+        help="Execution adapter (default: none; docker is admitted only for coding).",
+    )
+    parser.add_argument(
+        "--with",
+        dest="with_capabilities",
+        action="append",
+        default=[],
+        metavar="CAPABILITY",
+        help="Enable a maintained optional capability; repeat or use comma-separated names.",
+    )
+    parser.add_argument(
+        "--without",
+        dest="without_capabilities",
+        action="append",
+        default=[],
+        metavar="CAPABILITY",
+        help="Disable an optional preset capability while retaining its ownership home.",
+    )
+    parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="Generate the smallest supported model-agent project instead of the convention.",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt for omitted choices when attached to a terminal.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve and validate the exact generation plan without writing files.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable structured discovery, plan, error, or creation output.",
+    )
+    parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="List package-shipped maintained presets without creating a project.",
+    )
+    parser.add_argument(
+        "--list-capabilities",
+        action="store_true",
+        help="List selectable, preset-owned, and extension-only capability seams.",
+    )
+    parser.add_argument(
+        "--explain",
+        metavar="CAPABILITY",
+        help="Explain one package-shipped capability without creating a project.",
+    )
+    parser.add_argument(
         "--template",
         choices=("agent", "service"),
-        default="agent",
-        help=("Project shape: minimal agent (default) or maintained public-agent service."),
+        help=("Compatibility alias: --template service maps to --preset service."),
     )
     parser.add_argument(
         "--composition",
@@ -3435,7 +3529,7 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         help=(
             "Explicit admitted profile for Docker coding execution. The generated "
             "Python profile is the first built-in; applications may register custom "
-            "DockerCodingToolchainProfile values in composition.py."
+            "DockerCodingToolchainProfile values in environments/coding.py."
         ),
     )
 
@@ -3453,13 +3547,86 @@ def project_files(
     composition: str | None = None,
     coding_execution: str | None = None,
     coding_toolchain: str | None = None,
+    preset: str | None = None,
+    database: str = "sqlite",
+    execution: str | None = None,
+    with_capabilities: tuple[str, ...] = (),
+    without_capabilities: tuple[str, ...] = (),
+    minimal: bool = False,
+    application_plan: ApplicationPlan | None = None,
 ) -> dict[str, str]:
     resolved_agent_name = name if agent_name is None else agent_name
+    if application_plan is None:
+        resolved_preset = preset
+        if resolved_preset is None:
+            resolved_preset = "coding" if composition == "coding" else template
+        elif template != "agent" and template != resolved_preset:
+            raise ValueError("preset conflicts with template compatibility alias.")
+        if composition is not None and resolved_preset != composition:
+            raise ValueError("preset conflicts with composition compatibility alias.")
+        resolved_execution = execution
+        if resolved_execution is None:
+            resolved_execution = coding_execution or "none"
+        elif coding_execution is not None and resolved_execution != coding_execution:
+            raise ValueError("execution conflicts with coding_execution compatibility alias.")
+        application_plan = normalize_application_plan(
+            name=name,
+            agent_name=resolved_agent_name,
+            preset=resolved_preset,
+            database=database,
+            provider=provider or "neutral",
+            execution=resolved_execution,
+            with_capabilities=with_capabilities,
+            without_capabilities=without_capabilities,
+            minimal=minimal,
+        )
+    plan = application_plan
+    resolved_agent_name = plan.agent_name
+    provider = plan.provider_alias
+    template = plan.template_alias
+    composition = plan.composition_alias
+    coding_execution = plan.execution_alias
     reviewer_name = f"{resolved_agent_name}-reviewer"
 
     def render(template: str) -> str:
         provider_display = provider or "no live provider"
         provider_literal = "None" if provider is None else json.dumps(provider)
+        if plan.database == "postgres":
+            database_readme_proof_guidance = (
+                "Run setup and proof commands in the listed order. Do not parallelize "
+                "commands that construct the application against the same configured "
+                "Postgres database; schema setup and shared-state checks require explicit "
+                "coordination."
+            )
+            database_agents_proof_guidance = (
+                "- Run setup and proof commands sequentially. Do not parallelize application-\n"
+                "  constructing commands against the same configured Postgres database."
+            )
+            database_evals_storage_guidance = "the configured durable Postgres Evals store"
+            coding_database_summary = "durable Postgres knowledge"
+            coding_state_storage = (
+                "Artifact state is stored below that protected `.cayu` boundary; session, "
+                "task, and knowledge state lives in the configured Postgres stores. Use the "
+                "registered Git, artifact, and knowledge tools at their authenticated "
+                "boundaries instead."
+            )
+        else:
+            database_readme_proof_guidance = (
+                "Run setup and proof commands in the listed order. Do not parallelize "
+                "commands that construct the application against the same local SQLite "
+                "store; first use may initialize or migrate its schema."
+            )
+            database_agents_proof_guidance = (
+                "- Run setup and proof commands sequentially. Do not parallelize application-\n"
+                "  constructing commands against the same local SQLite store."
+            )
+            database_evals_storage_guidance = "this project's durable `data/cayu.db` store"
+            coding_database_summary = "durable SQLite knowledge"
+            coding_state_storage = (
+                "Session, task, artifact, and knowledge state is stored below that protected "
+                "`.cayu` boundary; use the registered Git, artifact, and knowledge tools at "
+                "their authenticated boundaries instead."
+            )
         replacements = {
             "__PROJECT_NAME__": name,
             "__AGENT_NAME__": resolved_agent_name,
@@ -3468,6 +3635,11 @@ def project_files(
             "__PROVIDER_DISPLAY__": provider_display,
             "__PROVIDER_LITERAL__": provider_literal,
             "__PROVIDER_GUIDE_POINTER__": _PROVIDER_GUIDE_POINTER,
+            "__DATABASE_README_PROOF_GUIDANCE__": database_readme_proof_guidance,
+            "__DATABASE_AGENTS_PROOF_GUIDANCE__": database_agents_proof_guidance,
+            "__DATABASE_EVALS_STORAGE_GUIDANCE__": database_evals_storage_guidance,
+            "__CODING_DATABASE_SUMMARY__": coding_database_summary,
+            "__CODING_STATE_STORAGE__": coding_state_storage,
         }
         return _TEMPLATE_TOKEN_RE.sub(
             lambda match: replacements[match.group(0)],
@@ -3488,10 +3660,36 @@ def project_files(
         "AGENTS.md": render(_AGENTS_MD),
         ".gitignore": _GITIGNORE,
     }
+    if not plan.minimal:
+        files.pop("configuration.py")
+        files.update(convention_files(plan, render=render))
+        files["pyproject.toml"] += scaffold_contract(plan)
+        files["README.md"] += application_guidance(plan)
+        files["AGENTS.md"] += application_guidance(plan)
+    elif plan.minimal:
+        files.update(convention_files(plan, render=render))
+        files["pyproject.toml"] += scaffold_contract(plan)
+    if plan.database == "postgres":
+        files["pyproject.toml"] = files["pyproject.toml"].replace(
+            '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"',
+            '[tool.cayu.session_store]\nbackend = "postgres"\nenv = "CAYU_DATABASE_URL"',
+        )
     if coding_execution is not None and composition != "coding":
         raise ValueError("coding_execution requires composition='coding'.")
     if coding_toolchain is not None and coding_execution != "docker":
         raise ValueError("coding_toolchain requires coding_execution='docker'.")
+    if plan.database == "postgres":
+        files["pyproject.toml"] = (
+            files["pyproject.toml"]
+            .replace(
+                f"cayu=={_installed_cayu_version()}",
+                f"cayu[postgres]=={_installed_cayu_version()}",
+            )
+            .replace(
+                f"cayu[server]=={_installed_cayu_version()}",
+                f"cayu[postgres,server]=={_installed_cayu_version()}",
+            )
+        )
     if composition is not None:
         if composition != "coding":
             raise ValueError("composition must be 'coding'.")
@@ -3505,6 +3703,7 @@ def project_files(
                 render=render,
                 execution=coding_execution,
                 toolchain=coding_toolchain,
+                database=plan.database,
             )
         )
         return files
@@ -3512,14 +3711,21 @@ def project_files(
         return files
     if template != "service":
         raise ValueError("template must be 'agent' or 'service'.")
+    version = _installed_cayu_version()
+    selected_extra = "postgres" if plan.database == "postgres" else None
+    current_dependency = (
+        f"cayu[{selected_extra}]=={version}" if selected_extra else f"cayu=={version}"
+    )
+    service_extra = "postgres,server" if plan.database == "postgres" else "server"
+    service_dependency = f"cayu[{service_extra}]=={version}"
     service_pyproject = (
         files["pyproject.toml"]
         .replace(
-            f'dependencies = ["cayu>={_installed_cayu_version()}"]',
-            f'dependencies = ["cayu[server]>={_installed_cayu_version()}"]',
+            f'dependencies = ["{current_dependency}"]',
+            f'dependencies = ["{service_dependency}"]',
         )
         .replace(
-            f'dev = ["cayu[server]>={_installed_cayu_version()}", "pytest"]',
+            f'dev = ["{service_dependency}", "pytest"]',
             'dev = ["pytest", "ruff>=0.15.15,<0.16"]',
         )
     )
@@ -3540,239 +3746,458 @@ def project_files(
     return files
 
 
-def run_new(args: argparse.Namespace) -> int:
-    name = args.name
-    if not _NAME_RE.fullmatch(name):
+def _new_error(*, code: str, message: str, as_json: bool) -> int:
+    if as_json:
         print(
-            f"error: invalid project name {name!r} "
-            "(use letters, digits, '-' or '_', starting with a letter).",
-            file=sys.stderr,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "error",
+                    "error": {"code": code, "message": message},
+                },
+                sort_keys=True,
+            )
         )
-        return 1
-    agent_name = name if args.agent_name is None else args.agent_name
-    if not _NAME_RE.fullmatch(agent_name):
-        print(
-            f"error: invalid agent name {agent_name!r} "
-            "(use letters, digits, '-' or '_', starting with a letter).",
-            file=sys.stderr,
-        )
-        return 1
-    composition = getattr(args, "composition", None)
-    coding_execution = getattr(args, "coding_execution", None)
-    coding_toolchain = getattr(args, "coding_toolchain", None)
-    if coding_execution is not None and composition != "coding":
-        print(
-            "error: --coding-execution requires --composition coding.",
-            file=sys.stderr,
-        )
-        return 1
-    if coding_toolchain is not None and coding_execution != "docker":
-        print(
-            "error: --coding-toolchain requires --coding-execution docker.",
-            file=sys.stderr,
-        )
-        return 1
-    if composition is not None and args.template != "agent":
-        print(
-            "error: --composition coding cannot be combined with --template service.",
-            file=sys.stderr,
-        )
-        return 1
-    target = Path(args.dir) / name
-    if target.is_symlink():
-        print(f"error: {target} cannot be a symbolic link.", file=sys.stderr)
-        return 1
-    if target.exists() and not target.is_dir():
-        print(f"error: {target} already exists and is not a directory.", file=sys.stderr)
-        return 1
-    if target.exists() and any(target.iterdir()):
-        print(f"error: {target} already exists and is not empty.", file=sys.stderr)
-        return 1
-    coding_git: str | None = None
-    coding_target_identity: tuple[int, int] | None = None
-    coding_target_mode: int | None = None
-    if composition == "coding":
-        try:
-            LocalWorkspace.require_path_operations_supported()
-        except RuntimeError as exc:
-            print(f"error: --composition coding {exc}", file=sys.stderr)
-            return 1
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            _require_safe_scaffold_parent(target.parent)
-            coding_git, _ = _preflight_coding_commands(parent=target.parent)
-            target.mkdir(parents=True, exist_ok=True)
-            target_stat = target.stat(follow_symlinks=False)
-            coding_target_identity = (target_stat.st_dev, target_stat.st_ino)
-            coding_target_mode = stat.S_IMODE(target_stat.st_mode)
-        except (_ScaffoldCommandError, OSError) as exc:
-            print(f"error: --composition coding {exc}", file=sys.stderr)
-            return 1
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    return 1
 
-    files = project_files(
-        name,
-        agent_name=agent_name,
-        provider=args.provider,
-        template=args.template,
-        composition=composition,
-        coding_execution=coding_execution,
-        coding_toolchain=coding_toolchain,
+
+def _run_new_discovery(args: argparse.Namespace) -> int | None:
+    requests = sum(
+        (
+            bool(args.list_presets),
+            bool(args.list_capabilities),
+            args.explain is not None,
+        )
     )
-    if composition == "coding":
-        assert coding_git is not None
-        assert coding_target_identity is not None
-        assert coding_target_mode is not None
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix=f".{name}.cayu-scaffold-",
-                dir=target.parent,
-            ) as raw_staging:
-                staging = Path(raw_staging)
-                staging_identity = _scaffold_directory_identity(staging)
-                for rel, content in files.items():
-                    path = staging / rel
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(content, encoding="utf-8")
+    if requests == 0:
+        return None
+    if requests > 1:
+        return _new_error(
+            code="DISCOVERY_SELECTION_CONFLICT",
+            message="choose only one of --list-presets, --list-capabilities, or --explain",
+            as_json=args.json,
+        )
+    if args.list_presets:
+        payload: object = {
+            "schema_version": 1,
+            "presets": [spec.as_dict() for spec in PRESETS],
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print("Cayu application presets:")
+            for spec in PRESETS:
+                print(f"  {spec.name:<10} {spec.summary}")
+        return 0
+    if args.list_capabilities:
+        payload = {
+            "schema_version": 1,
+            "capabilities": [spec.as_dict() for spec in CAPABILITIES],
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print("Cayu application capabilities:")
+            for spec in CAPABILITIES:
+                print(f"  {spec.name:<14} {spec.status:<14} {spec.summary}")
+        return 0
+    try:
+        spec = capability_spec(args.explain)
+    except ScaffoldPlanError as exc:
+        return _new_error(code=exc.code.upper(), message=str(exc), as_json=args.json)
+    if args.json:
+        print(
+            json.dumps(
+                {"schema_version": 1, "capability": spec.as_dict()}, indent=2, sort_keys=True
+            )
+        )
+    else:
+        print(f"{spec.name} ({spec.status})")
+        print(spec.summary)
+        print("Supported presets: " + ", ".join(spec.supported_presets))
+        if spec.implied:
+            print("Implies: " + ", ".join(spec.implied))
+        if spec.files:
+            print("Canonical homes: " + ", ".join(spec.files))
+    return 0
+
+
+def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan:
+    preset = args.preset
+    template = args.template
+    composition = args.composition
+    if preset is None:
+        preset = "coding" if composition == "coding" else template or "agent"
+    if template is not None and template != ("agent" if preset == "coding" else preset):
+        raise ScaffoldPlanError(
+            "preset_alias_conflict",
+            f"--template {template} conflicts with --preset {preset}",
+        )
+    if composition is not None and preset != composition:
+        raise ScaffoldPlanError(
+            "preset_alias_conflict",
+            f"--composition {composition} conflicts with --preset {preset}",
+        )
+    execution = args.execution or args.coding_execution or "none"
+    if (
+        args.execution is not None
+        and args.coding_execution is not None
+        and args.execution != args.coding_execution
+    ):
+        raise ScaffoldPlanError(
+            "execution_alias_conflict",
+            "--execution conflicts with --coding-execution",
+        )
+    if args.coding_execution is not None and preset != "coding":
+        raise ScaffoldPlanError(
+            "coding_execution_requires_coding",
+            "--coding-execution requires --preset coding or --composition coding",
+        )
+    if args.coding_toolchain is not None and execution != "docker":
+        raise ScaffoldPlanError(
+            "coding_toolchain_requires_docker",
+            "--coding-toolchain requires --execution docker",
+        )
+    agent_name = name if args.agent_name is None else args.agent_name
+    return normalize_application_plan(
+        name=name,
+        agent_name=agent_name,
+        preset=preset,
+        database=args.database,
+        provider=args.provider or "neutral",
+        execution=execution,
+        with_capabilities=tuple(args.with_capabilities),
+        without_capabilities=tuple(args.without_capabilities),
+        minimal=args.minimal,
+    )
+
+
+def _agent_context(plan: ApplicationPlan) -> dict[str, object]:
+    return {
+        "instructions": "AGENTS.md",
+        "cross_agent_bridge": "CLAUDE.md",
+        "scaffold_contract": "pyproject.toml:[tool.cayu.scaffold]",
+        "selected_plan": {
+            "preset": plan.preset,
+            "database": plan.database,
+            "provider": plan.provider,
+            "execution": plan.execution,
+            "capabilities": list(plan.capabilities),
+        },
+        "authoring_map": "uv run --no-sync cayu guide authoring#cayu-map --json",
+        "inspection": "uv run --no-sync cayu inspect --json",
+        "verification_commands": list(plan.verification_commands()),
+    }
+
+
+def _initialize_coding_git(
+    *,
+    staging: Path,
+    files: dict[str, str],
+    git: str,
+    hooks: Path,
+) -> None:
+    staging_identity = _scaffold_directory_identity(staging)
+    git_env = _sanitized_scaffold_git_environment(cwd=staging)
+    _run_scaffold_git_command(
+        _safe_git_argv(
+            git,
+            "init",
+            "-b",
+            "main",
+            f"--template={hooks}",
+            hooks_dir=hooks,
+        ),
+        cwd=staging,
+        env=git_env,
+        expected_directory_identity=staging_identity,
+    )
+    repository_root = _run_scaffold_git_command(
+        _safe_git_argv(git, "rev-parse", "--show-toplevel", hooks_dir=hooks),
+        cwd=staging,
+        env=git_env,
+        expected_directory_identity=staging_identity,
+    ).strip()
+    try:
+        resolved_repository_root = Path(repository_root).resolve(strict=True)
+    except (OSError, ValueError):
+        raise _ScaffoldCommandError("git repository root verification failed") from None
+    if resolved_repository_root != staging.resolve(strict=True):
+        raise _ScaffoldCommandError(
+            "git repository authority escaped the scaffold staging directory"
+        )
+    _run_scaffold_git_command(
+        _safe_git_argv(git, "add", "--force", "--", ".", hooks_dir=hooks),
+        cwd=staging,
+        env=git_env,
+        expected_directory_identity=staging_identity,
+    )
+    tracked_output = _run_scaffold_git_command(
+        _safe_git_argv(git, "ls-files", "--cached", "-z", "--", hooks_dir=hooks),
+        cwd=staging,
+        env=git_env,
+        expected_directory_identity=staging_identity,
+    )
+    tracked_files = frozenset(path for path in tracked_output.split("\0") if path)
+    if tracked_files != frozenset(files):
+        raise _ScaffoldCommandError("git index does not contain the complete generated project")
+    _run_scaffold_git_command(
+        _safe_git_argv(
+            git,
+            "-c",
+            "user.name=Cayu Scaffold",
+            "-c",
+            "user.email=scaffold@cayu.local",
+            "commit",
+            "-m",
+            "Initial Cayu coding composition",
+            hooks_dir=hooks,
+        ),
+        cwd=staging,
+        env=git_env,
+        expected_directory_identity=staging_identity,
+    )
+
+
+def _publish_new_project(
+    *,
+    target: Path,
+    files: dict[str, str],
+    plan: ApplicationPlan,
+    coding_git: str | None,
+) -> None:
+    target_preexisted = target.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _require_safe_scaffold_parent(target.parent)
+    target.mkdir(parents=True, exist_ok=True)
+    target_stat = target.stat(follow_symlinks=False)
+    target_identity = (target_stat.st_dev, target_stat.st_ino)
+    target_mode = stat.S_IMODE(target_stat.st_mode)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f".{plan.name}.cayu-scaffold-",
+            dir=target.parent,
+        ) as raw_staging:
+            staging = Path(raw_staging)
+            (staging / "data").mkdir()
+            for relative, content in files.items():
+                path = staging / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            if plan.preset == "coding":
+                assert coding_git is not None
                 with tempfile.TemporaryDirectory(
                     prefix="cayu-scaffold-hooks-", dir=target.parent
                 ) as raw_hooks:
-                    hooks = Path(raw_hooks)
-                    git_env = _sanitized_scaffold_git_environment(cwd=staging)
-                    _run_scaffold_git_command(
-                        _safe_git_argv(
-                            coding_git,
-                            "init",
-                            "-b",
-                            "main",
-                            f"--template={hooks}",
-                            hooks_dir=hooks,
-                        ),
-                        cwd=staging,
-                        env=git_env,
-                        expected_directory_identity=staging_identity,
+                    _initialize_coding_git(
+                        staging=staging,
+                        files=files,
+                        git=coding_git,
+                        hooks=Path(raw_hooks),
                     )
-                    repository_root = _run_scaffold_git_command(
-                        _safe_git_argv(
-                            coding_git,
-                            "rev-parse",
-                            "--show-toplevel",
-                            hooks_dir=hooks,
-                        ),
-                        cwd=staging,
-                        env=git_env,
-                        expected_directory_identity=staging_identity,
-                    ).strip()
-                    try:
-                        resolved_repository_root = Path(repository_root).resolve(strict=True)
-                    except (OSError, ValueError):
-                        raise _ScaffoldCommandError(
-                            "git repository root verification failed"
-                        ) from None
-                    if resolved_repository_root != staging.resolve(strict=True):
-                        raise _ScaffoldCommandError(
-                            "git repository authority escaped the scaffold staging directory"
-                        )
-                    _run_scaffold_git_command(
-                        _safe_git_argv(
-                            coding_git,
-                            "add",
-                            "--force",
-                            "--",
-                            ".",
-                            hooks_dir=hooks,
-                        ),
-                        cwd=staging,
-                        env=git_env,
-                        expected_directory_identity=staging_identity,
-                    )
-                    tracked_output = _run_scaffold_git_command(
-                        _safe_git_argv(
-                            coding_git,
-                            "ls-files",
-                            "--cached",
-                            "-z",
-                            "--",
-                            hooks_dir=hooks,
-                        ),
-                        cwd=staging,
-                        env=git_env,
-                        expected_directory_identity=staging_identity,
-                    )
-                    tracked_files = frozenset(path for path in tracked_output.split("\0") if path)
-                    if tracked_files != frozenset(files):
-                        raise _ScaffoldCommandError(
-                            "git index does not contain the complete generated project"
-                        )
-                    _run_scaffold_git_command(
-                        _safe_git_argv(
-                            coding_git,
-                            "-c",
-                            "user.name=Cayu Scaffold",
-                            "-c",
-                            "user.email=scaffold@cayu.local",
-                            "commit",
-                            "-m",
-                            "Initial Cayu coding composition",
-                            hooks_dir=hooks,
-                        ),
-                        cwd=staging,
-                        env=git_env,
-                        expected_directory_identity=staging_identity,
-                    )
-                _publish_staged_scaffold(
-                    staging=staging,
-                    target=target,
-                    expected_target_identity=coding_target_identity,
-                    target_mode=coding_target_mode,
-                )
-        except (_ScaffoldCommandError, OSError, ValueError) as exc:
-            print(
-                f"error: could not initialize coding workspace: {exc}",
-                file=sys.stderr,
+            _publish_staged_scaffold(
+                staging=staging,
+                target=target,
+                expected_target_identity=target_identity,
+                target_mode=target_mode,
             )
-            return 1
-    else:
-        for rel, content in files.items():
-            path = target / rel
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+    except Exception:
+        if not target_preexisted:
+            try:
+                if _scaffold_directory_identity(target) == target_identity:
+                    target.rmdir()
+            except (OSError, _ScaffoldCommandError):
+                pass
+        raise
 
-    print(f"Scaffolded {target}/ — credential-free proof:")
+
+def _render_new_receipt(
+    *,
+    target: Path,
+    plan: ApplicationPlan,
+    coding_toolchain: str | None,
+) -> None:
+    print(f"Scaffolded {target}/ — Cayu application convention {plan.convention}")
+    print(
+        "  Plan: "
+        f"preset={plan.preset} database={plan.database} provider={plan.provider} "
+        f"execution={plan.execution}"
+    )
+    capabilities = ", ".join(plan.capabilities) if plan.capabilities else "none"
+    print(f"  Capabilities: {capabilities}")
+    print("  Agent instructions: AGENTS.md (CLAUDE.md imports the same contract)")
+    print("  Scaffold contract: pyproject.toml [tool.cayu.scaffold]")
     print(f"  cd {target}")
-    print("  uv sync --extra dev")
-    print("  uv run cayu inspect --json")
-    if args.template == "service":
-        print("  uv run cayu check --deploy --fail-on warning --json")
-        print("  uv run pytest -q tests/test_public_service_security.py")
-    elif composition == "coding":
-        print("  uv run cayu check --json")
-        print("  uv run pytest -q tests/test_coding_composition.py")
-        if coding_execution == "docker":
-            print("  Configure pinned inputs: docker-coding-build.json")
-            print("  Build and record image: uv run python build_coding_image.py")
-            print(f"  Toolchain profile: {coding_toolchain or 'python'}")
-    else:
-        print("  uv run cayu check --json")
-        print("  uv run pytest")
-    print("  uv run cayu eval run")
-    if args.template == "service":
-        print("  Local public service: uv run cayu serve --dev")
+    if plan.preset == "coding" and plan.execution == "docker":
+        print("  Before proof: review and fill the null pins in docker-coding-build.json")
+    for command in plan.verification_commands():
+        label = (
+            "Build and record image: "
+            if command == "uv run --no-sync python build_coding_image.py"
+            else ""
+        )
+        print(f"  {label}{command}")
+    if plan.preset == "coding" and plan.execution == "docker":
+        print(f"  Toolchain profile: {coding_toolchain or 'python'}")
+        print(
+            "  Execution: admitted trusted-repository Docker checks and commands (network disabled)"
+        )
+    if plan.preset == "coding":
+        print(
+            f"  Live run: uv run --no-sync python run.py --agent {plan.agent_name} "
+            '--message "YOUR REQUEST"'
+        )
+    if plan.preset == "service":
+        print("  Local public service: uv run --no-sync cayu serve --dev")
         print("  Product API: http://127.0.0.1:8000/api/operations")
         print("  Operator control plane: http://127.0.0.1:8000/cayu/")
-    elif composition == "coding":
-        if coding_execution == "docker":
-            print(
-                "  Execution: admitted trusted-repository Docker checks and commands "
-                "(network disabled)"
-            )
-        print(f'  Live run: uv run python run.py --agent {agent_name} --message "YOUR REQUEST"')
-        print("  Local control plane: uv run cayu serve --dev")
-        print("  Open: http://127.0.0.1:8000/cayu/")
     else:
-        print("  Local control plane: uv run cayu serve --dev")
+        print("  Local control plane: uv run --no-sync cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")
-    if args.provider is None:
+    if plan.provider == "neutral":
         print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")
     else:
-        print(f"  Live provider: {args.provider} (credentials authenticate this choice).")
+        print(f"  Live provider: {plan.provider} (credentials authenticate this choice).")
+
+
+def run_new(args: argparse.Namespace) -> int:
+    """Plan, render, validate, and atomically publish one Cayu application."""
+
+    discovered = _run_new_discovery(args)
+    if discovered is not None:
+        return discovered
+    if args.interactive and args.json:
+        return _new_error(
+            code="INTERACTIVE_JSON_CONFLICT",
+            message="--interactive cannot be combined with --json",
+            as_json=True,
+        )
+    name = args.name
+    if args.interactive:
+        if not sys.stdin.isatty():
+            return _new_error(
+                code="INTERACTIVE_TTY_REQUIRED",
+                message="--interactive requires a terminal",
+                as_json=False,
+            )
+        if name is None:
+            name = input("Project name: ").strip()
+    if name is None:
+        return _new_error(
+            code="PROJECT_NAME_REQUIRED",
+            message="project name is required (or use a discovery option)",
+            as_json=args.json,
+        )
+    if not _NAME_RE.fullmatch(name):
+        return _new_error(
+            code="INVALID_PROJECT_NAME",
+            message=(
+                f"invalid project name {name!r} "
+                "(use letters, digits, '-' or '_', starting with a letter)"
+            ),
+            as_json=args.json,
+        )
+    try:
+        plan = _resolve_new_plan(args, name=name)
+    except ScaffoldPlanError as exc:
+        return _new_error(code=exc.code.upper(), message=str(exc), as_json=args.json)
+    if not _NAME_RE.fullmatch(plan.agent_name):
+        return _new_error(
+            code="INVALID_AGENT_NAME",
+            message=(
+                f"invalid agent name {plan.agent_name!r} "
+                "(use letters, digits, '-' or '_', starting with a letter)"
+            ),
+            as_json=args.json,
+        )
+
+    target = Path(args.dir) / name
+    if target.is_symlink():
+        return _new_error(
+            code="TARGET_IS_SYMLINK",
+            message=f"{target} cannot be a symbolic link",
+            as_json=args.json,
+        )
+    if target.exists() and not target.is_dir():
+        return _new_error(
+            code="TARGET_NOT_DIRECTORY",
+            message=f"{target} already exists and is not a directory",
+            as_json=args.json,
+        )
+    if target.exists() and any(target.iterdir()):
+        return _new_error(
+            code="TARGET_NOT_EMPTY",
+            message=f"{target} already exists and is not empty",
+            as_json=args.json,
+        )
+
+    try:
+        files = project_files(
+            name,
+            coding_toolchain=args.coding_toolchain,
+            application_plan=plan,
+        )
+    except (ScaffoldPlanError, ValueError) as exc:
+        code = exc.code.upper() if isinstance(exc, ScaffoldPlanError) else "PLAN_RENDER_FAILED"
+        return _new_error(code=code, message=str(exc), as_json=args.json)
+    directories = {"data"}
+    directories.update(parent for path in files if (parent := str(Path(path).parent)) != ".")
+    payload = {
+        "status": "planned" if args.dry_run else "created",
+        "target": str(target),
+        "plan": plan.as_dict(
+            files=tuple(sorted(files)),
+            directories=tuple(sorted(directories)),
+        ),
+        "agent_context": _agent_context(plan),
+    }
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(f"Plan for {target}/ ({len(files)} files, no writes):")
+            print(
+                f"  preset={plan.preset} database={plan.database} "
+                f"provider={plan.provider} execution={plan.execution}"
+            )
+            for relative in sorted(files):
+                print(f"  create {relative}")
+        return 0
+
+    coding_git: str | None = None
+    if plan.preset == "coding":
+        try:
+            LocalWorkspace.require_path_operations_supported()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _require_safe_scaffold_parent(target.parent)
+            coding_git, _ = _preflight_coding_commands(parent=target.parent)
+        except (RuntimeError, _ScaffoldCommandError, OSError) as exc:
+            return _new_error(
+                code="CODING_PREFLIGHT_FAILED",
+                message=f"coding preset {exc}",
+                as_json=args.json,
+            )
+    try:
+        _publish_new_project(
+            target=target,
+            files=files,
+            plan=plan,
+            coding_git=coding_git,
+        )
+    except (_ScaffoldCommandError, OSError, ValueError) as exc:
+        return _new_error(
+            code="SCAFFOLD_PUBLICATION_FAILED",
+            message=f"could not publish scaffold: {exc}",
+            as_json=args.json,
+        )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        _render_new_receipt(
+            target=target,
+            plan=plan,
+            coding_toolchain=args.coding_toolchain,
+        )
     return 0

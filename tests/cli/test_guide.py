@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from typing import Any
 
@@ -98,6 +99,20 @@ def test_package_shipped_application_anatomy_guide_is_discoverable(capsys) -> No
         "Test",
     ):
         assert role in anatomy
+
+
+def test_application_guide_json_is_versioned_and_offline_safe(capsys) -> None:
+    assert main(["guide", "applications#convention", "--json"]) == 0
+    guide = json.loads(capsys.readouterr().out)
+
+    assert guide["schema_version"] == 1
+    assert guide["topic"] == "applications"
+    assert guide["section"] == "convention"
+    assert guide["package_source"] == "cayu.guides/applications.md"
+    assert guide["verification_commands"] == [
+        "uv run --no-sync cayu inspect --json",
+        "uv run --no-sync cayu check --fail-on warning --json",
+    ]
 
 
 def test_package_shipped_durable_operations_guide_is_runnable(capsys) -> None:

@@ -28,6 +28,7 @@ only when the requested behavior requires it.
 
 | When you need it | Cayu concepts | Start here |
 | --- | --- | --- |
+| Create or extend a generated application | complete scaffold convention, normalized plan, explicit registration | `cayu guide applications` |
 | One model-driven agent | `CayuApp`, `AgentSpec`, `ModelProvider`, `RunRequest` | `cayu guide anatomy` |
 | A provider-neutral run result | `run_to_completion`, `RunOutcome`, events | `cayu guide anatomy#verify-the-contract` |
 | Model-specific routing or capabilities | provider registration, model catalog, thinking, structured output | `cayu guide providers`, `cayu guide structured-output` |
@@ -49,8 +50,8 @@ only when the requested behavior requires it.
 | Usage limits or cost control | usage events, run limits, budgets, pricing | `cayu guide references#cost-control` |
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
 | An HTTP control plane | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
-| A public or multi-user agent product | `cayu new NAME --template service`, maintained tenant-safe service factory | `cayu guide references#server` |
-| A maintained repository-coding starter | `cayu new NAME --composition coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
+| A public or multi-user agent product | `cayu new NAME --preset service`, maintained tenant-safe service factory | `cayu guide references#server` |
+| A maintained repository-coding starter | `cayu new NAME --preset coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
 | Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | `cayu guide references#advanced-runtime` |
 
 This map is a menu, not a checklist. A conversational, classification,
@@ -72,10 +73,12 @@ mounts require `AuthenticatedAccess(...)` with application-owned authorization.
 ## Coding composition
 
 For a repository-coding application that needs the same explicit capabilities
-on day one, use `cayu new NAME --composition coding`. The opt-in project assembles
-existing public tools and stores in ordinary `composition.py`: bounded file and
-`rg` search operations, Git change review, local artifacts, reviewed durable
-knowledge, a bounded background reviewer with result recovery, and human input.
+on day one, use `cayu new NAME --preset coding`. The opt-in project assembles
+existing public tools and stores in the canonical `tools/`, `policies/`,
+`environments/`, `operations/`, `knowledge/`, `prompts/`, and `agents/` modules:
+bounded file and `rg` search operations, Git change review, local artifacts,
+reviewed durable knowledge, a bounded background reviewer with result recovery,
+and human input. Root `composition.py` remains only a compatibility import.
 It requires `git` and `rg`, creates a clean initial Git commit, and ships one
 credential-free smoke for the complete composition. Its trusted-host local
 workspace and runner are not a sandbox. Keep the default scaffold for jobs that
@@ -87,7 +90,7 @@ Its exposure policy separately controls model-visible tools, and its ordinary
 tool policy, approval policy, and runtime gates independently authorize calls.
 
 For a public or multi-user product, start with
-`cayu new NAME --template service`. That template keeps customer authentication,
+`cayu new NAME --preset service`. That template keeps customer authentication,
 tenant-qualified application storage, public identifiers, allow-listed product
 responses, and the operator-only `/cayu/` mount in one maintained service
 factory. Its deployment check proves only the declarative factory posture; the

@@ -150,6 +150,10 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
     assert image_configuration["reference"] == image
     image_id = image_configuration["content_digest"]
     assert isinstance(image_id, str) and image_id.startswith("sha256:")
+    assert all(
+        not item["path"].startswith(".cayu/") for item in image_configuration["dependency_inputs"]
+    )
+    assert image_configuration["trusted_build_context_sha256"].startswith("sha256:")
 
     def remove_image() -> None:
         subprocess.run(

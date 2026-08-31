@@ -71,28 +71,48 @@ durable state, and explicit service ownership described by this layout.
 ```text
 invoice-agent/
   pyproject.toml
+  README.md
+  AGENTS.md
+  CLAUDE.md
   app.py
   run.py
-  AGENTS.md
-  agents/
-  tools/
+  configuration/       # settings, providers, storage, runtime options
+  agents/               # narrow AgentSpec declarations + explicit registration
+  prompts/
+  tools/                # native capabilities + ToolEffect declarations
+  policies/             # exposure, authorization, execution, egress, budgets, retries
+  environments/         # workspaces, runners, resources, lifecycle
+  workflows/
+  operations/           # tasks, workers, approvals, completion, recovery
+  knowledge/
+  memory/
+  domain/
+  integrations/
   evals/
+  observability/
   tests/
+  data/                 # ignored mutable local state
 ```
 
-`app.py` explicitly registers agents, tools, storage, and runtime config. The
-default scaffold creates only directories containing working source; add
-workflows, prompts, memory, configuration, environments, and domain packages
-when the requested behavior actually needs them. `AGENTS.md` is the generated
-project-local source of truth for inspection, safe generation, testing, evals,
-and evidence reporting.
+`app.py` is only the public composition root. Implement each concern in its
+owning package and wire it through `agents/registration.py` and explicit imports.
+Every optional concern has a tracked ownership docstring or insertion seam, but
+the default activates only the model agent, selected provider, and durable
+stores. `[tool.cayu.scaffold]` records the normalized preset, adapters,
+capabilities, and convention version for compatible generators and read-only
+drift checks; it is never runtime authority. Projects without that declaration
+remain freeform. `AGENTS.md` is the compact authoring and proof contract, while
+`CLAUDE.md` imports that same contract without duplicating it.
 
-`cayu new NAME --composition coding` is the maintained opt-in starter for a
-repository-coding application. It keeps provider selection in `app.py` and puts
-the explicit assembly in `composition.py`. That module registers existing public
-APIs for bounded file inspection and mutation, `rg` search, Git change review,
-local artifacts, SQLite knowledge with pending writes, a bounded background
-reviewer plus result recovery, and human-input pauses. The generator preflights
+`cayu new NAME --preset coding` is the maintained opt-in starter for a
+repository-coding application. It populates `tools/coding.py`,
+`policies/coding.py`, `environments/coding.py`, `operations/coding.py`,
+`knowledge/coding.py`, `prompts/coding.py`, and `agents/registration.py`; root
+`composition.py` is only a compatibility import. Those modules register existing
+public APIs for bounded file inspection and mutation, `rg` search, Git change
+review, local artifacts, selected SQLite or Postgres knowledge with pending
+writes, a bounded background reviewer plus result recovery, and human-input
+pauses. The generator preflights
 `git`, `rg`, and the POSIX descriptor-relative primitives required by secure
 `LocalWorkspace` path operations, then creates a clean initial Git commit so
 change review has a deterministic baseline. Unsupported hosts fail during
@@ -110,8 +130,9 @@ generated `LocalWorkspace` and minimal-environment `LocalRunner` are trusted-hos
 development adapters, not a sandbox. With `inherit_env=False`, the runner still
 forwards Cayu's operational allow-list for command resolution, home, locale, and
 temporary-directory behavior; it does not inherit arbitrary host variables. The
-composition is ordinary editable Python; do not replace it with an implicit agent
-kind, registry, permission grant, or post-start mutation.
+composition is ordinary editable Python; do not collapse it into the root
+compatibility module or replace it with an implicit agent kind, registry,
+permission grant, or post-start mutation.
 
 ## Large User Project
 

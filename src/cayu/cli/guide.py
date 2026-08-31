@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from importlib.resources import files
 from typing import Any
 
+from cayu._version import package_version
+
 _GUIDES = {
     "anatomy": ("application-anatomy.md", "Application lifecycle and process roles."),
+    "applications": (
+        "applications.md",
+        "Generated application convention, placement, planning, and drift checks.",
+    ),
     "authoring": ("authoring.md", "Concept map and the supported authoring loop."),
     "diagnostics": ("diagnostics.md", "Stable `cayu check` findings and fixes."),
     "durable-operations": (
@@ -31,6 +38,17 @@ _INCLUDES = {
         "# cayu-guide-include:pytest-selector:start",
         "# cayu-guide-include:pytest-selector:end",
     ),
+}
+_RELATED = {
+    "anatomy": ("applications", "authoring", "diagnostics"),
+    "applications": ("anatomy", "authoring", "diagnostics", "references"),
+    "authoring": ("anatomy", "tool-effects", "durable-operations", "references"),
+    "diagnostics": ("anatomy", "authoring"),
+    "durable-operations": ("tool-effects", "references"),
+    "providers": ("authoring", "diagnostics"),
+    "references": ("authoring", "durable-operations"),
+    "structured-output": ("authoring", "diagnostics"),
+    "tool-effects": ("authoring", "durable-operations"),
 }
 
 
@@ -63,10 +81,36 @@ def add_guide_parser(subparsers: Any) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("name", nargs="?", metavar="TOPIC[#SECTION]")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable topic, section, package, relationship, and verification metadata.",
+    )
 
 
 def run_guide(args: argparse.Namespace) -> int:
     if args.name is None:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "installed_cayu_version": package_version(),
+                        "topics": [
+                            {
+                                "topic": name,
+                                "summary": description,
+                                "package_source": f"cayu.guides/{resource}",
+                                "related_topics": list(_RELATED.get(name, ())),
+                            }
+                            for name, (resource, description) in _GUIDES.items()
+                        ],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
         print("Package-shipped Cayu guides:")
         for name, (_, description) in _GUIDES.items():
             print(f"  {name:<18} {description}")
@@ -75,12 +119,42 @@ def run_guide(args: argparse.Namespace) -> int:
     name, separator, anchor = args.name.partition("#")
     guide_record = _GUIDES.get(name)
     if guide_record is None:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "error": {
+                            "code": "UNKNOWN_GUIDE_TOPIC",
+                            "message": (
+                                f"unknown guide topic {name!r}; choose from: {', '.join(_GUIDES)}"
+                            ),
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
         print(
             f"error: unknown guide topic {name!r}; choose from: {', '.join(_GUIDES)}",
             file=sys.stderr,
         )
         return 2
     if separator and not anchor:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "error": {
+                            "code": "EMPTY_GUIDE_SECTION",
+                            "message": "guide section after `#` must not be empty",
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
         print("error: guide section after `#` must not be empty", file=sys.stderr)
         return 2
     guide = files("cayu.guides").joinpath(guide_record[0])
@@ -88,9 +162,45 @@ def run_guide(args: argparse.Namespace) -> int:
     if anchor:
         section = _guide_section(content, anchor)
         if section is None:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "error": {
+                                "code": "GUIDE_SECTION_NOT_FOUND",
+                                "message": (f"section {anchor!r} was not found in guide {name!r}"),
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 2
             print(f"error: section {anchor!r} was not found in guide {name!r}", file=sys.stderr)
             return 2
         content = section
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "topic": name,
+                    "section": anchor or None,
+                    "installed_cayu_version": package_version(),
+                    "package_source": f"cayu.guides/{guide_record[0]}",
+                    "summary": guide_record[1],
+                    "content": content,
+                    "related_topics": list(_RELATED.get(name, ())),
+                    "verification_commands": [
+                        "uv run --no-sync cayu inspect --json",
+                        "uv run --no-sync cayu check --fail-on warning --json",
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     print(content, end="")
     return 0
 

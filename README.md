@@ -88,20 +88,24 @@ cayu new myagent
 cd myagent
 
 cayu inspect --json
-cayu check --json
+cayu check --fail-on warning --json
 pytest
 cayu eval run
 
-# After configuring the provider in app.py:
+# After configuring the provider through configuration/settings.py or CAYU_PROVIDER:
 python run.py --message "Review this change."
 ```
 
 The scaffold is credential-free and includes:
 
-- a process-scoped `build_app()` factory with bounded local-store initialization;
+- a composition-only `app.py` with a process-scoped `build_app()` factory;
 - one model-only agent with no required tools;
+- complete tracked homes for prompts, tools, policies, environments, workflows,
+  operations, knowledge, memory, integrations, observability, and domain code;
+- explicit provider, storage, runtime, and agent-registration seams;
 - a hermetic runtime test and output eval; and
-- a project-local `AGENTS.md` with the exact build and verification contract.
+- a source-controlled `[tool.cayu.scaffold]` plan plus `AGENTS.md` and the
+  minimal `CLAUDE.md` bridge.
 
 Open the generated project, describe the requested job in the existing agent,
 and keep its public test/eval seam intact.
@@ -111,9 +115,9 @@ tools, durable knowledge, background review delegation, and human input, opt in
 to the maintained composition:
 
 ```bash
-cayu new mycoder --composition coding
+cayu new mycoder --preset coding
 cd mycoder
-cayu check --json
+cayu check --fail-on warning --json
 pytest -q tests/test_coding_composition.py
 python run.py --agent mycoder --message "Implement the requested change."
 ```
@@ -122,9 +126,20 @@ The generated repository starts from a clean Git commit and requires `git`, `rg`
 and the POSIX descriptor-relative filesystem primitives used by secure
 `LocalWorkspace` path operations. Unsupported hosts fail during generation or
 application construction. Its local workspace and runner are trusted-host
-development adapters, not a hostile-code sandbox. The default scaffold remains
-the minimal one-agent project, and the coding composition cannot be combined
-with `--template service`.
+development adapters, not a hostile-code sandbox. The default scaffold is the
+complete Cayu application convention; use `--minimal` only for the explicit
+small-model-agent escape hatch. Coding cannot be combined with the service
+preset. The compatibility forms `--composition coding` and `--template service`
+remain supported.
+
+Discover or review the Rails-style generation plan before writing:
+
+```bash
+cayu new --list-presets --json
+cayu new --list-capabilities --json
+cayu new myagent --preset agent --database postgres --provider anthropic --dry-run --json
+cayu guide applications#planning --json
+```
 
 ### Deploy with Cayu Cloud
 

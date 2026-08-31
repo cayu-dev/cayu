@@ -66,6 +66,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/data/default_model_catalog.json",
         "cayu/data/default_price_book.json",
         "cayu/guides/application-anatomy.md",
+        "cayu/guides/applications.md",
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
         "cayu/guides/durable-operations.md",
