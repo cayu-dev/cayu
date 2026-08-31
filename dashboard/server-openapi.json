@@ -9981,6 +9981,16 @@
             ],
             "title": "Case Ids"
           },
+          "cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunCostBudget-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "expected_execution_profiles": {
             "items": {
               "$ref": "#/components/schemas/EvalAuthoredSuiteExecutionProfileExpectation"
@@ -10096,6 +10106,16 @@
               }
             ],
             "title": "Case Ids"
+          },
+          "cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunCostBudget-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "EvalAuthoredSuiteRunSelectionRequest",

@@ -1703,6 +1703,7 @@ class EvalAuthoredSuiteRunSelectionRequest(ApiBaseModel):
         min_length=1,
         max_length=EVAL_CORPUS_MAX_CASES,
     )
+    cost_budget: EvalRunCostBudget | None = None
 
     @field_validator("case_ids")
     @classmethod

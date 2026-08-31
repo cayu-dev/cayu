@@ -4926,6 +4926,7 @@ export type EvalAuthoredSuiteRunLaunchRequest = {
      * Case Ids
      */
     case_ids?: Array<string> | null;
+    cost_budget?: EvalRunCostBudgetInput | null;
     /**
      * Expected Execution Profiles
      */
@@ -4977,6 +4978,7 @@ export type EvalAuthoredSuiteRunSelectionRequest = {
      * Case Ids
      */
     case_ids?: Array<string> | null;
+    cost_budget?: EvalRunCostBudgetInput | null;
 };
 
 /**

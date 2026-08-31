@@ -27,6 +27,7 @@ from cayu import (
 )
 from cayu.evals.execution import evaluation_target_identity
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
+from cayu.project_control_plane import ProjectEvalJudgeConfiguration
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
@@ -148,6 +149,7 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
     assert {entry.application_release_id for entry in catalog.items} == {"release-one"}
     assert catalog.default_target_key == first.target_keys[0]
     assert "CayuApp" not in catalog.model_dump_json()
+    assert all(entry.judge_profiles == () for entry in catalog.items)
     assert repr(first) == "EvalTargetRegistry(target_count=2)"
 
     for entry in catalog.items:
@@ -164,6 +166,123 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
         assert runtime_target.request_base.agent_name == entry.agent_name
         assert runtime_target.request_base.messages == []
         assert runtime_target.application_release_id == "release-one"
+
+
+def test_generated_registry_publishes_only_an_explicit_declarative_judge() -> None:
+    target = _target(_provider())
+    manifest = target.app.describe()
+    configuration = ProjectEvalJudgeConfiguration(
+        provider_name=target.app.list_providers()[0],
+        model="fixture-model",
+        privacy_policy="public-and-transcript",
+        allow_same_model=True,
+        timeout_seconds=45,
+        max_input_tokens=4096,
+        max_output_tokens=1024,
+        max_total_tokens=5120,
+        max_estimated_cost="0.1",
+        cost_currency="USD",
+    )
+    pricing = _price_book()
+
+    registry = generated_eval_target_registry(
+        target.app,
+        project_id="registry-project",
+        application_release_id="release-one",
+        app_manifest_fingerprint=manifest.fingerprint,
+        price_book=pricing,
+        judge_configuration=configuration,
+    )
+
+    assert registry is not None
+    entry = registry.catalog().items[0]
+    assert len(entry.judge_profiles) == 1
+    profile = entry.judge_profiles[0]
+    assert profile.key == "project-default-judge"
+    assert profile.label == "Project default judge"
+    assert profile.provider_name == configuration.provider_name
+    assert profile.model == "fixture-model"
+    assert profile.allowed_evidence == (
+        "final_output",
+        "transcript",
+        "public_reference",
+    )
+    assert profile.timeout_seconds == 45
+    assert profile.max_input_tokens == 4096
+    assert profile.max_output_tokens == 1024
+    assert profile.max_total_tokens == 5120
+    assert profile.max_estimated_cost == "0.1"
+    assert profile.cost_currency == "USD"
+    assert profile.pricing_profile_fingerprint is not None
+    assert profile.same_model_use == "allowed_and_labeled"
+    assert len(entry.judge_profile_routes) == 1
+    assert entry.judge_profile_routes[0].candidate_route_relation == "same_model"
+    runtime_target = registry.get(entry.target_key)
+    assert runtime_target is not None
+    assert len(runtime_target.model_judges) == 1
+    judge = runtime_target.model_judges[0]
+    assert judge.app is not target.app
+    assert judge.app.list_providers() == (configuration.provider_name,)
+    assert not judge.app.get_agent(judge.agent_name).tools
+    assert judge.price_book == pricing
+
+
+def test_generated_registry_rejects_a_priced_judge_without_project_pricing() -> None:
+    target = _target(_provider())
+    manifest = target.app.describe()
+
+    with pytest.raises(ValueError, match="cost ceiling requires project Evals pricing"):
+        generated_eval_target_registry(
+            target.app,
+            project_id="registry-project",
+            application_release_id="release-one",
+            app_manifest_fingerprint=manifest.fingerprint,
+            judge_configuration=ProjectEvalJudgeConfiguration(
+                provider_name=target.app.list_providers()[0],
+                model="fixture-model",
+                privacy_policy="public-only",
+                allow_same_model=False,
+                max_estimated_cost="0.1",
+                cost_currency="USD",
+            ),
+        )
+
+
+def test_generated_registry_rejects_secret_bearing_or_unregistered_judge_routes() -> None:
+    secret = "private-judge-route"
+    app = CayuApp(enable_logging=False, secret_redactor=SecretRedactor(secret))
+    app.register_provider(_provider(), default=True)
+    app.register_agent(AgentSpec(name="agent", model="fixture-model"))
+    manifest = app.describe()
+
+    with pytest.raises(ValueError, match="contains a workload secret") as secret_error:
+        generated_eval_target_registry(
+            app,
+            project_id="registry-project",
+            application_release_id="release-one",
+            app_manifest_fingerprint=manifest.fingerprint,
+            judge_configuration=ProjectEvalJudgeConfiguration(
+                provider_name=app.list_providers()[0],
+                model=secret,
+                privacy_policy="public-only",
+                allow_same_model=False,
+            ),
+        )
+    assert secret not in str(secret_error.value)
+
+    with pytest.raises(KeyError, match="Provider not registered"):
+        generated_eval_target_registry(
+            app,
+            project_id="registry-project",
+            application_release_id="release-one",
+            app_manifest_fingerprint=manifest.fingerprint,
+            judge_configuration=ProjectEvalJudgeConfiguration(
+                provider_name="unregistered",
+                model="fixture-model",
+                privacy_policy="public-only",
+                allow_same_model=False,
+            ),
+        )
 
 
 def test_explicit_catalog_publishes_safe_exact_judge_profiles() -> None:

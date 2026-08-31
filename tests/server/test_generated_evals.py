@@ -17,6 +17,7 @@ from cayu import AgentSpec
 from cayu.evals.store import EvalRunRequest, EvalRunStatus
 from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
+    ProjectEvalJudgeConfiguration,
     _create_project_control_plane_context,
 )
 from cayu.server import DashboardConfig, EvalsConfig, OpenAccess, ServerConfig, create_server
@@ -33,6 +34,36 @@ def _wait_for_terminal(client: TestClient, run_id: str) -> dict:
             return run
         time.sleep(0.01)
     raise AssertionError("Generated-target eval run did not terminalize.")
+
+
+def test_project_eval_pricing_rejects_a_conflicting_server_price_book(tmp_path) -> None:
+    app = _target(_provider()).app
+    project_root = Path(__file__).resolve().parents[2]
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    context = _create_project_control_plane_context(
+        project_root=project_root,
+        project_id="generated-project",
+        configured_release_id="release-current",
+        eval_store=store,
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+        eval_price_book=_price_book(version="project-pricing"),
+    )
+    try:
+        with pytest.raises(ValueError, match="pricing conflicts"):
+            create_server(
+                app,
+                config=ServerConfig.protected(
+                    _authenticate,
+                    dashboard=DashboardConfig(
+                        runtime_config={"priceBook": _price_book(version="server-pricing")}
+                    ),
+                ),
+                project_context=context,
+            )
+    finally:
+        asyncio.run(context.close())
 
 
 def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target_scoped(
@@ -53,6 +84,15 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
         store_backend="sqlite",
         store_source="project",
         access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+        eval_judge_configuration=ProjectEvalJudgeConfiguration(
+            provider_name=app.list_providers()[0],
+            model="fixture-model",
+            privacy_policy="public-only",
+            allow_same_model=True,
+            max_estimated_cost="0.1",
+            cost_currency="USD",
+        ),
+        eval_price_book=_price_book(),
     )
     foreign_corpus = _corpus(target_key="foreign-target", trials=1)
     foreign_suite = foreign_corpus.suites[0]
@@ -96,6 +136,16 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
             rooted_manifest.fingerprint
         }
         assert {item["execution_profile_ready"] for item in target_catalog["items"]} == {True}
+        assert {item["judge_profiles"][0]["key"] for item in target_catalog["items"]} == {
+            "project-default-judge"
+        }
+        assert {
+            item["judge_profiles"][0]["max_estimated_cost"] for item in target_catalog["items"]
+        } == {"0.1"}
+        assert {
+            item["judge_profile_routes"][0]["candidate_route_relation"]
+            for item in target_catalog["items"]
+        } == {"same_model"}
         assert {
             item["execution_profile"]["fixture_strategy"] for item in target_catalog["items"]
         } == {"none"}

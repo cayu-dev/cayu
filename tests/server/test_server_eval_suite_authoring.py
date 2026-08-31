@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from decimal import Decimal
 
 import pytest
 from tests.server.test_server_eval_scenarios import (
@@ -17,7 +18,13 @@ pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
 
-from cayu import EvalExecutionProfilePolicyV1, ModelStreamEvent, ScriptedModelProvider
+from cayu import (
+    EvalExecutionProfilePolicyV1,
+    ModelPrice,
+    ModelStreamEvent,
+    PriceBook,
+    ScriptedModelProvider,
+)
 from cayu.evals.corpus import (
     ArtifactAssertionSpec,
     CorpusUserMessageSpec,
@@ -223,6 +230,94 @@ def test_v3_authored_suite_executes_all_trials_and_applies_pass_threshold(tmp_pa
             assert published["cases"][0]["status"] == "passed"
             assert published["cases"][0]["reliability"]["passed_trials"] == 2
             assert published["accepted_exposure"]["revision"] == reviewed["exposure"]["revision"]
+    finally:
+        asyncio.run(store.close())
+
+
+def test_authored_simple_launch_binds_a_reviewed_candidate_cost_budget(tmp_path) -> None:
+    target, _, _ = _target(tmp_path)
+    target = target.model_copy(
+        update={
+            "price_book": PriceBook(
+                price_book_version="authored-suite-test-v1",
+                generated_at="2026-08-31T00:00:00Z",
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="scripted",
+                        model="scenario-model",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("2"),
+                    ),
+                ),
+            )
+        }
+    )
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    try:
+        with TestClient(_server(target, store)) as client:
+            preview = client.post(
+                "/api/evals/suites/preview",
+                headers=_AUTH_HEADERS,
+                json={"draft": _draft().model_dump(mode="json")},
+            )
+            assert preview.status_code == 200
+            suite = preview.json()["suite"]
+            saved = client.post(
+                "/api/evals/suites",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_suite_revision": suite["revision"],
+                    "suite": suite,
+                },
+            )
+            assert saved.status_code == 201
+            budget = {"max_estimated_cost": "0.25", "currency": "USD"}
+            reviewed_response = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs/preview",
+                headers=_AUTH_HEADERS,
+                json={"cost_budget": budget},
+            )
+            assert reviewed_response.status_code == 200
+            reviewed = reviewed_response.json()
+            assert reviewed["ready"] is True
+            assert reviewed["exposure"]["execution_profiles"][0]["candidate_cost_budget"] == {
+                "amount": "0.25",
+                "currency": "USD",
+            }
+            assert reviewed["exposure"]["candidate_cost"]["unavailable_reason"] == (
+                "candidate_cost_not_hard_bounded"
+            )
+
+            launch_body = {
+                "cost_budget": budget,
+                "expected_exposure_revision": reviewed["exposure"]["revision"],
+                "expected_execution_profiles": [
+                    {
+                        "case_ids": item["case_ids"],
+                        "execution_profile_revision": item["execution_profile_revision"],
+                    }
+                    for item in reviewed["launches"]
+                ],
+            }
+            changed = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "changed-authored-cost"},
+                json={
+                    **launch_body,
+                    "cost_budget": {"max_estimated_cost": "0.50", "currency": "USD"},
+                },
+            )
+            assert changed.status_code == 409
+            assert "exposure changed" in changed.json()["detail"]
+
+            launched = client.post(
+                f"/api/evals/suites/{suite['revision']}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "reviewed-authored-cost"},
+                json=launch_body,
+            )
+            assert launched.status_code == 202
+            invocation = launched.json()["runs"][0]["run"]["spec"]["invocation"]
+            assert invocation["cost_budget"] == budget
     finally:
         asyncio.run(store.close())
 

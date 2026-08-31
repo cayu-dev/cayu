@@ -11,11 +11,14 @@ from pathlib import Path
 from types import MappingProxyType
 
 from cayu._validation import require_durable_clean_nonblank, require_unicode_scalar_text
+from cayu.core.agents import AgentSpec
 from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.capacity import EvalExecutionCapacity
+from cayu.evals.corpus import JudgePrivacyPolicyV1
 from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
+    ModelJudgeTarget,
     _candidate_judge_route_relation,
     evaluation_target_identity,
     model_judge_profile,
@@ -26,6 +29,7 @@ from cayu.evals.execution_profiles import (
     prepare_eval_execution_profile,
 )
 from cayu.evals.store import EvalRunInvocation, EvalStore
+from cayu.project_control_plane import ProjectEvalJudgeConfiguration
 from cayu.runtime.app import CayuApp
 from cayu.runtime.budgets import BudgetLimit, budget_pricing_preflight_error
 from cayu.runtime.costs import PriceBook
@@ -56,6 +60,8 @@ DEFAULT_EVAL_PROFILE_ID = "default"
 _EXPLICIT_EVAL_PROFILE_ID = "explicit"
 _TARGET_KEY_DOMAIN = b"cayu-generated-eval-target-v1\0"
 _EVAL_PROFILE_RESOLUTION_CONCURRENCY = 16
+_GENERATED_JUDGE_AGENT_NAME = "cayu-evals-default-judge"
+_GENERATED_JUDGE_KEY = "project-default-judge"
 
 
 def _narrow_optional_limit(current: int | None, requested: int | None) -> int | None:
@@ -572,6 +578,7 @@ def generated_eval_target_registry(
     app_manifest_fingerprint: str,
     app_manifest_project_root: Path | None = None,
     price_book: PriceBook | None = None,
+    judge_configuration: ProjectEvalJudgeConfiguration | None = None,
 ) -> EvalTargetRegistry | None:
     """Build one normal-authority target per currently registered agent."""
 
@@ -591,8 +598,20 @@ def generated_eval_target_registry(
         return None
     if len(agent_names) > MAX_EVAL_TARGETS:
         raise ValueError(f"Automatic Evals supports at most {MAX_EVAL_TARGETS} registered agents.")
+    if (
+        judge_configuration is not None
+        and type(judge_configuration) is not ProjectEvalJudgeConfiguration
+    ):
+        raise TypeError(
+            "judge_configuration must be an exact ProjectEvalJudgeConfiguration or None."
+        )
 
     policy = EvalExecutionProfilePolicyV1.safe_default()
+    model_judges = _generated_project_model_judges(
+        app,
+        judge_configuration,
+        price_book=price_book,
+    )
     registrations: list[EvalTargetRegistration] = []
     for agent_name in agent_names:
         agent_name = _target_identity_component(agent_name, "agent_name")
@@ -607,9 +626,11 @@ def generated_eval_target_registry(
             request_base=RunRequest(agent_name=agent_name, messages=[]),
             application_release_id=application_release_id,
             price_book=price_book,
+            model_judges=model_judges,
             limits=CorpusExecutionLimits(max_trials=1, max_concurrency=1),
         )
         cost_budget_currencies = cost_budget_currencies_for_target(target)
+        judge_profiles = tuple(model_judge_profile(judge) for judge in model_judges)
         entry = EvalTargetCatalogEntry(
             target_key=target_key,
             project_id=project_id,
@@ -625,8 +646,15 @@ def generated_eval_target_registry(
             max_steps=target.request_base.max_steps,
             cost_budget_available=bool(cost_budget_currencies),
             cost_budget_currencies=cost_budget_currencies,
-            judge_profiles=(),
-            judge_profile_routes=(),
+            judge_profiles=judge_profiles,
+            judge_profile_routes=tuple(
+                EvalJudgeProfileRouteCatalogEntry(
+                    judge_profile_key=profile.key,
+                    judge_profile_revision=profile.revision,
+                    candidate_route_relation=_candidate_judge_route_relation(target, profile),
+                )
+                for profile in judge_profiles
+            ),
             judge_private_references=(),
             execution_profile_ready=False,
             execution_profile=None,
@@ -644,6 +672,57 @@ def generated_eval_target_registry(
             )
         )
     return EvalTargetRegistry(registrations)
+
+
+def _generated_project_model_judges(
+    app: CayuApp,
+    configuration: ProjectEvalJudgeConfiguration | None,
+    *,
+    price_book: PriceBook | None,
+) -> tuple[ModelJudgeTarget, ...]:
+    if configuration is None:
+        return ()
+    if configuration.max_estimated_cost is not None and price_book is None:
+        raise ValueError("Project default judge cost ceiling requires project Evals pricing.")
+    public_route = {
+        "provider_name": configuration.provider_name,
+        "model": configuration.model,
+    }
+    if app.redact_json(public_route) != public_route:
+        raise ValueError("Project default judge route contains a workload secret.")
+    provider = app.get_provider(configuration.provider_name)
+    judge_app = CayuApp(enable_logging=False)
+    judge_app.register_provider(provider, default=True)
+    judge_app.register_agent(
+        AgentSpec(
+            name=_GENERATED_JUDGE_AGENT_NAME,
+            provider_name=configuration.provider_name,
+            model=configuration.model,
+        )
+    )
+    privacy_policy = JudgePrivacyPolicyV1.create(
+        key=configuration.privacy_policy,
+        allow_transcript=configuration.privacy_policy == "public-and-transcript",
+        allow_public_reference=True,
+        allow_private_reference=False,
+    )
+    return (
+        ModelJudgeTarget(
+            key=_GENERATED_JUDGE_KEY,
+            label="Project default judge",
+            app=judge_app,
+            agent_name=_GENERATED_JUDGE_AGENT_NAME,
+            privacy_policy=privacy_policy,
+            timeout_seconds=configuration.timeout_seconds,
+            max_input_tokens=configuration.max_input_tokens,
+            max_output_tokens=configuration.max_output_tokens,
+            max_total_tokens=configuration.max_total_tokens,
+            max_estimated_cost=configuration.max_estimated_cost,
+            cost_currency=configuration.cost_currency or "USD",
+            price_book=(price_book if configuration.max_estimated_cost is not None else None),
+            allow_same_model=configuration.allow_same_model,
+        ),
+    )
 
 
 def explicit_eval_target_registry(

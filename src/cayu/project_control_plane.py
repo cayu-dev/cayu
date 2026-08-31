@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -11,6 +13,12 @@ from typing import Any, Literal
 from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.evals.store import EvalStore
 from cayu.runtime.app import CayuApp
+from cayu.runtime.costs import PriceBook, copy_price_book
+
+_CANONICAL_POSITIVE_DECIMAL_RE = re.compile(
+    r"(?:0|[1-9]\d*)(?:\.\d*[1-9])?\Z",
+    re.ASCII,
+)
 
 
 class ProjectControlPlaneAccess(StrEnum):
@@ -21,6 +29,88 @@ class ProjectControlPlaneAccess(StrEnum):
 
 
 _PROJECT_CONTEXT_ASSEMBLY_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectEvalJudgeConfiguration:
+    """Secret-free declarative authority for one generated-project judge."""
+
+    provider_name: str
+    model: str
+    privacy_policy: Literal["public-only", "public-and-transcript"]
+    allow_same_model: bool
+    timeout_seconds: int = 120
+    max_input_tokens: int = 32_768
+    max_output_tokens: int = 4_096
+    max_total_tokens: int = 36_864
+    max_estimated_cost: str | None = None
+    cost_currency: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("provider_name", "model"):
+            value = require_clean_nonblank(getattr(self, field_name), field_name)
+            require_unicode_scalar_text(value, field_name)
+            if len(value) > 256:
+                raise ValueError(f"{field_name} cannot exceed 256 characters.")
+            object.__setattr__(self, field_name, value)
+        if not isinstance(self.privacy_policy, str) or self.privacy_policy not in {
+            "public-only",
+            "public-and-transcript",
+        }:
+            raise ValueError("privacy_policy must be public-only or public-and-transcript.")
+        if type(self.allow_same_model) is not bool:
+            raise TypeError("allow_same_model must be a bool.")
+        for field_name, maximum in (
+            ("timeout_seconds", 3_600),
+            ("max_input_tokens", 1_000_000),
+            ("max_output_tokens", 1_000_000),
+            ("max_total_tokens", 1_000_000),
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int:
+                raise TypeError(f"{field_name} must be an integer.")
+            if value < 1 or value > maximum:
+                raise ValueError(f"{field_name} must be between 1 and {maximum}.")
+        if self.max_total_tokens < max(self.max_input_tokens, self.max_output_tokens):
+            raise ValueError("max_total_tokens cannot be below an individual token ceiling.")
+        if (self.max_estimated_cost is None) != (self.cost_currency is None):
+            raise ValueError(
+                "max_estimated_cost and cost_currency must either both be configured or omitted."
+            )
+        if self.max_estimated_cost is not None:
+            value = require_clean_nonblank(self.max_estimated_cost, "max_estimated_cost")
+            require_unicode_scalar_text(value, "max_estimated_cost")
+            try:
+                decimal_value = Decimal(value)
+            except InvalidOperation:
+                decimal_value = Decimal(0)
+            if (
+                len(value) > 64
+                or _CANONICAL_POSITIVE_DECIMAL_RE.fullmatch(value) is None
+                or not decimal_value.is_finite()
+                or decimal_value <= 0
+            ):
+                raise ValueError(
+                    "max_estimated_cost must be a canonical positive decimal with at most "
+                    "64 characters."
+                )
+            object.__setattr__(self, "max_estimated_cost", value)
+            currency_source = self.cost_currency
+            if currency_source is None:
+                raise ValueError("cost_currency is required with max_estimated_cost.")
+            currency = require_clean_nonblank(currency_source, "cost_currency")
+            require_unicode_scalar_text(currency, "cost_currency")
+            if (
+                len(currency) > 16
+                or not currency[0].isalpha()
+                or not currency.isascii()
+                or not all(
+                    character.isupper() or character.isdigit() or character in "._-"
+                    for character in currency
+                )
+            ):
+                raise ValueError("cost_currency must be a portable uppercase identifier.")
+            object.__setattr__(self, "cost_currency", currency)
 
 
 class ProjectControlPlaneContext:
@@ -37,6 +127,8 @@ class ProjectControlPlaneContext:
         "_close_lock",
         "_closed",
         "_configured_release_id",
+        "_eval_judge_configuration",
+        "_eval_price_book",
         "_eval_store",
         "_project_id",
         "_project_root",
@@ -50,6 +142,8 @@ class ProjectControlPlaneContext:
         project_root: Path,
         project_id: str | None,
         configured_release_id: str | None,
+        eval_judge_configuration: ProjectEvalJudgeConfiguration | None,
+        eval_price_book: PriceBook | None,
         eval_store: EvalStore | None,
         store_backend: Literal["sqlite", "postgres"] | None,
         store_source: str | None,
@@ -71,6 +165,15 @@ class ProjectControlPlaneContext:
                 "configured_release_id",
             )
             require_unicode_scalar_text(configured_release_id, "configured_release_id")
+        if (
+            eval_judge_configuration is not None
+            and type(eval_judge_configuration) is not ProjectEvalJudgeConfiguration
+        ):
+            raise TypeError(
+                "eval_judge_configuration must be an exact ProjectEvalJudgeConfiguration."
+            )
+        if eval_price_book is not None and type(eval_price_book) is not PriceBook:
+            raise TypeError("eval_price_book must be an exact PriceBook or None.")
         if eval_store is not None:
             if not isinstance(eval_store, EvalStore) or not eval_store.durable:
                 raise TypeError("eval_store must be a durable EvalStore.")
@@ -86,6 +189,10 @@ class ProjectControlPlaneContext:
         self._project_root = project_root
         self._project_id = project_id
         self._configured_release_id = configured_release_id
+        self._eval_judge_configuration = eval_judge_configuration
+        self._eval_price_book = (
+            None if eval_price_book is None else copy_price_book(eval_price_book)
+        )
         self._eval_store = eval_store
         self._store_backend = store_backend
         self._store_source = store_source
@@ -99,6 +206,8 @@ class ProjectControlPlaneContext:
             "ProjectControlPlaneContext("
             f"project_identity_configured={self.project_identity_configured!r}, "
             f"eval_store_configured={self.eval_store_configured!r}, "
+            f"eval_judge_configured={self.eval_judge_configured!r}, "
+            f"eval_pricing_configured={self.eval_pricing_configured!r}, "
             f"access={self._access.value!r})"
         )
 
@@ -109,6 +218,14 @@ class ProjectControlPlaneContext:
     @property
     def eval_store_configured(self) -> bool:
         return self._eval_store is not None
+
+    @property
+    def eval_judge_configured(self) -> bool:
+        return self._eval_judge_configuration is not None
+
+    @property
+    def eval_pricing_configured(self) -> bool:
+        return self._eval_price_book is not None
 
     @property
     def access(self) -> ProjectControlPlaneAccess:
@@ -151,6 +268,10 @@ class ProjectControlPlaneContext:
             application_release_id=release_id,
             app_manifest_fingerprint=manifest.fingerprint,
             app_manifest_project_root=self._project_root,
+            eval_judge_configuration=self._eval_judge_configuration,
+            eval_price_book=(
+                None if self._eval_price_book is None else copy_price_book(self._eval_price_book)
+            ),
             eval_store=self._eval_store,
             store_backend=self._store_backend,
             store_source=self._store_source,
@@ -168,6 +289,8 @@ class ResolvedProjectControlPlaneContext:
     application_release_id: str
     app_manifest_fingerprint: str
     app_manifest_project_root: Path
+    eval_judge_configuration: ProjectEvalJudgeConfiguration | None
+    eval_price_book: PriceBook | None
     eval_store: EvalStore | None
     store_backend: Literal["sqlite", "postgres"] | None
     store_source: str | None
@@ -183,6 +306,8 @@ class ResolvedProjectControlPlaneContext:
             or not self.app_manifest_project_root.is_absolute()
         ):
             raise TypeError("app_manifest_project_root must be an absolute Path.")
+        if self.eval_price_book is not None and type(self.eval_price_book) is not PriceBook:
+            raise TypeError("eval_price_book must be an exact PriceBook or None.")
 
     @property
     def trusted_local_development(self) -> bool:
@@ -194,6 +319,8 @@ class ResolvedProjectControlPlaneContext:
             "application_release_id": self.application_release_id,
             "app_manifest_fingerprint": self.app_manifest_fingerprint,
             "access": self.access.value,
+            "eval_judge": {"configured": self.eval_judge_configuration is not None},
+            "eval_pricing": {"configured": self.eval_price_book is not None},
             "eval_store": {
                 "configured": self.eval_store is not None,
                 "backend": self.store_backend,
@@ -211,11 +338,15 @@ def _create_project_control_plane_context(
     store_backend: Literal["sqlite", "postgres"] | None,
     store_source: str | None,
     access: ProjectControlPlaneAccess,
+    eval_judge_configuration: ProjectEvalJudgeConfiguration | None = None,
+    eval_price_book: PriceBook | None = None,
 ) -> ProjectControlPlaneContext:
     return ProjectControlPlaneContext(
         project_root=project_root,
         project_id=project_id,
         configured_release_id=configured_release_id,
+        eval_judge_configuration=eval_judge_configuration,
+        eval_price_book=eval_price_book,
         eval_store=eval_store,
         store_backend=store_backend,
         store_source=store_source,

@@ -44,6 +44,7 @@ import {
   structuredAssertionFromReviewedSuite,
 } from "@/lib/eval-judge-authoring"
 import {
+  authoredSuiteCostBudgetContract,
   authoredSuiteRunPreviewIdentity,
   blankEvalScenarioDraft,
   duplicateEvalSuiteCase,
@@ -104,6 +105,8 @@ export function EvalSuiteAuthoringAction({
   const [savedRevision, setSavedRevision] = useState<string | null>(null)
   const [runPreview, setRunPreview] = useState<EvalAuthoredSuiteRunPreview | null>(null)
   const [runPreviewIdentity, setRunPreviewIdentity] = useState<string | null>(null)
+  const [launchMaximumCost, setLaunchMaximumCost] = useState("")
+  const [launchCostCurrency, setLaunchCostCurrency] = useState("USD")
   const [pending, setPending] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -217,6 +220,11 @@ export function EvalSuiteAuthoringAction({
     defaultCalibrationMessages.length > 0
       ? defaultCalibrationMessages.map((message) => message.text).join("\n")
       : (activeCase?.name ?? "Evaluate the saved scenario.")
+  const launchCostBudget = useMemo(
+    () => authoredSuiteCostBudgetContract(launchMaximumCost, launchCostCurrency, target),
+    [launchCostCurrency, launchMaximumCost, target],
+  )
+  const launchCostBudgetInvalid = launchCostBudget === null
   const launchSelection = useMemo(() => {
     const selected = draft.cases
       .filter((_, index) => {
@@ -225,8 +233,11 @@ export function EvalSuiteAuthoringAction({
       })
       .map((item) => item.id)
       .sort()
-    return selected.length === draft.cases.length ? {} : { case_ids: selected }
-  }, [caseRowKeys, draft.cases, selectedCaseKeys])
+    const selection = selected.length === draft.cases.length ? {} : { case_ids: selected }
+    return launchCostBudget === undefined
+      ? selection
+      : { ...selection, cost_budget: launchCostBudget }
+  }, [caseRowKeys, draft.cases, launchCostBudget, selectedCaseKeys])
   const currentRunPreviewIdentity = useMemo(
     () =>
       authoredSuiteRunPreviewIdentity(
@@ -248,6 +259,13 @@ export function EvalSuiteAuthoringAction({
   const scenarioTransitionLocked = authoringPending || scenarioHasUnsavedChanges
 
   useEffect(() => () => controllerRef.current?.abort(), [])
+
+  useEffect(() => {
+    const currencies = target?.cost_budget_currencies ?? []
+    if (currencies.length > 0 && !currencies.includes(launchCostCurrency)) {
+      setLaunchCostCurrency(currencies[0] ?? "USD")
+    }
+  }, [launchCostCurrency, target?.cost_budget_currencies])
 
   const editDraft = (edit: (next: EvalAuthoredSuiteDraft) => void) => {
     setDraft((current) => {
@@ -477,6 +495,10 @@ export function EvalSuiteAuthoringAction({
 
   const previewRun = () => {
     if (authoringLocked) return
+    if (launchCostBudgetInvalid) {
+      setError("Enter a positive cost ceiling in one currency published by this target.")
+      return
+    }
     if (!previewCurrent || savedRevision !== suitePreview?.suite.revision) {
       setError("Check and save the current suite revision before launch readiness.")
       return
@@ -500,6 +522,7 @@ export function EvalSuiteAuthoringAction({
       !runPreviewCurrent ||
       !runPreview?.ready ||
       !runPreview.exposure ||
+      launchCostBudgetInvalid ||
       savedRevision === null ||
       savedRevision !== suitePreview?.suite.revision
     ) {
@@ -1263,6 +1286,54 @@ export function EvalSuiteAuthoringAction({
                 )}
               </fieldset>
 
+              <Card size="sm" className="mt-4" data-testid="authored-suite-cost-budget">
+                <CardHeader>
+                  <div>
+                    <CardTitle>Candidate cost ceiling</CardTitle>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Optional per-trial runtime interruption budget. It narrows this launch and is
+                      reviewed again before admission; it is not stored in the immutable suite.
+                    </p>
+                  </div>
+                </CardHeader>
+                <CardContent className="grid gap-3 sm:grid-cols-2">
+                  <Field label="Maximum cost per trial" id="authored-suite-maximum-cost">
+                    <Input
+                      id="authored-suite-maximum-cost"
+                      data-testid="authored-suite-maximum-cost"
+                      inputMode="decimal"
+                      maxLength={64}
+                      placeholder="No cost ceiling"
+                      value={launchMaximumCost}
+                      disabled={authoringLocked}
+                      onChange={(event) => setLaunchMaximumCost(event.target.value)}
+                    />
+                  </Field>
+                  <Field label="Cost currency" id="authored-suite-cost-currency">
+                    <Input
+                      id="authored-suite-cost-currency"
+                      data-testid="authored-suite-cost-currency"
+                      maxLength={16}
+                      value={launchCostCurrency}
+                      disabled={authoringLocked}
+                      onChange={(event) => setLaunchCostCurrency(event.target.value.toUpperCase())}
+                    />
+                  </Field>
+                  <p
+                    className={`text-xs sm:col-span-2 ${
+                      launchCostBudgetInvalid ? "text-destructive" : "text-muted-foreground"
+                    }`}
+                  >
+                    {target?.cost_budget_available === true
+                      ? launchCostBudgetInvalid
+                        ? "Use a positive canonical decimal and one of: " +
+                          target.cost_budget_currencies.join(", ")
+                        : `Published currencies: ${target.cost_budget_currencies.join(", ")}.`
+                      : "This target has no compatible server-owned price book, so a monetary ceiling is unavailable."}
+                  </p>
+                </CardContent>
+              </Card>
+
               {scenarioHasUnsavedChanges && (
                 <div
                   className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-300"
@@ -1361,7 +1432,8 @@ export function EvalSuiteAuthoringAction({
                   authoringLocked ||
                   !previewCurrent ||
                   savedRevision !== suitePreview?.suite.revision ||
-                  selectedCaseKeys.size === 0
+                  selectedCaseKeys.size === 0 ||
+                  launchCostBudgetInvalid
                 }
                 onClick={previewRun}
               >
@@ -1374,7 +1446,8 @@ export function EvalSuiteAuthoringAction({
                   authoringLocked ||
                   !runPreviewCurrent ||
                   !runPreview?.ready ||
-                  !runPreview.exposure
+                  !runPreview.exposure ||
+                  launchCostBudgetInvalid
                 }
                 onClick={launch}
               >
@@ -1535,7 +1608,7 @@ function RunExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) 
       <div>
         <span className="text-muted-foreground">Maximum priced cost</span>
         <div className="font-medium">
-          Candidate {formatExposureCost(exposure.candidate_cost)} · judge{" "}
+          Candidate {formatCandidateExposureCost(exposure)} · judge{" "}
           {formatExposureCost(exposure.judge_cost)}
         </div>
       </div>
@@ -1544,6 +1617,20 @@ function RunExposureSummary({ exposure }: { exposure: EvalSuiteRunExposureV1 }) 
       </div>
     </div>
   )
+}
+
+function formatCandidateExposureCost(exposure: EvalSuiteRunExposureV1): string {
+  const thresholds = [
+    ...new Set(
+      exposure.execution_profiles.flatMap((profile) => {
+        const budget = profile.candidate_cost_budget
+        return budget ? [`${budget.amount} ${budget.currency}`] : []
+      }),
+    ),
+  ]
+  const observedCeiling = formatExposureCost(exposure.candidate_cost)
+  if (thresholds.length === 0) return observedCeiling
+  return `${thresholds.join(" + ")} per-trial interruption threshold · ${observedCeiling}`
 }
 
 function formatExposureCost(exposure: EvalSuiteRunExposureV1["candidate_cost"]): string {

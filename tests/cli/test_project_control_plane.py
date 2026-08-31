@@ -111,6 +111,140 @@ def test_project_context_uses_only_the_trusted_local_default(
         asyncio.run(development.close())
 
 
+def test_project_context_parses_an_explicit_bounded_default_judge(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        store="""
+
+[tool.cayu.evals]
+price_book = "bundled-public"
+
+[tool.cayu.evals.default_judge]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+privacy_policy = "public-and-transcript"
+allow_same_model = false
+timeout_seconds = 45
+max_input_tokens = 4096
+max_output_tokens = 1024
+max_total_tokens = 5120
+max_estimated_cost = "0.1"
+cost_currency = "USD"
+""",
+    )
+
+    context = build_project_control_plane_context(
+        tmp_path,
+        mode="production",
+        environ={},
+    )
+    try:
+        resolved = resolve_project_control_plane_context(
+            context,
+            CayuApp(enable_logging=False),
+        )
+        assert resolved is not None
+        assert context.eval_judge_configured is True
+        assert context.eval_pricing_configured is True
+        assert resolved.eval_judge_configuration is not None
+        assert resolved.eval_judge_configuration.provider_name == "anthropic"
+        assert resolved.eval_judge_configuration.model == "claude-sonnet-4-6"
+        assert resolved.eval_judge_configuration.privacy_policy == "public-and-transcript"
+        assert resolved.eval_judge_configuration.allow_same_model is False
+        assert resolved.eval_judge_configuration.timeout_seconds == 45
+        assert resolved.eval_judge_configuration.max_input_tokens == 4096
+        assert resolved.eval_judge_configuration.max_output_tokens == 1024
+        assert resolved.eval_judge_configuration.max_total_tokens == 5120
+        assert resolved.eval_judge_configuration.max_estimated_cost == "0.1"
+        assert resolved.eval_judge_configuration.cost_currency == "USD"
+        assert resolved.eval_price_book is not None
+        assert resolved.safe_summary()["eval_judge"] == {"configured": True}
+        assert resolved.safe_summary()["eval_pricing"] == {"configured": True}
+        assert "claude-sonnet-4-6" not in repr(context)
+    finally:
+        asyncio.run(context.close())
+
+
+@pytest.mark.parametrize(
+    "judge",
+    [
+        "provider = 'openai'\nmodel = 'gpt-5'\nprivacy_policy = 'public-only'\n",
+        (
+            "provider = 'openai'\nmodel = 'gpt-5'\n"
+            "privacy_policy = 'ambient'\nallow_same_model = false\n"
+        ),
+        (
+            "provider = 'openai'\nmodel = 'gpt-5'\n"
+            "privacy_policy = ['public-only']\nallow_same_model = false\n"
+        ),
+        (
+            "provider = 'openai'\nmodel = 'gpt-5'\n"
+            "privacy_policy = 'public-only'\nallow_same_model = 'yes'\n"
+        ),
+        (
+            "provider = 'openai'\nmodel = 'gpt-5'\n"
+            "privacy_policy = 'public-only'\nallow_same_model = false\n"
+            "max_total_tokens = 10\nmax_input_tokens = 11\n"
+        ),
+        (
+            "provider = 'openai'\nmodel = 'gpt-5'\n"
+            "privacy_policy = 'public-only'\nallow_same_model = false\n"
+            "max_estimated_cost = '1e-3'\ncost_currency = 'USD'\n"
+        ),
+    ],
+)
+def test_project_context_rejects_incomplete_or_unsafe_default_judge(
+    tmp_path: Path,
+    judge: str,
+) -> None:
+    _project(
+        tmp_path,
+        store=f"\n[tool.cayu.evals.default_judge]\n{judge}",
+    )
+
+    with pytest.raises(ProjectError, match=r"\[tool\.cayu\.evals\.default_judge\]"):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+
+def test_project_context_rejects_an_unknown_eval_price_book(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        store='\n[tool.cayu.evals]\nprice_book = "ambient"\n',
+    )
+
+    with pytest.raises(ProjectError, match=r'price_book must be "bundled-public"'):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+
+def test_project_context_rejects_unknown_eval_configuration_keys(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        store='\n[tool.cayu.evals]\nprice_bok = "bundled-public"\n',
+    )
+
+    with pytest.raises(ProjectError, match=r"unsupported keys: price_bok"):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+
+def test_project_context_requires_pricing_for_a_judge_cost_ceiling(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        store="""
+
+[tool.cayu.evals.default_judge]
+provider = "openai"
+model = "gpt-5"
+privacy_policy = "public-only"
+allow_same_model = false
+max_estimated_cost = "0.1"
+cost_currency = "USD"
+""",
+    )
+
+    with pytest.raises(ProjectError, match="cost ceiling requires"):
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+
 def test_project_context_reports_missing_project_identity_without_guessing(
     tmp_path: Path,
 ) -> None:

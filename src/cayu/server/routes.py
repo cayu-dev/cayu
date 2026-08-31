@@ -4178,13 +4178,28 @@ def create_router(
         and _project_context is not None
         and _project_context.project_id is not None
     ):
+        project_evals_pricing = _project_context.eval_price_book
+        if (
+            project_evals_pricing is not None
+            and generated_evals_pricing is not None
+            and pricing_profile_identity(project_evals_pricing).fingerprint
+            != pricing_profile_identity(generated_evals_pricing).fingerprint
+        ):
+            raise ValueError(
+                "Project Evals pricing conflicts with the server-owned dashboard price book."
+            )
         generated_registry = generated_eval_target_registry(
             cayu_app,
             project_id=_project_context.project_id,
             application_release_id=_project_context.application_release_id,
             app_manifest_fingerprint=_project_context.app_manifest_fingerprint,
             app_manifest_project_root=_project_context.app_manifest_project_root,
-            price_book=generated_evals_pricing,
+            price_book=(
+                project_evals_pricing
+                if project_evals_pricing is not None
+                else generated_evals_pricing
+            ),
+            judge_configuration=_project_context.eval_judge_configuration,
         )
     eval_runtime = resolved_evals_runtime(
         explicit=evals,
@@ -5565,6 +5580,24 @@ def create_router(
                     detail="Eval execution bounds or authenticated provenance are invalid.",
                 ) from exc
 
+        def _narrow_eval_cost_budget(
+            current: EvalRunCostBudget | None,
+            requested: EvalRunCostBudget | None,
+        ) -> EvalRunCostBudget | None:
+            if current is None:
+                return requested
+            if requested is None:
+                return current
+            if current.currency != requested.currency:
+                raise ValueError("Eval cost-budget contractions must use one currency.")
+            return EvalRunCostBudget(
+                max_estimated_cost=min(
+                    current.max_estimated_cost,
+                    requested.max_estimated_cost,
+                ),
+                currency=current.currency,
+            )
+
         def _bind_eval_admission_request(
             invocation: EvalRunInvocation,
             *,
@@ -6348,13 +6381,13 @@ def create_router(
 
         async def _preview_authored_suite_launch(
             suite: EvalSuiteDocument,
-            case_ids: tuple[str, ...] | None,
+            request: EvalAuthoredSuiteRunSelectionRequest,
         ) -> tuple[
             EvalAuthoredSuiteRunPreviewResponse,
             dict[str, tuple[EvalScenarioDocumentV2, ScenarioLaunchBindingV2]],
         ]:
             try:
-                selection = eval_suite_selection(suite, case_ids)
+                selection = eval_suite_selection(suite, request.case_ids)
             except (KeyError, TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400,
@@ -6488,6 +6521,18 @@ def create_router(
                     )
             if simple_cases and not diagnostics:
                 try:
+                    simple_invocation = _eval_run_invocation(
+                        None,
+                        max_steps=None,
+                        limits=None,
+                        cost_budget=request.cost_budget,
+                        authored_suite_revision=suite.revision,
+                        authored_suite_selection_revision=selection.revision,
+                    )
+                    effective_simple_target = target_for_eval_invocation(
+                        execution_target,
+                        simple_invocation,
+                    )
                     simple_selection = eval_suite_selection(
                         suite,
                         tuple(case.id for case in simple_cases),
@@ -6496,13 +6541,13 @@ def create_router(
                         corpus_for_authored_simple_selection,
                         suite,
                         simple_selection,
-                        execution_target,
+                        effective_simple_target,
                         project_root=registration.manifest_project_root,
                     )
                     await asyncio.to_thread(
                         compile_corpus_suite,
                         corpus,
-                        execution_target,
+                        effective_simple_target,
                         suite.suite.id,
                     )
                 except (TypeError, ValueError):
@@ -6519,7 +6564,7 @@ def create_router(
                     try:
                         prepared_profile = await active_eval_registry.prepare_execution_profile(
                             suite.target_key,
-                            effective_target=execution_target,
+                            effective_target=effective_simple_target,
                         )
                     except Exception:
                         diagnostics.append(
@@ -6618,7 +6663,10 @@ def create_router(
                                 None,
                                 max_steps=preflight.binding.max_steps,
                                 limits=preflight.binding.operator_run_limits,
-                                cost_budget=preflight.binding.cost_budget,
+                                cost_budget=_narrow_eval_cost_budget(
+                                    preflight.binding.cost_budget,
+                                    request.cost_budget,
+                                ),
                                 scenario=scenario_invocation,
                                 authored_suite_revision=suite.revision,
                                 authored_suite_selection_revision=selection.revision,
@@ -6704,9 +6752,12 @@ def create_router(
                             case_ids=launch.case_ids,
                             execution_profile=execution_profiles_by_case[launch.case_ids[0]],
                             cost_budget=(
-                                None
+                                request.cost_budget
                                 if launch.kind == "simple_input"
-                                else prepared_scenarios[launch.case_ids[0]][1].cost_budget
+                                else _narrow_eval_cost_budget(
+                                    prepared_scenarios[launch.case_ids[0]][1].cost_budget,
+                                    request.cost_budget,
+                                )
                             ),
                         )
                         for launch in launches
@@ -7262,7 +7313,7 @@ def create_router(
             body: EvalAuthoredSuiteRunSelectionRequest,
         ) -> EvalAuthoredSuiteRunPreviewResponse:
             suite = await _load_authored_suite(suite_revision)
-            preview, _ = await _preview_authored_suite_launch(suite, body.case_ids)
+            preview, _ = await _preview_authored_suite_launch(suite, body)
             return preview
 
         @bounded_evals_router.post(
@@ -7287,7 +7338,7 @@ def create_router(
                     auth_context,
                     max_steps=None,
                     limits=None,
-                    cost_budget=None,
+                    cost_budget=body.cost_budget,
                 ),
                 kind="authored_suite",
                 target_key=suite.target_key,
@@ -7350,7 +7401,7 @@ def create_router(
             partial_replay = any(part is not None for part in replayed_parts)
             preview, prepared_scenarios = await _preview_authored_suite_launch(
                 suite,
-                body.case_ids,
+                body,
             )
             if not preview.ready:
                 raise HTTPException(
@@ -7420,7 +7471,7 @@ def create_router(
                         auth_context,
                         max_steps=None,
                         limits=None,
-                        cost_budget=None,
+                        cost_budget=body.cost_budget,
                         authored_suite_revision=suite.revision,
                         authored_suite_selection_revision=preview.selection.revision,
                         authored_suite_launch_revision=launch_revision,
@@ -7462,7 +7513,10 @@ def create_router(
                         auth_context,
                         max_steps=binding.max_steps,
                         limits=binding.operator_run_limits,
-                        cost_budget=binding.cost_budget,
+                        cost_budget=_narrow_eval_cost_budget(
+                            binding.cost_budget,
+                            body.cost_budget,
+                        ),
                         scenario=scenario_invocation,
                         authored_suite_revision=suite.revision,
                         authored_suite_selection_revision=preview.selection.revision,

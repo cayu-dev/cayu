@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  authoredSuiteCostBudgetContract,
   authoredSuiteRunPreviewIdentity,
   blankEvalScenarioDraft,
   duplicateEvalSuiteCase,
@@ -81,11 +82,41 @@ test("saved suite projection is editable without mutating immutable server mater
 })
 
 test("launch preview identity is bound to the exact saved and reviewed suite revision", () => {
-  const selection = { case_ids: ["refund-case"] }
+  const selection = {
+    case_ids: ["refund-case"],
+    cost_budget: { max_estimated_cost: "0.10", currency: "USD" },
+  }
   const current = authoredSuiteRunPreviewIdentity(revision("a"), revision("a"), selection)
 
   assert.equal(current, authoredSuiteRunPreviewIdentity(revision("a"), revision("a"), selection))
   assert.notEqual(current, authoredSuiteRunPreviewIdentity(revision("a"), revision("b"), selection))
+  assert.notEqual(
+    current,
+    authoredSuiteRunPreviewIdentity(revision("a"), revision("a"), {
+      ...selection,
+      cost_budget: { max_estimated_cost: "0.20", currency: "USD" },
+    }),
+  )
+})
+
+test("authored suite candidate budgets require published target pricing", () => {
+  const target = { cost_budget_available: true, cost_budget_currencies: ["USD"] }
+  assert.deepEqual(authoredSuiteCostBudgetContract("0.10", "usd", target), {
+    max_estimated_cost: "0.10",
+    currency: "USD",
+  })
+  assert.equal(authoredSuiteCostBudgetContract("", "USD", target), undefined)
+  assert.equal(authoredSuiteCostBudgetContract("0.00", "USD", target), null)
+  assert.equal(authoredSuiteCostBudgetContract("-1", "USD", target), null)
+  assert.equal(authoredSuiteCostBudgetContract(`1${"0".repeat(64)}`, "USD", target), null)
+  assert.equal(authoredSuiteCostBudgetContract("0.10", "EUR", target), null)
+  assert.equal(
+    authoredSuiteCostBudgetContract("0.10", "USD", {
+      cost_budget_available: false,
+      cost_budget_currencies: [],
+    }),
+    null,
+  )
 })
 
 test("only nonblank embedded artifact overrides require fixture materialization", () => {

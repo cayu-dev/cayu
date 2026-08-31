@@ -10,11 +10,13 @@ import {
 } from "./evaluation-promotion.ts"
 import type {
   EvalCaseDraftV2,
+  EvalRunCostBudgetInput,
   EvalScenarioDraftV2,
   EvalSuiteDocumentV1,
   EvalSuiteDocumentV2,
   EvalSuiteDocumentV3,
   EvalSuiteDraftV3,
+  EvalTargetCatalogEntry,
   StructuredModelJudgeAssertionDraftV1,
   StructuredModelJudgeAssertionSpec,
 } from "./generated/server-api"
@@ -156,9 +158,33 @@ export function evalSuitePreviewMatchesDraft(
 export function authoredSuiteRunPreviewIdentity(
   savedSuiteRevision: string | null,
   reviewedSuiteRevision: string | null,
-  selection: { case_ids?: readonly string[] },
+  selection: {
+    case_ids?: readonly string[]
+    cost_budget?: EvalRunCostBudgetInput | null
+  },
 ): string {
   return JSON.stringify([savedSuiteRevision, reviewedSuiteRevision, selection])
+}
+
+export function authoredSuiteCostBudgetContract(
+  maximum: string,
+  currency: string,
+  target: EvalTargetCatalogEntry | undefined,
+): EvalRunCostBudgetInput | null | undefined {
+  const amount = maximum.trim()
+  if (amount === "") return undefined
+  const normalizedCurrency = currency.trim().toUpperCase()
+  if (
+    amount.length > 64 ||
+    !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(amount) ||
+    !/[1-9]/.test(amount) ||
+    normalizedCurrency.length > 16 ||
+    target?.cost_budget_available !== true ||
+    !target.cost_budget_currencies.includes(normalizedCurrency)
+  ) {
+    return null
+  }
+  return { max_estimated_cost: amount, currency: normalizedCurrency }
 }
 
 export function scenarioArtifactBindingsRequireMaterialization(
