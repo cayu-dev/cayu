@@ -1379,6 +1379,7 @@ export type ApiSession = {
      * Provider Name
      */
     provider_name: string | null;
+    runtime_build_provenance: RuntimeBuildProvenance;
     /**
      * Runtime Name
      */
@@ -1439,6 +1440,7 @@ export type ApiSessionBase = {
      * Provider Name
      */
     provider_name: string | null;
+    runtime_build_provenance: RuntimeBuildProvenance;
     /**
      * Runtime Name
      */
@@ -1506,6 +1508,7 @@ export type ApiSessionDetail = {
      * Provider Name
      */
     provider_name: string | null;
+    runtime_build_provenance: RuntimeBuildProvenance;
     /**
      * Runtime Name
      */
@@ -1647,6 +1650,7 @@ export type ApiSessionTopologyNode = {
      * Provider Name
      */
     provider_name: string;
+    runtime_build_provenance: RuntimeBuildProvenance;
     /**
      * Runtime Name
      */
@@ -8524,10 +8528,11 @@ export type ExecutionProfileIdentity = {
      * Fingerprint
      */
     fingerprint: string;
+    runtime_build_provenance?: RuntimeBuildProvenance;
     /**
      * Schema Version
      */
-    schema_version?: 1 | 2 | 4 | 5;
+    schema_version?: 1 | 2 | 4 | 5 | 6;
 };
 
 /**
@@ -13463,6 +13468,70 @@ export type RunLimits = {
      */
     scope?: 'session' | 'run';
 };
+
+/**
+ * RuntimeBuildArtifactKind
+ *
+ * Digest domain whose bytes or manifest identify the build.
+ */
+export type RuntimeBuildArtifactKind = 'wheel' | 'oci_image' | 'source_tree' | 'other';
+
+/**
+ * RuntimeBuildProvenance
+ *
+ * Versioned, bounded identity for the exact Cayu runtime build.
+ */
+export type RuntimeBuildProvenance = {
+    /**
+     * Artifact Digest
+     */
+    artifact_digest?: string | null;
+    artifact_kind?: RuntimeBuildArtifactKind | null;
+    availability: RuntimeBuildProvenanceAvailability;
+    /**
+     * Detail Code
+     */
+    detail_code?: string | null;
+    /**
+     * Fingerprint
+     */
+    fingerprint?: string | null;
+    origin: RuntimeBuildProvenanceOrigin;
+    /**
+     * Recipe
+     */
+    recipe?: 'cayu.runtime-build-provenance.v1';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Source Revision
+     */
+    source_revision?: string | null;
+    strength: RuntimeBuildProvenanceStrength;
+};
+
+/**
+ * RuntimeBuildProvenanceAvailability
+ *
+ * Whether exact build identity is available for admission.
+ */
+export type RuntimeBuildProvenanceAvailability = 'available' | 'unavailable';
+
+/**
+ * RuntimeBuildProvenanceOrigin
+ *
+ * Boundary that supplied one runtime build identity.
+ */
+export type RuntimeBuildProvenanceOrigin = 'wheel_record' | 'oci_image_digest' | 'development_source_tree' | 'explicit_manifest' | 'legacy_record' | 'unavailable';
+
+/**
+ * RuntimeBuildProvenanceStrength
+ *
+ * Execution-profile strength vocabulary for runtime build identity.
+ */
+export type RuntimeBuildProvenanceStrength = 'structural' | 'application_versioned' | 'unavailable';
 
 /**
  * RuntimeManifest

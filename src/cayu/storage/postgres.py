@@ -269,6 +269,7 @@ from cayu.runtime.sessions import (
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRunFenced,
+    SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
     SessionStateSnapshot,
     SessionStatus,
@@ -386,6 +387,7 @@ from cayu.runtime.sessions import (
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
     _session_metadata_after_model_transition,
+    _session_metadata_after_runtime_identity_adoption,
     _session_metadata_after_tool_capability_ceiling_admission,
     _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline,
@@ -438,6 +440,7 @@ from cayu.runtime.sessions import (
     copy_session_identity,
     copy_session_lineage_query,
     copy_session_query,
+    copy_session_runtime_identity,
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
@@ -24921,7 +24924,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 """
                 SELECT id, agent_name, provider_name, model, parent_session_id,
                        causal_budget_id, runtime_name, runtime_version, environment_name,
-                       status, created_at, updated_at, last_activity_at, run_epoch
+                       status, created_at, updated_at, last_activity_at, run_epoch,
+                       metadata -> 'cayu:runtime_build_provenance'
+                           AS runtime_build_provenance
                 FROM cayu_sessions
                 WHERE id = %s
                 """,
@@ -24954,6 +24959,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 causal_budget_id=row[5],
                 runtime_name=row[6],
                 runtime_version=row[7],
+                runtime_build_provenance=(
+                    pg_support.runtime_build_provenance_from_session_metadata(
+                        {} if row[14] is None else {"cayu:runtime_build_provenance": row[14]}
+                    )
+                ),
                 environment_name=row[8],
                 status=SessionStatus(row[9]),
                 created_at=pg_support.to_utc(row[10]),
@@ -25278,6 +25288,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
@@ -25306,6 +25317,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
             execution_profile_decision
+        )
+        prepared_adopted_runtime_identity = (
+            None
+            if adopted_runtime_identity is None
+            else copy_session_runtime_identity(adopted_runtime_identity)
         )
         prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
             tool_capability_ceiling
@@ -25352,6 +25368,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             prepared_model_transition,
                             execution_profile_metadata=transition_profile_metadata,
                         )
+                    transition_metadata = _session_metadata_after_runtime_identity_adoption(
+                        loaded,
+                        prepared_adopted_runtime_identity,
+                        model_transition=prepared_model_transition,
+                        execution_profile_metadata=transition_metadata,
+                    )
                     transition_metadata = _session_metadata_after_tool_capability_ceiling_admission(
                         loaded,
                         prepared_tool_capability_ceiling,
@@ -25401,6 +25423,38 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             """,
                             (*transition_values, session_id),
                         )
+                    elif prepared_adopted_runtime_identity is not None:
+                        target_provider_name = (
+                            loaded.provider_name
+                            if prepared_model_transition is None
+                            else prepared_model_transition.target.provider_name
+                        )
+                        target_model = (
+                            loaded.model
+                            if prepared_model_transition is None
+                            else prepared_model_transition.target.model
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET status = %s, updated_at = %s, last_activity_at = %s,
+                                run_epoch = run_epoch + %s,
+                                event_seq = event_seq + %s,
+                                provider_name = %s, model = %s,
+                                runtime_name = %s, runtime_version = %s, metadata = %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (
+                                *transition_values,
+                                target_provider_name,
+                                target_model,
+                                prepared_adopted_runtime_identity.runtime_name,
+                                prepared_adopted_runtime_identity.runtime_version,
+                                _dumps(transition_metadata),
+                                session_id,
+                            ),
+                        )
                     elif prepared_model_transition is not None:
                         await cur.execute(
                             """
@@ -25449,6 +25503,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     elif transition_metadata is not None:
                         transition_updates["metadata"] = transition_metadata
+                    if prepared_adopted_runtime_identity is not None:
+                        transition_updates.update(
+                            runtime_name=prepared_adopted_runtime_identity.runtime_name,
+                            runtime_version=prepared_adopted_runtime_identity.runtime_version,
+                            metadata=transition_metadata,
+                        )
                     transitioned = loaded.model_copy(update=transition_updates)
                     if result_checkpoint_transform is not None:
                         result_checkpoint = result_checkpoint_transform(
@@ -31500,6 +31560,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_columns = ", ".join(
             f"cayu_sessions.{column.strip()}"
             for column in pg_support.PENDING_ACTION_SESSION_COLUMNS.split(",")
+        )
+        session_columns += (
+            ", cayu_sessions.metadata -> 'cayu:runtime_build_provenance' "
+            "AS runtime_build_provenance"
         )
         candidate_select_sql = cast(
             "LiteralString",

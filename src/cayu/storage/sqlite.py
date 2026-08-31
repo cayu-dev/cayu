@@ -124,6 +124,7 @@ from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SESSION_INSPECTION_LABEL_LIMIT,
@@ -201,6 +202,7 @@ from cayu.runtime.sessions import (
     SessionQueuedMessage,
     SessionQueuedMessagesPending,
     SessionRunFenced,
+    SessionRuntimeIdentity,
     SessionRuntimePublicationConflict,
     SessionStateSnapshot,
     SessionStatus,
@@ -318,6 +320,7 @@ from cayu.runtime.sessions import (
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
     _session_metadata_after_model_transition,
+    _session_metadata_after_runtime_identity_adoption,
     _session_metadata_after_tool_capability_ceiling_admission,
     _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline_json,
@@ -370,6 +373,7 @@ from cayu.runtime.sessions import (
     copy_session_identity,
     copy_session_lineage_query,
     copy_session_query,
+    copy_session_runtime_identity,
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
@@ -394,6 +398,7 @@ from cayu.runtime.sessions import (
     require_deferred_initial_transcript_replacement,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
+    runtime_build_provenance_from_session_metadata,
     session_messages_input_contract_evidence,
     session_next_cursor,
     session_outcome,
@@ -973,7 +978,16 @@ def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | 
 _SESSION_TOPOLOGY_COLUMNS = """
     id, agent_name, provider_name, model, parent_session_id,
     causal_budget_id, runtime_name, runtime_version, environment_name,
-    status, created_at, updated_at, last_activity_at
+    status, created_at, updated_at, last_activity_at,
+    json_extract(metadata_json, '$."cayu:runtime_build_provenance"')
+        AS runtime_build_provenance_json
+"""
+
+_SESSION_TOPOLOGY_PROJECTED_COLUMNS = """
+    id, agent_name, provider_name, model, parent_session_id,
+    causal_budget_id, runtime_name, runtime_version, environment_name,
+    status, created_at, updated_at, last_activity_at,
+    runtime_build_provenance_json
 """
 
 
@@ -987,6 +1001,15 @@ def _session_topology_node_from_sqlite_row(row: sqlite3.Row) -> SessionTopologyN
         causal_budget_id=row["causal_budget_id"],
         runtime_name=row["runtime_name"],
         runtime_version=row["runtime_version"],
+        runtime_build_provenance=runtime_build_provenance_from_session_metadata(
+            {}
+            if row["runtime_build_provenance_json"] is None
+            else {
+                RUNTIME_BUILD_PROVENANCE_METADATA_KEY: json.loads(
+                    row["runtime_build_provenance_json"]
+                )
+            }
+        ),
         environment_name=row["environment_name"],
         status=SessionStatus(row["status"]),
         created_at=sqlite_support.parse_datetime(row["created_at"]),
@@ -4410,7 +4433,11 @@ class SQLiteSessionStore(SessionStore):
                 """
                 SELECT id, agent_name, provider_name, model, parent_session_id,
                        causal_budget_id, runtime_name, runtime_version, environment_name,
-                       status, created_at, updated_at, last_activity_at, run_epoch
+                       status, created_at, updated_at, last_activity_at, run_epoch,
+                       json_extract(
+                           metadata_json,
+                           '$."cayu:runtime_build_provenance"'
+                       ) AS runtime_build_provenance_json
                 FROM cayu_sessions
                 WHERE id = ?
                 """,
@@ -4441,6 +4468,15 @@ class SQLiteSessionStore(SessionStore):
                 causal_budget_id=row["causal_budget_id"],
                 runtime_name=row["runtime_name"],
                 runtime_version=row["runtime_version"],
+                runtime_build_provenance=runtime_build_provenance_from_session_metadata(
+                    {}
+                    if row["runtime_build_provenance_json"] is None
+                    else {
+                        RUNTIME_BUILD_PROVENANCE_METADATA_KEY: json.loads(
+                            row["runtime_build_provenance_json"]
+                        )
+                    }
+                ),
                 environment_name=row["environment_name"],
                 status=SessionStatus(row["status"]),
                 created_at=sqlite_support.parse_datetime(row["created_at"]),
@@ -4774,6 +4810,7 @@ class SQLiteSessionStore(SessionStore):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
@@ -4802,6 +4839,11 @@ class SQLiteSessionStore(SessionStore):
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
             execution_profile_decision
+        )
+        prepared_adopted_runtime_identity = (
+            None
+            if adopted_runtime_identity is None
+            else copy_session_runtime_identity(adopted_runtime_identity)
         )
         prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
             tool_capability_ceiling
@@ -4850,6 +4892,12 @@ class SQLiteSessionStore(SessionStore):
                         prepared_model_transition,
                         execution_profile_metadata=transition_profile_metadata,
                     )
+                transition_metadata = _session_metadata_after_runtime_identity_adoption(
+                    loaded,
+                    prepared_adopted_runtime_identity,
+                    model_transition=prepared_model_transition,
+                    execution_profile_metadata=transition_metadata,
+                )
                 transition_metadata = _session_metadata_after_tool_capability_ceiling_admission(
                     loaded,
                     prepared_tool_capability_ceiling,
@@ -4889,6 +4937,36 @@ class SQLiteSessionStore(SessionStore):
                         """,
                         (
                             *transition_values,
+                            session_id,
+                            *(str(status) for status in allowed_statuses),
+                        ),
+                    )
+                elif prepared_adopted_runtime_identity is not None:
+                    target_provider_name = (
+                        loaded.provider_name
+                        if prepared_model_transition is None
+                        else prepared_model_transition.target.provider_name
+                    )
+                    target_model = (
+                        loaded.model
+                        if prepared_model_transition is None
+                        else prepared_model_transition.target.model
+                    )
+                    cursor = self._connection.execute(
+                        f"""
+                        UPDATE cayu_sessions
+                        SET status = ?, updated_at = ?, last_activity_at = ?,
+                            run_epoch = run_epoch + ?, provider_name = ?, model = ?,
+                            runtime_name = ?, runtime_version = ?, metadata_json = ?
+                        WHERE id = ? AND status IN ({placeholders})
+                        """,
+                        (
+                            *transition_values,
+                            target_provider_name,
+                            target_model,
+                            prepared_adopted_runtime_identity.runtime_name,
+                            prepared_adopted_runtime_identity.runtime_version,
+                            sqlite_support.json_dumps(transition_metadata),
                             session_id,
                             *(str(status) for status in allowed_statuses),
                         ),
@@ -4947,6 +5025,12 @@ class SQLiteSessionStore(SessionStore):
                     )
                 elif transition_metadata is not None:
                     transition_updates["metadata"] = transition_metadata
+                if prepared_adopted_runtime_identity is not None:
+                    transition_updates.update(
+                        runtime_name=prepared_adopted_runtime_identity.runtime_name,
+                        runtime_version=prepared_adopted_runtime_identity.runtime_version,
+                        metadata=transition_metadata,
+                    )
                 transitioned = loaded.model_copy(update=transition_updates)
                 if result_checkpoint_transform is not None:
                     result_checkpoint = result_checkpoint_transform(
@@ -10358,7 +10442,7 @@ class SQLiteSessionStore(SessionStore):
                         cursor_params = [formatted_cursor, formatted_cursor, cursor_id]
                     branch_queries.append(
                         f"""
-                        SELECT branch_order, {_SESSION_TOPOLOGY_COLUMNS}
+                        SELECT branch_order, {_SESSION_TOPOLOGY_PROJECTED_COLUMNS}
                         FROM (
                             SELECT ? AS branch_order, {_SESSION_TOPOLOGY_COLUMNS}
                             FROM cayu_sessions
@@ -10757,7 +10841,11 @@ class SQLiteSessionStore(SessionStore):
                 cayu_sessions.environment_name,
                 cayu_sessions.status,
                 cayu_sessions.created_at,
-                cayu_sessions.updated_at
+                cayu_sessions.updated_at,
+                json_extract(
+                    cayu_sessions.metadata_json,
+                    '$."cayu:runtime_build_provenance"'
+                ) AS runtime_build_provenance_json
             FROM cayu_checkpoints
                 INDEXED BY idx_cayu_checkpoints_pending_control_action
             JOIN cayu_sessions ON cayu_sessions.id = cayu_checkpoints.session_id

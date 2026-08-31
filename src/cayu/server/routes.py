@@ -284,6 +284,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -2388,6 +2389,7 @@ def _serialize_session_base(
         untrusted_container_fields={"labels"},
     )
     payload["id"] = cayu_app.project_session_id_for_exposure(session.id)
+    payload["runtime_build_provenance"] = session.runtime_build_provenance.model_dump(mode="json")
     payload["parent_session_id"] = (
         None
         if session.parent_session_id is None
@@ -2462,11 +2464,16 @@ def _serialize_session_cost_summary(
 
 
 def _serialize_session(cayu_app: Any, session: Session) -> dict[str, Any]:
+    public_metadata = {
+        key: value
+        for key, value in session.metadata.items()
+        if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+    }
     return {
         **_serialize_session_base(cayu_app, session),
         "metadata": _redact_control_plane_json(
             cayu_app,
-            session.metadata,
+            public_metadata,
             "session.metadata",
         ),
     }
@@ -2503,7 +2510,7 @@ def _serialize_session_topology_node(
     cayu_app: Any,
     node: SessionTopologyNode,
 ) -> dict[str, Any]:
-    return _redact_control_plane_values(
+    payload = _redact_control_plane_values(
         cayu_app,
         {
             "id": node.id,
@@ -2528,6 +2535,8 @@ def _serialize_session_topology_node(
             "updated_at",
         },
     )
+    payload["runtime_build_provenance"] = node.runtime_build_provenance.model_dump(mode="json")
+    return payload
 
 
 def _require_safe_session_topology_authority(

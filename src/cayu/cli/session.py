@@ -55,7 +55,7 @@ from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "7"
+CLI_SCHEMA_VERSION = "8"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
@@ -672,6 +672,7 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
             "model": identity.model,
             "runtime_name": identity.runtime_name,
             "runtime_version": identity.runtime_version,
+            "runtime_build_provenance": identity.runtime_build_provenance.model_dump(mode="json"),
             "environment": identity.environment_name,
             "status": identity.status.value,
             "created_at": identity.created_at.isoformat(),

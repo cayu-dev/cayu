@@ -235,7 +235,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
         super().__init__()
         self.inject_pending_round = False
 
-    async def transition_status_and_checkpoint(
+    async def transition_status_and_checkpoint(  # ty: ignore[invalid-method-override]
         self,
         session_id,
         *,

@@ -3062,6 +3062,10 @@ def test_server_run_accepts_budget_limits() -> None:
     sessions = client.get("/api/sessions").json()["sessions"]
     assert len(sessions) == 1
     assert sessions[0]["status"] == "interrupted"
+    provenance = sessions[0]["runtime_build_provenance"]
+    assert provenance["availability"] == "available"
+    assert provenance["origin"] == "development_source_tree"
+    assert len(provenance["fingerprint"]) == 64
 
 
 def test_server_run_defaults_and_overrides_max_steps() -> None:
@@ -5140,6 +5144,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         "approval_id",
     )
     assert approval["arguments"] is None
+    assert approval["session"]["runtime_build_provenance"]["availability"] == "unavailable"
     user_input = actions_by_session["pending_user_input"]
     assert user_input["kind"] == "user_input"
     assert user_input["input_id"] == public_event_linkage_id(
@@ -8093,7 +8098,7 @@ def test_direct_app_fork_and_dispatch_accept_generated_public_session_alias() ->
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
 
-    async def scenario() -> tuple[str, list[Event], list[Event], list[Event], Any]:
+    async def scenario() -> tuple[str, list[Event], list[Event], list[Event], Any, Any]:
         initial = await _collect_run(
             app,
             RunRequest(
@@ -8131,9 +8136,12 @@ def test_direct_app_fork_and_dispatch_accept_generated_public_session_alias() ->
                 messages=[Message.text("user", "submitted dispatch")],
             )
         )
-        return public_session_id, forked, grandchild, inline, handle
+        stored_fork_id = await app._resolve_public_session_id(forked[0].session_id)
+        stored_fork = await app.session_store.load(stored_fork_id)
+        assert stored_fork is not None
+        return public_session_id, forked, grandchild, inline, handle, stored_fork
 
-    public_session_id, forked, grandchild, inline, handle = asyncio.run(scenario())
+    public_session_id, forked, grandchild, inline, handle, stored_fork = asyncio.run(scenario())
 
     assert public_event_envelope_alias_field(public_session_id) == "session_id"
     assert [event.type for event in forked] == [EventType.SESSION_FORKED]
@@ -8145,6 +8153,8 @@ def test_direct_app_fork_and_dispatch_accept_generated_public_session_alias() ->
     assert {event.session_id for event in inline} == {public_session_id}
     assert handle.status is DispatchStatus.COMPLETED
     assert handle.session_id == public_session_id
+    assert stored_fork.runtime_build_provenance.origin.value != "legacy_record"
+    assert "-" in stored_fork.runtime_build_provenance.recipe
 
 
 def test_exact_secret_source_alias_rejects_fork_before_child_creation() -> None:

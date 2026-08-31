@@ -48,6 +48,7 @@ from cayu.runtime.sessions import (
     copy_session,
     effective_fork_source_execution_profile,
     run_request_authority_is_runtime_generated,
+    session_user_metadata,
     strip_runtime_session_create_claim_before_redaction,
 )
 from cayu.runtime.structured_output import require_secret_free_structured_output_spec
@@ -731,26 +732,26 @@ def prepare_derived_fork_session(
                 break
     if error is None and _labels_contain_secret(fork_session.labels, redactor=redactor):
         error = "labels contain a workload secret and cannot be used as durable session authority."
+    user_metadata = session_user_metadata(fork_session.metadata)
     if error is None and _json_contains_secret_key(
-        fork_session.metadata,
+        user_metadata,
         redactor=redactor,
     ):
         error = (
             "metadata contains a workload secret and cannot be used as durable session authority."
         )
-    if (
-        error is None
-        and redactor.redact_json_values(fork_session.metadata) != fork_session.metadata
-    ):
+    if error is None and redactor.redact_json_values(user_metadata) != user_metadata:
         error = (
             "metadata contains a workload secret and cannot be used as durable session authority."
         )
     if error is not None:
+        user_metadata.clear()
         fork_session.metadata.clear()
         del fork_session, source_session
         field_name = value = expected = ""
         runtime_generated_session_id = store_resolved_source_session_id = None
         raise ForkAuthorityError(error) from None
+    user_metadata.clear()
     return fork_session
 
 

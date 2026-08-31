@@ -342,6 +342,7 @@ function sessionStructure(node: ApiSessionTopologyNode): string {
     node.provider_name,
     node.runtime_name,
     node.runtime_version,
+    JSON.stringify(node.runtime_build_provenance),
     node.environment_name,
     node.created_at,
   ])

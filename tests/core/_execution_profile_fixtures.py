@@ -35,6 +35,7 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime.app import CayuApp
 from cayu.runtime.budgets import BudgetLimit, request_budget_limits_for_session
+from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -405,6 +406,7 @@ def profiled_session_identity(
             durable_system_prompt=durable_system_prompt,
             runtime_name="cayu",
             runtime_version=runtime_version,
+            runtime_build_provenance=current_runtime_build_provenance(),
             redactor=profile_app._secret_redactor,
             process_identity=profile_app._execution_profile_process_identity,
             registered_provider=profile_app._providers[provider_name],

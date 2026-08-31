@@ -21,6 +21,7 @@ from cayu.providers import (
     ModelStreamEvent,
 )
 from cayu.runtime import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     CayuApp,
     EnqueueSessionMessageRequest,
     EventOrder,
@@ -1233,7 +1234,12 @@ def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path)
         assert session.agent_name == "assistant"
         assert session.environment_name == "local-dev"
         assert session.status == SessionStatus.RUNNING
-        assert session.metadata == {"project_id": 123}
+        assert {
+            key: value
+            for key, value in session.metadata.items()
+            if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+        } == {"project_id": 123}
+        assert session.runtime_build_provenance.fingerprint is None
         assert [event.type for event in events] == [
             EventType.SESSION_STARTED,
             EventType.MODEL_COMPLETED,

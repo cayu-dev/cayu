@@ -309,6 +309,7 @@ from cayu.runtime.budgets import (
     has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
+from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.checkpoints import (
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -480,6 +481,7 @@ from cayu.runtime.sessions import (
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -524,6 +526,7 @@ from cayu.runtime.sessions import (
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
+    SessionRuntimeIdentity,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
@@ -568,6 +571,7 @@ from cayu.runtime.sessions import (
     copy_profiled_session_fork_result,
     copy_resume_request,
     copy_run_request,
+    copy_session_runtime_identity,
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
     model_completion_stage_settlement_request,
@@ -3134,6 +3138,7 @@ def _session_identity(
         model=model,
         runtime_name="cayu",
         runtime_version=_runtime_version(),
+        runtime_build_provenance=current_runtime_build_provenance(),
         execution_profile=execution_profile,
     )
 
@@ -3180,7 +3185,17 @@ def _execution_profile_identity(
     retry_policy: RetryPolicy | None = None,
     finalization_material: dict[str, Any] | None = None,
     tool_capability_ceiling: ToolCapabilityCeiling | None = None,
+    runtime_identity: SessionRuntimeIdentity | None = None,
 ) -> ExecutionProfileIdentity:
+    runtime_identity = (
+        SessionRuntimeIdentity(
+            runtime_name="cayu",
+            runtime_version=_runtime_version(),
+            runtime_build_provenance=current_runtime_build_provenance(),
+        )
+        if runtime_identity is None
+        else copy_session_runtime_identity(runtime_identity)
+    )
     provider_options, provider_options_process_local = _execution_profile_provider_options(
         registered_agent.spec.provider_options,
         provider=registered_provider.provider if registered_provider is not None else None,
@@ -3212,8 +3227,9 @@ def _execution_profile_identity(
         provider_name=provider_name,
         model=model,
         durable_system_prompt=durable_system_prompt,
-        runtime_name="cayu",
-        runtime_version=_runtime_version(),
+        runtime_name=runtime_identity.runtime_name,
+        runtime_version=runtime_identity.runtime_version,
+        runtime_build_provenance=runtime_identity.runtime_build_provenance,
         redactor=redactor,
         registered_environment=registered_environment,
         process_identity=process_identity,
@@ -4730,6 +4746,7 @@ class SessionEngine:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             runtime_version=_runtime_version(),
+            runtime_build_provenance=current_runtime_build_provenance(),
             redactor=self._secret_redactor,
             process_identity=self._execution_profile_process_identity,
             registered_environment=self._get_registered_environment_for_session(
@@ -5838,6 +5855,7 @@ class SessionEngine:
                 model=session.model,
                 runtime_name=session.runtime_name,
                 runtime_version=session.runtime_version,
+                runtime_build_provenance=session.runtime_build_provenance,
                 environment_name=session.environment_name,
             ),
             validated_profile=active_profile.profile,
@@ -9612,6 +9630,7 @@ class SessionEngine:
                     model=session_identity.model,
                     runtime_name=session_identity.runtime_name,
                     runtime_version=session_identity.runtime_version,
+                    runtime_build_provenance=(session_identity.runtime_build_provenance),
                     environment_name=_environment_name(registered_environment),
                 ),
                 validated_profile=execution_profile,
@@ -9670,6 +9689,8 @@ class SessionEngine:
                     intent.child_session_id != current_session.id
                     or intent.child_runtime_name != current_session.runtime_name
                     or intent.child_runtime_version != current_session.runtime_version
+                    or intent.child_runtime_build_provenance
+                    != current_session.runtime_build_provenance
                     or intent.queue_task_id != prepared_session_authority.queue_task_id
                     or intent.submission_sha256 != prepared_session_authority.submission_sha256
                     or intent.interaction_id != interaction_id
@@ -9712,6 +9733,7 @@ class SessionEngine:
                     model=pending_session.model,
                     runtime_name=pending_session.runtime_name,
                     runtime_version=pending_session.runtime_version,
+                    runtime_build_provenance=(pending_session.runtime_build_provenance),
                     environment_name=pending_session.environment_name,
                 ),
                 validated_profile=execution_profile,
@@ -15149,9 +15171,15 @@ class SessionEngine:
             registered_agent=registered_agent,
             capability_ceiling=effective_tool_capability_ceiling,
         )
+        candidate_runtime_identity: SessionRuntimeIdentity | None = None
         candidate_execution_profile: ExecutionProfileIdentity | None = None
         execution_profile_decision: ExecutionProfileDecision | None = None
         if not continuing_recovery_boundary:
+            candidate_runtime_identity = SessionRuntimeIdentity(
+                runtime_name="cayu",
+                runtime_version=_runtime_version(),
+                runtime_build_provenance=current_runtime_build_provenance(),
+            )
             candidate_execution_profile = _execution_profile_identity(
                 registered_agent=registered_agent,
                 provider_name=registered_provider.name,
@@ -15183,6 +15211,7 @@ class SessionEngine:
                 limits=request.limits,
                 retry_policy=self._effective_retry_policy(request.retry_policy),
                 tool_capability_ceiling=effective_tool_capability_ceiling,
+                runtime_identity=candidate_runtime_identity,
             )
             expected_execution_profile = stored_execution_profile
             # A resumed session executes the already-durable system projection.
@@ -15671,6 +15700,18 @@ class SessionEngine:
             if target_changed and requested_target is not None
             else loaded_session.model
         )
+        adopted_runtime_identity: SessionRuntimeIdentity | None = None
+        if (
+            execution_profile_decision is not None
+            and execution_profile_decision.kind is ExecutionProfileDecisionKind.ADOPTED
+            and ExecutionProfileComponentClass.RUNTIME
+            in execution_profile_decision.changed_component_classes
+        ):
+            if candidate_runtime_identity is None:
+                raise AssertionError(
+                    "Runtime profile adoption lost its complete candidate identity."
+                )
+            adopted_runtime_identity = copy_session_runtime_identity(candidate_runtime_identity)
         prepared_invocation_context = _authenticated_invocation_context(
             active_profile=target_active_profile,
             binding=PreparedInvocationBinding(
@@ -15681,8 +15722,21 @@ class SessionEngine:
                 agent_name=loaded_session.agent_name,
                 provider_name=registered_provider.name,
                 model=target_model,
-                runtime_name=loaded_session.runtime_name,
-                runtime_version=loaded_session.runtime_version,
+                runtime_name=(
+                    loaded_session.runtime_name
+                    if adopted_runtime_identity is None
+                    else adopted_runtime_identity.runtime_name
+                ),
+                runtime_version=(
+                    loaded_session.runtime_version
+                    if adopted_runtime_identity is None
+                    else adopted_runtime_identity.runtime_version
+                ),
+                runtime_build_provenance=(
+                    loaded_session.runtime_build_provenance
+                    if adopted_runtime_identity is None
+                    else adopted_runtime_identity.runtime_build_provenance
+                ),
                 environment_name=_environment_name(registered_environment),
             ),
             validated_profile=invocation_profile,
@@ -15720,6 +15774,7 @@ class SessionEngine:
                     defer_interaction_source=continuing_recovery_boundary,
                     model_transition=model_transition,
                     execution_profile_decision=execution_profile_decision,
+                    adopted_runtime_identity=adopted_runtime_identity,
                     expected_active_profile=admission_source_active_profile,
                 )
             )
@@ -16437,6 +16492,12 @@ class SessionEngine:
         ):
             raise RuntimeError("Fork-group task evaluator authority is inconsistent.")
 
+        current_child_runtime_identity = SessionRuntimeIdentity(
+            runtime_name="cayu",
+            runtime_version=_runtime_version(),
+            runtime_build_provenance=current_runtime_build_provenance(),
+        )
+
         def current_child_execution_profile() -> ExecutionProfileIdentity:
             candidate = _execution_profile_identity(
                 registered_agent=registered_agent,
@@ -16485,6 +16546,7 @@ class SessionEngine:
                     else self._effective_retry_policy(initial_invocation.request.retry_policy)
                 ),
                 tool_capability_ceiling=effective_tool_capability_ceiling,
+                runtime_identity=current_child_runtime_identity,
             )
             if (
                 prompt_workflow.rendered_child_prompt is None
@@ -16500,6 +16562,11 @@ class SessionEngine:
 
         initial_invocation_profile: ExecutionProfileIdentity | None = None
         selected_execution_profile = source_execution_profile
+        selected_runtime_identity = SessionRuntimeIdentity(
+            runtime_name=source_session.runtime_name,
+            runtime_version=source_session.runtime_version,
+            runtime_build_provenance=source_session.runtime_build_provenance,
+        )
         execution_profile_decision: ExecutionProfileDecision | None = None
         if request.execution_profile_selection is ForkExecutionProfileSelection.CURRENT_CHILD:
             candidate_execution_profile = current_child_execution_profile()
@@ -16582,6 +16649,7 @@ class SessionEngine:
                     changed_component_classes=changed_profile_components,
                 )
             selected_execution_profile = candidate_execution_profile
+            selected_runtime_identity = current_child_runtime_identity
             initial_invocation_profile = (
                 None if initial_invocation is None else candidate_execution_profile
             )
@@ -16930,6 +16998,9 @@ class SessionEngine:
             model_changed=model_changed,
             inherited_taint_labels=inherited_taint_labels,
         )
+        fork_metadata[RUNTIME_BUILD_PROVENANCE_METADATA_KEY] = (
+            selected_runtime_identity.runtime_build_provenance.model_dump(mode="json")
+        )
         fork_session = Session(
             id=destination_session_id,
             agent_name=agent_name,
@@ -16937,8 +17008,8 @@ class SessionEngine:
             model=model,
             parent_session_id=source_session.id,
             causal_budget_id=source_session.causal_budget_id,
-            runtime_name=source_session.runtime_name,
-            runtime_version=source_session.runtime_version,
+            runtime_name=selected_runtime_identity.runtime_name,
+            runtime_version=selected_runtime_identity.runtime_version,
             environment_name=environment_name,
             status=source_session.status,
             invocation=fork_session_invocation(source_session),

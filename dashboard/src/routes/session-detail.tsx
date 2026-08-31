@@ -2897,6 +2897,19 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             <span>Created {formatDateTime(session.created_at)}</span>
             {session.provider_name && <Badge variant="outline">{session.provider_name}</Badge>}
             {session.model && <Badge variant="outline">{session.model}</Badge>}
+            <Badge
+              variant={
+                session.runtime_build_provenance.availability === "available"
+                  ? "outline"
+                  : "destructive"
+              }
+              title={`${session.runtime_build_provenance.origin} · ${session.runtime_build_provenance.strength}${session.runtime_build_provenance.fingerprint ? ` · ${session.runtime_build_provenance.fingerprint}` : ""}`}
+            >
+              {session.runtime_name}
+              {session.runtime_version ? ` ${session.runtime_version}` : ""} · build{" "}
+              {session.runtime_build_provenance.fingerprint?.slice(0, 12) ??
+                session.runtime_build_provenance.availability}
+            </Badge>
             {state?.provider_operation.status === "provider_operation_in_progress" ? (
               <Badge variant="secondary">Provider operation in progress</Badge>
             ) : state?.provider_operation.status === "reconnect_scheduled" ? (

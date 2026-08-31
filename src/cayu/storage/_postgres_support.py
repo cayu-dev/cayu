@@ -7,12 +7,14 @@ from typing import Any
 from cayu._validation import copy_label_map
 from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.sessions import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     PendingActionSession,
     Session,
     SessionOrder,
     SessionStatus,
     SessionTopologyNode,
+    runtime_build_provenance_from_session_metadata,
 )
 from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
@@ -701,7 +703,8 @@ SESSION_COLUMNS = (
 SESSION_TOPOLOGY_COLUMNS = (
     "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
     "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
-    "last_activity_at"
+    "last_activity_at, metadata -> 'cayu:runtime_build_provenance' "
+    "AS runtime_build_provenance"
 )
 
 
@@ -715,6 +718,9 @@ def session_topology_node_from_row(row: tuple[Any, ...]) -> SessionTopologyNode:
         causal_budget_id=row[5],
         runtime_name=row[6],
         runtime_version=row[7],
+        runtime_build_provenance=runtime_build_provenance_from_session_metadata(
+            {} if row[13] is None else {RUNTIME_BUILD_PROVENANCE_METADATA_KEY: row[13]}
+        ),
         environment_name=row[8],
         status=SessionStatus(row[9]),
         created_at=to_utc(row[10]),
@@ -742,6 +748,9 @@ def pending_action_session_from_row(
         causal_budget_id=row[5],
         runtime_name=row[6],
         runtime_version=row[7],
+        runtime_build_provenance=runtime_build_provenance_from_session_metadata(
+            {} if row[12] is None else {RUNTIME_BUILD_PROVENANCE_METADATA_KEY: row[12]}
+        ),
         environment_name=row[8],
         status=SessionStatus(row[9]),
         created_at=to_utc(row[10]),

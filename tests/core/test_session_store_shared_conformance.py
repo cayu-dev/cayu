@@ -185,6 +185,9 @@ from cayu.runtime import (
     ResumeRequest,
     RunLimits,
     RunRequest,
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
     RuntimeHook,
     RuntimeHookContext,
     RuntimePublicationCheckpointOperation,
@@ -2073,6 +2076,44 @@ def test_session_store_conformance_preserves_openrouter_reasoning_details(
             part = transcript[0].content[0]
             assert type(part) is ProviderStatePart
             assert part.state["details"] == details
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_preserves_runtime_build_provenance_across_reopen(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        provenance = RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest=sha256(b"session-build-a").hexdigest(),
+            source_revision="revision-a",
+        )
+        session_id = f"runtime-build-provenance-{session_store_case[0]}"
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=SessionIdentity(
+                    provider_name="fake",
+                    model="fake-model",
+                    runtime_version="0.4.0",
+                    runtime_build_provenance=provenance,
+                ),
+            )
+            store = await _reopen_store(session_store_case, store)
+
+            session = await store.load(session_id)
+            inspection = await store.inspect_identity(session_id)
+
+            assert session is not None
+            assert session.runtime_build_provenance == provenance
+            assert session.runtime_build_fingerprint == provenance.fingerprint
+            assert session.runtime_source_revision == "revision-a"
+            assert inspection.runtime_build_provenance == provenance
         finally:
             await _close_store(store)
 
@@ -9993,7 +10034,7 @@ def test_session_store_conformance_revalidates_all_mutable_durable_inputs_atomic
             assert invalid_metadata.value.code == "nul_character"
             loaded = await store.load(session_id)
             assert loaded is not None
-            assert loaded.metadata == {"stable": True}
+            assert sessions_module.session_user_metadata(loaded.metadata) == {"stable": True}
 
             queue_request = EnqueueSessionMessageRequest(
                 session_id=session_id,
@@ -10270,13 +10311,14 @@ def test_sqlite_jsonl_to_postgres_preserves_exact_portable_number_representation
                     environment_name=source.environment_name,
                     messages=[],
                     labels=source.labels,
-                    metadata=source.metadata,
+                    metadata=sessions_module.session_user_metadata(source.metadata),
                 ),
                 identity=SessionIdentity(
                     provider_name=source.provider_name,
                     model=source.model,
                     runtime_name=source.runtime_name,
                     runtime_version=source.runtime_version,
+                    runtime_build_provenance=source.runtime_build_provenance,
                 ),
             )
             await postgres_store.append_events(source.id, imported.events)
@@ -10289,6 +10331,7 @@ def test_sqlite_jsonl_to_postgres_preserves_exact_portable_number_representation
             )
             restored = await postgres_store.load(source.id)
             assert restored is not None
+            assert restored.runtime_build_provenance == source.runtime_build_provenance
             _assert_portable_number_probe(restored.metadata["numbers"])
             restored_events = await postgres_store.load_events(source.id)
             _assert_portable_number_probe(restored_events[0].payload["numbers"])

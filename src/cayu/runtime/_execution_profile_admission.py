@@ -18,6 +18,7 @@ from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authorit
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileComponentClass,
@@ -184,6 +185,7 @@ def resolve_execution_profile_identity(
     runtime_name: str,
     runtime_version: str | None,
     redactor: SecretRedactor,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
     process_identity: str = "standalone-profile-builder",
     registered_environment: runtime_records.RegisteredEnvironment | None = None,
     runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
@@ -587,6 +589,7 @@ def resolve_execution_profile_identity(
     return build_execution_profile_identity(
         runtime_name=runtime_name,
         runtime_version=runtime_version,
+        runtime_build_provenance=runtime_build_provenance,
         provider_name=provider_name,
         model=model,
         durable_system_prompt=durable_system_prompt,
@@ -704,6 +707,7 @@ def prepare_execution_profile_continuation(
     registered_provider: runtime_records.RegisteredProvider,
     runtime_version: str | None,
     redactor: SecretRedactor,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
     process_identity: str = "standalone-profile-builder",
     registered_environment: runtime_records.RegisteredEnvironment | None = None,
     runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
@@ -782,6 +786,7 @@ def prepare_execution_profile_continuation(
             durable_system_prompt=None,
             runtime_name="cayu",
             runtime_version=runtime_version,
+            runtime_build_provenance=runtime_build_provenance,
             redactor=redactor,
             process_identity=process_identity,
             registered_environment=registered_environment,

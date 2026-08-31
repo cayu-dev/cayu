@@ -250,6 +250,7 @@ async def assert_session_topology_store_conformance(store: SessionStore) -> None
         "causal_budget_id",
         "runtime_name",
         "runtime_version",
+        "runtime_build_provenance",
         "environment_name",
         "status",
         "created_at",

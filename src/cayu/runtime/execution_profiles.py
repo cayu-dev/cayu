@@ -37,6 +37,13 @@ from cayu.runtime.approvals import (
     copy_resolution_actor,
     resolution_actor_payload,
 )
+from cayu.runtime.build_provenance import (
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceAvailability,
+    RuntimeBuildProvenanceStrength,
+    legacy_runtime_build_provenance,
+    runtime_build_provenance_identity,
+)
 from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 from cayu.runtime.tool_catalogue import (
     TOOL_CATALOGUE_MAX_TOOLS,
@@ -45,7 +52,7 @@ from cayu.runtime.tool_catalogue import (
     validate_tool_descriptor_version,
 )
 
-EXECUTION_PROFILE_SCHEMA_VERSION = 5
+EXECUTION_PROFILE_SCHEMA_VERSION = 6
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
@@ -124,11 +131,13 @@ _SCHEMA_V5_COMPONENT_CLASSES = frozenset(
         ExecutionProfileComponentClass.EGRESS_AUTHORITY,
     }
 )
+_SCHEMA_V6_COMPONENT_CLASSES = _SCHEMA_V5_COMPONENT_CLASSES
 _SCHEMA_COMPONENT_CLASSES = {
     1: _SCHEMA_V1_COMPONENT_CLASSES,
     2: _SCHEMA_V2_COMPONENT_CLASSES,
     4: _SCHEMA_V4_COMPONENT_CLASSES,
     5: _SCHEMA_V5_COMPONENT_CLASSES,
+    6: _SCHEMA_V6_COMPONENT_CLASSES,
 }
 
 
@@ -643,10 +652,20 @@ class ExecutionProfileIdentity(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 4, 5] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 4, 5, 6] = EXECUTION_PROFILE_SCHEMA_VERSION
     fingerprint: str
     components: tuple[ExecutionProfileComponentIdentity, ...]
     egress_authority: EgressAuthorityIdentity | None = None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
+
+    @field_validator("runtime_build_provenance", mode="before")
+    @classmethod
+    def copy_runtime_build_provenance(cls, value: object) -> RuntimeBuildProvenance:
+        if isinstance(value, RuntimeBuildProvenance):
+            value = value.model_dump(mode="json")
+        return runtime_build_provenance_identity(RuntimeBuildProvenance.model_validate(value))
 
     @field_validator("egress_authority", mode="before")
     @classmethod
@@ -675,6 +694,20 @@ class ExecutionProfileIdentity(BaseModel):
             )
         if self.schema_version < 5 and self.egress_authority is not None:
             raise ValueError("Legacy execution profiles cannot carry egress authority details.")
+        if self.schema_version < 6 and self.runtime_build_provenance != (
+            legacy_runtime_build_provenance()
+        ):
+            raise ValueError("Legacy execution profiles cannot carry runtime build provenance.")
+        runtime_component = self.component(ExecutionProfileComponentClass.RUNTIME)
+        if self.schema_version >= 6 and (
+            runtime_component.availability is ExecutionProfileIdentityAvailability.UNAVAILABLE
+        ) != (
+            self.runtime_build_provenance.availability
+            is RuntimeBuildProvenanceAvailability.UNAVAILABLE
+        ):
+            raise ValueError(
+                "Execution-profile runtime availability conflicts with build provenance."
+            )
         if self.schema_version >= 5:
             expected_egress_component = _egress_authority_component(self.egress_authority)
             if self.component(ExecutionProfileComponentClass.EGRESS_AUTHORITY) != (
@@ -686,6 +719,7 @@ class ExecutionProfileIdentity(BaseModel):
         expected = _profile_fingerprint(
             self.components,
             schema_version=self.schema_version,
+            runtime_build_provenance=self.runtime_build_provenance,
         )
         if self.fingerprint != expected:
             raise ValueError("Execution-profile fingerprint does not match its components.")
@@ -984,6 +1018,7 @@ def build_execution_profile_identity(
     invocation_budget_policy: Mapping[str, Any] | None = None,
     structured_output: Mapping[str, Any] | None = None,
     finalization: Mapping[str, Any] | None = None,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
 ) -> ExecutionProfileIdentity:
     """Build a profile without retaining raw prompts, schemas, or tool names."""
 
@@ -1191,16 +1226,30 @@ def build_execution_profile_identity(
             {"system_prompt": durable_system_prompt},
         ),
         execution_profile_provider_target_component(provider_name, model),
-        execution_profile_runtime_component(runtime_name, runtime_version),
+        execution_profile_runtime_component(
+            runtime_name,
+            runtime_version,
+            runtime_build_provenance,
+        ),
     )
     sorted_components = tuple(sorted(components, key=lambda component: component.component_class))
     return ExecutionProfileIdentity(
         fingerprint=_profile_fingerprint(
             sorted_components,
             schema_version=EXECUTION_PROFILE_SCHEMA_VERSION,
+            runtime_build_provenance=(
+                legacy_runtime_build_provenance()
+                if runtime_build_provenance is None
+                else runtime_build_provenance
+            ),
         ),
         components=sorted_components,
         egress_authority=egress_authority,
+        runtime_build_provenance=(
+            legacy_runtime_build_provenance()
+            if runtime_build_provenance is None
+            else runtime_build_provenance
+        ),
     )
 
 
@@ -1223,21 +1272,41 @@ def execution_profile_provider_target_component(
 def execution_profile_runtime_component(
     runtime_name: str,
     runtime_version: str | None,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
 ) -> ExecutionProfileComponentIdentity:
     """Return the canonical runtime component used by profile construction."""
 
     runtime_name = require_durable_clean_nonblank(runtime_name, "runtime_name")
-    if runtime_version is None:
+    if runtime_build_provenance is not None and (
+        type(runtime_build_provenance) is not RuntimeBuildProvenance
+    ):
+        raise TypeError("runtime_build_provenance must be RuntimeBuildProvenance or None.")
+    if runtime_build_provenance is None or (
+        runtime_build_provenance.availability is RuntimeBuildProvenanceAvailability.UNAVAILABLE
+    ):
         return _unavailable_component(ExecutionProfileComponentClass.RUNTIME)
+    strength = {
+        RuntimeBuildProvenanceStrength.STRUCTURAL: ExecutionProfileIdentityStrength.STRUCTURAL,
+        RuntimeBuildProvenanceStrength.APPLICATION_VERSIONED: (
+            ExecutionProfileIdentityStrength.APPLICATION_VERSIONED
+        ),
+    }.get(runtime_build_provenance.strength)
+    if strength is None:
+        raise ValueError("Available runtime build provenance has invalid identity strength.")
     return _available_component(
         ExecutionProfileComponentClass.RUNTIME,
-        ExecutionProfileIdentityStrength.STRUCTURAL,
+        strength,
         {
+            "kind": "cayu:runtime-build-identity",
+            "schema_version": 1,
             "runtime_name": runtime_name,
-            "runtime_version": require_durable_clean_nonblank(
-                runtime_version,
-                "runtime_version",
+            "runtime_version": (
+                None
+                if runtime_version is None
+                else require_durable_clean_nonblank(runtime_version, "runtime_version")
             ),
+            "runtime_build_fingerprint": runtime_build_provenance.fingerprint,
+            "runtime_build_origin": runtime_build_provenance.origin.value,
         },
     )
 
@@ -1309,6 +1378,11 @@ def execution_profile_with_component(
     """Return a profile with one durable component identity replaced."""
 
     by_class = {item.component_class: item for item in profile.components}
+    if (
+        component.component_class is ExecutionProfileComponentClass.RUNTIME
+        and component != profile.component(ExecutionProfileComponentClass.RUNTIME)
+    ):
+        raise ValueError("Runtime components cannot be replaced without exact build provenance.")
     by_class[component.component_class] = component
     components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
     egress_authority = profile.egress_authority
@@ -1322,9 +1396,11 @@ def execution_profile_with_component(
         fingerprint=_profile_fingerprint(
             components,
             schema_version=profile.schema_version,
+            runtime_build_provenance=profile.runtime_build_provenance,
         ),
         components=components,
         egress_authority=egress_authority,
+        runtime_build_provenance=profile.runtime_build_provenance,
     )
 
 
@@ -1348,9 +1424,14 @@ def execution_profile_with_egress_authority(
     components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
     return ExecutionProfileIdentity(
         schema_version=profile.schema_version,
-        fingerprint=_profile_fingerprint(components, schema_version=profile.schema_version),
+        fingerprint=_profile_fingerprint(
+            components,
+            schema_version=profile.schema_version,
+            runtime_build_provenance=profile.runtime_build_provenance,
+        ),
         components=components,
         egress_authority=authority,
+        runtime_build_provenance=profile.runtime_build_provenance,
     )
 
 
@@ -1574,9 +1655,20 @@ def _profile_fingerprint(
     components: tuple[ExecutionProfileComponentIdentity, ...],
     *,
     schema_version: int,
+    runtime_build_provenance: RuntimeBuildProvenance | None = None,
 ) -> str:
     material = {
         "schema_version": schema_version,
         "components": [component.model_dump(mode="json") for component in components],
     }
+    if schema_version >= 6:
+        provenance = (
+            legacy_runtime_build_provenance()
+            if runtime_build_provenance is None
+            else runtime_build_provenance
+        )
+        material["runtime_build_provenance"] = provenance.model_dump(
+            mode="json",
+            exclude={"source_revision"},
+        )
     return sha256(canonical_durable_json_bytes(material, "execution_profile")).hexdigest()

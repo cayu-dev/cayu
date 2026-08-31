@@ -8,6 +8,7 @@ import warnings
 from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -81,6 +82,8 @@ from cayu import (
     ExecutionProfilePolicyError,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
     HttpEgressPolicy,
     InMemoryKnowledgeStore,
     InMemorySessionStore,
@@ -167,6 +170,11 @@ from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
     project_persisted_runtime_event,
 )
+from cayu.runtime.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
 from cayu.runtime.egress_authority_transitions import (
     _build_transition_record,
     _find_parked_egress_authority_allocation,
@@ -188,6 +196,14 @@ from cayu.runtime.sessions import (
     _with_runtime_resume_transport_metadata,
     execution_profile_adoption_request_fingerprint,
 )
+
+
+def _test_runtime_build_provenance() -> RuntimeBuildProvenance:
+    return RuntimeBuildProvenance.from_artifact_digest(
+        origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+        artifact_kind=RuntimeBuildArtifactKind.OTHER,
+        artifact_digest="a" * 64,
+    )
 
 
 def test_openai_background_mode_is_part_of_the_builtin_provider_profile() -> None:
@@ -237,6 +253,7 @@ def test_unknown_provider_retry_contract_is_an_explicit_finalization_migration()
         durable_system_prompt=None,
         direct_tools=(),
         tool_catalogue_revision=f"sha256:{'c' * 64}",
+        runtime_build_provenance=_test_runtime_build_provenance(),
         finalization={
             "kind": "cayu:model-finalization:v1",
             "max_steps": 16,
@@ -257,6 +274,7 @@ def test_unknown_provider_retry_contract_is_an_explicit_finalization_migration()
         durable_system_prompt=None,
         direct_tools=(),
         tool_catalogue_revision=f"sha256:{'c' * 64}",
+        runtime_build_provenance=_test_runtime_build_provenance(),
         finalization=current_material,
     )
 
@@ -1600,6 +1618,7 @@ def test_profile_strengths_report_identity_provenance() -> None:
             durable_system_prompt=None,
             runtime_name="cayu",
             runtime_version="test",
+            runtime_build_provenance=_test_runtime_build_provenance(),
             redactor=app._secret_redactor,
             process_identity=app._execution_profile_process_identity,
             registered_environment=app._get_registered_environment(None),
@@ -1778,7 +1797,7 @@ def _automatic_recall_context(
     )
 
 
-def test_schema_v5_covers_model_decision_semantics_without_raw_material() -> None:
+def test_schema_v6_covers_model_decision_semantics_without_raw_material() -> None:
     context_policy = _automatic_recall_context(
         CheckpointCompactionContextPolicy(
             compactor=TranscriptDigestCompactor(max_summary_chars=4096),
@@ -1806,7 +1825,7 @@ def test_schema_v5_covers_model_decision_semantics_without_raw_material() -> Non
         retry_policy=RetryPolicy(max_attempts=2),
     )
 
-    assert profile.schema_version == 5
+    assert profile.schema_version == 6
     assert {component.component_class for component in profile.components} == set(
         ExecutionProfileComponentClass
     )
@@ -2855,6 +2874,7 @@ def test_live_state_profile_component_records_explicit_absence_and_future_change
         durable_system_prompt=None,
         direct_tools=[],
         tool_catalogue_revision=f"sha256:{'c' * 64}",
+        runtime_build_provenance=_test_runtime_build_provenance(),
     )
     projected = build_execution_profile_identity(
         runtime_name="cayu",
@@ -2864,6 +2884,7 @@ def test_live_state_profile_component_records_explicit_absence_and_future_change
         durable_system_prompt=None,
         direct_tools=[],
         tool_catalogue_revision=f"sha256:{'c' * 64}",
+        runtime_build_provenance=_test_runtime_build_provenance(),
         live_state_projection={
             "kind": "runtime-state-snapshot",
             "version": 1,
@@ -2880,13 +2901,14 @@ def test_live_state_profile_component_records_explicit_absence_and_future_change
 
 
 def test_direct_tool_profile_requires_and_binds_catalogue_revision() -> None:
-    arguments = {
+    arguments: dict[str, Any] = {
         "runtime_name": "cayu",
         "runtime_version": "1",
         "provider_name": "fake",
         "model": "fake-model",
         "durable_system_prompt": None,
         "direct_tools": [],
+        "runtime_build_provenance": _test_runtime_build_provenance(),
     }
     with pytest.raises(ValueError, match="SHA-256 catalogue revision"):
         build_execution_profile_identity(
@@ -2909,7 +2931,7 @@ def test_direct_tool_profile_requires_and_binds_catalogue_revision() -> None:
 
 
 def test_public_profile_builder_default_implementation_binds_compact_tool_identities() -> None:
-    arguments = {
+    arguments: dict[str, Any] = {
         "runtime_name": "cayu",
         "runtime_version": "1",
         "provider_name": "fake",
@@ -5609,6 +5631,230 @@ def test_explicit_authorized_tool_profile_adoption_is_atomic_and_replayable() ->
             )
         )
         assert len(restarted_provider.requests) == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_authorized_runtime_build_adoption_advances_durable_identity_atomically(
+    monkeypatch,
+    tmp_path,
+    store_kind: str,
+) -> None:
+    async def exercise() -> None:
+        build_a = RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="a" * 64,
+            source_revision="revision-a",
+        )
+        build_b = RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="b" * 64,
+            source_revision="revision-b",
+        )
+        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.0")
+        monkeypatch.setattr(
+            session_engine_module,
+            "current_runtime_build_provenance",
+            lambda: build_a,
+        )
+        store = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "runtime-build-adoption.sqlite")
+        )
+        try:
+            original_app = CayuApp(session_store=store, enable_logging=False)
+            original_app.register_provider(_completed_provider(), default=True)
+            original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await _collect(
+                original_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="runtime-build-adoption",
+                        messages=[Message.text("user", "first")],
+                    )
+                )
+            )
+            before = await store.load("runtime-build-adoption")
+            assert before is not None
+            baseline = before.metadata[EXECUTION_PROFILE_METADATA_KEY]["baseline"]
+
+            monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.1")
+            monkeypatch.setattr(
+                session_engine_module,
+                "current_runtime_build_provenance",
+                lambda: build_b,
+            )
+            policy = RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="The reviewed runtime deployment is authorized.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            )
+            provider = _completed_provider()
+            adopted_app = CayuApp(
+                session_store=store,
+                execution_profile_policy=policy,
+                enable_logging=False,
+            )
+            adopted_app.register_provider(provider, default=True)
+            adopted_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            events = await _collect(
+                adopted_app.resume(
+                    ResumeRequest(
+                        session_id="runtime-build-adoption",
+                        messages=[Message.text("user", "second")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="adopt-runtime-build-b",
+                            reason="Move the session to reviewed build B.",
+                            requested_by=ResolutionActor(
+                                subject="maintainer",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+            assert len(policy.requests) == 1
+            assert len(provider.requests) == 1
+            assert events[0].payload["decision"] == ExecutionProfileDecisionKind.ADOPTED
+            after = await store.load("runtime-build-adoption")
+            assert after is not None
+            assert after.runtime_version == "0.4.1"
+            assert after.runtime_build_provenance == build_b
+            assert after.metadata[EXECUTION_PROFILE_METADATA_KEY]["baseline"] == baseline
+            assert (
+                after.metadata[EXECUTION_PROFILE_METADATA_KEY]["expected"]
+                == events[0].payload["candidate_profile"]
+            )
+
+            replay_provider = _completed_provider()
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(replay_provider, default=True)
+            replay_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await _collect(
+                replay_app.resume(
+                    ResumeRequest(
+                        session_id="runtime-build-adoption",
+                        messages=[Message.text("user", "third")],
+                    )
+                )
+            )
+            assert len(replay_provider.requests) == 1
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_authorized_current_child_fork_adopts_complete_runtime_identity_and_resumes(
+    monkeypatch,
+    tmp_path,
+    store_kind: str,
+) -> None:
+    async def exercise() -> None:
+        build_a = RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="a" * 64,
+        )
+        build_b = RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="b" * 64,
+        )
+        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.0")
+        monkeypatch.setattr(
+            session_engine_module,
+            "current_runtime_build_provenance",
+            lambda: build_a,
+        )
+        store = (
+            InMemorySessionStore()
+            if store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "runtime-build-fork-adoption.sqlite")
+        )
+        try:
+            original_app = CayuApp(session_store=store, enable_logging=False)
+            original_app.register_provider(_completed_provider(), default=True)
+            original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await _collect(
+                original_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="runtime-build-fork-source",
+                        messages=[Message.text("user", "first")],
+                    )
+                )
+            )
+
+            monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: "0.4.1")
+            monkeypatch.setattr(
+                session_engine_module,
+                "current_runtime_build_provenance",
+                lambda: build_b,
+            )
+            policy = RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="The reviewed child runtime deployment is authorized.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            )
+            provider = _completed_provider()
+            adopted_app = CayuApp(
+                session_store=store,
+                execution_profile_policy=policy,
+                enable_logging=False,
+            )
+            adopted_app.register_provider(provider, default=True)
+            adopted_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await _collect(
+                adopted_app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id="runtime-build-fork-source",
+                        session_id="runtime-build-fork-child",
+                        execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="adopt-current-child-runtime-build-b",
+                            reason="Create the child under reviewed build B.",
+                            requested_by=ResolutionActor(
+                                subject="maintainer",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+            child = await store.load("runtime-build-fork-child")
+            assert child is not None
+            assert child.runtime_name == "cayu"
+            assert child.runtime_version == "0.4.1"
+            assert child.runtime_build_provenance == build_b
+            child_profile = execution_profile_from_session_metadata(child.metadata)
+            assert child_profile.runtime_build_provenance == build_b
+
+            await _collect(
+                adopted_app.resume(
+                    ResumeRequest(
+                        session_id=child.id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            )
+            assert len(policy.requests) == 1
+            assert len(provider.requests) == 1
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
 
     asyncio.run(exercise())
 
@@ -8728,7 +8974,11 @@ def test_public_run_fails_closed_before_work_when_required_identity_is_unavailab
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: None)
+        monkeypatch.setattr(
+            session_engine_module,
+            "current_runtime_build_provenance",
+            lambda: RuntimeBuildProvenance.unavailable("test_unavailable"),
+        )
 
         with pytest.raises(RuntimeError, match="unavailable required components: runtime"):
             await _collect(

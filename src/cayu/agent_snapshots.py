@@ -38,6 +38,10 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
+from cayu.build_provenance import (
+    RuntimeBuildProvenance,
+    legacy_runtime_build_provenance,
+)
 
 if TYPE_CHECKING:
     from cayu.evals.models import Trajectory
@@ -327,6 +331,9 @@ class AgentSnapshotExecutionProfileRef(_SnapshotModel):
     schema_version: StrictInt = Field(ge=1)
     fingerprint: StrictStr
     components: tuple[AgentSnapshotExecutionProfileComponent, ...]
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
 
     @field_validator("fingerprint")
     @classmethod
@@ -345,6 +352,19 @@ class AgentSnapshotExecutionProfileRef(_SnapshotModel):
         names = tuple(component.name for component in self.components)
         if not names or names != tuple(sorted(set(names))):
             raise ValueError("Execution-profile components must be nonempty, unique, and sorted.")
+        if self.schema_version < 6 and self.runtime_build_provenance != (
+            legacy_runtime_build_provenance()
+        ):
+            raise ValueError("Legacy snapshot profiles cannot claim runtime build provenance.")
+        runtime = next(
+            (component for component in self.components if component.name == "runtime"), None
+        )
+        if runtime is None:
+            raise ValueError("Snapshot execution profiles require a runtime component.")
+        if self.schema_version == 6 and (runtime.availability == "unavailable") != (
+            self.runtime_build_provenance.availability.value == "unavailable"
+        ):
+            raise ValueError("Snapshot runtime availability conflicts with build provenance.")
         return self
 
 
@@ -1655,6 +1675,7 @@ def execution_profile_snapshot_ref(
             )
             for component in validated.components
         ),
+        runtime_build_provenance=validated.runtime_build_provenance,
     )
 
 

@@ -43,6 +43,7 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_receipt_matches_seed,
     require_durable_subagent_rejection_receipt_matches_seed,
 )
+from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.dispatch import (
     DispatchHandle,
     DispatchStatus,
@@ -102,6 +103,7 @@ class DurableSubagentPreparedRun:
     model: str
     runtime_name: str
     runtime_version: str | None
+    runtime_build_provenance: RuntimeBuildProvenance
     execution_profile: ExecutionProfileIdentity
 
 
@@ -756,6 +758,7 @@ class DurableSubagentCoordinator:
         child_model = prepared.model
         child_runtime_name = prepared.runtime_name
         child_runtime_version = prepared.runtime_version
+        child_runtime_build_provenance = prepared.runtime_build_provenance
         child_execution_profile = prepared.execution_profile
         # Do not retain the provider-bearing preparation bundle across the durable
         # checkpoint publication below. Store failures may escape with frame locals.
@@ -788,6 +791,7 @@ class DurableSubagentCoordinator:
             child_model=child_model,
             child_runtime_name=child_runtime_name,
             child_runtime_version=child_runtime_version,
+            child_runtime_build_provenance=child_runtime_build_provenance,
             environment_name=seed.environment_name,
             spawn_fingerprint=seed.spawn_fingerprint,
             child_session_id=seed.child_session_id,
@@ -935,6 +939,7 @@ class DurableSubagentCoordinator:
                         model=intent.child_model,
                         runtime_name=intent.child_runtime_name,
                         runtime_version=intent.child_runtime_version,
+                        runtime_build_provenance=(intent.child_runtime_build_provenance),
                         execution_profile=intent.child_execution_profile,
                     ),
                     checkpoint_transform=persist_child_submission,
@@ -990,6 +995,7 @@ class DurableSubagentCoordinator:
             or child.model != intent.child_model
             or child.runtime_name != intent.child_runtime_name
             or child.runtime_version != intent.child_runtime_version
+            or child.runtime_build_provenance != intent.child_runtime_build_provenance
             or child.environment_name != intent.environment_name
             or child.invocation
             != inherited_session_invocation(
@@ -1232,6 +1238,7 @@ class DurableSubagentCoordinator:
             or session.causal_budget_id != intent.causal_budget_id
             or session.runtime_name != intent.child_runtime_name
             or session.runtime_version != intent.child_runtime_version
+            or session.runtime_build_provenance != intent.child_runtime_build_provenance
             or execution_profile_from_session_metadata(session.metadata)
             != intent.child_execution_profile
         ):

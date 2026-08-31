@@ -89,6 +89,27 @@ guard.
 
 ## Unreleased
 
+### Durable runtime identity is bound to immutable build provenance
+
+Sessions now retain a typed `RuntimeBuildProvenance` manifest and bind its exact
+lowercase SHA-256 fingerprint into execution-profile schema 6. Wheel installs
+derive structural identity from hashed `RECORD` entries; OCI and other immutable
+deployments can provide a bounded explicit manifest; editable source installs
+use an explicitly weaker deterministic content identity. Source revision remains
+diagnostic and semantic `runtime_version` remains separate. Legacy sessions are
+reported as provenance unavailable rather than being assigned the current
+worker's build.
+
+The identity propagates through session creation, resume, fork, lifecycle
+receipts, prepared durable children, storage projections, server responses,
+`cayu session show`, snapshots, and portable bundles. A worker with another
+build fingerprint rejects queued or resumable work before provider dispatch.
+The server contract advances from version 38 to version 39, the
+session-inspection CLI schema to version 8, and prepared durable-subagent intent
+to schema 3. Production
+deployments can set `CAYU_REQUIRE_STRONG_RUNTIME_BUILD_PROVENANCE=1`; mixed-build
+rollouts must drain or route existing exact-profile work to matching workers.
+
 ### AgentBundle ships as one deterministic `.cayu` file
 
 The downloadable representation of one `AgentBundle` is now a regular `.cayu`

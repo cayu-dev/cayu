@@ -239,6 +239,7 @@ from cayu.runtime.budgets import (
     SessionBudgetStore,
     copy_budget_policy,
 )
+from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
@@ -935,6 +936,9 @@ class CayuApp:
         max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        # Resolve once at application startup. Strict deployments fail here,
+        # before any session or provider authority can be admitted.
+        current_runtime_build_provenance()
         if session_store is not None and not isinstance(session_store, SessionStore):
             raise TypeError("session_store must be a SessionStore.")
         if task_store is not None and not isinstance(task_store, TaskStore):
@@ -4828,6 +4832,7 @@ class CayuApp:
                 model=prepared.session_identity.model,
                 runtime_name=prepared.session_identity.runtime_name,
                 runtime_version=prepared.session_identity.runtime_version,
+                runtime_build_provenance=(prepared.session_identity.runtime_build_provenance),
                 execution_profile=prepared.execution_profile,
             )
         finally:
@@ -6550,6 +6555,7 @@ class CayuApp:
                     model=request.session.model,
                     runtime_name=request.session.runtime_name,
                     runtime_version=request.session.runtime_version,
+                    runtime_build_provenance=(request.session.runtime_build_provenance),
                     environment_name=request.session.environment_name,
                 ),
                 validated_profile=execution_profile,

@@ -1892,6 +1892,7 @@ from cayu import (
     TaskInvocationSnapshot,
     TaskStatus,
     ToolCapabilityCeiling,
+    current_runtime_build_provenance,
 )
 from cayu.runtime import ActiveInvocationExecutionProfile, AdmitInvocationCommand
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
@@ -1958,6 +1959,7 @@ def profiled_session_identity(
 ) -> SessionIdentity:
     # Mirror the runtime-owned identity for this manually seeded resume fixture.
     runtime_version = version("cayu")
+    runtime_build_provenance = current_runtime_build_provenance()
     registered_agent = app._agents[agent_name]
     engine = app._session_engine
     invocation_loop_policy_identities = tuple(
@@ -1968,10 +1970,12 @@ def profiled_session_identity(
         model=model,
         runtime_name="cayu",
         runtime_version=runtime_version,
+        runtime_build_provenance=runtime_build_provenance,
         execution_profile=execution_profile_admission.resolve_execution_profile_identity(
             registered_agent=registered_agent,
             runtime_name="cayu",
             runtime_version=runtime_version,
+            runtime_build_provenance=runtime_build_provenance,
             provider_name=provider_name,
             model=model,
             durable_system_prompt=registered_agent.spec.system_prompt,

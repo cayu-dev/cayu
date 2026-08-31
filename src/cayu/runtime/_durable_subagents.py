@@ -18,6 +18,7 @@ from cayu._validation import (
 )
 from cayu.core.messages import Message
 from cayu.runtime._child_session_identity import ChildSessionKind, generate_child_session_id
+from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.sessions import RunRequest, copy_run_request
 from cayu.vaults import SecretRedactor
@@ -27,7 +28,7 @@ DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY = "durable_subagent_submission_
 DURABLE_SUBAGENT_SEED_RECORD_TYPE = "cayu.durable-subagent-submission-seed"
 DURABLE_SUBAGENT_SEED_SCHEMA_VERSION = 1
 DURABLE_SUBAGENT_INTENT_RECORD_TYPE = "cayu.durable-subagent-submission"
-DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION = 2
+DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION = 3
 DURABLE_SUBAGENT_RECEIPT_RECORD_TYPE = "cayu.durable-subagent-submission-receipt"
 DURABLE_SUBAGENT_RECEIPT_SCHEMA_VERSION = 1
 
@@ -805,11 +806,12 @@ class DurableSubagentSubmissionIntent(_DurableSubagentAuthorityRecord):
     """Immutable mapping persisted before a durable child queue task is published."""
 
     record_type: Literal["cayu.durable-subagent-submission"] = DURABLE_SUBAGENT_INTENT_RECORD_TYPE
-    schema_version: Literal[2] = DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION
+    schema_version: Literal[3] = DURABLE_SUBAGENT_INTENT_SCHEMA_VERSION
     child_provider_name: str
     child_model: str
     child_runtime_name: str
     child_runtime_version: str | None
+    child_runtime_build_provenance: RuntimeBuildProvenance
     seed_sha256: str
     child_execution_profile: ExecutionProfileIdentity
     submission_sha256: str

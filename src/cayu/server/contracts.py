@@ -89,6 +89,7 @@ from cayu.runtime.aggregates import (
     UsageSessionAggregateBreakdown,
     UsageSessionCostBreakdown,
 )
+from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     CostLineItem,
@@ -2041,6 +2042,7 @@ class ApiSessionBase(ApiBaseModel):
     causal_budget_id: str | None
     runtime_name: str
     runtime_version: str | None
+    runtime_build_provenance: RuntimeBuildProvenance
     environment_name: str | None
     created_at: str
     updated_at: str
@@ -2209,6 +2211,7 @@ class ApiSessionTopologyNode(ApiBaseModel):
     causal_budget_id: SessionTopologyIdentifier
     runtime_name: str
     runtime_version: str | None
+    runtime_build_provenance: RuntimeBuildProvenance
     environment_name: str | None
     status: str
     created_at: str

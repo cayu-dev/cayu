@@ -58,7 +58,11 @@ JSONL row also carries the schema version so independently consumed
 `model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
 the version 1 representation.
 
-Session-inspection CLI schema version `7` extends the bounded
+Session-inspection CLI schema version `8` adds the exact bounded
+`runtime_build_provenance` manifest to `session show`. Operators can distinguish
+same-version builds, inspect typed OCI or wheel origin, and see explicit weak or
+unavailable legacy evidence without reading runtime-owned metadata. Version `8`
+retains version `7`'s bounded
 `provider_operation` object with `provider_operation_unavailable`,
 `ambiguous_submission`, and `fallback_retry`; a recovery reason; duplicate
 request risk; allowed resolutions; and the exact `stage_id` and `run_epoch`

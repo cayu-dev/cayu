@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import field as dataclass_field
 from enum import StrEnum
 from hashlib import sha256
 from typing import Annotated, Any, Literal, Never, SupportsIndex, TypeAlias, cast
@@ -42,6 +43,11 @@ from cayu.core.events import (
 from cayu.core.messages import Message, detach_message
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime.budgets import BudgetPolicy
+from cayu.runtime.build_provenance import (
+    RuntimeBuildProvenance,
+    copy_runtime_build_provenance,
+    legacy_runtime_build_provenance,
+)
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
@@ -51,6 +57,7 @@ from cayu.runtime.checkpoints import (
 from cayu.runtime.execution_profiles import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     ActiveInvocationExecutionProfile,
+    ExecutionProfileComponentClass,
     ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
@@ -77,6 +84,7 @@ from cayu.runtime.sessions import (
     SessionInvocationAdmission,
     SessionModelTransition,
     SessionRunFenced,
+    SessionRuntimeIdentity,
     SessionStatus,
     SessionStore,
     _authenticated_session_instance_id_for_run_request,
@@ -86,6 +94,7 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session,
     copy_session_identity,
+    copy_session_runtime_identity,
     runtime_prepared_session_authority,
     runtime_publication_checkpoint_mutation,
     session_user_metadata,
@@ -157,6 +166,12 @@ def _validate_invocation_binding(binding: Any) -> None:
                 field_name,
                 require_durable_clean_nonblank(value, field_name),
             )
+    provenance = binding.runtime_build_provenance
+    object.__setattr__(
+        binding,
+        "runtime_build_provenance",
+        copy_runtime_build_provenance(provenance),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +188,9 @@ class PreparedInvocationBinding:
     runtime_name: str
     runtime_version: str | None
     environment_name: str | None
+    runtime_build_provenance: RuntimeBuildProvenance = dataclass_field(
+        default_factory=legacy_runtime_build_provenance
+    )
 
     def __post_init__(self) -> None:
         _validate_invocation_binding(self)
@@ -192,6 +210,9 @@ class AdmittedInvocationBinding:
     runtime_name: str
     runtime_version: str | None
     environment_name: str | None
+    runtime_build_provenance: RuntimeBuildProvenance = dataclass_field(
+        default_factory=legacy_runtime_build_provenance
+    )
 
     def __post_init__(self) -> None:
         _validate_invocation_binding(self)
@@ -431,6 +452,7 @@ class InvocationContext:
                 or session.model != binding.model
                 or session.runtime_name != binding.runtime_name
                 or session.runtime_version != binding.runtime_version
+                or session.runtime_build_provenance != binding.runtime_build_provenance
                 or session.environment_name != binding.environment_name
             ):
                 raise ValueError("Invocation context cannot replace its admitted session.")
@@ -444,6 +466,7 @@ class InvocationContext:
             or session.model != binding.model
             or session.runtime_name != binding.runtime_name
             or session.runtime_version != binding.runtime_version
+            or session.runtime_build_provenance != binding.runtime_build_provenance
             or session.environment_name != binding.environment_name
         ):
             raise ValueError("Admitted session conflicts with prepared invocation authority.")
@@ -460,6 +483,7 @@ class InvocationContext:
                 runtime_name=binding.runtime_name,
                 runtime_version=binding.runtime_version,
                 environment_name=binding.environment_name,
+                runtime_build_provenance=binding.runtime_build_provenance,
             ),
             validated_profile=self.profile,
             registered_agent=self.registered_agent,
@@ -673,6 +697,7 @@ class InvocationContext:
             or session.model != binding.model
             or session.runtime_name != binding.runtime_name
             or session.runtime_version != binding.runtime_version
+            or session.runtime_build_provenance != binding.runtime_build_provenance
             or session.environment_name != binding.environment_name
             or active_profile.session_id != session.id
             or active_profile.interaction_id != binding.interaction_id
@@ -693,6 +718,7 @@ class InvocationContext:
                 runtime_name=session.runtime_name,
                 runtime_version=session.runtime_version,
                 environment_name=session.environment_name,
+                runtime_build_provenance=session.runtime_build_provenance,
             ),
             validated_profile=self.profile,
             registered_agent=self.registered_agent,
@@ -905,6 +931,7 @@ class CreateInvocationCommand(_InvocationCommandModel):
         runtime_component = execution_profile_runtime_component(
             self.identity.runtime_name,
             self.identity.runtime_version,
+            self.identity.runtime_build_provenance,
         )
         if (
             self.active_profile.profile.component(runtime_component.component_class)
@@ -928,6 +955,7 @@ class AdmitInvocationCommand(_InvocationCommandModel):
     defer_interaction_source: StrictBool = False
     model_transition: SessionModelTransition | None = None
     execution_profile_decision: ExecutionProfileDecision | None = None
+    adopted_runtime_identity: SessionRuntimeIdentity | None = None
     expected_active_profile: ActiveInvocationExecutionProfile | None = None
     allow_pending_initial_interaction: StrictBool = False
 
@@ -970,6 +998,18 @@ class AdmitInvocationCommand(_InvocationCommandModel):
     def copy_optional_event(cls, value: Event | None) -> Event | None:
         return None if value is None else copy_event(value)
 
+    @field_validator("adopted_runtime_identity", mode="before")
+    @classmethod
+    def copy_optional_runtime_identity(
+        cls,
+        value: object,
+    ) -> SessionRuntimeIdentity | None:
+        if value is None:
+            return None
+        if isinstance(value, SessionRuntimeIdentity):
+            return copy_session_runtime_identity(value)
+        return SessionRuntimeIdentity.model_validate(value)
+
     @field_validator("continued_interaction_id")
     @classmethod
     def validate_continued_interaction(cls, value: str | None) -> str | None:
@@ -986,6 +1026,30 @@ class AdmitInvocationCommand(_InvocationCommandModel):
             raise ValueError("Admission target belongs to another session.")
         if target.run_epoch != self.expected_run_epoch + 1:
             raise ValueError("Admission target must claim the next run epoch.")
+        decision = self.execution_profile_decision
+        runtime_changed = (
+            decision is not None
+            and ExecutionProfileComponentClass.RUNTIME in decision.changed_component_classes
+        )
+        requires_runtime_identity = (
+            runtime_changed
+            and decision is not None
+            and decision.kind is ExecutionProfileDecisionKind.ADOPTED
+        )
+        if requires_runtime_identity != (self.adopted_runtime_identity is not None):
+            raise ValueError(
+                "An adopted runtime profile change requires its exact target runtime identity."
+            )
+        if self.adopted_runtime_identity is not None:
+            runtime_component = execution_profile_runtime_component(
+                self.adopted_runtime_identity.runtime_name,
+                self.adopted_runtime_identity.runtime_version,
+                self.adopted_runtime_identity.runtime_build_provenance,
+            )
+            if target.profile.component(ExecutionProfileComponentClass.RUNTIME) != (
+                runtime_component
+            ):
+                raise ValueError("Adopted runtime identity conflicts with admission authority.")
         expected = self.expected_active_profile
         if expected is not None:
             if expected.session_id != self.session_id:
@@ -1342,6 +1406,7 @@ class _InvocationLifecycleCommandReceipt(BaseModel):
         runtime_component = execution_profile_runtime_component(
             self.result_session.runtime_name,
             self.result_session.runtime_version,
+            self.result_session.runtime_build_provenance,
         )
         if result_profile.component(runtime_component.component_class) != runtime_component:
             raise ValueError(
@@ -1605,6 +1670,7 @@ def _require_receipt_result_matches_live_session(
         or result.causal_budget_id != session.causal_budget_id
         or result.runtime_name != session.runtime_name
         or result.runtime_version != session.runtime_version
+        or result.runtime_build_provenance != session.runtime_build_provenance
         or result.environment_name != session.environment_name
         or result.created_at != session.created_at
         or result.invocation != session.invocation
@@ -1651,6 +1717,15 @@ def _require_receipt_result_matches_command(
             result.status is not SessionStatus.RUNNING
             or tool_capability_ceiling_from_session_metadata(result.metadata)
             != command.tool_capability_ceiling
+            or (
+                command.adopted_runtime_identity is not None
+                and (
+                    result.runtime_name != command.adopted_runtime_identity.runtime_name
+                    or result.runtime_version != command.adopted_runtime_identity.runtime_version
+                    or result.runtime_build_provenance
+                    != command.adopted_runtime_identity.runtime_build_provenance
+                )
+            )
         ):
             raise RuntimeError("Durable invocation admission receipt forged its result snapshot.")
         return
@@ -2618,6 +2693,7 @@ async def apply_invocation_lifecycle_command(
                         defer_interaction_source=copied.defer_interaction_source,
                         model_transition=copied.model_transition,
                         execution_profile_decision=copied.execution_profile_decision,
+                        adopted_runtime_identity=copied.adopted_runtime_identity,
                         expected_active_invocation_profile=copied.expected_active_profile,
                         allow_pending_initial_interaction=(
                             copied.allow_pending_initial_interaction

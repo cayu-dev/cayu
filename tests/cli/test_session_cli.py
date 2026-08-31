@@ -140,7 +140,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "7",
+        "schema_version": "8",
         "sessions": [
             {
                 "agent": "writer",
@@ -269,7 +269,7 @@ def test_session_resolve_provider_operation_posts_fenced_server_request(
     }
     output = json.loads(capsys.readouterr().out)
     assert output == {
-        "schema_version": "7",
+        "schema_version": "8",
         "accepted": True,
         "session_id": "session_757",
         "stage_id": "stage_757",
@@ -1581,7 +1581,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
-    assert {row["schema_version"] for row in jsonl_rows} == {"7"}
+    assert {row["schema_version"] for row in jsonl_rows} == {"8"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
     assert aggregate_row["total_tokens"] == "12"
 
@@ -1640,7 +1640,7 @@ def test_session_usage_json_serializes_aggregate_counters_losslessly(
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == "7"
+    assert payload["schema_version"] == "8"
     assert payload["aggregate"]["input_tokens"] == expected
     assert payload["aggregate"]["total_tokens"] == expected
 
@@ -3120,7 +3120,7 @@ def test_session_cli_lists_and_filters_response_scoped_interactions(
         == 0
     )
     listed = json.loads(capsys.readouterr().out)
-    assert listed["schema_version"] == "7"
+    assert listed["schema_version"] == "8"
     assert [item["interaction_id"] for item in listed["interactions"]] == [
         "interaction-b",
         "interaction-a",

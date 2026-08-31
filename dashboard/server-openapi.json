@@ -2725,6 +2725,9 @@
             ],
             "title": "Provider Name"
           },
+          "runtime_build_provenance": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenance"
+          },
           "runtime_name": {
             "title": "Runtime Name",
             "type": "string"
@@ -2759,6 +2762,7 @@
           "causal_budget_id",
           "runtime_name",
           "runtime_version",
+          "runtime_build_provenance",
           "environment_name",
           "created_at",
           "updated_at",
@@ -2845,6 +2849,9 @@
             ],
             "title": "Provider Name"
           },
+          "runtime_build_provenance": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenance"
+          },
           "runtime_name": {
             "title": "Runtime Name",
             "type": "string"
@@ -2879,6 +2886,7 @@
           "causal_budget_id",
           "runtime_name",
           "runtime_version",
+          "runtime_build_provenance",
           "environment_name",
           "created_at",
           "updated_at",
@@ -2972,6 +2980,9 @@
             ],
             "title": "Provider Name"
           },
+          "runtime_build_provenance": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenance"
+          },
           "runtime_name": {
             "title": "Runtime Name",
             "type": "string"
@@ -3006,6 +3017,7 @@
           "causal_budget_id",
           "runtime_name",
           "runtime_version",
+          "runtime_build_provenance",
           "environment_name",
           "created_at",
           "updated_at",
@@ -3246,6 +3258,9 @@
             "title": "Provider Name",
             "type": "string"
           },
+          "runtime_build_provenance": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenance"
+          },
           "runtime_name": {
             "title": "Runtime Name",
             "type": "string"
@@ -3279,6 +3294,7 @@
           "causal_budget_id",
           "runtime_name",
           "runtime_version",
+          "runtime_build_provenance",
           "environment_name",
           "status",
           "created_at",
@@ -17255,13 +17271,17 @@
             "title": "Fingerprint",
             "type": "string"
           },
+          "runtime_build_provenance": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenance"
+          },
           "schema_version": {
-            "default": 5,
+            "default": 6,
             "enum": [
               1,
               2,
               4,
-              5
+              5,
+              6
             ],
             "title": "Schema Version",
             "type": "integer"
@@ -26786,6 +26806,137 @@
         "title": "RunLimits",
         "type": "object"
       },
+      "RuntimeBuildArtifactKind": {
+        "description": "Digest domain whose bytes or manifest identify the build.",
+        "enum": [
+          "wheel",
+          "oci_image",
+          "source_tree",
+          "other"
+        ],
+        "title": "RuntimeBuildArtifactKind",
+        "type": "string"
+      },
+      "RuntimeBuildProvenance": {
+        "additionalProperties": false,
+        "description": "Versioned, bounded identity for the exact Cayu runtime build.",
+        "properties": {
+          "artifact_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Digest"
+          },
+          "artifact_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeBuildArtifactKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "availability": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenanceAvailability"
+          },
+          "detail_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail Code"
+          },
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenanceOrigin"
+          },
+          "recipe": {
+            "const": "cayu.runtime-build-provenance.v1",
+            "default": "cayu.runtime-build-provenance.v1",
+            "title": "Recipe",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Revision"
+          },
+          "strength": {
+            "$ref": "#/components/schemas/RuntimeBuildProvenanceStrength"
+          }
+        },
+        "required": [
+          "origin",
+          "availability",
+          "strength"
+        ],
+        "title": "RuntimeBuildProvenance",
+        "type": "object"
+      },
+      "RuntimeBuildProvenanceAvailability": {
+        "description": "Whether exact build identity is available for admission.",
+        "enum": [
+          "available",
+          "unavailable"
+        ],
+        "title": "RuntimeBuildProvenanceAvailability",
+        "type": "string"
+      },
+      "RuntimeBuildProvenanceOrigin": {
+        "description": "Boundary that supplied one runtime build identity.",
+        "enum": [
+          "wheel_record",
+          "oci_image_digest",
+          "development_source_tree",
+          "explicit_manifest",
+          "legacy_record",
+          "unavailable"
+        ],
+        "title": "RuntimeBuildProvenanceOrigin",
+        "type": "string"
+      },
+      "RuntimeBuildProvenanceStrength": {
+        "description": "Execution-profile strength vocabulary for runtime build identity.",
+        "enum": [
+          "structural",
+          "application_versioned",
+          "unavailable"
+        ],
+        "title": "RuntimeBuildProvenanceStrength",
+        "type": "string"
+      },
       "RuntimeManifest": {
         "additionalProperties": false,
         "properties": {
@@ -27870,7 +28021,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "38",
+            "default": "39",
             "title": "Contract Version",
             "type": "string"
           },
@@ -32379,7 +32530,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "38",
+            "default": "39",
             "title": "Contract Version",
             "type": "string"
           }

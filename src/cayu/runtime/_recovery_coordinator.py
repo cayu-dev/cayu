@@ -1570,6 +1570,7 @@ class RecoveryCoordinator:
                 model=session.model,
                 runtime_name=session.runtime_name,
                 runtime_version=session.runtime_version,
+                runtime_build_provenance=session.runtime_build_provenance,
                 environment_name=session.environment_name,
             ),
             validated_profile=active_profile.profile,

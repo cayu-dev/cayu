@@ -22,6 +22,7 @@ from cayu import (
 )
 from cayu.core import Event, EventType, Message, ThinkingPart, ToolCallPart
 from cayu.runtime import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     EventRecord,
     ForkSessionRequest,
     InMemorySessionStore,
@@ -2728,7 +2729,12 @@ def test_session_stores_release_run_ownership_after_terminal_status(
 
         await asyncio.create_task(second_run())
         updated = await store.update_metadata("sess_sequential_runs", {"runs": 2})
-        assert updated.metadata == {"runs": 2}
+        assert {
+            key: value
+            for key, value in updated.metadata.items()
+            if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+        } == {"runs": 2}
+        assert updated.runtime_build_provenance.fingerprint is None
         await _close_store(store)
 
     asyncio.run(run_store_operations())
@@ -2959,11 +2965,16 @@ def test_session_stores_update_metadata_replaces(store_factory, tmp_path):
         before_edit = await store.load("sess_meta")
         assert before_edit is not None
         updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
-        assert updated.metadata == {
+        assert {
+            key: value
+            for key, value in updated.metadata.items()
+            if key != RUNTIME_BUILD_PROVENANCE_METADATA_KEY
+        } == {
             "b": [1, 2],
             "subagent": {"mode": "background"},
             "cayu:taint_labels": ["untrusted"],
         }
+        assert updated.runtime_build_provenance.fingerprint is None
         assert updated.updated_at >= before_edit.updated_at
         assert updated.last_activity_at == before_edit.last_activity_at
         # Updating metadata must not change the session's status.

@@ -6,11 +6,14 @@ import multiprocessing
 import warnings
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from hashlib import sha256
 
 import psycopg
 import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
+import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime.app as runtime_app_module
 from cayu.core import (
     AgentSpec,
     Event,
@@ -35,6 +38,9 @@ from cayu.runtime import (
     InMemoryTaskStore,
     InterruptSessionRequest,
     RunRequest,
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
     RuntimeHook,
     SessionQuery,
     SessionStatus,
@@ -1028,9 +1034,12 @@ def test_durable_subagent_creates_child_before_claimable_task_and_worker_complet
             queued[0].input["dispatch"]["prepared_subagent"]["authority"]["child_session_id"]
             == child.id
         )
-        assert persisted_intent["schema_version"] == 2
+        assert persisted_intent["schema_version"] == 3
         assert persisted_intent["child_runtime_name"] == child.runtime_name
         assert persisted_intent["child_runtime_version"] == child.runtime_version
+        assert persisted_intent["child_runtime_build_provenance"] == (
+            child.runtime_build_provenance.model_dump(mode="json")
+        )
 
         direct_recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
@@ -4609,6 +4618,85 @@ def test_worker_rejects_changed_child_execution_profile_before_provider_dispatch
         completed_child = await sessions.load(child.id)
         assert completed_child is not None
         assert completed_child.status is SessionStatus.COMPLETED
+        assert len(provider.requests) == 3
+
+    asyncio.run(run())
+
+
+def test_worker_rejects_changed_runtime_build_before_provider_dispatch(monkeypatch) -> None:
+    async def run() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(tasks)
+        provider = _DurableSubagentProvider()
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            dispatcher=dispatcher,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        _register_durable_subagent_agents(app)
+        await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="parent",
+                    session_id="durable-runtime-build-parent",
+                    messages=[Message.text("user", "parent task")],
+                )
+            )
+        )
+        child = (
+            await sessions.list_sessions(
+                SessionQuery(parent_session_id="durable-runtime-build-parent")
+            )
+        ).sessions[0]
+        build_b = RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest=sha256(b"runtime-build-b").hexdigest(),
+        )
+        worker_dispatcher = TaskStoreDispatcher(tasks)
+        worker_provider = _DurableSubagentProvider()
+
+        with monkeypatch.context() as build_b_context:
+            build_b_context.setattr(
+                runtime_app_module,
+                "current_runtime_build_provenance",
+                lambda: build_b,
+            )
+            build_b_context.setattr(
+                session_engine_module,
+                "current_runtime_build_provenance",
+                lambda: build_b,
+            )
+            worker = CayuApp(
+                session_store=sessions,
+                task_store=tasks,
+                dispatcher=worker_dispatcher,
+                enable_logging=False,
+            )
+            worker.register_provider(worker_provider, default=True)
+            _register_durable_subagent_agents(worker)
+
+            handle = await worker_dispatcher.process_next(
+                worker,
+                worker_id="runtime-build-b-worker",
+            )
+
+        assert handle is not None
+        assert handle.status.value == "submitted"
+        unchanged_child = await sessions.load(child.id)
+        assert unchanged_child is not None
+        assert unchanged_child.status is SessionStatus.PENDING
+        assert unchanged_child.runtime_build_provenance != build_b
+        queued = (await tasks.list_tasks(TaskQuery()))[0]
+        assert queued.status is TaskStatus.PENDING
+        assert worker_provider.requests == []
+
+        compatible = await dispatcher.process_next(app, worker_id="runtime-build-a-worker")
+        assert compatible is not None
+        assert compatible.status.value == "completed"
         assert len(provider.requests) == 3
 
     asyncio.run(run())

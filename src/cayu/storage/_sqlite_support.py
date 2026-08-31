@@ -22,6 +22,7 @@ from cayu.core.messages import Message
 from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.sessions import (
     PENDING_ACTION_EVENT_TYPE_VALUES,
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     PendingActionSession,
     RunRequest,
@@ -31,6 +32,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     deferred_interaction_input_from_storage_payload,
     deferred_interaction_input_storage_payload,
+    runtime_build_provenance_from_session_metadata,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
@@ -9895,6 +9897,15 @@ def pending_action_session_from_row(
         causal_budget_id=row["causal_budget_id"],
         runtime_name=row["runtime_name"],
         runtime_version=row["runtime_version"],
+        runtime_build_provenance=runtime_build_provenance_from_session_metadata(
+            {}
+            if row["runtime_build_provenance_json"] is None
+            else {
+                RUNTIME_BUILD_PROVENANCE_METADATA_KEY: json.loads(
+                    row["runtime_build_provenance_json"]
+                )
+            }
+        ),
         environment_name=row["environment_name"],
         status=SessionStatus(row["status"]),
         created_at=parse_datetime(row["created_at"]),

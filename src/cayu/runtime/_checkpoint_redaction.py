@@ -19,6 +19,10 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     execution_profile_from_session_metadata,
 )
+from cayu.runtime.sessions import (
+    RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    runtime_build_provenance_from_session_metadata,
+)
 from cayu.runtime.structured_output import json_schema_contains_secret
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
@@ -201,6 +205,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "label",
     "runtime_authored_user_message",
     "runtime_authored_anchors",
+    "runtime_build_provenance",
     "limits",
     "match",
     "match_prefixes",
@@ -503,6 +508,20 @@ _ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS = frozenset(
         "availability",
     }
 )
+_RUNTIME_BUILD_PROVENANCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "recipe",
+        "origin",
+        "availability",
+        "strength",
+        "fingerprint",
+        "artifact_kind",
+        "artifact_digest",
+        "source_revision",
+        "detail_code",
+    }
+)
 _WORKSPACE_OBSERVATION_IDENTITY_FIELDS = frozenset(
     {
         "record_type",
@@ -708,6 +727,7 @@ def durable_value_contains_secret(
                     or _is_durable_subagent_structural_key(path, key)
                     or _is_completion_result_event_publication_structural_key(path, key)
                     or _is_invocation_lifecycle_receipt_structural_key(path, key)
+                    or _is_active_invocation_build_provenance_structural_key(path, key)
                     or (path, key) in _trusted_lifecycle_receipt_keys
                     or _is_quarantined_assistant_message_structural_key(path, key)
                     or _is_staged_terminal_event_payload(path)
@@ -892,6 +912,23 @@ def _invocation_lifecycle_receipt_metadata_authority(
 
     for receipt in ledger.receipts:
         raw_metadata = receipt.result_session.metadata
+        profile_path = (
+            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+            "receipts",
+            "result_session",
+            "metadata",
+        )
+        raw_provenance = raw_metadata.get(RUNTIME_BUILD_PROVENANCE_METADATA_KEY)
+        if raw_provenance is not None:
+            try:
+                provenance = runtime_build_provenance_from_session_metadata(raw_metadata)
+            except (TypeError, ValueError):
+                return frozenset(), frozenset()
+            trusted_keys.add((profile_path, RUNTIME_BUILD_PROVENANCE_METADATA_KEY))
+            retain_projection(
+                provenance.model_dump(mode="json"),
+                (*profile_path, RUNTIME_BUILD_PROVENANCE_METADATA_KEY),
+            )
         if EXECUTION_PROFILE_METADATA_KEY not in raw_metadata:
             continue
         raw_profile_record = raw_metadata[EXECUTION_PROFILE_METADATA_KEY]
@@ -905,12 +942,6 @@ def _invocation_lifecycle_receipt_metadata_authority(
             expected = ExecutionProfileIdentity.model_validate(raw_profile_record["expected"])
         except (TypeError, ValueError):
             return frozenset(), frozenset()
-        profile_path = (
-            INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-            "receipts",
-            "result_session",
-            "metadata",
-        )
         trusted_keys.add((profile_path, EXECUTION_PROFILE_METADATA_KEY))
         record_path = (*profile_path, EXECUTION_PROFILE_METADATA_KEY)
         for key in ("record_type", "schema_version", "baseline", "expected"):
@@ -935,6 +966,17 @@ def _invocation_lifecycle_receipt_metadata_authority(
 def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:
     if path in _ACTIVE_INVOCATION_PROFILE_ROOT_IDENTITY_PATHS:
         return True
+    if (
+        len(path) == 4
+        and path[:3]
+        == (
+            ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            "profile",
+            "runtime_build_provenance",
+        )
+        and path[-1] in _RUNTIME_BUILD_PROVENANCE_FIELDS
+    ):
+        return True
     return (
         len(path) == 4
         and path[:3]
@@ -944,6 +986,23 @@ def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:
             "components",
         )
         and path[-1] in _ACTIVE_INVOCATION_PROFILE_COMPONENT_IDENTITY_FIELDS
+    )
+
+
+def _is_active_invocation_build_provenance_structural_key(
+    path: tuple[str, ...],
+    key: str,
+) -> bool:
+    if path == (ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY, "profile"):
+        return key == "runtime_build_provenance"
+    return (
+        path
+        == (
+            ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+            "profile",
+            "runtime_build_provenance",
+        )
+        and key in _RUNTIME_BUILD_PROVENANCE_FIELDS
     )
 
 
@@ -1000,6 +1059,13 @@ def _is_invocation_lifecycle_receipt_identity_path(path: tuple[str, ...]) -> boo
             "root_session_id",
             "source",
         }
+    if len(path) == 5 and path[:4] == (
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        "receipts",
+        "active_profile",
+        "profile",
+    ):
+        return path[4] == "runtime_build_provenance"
     return (
         len(path) >= 4
         and path[:3]

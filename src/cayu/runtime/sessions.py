@@ -187,6 +187,12 @@ from cayu.runtime.budgets import (
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
+from cayu.runtime.build_provenance import (
+    RuntimeBuildProvenance,
+    copy_runtime_build_provenance,
+    legacy_runtime_build_provenance,
+    runtime_build_provenance_identity,
+)
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
@@ -220,6 +226,8 @@ from cayu.runtime.execution_profiles import (
     execution_profile_changes_authority,
     execution_profile_from_session_metadata,
     execution_profile_metadata_after_adoption,
+    execution_profile_provider_target_component,
+    execution_profile_runtime_component,
     execution_profile_session_metadata,
 )
 from cayu.runtime.execution_units import (
@@ -968,6 +976,7 @@ FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_group_source_snapshot"
 FORK_EXECUTION_PROFILE_RECORD_TYPE = "cayu.session-fork-execution-profile"
 FORK_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
+RUNTIME_BUILD_PROVENANCE_METADATA_KEY = "cayu:runtime_build_provenance"
 SESSION_CREATE_CLAIM_RECORD_TYPE = "cayu.session-create-claim"
 SESSION_CREATE_CLAIM_SCHEMA_VERSION = 1
 SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
@@ -3085,6 +3094,41 @@ def apply_fork_system_prompt_replacement(
     return retained_messages, retained_interaction_ids
 
 
+class SessionRuntimeIdentity(BaseModel):
+    """Exact Cayu runtime identity adopted at an invocation safe boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    runtime_name: str = "cayu"
+    runtime_version: str | None = None
+    runtime_build_provenance: RuntimeBuildProvenance
+
+    @field_validator("runtime_name")
+    @classmethod
+    def validate_runtime_name(cls, value: str) -> str:
+        return require_clean_nonblank(value, "runtime_name")
+
+    @field_validator("runtime_version")
+    @classmethod
+    def validate_runtime_version(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "runtime_version")
+
+    @field_validator("runtime_build_provenance", mode="before")
+    @classmethod
+    def validate_runtime_build_provenance(cls, value: object) -> RuntimeBuildProvenance:
+        if isinstance(value, RuntimeBuildProvenance):
+            value = value.model_dump(mode="json")
+        return RuntimeBuildProvenance.model_validate(value)
+
+
+def copy_session_runtime_identity(identity: SessionRuntimeIdentity) -> SessionRuntimeIdentity:
+    if type(identity) is not SessionRuntimeIdentity:
+        raise TypeError("identity must be a SessionRuntimeIdentity.")
+    return SessionRuntimeIdentity.model_validate(identity.model_dump(mode="json"))
+
+
 class SessionIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3092,7 +3136,26 @@ class SessionIdentity(BaseModel):
     model: str
     runtime_name: str = "cayu"
     runtime_version: str | None = None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=lambda: RuntimeBuildProvenance.unavailable("caller_unspecified")
+    )
     execution_profile: ExecutionProfileIdentity | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def inherit_profile_build_provenance(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or "runtime_build_provenance" in value:
+            return value
+        mapping = cast("Mapping[str, object]", value)
+        raw_profile = mapping.get("execution_profile")
+        if raw_profile is None:
+            return value
+        profile = ExecutionProfileIdentity.model_validate(raw_profile)
+        copied = dict(mapping)
+        copied["runtime_build_provenance"] = profile.runtime_build_provenance.model_dump(
+            mode="json"
+        )
+        return copied
 
     @field_validator("provider_name", "model", "runtime_name")
     @classmethod
@@ -3109,6 +3172,32 @@ class SessionIdentity(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("runtime_build_provenance", mode="before")
+    @classmethod
+    def validate_runtime_build_provenance(cls, value: object) -> RuntimeBuildProvenance:
+        if isinstance(value, RuntimeBuildProvenance):
+            value = value.model_dump(mode="json")
+        return RuntimeBuildProvenance.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_profile_build_provenance(self) -> SessionIdentity:
+        if self.execution_profile is not None and (
+            self.execution_profile.runtime_build_provenance
+            != runtime_build_provenance_identity(self.runtime_build_provenance)
+        ):
+            raise ValueError(
+                "Session runtime build provenance conflicts with its execution profile."
+            )
+        return self
+
+    @property
+    def runtime_build_fingerprint(self) -> str | None:
+        return self.runtime_build_provenance.fingerprint
+
+    @property
+    def runtime_source_revision(self) -> str | None:
+        return self.runtime_build_provenance.source_revision
 
 
 class Session(BaseModel):
@@ -3196,11 +3285,39 @@ class Session(BaseModel):
             return None
         return require_clean_nonblank(value, info.field_name)
 
+    @model_validator(mode="after")
+    def validate_profile_build_provenance(self) -> Session:
+        if EXECUTION_PROFILE_METADATA_KEY not in self.metadata:
+            return self
+        profile = execution_profile_from_session_metadata(self.metadata)
+        if profile.schema_version >= 6 and (
+            profile.runtime_build_provenance
+            != runtime_build_provenance_identity(self.runtime_build_provenance)
+        ):
+            raise ValueError(
+                "Session runtime build provenance conflicts with its execution profile."
+            )
+        return self
+
     @property
     def tool_capability_ceiling(self) -> ToolCapabilityCeiling:
         """Return the session's required durable application-tool authority."""
 
         return tool_capability_ceiling_from_session_metadata(self.metadata)
+
+    @property
+    def runtime_build_provenance(self) -> RuntimeBuildProvenance:
+        """Load exact build provenance without attributing legacy work to this process."""
+
+        return runtime_build_provenance_from_session_metadata(self.metadata)
+
+    @property
+    def runtime_build_fingerprint(self) -> str | None:
+        return self.runtime_build_provenance.fingerprint
+
+    @property
+    def runtime_source_revision(self) -> str | None:
+        return self.runtime_build_provenance.source_revision
 
 
 def _queued_dispatch_session_instance_fingerprint(session: Session) -> str:
@@ -3236,6 +3353,7 @@ class _SessionCreateMaterial:
     causal_budget_id: str
     runtime_name: str
     runtime_version: str | None
+    runtime_build_provenance: RuntimeBuildProvenance
     environment_name: str | None
 
     @classmethod
@@ -3254,6 +3372,7 @@ class _SessionCreateMaterial:
             causal_budget_id=request.causal_budget_id or request.task_id or session_id,
             runtime_name=identity.runtime_name,
             runtime_version=identity.runtime_version,
+            runtime_build_provenance=identity.runtime_build_provenance,
             environment_name=request.environment_name,
         )
 
@@ -3267,6 +3386,7 @@ class _SessionCreateMaterial:
             causal_budget_id=session.causal_budget_id,
             runtime_name=session.runtime_name,
             runtime_version=session.runtime_version,
+            runtime_build_provenance=session.runtime_build_provenance,
             environment_name=session.environment_name,
         )
 
@@ -3961,6 +4081,7 @@ class SessionInvocationAdmission:
     defer_interaction_source: bool = False
     model_transition: SessionModelTransition | None = None
     execution_profile_decision: ExecutionProfileDecision | None = None
+    adopted_runtime_identity: SessionRuntimeIdentity | None = None
     expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None
     allow_pending_initial_interaction: bool = False
 
@@ -4020,6 +4141,38 @@ class SessionInvocationAdmission:
                 "execution_profile_decision",
                 copy_execution_profile_decision(self.execution_profile_decision),
             )
+        if self.adopted_runtime_identity is not None:
+            object.__setattr__(
+                self,
+                "adopted_runtime_identity",
+                copy_session_runtime_identity(self.adopted_runtime_identity),
+            )
+        decision = self.execution_profile_decision
+        runtime_changed = (
+            decision is not None
+            and ExecutionProfileComponentClass.RUNTIME in decision.changed_component_classes
+        )
+        requires_runtime_identity = (
+            runtime_changed
+            and decision is not None
+            and decision.kind is ExecutionProfileDecisionKind.ADOPTED
+        )
+        if requires_runtime_identity != (self.adopted_runtime_identity is not None):
+            raise ValueError(
+                "An adopted runtime profile change requires its exact target runtime identity."
+            )
+        if self.adopted_runtime_identity is not None:
+            if decision is None or decision.kind is not ExecutionProfileDecisionKind.ADOPTED:
+                raise ValueError("Runtime identity can change only through an adopted profile.")
+            runtime_component = execution_profile_runtime_component(
+                self.adopted_runtime_identity.runtime_name,
+                self.adopted_runtime_identity.runtime_version,
+                self.adopted_runtime_identity.runtime_build_provenance,
+            )
+            if self.execution_profile.component(ExecutionProfileComponentClass.RUNTIME) != (
+                runtime_component
+            ):
+                raise ValueError("Adopted runtime identity conflicts with the target profile.")
         if (
             self.expected_active_invocation_profile is not None
             and type(self.expected_active_invocation_profile)
@@ -6224,6 +6377,9 @@ class PendingActionSession(BaseModel):
     causal_budget_id: str
     runtime_name: str
     runtime_version: str | None = None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
     environment_name: str | None = None
     status: SessionStatus
     created_at: datetime
@@ -6241,6 +6397,7 @@ class PendingActionSession(BaseModel):
             causal_budget_id=session.causal_budget_id,
             runtime_name=session.runtime_name,
             runtime_version=session.runtime_version,
+            runtime_build_provenance=session.runtime_build_provenance,
             environment_name=session.environment_name,
             status=session.status,
             created_at=session.created_at,
@@ -6524,6 +6681,9 @@ class SessionInspectionIdentity(BaseModel):
     causal_budget_id: str
     runtime_name: str
     runtime_version: str | None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
     environment_name: str | None
     status: SessionStatus
     created_at: datetime
@@ -7594,6 +7754,9 @@ class SessionTopologyNode(BaseModel):
     causal_budget_id: str
     runtime_name: str
     runtime_version: str | None
+    runtime_build_provenance: RuntimeBuildProvenance = Field(
+        default_factory=legacy_runtime_build_provenance
+    )
     environment_name: str | None
     status: SessionStatus
     created_at: datetime
@@ -7613,6 +7776,7 @@ class SessionTopologyNode(BaseModel):
             causal_budget_id=session.causal_budget_id,
             runtime_name=session.runtime_name,
             runtime_version=session.runtime_version,
+            runtime_build_provenance=session.runtime_build_provenance,
             environment_name=session.environment_name,
             status=session.status,
             created_at=session.created_at,
@@ -8792,6 +8956,7 @@ class SessionStore(ABC):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         """Atomically persist status, checkpoint, interaction, target, and profile admission."""
@@ -8807,6 +8972,7 @@ class SessionStore(ABC):
         execution_profile: ExecutionProfileIdentity,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         continued_interaction_id: str | None = None,
@@ -8819,21 +8985,23 @@ class SessionStore(ABC):
             raise NotImplementedError(
                 "This SessionStore does not support atomic execution-profile admission."
             )
-        return await self.transition_status_and_checkpoint(
-            session_id,
-            from_statuses=from_statuses,
-            to_status=to_status,
-            checkpoint_transform=checkpoint_transform,
-            result_checkpoint_transform=result_checkpoint_transform,
-            interaction_started_event=interaction_started_event,
-            interaction_source_messages=interaction_source_messages,
-            continued_interaction_id=continued_interaction_id,
-            defer_interaction_source=defer_interaction_source,
-            model_transition=model_transition,
-            execution_profile=execution_profile,
-            execution_profile_decision=execution_profile_decision,
-            tool_capability_ceiling=tool_capability_ceiling,
-        )
+        transition_kwargs: dict[str, Any] = {
+            "from_statuses": from_statuses,
+            "to_status": to_status,
+            "checkpoint_transform": checkpoint_transform,
+            "result_checkpoint_transform": result_checkpoint_transform,
+            "interaction_started_event": interaction_started_event,
+            "interaction_source_messages": interaction_source_messages,
+            "continued_interaction_id": continued_interaction_id,
+            "defer_interaction_source": defer_interaction_source,
+            "model_transition": model_transition,
+            "execution_profile": execution_profile,
+            "execution_profile_decision": execution_profile_decision,
+            "tool_capability_ceiling": tool_capability_ceiling,
+        }
+        if adopted_runtime_identity is not None:
+            transition_kwargs["adopted_runtime_identity"] = adopted_runtime_identity
+        return await self.transition_status_and_checkpoint(session_id, **transition_kwargs)
 
     async def admit_session_invocation(
         self,
@@ -8906,6 +9074,8 @@ class SessionStore(ABC):
             "execution_profile_decision": admission.execution_profile_decision,
             "tool_capability_ceiling": admission.tool_capability_ceiling,
         }
+        if admission.adopted_runtime_identity is not None:
+            transition_kwargs["adopted_runtime_identity"] = admission.adopted_runtime_identity
         if active_profile is not None and admission.interaction_started_event is not None:
             transition_kwargs["execution_profile"] = admission.execution_profile
         if admission.result_checkpoint_transform is not None:
@@ -12674,6 +12844,7 @@ class InMemorySessionStore(SessionStore):
                 causal_budget_id=session.causal_budget_id,
                 runtime_name=session.runtime_name,
                 runtime_version=session.runtime_version,
+                runtime_build_provenance=session.runtime_build_provenance,
                 environment_name=session.environment_name,
                 status=session.status,
                 created_at=session.created_at,
@@ -13128,6 +13299,7 @@ class InMemorySessionStore(SessionStore):
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         execution_profile_decision: ExecutionProfileDecision | None = None,
+        adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -13154,6 +13326,11 @@ class InMemorySessionStore(SessionStore):
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
             execution_profile_decision
+        )
+        prepared_adopted_runtime_identity = (
+            None
+            if adopted_runtime_identity is None
+            else copy_session_runtime_identity(adopted_runtime_identity)
         )
         prepared_tool_capability_ceiling = _copy_optional_tool_capability_ceiling(
             tool_capability_ceiling
@@ -13203,6 +13380,17 @@ class InMemorySessionStore(SessionStore):
                 session_updates.update(
                     provider_name=prepared_model_transition.target.provider_name,
                     model=prepared_model_transition.target.model,
+                )
+            transition_metadata = _session_metadata_after_runtime_identity_adoption(
+                session,
+                prepared_adopted_runtime_identity,
+                model_transition=prepared_model_transition,
+                execution_profile_metadata=transition_metadata,
+            )
+            if prepared_adopted_runtime_identity is not None:
+                session_updates.update(
+                    runtime_name=prepared_adopted_runtime_identity.runtime_name,
+                    runtime_version=prepared_adopted_runtime_identity.runtime_version,
                 )
             transition_metadata = _session_metadata_after_tool_capability_ceiling_admission(
                 session,
@@ -19342,6 +19530,7 @@ def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
         model=identity.model,
         runtime_name=identity.runtime_name,
         runtime_version=identity.runtime_version,
+        runtime_build_provenance=copy_runtime_build_provenance(identity.runtime_build_provenance),
         execution_profile=(
             None
             if identity.execution_profile is None
@@ -19363,6 +19552,8 @@ def session_metadata_for_creation(
     copied = copy_durable_json_object(metadata, "metadata")
     if EXECUTION_PROFILE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
+    if RUNTIME_BUILD_PROVENANCE_METADATA_KEY in copied:
+        raise ValueError("Session metadata contains runtime-owned build-provenance authority.")
     if FORK_EXECUTION_PROFILE_METADATA_KEY in copied:
         raise ValueError("Session metadata contains runtime-owned fork-profile authority.")
     if TOOL_CAPABILITY_CEILING_METADATA_KEY in copied:
@@ -19381,12 +19572,33 @@ def session_metadata_for_creation(
         copied[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
             identity.execution_profile
         )
+    copied[RUNTIME_BUILD_PROVENANCE_METADATA_KEY] = identity.runtime_build_provenance.model_dump(
+        mode="json"
+    )
     if tool_capability_ceiling is not None:
         copied = session_metadata_with_tool_capability_ceiling(
             copied,
             tool_capability_ceiling,
         )
     return copied
+
+
+def runtime_build_provenance_from_session_metadata(
+    metadata: Mapping[str, Any],
+) -> RuntimeBuildProvenance:
+    """Load bounded build provenance, mapping old rows to explicit legacy state."""
+
+    if not isinstance(metadata, Mapping):
+        raise TypeError("Session metadata must be an object.")
+    raw = metadata.get(RUNTIME_BUILD_PROVENANCE_METADATA_KEY)
+    if raw is None:
+        return legacy_runtime_build_provenance()
+    try:
+        return RuntimeBuildProvenance.model_validate(
+            copy_durable_json_value(raw, "runtime_build_provenance")
+        )
+    except Exception as exc:
+        raise ValueError("Session runtime build-provenance metadata is malformed.") from exc
 
 
 def _copy_optional_execution_profile(
@@ -19475,6 +19687,44 @@ def _validate_execution_profile_admission(
         session.metadata,
         candidate_profile,
     )
+
+
+def _session_metadata_after_runtime_identity_adoption(
+    session: Session,
+    identity: SessionRuntimeIdentity | None,
+    *,
+    model_transition: SessionModelTransition | None,
+    execution_profile_metadata: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Atomically compose adopted runtime provenance with profile metadata."""
+
+    if identity is None:
+        return execution_profile_metadata
+    if execution_profile_metadata is None:
+        raise ValueError("Runtime identity adoption requires adopted profile metadata.")
+    target_provider_name = (
+        session.provider_name if model_transition is None else model_transition.target.provider_name
+    )
+    target_model = session.model if model_transition is None else model_transition.target.model
+    profile = execution_profile_from_session_metadata(execution_profile_metadata)
+    provider_component = execution_profile_provider_target_component(
+        target_provider_name,
+        target_model,
+    )
+    if profile.component(ExecutionProfileComponentClass.PROVIDER_TARGET) != provider_component:
+        raise ValueError("Adopted runtime metadata conflicts with the target provider identity.")
+    runtime_component = execution_profile_runtime_component(
+        identity.runtime_name,
+        identity.runtime_version,
+        identity.runtime_build_provenance,
+    )
+    if profile.component(ExecutionProfileComponentClass.RUNTIME) != runtime_component:
+        raise ValueError("Adopted runtime metadata conflicts with the target runtime identity.")
+    copied = copy_durable_json_value(execution_profile_metadata, "session.metadata")
+    copied[RUNTIME_BUILD_PROVENANCE_METADATA_KEY] = identity.runtime_build_provenance.model_dump(
+        mode="json"
+    )
+    return copied
 
 
 def _session_metadata_after_tool_capability_ceiling_admission(

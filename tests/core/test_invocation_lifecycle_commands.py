@@ -64,6 +64,11 @@ from cayu.runtime._invocation_lifecycle import (
     prepare_rebind_invocation_command,
 )
 from cayu.runtime.budgets import BudgetPolicy
+from cayu.runtime.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -102,6 +107,11 @@ def _profile(*, tool_name: str = "original_tool") -> ExecutionProfileIdentity:
     return build_execution_profile_identity(
         runtime_name="cayu",
         runtime_version="test",
+        runtime_build_provenance=RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="a" * 64,
+        ),
         provider_name="fake",
         model="fake-model",
         durable_system_prompt="durable instructions",
@@ -2972,6 +2982,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
                 model="fake-model",
                 runtime_name="cayu",
                 runtime_version="test",
+                runtime_build_provenance=active.profile.runtime_build_provenance,
                 environment_name=None,
             ),
             registered_agent=registered_agent,
@@ -2996,6 +3007,7 @@ def test_invocation_context_preserves_exact_live_authority_references() -> None:
             model="fake-model",
             runtime_name="cayu",
             runtime_version="test",
+            runtime_build_provenance=active.profile.runtime_build_provenance,
             environment_name=None,
         ),
         registered_agent=registered_agent,

@@ -2412,6 +2412,51 @@ baseline but cannot be rewritten in place as governed egress profiles.
 
 The default policy rejects every changed or unverifiable required component. Equality requires the same component class, strength, availability, and fingerprint; two unavailable values do not become equal merely because both lack evidence. A custom `ExecutionProfilePolicy` cannot return `compatible_reuse` for provider-target or authority-bearing changes. A configured policy may return `adopt` without caller intent only when `egress_authority` is the sole changed component and its typed comparison proves a strict narrowing; Cayu records an attributable system policy actor and still requires exact backend cutover evidence before admission. Every other authority-bearing adoption requires explicit caller intent, and widening or incomparable egress changes additionally require `authority_decision="authorized"`.
 
+### Immutable runtime build provenance
+
+The runtime component uses `RuntimeBuildProvenance`, not the semantic package
+version alone. Its authoritative `fingerprint` is a lowercase SHA-256 value
+derived from a versioned, domain-separated recipe over typed packaging or
+deployment evidence. `runtime_version` remains useful release semantics and
+`source_revision` remains optional diagnostic provenance; neither substitutes
+for the build fingerprint, and changing only the diagnostic source revision
+does not change runtime identity. Two workers with the same version and
+different build fingerprints have different execution profiles.
+
+Installed wheels derive structural evidence once per process from a canonical
+projection of the installed distribution's hashed `RECORD` entries. Every
+non-bytecode entry must carry a SHA-256 hash except the `RECORD` file itself and
+its standard signature sidecars; an uncovered or differently hashed entry
+fails closed to weak source-tree provenance rather than being omitted from the
+structural identity. OCI
+deployments provide a typed `oci_image_digest` manifest through
+`CAYU_RUNTIME_BUILD_PROVENANCE`; the manifest retains both the OCI artifact
+domain and its digest rather than flattening the value into a generic revision
+string. Packaging and deployment systems can use `explicit_manifest` for an
+equivalent immutable artifact digest. The manifest is bounded to 4096 UTF-8
+bytes and strictly validated before `CayuApp` admission. Cayu never invokes Git
+or hashes a repository for each session or model call.
+
+Editable installs use a deterministic source-package content identity with
+`application_versioned` strength. It is deliberately weaker than wheel or OCI
+evidence and never claims structural packaging provenance. Set
+`CAYU_REQUIRE_STRONG_RUNTIME_BUILD_PROVENANCE=1` in production to reject weak or
+unavailable evidence at application startup. If a legacy record has no build
+provenance, Cayu reconstructs a typed `legacy_record` with unavailable strength;
+it never fills the record with the current worker's build and never treats two
+unavailable values as a wildcard match.
+
+Session creation stores the exact manifest in runtime-owned metadata and carries
+it through initial runs, resumes, forks, active-invocation bindings, lifecycle
+receipts, prepared durable children, inspection projections, and portable
+snapshot/bundle closure. SQLite and PostgreSQL operator queries project only
+that bounded reserved field rather than loading arbitrary session metadata.
+A prepared child created by build A is rejected and requeued by build B before
+provider, tool, hook, policy, secret, environment, or workspace work; build A
+can recover the same child after restart. During deployment, drain or segregate
+queued and resumable work by build fingerprint, deploy compatible workers first,
+and keep old workers available until their exact-profile work is terminal.
+
 The bounded unknown-provider retry contract advances Cayu's built-in model
 finalization material from `cayu:model-finalization:v1` to `v2`, and advances
 the built-in `ModelCompactor` and `PromptCacheCompactor` materials from version
