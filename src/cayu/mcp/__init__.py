@@ -1,6 +1,5 @@
 """MCP integration contracts."""
 
-from cayu.mcp._http_protocol import McpProtocolEra
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
@@ -12,6 +11,7 @@ from cayu.mcp._jsonrpc import (
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
     McpProtocolError,
 )
+from cayu.mcp._protocol import McpProtocolEra
 from cayu.mcp._stdio_process import (
     DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S,
     DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S,

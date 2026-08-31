@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 from collections.abc import Callable
@@ -15,6 +16,7 @@ from cayu._validation import (
     json_utf8_size_within_limit,
     require_clean_nonblank,
 )
+from cayu.mcp._http_protocol import filter_invalid_modern_http_tool_headers
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
@@ -42,6 +44,13 @@ from cayu.mcp._jsonrpc import (
     validate_negotiated_protocol_version,
     validate_positive_integer,
     validate_positive_number,
+)
+from cayu.mcp._protocol import (
+    LegacyMcpWireProtocol,
+    McpProtocolEra,
+    ModernMcpWireProtocol,
+    modern_discover_result_from_payload,
+    validate_modern_mcp_result,
 )
 from cayu.mcp._stdio_process import (
     DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S,
@@ -132,6 +141,7 @@ DEFAULT_MCP_STDERR_CAPTURE_BYTES = 8192
 DEFAULT_MCP_STDERR_DRAIN_GRACE_S = 0.2
 _RETAINED_STDIO_WRITE_SETTLEMENT_TASKS: set[asyncio.Task[None]] = set()
 _RETAINED_STDIO_SHUTDOWN_TASKS: set[asyncio.Task[Any]] = set()
+_LOGGER = logging.getLogger(__name__)
 
 
 class _StdioPreDispatchMessageTooLargeError(McpMessageTooLargeError):
@@ -159,6 +169,7 @@ class _StdioClientConnectionConfig:
     client_version: str
     max_list_pages: int
     max_list_items: int
+    protocol_era: McpProtocolEra
     inherit_env: bool
     secret_resolver: SecretResolver | None
     process_lifetime: StdioMcpProcessLifetime
@@ -230,6 +241,24 @@ def _stdio_containment_rendezvous_identity(server: McpServerSpec) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _modern_stdio_tool_result_from_payload(payload: object) -> McpToolResult:
+    return tool_result_from_payload(
+        payload,
+        allow_arbitrary_structured_content=True,
+    )
+
+
+def _filter_invalid_modern_stdio_tool_headers(response: dict[str, Any]) -> None:
+    """Apply the modern catalogue rule without emitting HTTP headers on stdio."""
+
+    filter_result = filter_invalid_modern_http_tool_headers(response)
+    if filter_result is not None and filter_result.excluded_count:
+        _LOGGER.warning(
+            "Excluded %d MCP tool(s) with invalid x-mcp-header annotations.",
+            filter_result.excluded_count,
+        )
+
+
 class StdioMcpClient(McpClient):
     """MCP client for local stdio servers."""
 
@@ -245,6 +274,7 @@ class StdioMcpClient(McpClient):
         client_version: str = DEFAULT_MCP_CLIENT_VERSION,
         max_list_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
         max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
+        protocol_era: McpProtocolEra = McpProtocolEra.LEGACY,
         inherit_env: bool = False,
         secret_resolver: SecretResolver | None = None,
         process_lifetime: StdioMcpProcessLifetime | str = (
@@ -279,6 +309,9 @@ class StdioMcpClient(McpClient):
         self.client_version = require_clean_nonblank(client_version, "client_version")
         self.max_list_pages = validate_positive_integer(max_list_pages, "max_list_pages")
         self.max_list_items = validate_positive_integer(max_list_items, "max_list_items")
+        if type(protocol_era) is not McpProtocolEra:
+            raise TypeError("protocol_era must be an McpProtocolEra.")
+        self.protocol_era = protocol_era
         if type(inherit_env) is not bool:
             raise TypeError("inherit_env must be a bool.")
         self.inherit_env = inherit_env
@@ -321,6 +354,9 @@ class StdioMcpClient(McpClient):
         secret_resolver = self.secret_resolver
         if secret_resolver is not None:
             validate_secret_resolver(secret_resolver)
+        protocol_era = self.protocol_era
+        if type(protocol_era) is not McpProtocolEra:
+            raise TypeError("protocol_era must be an McpProtocolEra.")
         return _StdioClientConnectionConfig(
             transport_limits=transport_limits,
             request_timeout_s=request_timeout_s,
@@ -340,6 +376,7 @@ class StdioMcpClient(McpClient):
             client_version=require_clean_nonblank(self.client_version, "client_version"),
             max_list_pages=validate_positive_integer(self.max_list_pages, "max_list_pages"),
             max_list_items=validate_positive_integer(self.max_list_items, "max_list_items"),
+            protocol_era=protocol_era,
             inherit_env=inherit_env,
             secret_resolver=secret_resolver,
             process_lifetime=validate_stdio_mcp_process_lifetime(self.process_lifetime),
@@ -455,6 +492,7 @@ class StdioMcpClient(McpClient):
             client_version=config.client_version,
             max_list_pages=config.max_list_pages,
             max_list_items=config.max_list_items,
+            protocol_era=config.protocol_era,
             secret_redactor=secret_redactor,
         )
         if session.process_capability_evidence != process_capability_evidence:
@@ -504,6 +542,7 @@ class StdioMcpSession(McpSession):
         client_version: str,
         max_list_pages: int = DEFAULT_MCP_MAX_LIST_PAGES,
         max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
+        protocol_era: McpProtocolEra = McpProtocolEra.LEGACY,
         secret_redactor: SecretRedactor | None = None,
     ) -> None:
         server = copy_mcp_server_spec(server)
@@ -529,6 +568,16 @@ class StdioMcpSession(McpSession):
         self.client_version = client_version
         self.max_list_pages = validate_positive_integer(max_list_pages, "max_list_pages")
         self.max_list_items = validate_positive_integer(max_list_items, "max_list_items")
+        if type(protocol_era) is not McpProtocolEra:
+            raise TypeError("protocol_era must be an McpProtocolEra.")
+        self._wire_protocol = (
+            LegacyMcpWireProtocol()
+            if protocol_era is McpProtocolEra.LEGACY
+            else ModernMcpWireProtocol(
+                client_name=client_name,
+                client_version=client_version,
+            )
+        )
         self._initialize_result: McpInitializeResult | None = None
         self._next_id = 1
         self._closed = False
@@ -556,6 +605,12 @@ class StdioMcpSession(McpSession):
         self._tools_list_changed_activation_handle: asyncio.Handle | None = None
 
     @property
+    def protocol_era(self) -> McpProtocolEra:
+        """The wire era selected for this session, fixed for its lifetime."""
+
+        return self._wire_protocol.era
+
+    @property
     def initialize_result(self) -> McpInitializeResult:
         if self._initialize_result is None:
             raise McpProtocolError("MCP session has not been initialized.")
@@ -565,6 +620,8 @@ class StdioMcpSession(McpSession):
         self,
         handler: Callable[[], None] | None,
     ) -> bool:
+        if handler is not None and not self._wire_protocol.supports_legacy_listener:
+            return False
         if handler is not None and self._closed:
             return False
         if handler is None:
@@ -607,6 +664,8 @@ class StdioMcpSession(McpSession):
         self,
         handler: Callable[[bool], None] | None,
     ) -> bool:
+        if handler is not None and not self._wire_protocol.supports_legacy_listener:
+            return False
         if handler is not None and self._closed:
             return False
         self._tools_list_changed_continuity_handler = handler
@@ -667,6 +726,12 @@ class StdioMcpSession(McpSession):
         self._request_timeout_s = timeout_s
 
     async def initialize(self) -> None:
+        if self.protocol_era is McpProtocolEra.MODERN_2026_07_28:
+            await self._discover_modern()
+            return
+        await self._initialize_legacy()
+
+    async def _initialize_legacy(self) -> None:
         def parse_initialize_result(result: Any) -> McpInitializeResult:
             initialize_result = initialize_result_from_payload(result)
             validation_error: McpProtocolError | None = None
@@ -693,6 +758,22 @@ class StdioMcpSession(McpSession):
             _retain_mcp_session_close(self, primary_error=error)
             raise
 
+    async def _discover_modern(self) -> None:
+        try:
+            discover_result = await self._request(
+                "server/discover",
+                {},
+                result_parser=modern_discover_result_from_payload,
+            )
+            if self._closed:
+                raise McpProtocolError("MCP stdio session closed during discovery.")
+            self._initialize_result = discover_result
+        except BaseException as error:
+            self._initialize_result = None
+            self._closed = True
+            _retain_mcp_session_close(self, primary_error=error)
+            raise
+
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
         discovery = await self._discover_builtin_tools_for_toolset()
         await discovery.commit()
@@ -706,6 +787,7 @@ class StdioMcpSession(McpSession):
     async def _discover_builtin_tools_for_toolset(self) -> _McpToolDiscovery:
         transport_names: dict[str, str] = {}
         private_contract_hashes: list[str] = []
+        observed_wire_tool_count = [0]
         parsed_tool_count = 0
 
         def parse_tools_page(result: Any) -> dict[str, Any]:
@@ -746,6 +828,7 @@ class StdioMcpSession(McpSession):
                 params,
                 authority_mapping=transport_names,
                 private_tool_contract_hashes=private_contract_hashes,
+                private_observed_tool_count=observed_wire_tool_count,
                 paginated=True,
                 result_parser=parse_tools_page,
             )
@@ -852,7 +935,11 @@ class StdioMcpSession(McpSession):
         return await self._request(
             "tools/call",
             request_params,
-            result_parser=tool_result_from_payload,
+            result_parser=(
+                _modern_stdio_tool_result_from_payload
+                if self._wire_protocol.validates_modern_results
+                else tool_result_from_payload
+            ),
             dispatch_signal=dispatch_signal,
         )
 
@@ -1117,6 +1204,7 @@ class StdioMcpSession(McpSession):
         *,
         authority_mapping: dict[str, str] | None = None,
         private_tool_contract_hashes: list[str] | None = None,
+        private_observed_tool_count: list[int] | None = None,
         paginated: bool = False,
         result_parser: Callable[[Any], Any] | None = None,
         dispatch_signal: _McpToolDispatchSignal | None = None,
@@ -1143,6 +1231,7 @@ class StdioMcpSession(McpSession):
         preparation_error: BaseException | None = None
         try:
             try:
+                params = self._wire_protocol.prepare_request_params(method_name, params)
                 request_preflight = mcp_jsonrpc_request_preflight(
                     request_id,
                     method_name,
@@ -1324,10 +1413,24 @@ class StdioMcpSession(McpSession):
             raise sanitized_failure
         if sanitized_cancellation is not None:
             raise sanitized_cancellation
+        if self._wire_protocol.validates_modern_results and method_name == "tools/list":
+            raw_result = response.get("result")
+            raw_tools = raw_result.get("tools") if type(raw_result) is dict else None
+            if type(raw_tools) is list and private_observed_tool_count is not None:
+                observed_items = private_observed_tool_count[0] + len(raw_tools)
+                if observed_items > self.max_list_items:
+                    response.clear()
+                    raise McpProtocolError(
+                        f"MCP tools/list returned {observed_items} items, exceeding "
+                        f"max_list_items={self.max_list_items}."
+                    ) from None
+                private_observed_tool_count[0] = observed_items
+            _filter_invalid_modern_stdio_tool_headers(response)
         redaction_result = safely_redact_jsonrpc_response(
             response,
             method=method_name,
             redactor=self._secret_redactor,
+            preserve_modern_control_fields=self._wire_protocol.validates_modern_results,
         )
         redacted_response = redaction_result.response
         mapping_result = JsonrpcAuthorityMappingResult({})
@@ -1401,6 +1504,8 @@ class StdioMcpSession(McpSession):
             result = result_from_jsonrpc_response(redacted_response, method_name)
             redacted_response.clear()
             redaction_result = None
+            if self._wire_protocol.validates_modern_results:
+                result = validate_modern_mcp_result(result, method=method_name)
             if result_parser is not None:
                 result = result_parser(result)
         except BaseException:
@@ -1471,13 +1576,18 @@ class StdioMcpSession(McpSession):
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         method_name = require_clean_nonblank(method, "method")
+        try:
+            params = self._wire_protocol.prepare_request_params(method_name, params)
+            payload = jsonrpc_notification_payload(method_name, params)
+        finally:
+            params.clear()
         sanitized_cancellation: asyncio.CancelledError | None = None
         sanitized_failure: BaseException | None = None
         cancellation_boundary = _McpCallerCancellationBoundary()
         try:
             await cancellation_boundary.checkpoint()
             await self._write_with_timeout(
-                jsonrpc_notification_payload(method_name, params),
+                payload,
                 timeout_message=f"MCP notification {method_name} write timed out.",
             )
         except asyncio.CancelledError as cancellation:
@@ -1843,7 +1953,7 @@ class StdioMcpSession(McpSession):
         method_name: str,
         reason: str,
     ) -> None:
-        if method_name == "initialize":
+        if method_name == self._wire_protocol.establishment_method:
             return
         notify_task = asyncio.create_task(
             _capture_mcp_owned_task_fatal_signal(
@@ -1973,7 +2083,10 @@ class StdioMcpSession(McpSession):
         if "method" in message:
             if message_id is not None:
                 await self._write_server_request_error(message)
-            elif _is_mcp_tools_list_changed_notification(message):
+            elif (
+                self._wire_protocol.supports_legacy_listener
+                and _is_mcp_tools_list_changed_notification(message)
+            ):
                 handler = self._tools_list_changed_handler
                 if handler is None:
                     self._tools_list_changed_pending_before_owner = True

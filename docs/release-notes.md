@@ -1,5 +1,13 @@
 # Release notes
 
+## Unreleased
+
+- Add explicit pinned MCP `2026-07-28` stdio support through
+  `StdioMcpClient(protocol_era=McpProtocolEra.MODERN_2026_07_28)`, with discovery,
+  modern request metadata, validated results, and bounded process cleanup.
+  Legacy MCP remains the default; automatic fallback, response caching,
+  subscriptions, and MRTR are not included.
+
 ## v0.5.2
 
 - Generated projects disable automatic knowledge maintenance by default.

@@ -60,12 +60,9 @@ from cayu.mcp._http_protocol import (
     MCP_SESSION_ID_HEADER,
     LegacyHttpMcpWireProtocol,
     McpHttpToolHeaderContract,
-    McpProtocolEra,
     ModernHttpMcpWireProtocol,
+    filter_invalid_modern_http_tool_headers,
     mirrored_mcp_http_tool_headers,
-    modern_discover_result_from_payload,
-    modern_http_tool_header_contract,
-    validate_modern_mcp_result,
 )
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
@@ -93,6 +90,11 @@ from cayu.mcp._jsonrpc import (
     validate_negotiated_protocol_version,
     validate_positive_integer,
     validate_positive_number,
+)
+from cayu.mcp._protocol import (
+    McpProtocolEra,
+    modern_discover_result_from_payload,
+    validate_modern_mcp_result,
 )
 from cayu.mcp._transport import (
     McpCallDeadlineExceededError,
@@ -204,33 +206,15 @@ def _filter_invalid_modern_http_tool_headers(
 ) -> tuple[McpHttpToolHeaderContract, ...] | None:
     """Exclude tools whose ``x-mcp-header`` authority violates the 2026 spec."""
 
-    result = response.get("result")
-    if type(result) is not dict:
+    filter_result = filter_invalid_modern_http_tool_headers(response)
+    if filter_result is None:
         return None
-    tools = result.get("tools")
-    if type(tools) is not list:
-        return None
-    retained_tools: list[Any] = []
-    contracts: list[McpHttpToolHeaderContract] = []
-    excluded_count = 0
-    for tool in tools:
-        input_schema = tool.get("inputSchema", {}) if type(tool) is dict else None
-        try:
-            contract = modern_http_tool_header_contract(input_schema)
-        except McpProtocolError:
-            excluded_count += 1
-            continue
-        retained_tools.append(tool)
-        contracts.append(contract)
-    tools.clear()
-    tools.extend(retained_tools)
-    retained_tools.clear()
-    if excluded_count:
+    if filter_result.excluded_count:
         _LOGGER.warning(
             "Excluded %d MCP tool(s) with invalid x-mcp-header annotations.",
-            excluded_count,
+            filter_result.excluded_count,
         )
-    return tuple(contracts)
+    return filter_result.contracts
 
 
 def _modern_http_tool_result_from_payload(payload: object) -> McpToolResult:

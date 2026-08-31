@@ -12,17 +12,11 @@ import base64
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any, cast
 
-from cayu._validation import (
-    MAX_PORTABLE_JSON_INTEGER,
-    copy_json_value,
-    require_clean_nonblank,
-    require_nonblank,
-)
+from cayu._validation import MAX_PORTABLE_JSON_INTEGER
 from cayu.mcp._jsonrpc import MCP_MODERN_PROTOCOL_VERSION, McpProtocolError
-from cayu.mcp.base import McpInitializeResult
+from cayu.mcp._protocol import McpProtocolEra, ModernMcpWireProtocol
 
 MCP_PROTOCOL_VERSION_HEADER = "mcp-protocol-version"
 MCP_SESSION_ID_HEADER = "mcp-session-id"
@@ -35,10 +29,6 @@ MAX_MCP_HTTP_HEADER_NAME_BYTES = 256
 MAX_MCP_HTTP_HEADER_VALUE_BYTES = 8_192
 MAX_MCP_HTTP_MIRRORED_HEADER_BYTES = 65_536
 
-_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
-_CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo"
-_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
-_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo"
 _BASE64_SENTINEL_PREFIX = "=?base64?"
 _BASE64_SENTINEL_SUFFIX = "?="
 _HTTP_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -72,13 +62,6 @@ _OBJECT_VALUED_SCHEMA_KEYWORDS = frozenset(
 )
 
 
-class McpProtocolEra(StrEnum):
-    """MCP wire era selected for one transport connection."""
-
-    LEGACY = "legacy"
-    MODERN_2026_07_28 = MCP_MODERN_PROTOCOL_VERSION
-
-
 @dataclass(frozen=True, slots=True)
 class McpHttpToolHeaderBinding:
     """Private routing-header authority derived from one admitted tool schema."""
@@ -90,14 +73,13 @@ class McpHttpToolHeaderBinding:
 
 McpHttpToolHeaderContract = tuple[McpHttpToolHeaderBinding, ...]
 
-_MODERN_CACHEABLE_METHODS = frozenset(
-    {
-        "server/discover",
-        "tools/list",
-        "resources/list",
-        "resources/read",
-    }
-)
+
+@dataclass(frozen=True, slots=True)
+class McpHttpToolHeaderFilterResult:
+    """Contracts aligned with retained tools plus the excluded wire count."""
+
+    contracts: tuple[McpHttpToolHeaderContract, ...]
+    excluded_count: int
 
 
 class LegacyHttpMcpWireProtocol:
@@ -144,34 +126,19 @@ class LegacyHttpMcpWireProtocol:
         return headers.get(MCP_SESSION_ID_HEADER)
 
 
-class ModernHttpMcpWireProtocol:
+class ModernHttpMcpWireProtocol(ModernMcpWireProtocol):
     """Stateless MCP 2026-07-28 Streamable HTTP codec."""
 
-    era = McpProtocolEra.MODERN_2026_07_28
-    establishment_method = "server/discover"
-    supports_legacy_listener = False
     uses_protocol_sessions = False
-    validates_modern_results = True
 
     def __init__(self, *, client_name: str, client_version: str) -> None:
-        self._request_meta = {
-            _PROTOCOL_VERSION_META_KEY: MCP_MODERN_PROTOCOL_VERSION,
-            _CLIENT_INFO_META_KEY: {
-                "name": client_name,
-                "version": client_version,
-            },
-            _CLIENT_CAPABILITIES_META_KEY: {},
-        }
+        super().__init__(client_name=client_name, client_version=client_version)
 
     def prepare_request_params(
         self,
         method: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        if "_meta" in params:
-            raise McpProtocolError(
-                "MCP 2026 request parameters cannot override the reserved _meta envelope."
-            )
         if not _plain_http_header_value(method):
             raise McpProtocolError("MCP 2026 request method was not HTTP-header safe.")
         name_field = _modern_request_name_field(method)
@@ -180,8 +147,7 @@ class ModernHttpMcpWireProtocol:
             if type(name) is not str:
                 raise McpProtocolError(f"MCP 2026 {method} params.{name_field} must be a string.")
             encode_mcp_http_header_value(name, field_name="Mcp-Name")
-        params["_meta"] = copy_json_value(self._request_meta, "MCP 2026 request metadata")
-        return params
+        return super().prepare_request_params(method, params)
 
     def request_headers(
         self,
@@ -338,118 +304,35 @@ def modern_http_tool_header_contract(input_schema: object) -> McpHttpToolHeaderC
     return tuple(bindings)
 
 
-def validate_modern_mcp_result(result: object, *, method: str) -> dict[str, Any]:
-    """Validate and remove 2026 wire-only result discrimination/cache fields."""
+def filter_invalid_modern_http_tool_headers(
+    response: dict[str, Any],
+) -> McpHttpToolHeaderFilterResult | None:
+    """Drop tools with invalid HTTP-header annotations and retain aligned contracts."""
 
+    result = response.get("result")
     if type(result) is not dict:
-        # Do not retain a malformed scalar result in this public traceback.
-        result = None
-        raise McpProtocolError(f"MCP {method} result must be an object.")
-    result = cast("dict[str, Any]", result)
-    protocol_error: str | None = None
-    try:
-        return _validate_modern_mcp_result(result, method=method)
-    except McpProtocolError as error:
-        protocol_error = str(error)
-    finally:
-        if protocol_error is not None:
-            # Modern control fields bypass ordinary payload redaction so their
-            # exact types can be validated. Never retain a rejected raw value in
-            # the validator traceback that crosses the transport boundary.
-            result.clear()
-    raise McpProtocolError(protocol_error) from None
-
-
-def _validate_modern_mcp_result(
-    result: dict[str, Any],
-    *,
-    method: str,
-) -> dict[str, Any]:
-    if "resultType" in result and result.get("resultType") != "complete":
-        raise McpProtocolError(f"MCP {method} returned an unsupported resultType.")
-    result.pop("resultType", None)
-    if method in _MODERN_CACHEABLE_METHODS:
-        ttl_ms = result.get("ttlMs")
-        if type(ttl_ms) is not int or not 0 <= ttl_ms <= MAX_PORTABLE_JSON_INTEGER:
-            raise McpProtocolError(
-                f"MCP {method} result ttlMs must be a non-negative portable JSON integer."
-            )
-        cache_scope = result.get("cacheScope")
-        if type(cache_scope) is not str or cache_scope not in {"private", "public"}:
-            raise McpProtocolError(f"MCP {method} result cacheScope must be 'private' or 'public'.")
-        result.pop("ttlMs")
-        result.pop("cacheScope")
-    return result
-
-
-def modern_discover_result_from_payload(payload: object) -> McpInitializeResult:
-    """Normalize validated 2026 discovery into Cayu's server-metadata contract."""
-
-    if type(payload) is not dict:
-        raise McpProtocolError("MCP server/discover result must be an object.")
-    payload = cast("dict[str, Any]", payload)
-    parsed: McpInitializeResult | None = None
-    protocol_error: str | None = None
-    try:
-        parsed = _modern_discover_result_from_payload(payload)
-    except McpProtocolError as error:
-        protocol_error = str(error)
-    except (TypeError, ValueError):
-        protocol_error = "MCP server/discover result contained invalid data."
-    finally:
-        payload.clear()
-    if protocol_error is not None:
-        raise McpProtocolError(protocol_error) from None
-    if parsed is None:
-        raise AssertionError("MCP discovery parser returned no result or error.")
-    return parsed
-
-
-def _modern_discover_result_from_payload(
-    payload: dict[str, Any],
-) -> McpInitializeResult:
-    supported_versions = payload.get("supportedVersions")
-    if type(supported_versions) is not list or len(supported_versions) > 64:
-        raise McpProtocolError("MCP server/discover supportedVersions must be a bounded array.")
-    validated_versions: list[str] = []
-    for version in supported_versions:
-        if type(version) is not str:
-            raise McpProtocolError("MCP server/discover supportedVersions entries must be strings.")
-        version = require_clean_nonblank(version, "supported protocol version")
-        if len(version.encode("utf-8")) > 128:
-            raise McpProtocolError(
-                "MCP server/discover supported protocol version exceeded 128 bytes."
-            )
-        validated_versions.append(version)
-    if MCP_MODERN_PROTOCOL_VERSION not in validated_versions:
-        raise McpProtocolError("MCP server does not support pinned protocol version 2026-07-28.")
-    capabilities = payload.get("capabilities")
-    if type(capabilities) is not dict:
-        raise McpProtocolError("MCP server/discover capabilities must be an object.")
-    instructions = payload.get("instructions")
-    if instructions is not None and type(instructions) is not str:
-        raise McpProtocolError("MCP server/discover instructions must be a string.")
-
-    server_name: str | None = None
-    server_version: str | None = None
-    meta = payload.get("_meta")
-    server_info = meta.get(_SERVER_INFO_META_KEY) if type(meta) is dict else None
-    if type(server_info) is dict:
-        candidate_name = server_info.get("name")
-        candidate_version = server_info.get("version")
-        if type(candidate_name) is str and type(candidate_version) is str:
-            try:
-                server_name = require_nonblank(candidate_name, "server name")
-                server_version = require_nonblank(candidate_version, "server version")
-            except (TypeError, ValueError):
-                server_name = None
-                server_version = None
-    return McpInitializeResult(
-        protocol_version=MCP_MODERN_PROTOCOL_VERSION,
-        server_name=server_name,
-        server_version=server_version,
-        instructions=instructions,
-        capabilities=capabilities,
+        return None
+    tools = result.get("tools")
+    if type(tools) is not list:
+        return None
+    retained_tools: list[Any] = []
+    contracts: list[McpHttpToolHeaderContract] = []
+    excluded_count = 0
+    for tool in tools:
+        input_schema = tool.get("inputSchema", {}) if type(tool) is dict else None
+        try:
+            contract = modern_http_tool_header_contract(input_schema)
+        except McpProtocolError:
+            excluded_count += 1
+            continue
+        retained_tools.append(tool)
+        contracts.append(contract)
+    tools.clear()
+    tools.extend(retained_tools)
+    retained_tools.clear()
+    return McpHttpToolHeaderFilterResult(
+        contracts=tuple(contracts),
+        excluded_count=excluded_count,
     )
 
 

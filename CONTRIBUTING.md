@@ -147,6 +147,13 @@ uv run pytest tests/core -q                    # focused runs are fine while ite
 uv run pytest --store-durations --clean-durations  # refresh CI's .test_durations snapshot
 ```
 
+The modern MCP stdio suite (`uv run pytest tests/core/test_mcp_stdio_modern.py -q`)
+runs both deterministic fault fixtures and a real official MCP Python SDK server.
+The SDK is pinned in the `dev` extra and `uv.lock`; it is not a Cayu runtime
+dependency. The interoperability test runs during normal CI and checks discovery,
+tool/resource operations, exact request metadata, and clean shutdown. Its separate
+default-containment test requires supported Linux process enforcement.
+
 For deterministic pre-commit, acknowledgement-loss, and ownership-handoff
 coverage around durable session operations, use the repository-private
 [Session operation publication fault harness](docs/session-operation-fault-harness.md).

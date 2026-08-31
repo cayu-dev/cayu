@@ -12792,6 +12792,15 @@ The first MCP implementation supports stdio servers:
 
 - `StdioMcpClient` launches an explicit argv command and speaks newline-delimited
   JSON-RPC over stdin/stdout.
+- It defaults to the legacy initialized wire era. Supplying
+  `protocol_era=McpProtocolEra.MODERN_2026_07_28` is an exact, fail-closed opt-in
+  to the stateless 2026-07-28 request envelope. Modern stdio performs
+  `server/discover`, stamps every request and cancellation notification with the
+  required `_meta`, and reuses the same bounded process, framing, deadline, and
+  cleanup implementation. It does not send HTTP routing headers.
+  The session's `protocol_era` is read-only and is derived from its wire
+  implementation, so initialization, request metadata, and response validation
+  cannot select different eras.
 - `inherit_env=False` does not pass an empty environment. It copies only a small
   launcher safelist (`PATH`, `HOME`, locale/temp/profile variables) so common
   stdio launchers such as `npx` and `uvx` can start while host secrets remain
@@ -12903,9 +12912,11 @@ The first MCP implementation supports stdio servers:
   message.
 - Timed-out or caller-cancelled in-flight requests send MCP
   `notifications/cancelled` when the request has already been written, except for
-  `initialize`, which MCP clients must not cancel. The notification write is
-  best-effort and timeout-bounded; if it is interrupted, the stdio session is
-  closed instead of being reused.
+  the selected establishment request (`initialize` for legacy peers and
+  `server/discover` for modern peers), which MCP clients must not cancel. A
+  modern cancellation notification carries the same pinned request metadata.
+  The notification write is best-effort and timeout-bounded; if it is
+  interrupted, the stdio session is closed instead of being reused.
 - Session shutdown closes the child process stdin first, waits for graceful exit,
   then escalates to terminate/kill if the server does not exit. In contained
   mode, normal server exit also settles descendants that a launcher left behind.
@@ -13019,10 +13030,11 @@ The first MCP implementation supports stdio servers:
   secret-safe refresh diagnostic instead of being retried silently. A validated
   stream resets transient reconnect backoff before any later continuity loss, so
   routine stream rotation does not inherit failure history. The legacy HTTP and
-  stdio paths negotiate MCP through 2025-06-18. An explicit
-  `HttpMcpClient(protocol_era=McpProtocolEra.MODERN_2026_07_28)` instead speaks
-  the stateless MCP 2026-07-28 wire protocol. It does not install this legacy
-  GET/SSE listener even when discovery advertises `tools.listChanged`;
+  stdio paths negotiate MCP through 2025-06-18. Either transport can instead be
+  constructed with
+  `protocol_era=McpProtocolEra.MODERN_2026_07_28` to speak the stateless pinned
+  wire protocol. A modern transport does not install the legacy catalogue-change
+  listener even when discovery advertises `tools.listChanged`;
   `subscriptions/listen` remains a separate deferred capability.
 - Callers must close the toolset when the application or environment shuts down.
   Tool adapters intentionally reuse that established session instead of launching
@@ -13151,31 +13163,37 @@ injected into request headers at connect time. Each `SecretRef` is resolved
 through the supplied vault/proxy and is never inlined into the spec; plain,
 non-secret values go in `env` (stdio) or `headers` (HTTP).
 
-`HttpMcpClient` defaults to `McpProtocolEra.LEGACY`. Selecting
+`HttpMcpClient` and `StdioMcpClient` default to `McpProtocolEra.LEGACY`. Selecting
 `McpProtocolEra.MODERN_2026_07_28` is an exact, fail-closed opt-in; Cayu does not
 probe or silently fall back to a legacy peer. The modern client calls
 `server/discover`, requires the server to advertise `2026-07-28`, and attaches
 the protocol version, client identity, and empty supported-capability object to
-every request's reserved `_meta`. Every POST also carries matching
-`MCP-Protocol-Version` and `Mcp-Method` headers, plus a safely encoded `Mcp-Name`
-for tool calls and resource reads. Modern tool calls require a previously
-admitted `tools/list` snapshot. Primitive arguments whose admitted schema marks
-them with a valid `x-mcp-header` are mirrored into bounded `Mcp-Param-*` headers;
-invalid annotations exclude only their tool, and an unlisted or stale schema
-cannot mint header authority. Tool names and header contracts publish together
-with the existing private dispatch mapping.
+every request's reserved `_meta`. Modern stdio carries that envelope over its
+existing newline-delimited JSON-RPC process boundary and stamps its bounded
+best-effort cancellation notification the same way. Every modern HTTP POST also
+carries matching `MCP-Protocol-Version` and `Mcp-Method` headers, plus a safely
+encoded `Mcp-Name` for tool calls and resource reads. Modern tool calls require a
+previously admitted `tools/list` snapshot. Primitive arguments whose admitted
+schema marks them with a valid `x-mcp-header` are mirrored into bounded
+`Mcp-Param-*` headers;
+invalid annotations exclude only their tool on either transport, and an unlisted
+or stale schema cannot mint HTTP header authority. Stdio validates the same
+catalogue annotations but never emits them as headers. Tool names and HTTP header
+contracts publish together with the existing private dispatch mapping.
 
 Modern successful results may declare `resultType="complete"`; as required for
 protocol compatibility, an absent `resultType` is treated as `"complete"`, while
 every other result type is rejected in this slice. Discovery, tool lists,
 resource lists, and resource reads must also carry typed `ttlMs` and
 `cacheScope` hints. Cayu validates and discards those hints in this slice; it
-does not yet cache responses. Modern HTTP has no `initialize`,
-`notifications/initialized`, `Mcp-Session-Id`, GET listener, replay cursor, or
-session DELETE. Once discovery succeeds, cancellation or timeout settles only
-the affected request stream; independent stateless requests remain usable.
-Automatic negotiation, 2026 stdio, response caching,
-`subscriptions/listen`, and MRTR / `input_required` are not implemented.
+does not yet cache responses. Neither modern transport sends `initialize` or
+`notifications/initialized`. Modern HTTP additionally has no `Mcp-Session-Id`,
+GET listener, replay cursor, or session DELETE; once discovery succeeds, its
+cancellation or timeout settles only the affected request stream. Modern stdio
+retains the existing conservative shared-process rule: an uncertain in-flight
+request sends bounded cancellation and then closes that process connection.
+Automatic negotiation, response caching, `subscriptions/listen`, and MRTR /
+`input_required` are not implemented.
 
 Every MCP exchange also has a Cayu-owned transport envelope. Pass one immutable
 `McpTransportLimits` to `StdioMcpClient(transport_limits=...)` or
