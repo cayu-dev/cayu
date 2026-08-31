@@ -24,6 +24,7 @@ def _command_specs() -> tuple[
     ],
     ...,
 ]:
+    from cayu.cli.agent import add_agent_parser, run_agent
     from cayu.cli.auth import add_auth_parser, run_auth
     from cayu.cli.check import add_check_parser, run_check
     from cayu.cli.cloud import add_cloud_parser, run_cloud
@@ -41,6 +42,7 @@ def _command_specs() -> tuple[
     from cayu.cli.worker import add_worker_parser, run_worker
 
     return (
+        ("agent", add_agent_parser, run_agent),
         ("auth", add_auth_parser, run_auth),
         ("check", add_check_parser, run_check),
         ("cloud", add_cloud_parser, run_cloud),

@@ -5218,7 +5218,8 @@ def test_cancelled_queue_worker_reclaims_child_without_second_provider_dispatch(
         try:
             await processing
         except asyncio.CancelledError as exc:
-            assert str(exc) == "worker shutdown"
+            # Provider-boundary cancellation text is credential-safe and canonical.
+            assert str(exc) == "Provider operation cancelled"
         else:
             raise AssertionError("Queue worker cancellation did not propagate.")
         assert processing.cancelling() == 1

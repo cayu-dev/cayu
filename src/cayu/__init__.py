@@ -2,6 +2,19 @@
 
 from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu._version import __version__
+from cayu.agent_bundle_containers import (
+    AGENT_BUNDLE_CONTAINER_EXTENSION,
+    AGENT_BUNDLE_CONTAINER_MAX_BYTES,
+    AGENT_BUNDLE_CONTAINER_MAX_ENTRIES,
+    AGENT_BUNDLE_CONTAINER_MEDIA_TYPE,
+    AGENT_BUNDLE_CONTAINER_MIMETYPE_ENTRY,
+    AGENT_BUNDLE_CONTAINER_SCHEMA_VERSION,
+    AgentBundleContainerInspection,
+    AgentBundleContainerReceipt,
+    inspect_agent_bundle_container,
+    pack_agent_bundle,
+    unpack_agent_bundle_container,
+)
 from cayu.agent_bundles import (
     AGENT_BUNDLE_INDEX_FILENAME,
     AGENT_BUNDLE_MAX_INDEX_BYTES,
@@ -2498,6 +2511,12 @@ from cayu.workspaces import (
 )
 
 __all__ = [
+    "AGENT_BUNDLE_CONTAINER_EXTENSION",
+    "AGENT_BUNDLE_CONTAINER_MAX_BYTES",
+    "AGENT_BUNDLE_CONTAINER_MAX_ENTRIES",
+    "AGENT_BUNDLE_CONTAINER_MEDIA_TYPE",
+    "AGENT_BUNDLE_CONTAINER_MIMETYPE_ENTRY",
+    "AGENT_BUNDLE_CONTAINER_SCHEMA_VERSION",
     "AGENT_BUNDLE_INDEX_FILENAME",
     "AGENT_BUNDLE_MAX_INDEX_BYTES",
     "AGENT_BUNDLE_MAX_OBJECTS",
@@ -2871,6 +2890,8 @@ __all__ = [
     "Agent",
     "AgentAuthoringState",
     "AgentBundle",
+    "AgentBundleContainerInspection",
+    "AgentBundleContainerReceipt",
     "AgentBundleCoordinator",
     "AgentBundleError",
     "AgentBundleExportReceipt",
@@ -4804,6 +4825,7 @@ __all__ = [
     "gated_loop",
     "group_learning_signals",
     "has_run_limits",
+    "inspect_agent_bundle_container",
     "inspect_eval_corpus",
     "inspect_eval_scenario",
     "interrupted_task_handoff_request",
@@ -4851,6 +4873,7 @@ __all__ = [
     "new_recall_receipt_id",
     "normalize_gate_outcome",
     "normalize_usage_metrics",
+    "pack_agent_bundle",
     "parallel",
     "parse_public_authority_alias",
     "pipeline",
@@ -4920,6 +4943,7 @@ __all__ = [
     "trajectory_to_json",
     "trim_context_messages",
     "trim_context_turns",
+    "unpack_agent_bundle_container",
     "usage_metrics_from_event_payload",
     "validate_application_tool_name",
     "validate_captured_result_for_corpus",

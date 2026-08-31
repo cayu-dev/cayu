@@ -3,11 +3,13 @@
 Run each command in a separate process to exercise the portable boundary::
 
     uv run python examples/portable_agent_bundle.py export --root /tmp/cayu-agent-demo
+    uv run python examples/portable_agent_bundle.py inspect --root /tmp/cayu-agent-demo
     uv run python examples/portable_agent_bundle.py import --root /tmp/cayu-agent-demo
     uv run python examples/portable_agent_bundle.py materialize --root /tmp/cayu-agent-demo
 
-The bundle is an ordinary directory.  It contains authenticated agent-state
-objects, never credentials.  The demo application's explicit materialization
+The downloadable bundle is one ordinary ``compound-agent-v123.cayu`` file.  It
+contains authenticated agent-state objects, never credentials.  The canonical
+unpacked directory remains available for CAS and debugging.  The demo application's explicit materialization
 authority resolves the declared hosted-model binding afresh and starts with a
 new runtime/session/budget/lease/scratch identity and an empty tool-discovery
 grant view.
@@ -51,6 +53,8 @@ from cayu import (
     PortableAgentSnapshotComponentProvider,
     SQLiteAgentSnapshotStore,
     agent_snapshot_component_package,
+    inspect_agent_bundle_container,
+    unpack_agent_bundle_container,
 )
 
 
@@ -98,7 +102,8 @@ def _paths(root: Path) -> dict[str, Path]:
     return {
         "source_db": root / "source-snapshots.sqlite3",
         "source_objects": root / "source-objects",
-        "bundle": root / "compound-agent-v123",
+        "container": root / "compound-agent-v123.cayu",
+        "unpacked": root / "compound-agent-v123.cayu.d",
         "destination_db": root / "destination-snapshots.sqlite3",
         "destination_objects": root / "destination-objects",
         "materialized": root / "materialized",
@@ -270,7 +275,7 @@ async def _export(root: Path) -> dict[str, object]:
     receipt = await AgentBundleCoordinator(
         snapshot_store=snapshot_store,
         object_store=object_store,
-    ).export(
+    ).export_container(
         operation_id="portable-demo-export",
         access=AgentSnapshotAccess(
             snapshot=snapshot.ref,
@@ -278,13 +283,18 @@ async def _export(root: Path) -> dict[str, object]:
             authority_scope_fingerprint=scope,
         ),
         profile=AgentSnapshotProfile.REUSABLE_AGENT,
-        destination=paths["bundle"],
+        destination=paths["container"],
     )
     return receipt.model_dump(mode="json")
 
 
-def _bundle(path: Path) -> AgentBundle:
-    return AgentBundle.model_validate_json((path / AGENT_BUNDLE_INDEX_FILENAME).read_bytes())
+def _inspect(root: Path) -> dict[str, object]:
+    return inspect_agent_bundle_container(_paths(root)["container"]).model_dump(mode="json")
+
+
+def _bundle(container: Path, unpacked: Path) -> AgentBundle:
+    unpack_agent_bundle_container(container, unpacked)
+    return AgentBundle.model_validate_json((unpacked / AGENT_BUNDLE_INDEX_FILENAME).read_bytes())
 
 
 async def _import(root: Path) -> dict[str, object]:
@@ -293,9 +303,9 @@ async def _import(root: Path) -> dict[str, object]:
     receipt = await AgentBundleCoordinator(
         snapshot_store=SQLiteAgentSnapshotStore(paths["destination_db"]),
         object_store=FileSystemAgentSnapshotObjectStore(paths["destination_objects"]),
-    ).import_bundle(
+    ).import_container(
         operation_id="portable-demo-import",
-        source=paths["bundle"],
+        source=paths["container"],
         subject=subject.model_copy(update={"agent_id": "compound-agent-imported"}),
         authority_scope_fingerprint=_digest("portable-demo-destination-scope"),
         owner="portable-demo",
@@ -305,7 +315,7 @@ async def _import(root: Path) -> dict[str, object]:
 
 async def _materialize(root: Path) -> dict[str, object]:
     paths = _paths(root)
-    bundle = _bundle(paths["bundle"])
+    bundle = _bundle(paths["container"], paths["unpacked"])
     _, _, subject = _components(paths["source_objects"])
     scope = _digest("portable-demo-destination-scope")
     destination_subject = subject.model_copy(update={"agent_id": "compound-agent-imported"})
@@ -344,17 +354,21 @@ async def _materialize(root: Path) -> dict[str, object]:
 
 async def _main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("export", "import", "materialize"))
+    parser.add_argument("command", choices=("export", "inspect", "import", "materialize"))
     parser.add_argument("--root", type=Path, required=True)
     arguments = parser.parse_args()
     root = arguments.root.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    result = {
-        "export": _export,
-        "import": _import,
-        "materialize": _materialize,
-    }[arguments.command]
-    print(json.dumps(await result(root), sort_keys=True, separators=(",", ":")))
+    if arguments.command == "inspect":
+        value = _inspect(root)
+    else:
+        result = {
+            "export": _export,
+            "import": _import,
+            "materialize": _materialize,
+        }[arguments.command]
+        value = await result(root)
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":

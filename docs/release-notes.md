@@ -89,6 +89,42 @@ guard.
 
 ## Unreleased
 
+### AgentBundle ships as one deterministic `.cayu` file
+
+The downloadable representation of one `AgentBundle` is now a regular `.cayu`
+file with media type `application/vnd.cayu.agent-bundle`. Container schema v1
+is a deterministic ZIP64 envelope with an explicit version record, exact
+canonical `index.json`, stored entries, normalized metadata, and only the
+transferred digest paths declared by the bundle. Its transport SHA-256 is
+reported for download verification but does not replace `snapshot_root`,
+`bundle_id`, or export authority.
+
+Path and stream APIs pack, inspect, unpack, export, and import in bounded chunks.
+Output streams must be empty, readable, seekable, and truncatable so a failed
+write can roll back to empty and a completed container can be validated before
+acknowledgement. Caller cancellation settles and resets any off-thread stream
+writer before returning, keeping the same destination safe for an exact retry.
+Once validated publication and durable protection release both commit, that
+receipt wins a racing cancellation; release failure resets the stream instead.
+The coordinator retains root protection until atomic file publication and uses
+the existing verified directory/CAS importer for atomic root-and-pin
+publication. Full containers are self-contained; thin containers visibly name
+and enforce their exact destination inventory. Strict raw ZIP and logical
+bundle validation reject compression, encryption, traversal, links, duplicate
+or reordered names, malformed or contradictory ZIP64, overlapping/truncated/
+trailing data, size or digest disagreement, and existing closure/secret
+violations before a final file or snapshot root becomes visible.
+
+Use governed `cayu agent bundle export` and `import` with explicit SQLite
+snapshot-store, filesystem object-store, subject, binding, authority-scope, and
+pin-owner inputs. They invoke the coordinator's protected export and atomic
+root-and-pin import surfaces; `pack` and `unpack` remain separate representation
+conversions. `inspect` and `examples/portable_agent_bundle.py` exercise the rest
+of the one-file copy and materialization workflow. The unpacked directory remains
+the canonical CAS/debugging representation; registry, Cloud, browser, and
+desktop integrations can use the documented extension and MIME association
+without being implemented in this release.
+
 ### Evals separate per-run concurrency from shared runtime capacity
 
 Evaluation targets and durable run records no longer impose a universal

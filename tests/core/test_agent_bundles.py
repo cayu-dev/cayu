@@ -834,14 +834,17 @@ def test_public_example_crosses_fresh_process_export_import_materialization(
         return json.loads(completed.stdout)
 
     exported = run("export")
-    original = root / "compound-agent-v123"
-    copied = root / "copied-agent-bundle"
+    original = root / "compound-agent-v123.cayu"
+    copied = root / "copied-agent-bundle.cayu"
     original.rename(copied)
-    shutil.copytree(copied, original)
+    shutil.copyfile(copied, original)
+    inspected = run("inspect")
     imported = run("import")
     materialized = run("materialize")
 
     exported_root = exported["bundle"]["snapshot_ref"]["snapshot_root"]
+    assert inspected["snapshot_root"] == exported_root
+    assert inspected["mode"] == "full"
     assert imported["snapshot_ref"]["snapshot_root"] == exported_root
     assert materialized["snapshot_ref"]["snapshot_root"] == exported_root
     assert materialized["fresh_identities"]["discovery_grant_ids"] == []

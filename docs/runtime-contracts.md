@@ -10680,6 +10680,116 @@ distinguish root-manifest bytes, complete logical closure bytes, bytes already
 shared with the declared destination, incremental transfer bytes, expected
 materialized file bytes, and unresolved external bindings.
 
+#### Single-file `.cayu` container v1
+
+The public downloadable representation for one existing `AgentBundle` is a
+regular file ending in `.cayu` with media type
+`application/vnd.cayu.agent-bundle`. Container schema v1 is independent of
+`AgentBundle.schema_version` and `AgentSnapshot.schema_version`; packing cannot
+create a state root, change `snapshot_root`, change an object digest, rebind
+export authority, or make a thin bundle self-contained.
+
+V1 is a deterministic ZIP64 envelope containing only stored, uncompressed
+entries in this order:
+
+```text
+mimetype
+index.json
+objects/<first 2 lowercase SHA-256 characters>/<remaining 62 characters>
+```
+
+The first entry contains exactly `application/vnd.cayu.agent-bundle` as ASCII
+without a newline. Its normalized private ZIP extra field carries explicit
+container version `1`; readers reject absent or future versions. The second
+entry is the exact canonical bundle index. Remaining entries are exactly the
+index's `transferred_digests`, ordered by their canonical digest paths. Writers
+normalize timestamps to the ZIP epoch, regular-file permissions to `0600`,
+host attributes, entry order, empty comments, and all extra fields other than
+the required version and standard ZIP64 size records. The same index and object
+bytes therefore produce byte-identical files and the same transport SHA-256.
+That transport digest is download evidence only, never a snapshot root, bundle
+ID, binding, capability, or authorization token.
+
+`pack_agent_bundle()` and `unpack_agent_bundle_container()` convert between the
+single file and canonical directory without creating a new export. Both
+revalidate the exact index and transferred object set. Path and binary-stream
+surfaces spool only to private files and copy object bodies in bounded chunks;
+they never retain a large object or whole archive in memory. Output streams
+must be empty, readable, seekable, and truncatable. Cayu rolls a partial stream
+write back to empty before reporting failure, validates the completed stream
+before acknowledgement, and rejects destinations where those guarantees cannot
+be established. Cancellation does not abandon an off-thread stream writer:
+Cayu settles it under the coordinator lock, restores the stream to empty, then
+redelivers caller cancellation with root protection retained. After validated
+publication, successful durable protection release is the final commit point;
+if cancellation races that release, the committed receipt wins and is returned
+to the caller. A failed release resets a stream before failure is reported. Path
+inspection copies one no-follow regular-file descriptor into a private snapshot,
+hashes and validates that snapshot, then rehashes the still-open descriptor and
+requires its exact digest and path identity to remain unchanged before
+acknowledgement. `export_container()`
+keeps the existing durable `exporting` root protection through atomic file
+publication and acknowledgement. A completed retry verifies and reuses the
+exact canonical file, including its transport SHA-256 rather than bundle
+equality alone. Local file publication fsyncs the completed staging file, creates
+the final same-directory regular-file link without replacement, and fsyncs the
+parent directory before acknowledgement. Unpack fsyncs each file, its staging
+directories, and the publication parent around the atomic directory rename,
+matching Cayu's supported local-store durability boundary. Cancellation can
+leave private staging plus truthful outcome-
+unknown protection, but never a partial final file. `import_container()` first
+validates and privately unpacks every declared entry, then uses the existing
+directory importer so the logical binding, root closure, and first pin still
+publish atomically.
+
+The reader does not call a generic archive extractor and does not trust the
+filename extension. It checks the MIME bytes and explicit container version;
+central-directory and local-header agreement; ZIP64 end records; exact entry
+order, ASCII paths, sizes, CRCs, and content digests; contiguous non-overlapping
+local records; the absence of prefix/trailing data; and canonical metadata.
+The exact 65,535-entry boundary uses an ordinary end record; larger entry counts
+require canonical ZIP64 end records, matching the writer threshold.
+Encryption, data descriptors, compression, multiple disks, duplicate or case-
+colliding names, Unicode/absolute/drive/UNC/traversal paths, symlinks and other
+non-regular types, unknown extras or flags, contradictory ZIP64 metadata,
+unnecessary ZIP64 end records, missing/extra objects, truncation, and all
+existing bundle/closure violations
+fail before final publication. Archive mode bits never override authenticated
+component executable modes.
+
+`cayu agent bundle inspect FILE.cayu` reports only bounded safe identity, mode,
+profile, size, count, unresolved-binding, destination-inventory, and transport-
+digest metadata. Thin containers visibly report their exact destination
+inventory dependency and import only when omitted component objects already
+exist in that authorized CAS. The canonical directory remains supported for
+very large CAS workflows, debugging, structural sharing, and future registries.
+Cloud downloads, registries, browsers, and desktop tools should use the
+extension and media type above; this contract does not implement those
+integrations, signing, encryption, mounting, or direct execution.
+
+The CLI keeps governed operations distinct from representation conversion.
+`export` opens the declared SQLite snapshot store and filesystem object CAS,
+requires the exact snapshot root, binding, and source authority scope, and calls
+`AgentBundleCoordinator.export_container()` so durable `exporting` protection
+spans file acknowledgement. `import` requires the destination stores, a bounded
+`AgentSnapshotSubject` JSON document, destination authority scope, and pin owner,
+then calls `AgentBundleCoordinator.import_container()` to publish and pin the
+root atomically. `pack` and `unpack` remain authority-neutral conversions:
+
+```bash
+cayu agent bundle export \
+  --snapshot-store snapshots.sqlite3 --object-store snapshot-objects \
+  --snapshot-root SNAPSHOT_SHA256 --binding-id BINDING_SHA256 \
+  --authority-scope-fingerprint SOURCE_SCOPE_SHA256 --output agent.cayu
+cayu agent bundle import agent.cayu \
+  --snapshot-store destination.sqlite3 --object-store destination-objects \
+  --subject destination-subject.json \
+  --authority-scope-fingerprint DESTINATION_SCOPE_SHA256 --owner release-manager
+```
+
+Callers may supply a stable `--operation-id`; otherwise the CLI derives a
+bounded deterministic retry identity from the non-secret declared inputs.
+
 Import validates the canonical index and all declared files under fixed object,
 index, count, and total-byte ceilings. Object paths derive only from lowercase
 digests. Symlinks, traversal, extra files, missing files, truncation, corruption,
@@ -10737,15 +10847,18 @@ This is exact-known-value protection, not general DLP or information-flow
 tracking. Evaluator-private stores and application authorization remain the
 authoritative exclusion boundary.
 
-Run the complete credential-free three-process example with:
+Run the complete credential-free multi-process example with:
 
 ```bash
 uv run python examples/portable_agent_bundle.py export --root /tmp/cayu-agent-demo
+uv run python examples/portable_agent_bundle.py inspect --root /tmp/cayu-agent-demo
 uv run python examples/portable_agent_bundle.py import --root /tmp/cayu-agent-demo
 uv run python examples/portable_agent_bundle.py materialize --root /tmp/cayu-agent-demo
 ```
 
-The commands intentionally use separate SQLite stores and interpreter processes.
+Copy `compound-agent-v123.cayu` between the export and inspect/import commands to
+exercise the ordinary download boundary. The commands intentionally use
+separate SQLite stores and interpreter processes.
 The imported root equals the exported root, while logical registration,
 authority scope, runtime/session/budget/lease/scratch identities, hosted-model
 binding, and discovery grants are fresh.

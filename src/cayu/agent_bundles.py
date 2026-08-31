@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
@@ -21,7 +22,7 @@ from contextlib import asynccontextmanager, contextmanager, suppress
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Literal
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -35,6 +36,10 @@ from pydantic import (
 )
 
 from cayu._filesystem_lock import cooperative_path_lock
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -80,6 +85,9 @@ from cayu.agent_snapshots import (
     agent_snapshot_from_json,
 )
 from cayu.vaults.redaction import SecretRedactor
+
+if TYPE_CHECKING:
+    from cayu.agent_bundle_containers import AgentBundleContainerReceipt
 
 AGENT_BUNDLE_RECORD_TYPE = "cayu.agent-bundle"
 AGENT_BUNDLE_SCHEMA_VERSION = 1
@@ -410,6 +418,131 @@ async def _async_path_lock(
         except asyncio.CancelledError:
             await release
             raise
+
+
+async def _pack_container_without_abandoning_mutation(
+    source: Path,
+    destination: Path | BinaryIO,
+) -> AgentBundleContainerReceipt:
+    """Settle off-thread publication and restore stream retryability on cancellation."""
+
+    from cayu.agent_bundle_containers import (
+        _reset_transactional_stream,
+        pack_agent_bundle,
+    )
+
+    publication = asyncio.create_task(
+        asyncio.to_thread(pack_agent_bundle, source, destination),
+        name="cayu-agent-bundle-container-publication",
+    )
+    outcome = await await_shielded_task_outcome(publication)
+    error = outcome.error
+    cancellation = outcome.cancellation
+    consumed_requests = outcome.cancellation_requests_consumed
+    reset_error: BaseException | None = None
+    if cancellation is not None and not isinstance(destination, Path):
+        stream_was_rejected_without_mutation = isinstance(
+            error, AgentBundleError
+        ) and error.code in {
+            "container_stream_destination_not_empty",
+            "container_stream_transaction_unsupported",
+        }
+        if not stream_was_rejected_without_mutation:
+            reset = asyncio.create_task(
+                asyncio.to_thread(_reset_transactional_stream, destination),
+                name="cayu-agent-bundle-container-stream-cancellation-reset",
+            )
+            reset_outcome = await await_shielded_task_outcome(
+                reset,
+                cancellation=cancellation,
+            )
+            cancellation = reset_outcome.cancellation or cancellation
+            consumed_requests += reset_outcome.cancellation_requests_consumed
+            reset_error = reset_outcome.error
+    if cancellation is not None:
+        restore_task_cancellation_requests(
+            consumed_requests,
+            cancellation=cancellation,
+        )
+        cause = reset_error or error
+        if reset_error is not None:
+            cancellation.add_note(
+                "Agent bundle stream reset failed while caller cancellation was pending."
+            )
+        elif error is not None:
+            cancellation.add_note(
+                "Agent bundle publication failed while caller cancellation was pending."
+            )
+        if cause is not None:
+            raise cancellation from cause
+        raise cancellation
+    if error is not None:
+        raise error
+    if outcome.result is None:  # pragma: no cover - successful publication returns a receipt
+        raise RuntimeError("Agent bundle container publication returned no receipt.")
+    return outcome.result
+
+
+async def _release_container_export_protection_after_publication(
+    *,
+    snapshot_store: AgentSnapshotStore,
+    operation_id: str,
+    access: AgentSnapshotAccess,
+    protection_id: str,
+    destination: Path | BinaryIO,
+) -> None:
+    """Settle the release; a committed release makes publication authoritative."""
+
+    release = asyncio.create_task(
+        snapshot_store.release_snapshot_protection(
+            operation_id=operation_id,
+            access=access,
+            protection_id=protection_id,
+        ),
+        name="cayu-agent-bundle-container-protection-release",
+    )
+    outcome = await await_shielded_task_outcome(release)
+    if outcome.error is None:
+        # Publication was already validated, and durable release is the final
+        # commit point. A cancellation racing this successful commit must not
+        # replace the receipt that the caller is now guaranteed to receive.
+        return
+
+    cancellation = outcome.cancellation
+    consumed_requests = outcome.cancellation_requests_consumed
+    reset_error: BaseException | None = None
+    if not isinstance(destination, Path):
+        from cayu.agent_bundle_containers import _reset_transactional_stream
+
+        reset = asyncio.create_task(
+            asyncio.to_thread(_reset_transactional_stream, destination),
+            name="cayu-agent-bundle-container-stream-release-failure-reset",
+        )
+        reset_outcome = await await_shielded_task_outcome(
+            reset,
+            cancellation=cancellation,
+        )
+        cancellation = reset_outcome.cancellation or cancellation
+        consumed_requests += reset_outcome.cancellation_requests_consumed
+        reset_error = reset_outcome.error
+    if cancellation is not None:
+        restore_task_cancellation_requests(
+            consumed_requests,
+            cancellation=cancellation,
+        )
+        if reset_error is not None:
+            cancellation.add_note(
+                "Agent bundle stream reset failed after protection release failed."
+            )
+        else:
+            cancellation.add_note(
+                "Agent bundle protection release failed while caller cancellation was pending."
+            )
+        raise cancellation from (reset_error or outcome.error)
+    if reset_error is not None:
+        reset_error.add_note("Agent bundle protection release also failed.")
+        raise reset_error from outcome.error
+    raise outcome.error
 
 
 class _BundleModel(BaseModel):
@@ -2632,6 +2765,15 @@ class AgentBundleCoordinator:
         ):
             raise TypeError("terminal_authority must be an AgentSnapshotTerminalAuthority.")
         self.terminal_authority = terminal_authority
+        self._container_export_lock = asyncio.Lock()
+        self._container_export_waiters: dict[
+            tuple[str, str, str, str, str, AgentSnapshotProfile, AgentBundleMode, str],
+            int,
+        ] = {}
+        self._container_export_expected_receipts: dict[
+            tuple[str, str, str, str, str, AgentSnapshotProfile, AgentBundleMode, str],
+            AgentBundleContainerReceipt,
+        ] = {}
 
     async def export(
         self,
@@ -2709,6 +2851,154 @@ class AgentBundleCoordinator:
                         protection_id=protection.protection_id,
                     )
 
+    async def export_container(
+        self,
+        *,
+        operation_id: str,
+        access: AgentSnapshotAccess,
+        profile: AgentSnapshotProfile,
+        destination: str | Path | BinaryIO,
+        mode: AgentBundleMode = AgentBundleMode.FULL,
+        destination_inventory: AgentBundleInventory | None = None,
+    ) -> AgentBundleContainerReceipt:
+        """Export one authorized snapshot closure as a single ``.cayu`` file.
+
+        The ordinary directory remains the canonical unpacked representation.
+        Root protection spans directory construction, container publication,
+        and acknowledgement; a cancellation or failed publication retains the
+        protection for an exact retry.
+        """
+
+        operation_id = _clean(operation_id, "operation_id", max_chars=256)
+        inventory = destination_inventory or AgentBundleInventory()
+        if mode is AgentBundleMode.FULL and inventory.object_digests:
+            raise ValueError("A full bundle does not consume a destination inventory.")
+        if isinstance(destination, str | os.PathLike):
+            destination_path = Path(cast("str | os.PathLike[str]", destination))
+            if not destination_path.is_absolute():
+                raise ValueError("Container destination must be absolute.")
+            temporary_parent = destination_path.parent
+            temporary_parent.mkdir(parents=True, exist_ok=True)
+        else:
+            if not hasattr(destination, "write"):
+                raise TypeError("destination must be a path or binary stream.")
+            destination_path = destination
+            temporary_parent = None
+        flight_key: (
+            tuple[str, str, str, str, str, AgentSnapshotProfile, AgentBundleMode, str] | None
+        ) = None
+        if isinstance(destination_path, Path):
+            flight_key = (
+                str(destination_path),
+                operation_id,
+                access.snapshot.snapshot_root,
+                access.binding_id,
+                access.authority_scope_fingerprint,
+                profile,
+                mode,
+                inventory.fingerprint,
+            )
+            self._container_export_waiters[flight_key] = (
+                self._container_export_waiters.get(flight_key, 0) + 1
+            )
+        try:
+            async with self._container_export_lock:
+                if not isinstance(destination_path, Path):
+                    return await self._export_container_locked(
+                        operation_id=operation_id,
+                        access=access,
+                        profile=profile,
+                        destination=destination_path,
+                        mode=mode,
+                        inventory=inventory,
+                        temporary_parent=temporary_parent,
+                    )
+                async with _async_path_lock(
+                    destination_path.parent,
+                    destination_path.name,
+                    lock_directory_name="cayu-agent-bundle-container-export-operation-locks",
+                ):
+                    assert flight_key is not None
+                    receipt = await self._export_container_locked(
+                        operation_id=operation_id,
+                        access=access,
+                        profile=profile,
+                        destination=destination_path,
+                        mode=mode,
+                        inventory=inventory,
+                        temporary_parent=temporary_parent,
+                        expected_receipt=self._container_export_expected_receipts.get(flight_key),
+                    )
+                    self._container_export_expected_receipts[flight_key] = receipt
+                    return receipt
+        finally:
+            if flight_key is not None:
+                waiters = self._container_export_waiters[flight_key] - 1
+                if waiters:
+                    self._container_export_waiters[flight_key] = waiters
+                else:
+                    del self._container_export_waiters[flight_key]
+                    self._container_export_expected_receipts.pop(flight_key, None)
+
+    async def _export_container_locked(
+        self,
+        *,
+        operation_id: str,
+        access: AgentSnapshotAccess,
+        profile: AgentSnapshotProfile,
+        destination: Path | BinaryIO,
+        mode: AgentBundleMode,
+        inventory: AgentBundleInventory,
+        temporary_parent: Path | None,
+        expected_receipt: AgentBundleContainerReceipt | None = None,
+    ) -> AgentBundleContainerReceipt:
+        """Export while one caller owns the complete snapshot-protection interval."""
+
+        from cayu.agent_bundle_containers import _read_container
+
+        protection = AgentSnapshotProtection.create(
+            operation_id=operation_id,
+            access=access,
+            kind=AgentSnapshotProtectionKind.EXPORTING,
+            owner="agent-bundle-coordinator",
+            reason="bundle-container-export-in-progress",
+        )
+        await self.snapshot_store.protect_snapshot(protection)
+        if isinstance(destination, Path) and destination.exists() and expected_receipt is not None:
+            receipt = await asyncio.to_thread(_read_container, destination)
+            if receipt != expected_receipt:
+                raise AgentBundleError("container_destination_conflict")
+        else:
+            expected_bundle, objects = await self._prepare_protected_export(
+                access=access,
+                profile=profile,
+                mode=mode,
+                destination_inventory=inventory,
+            )
+            with tempfile.TemporaryDirectory(
+                prefix=".cayu-agent-bundle-container-",
+                dir=temporary_parent,
+            ) as temporary_root:
+                unpacked = Path(temporary_root) / "bundle"
+                await self._write_bundle(
+                    destination=unpacked,
+                    bundle=expected_bundle,
+                    objects=objects,
+                    operation_id=operation_id,
+                )
+                receipt = await _pack_container_without_abandoning_mutation(
+                    unpacked,
+                    destination,
+                )
+        await _release_container_export_protection_after_publication(
+            snapshot_store=self.snapshot_store,
+            operation_id=operation_id,
+            access=access,
+            protection_id=protection.protection_id,
+            destination=destination,
+        )
+        return receipt
+
     async def _export_protected(
         self,
         *,
@@ -2719,6 +3009,34 @@ class AgentBundleCoordinator:
         mode: AgentBundleMode,
         destination_inventory: AgentBundleInventory,
     ) -> AgentBundleExportReceipt:
+        bundle, objects = await self._prepare_protected_export(
+            access=access,
+            profile=profile,
+            mode=mode,
+            destination_inventory=destination_inventory,
+        )
+        await self._write_bundle(
+            destination,
+            bundle,
+            objects,
+            operation_id,
+        )
+        return AgentBundleExportReceipt.create(
+            operation_id=operation_id,
+            bundle=bundle,
+            destination_fingerprint=_bundle_path_fingerprint(destination),
+        )
+
+    async def _prepare_protected_export(
+        self,
+        *,
+        access: AgentSnapshotAccess,
+        profile: AgentSnapshotProfile,
+        mode: AgentBundleMode,
+        destination_inventory: AgentBundleInventory,
+    ) -> tuple[AgentBundle, dict[str, tuple[AgentBundleObjectRef, bytes | None]]]:
+        """Derive and verify one exact export without publishing its representation."""
+
         snapshot = await self.snapshot_store.get_snapshot(access)
         nodes = await self.snapshot_store.enumerate_snapshot_closure(access)
         objects: dict[str, tuple[AgentBundleObjectRef, bytes | None]] = {}
@@ -2873,17 +3191,7 @@ class AgentBundleCoordinator:
                 ),
             ),
         )
-        await self._write_bundle(
-            destination,
-            bundle,
-            objects,
-            operation_id,
-        )
-        return AgentBundleExportReceipt.create(
-            operation_id=operation_id,
-            bundle=bundle,
-            destination_fingerprint=_bundle_path_fingerprint(destination),
-        )
+        return bundle, objects
 
     async def _write_bundle(
         self,
@@ -3075,6 +3383,36 @@ class AgentBundleCoordinator:
             imported_digests=imported,
             reused_digests=reused,
         )
+
+    async def import_container(
+        self,
+        *,
+        operation_id: str,
+        source: str | Path | BinaryIO,
+        subject: AgentSnapshotSubject,
+        authority_scope_fingerprint: str,
+        owner: str,
+        retention_class: AgentSnapshotRetentionClass = AgentSnapshotRetentionClass.RELEASE,
+    ) -> AgentBundleImportReceipt:
+        """Validate a ``.cayu`` container, then atomically import and pin its bundle."""
+
+        from cayu.agent_bundle_containers import unpack_agent_bundle_container
+
+        with tempfile.TemporaryDirectory(prefix="cayu-agent-bundle-import-") as temporary_root:
+            unpacked = Path(temporary_root) / "bundle"
+            await asyncio.to_thread(
+                unpack_agent_bundle_container,
+                source,
+                unpacked,
+            )
+            return await self.import_bundle(
+                operation_id=operation_id,
+                source=unpacked,
+                subject=subject,
+                authority_scope_fingerprint=authority_scope_fingerprint,
+                owner=owner,
+                retention_class=retention_class,
+            )
 
     async def materialize(
         self,
