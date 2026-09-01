@@ -25,6 +25,9 @@ from tests.core.checkpoint_schema_conformance import (
     assert_versionless_pending_continuation_fails_closed_conformance,
 )
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
+from tests.core.session_operation_fault_conformance import (
+    assert_session_operation_fault_conformance,
+)
 from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
@@ -406,6 +409,16 @@ def test_postgres_session_store_preserves_projected_tool_results(
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_session_operation_fault_conformance(postgres_dsn: str) -> None:
+    async def ops(store) -> None:
+        await assert_session_operation_fault_conformance(
+            store,
+            session_id_prefix="postgres",
+        )
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_durable_workspace_branch_conformance(postgres_dsn: str, tmp_path) -> None:

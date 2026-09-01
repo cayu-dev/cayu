@@ -117,6 +117,12 @@ uv run pytest tests/core -q                    # focused runs are fine while ite
 uv run pytest --store-durations --clean-durations  # refresh CI's .test_durations snapshot
 ```
 
+For deterministic pre-commit, acknowledgement-loss, and ownership-handoff
+coverage around durable session operations, use the repository-private
+[Session operation publication fault harness](docs/session-operation-fault-harness.md).
+It preserves each backend's real transaction boundary and must not be copied into
+production code or the installed testing API.
+
 The parallel command is safe with the default testcontainers-managed Postgres setup,
 where each worker gets an isolated container. When `CAYU_TEST_POSTGRES_DSN` points at one
 shared database, run the suite serially because store tests intentionally clear their

@@ -15,6 +15,18 @@ from tests.core._execution_profile_fixtures import (
     create_admitted_session,
     profiled_session_identity,
 )
+from tests.core._session_operation_fault_harness import (
+    CommitEvidence,
+    Delegate,
+    FailBeforeCommit,
+    InjectedSessionOperationPublicationError,
+    PauseBeforeTransform,
+    PublicationBarrier,
+    PublicationFaultActionKind,
+    SessionOperationFaultHarness,
+    SessionOperationFaultRule,
+    SessionOperationSelector,
+)
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import SQLiteBudgetLedger, SQLiteSessionStore
@@ -125,6 +137,7 @@ from cayu.runtime.provider_operations import (
     provider_operation_progress_envelope,
     provider_operation_progress_event_id,
     provider_operation_resolution_outcome_event_id,
+    provider_operation_resolution_storage_key,
     resolve_provider_operation_stage,
 )
 from cayu.runtime.sessions import (
@@ -4831,6 +4844,10 @@ def test_explicit_fail_resolution_terminalizes_without_provider_redispatch() -> 
         active = await store.load_active_model_completion_stage(session_id)
         assert interrupted is not None
         assert active is not None
+        session_before = interrupted.model_copy(deep=True)
+        checkpoint_before = await store.load_checkpoint(session_id)
+        active_before = active.model_copy(deep=True)
+        events_before = await store.load_events(session_id)
         request = ProviderOperationResolutionRequest(
             session_id=session_id,
             stage_id=active.stage.stage_id,
@@ -4838,38 +4855,180 @@ def test_explicit_fail_resolution_terminalizes_without_provider_redispatch() -> 
             action=ProviderOperationResolutionAction.FAIL,
             reason="provider operation unavailable; fail this model attempt",
         )
+        resolution_key = provider_operation_resolution_storage_key(active.stage.stage_id)
+        rule = SessionOperationFaultRule(
+            rule_id="provider-fail-retry",
+            selector=SessionOperationSelector(
+                session_id=session_id,
+                idempotency_key=resolution_key,
+                event_types=frozenset({EventType.PROVIDER_OPERATION_RESOLVED}),
+            ),
+            actions=(FailBeforeCommit(count=2), Delegate()),
+        )
 
-        events = [event async for event in app.resolve_provider_operation(request)]
+        async with SessionOperationFaultHarness(store, rules=(rule,)) as harness:
+            for _ in range(2):
+                with pytest.raises(InjectedSessionOperationPublicationError):
+                    _ = [event async for event in app.resolve_provider_operation(request)]
 
-        assert [event.type for event in events] == [
-            EventType.PROVIDER_OPERATION_RESOLVED,
-            EventType.MODEL_ERROR,
-            EventType.INTERACTION_FAILED,
-            EventType.SESSION_FAILED,
+                assert await store.load(session_id) == session_before
+                assert await store.load_checkpoint(session_id) == checkpoint_before
+                assert await store.load_active_model_completion_stage(session_id) == active_before
+                assert await store.load_events(session_id) == events_before
+                assert (
+                    await load_provider_operation_resolution(
+                        store,
+                        session_id,
+                        active.stage.stage_id,
+                    )
+                    is None
+                )
+                assert await load_pending_provider_operation_disposition(store, session_id) is None
+
+            events = [event async for event in app.resolve_provider_operation(request)]
+
+            assert [event.type for event in events] == [
+                EventType.PROVIDER_OPERATION_RESOLVED,
+                EventType.MODEL_ERROR,
+                EventType.INTERACTION_FAILED,
+                EventType.SESSION_FAILED,
+            ]
+            assert events[1].payload["error_type"] == "provider_operation_unavailable"
+            assert events[1].payload["recovery_reason"] == "unavailable"
+            assert events[0].payload["duplicate_request_risk"] is True
+            assert events[3].payload["failure_type"] == "provider_operation_unavailable"
+            expected_profile_fingerprint = active.stage.intent["recovery_context"][
+                "execution_profile_fingerprint"
+            ]
+            assert (
+                events[0].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
+            )
+            assert (
+                events[1].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
+            )
+            assert (
+                events[3].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
+            )
+            failed = await store.load(session_id)
+            assert failed is not None
+            assert failed.status is SessionStatus.FAILED
+            assert provider.adapter.start_calls == 0
+            assert await store.load_active_model_completion_stage(session_id) is None
+
+            replay = [event async for event in app.resolve_provider_operation(request)]
+            assert [event.type for event in replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
+
+        assert [entry.action for entry in harness.trace] == [
+            PublicationFaultActionKind.FAIL_BEFORE_COMMIT,
+            PublicationFaultActionKind.FAIL_BEFORE_COMMIT,
+            PublicationFaultActionKind.DELEGATE,
         ]
-        assert events[1].payload["error_type"] == "provider_operation_unavailable"
-        assert events[1].payload["recovery_reason"] == "unavailable"
-        assert events[0].payload["duplicate_request_risk"] is True
-        assert events[3].payload["failure_type"] == "provider_operation_unavailable"
-        expected_profile_fingerprint = active.stage.intent["recovery_context"][
-            "execution_profile_fingerprint"
+        assert [entry.committed for entry in harness.trace[:3]] == [
+            CommitEvidence.NO,
+            CommitEvidence.NO,
+            CommitEvidence.YES,
         ]
-        assert events[0].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
-        assert events[1].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
-        assert events[3].payload["execution_profile_fingerprint"] == expected_profile_fingerprint
-        failed = await store.load(session_id)
-        assert failed is not None
-        assert failed.status is SessionStatus.FAILED
-        assert provider.adapter.start_calls == 0
-        assert await store.load_active_model_completion_stage(session_id) is None
-
-        replay = [event async for event in app.resolve_provider_operation(request)]
-        assert [event.type for event in replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
         stored_events = await store.load_events(session_id)
+        assert (
+            sum(event.type is EventType.PROVIDER_OPERATION_RESOLVED for event in stored_events) == 1
+        )
         assert sum(event.type is EventType.MODEL_ERROR for event in stored_events) == 1
         assert sum(event.type is EventType.INTERACTION_FAILED for event in stored_events) == 1
         assert sum(event.type is EventType.SESSION_FAILED for event in stored_events) == 1
         assert provider.adapter.start_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_provider_resolution_stale_owner_cannot_overwrite_successor_publication() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-resolution-stale-publication-owner"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        app, fallback_request = await _prepare_explicit_fallback_resolution(
+            store,
+            session_id=session_id,
+            provider=provider,
+        )
+        request = fallback_request.model_copy(
+            update={
+                "action": ProviderOperationResolutionAction.FAIL,
+                "reason": "fence the stale provider-resolution owner",
+            }
+        )
+        active = await store.load_active_model_completion_stage(session_id)
+        interrupted = await store.load(session_id)
+        assert active is not None
+        assert interrupted is not None
+        resolution_key = provider_operation_resolution_storage_key(active.stage.stage_id)
+        barrier = PublicationBarrier()
+        rule = SessionOperationFaultRule(
+            rule_id="provider-stale-owner",
+            selector=SessionOperationSelector(
+                session_id=session_id,
+                idempotency_key=resolution_key,
+                event_types=frozenset({EventType.PROVIDER_OPERATION_RESOLVED}),
+            ),
+            actions=(PauseBeforeTransform(barrier), Delegate()),
+        )
+
+        async def collect_stale_resolution() -> list[Event]:
+            return [event async for event in app.resolve_provider_operation(request)]
+
+        successor_owned = False
+        async with SessionOperationFaultHarness(store, rules=(rule,)) as harness:
+            stale = asyncio.create_task(collect_stale_resolution())
+            await barrier.wait_until_entered()
+            try:
+                successor = await store.fence_stalled_run(
+                    session_id,
+                    statuses={SessionStatus.INTERRUPTED},
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+                assert successor is not None
+                assert successor.run_epoch == interrupted.run_epoch + 1
+                successor_owned = True
+                successor_request = request.model_copy(
+                    update={"expected_run_epoch": successor.run_epoch}
+                )
+                accepted = await resolve_provider_operation_stage(
+                    store,
+                    successor_request,
+                    redactor=SecretRedactor(),
+                )
+                assert accepted.replayed is False
+            finally:
+                barrier.release()
+
+            with pytest.raises(SessionRunFenced):
+                await stale
+
+            durable = await load_provider_operation_resolution(
+                store,
+                session_id,
+                active.stage.stage_id,
+            )
+            assert durable is not None
+            assert durable.record.request_digest == accepted.record.request_digest
+            pending = await load_pending_provider_operation_disposition(store, session_id)
+            assert pending is not None
+            assert pending[1].record.request_digest == accepted.record.request_digest
+            assert await store.load_active_model_completion_stage(session_id) is None
+            stored_events = await store.load_events(session_id)
+            assert (
+                sum(event.type is EventType.PROVIDER_OPERATION_RESOLVED for event in stored_events)
+                == 1
+            )
+            assert provider.adapter.start_calls == 0
+
+        assert [entry.action for entry in harness.trace] == [
+            PublicationFaultActionKind.PAUSE_BEFORE_TRANSFORM,
+            PublicationFaultActionKind.DELEGATE,
+        ]
+        assert harness.trace[0].committed is CommitEvidence.NO
+        assert harness.trace[1].committed is CommitEvidence.YES
+        if successor_owned:
+            await store.release_run_fence(session_id)
 
     asyncio.run(scenario())
 

@@ -11,6 +11,14 @@ from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
+from tests.core._session_operation_fault_harness import (
+    CommitEvidence,
+    CommitThenRaise,
+    PublicationFaultActionKind,
+    SessionOperationFaultHarness,
+    SessionOperationFaultRule,
+    SessionOperationSelector,
+)
 
 from cayu import (
     AgentSpec,
@@ -161,7 +169,6 @@ def _bound_context(
     args: dict[str, Any],
     tool_call_id: str,
     authorize: bool = True,
-    fail_once_after_record_type: str | None = None,
     secret_redactor: SecretRedactor | None = None,
     secret_snapshot_provider: Callable[[], InvocationRedactorSnapshot] | None = None,
     seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -213,10 +220,6 @@ def _bound_context(
             expected_statuses={SessionStatus.RUNNING},
             expected_run_epoch=session.run_epoch,
         )
-        nonlocal fail_once_after_record_type
-        if desired_copy.get("record_type") == fail_once_after_record_type:
-            fail_once_after_record_type = None
-            raise ConnectionError("durable commit acknowledgement was lost")
         return desired_copy
 
     async def authorize_reference(
@@ -270,7 +273,6 @@ async def _publish(
     path: str = "handoff/solver.py",
     tool_call_id: str = "publish-1",
     clock: datetime = _NOW,
-    fail_once_after_record_type: str | None = None,
     secret_redactor: SecretRedactor | None = None,
     secret_snapshot_provider: Callable[[], InvocationRedactorSnapshot] | None = None,
     seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -284,7 +286,6 @@ async def _publish(
         tool_name="publish_workspace_artifact",
         args=args,
         tool_call_id=tool_call_id,
-        fail_once_after_record_type=fail_once_after_record_type,
         secret_redactor=secret_redactor,
         secret_snapshot_provider=secret_snapshot_provider,
         seal_durable_output=seal_durable_output,
@@ -303,7 +304,6 @@ async def _materialize(
     destination: str = "received/solver.py",
     tool_call_id: str = "materialize-1",
     clock: datetime = _NOW + timedelta(minutes=1),
-    fail_once_after_record_type: str | None = None,
     secret_redactor: SecretRedactor | None = None,
     secret_snapshot_provider: Callable[[], InvocationRedactorSnapshot] | None = None,
     seal_durable_output: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -317,7 +317,6 @@ async def _materialize(
         tool_name="materialize_shared_artifact",
         args=args,
         tool_call_id=tool_call_id,
-        fail_once_after_record_type=fail_once_after_record_type,
         secret_redactor=secret_redactor,
         secret_snapshot_provider=secret_snapshot_provider,
         seal_durable_output=seal_durable_output,
@@ -1474,52 +1473,85 @@ def test_lost_commit_acknowledgements_rejoin_publication_and_materialization(
         child_workspace = _workspace(tmp_path / "child", workspace_id="child-workspace")
         await parent_workspace.write_bytes("handoff/data.txt", b"acknowledged durably")
         policy = _policy()
-
-        with pytest.raises(ConnectionError, match="acknowledgement"):
-            await _publish(
+        rules = (
+            SessionOperationFaultRule(
+                rule_id="shared-artifact-publish",
+                selector=SessionOperationSelector(
+                    session_id=parent.id,
+                    label="shared-artifact-publish",
+                ),
+                actions=(CommitThenRaise(),),
+            ),
+            SessionOperationFaultRule(
+                rule_id="shared-artifact-materialize",
+                selector=SessionOperationSelector(
+                    session_id=child.id,
+                    label="shared-artifact-materialize",
+                ),
+                actions=(CommitThenRaise(),),
+            ),
+        )
+        async with SessionOperationFaultHarness(store, rules=rules) as harness:
+            with (
+                harness.label("shared-artifact-publish"),
+                pytest.raises(ConnectionError, match="acknowledgement"),
+            ):
+                await _publish(
+                    session=parent,
+                    session_store=store,
+                    workspace=parent_workspace,
+                    artifact_store=artifact_store,
+                    policy=policy,
+                    path="handoff/data.txt",
+                    tool_call_id="lost-publish-ack",
+                )
+            published = await _publish(
                 session=parent,
                 session_store=store,
                 workspace=parent_workspace,
                 artifact_store=artifact_store,
                 policy=policy,
                 path="handoff/data.txt",
-                tool_call_id="lost-publish-ack",
-                fail_once_after_record_type="cayu.shared-artifact-publication-receipt",
+                tool_call_id="rejoin-publish",
             )
-        published = await _publish(
-            session=parent,
-            session_store=store,
-            workspace=parent_workspace,
-            artifact_store=artifact_store,
-            policy=policy,
-            path="handoff/data.txt",
-            tool_call_id="rejoin-publish",
-        )
-        assert published.structured["recovered_from_durable_receipt"] is True
+            assert published.structured["recovered_from_durable_receipt"] is True
 
-        with pytest.raises(ConnectionError, match="acknowledgement"):
-            await _materialize(
+            with (
+                harness.label("shared-artifact-materialize"),
+                pytest.raises(ConnectionError, match="acknowledgement"),
+            ):
+                await _materialize(
+                    session=child,
+                    session_store=store,
+                    workspace=child_workspace,
+                    artifact_store=artifact_store,
+                    policy=policy,
+                    opaque_ref=published.content,
+                    tool_call_id="lost-materialize-ack",
+                )
+            materialized = await _materialize(
                 session=child,
                 session_store=store,
                 workspace=child_workspace,
                 artifact_store=artifact_store,
                 policy=policy,
                 opaque_ref=published.content,
-                tool_call_id="lost-materialize-ack",
-                fail_once_after_record_type="cayu.shared-artifact-materialization-receipt",
+                tool_call_id="rejoin-materialize",
             )
-        materialized = await _materialize(
-            session=child,
-            session_store=store,
-            workspace=child_workspace,
-            artifact_store=artifact_store,
-            policy=policy,
-            opaque_ref=published.content,
-            tool_call_id="rejoin-materialize",
-        )
         assert materialized.structured["recovered_from_durable_receipt"] is True
         copied = await child_workspace.read_bytes("received/solver.py", max_bytes=1024)
         assert copied.content == b"acknowledged durably"
+        injected = [record for record in harness.trace if record.matched_rule_id is not None]
+        assert [record.matched_rule_id for record in injected] == [
+            "shared-artifact-publish",
+            "shared-artifact-materialize",
+        ]
+        assert all(
+            record.action is PublicationFaultActionKind.COMMIT_THEN_RAISE
+            and record.committed is CommitEvidence.YES
+            and record.acknowledgement_returned is False
+            for record in injected
+        )
 
     asyncio.run(exercise())
 
