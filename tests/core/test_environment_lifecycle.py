@@ -518,6 +518,8 @@ def test_cancellation_during_factory_resolution_finalizes_before_fence_release()
             expected_session_instance_id: str | None = None,
             expected_active_invocation_profile=None,
             expected_invocation_authority_state="active",
+            expected_recovery_claim_id: str | None = None,
+            expected_recovery_claim_clock=None,
         ):
             result = await super().publish_interaction_transition(
                 session_id,
@@ -529,6 +531,8 @@ def test_cancellation_during_factory_resolution_finalizes_before_fence_release()
                 expected_session_instance_id=expected_session_instance_id,
                 expected_active_invocation_profile=expected_active_invocation_profile,
                 expected_invocation_authority_state=expected_invocation_authority_state,
+                expected_recovery_claim_id=expected_recovery_claim_id,
+                expected_recovery_claim_clock=expected_recovery_claim_clock,
             )
             if to_status == SessionStatus.INTERRUPTED:
                 self.lifecycle_order.append("finalized")

@@ -84,7 +84,12 @@ from cayu.runtime.sessions import (
     restore_persisted_event_authority,
 )
 from cayu.runtime.structured_output import StructuredOutputSpec, StructuredOutputValidation
-from cayu.runtime.user_input import PendingUserInput
+from cayu.runtime.user_input import (
+    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+    AmbiguousUserInputSupersessionIntent,
+    PendingUserInput,
+    event_with_ambiguous_user_input_supersession_authority,
+)
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -270,6 +275,85 @@ def test_event_payload_policies_cover_every_exact_builtin_type() -> None:
                 ("actor", "subject"),
                 ("actor", "tenant"),
             } <= policy.owned_nested_paths
+
+
+def test_answered_user_input_checkpoint_controls_survive_secret_collisions() -> None:
+    pause_digest = "a" * 64
+    resolution_request_digest = "b" * 64
+    private = event_with_runtime_payload_authority(
+        Event(
+            type=EventType.SESSION_CHECKPOINTED,
+            session_id="checkpoint-control-collision",
+            payload={
+                "checkpoint": "pending_user_input",
+                "transition": "answered",
+                "pause_digest": pause_digest,
+                "resolution_request_digest": resolution_request_digest,
+            },
+        ),
+        "pause_digest",
+        "resolution_request_digest",
+    )
+    redactor = SecretRedactor(
+        [
+            "transition",
+            "answered",
+            "pause_digest",
+            pause_digest,
+            "resolution_request_digest",
+            resolution_request_digest,
+        ]
+    )
+
+    prepared = prepare_new_runtime_event(private, redactor=redactor)
+    public = project_runtime_event(prepared, sequence=1, redactor=redactor)
+
+    assert public.payload == {
+        "checkpoint": "pending_user_input",
+        "transition": "answered",
+        "pause_digest": PRIVATE_EVENT_AUTHORITY,
+        "resolution_request_digest": PRIVATE_EVENT_AUTHORITY,
+    }
+
+
+def test_ambiguous_user_input_supersession_controls_survive_secret_collisions() -> None:
+    intent = AmbiguousUserInputSupersessionIntent(
+        session_id="control-session",
+        session_instance_id="control-instance",
+        source_checkpoint_digest="a" * 64,
+    )
+    private = event_with_ambiguous_user_input_supersession_authority(
+        Event(
+            type=EventType.SESSION_INTERRUPTED,
+            session_id="control-session",
+            payload={
+                "interruption_type": "operator_requested",
+                AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY: intent.model_dump(mode="json"),
+            },
+        ),
+        intent,
+    )
+    redactor = SecretRedactor(
+        [
+            AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+            "ambiguous",
+            "source_checkpoint_digest",
+        ]
+    )
+
+    prepared = prepare_new_runtime_event(private, redactor=redactor)
+    public = project_runtime_event(prepared, sequence=1, redactor=redactor)
+
+    assert prepared.payload[AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY] == intent.model_dump(
+        mode="json"
+    )
+    assert public.payload[AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY] == {
+        "schema_version": 1,
+        "session_id": PRIVATE_EVENT_AUTHORITY,
+        "session_instance_id": PRIVATE_EVENT_AUTHORITY,
+        "source_checkpoint_digest": PRIVATE_EVENT_AUTHORITY,
+        "state": "ambiguous",
+    }
 
 
 def test_model_error_projects_the_effective_retry_ceiling() -> None:
@@ -664,6 +748,9 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
             "execution_profile_fingerprint",
             "interaction_id",
             "run_limit_accounting",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
             "staged_terminals",
             "tool_exposure",
         }
@@ -1699,6 +1786,10 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         tool_calls=[pending_call],
     )
     user_input = PendingUserInput(
+        session_id="session",
+        session_instance_id="session-instance",
+        source_interaction_id="interaction-source",
+        source_run_epoch=1,
         input_id="input-private",
         tool_round_id=f"tround_{'1' * 32}",
         model_step_id=f"mstep_{'2' * 32}",
@@ -1708,6 +1799,7 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         question="Continue?",
         arguments={"path": "README.md"},
         agent_name="assistant",
+        execution_profile_fingerprint="e" * 64,
         tool_calls=[pending_call],
     )
     approval_event = Event(

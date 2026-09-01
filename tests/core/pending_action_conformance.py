@@ -143,7 +143,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         events: list[Event],
         checkpoint: dict[str, Any],
     ) -> None:
-        await store.create(
+        created = await store.create(
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -151,6 +151,22 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
             ),
             identity=_identity(),
         )
+        pending_user_input = checkpoint.get("pending_user_input")
+        if type(pending_user_input) is dict:
+            pending_user_input.setdefault("session_id", session_id)
+            pending_user_input.setdefault(
+                "session_instance_id",
+                created.instance_id,
+            )
+            pending_user_input.setdefault(
+                "source_interaction_id",
+                f"interaction:{session_id}",
+            )
+            pending_user_input.setdefault("source_run_epoch", created.run_epoch)
+            pending_user_input.setdefault(
+                "execution_profile_fingerprint",
+                "e" * 64,
+            )
         await store.append_events(session_id, events)
         await store.checkpoint(session_id, checkpoint)
         await store.update_status(session_id, status)

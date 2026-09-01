@@ -1141,10 +1141,10 @@ def _checkpoint_staged_terminal_owner(
     pending_round = pending_tool_round_from_checkpoint(checkpoint)
     from cayu.runtime.user_input import (
         PENDING_USER_INPUT_CHECKPOINT_KEY,
-        pending_user_input_from_checkpoint,
+        user_input_lifecycle_authority_from_checkpoint,
     )
 
-    pending_input = pending_user_input_from_checkpoint(checkpoint)
+    pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     if pending_round is not None and pending_input is not None:
         raise RuntimeError("Checkpoint has multiple staged-terminal owners.")
     if pending_round is not None:

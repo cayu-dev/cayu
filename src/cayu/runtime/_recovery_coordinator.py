@@ -22,7 +22,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
 
 from cayu._exception_groups import (
@@ -38,6 +38,7 @@ from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
     capture_awaitable_outcome,
+    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -338,12 +339,31 @@ from cayu.runtime.tool_policy import ToolPolicyDecision
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
 from cayu.runtime.user_input import (
+    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
     PENDING_USER_INPUT_CHECKPOINT_KEY,
+    USER_INPUT_SUPERSESSION_INTENT_KEY,
+    AmbiguousUserInputSupersessionIntent,
     PendingUserInput,
+    UserInputPauseState,
     UserInputRecoveryRequest,
+    UserInputResolutionIntent,
     UserInputResponse,
-    pending_user_input_from_checkpoint,
+    UserInputSupersessionIntent,
+    ambiguous_pending_user_input_from_checkpoint,
+    checkpoint_with_executing_user_input_resolution_intent,
+    checkpoint_with_user_input_resolution_intent,
+    checkpoint_without_exact_pending_user_input,
+    event_with_ambiguous_user_input_supersession_authority,
+    event_with_pending_user_input_authority,
+    event_with_user_input_supersession_authority,
+    pending_user_input_digest,
+    pending_user_input_identity,
     pending_user_input_interruption_payload,
+    require_resolution_intent_matches_pending,
+    user_input_answer_request_digest,
+    user_input_lifecycle_authority_from_checkpoint,
+    user_input_resolution_request_digest,
+    user_input_supersession_intent_for,
 )
 from cayu.runtime.workspace_observation_recovery import (
     WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY,
@@ -381,6 +401,11 @@ _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
+_TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS = (
+    GeneratorExit,
+    KeyboardInterrupt,
+    SystemExit,
+)
 _MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
 _TERMINAL_EVIDENCE_REPAIR_NAMESPACE = UUID("bd021bef-ec8f-4e1e-950d-734e2c9ac513")
 _INCOMPLETE_RECOVERY_CURSOR_VERSION = 1
@@ -403,6 +428,8 @@ _RECOVERY_RESUMABLE_SESSION_STATUSES = {
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
 }
+
+_RecoveryResultT = TypeVar("_RecoveryResultT")
 _TERMINAL_EVENT_TYPE_BY_STATUS = {
     SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
     SessionStatus.FAILED: EventType.SESSION_FAILED,
@@ -841,6 +868,72 @@ def _recovery_abandonment_signal(
     return None
 
 
+def _terminal_finalization_process_control(
+    error: BaseException | None,
+) -> BaseException | None:
+    """Return the first scalar process-control signal in transfer evidence."""
+
+    if error is None:
+        return None
+    return next(
+        (
+            candidate
+            for candidate in iter_exception_tree(error)
+            if not isinstance(candidate, BaseExceptionGroup)
+            and isinstance(candidate, _TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS)
+        ),
+        None,
+    )
+
+
+def _terminal_finalization_failure_without_identity(
+    error: BaseException,
+    excluded: BaseException,
+    *,
+    remaining_nodes: list[int] | None = None,
+    visited: set[int] | None = None,
+) -> BaseException | None:
+    """Retain ordered transfer evidence without duplicating its public signal."""
+
+    if error is excluded:
+        return None
+    if remaining_nodes is None:
+        remaining_nodes = [128]
+    if visited is None:
+        visited = set()
+    if remaining_nodes[0] < 1:
+        return RuntimeError("Additional terminal finalization failures were omitted.")
+    remaining_nodes[0] -= 1
+    if not isinstance(error, BaseExceptionGroup):
+        return error
+    error_id = id(error)
+    if error_id in visited:
+        return RuntimeError("Cyclic terminal finalization failure evidence was omitted.")
+    visited.add(error_id)
+    children = exception_group_children(error)
+    if children is None:
+        return RuntimeError("Invalid terminal finalization failure evidence was omitted.")
+    retained = [
+        child_without_signal
+        for child in children
+        if (
+            child_without_signal := _terminal_finalization_failure_without_identity(
+                child,
+                excluded,
+                remaining_nodes=remaining_nodes,
+                visited=visited,
+            )
+        )
+        is not None
+    ]
+    if not retained:
+        return None
+    return BaseExceptionGroup(
+        "Terminal finalization claim transfer retained additional failures.",
+        retained,
+    )
+
+
 def _task_cancellation_count() -> int:
     """Return the current task's cancellation generation for boundary tracking."""
     task = asyncio.current_task()
@@ -1193,6 +1286,7 @@ class RecoveryAbandonedSessionRequest:
     active_run: ActiveSessionRun[SessionUsageTracker] | None = None
     interaction_transition_failures: tuple[dict[str, Any], ...] = ()
     interaction_transition: InteractionTransitionSpec | None = None
+    interaction_transition_recovery_claim_id: str | None = None
     provider_cancellation_failures: tuple[dict[str, Any], ...] = ()
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
@@ -1206,6 +1300,15 @@ class _IncompleteRecoveryClaim:
     session: Session
     run_operation: _SessionRunOperation | None = None
     invocation_context: InvocationContext | None = None
+
+
+@dataclass(frozen=True)
+class _TerminalFinalizationClaimAcquisition:
+    claim_id: str
+    claim_expires_at: datetime
+    cancellation: asyncio.CancelledError | None = None
+    transfer_failure: BaseException | None = None
+    process_control: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -1390,6 +1493,7 @@ PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], Checkpo
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
 RecoveryMutationHook = Callable[[], Awaitable[None]]
+RecoveryExecutionAdmissionHook = Callable[[Session], Awaitable[bool]]
 IncompleteRecoveryResultHook = Callable[
     [IncompleteSessionRecoveryResult, InvocationContext | None],
     Awaitable[IncompleteSessionRecoveryResult],
@@ -2358,7 +2462,12 @@ class RecoveryCoordinator:
         pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
+        )
         if pending_approval is not None and pending_user_input is not None:
             raise RuntimeError(
                 "The checkpoint contains conflicting pending approval and user-input pauses."
@@ -2792,6 +2901,32 @@ class RecoveryCoordinator:
         if pause_kind is None or pause_id is None or resume_tool_call_id is None:
             raise RuntimeError("Durable pause-continuation anchor has no pause identity.")
 
+        user_input_open_receipt = None
+        user_input_close_receipt = None
+        if pause_kind == "user-input":
+            user_input_open_receipt = await self._session_store.load_runtime_publication_receipt(
+                session.id,
+                f"user-input-open:{pause_id}",
+            )
+            user_input_close_receipt = await self._session_store.load_runtime_publication_receipt(
+                session.id,
+                f"user-input-close:{pause_id}",
+            )
+            if (
+                user_input_open_receipt is None
+                or user_input_close_receipt is None
+                or user_input_open_receipt.kind != "user-input-open"
+                or user_input_close_receipt.kind != "user-input-close"
+                or user_input_open_receipt.intent.get("input_id") != pause_id
+                or user_input_close_receipt.intent.get("input_id") != pause_id
+                or user_input_open_receipt.interaction_id
+                != user_input_open_receipt.intent.get("source_interaction_id")
+                or user_input_close_receipt.interaction_id != user_input_open_receipt.interaction_id
+            ):
+                raise RuntimeError(
+                    "Durable user-input continuation has no exact publication authority."
+                )
+
         expected_interruption_type = (
             _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED
             if pause_kind == "approval"
@@ -2879,8 +3014,48 @@ class RecoveryCoordinator:
                     pending_pause = PendingToolApproval.model_validate(pause_checkpoint)
                     origin_pause_id = pending_pause.approval_id
                 else:
+                    assert user_input_open_receipt is not None
+                    assert user_input_close_receipt is not None
+                    pause_checkpoint.update(
+                        {
+                            "session_id": user_input_open_receipt.intent.get("session_id"),
+                            "session_instance_id": user_input_open_receipt.intent.get(
+                                "session_instance_id"
+                            ),
+                            "source_interaction_id": user_input_open_receipt.intent.get(
+                                "source_interaction_id"
+                            ),
+                            "source_run_epoch": user_input_open_receipt.intent.get(
+                                "source_run_epoch"
+                            ),
+                            "execution_profile_fingerprint": (
+                                user_input_open_receipt.intent.get("execution_profile_fingerprint")
+                            ),
+                        }
+                    )
                     pending_pause = PendingUserInput.model_validate(pause_checkpoint)
                     origin_pause_id = pending_pause.input_id
+                    await self._require_exact_user_input_open_receipt(
+                        session=session,
+                        input_id=pending_pause.input_id,
+                    )
+                    await self._exact_user_input_close_event(
+                        session=session,
+                        input_id=pending_pause.input_id,
+                        receipt=user_input_close_receipt,
+                    )
+                    pause_identity = pending_user_input_identity(pending_pause)
+                    if any(
+                        user_input_open_receipt.intent.get(key) != value
+                        or user_input_close_receipt.intent.get(key) != value
+                        for key, value in pause_identity.items()
+                        if key != "pause_digest"
+                    ) or user_input_open_receipt.intent.get(
+                        "pause_digest"
+                    ) != user_input_close_receipt.intent.get("pause_digest"):
+                        raise ValueError(
+                            "User-input publication receipts conflict with the pause origin."
+                        )
             except (TypeError, ValueError):
                 raise RuntimeError(
                     "Durable pause-origin evidence contains an invalid pause checkpoint."
@@ -3291,6 +3466,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
         preserve_open_interaction_on_failure: bool = False,
         before_mutation: RecoveryMutationHook | None = None,
+        before_resume: RecoveryExecutionAdmissionHook | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
@@ -3473,6 +3649,10 @@ class RecoveryCoordinator:
             )
         )
         try:
+            if cancellation is not None:
+                raise cancellation
+            if before_resume is not None and not await before_resume(session):
+                return session, None
             resumed_event = await self._resume_interaction(
                 session,
                 registered_agent,
@@ -3569,9 +3749,567 @@ class RecoveryCoordinator:
             _deactivate_session_interaction(session.id)
         raise cancellation
 
+    async def _require_exact_user_input_open_receipt(
+        self,
+        *,
+        session: Session,
+        pending: PendingUserInput | None = None,
+        input_id: str | None = None,
+    ) -> RuntimePublicationReceipt:
+        """Load and authenticate the complete publication that opened one pause."""
+
+        if pending is not None:
+            if input_id is not None and input_id != pending.input_id:
+                raise SessionRuntimePublicationConflict(
+                    "Pending user input conflicts with its requested opening receipt."
+                )
+            input_id = pending.input_id
+        if type(input_id) is not str or not input_id:
+            raise SessionRuntimePublicationConflict(
+                "User-input opening receipt lookup has no exact pause identity."
+            )
+        receipt = await self._session_store.load_runtime_publication_receipt(
+            session.id,
+            f"user-input-open:{input_id}",
+        )
+        identity_fields = {
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+        }
+        required_fields = identity_fields | {"source_round_digest", "event_ids"}
+        expected_identity = pending_user_input_identity(pending) if pending is not None else None
+        if (
+            receipt is None
+            or receipt.session_id != session.id
+            or receipt.publication_id != f"user-input-open:{input_id}"
+            or receipt.kind != "user-input-open"
+            or receipt.source_status is not SessionStatus.RUNNING
+            or set(receipt.intent) != required_fields
+            or receipt.intent.get("schema_version") != 1
+            or receipt.intent.get("session_id") != session.id
+            or receipt.intent.get("session_instance_id") != session.instance_id
+            or receipt.intent.get("input_id") != input_id
+            or receipt.source_run_epoch != receipt.intent.get("source_run_epoch")
+            or receipt.interaction_id != receipt.intent.get("source_interaction_id")
+            or receipt.transcript_start_cursor != receipt.transcript_end_cursor
+            or receipt.referenced_events
+            or (
+                expected_identity is not None
+                and any(
+                    receipt.intent.get(key) != value for key, value in expected_identity.items()
+                )
+            )
+            or receipt.intent.get("event_ids") != list(receipt.appended_event_ids)
+            or len(receipt.appended_event_ids) != 2
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Pending user input has no exact durable opening receipt."
+            )
+        for field_name in (
+            "execution_profile_fingerprint",
+            "pause_digest",
+            "source_round_digest",
+        ):
+            value = receipt.intent.get(field_name)
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "User-input opening receipt contains malformed digest authority."
+                )
+        records: list[EventRecord] = []
+        for event_id in receipt.appended_event_ids:
+            candidates = await self._session_store.query_events(
+                EventQuery(session_id=session.id, event_id=event_id, limit=2)
+            )
+            if len(candidates) != 1 or candidates[0].event.id != event_id:
+                raise SessionRuntimePublicationConflict(
+                    "User-input opening event is missing from durable history."
+                )
+            records.append(candidates[0])
+        if [record.event.type for record in records] != [
+            EventType.SESSION_CHECKPOINTED,
+            EventType.SESSION_AWAITING_USER_INPUT,
+        ]:
+            raise SessionRuntimePublicationConflict(
+                "User-input opening event sequence conflicts with its receipt."
+            )
+        for record in records:
+            event = record.event
+            if (
+                event.session_id != session.id
+                or event.interaction_id != receipt.intent["source_interaction_id"]
+                or any(
+                    event.payload.get(field_name) != receipt.intent[field_name]
+                    for field_name in (
+                        "input_id",
+                        "tool_call_id",
+                        "tool_round_id",
+                        "model_step_id",
+                        "model_attempt_id",
+                        "source_run_epoch",
+                        "pause_digest",
+                    )
+                )
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "User-input opening event conflicts with its pause authority."
+                )
+        return receipt
+
+    async def _validated_user_input_supersession_interrupt_payload(
+        self,
+        *,
+        session: Session,
+        pending_interrupt_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Authenticate one retained exact or ambiguous user-input supersession."""
+
+        supersession_payload = pending_interrupt_payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+        ambiguous_supersession_payload = pending_interrupt_payload.get(
+            AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY
+        )
+        if supersession_payload is None and ambiguous_supersession_payload is None:
+            return None
+        if supersession_payload is not None and ambiguous_supersession_payload is not None:
+            raise SessionRuntimePublicationConflict(
+                "Retained user-input supersession has conflicting authority."
+            )
+        try:
+            interruption_request_id = interruption_request_id_from_payload(
+                pending_interrupt_payload
+            )
+        except ValueError as exc:
+            raise SessionRuntimePublicationConflict(
+                "Retained user-input supersession conflicts with its session."
+            ) from exc
+        if (
+            interruption_request_id is None
+            or pending_interrupt_payload.get("interruption_type")
+            != _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Retained user-input supersession conflicts with its session."
+            )
+        if supersession_payload is not None:
+            try:
+                supersession_intent = UserInputSupersessionIntent.model_validate(
+                    supersession_payload
+                )
+            except (TypeError, ValueError) as exc:
+                raise SessionRuntimePublicationConflict(
+                    "Retained user-input supersession evidence is malformed."
+                ) from exc
+            if (
+                supersession_intent.session_id != session.id
+                or supersession_intent.session_instance_id != session.instance_id
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Retained user-input supersession conflicts with its session."
+                )
+            open_receipt = await self._require_exact_user_input_open_receipt(
+                session=session,
+                input_id=supersession_intent.input_id,
+            )
+            supersession_identity = supersession_intent.model_dump(
+                mode="json",
+                exclude={
+                    "state",
+                    "claim_run_epoch",
+                    "resolution_request_digest",
+                },
+            )
+            if any(
+                open_receipt.intent.get(field_name) != value
+                for field_name, value in supersession_identity.items()
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Retained user-input supersession conflicts with its opening receipt."
+                )
+        else:
+            try:
+                ambiguous_supersession_intent = AmbiguousUserInputSupersessionIntent.model_validate(
+                    ambiguous_supersession_payload
+                )
+            except (TypeError, ValueError) as exc:
+                raise SessionRuntimePublicationConflict(
+                    "Retained ambiguous user-input supersession evidence is malformed."
+                ) from exc
+            if (
+                ambiguous_supersession_intent.session_id != session.id
+                or ambiguous_supersession_intent.session_instance_id != session.instance_id
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Retained ambiguous user-input supersession conflicts with its session."
+                )
+        return copy_json_value(
+            pending_interrupt_payload,
+            "pending_session_interrupt",
+        )
+
+    async def _exact_user_input_close_event(
+        self,
+        *,
+        session: Session,
+        input_id: str,
+        receipt: RuntimePublicationReceipt,
+        expected_resolution_request_digest: str | None = None,
+    ) -> Event:
+        """Authenticate an exact answered receipt and return its durable close event."""
+
+        open_receipt = await self._require_exact_user_input_open_receipt(
+            session=session,
+            input_id=input_id,
+        )
+        intent = receipt.intent
+        referenced_ids = [reference.event_id for reference in receipt.referenced_events]
+        required_fields = {
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+            "claim_run_epoch",
+            "answer_request_digest",
+            "execution_state",
+            "resolution_request_digest",
+            "tool_call_ids",
+            "event_ids",
+            "referenced_event_ids",
+        }
+        if (
+            receipt.session_id != session.id
+            or receipt.publication_id != f"user-input-close:{input_id}"
+            or receipt.kind != "user-input-close"
+            or receipt.source_status is not SessionStatus.RUNNING
+            or set(intent) != required_fields
+            or intent.get("schema_version") != 1
+            or intent.get("session_id") != session.id
+            or intent.get("session_instance_id") != session.instance_id
+            or intent.get("source_interaction_id") != receipt.interaction_id
+            or intent.get("input_id") != input_id
+            or intent.get("claim_run_epoch") != receipt.source_run_epoch
+            or intent.get("execution_state") != "executing"
+            or intent.get("event_ids") != list(receipt.appended_event_ids)
+            or intent.get("referenced_event_ids") != referenced_ids
+            or len(receipt.appended_event_ids) != 1
+            or (
+                expected_resolution_request_digest is not None
+                and intent.get("resolution_request_digest") != expected_resolution_request_digest
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "User input was already closed with conflicting resolution authority."
+            )
+        immutable_identity_fields = (
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+        )
+        if any(
+            intent.get(field_name) != open_receipt.intent.get(field_name)
+            for field_name in immutable_identity_fields
+        ):
+            raise SessionRuntimePublicationConflict(
+                "User-input closure does not belong to its exact opening publication."
+            )
+        for field_name in (
+            "execution_profile_fingerprint",
+            "pause_digest",
+            "answer_request_digest",
+            "resolution_request_digest",
+        ):
+            value = intent.get(field_name)
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "User-input closure receipt contains malformed digest authority."
+                )
+        event_id = receipt.appended_event_ids[0]
+        records = await self._session_store.query_events(
+            EventQuery(session_id=session.id, event_id=event_id, limit=2)
+        )
+        if len(records) != 1 or records[0].event.id != event_id:
+            raise SessionRuntimePublicationConflict(
+                "User-input closure event is missing from durable history."
+            )
+        event = records[0].event
+        if (
+            event.type is not EventType.SESSION_CHECKPOINTED
+            or event.session_id != session.id
+            or event.interaction_id != intent.get("source_interaction_id")
+            or event.payload.get("checkpoint") != PENDING_USER_INPUT_CHECKPOINT_KEY
+            or event.payload.get("transition") != "answered"
+            or any(
+                event.payload.get(field_name) != intent.get(field_name)
+                for field_name in (
+                    "source_run_epoch",
+                    "input_id",
+                    "tool_call_id",
+                    "tool_round_id",
+                    "model_step_id",
+                    "model_attempt_id",
+                    "pause_digest",
+                    "resolution_request_digest",
+                )
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "User-input closure event conflicts with its receipt."
+            )
+        return event
+
+    async def _has_exact_persisted_user_input_manual_recovery(
+        self,
+        *,
+        session: Session,
+        pending: PendingUserInput,
+        resolution_intent: UserInputResolutionIntent,
+    ) -> bool:
+        """Prove that a manual-recovery claim produced its exact terminal evidence."""
+
+        if resolution_intent.resolution_stage != "manual-recovery":
+            return False
+        require_resolution_intent_matches_pending(resolution_intent, pending=pending)
+        round_identity = ToolRoundIdentity(
+            tool_round_id=pending.tool_round_id,
+            model_step_id=pending.model_step_id,
+            model_attempt_id=pending.model_attempt_id,
+        )
+        pending_call_ids = {call.tool_call_id for call in pending.tool_calls}
+        matches: list[Event] = []
+        for event in await self._session_store.load_events(session.id):
+            tool_call_id = event.payload.get("tool_call_id")
+            if (
+                event.type not in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                or event.session_id != session.id
+                or event.payload.get("manual_recovery") is not True
+                or event.payload.get("input_id") != pending.input_id
+                or not round_identity.matches_payload(event.payload)
+                or type(tool_call_id) is not str
+                or tool_call_id not in pending_call_ids
+                or event.payload.get("idempotency_key")
+                != tool_execution.tool_idempotency_key(
+                    session_id=session.id,
+                    tool_round_id=pending.tool_round_id,
+                    tool_call_id=tool_call_id,
+                    pause_id=pending.input_id,
+                )
+                or event.payload.get("execution_profile_fingerprint")
+                != pending.execution_profile_fingerprint
+                or event.payload.get("resolution_request_digest")
+                != resolution_intent.resolution_request_digest
+            ):
+                continue
+            matches.append(event)
+        if len(matches) > 1:
+            raise SessionRuntimePublicationConflict(
+                "User-input manual recovery has duplicate exact terminal evidence."
+            )
+        return len(matches) == 1
+
+    async def _classify_user_input_pause(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        input_id: str,
+        _refresh_supersession_conflict: bool = True,
+    ) -> UserInputPauseState:
+        """Classify one exact pause from positive durable lifecycle evidence."""
+
+        close_receipt = await self._session_store.load_runtime_publication_receipt(
+            session.id,
+            f"user-input-close:{input_id}",
+        )
+        if close_receipt is not None:
+            # The caller's checkpoint read may have raced the atomic close.
+            # Read it again only after the receipt is observable so an
+            # acknowledgement-loss retry cannot mistake the pre-close pause
+            # for contradictory durable state.
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+        try:
+            pending, resolution_intent = user_input_lifecycle_authority_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=session.run_epoch,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return UserInputPauseState.AMBIGUOUS
+        interrupt_marker: object | None = None
+        if checkpoint is not None:
+            interrupt_payload = checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            if type(interrupt_payload) is dict:
+                interrupt_marker = interrupt_payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+
+        try:
+            supersession_events = await self._session_store.load_user_input_supersession_events(
+                session.id,
+                input_id,
+            )
+        except (TypeError, ValueError):
+            return UserInputPauseState.AMBIGUOUS
+        pending_conflicts_with_supersession = pending is not None and (
+            supersession_events
+            or (type(interrupt_marker) is dict and interrupt_marker.get("input_id") == input_id)
+        )
+        if pending_conflicts_with_supersession:
+            # The caller's checkpoint read may have preceded an atomic
+            # supersession whose terminal event is already visible. Never let
+            # that mixed snapshot reclassify the retired pause as active.
+            if not _refresh_supersession_conflict:
+                return UserInputPauseState.AMBIGUOUS
+            refreshed_session = await self._session_store.load(session.id)
+            if refreshed_session is None:
+                return UserInputPauseState.AMBIGUOUS
+            refreshed_checkpoint = await self._session_store.load_checkpoint(session.id)
+            return await self._classify_user_input_pause(
+                session=refreshed_session,
+                checkpoint=refreshed_checkpoint,
+                input_id=input_id,
+                _refresh_supersession_conflict=False,
+            )
+        if close_receipt is not None:
+            if (
+                (pending is not None and pending.input_id == input_id)
+                or (resolution_intent is not None and resolution_intent.input_id == input_id)
+                or (type(interrupt_marker) is dict and interrupt_marker.get("input_id") == input_id)
+            ):
+                return UserInputPauseState.AMBIGUOUS
+            if supersession_events:
+                return UserInputPauseState.AMBIGUOUS
+            try:
+                await self._exact_user_input_close_event(
+                    session=session,
+                    input_id=input_id,
+                    receipt=close_receipt,
+                )
+            except SessionRuntimePublicationConflict:
+                return UserInputPauseState.AMBIGUOUS
+            else:
+                return UserInputPauseState.ANSWERED
+
+        if pending is not None:
+            if (
+                pending.input_id != input_id
+                or pending.session_id != session.id
+                or pending.session_instance_id != session.instance_id
+            ):
+                return UserInputPauseState.AMBIGUOUS
+            try:
+                await self._require_exact_user_input_open_receipt(
+                    session=session,
+                    pending=pending,
+                )
+            except SessionRuntimePublicationConflict:
+                return UserInputPauseState.AMBIGUOUS
+            return (
+                UserInputPauseState.ANSWERING
+                if resolution_intent is not None
+                else UserInputPauseState.ACTIVE
+            )
+
+        if resolution_intent is not None:
+            return UserInputPauseState.AMBIGUOUS
+
+        marker_candidates: list[object] = []
+        if interrupt_marker is not None:
+            marker_candidates.append(interrupt_marker)
+        marker_candidates.extend(
+            event.payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY) for event in supersession_events
+        )
+        matching_markers: list[dict[str, object]] = []
+        for marker in marker_candidates:
+            if type(marker) is not dict:
+                continue
+            typed_marker = cast("dict[str, object]", marker)
+            if typed_marker.get("input_id") == input_id:
+                matching_markers.append(typed_marker)
+        if not matching_markers:
+            return UserInputPauseState.AMBIGUOUS
+        if len(supersession_events) > 1:
+            return UserInputPauseState.AMBIGUOUS
+        if any(
+            event.type is not EventType.SESSION_INTERRUPTED
+            or event.session_id != session.id
+            or event.payload.get("interruption_type") != "operator_requested"
+            for event in supersession_events
+        ):
+            return UserInputPauseState.AMBIGUOUS
+        try:
+            open_receipt = await self._require_exact_user_input_open_receipt(
+                session=session,
+                input_id=input_id,
+            )
+        except SessionRuntimePublicationConflict:
+            return UserInputPauseState.AMBIGUOUS
+        immutable_identity_fields = (
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+        )
+        parsed_markers: list[UserInputSupersessionIntent] = []
+        for marker in matching_markers:
+            try:
+                parsed = UserInputSupersessionIntent.model_validate(marker)
+            except (TypeError, ValueError):
+                return UserInputPauseState.AMBIGUOUS
+            if parsed.session_id != session.id or parsed.session_instance_id != session.instance_id:
+                return UserInputPauseState.AMBIGUOUS
+            parsed_payload = parsed.model_dump(mode="json", exclude_none=True)
+            if any(
+                parsed_payload.get(field_name) != open_receipt.intent.get(field_name)
+                for field_name in immutable_identity_fields
+            ):
+                return UserInputPauseState.AMBIGUOUS
+            parsed_markers.append(parsed)
+        if any(marker != parsed_markers[0] for marker in parsed_markers[1:]):
+            return UserInputPauseState.AMBIGUOUS
+        return UserInputPauseState.SUPERSEDED
+
     async def resolve_user_input(
         self,
-        response: UserInputResponse,
+        response: UserInputResponse | UserInputRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
@@ -3584,16 +4322,99 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {response.session_id}")
 
+        answer_request_digest = user_input_answer_request_digest(response)
+        resolution_request_digest = user_input_resolution_request_digest(response)
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending = pending_user_input_from_checkpoint(
+        close_receipt = await self._session_store.load_runtime_publication_receipt(
+            loaded_session.id,
+            f"user-input-close:{response.input_id}",
+        )
+        if close_receipt is not None:
+            if (
+                await self._classify_user_input_pause(
+                    session=loaded_session,
+                    checkpoint=checkpoint,
+                    input_id=response.input_id,
+                )
+                is not UserInputPauseState.ANSWERED
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "User-input closure conflicts with durable lifecycle state."
+                )
+            closure_event = await self._exact_user_input_close_event(
+                session=loaded_session,
+                input_id=response.input_id,
+                receipt=close_receipt,
+                expected_resolution_request_digest=resolution_request_digest,
+            )
+            if before_mutation is not None:
+                await before_mutation()
+            yield closure_event
+            return
+
+        pending, candidate_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            current_run_epoch=loaded_session.run_epoch,
         )
         if pending is None:
+            pause_state = await self._classify_user_input_pause(
+                session=loaded_session,
+                checkpoint=checkpoint,
+                input_id=response.input_id,
+            )
+            if pause_state is UserInputPauseState.SUPERSEDED:
+                raise SessionRuntimePublicationConflict(
+                    "User input was superseded by an external interruption."
+                )
+            if pause_state is UserInputPauseState.ANSWERED:
+                raise SessionRuntimePublicationConflict(
+                    "User input is answered but its exact closure cannot be replayed."
+                )
             raise RuntimeError("Session has no pending user input.")
         if pending.input_id != response.input_id:
             raise ValueError(f"User input id does not match pending input: {response.input_id}")
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            pending.session_id != loaded_session.id
+            or pending.session_instance_id != loaded_session.instance_id
+            or (
+                active_profile is not None
+                and pending.execution_profile_fingerprint != active_profile.profile.fingerprint
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Pending user input has conflicting durable invocation authority."
+            )
+        await self._require_exact_user_input_open_receipt(
+            session=loaded_session,
+            pending=pending,
+        )
+        resume_after_manual_recovery = False
+        if candidate_intent is not None:
+            if candidate_intent.answer_request_digest != answer_request_digest:
+                raise SessionRuntimePublicationConflict(
+                    "User input was already claimed with a different resolution request."
+                )
+            if candidate_intent.resolution_stage == "answer":
+                if candidate_intent.resolution_request_digest != resolution_request_digest:
+                    raise SessionRuntimePublicationConflict(
+                        "User input was already claimed with a different resolution request."
+                    )
+            else:
+                resume_after_manual_recovery = (
+                    loaded_session.status is SessionStatus.INTERRUPTED
+                    and await self._has_exact_persisted_user_input_manual_recovery(
+                        session=loaded_session,
+                        pending=pending,
+                        resolution_intent=candidate_intent,
+                    )
+                )
+                if not resume_after_manual_recovery:
+                    raise SessionRuntimePublicationConflict(
+                        "User input was already claimed with a different resolution request."
+                    )
         # The output-schema contract is fixed by the paused run's provider history; a resolver
         # cannot swap it (a spec matching or absent is fine; a differing one is rejected). Checked
         # before the status transition so it surfaces to the caller rather than being caught by the
@@ -3656,17 +4477,63 @@ class RecoveryCoordinator:
             budget_policy=budget_policy_snapshot,
             request_loop_policies=response.loop_policies,
         )
+        claimed_intent: UserInputResolutionIntent | None = None
+
+        def claim_exact_user_input(
+            current_session: Session,
+            current_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            nonlocal claimed_intent
+            current_pending, current_intent = user_input_lifecycle_authority_from_checkpoint(
+                current_checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=current_session.run_epoch,
+            )
+            if current_pending != pending or current_intent != candidate_intent:
+                raise SessionRuntimePublicationConflict(
+                    "Pending user-input authority changed before answer claim."
+                )
+            claimed_checkpoint, claimed_intent = checkpoint_with_user_input_resolution_intent(
+                current_checkpoint,
+                pending=pending,
+                answer_request_digest=answer_request_digest,
+                resolution_stage="answer",
+                resolution_request_digest=resolution_request_digest,
+                claim_run_epoch=current_session.run_epoch + 1,
+                redactor=self._secret_redactor,
+                allow_manual_recovery_to_answer=resume_after_manual_recovery,
+            )
+            return claimed_checkpoint
+
+        async def admit_exact_user_input_execution(claimed_session: Session) -> bool:
+            nonlocal claimed_intent
+            if claimed_intent is None:
+                raise RuntimeError("User-input answer claim completed without durable intent.")
+            try:
+                claimed_intent = await self._admit_user_input_resolution_execution(
+                    session=claimed_session,
+                    pending=pending,
+                    resolution_intent=claimed_intent,
+                )
+            except SessionRuntimePublicationConflict:
+                return False
+            return True
+
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+            checkpoint_transform=claim_exact_user_input,
             execution_profile_snapshot=execution_profile_snapshot,
             before_mutation=before_mutation,
+            before_resume=admit_exact_user_input_execution,
             invocation_context=invocation_context,
         )
         if resumed_event is not None:
             yield resumed_event
+        if claimed_intent is None:
+            raise RuntimeError("User-input answer claim completed without durable intent.")
         invocation_context = invocation_context.with_rebound_session(
             session,
             active_profile=execution_profile_snapshot.model_copy(
@@ -3678,6 +4545,9 @@ class RecoveryCoordinator:
             response=response,
             session=session,
             pending=pending,
+            resolution_intent=claimed_intent,
+            resolution_stage="answer",
+            closure_request_digest=resolution_request_digest,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
@@ -3725,16 +4595,91 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
 
+        answer_request_digest = user_input_answer_request_digest(request)
+        resolution_request_digest = user_input_resolution_request_digest(request)
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending = pending_user_input_from_checkpoint(
+        close_receipt = await self._session_store.load_runtime_publication_receipt(
+            loaded_session.id,
+            f"user-input-close:{request.input_id}",
+        )
+        if close_receipt is not None:
+            if (
+                await self._classify_user_input_pause(
+                    session=loaded_session,
+                    checkpoint=checkpoint,
+                    input_id=request.input_id,
+                )
+                is not UserInputPauseState.ANSWERED
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "User-input closure conflicts with durable lifecycle state."
+                )
+            closure_event = await self._exact_user_input_close_event(
+                session=loaded_session,
+                input_id=request.input_id,
+                receipt=close_receipt,
+                expected_resolution_request_digest=resolution_request_digest,
+            )
+            if before_mutation is not None:
+                await before_mutation()
+            yield closure_event
+            return
+
+        pending, candidate_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            current_run_epoch=loaded_session.run_epoch,
         )
         if pending is None:
-            raise RuntimeError("Session has no pending user input.")
+            pause_state = await self._classify_user_input_pause(
+                session=loaded_session,
+                checkpoint=checkpoint,
+                input_id=request.input_id,
+            )
+            if pause_state is UserInputPauseState.SUPERSEDED:
+                raise SessionRuntimePublicationConflict(
+                    "User input was superseded by an external interruption."
+                )
+            if pause_state is UserInputPauseState.ANSWERED:
+                raise SessionRuntimePublicationConflict(
+                    "User input is answered but its exact closure cannot be replayed."
+                )
+            raise SessionRuntimePublicationConflict(
+                "User-input lifecycle is ambiguous; exact recovery authority is required."
+            )
         if pending.input_id != request.input_id:
             raise ValueError(f"User input id does not match pending input: {request.input_id}")
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            pending.session_id != loaded_session.id
+            or pending.session_instance_id != loaded_session.instance_id
+            or (
+                active_profile is not None
+                and pending.execution_profile_fingerprint != active_profile.profile.fingerprint
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Pending user input has conflicting durable invocation authority."
+            )
+        await self._require_exact_user_input_open_receipt(
+            session=loaded_session,
+            pending=pending,
+        )
+        if candidate_intent is not None and (
+            candidate_intent.answer_request_digest != answer_request_digest
+            or (
+                candidate_intent.resolution_stage == "manual-recovery"
+                and candidate_intent.resolution_request_digest != resolution_request_digest
+            )
+            or (
+                candidate_intent.resolution_stage == "answer"
+                and loaded_session.status is not SessionStatus.INTERRUPTED
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "User input was already claimed with a different resolution request."
+            )
         effective_structured_output = _effective_user_input_structured_output(
             structured_output=request.structured_output,
             pending=pending,
@@ -3754,6 +4699,17 @@ class RecoveryCoordinator:
         pending_tool_call = approval_support.round_tool_call_for_recovery(
             pending_calls=pending.tool_calls,
             tool_call_id=request.tool_call_id,
+        )
+        approval_support.validate_round_recovery_target(
+            events=await self._session_store.load_events(loaded_session.id),
+            pending_calls=pending.tool_calls,
+            tool_call_id=request.tool_call_id,
+            input_id=pending.input_id,
+            tool_round_identity=ToolRoundIdentity(
+                tool_round_id=pending.tool_round_id,
+                model_step_id=pending.model_step_id,
+                model_attempt_id=pending.model_attempt_id,
+            ),
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
@@ -3796,17 +4752,67 @@ class RecoveryCoordinator:
             budget_policy=budget_policy_snapshot,
             request_loop_policies=request.loop_policies,
         )
+        claimed_intent: UserInputResolutionIntent | None = None
+
+        def claim_exact_user_input_recovery(
+            current_session: Session,
+            current_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            nonlocal claimed_intent
+            current_pending, current_intent = user_input_lifecycle_authority_from_checkpoint(
+                current_checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=current_session.run_epoch,
+            )
+            if current_pending != pending or current_intent != candidate_intent:
+                raise SessionRuntimePublicationConflict(
+                    "Pending user-input authority changed before recovery claim."
+                )
+            claimed_checkpoint, claimed_intent = checkpoint_with_user_input_resolution_intent(
+                current_checkpoint,
+                pending=pending,
+                answer_request_digest=answer_request_digest,
+                resolution_stage="manual-recovery",
+                resolution_request_digest=resolution_request_digest,
+                claim_run_epoch=current_session.run_epoch + 1,
+                redactor=self._secret_redactor,
+                allow_answer_to_manual_recovery=(
+                    current_session.status is SessionStatus.INTERRUPTED
+                ),
+            )
+            return claimed_checkpoint
+
+        async def admit_exact_user_input_recovery_execution(
+            claimed_session: Session,
+        ) -> bool:
+            nonlocal claimed_intent
+            if claimed_intent is None:
+                raise RuntimeError("User-input recovery claim completed without durable intent.")
+            try:
+                claimed_intent = await self._admit_user_input_resolution_execution(
+                    session=claimed_session,
+                    pending=pending,
+                    resolution_intent=claimed_intent,
+                )
+            except SessionRuntimePublicationConflict:
+                return False
+            return True
+
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
+            checkpoint_transform=claim_exact_user_input_recovery,
             execution_profile_snapshot=execution_profile_snapshot,
             before_mutation=before_mutation,
+            before_resume=admit_exact_user_input_recovery_execution,
             invocation_context=invocation_context,
         )
         if resumed_event is not None:
             yield resumed_event
+        if claimed_intent is None:
+            raise RuntimeError("User-input recovery claim completed without durable intent.")
         invocation_context = invocation_context.with_rebound_session(
             session,
             active_profile=execution_profile_snapshot.model_copy(
@@ -3818,6 +4824,8 @@ class RecoveryCoordinator:
             loaded_session=loaded_session,
             session=session,
             pending=pending,
+            resolution_intent=claimed_intent,
+            closure_request_digest=resolution_request_digest,
             pending_tool_call=pending_tool_call,
             registered_agent=registered_agent,
             registered_provider=registered_provider,
@@ -5302,12 +6310,213 @@ class RecoveryCoordinator:
                         current_task,
                     )
 
+    async def _admit_user_input_resolution_execution(
+        self,
+        *,
+        session: Session,
+        pending: PendingUserInput,
+        resolution_intent: UserInputResolutionIntent,
+    ) -> UserInputResolutionIntent:
+        """Linearize exact continuation ownership before any governed work."""
+
+        require_resolution_intent_matches_pending(resolution_intent, pending=pending)
+        expected = resolution_intent.model_copy(update={"execution_state": "executing"})
+        admitted: UserInputResolutionIntent | None = None
+
+        def raise_process_control(
+            *failures: BaseException | None,
+        ) -> None:
+            unique_failures: list[BaseException] = []
+            seen_failure_ids: set[int] = set()
+            for failure in failures:
+                if failure is None or id(failure) in seen_failure_ids:
+                    continue
+                seen_failure_ids.add(id(failure))
+                unique_failures.append(failure)
+            process_control = next(
+                (
+                    candidate
+                    for failure in unique_failures
+                    if (candidate := _terminal_finalization_process_control(failure)) is not None
+                ),
+                None,
+            )
+            if process_control is None:
+                return
+            secondary_failures = [
+                retained
+                for failure in unique_failures
+                if failure is not process_control
+                if (
+                    retained := _terminal_finalization_failure_without_identity(
+                        failure,
+                        process_control,
+                    )
+                )
+                is not None
+            ]
+            if secondary_failures:
+                secondary: BaseException
+                if len(secondary_failures) == 1:
+                    secondary = secondary_failures[0]
+                else:
+                    secondary = BaseExceptionGroup(
+                        "User-input execution admission retained secondary failures.",
+                        secondary_failures,
+                    )
+                if not _attach_exception_cause_preserving_graph(
+                    process_control,
+                    secondary,
+                ):
+                    raise BaseExceptionGroup(
+                        "User-input execution admission retained process control and "
+                        "secondary failures.",
+                        [process_control, secondary],
+                    ) from None
+            raise process_control
+
+        def admit(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            nonlocal admitted
+            if (
+                current_session.id != session.id
+                or current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+                or current_session.status is not SessionStatus.RUNNING
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "User-input resolution was superseded before execution admission."
+                )
+            try:
+                updated, admitted = checkpoint_with_executing_user_input_resolution_intent(
+                    checkpoint,
+                    current_run_epoch=current_session.run_epoch,
+                    pending=pending,
+                    intent=resolution_intent,
+                    redactor=self._secret_redactor,
+                )
+            except RuntimeError as exc:
+                raise SessionRuntimePublicationConflict(
+                    "User-input resolution was superseded before execution admission."
+                ) from exc
+            return updated
+
+        async def commit() -> UserInputResolutionIntent:
+            await self._session_store.transform_checkpoint(session.id, admit)
+            if admitted is None:
+                raise RuntimeError(
+                    "User-input execution admission completed without durable authority."
+                )
+            return admitted
+
+        outcome = await await_shielded_task_outcome(asyncio.create_task(commit()))
+        cancellation = outcome.cancellation
+        cancellation_requests_consumed = outcome.cancellation_requests_consumed
+        error = outcome.error
+        if isinstance(error, asyncio.CancelledError) and cancellation is None:
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="User-input resolution execution admission",
+            )
+        if error is None:
+            if outcome.result != expected:
+                error = RuntimeError(
+                    "User-input execution admission returned conflicting authority."
+                )
+            elif cancellation is not None:
+                restore_task_cancellation_requests(
+                    cancellation_requests_consumed,
+                    cancellation=cancellation,
+                )
+                raise cancellation
+            else:
+                return expected
+
+        reconciled: UserInputResolutionIntent | None = None
+
+        def inspect(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> None:
+            nonlocal reconciled
+            if (
+                current_session.id != session.id
+                or current_session.instance_id != session.instance_id
+                or current_session.run_epoch != session.run_epoch
+                or current_session.status is not SessionStatus.RUNNING
+            ):
+                return None
+            current_pending, current_intent = user_input_lifecycle_authority_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                current_run_epoch=current_session.run_epoch,
+            )
+            if current_pending == pending and current_intent == expected:
+                reconciled = current_intent
+            return None
+
+        reconciliation = await await_shielded_task_outcome(
+            asyncio.create_task(self._session_store.transform_checkpoint(session.id, inspect)),
+            cancellation=cancellation,
+        )
+        cancellation = reconciliation.cancellation
+        cancellation_requests_consumed += reconciliation.cancellation_requests_consumed
+        reconciliation_error = reconciliation.error
+        if isinstance(reconciliation_error, asyncio.CancelledError):
+            reconciliation_error = unexpected_child_cancellation_error(
+                reconciliation_error,
+                operation="User-input execution admission reconciliation",
+            )
+        if reconciliation_error is not None:
+            raise_process_control(error, reconciliation_error, cancellation)
+            if cancellation is not None:
+                cancellation.add_note(
+                    "User-input execution admission and reconciliation failed during cancellation."
+                )
+                restore_task_cancellation_requests(
+                    cancellation_requests_consumed,
+                    cancellation=cancellation,
+                )
+                if reconciliation_error is error:
+                    raise cancellation from error
+                raise cancellation from BaseExceptionGroup(
+                    "User-input execution admission and reconciliation failures.",
+                    [error, reconciliation_error],
+                )
+            if reconciliation_error is error:
+                raise error
+            raise error from reconciliation_error
+        if reconciled != expected:
+            if cancellation is not None:
+                cancellation.add_note(
+                    "User-input execution admission did not commit before cancellation."
+                )
+                restore_task_cancellation_requests(
+                    cancellation_requests_consumed,
+                    cancellation=cancellation,
+                )
+                raise cancellation from error
+            raise error
+        raise_process_control(error, cancellation)
+        if cancellation is not None:
+            restore_task_cancellation_requests(
+                cancellation_requests_consumed,
+                cancellation=cancellation,
+            )
+            raise cancellation
+        return expected
+
     async def continue_user_input_resolution(
         self,
         *,
         response: UserInputResponse,
         session: Session,
         pending: PendingUserInput,
+        resolution_intent: UserInputResolutionIntent,
+        resolution_stage: Literal["answer", "manual-recovery"],
+        closure_request_digest: str,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -5325,6 +6534,16 @@ class RecoveryCoordinator:
             or invocation_context.budget_policy is not budget_policy
         ):
             raise RuntimeError("User-input recovery lost frozen invocation authority.")
+        answer_request_digest = user_input_answer_request_digest(response)
+        if closure_request_digest != resolution_intent.resolution_request_digest:
+            raise RuntimeError("User-input continuation closure digest conflicts with its request.")
+        require_resolution_intent_matches_pending(
+            resolution_intent,
+            pending=pending,
+            answer_request_digest=answer_request_digest,
+            resolution_stage=resolution_stage,
+            resolution_request_digest=closure_request_digest,
+        )
         environment_name = _environment_name(registered_environment)
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending.tool_round_id,
@@ -5356,7 +6575,19 @@ class RecoveryCoordinator:
         effective_retry_policy = invocation_semantics.retry_policy
         continued_run_limit_accounting = pending.run_limit_accounting
         try:
-            transcript = await self._session_store.load_transcript(session.id)
+            resolution_intent = await self._admit_user_input_resolution_execution(
+                session=session,
+                pending=pending,
+                resolution_intent=resolution_intent,
+            )
+            transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
+            try:
+                transcript = [
+                    detach_message(record.message) for record in transcript_snapshot.records
+                ]
+                user_input_transcript_cursor = transcript_snapshot.cursor
+            finally:
+                del transcript_snapshot
             resume_events = await self._session_store.load_events(session.id)
             if continued_run_limit_accounting is not None:
                 continued_run_limit_accounting = rebase_run_limit_accounting_context(
@@ -5941,8 +7172,23 @@ class RecoveryCoordinator:
 
             # The resume executes the round's tools sequentially in model order, so the outcome
             # list already lines up with the assistant tool-call parts.
+            source_checkpoint = await self._session_store.load_checkpoint(session.id)
+            current_pending, current_intent = user_input_lifecycle_authority_from_checkpoint(
+                source_checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+                current_run_epoch=session.run_epoch,
+            )
+            if (
+                current_pending is None
+                or pending_user_input_digest(current_pending) != pending_user_input_digest(pending)
+                or current_intent != resolution_intent
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Pending user-input authority changed before atomic closure."
+                )
             durable_round = pending_actions.pending_action_evidence_round_from_checkpoint(
-                await self._session_store.load_checkpoint(session.id)
+                source_checkpoint
             )
             if (
                 durable_round is None
@@ -5963,14 +7209,102 @@ class RecoveryCoordinator:
                         tool_outcomes,
                     ),
                 )
-            transcript.extend(transcript_messages)
-            cleared_checkpoint = await self._checkpoint_without_pending_user_input(session.id)
-            await self._session_store.append_transcript_messages_and_transform_checkpoint(
-                session.id,
-                transcript_messages,
-                self._checkpoint_transform(cleared_checkpoint),
+            final_events = await self._load_tool_round_lifecycle_events(
+                session_id=session.id,
+                pending_round=durable_round,
+            )
+            lifecycle_event_types = {
+                EventType.TOOL_CALL_STARTED,
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+            }
+            lifecycle_events = [
+                event
+                for event in final_events
+                if event.type in lifecycle_event_types
+                and event.payload.get("input_id") == pending.input_id
+                and tool_round_identity.matches_payload(event.payload)
+            ]
+            target_checkpoint = checkpoint_without_exact_pending_user_input(
+                source_checkpoint,
+                pending=current_pending,
+                intent=resolution_intent,
+                redactor=self._secret_redactor,
+            )
+            close_event = event_with_pending_user_input_authority(
+                event_with_execution_profile_authority(
+                    event_with_runtime_payload_authority(
+                        Event(
+                            type=EventType.SESSION_CHECKPOINTED,
+                            session_id=session.id,
+                            interaction_id=pending.source_interaction_id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload={
+                                "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
+                                "transition": "answered",
+                                **tool_round_identity.payload(),
+                                "input_id": pending.input_id,
+                                "tool_call_id": pending.tool_call_id,
+                                "source_run_epoch": pending.source_run_epoch,
+                                "pause_digest": pending_user_input_digest(pending),
+                                "resolution_request_digest": closure_request_digest,
+                            },
+                        ),
+                        "model_step_id",
+                        "model_attempt_id",
+                        "tool_round_id",
+                        "input_id",
+                        "tool_call_id",
+                        "pause_digest",
+                        "resolution_request_digest",
+                    ),
+                    execution_profile_snapshot.profile,
+                ),
+                pending,
+            )
+            prepared_close = approval_publication.prepare_pending_action_publication(
+                session_id=session.id,
+                publication_id=f"user-input-close:{pending.input_id}",
+                kind="user-input-close",
+                intent={
+                    **pending_user_input_identity(pending),
+                    "claim_run_epoch": resolution_intent.claim_run_epoch,
+                    "answer_request_digest": resolution_intent.answer_request_digest,
+                    "execution_state": resolution_intent.execution_state,
+                    "resolution_request_digest": closure_request_digest,
+                    "tool_call_ids": [call.tool_call_id for call in current_pending.tool_calls],
+                    "event_ids": [close_event.id],
+                    "referenced_event_ids": [event.id for event in lifecycle_events],
+                },
+                source_checkpoint=source_checkpoint,
+                target_checkpoint=target_checkpoint,
+                transcript_messages=transcript_messages,
+                events=[close_event],
+                referenced_events=lifecycle_events,
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=session.run_epoch,
+                expected_transcript_cursor=user_input_transcript_cursor,
+            )
+            prepared_events = prepared_close.request.events
+            if len(prepared_events) != 1:
+                raise AssertionError("User-input closure must publish one checkpoint event.")
+            close_event = prepared_events[0]
+            close_cancellation = (
+                await approval_publication.publish_pending_action_with_exact_replay(
+                    prepared_close,
+                    session_store=self._session_store,
+                    event_writer=self._event_writer,
+                    fan_out=False,
+                )
             )
             pending_cleared = True
+            transcript.extend(transcript_messages)
+            await self._event_writer.fan_out_persisted([close_event])
+            yield close_event
+            if close_cancellation is not None:
+                raise close_cancellation
 
             session_stream = self._run_session(
                 RecoverySessionRunRequest(
@@ -6034,36 +7368,87 @@ class RecoveryCoordinator:
                 # recovery so the retry is not a silent double-execution.
                 # Carry the failure so a caller can distinguish "your answer failed, retry" from a
                 # fresh pause (whose interrupted event has no error fields).
-                payload: dict[str, Any] = {
-                    **exception_failure_payload(
-                        exc,
-                        redactor=self._secret_redactor,
-                    ),
-                    **tool_round_identity.payload(),
-                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                    **pending_user_input_interruption_payload(pending),
-                }
-                if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
-                    payload["manual_recovery_required"] = True
-                    payload["tool_call_id"] = exc.tool_call_id
-                    payload["tool_name"] = exc.tool_name
-                if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
-                    payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
+                checkpoint_at_failure = await self._session_store.load_checkpoint(session.id)
+                interrupt_payload = (
+                    None
+                    if checkpoint_at_failure is None
+                    else checkpoint_at_failure.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+                )
+                supersession_intent: UserInputSupersessionIntent | None = None
+                if type(interrupt_payload) is dict and (
+                    USER_INPUT_SUPERSESSION_INTENT_KEY in interrupt_payload
+                ):
+                    try:
+                        supersession_intent = UserInputSupersessionIntent.model_validate(
+                            interrupt_payload[USER_INPUT_SUPERSESSION_INTENT_KEY]
+                        )
+                    except (TypeError, ValueError) as marker_error:
+                        raise SessionRuntimePublicationConflict(
+                            "External user-input supersession evidence is malformed."
+                        ) from marker_error
+                    expected_supersession = user_input_supersession_intent_for(
+                        pending,
+                        resolution_intent=resolution_intent,
+                    )
+                    if supersession_intent != expected_supersession:
+                        raise SessionRuntimePublicationConflict(
+                            "External interruption superseded a different user-input answer."
+                        ) from exc
+                    payload = copy_json_value(
+                        interrupt_payload,
+                        "pending_session_interrupt",
+                    )
+                else:
+                    payload = {
+                        **exception_failure_payload(
+                            exc,
+                            redactor=self._secret_redactor,
+                        ),
+                        **tool_round_identity.payload(),
+                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                        **pending_user_input_interruption_payload(pending),
+                    }
+                    if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
+                        payload["manual_recovery_required"] = True
+                        payload["tool_call_id"] = exc.tool_call_id
+                        payload["tool_name"] = exc.tool_name
+                    if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
+                        payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
                 session = await self._session_store.update_status(
                     session.id, SessionStatus.INTERRUPTED
                 )
+                interrupted_event = Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=payload,
+                )
+                interrupted_event = event_with_execution_profile_authority(
+                    interrupted_event,
+                    execution_profile_snapshot.profile,
+                )
+                if supersession_intent is not None:
+                    runtime_fields = tuple(
+                        field_name
+                        for field_name in (
+                            "interruption_request_id",
+                            "retry_request_id",
+                            "attempt_id",
+                        )
+                        if type(payload.get(field_name)) is str
+                    )
+                    interrupted_event = event_with_runtime_payload_authority(
+                        interrupted_event,
+                        *runtime_fields,
+                    )
+                    interrupted_event = event_with_user_input_supersession_authority(
+                        interrupted_event,
+                        supersession_intent,
+                    )
                 async for event in self._emit_terminal_event_with_hooks(
                     RecoveryTerminalEventRequest(
-                        event=event_with_execution_profile_authority(
-                            Event(
-                                type=EventType.SESSION_INTERRUPTED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                payload=payload,
-                            ),
-                            execution_profile_snapshot.profile,
-                        ),
+                        event=interrupted_event,
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,
                         registered_agent=registered_agent,
@@ -6075,15 +7460,6 @@ class RecoveryCoordinator:
                     yield event
                 return
             raise
-
-    async def _checkpoint_without_pending_user_input(
-        self,
-        session_id: str,
-    ) -> dict[str, Any]:
-        checkpoint = await self._session_store.load_checkpoint(session_id)
-        checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY, None)
-        return checkpoint
 
     async def _publish_continuation_staged_terminals(
         self,
@@ -7884,6 +9260,8 @@ class RecoveryCoordinator:
         loaded_session: Session,
         session: Session,
         pending: PendingUserInput,
+        resolution_intent: UserInputResolutionIntent,
+        closure_request_digest: str,
         pending_tool_call: PendingToolCallApproval,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
@@ -7901,6 +9279,19 @@ class RecoveryCoordinator:
             or invocation_context.budget_policy is not budget_policy
         ):
             raise RuntimeError("User-input manual recovery lost frozen invocation authority.")
+        answer_request_digest = user_input_answer_request_digest(request)
+        resolution_request_digest = user_input_resolution_request_digest(request)
+        if closure_request_digest != resolution_request_digest:
+            raise RuntimeError(
+                "User-input manual-recovery closure digest conflicts with its request."
+            )
+        require_resolution_intent_matches_pending(
+            resolution_intent,
+            pending=pending,
+            answer_request_digest=answer_request_digest,
+            resolution_stage="manual-recovery",
+            resolution_request_digest=resolution_request_digest,
+        )
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending.tool_round_id,
             model_step_id=pending.model_step_id,
@@ -7913,6 +9304,11 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
         abandoned = False
         try:
+            resolution_intent = await self._admit_user_input_resolution_execution(
+                session=session,
+                pending=pending,
+                resolution_intent=resolution_intent,
+            )
             recovered_result = ToolResult(
                 content=request.message,
                 structured=request.structured,
@@ -8021,6 +9417,7 @@ class RecoveryCoordinator:
                         ),
                         "input_id": pending.input_id,
                         "manual_recovery": True,
+                        "resolution_request_digest": resolution_request_digest,
                         **tool_argument_publication.unavailable_argument_projection().payload_fields(),
                         **_public_resolution_audit_fields(
                             secret_resolution_scope=recovery_secret_resolution_scope,
@@ -8038,6 +9435,10 @@ class RecoveryCoordinator:
             recovery_tool_event = event_with_execution_profile_authority(
                 recovery_tool_event,
                 execution_profile_snapshot.profile,
+            )
+            recovery_tool_event = event_with_runtime_payload_authority(
+                recovery_tool_event,
+                "resolution_request_digest",
             )
             recovery_event_to_reconcile = recovery_tool_event
             recovery_events = [
@@ -8171,6 +9572,29 @@ class RecoveryCoordinator:
                 # state. It must not suppress a later fence-release failure.
                 authoritative_failure = None
                 return
+            current_session = await self._require_session(session.id)
+            if current_session.status in {
+                SessionStatus.INTERRUPTING,
+                SessionStatus.INTERRUPTED,
+            }:
+                if current_session.status is SessionStatus.INTERRUPTING:
+                    current_session = await self._session_store.update_status(
+                        session.id,
+                        SessionStatus.INTERRUPTED,
+                    )
+                async for event in self._interrupt_session_for_recovery(
+                    RecoveryInterruptionRequest(
+                        session=current_session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=invocation_context,
+                    )
+                ):
+                    yield event
+                authoritative_failure = None
+                return
             await self._session_store.update_status(session.id, loaded_session.status)
             raise
         except BaseExceptionGroup as exc:
@@ -8233,6 +9657,9 @@ class RecoveryCoordinator:
                 response=response,
                 session=session,
                 pending=pending,
+                resolution_intent=resolution_intent,
+                resolution_stage="manual-recovery",
+                closure_request_digest=closure_request_digest,
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
@@ -12059,6 +13486,7 @@ class RecoveryCoordinator:
             failures=request.interaction_transition_failures,
             agent_name=request.registered_agent.spec.name,
             environment_name=request.environment_name,
+            expected_recovery_claim_id=(request.interaction_transition_recovery_claim_id),
         )
 
     async def _record_durable_interaction_transition_cancellation(
@@ -12069,6 +13497,7 @@ class RecoveryCoordinator:
         failures: tuple[dict[str, Any], ...],
         agent_name: str,
         environment_name: str | None,
+        expected_recovery_claim_id: str | None,
     ) -> bool:
         """Record an exact transition failure without resolving mutable registrations."""
 
@@ -12090,10 +13519,17 @@ class RecoveryCoordinator:
                 "Interaction transition cancellation evidence is not a settled event "
                 "for the abandoned session."
             )
-        receipt = await self._session_store.load_interaction_transition_receipt(
-            session.id,
-            transition=expected,
-        )
+        if expected_recovery_claim_id is None:
+            receipt = await self._session_store.load_interaction_transition_receipt(
+                session.id,
+                transition=expected,
+            )
+        else:
+            receipt = await self._session_store.load_interaction_transition_receipt(
+                session.id,
+                transition=expected,
+                expected_recovery_claim_id=expected_recovery_claim_id,
+            )
         if receipt is None:
             return False
         receipt = InteractionTransitionReceiptResult.model_validate(receipt)
@@ -12776,6 +14212,19 @@ class RecoveryCoordinator:
             mutation_admitted = True
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        ambiguous_user_input = ambiguous_pending_user_input_from_checkpoint(checkpoint)
+        if ambiguous_user_input is not None:
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,),
+                events=(),
+                message=(
+                    "Session has a historical user-input pause without exact authority; "
+                    "explicitly interrupt the session before starting new work."
+                ),
+            )
         pending_provider_interrupt = _provider_cancellation_interrupt_payload(checkpoint)
         active_invocation_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         if active_invocation_profile is None and invocation_lifecycle_receipt_history_present(
@@ -12823,10 +14272,11 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
         )
-        pending_user_input = pending_user_input_from_checkpoint(
+        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
@@ -13239,16 +14689,21 @@ class RecoveryCoordinator:
                     "Terminal evidence is not repairable: the pending interruption marker "
                     "has no stable request identity."
                 )
+            await self._validated_user_input_supersession_interrupt_payload(
+                session=session,
+                pending_interrupt_payload=pending_interrupt_payload,
+            )
 
         pending_approval = approval_support.pending_approval_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
         )
-        pending_user_input = pending_user_input_from_checkpoint(
+        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
@@ -13279,6 +14734,19 @@ class RecoveryCoordinator:
                 "Terminal evidence is not repairable: the checkpoint contains "
                 "conflicting pending actions."
             )
+        if pending_user_input is not None:
+            pause_state = await self._classify_user_input_pause(
+                session=session,
+                checkpoint=checkpoint,
+                input_id=pending_user_input.input_id,
+            )
+            if pause_state not in {
+                UserInputPauseState.ACTIVE,
+                UserInputPauseState.ANSWERING,
+            }:
+                raise SessionRuntimePublicationConflict(
+                    "Terminal user-input evidence has ambiguous pause authority."
+                )
         pending_action_interrupt_payload: dict[str, Any] | None = None
         if pending_approval is not None and session.status == SessionStatus.INTERRUPTED:
             pending_action_interrupt_payload = {
@@ -13339,11 +14807,12 @@ class RecoveryCoordinator:
             )
 
         existing_event = None if not terminal_events else terminal_events[0].model_copy(deep=True)
-        if (
-            existing_event is not None
-            and pending_interrupt_payload is not None
-            and "provider_cancellation_failures" in pending_interrupt_payload
-        ):
+        exact_interrupt_marker_retained = pending_interrupt_payload is not None and (
+            "provider_cancellation_failures" in pending_interrupt_payload
+            or USER_INPUT_SUPERSESSION_INTENT_KEY in pending_interrupt_payload
+            or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in pending_interrupt_payload
+        )
+        if existing_event is not None and exact_interrupt_marker_retained:
             require_interruption_event_matches_pending_marker(
                 existing_event,
                 pending_interrupt_payload,
@@ -13553,6 +15022,32 @@ class RecoveryCoordinator:
                 event,
                 "interruption_request_id",
             )
+        supersession_payload = payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+        if supersession_payload is not None:
+            try:
+                supersession_intent = UserInputSupersessionIntent.model_validate(
+                    supersession_payload
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("User-input supersession evidence is malformed.") from exc
+            event = event_with_user_input_supersession_authority(
+                event,
+                supersession_intent,
+            )
+        ambiguous_supersession_payload = payload.get(AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY)
+        if ambiguous_supersession_payload is not None:
+            try:
+                ambiguous_supersession_intent = AmbiguousUserInputSupersessionIntent.model_validate(
+                    ambiguous_supersession_payload
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Ambiguous user-input supersession evidence is malformed."
+                ) from exc
+            event = event_with_ambiguous_user_input_supersession_authority(
+                event,
+                ambiguous_supersession_intent,
+            )
         raw_profile_fingerprint = payload.get("execution_profile_fingerprint")
         if raw_profile_fingerprint is None:
             profile_fingerprint = None
@@ -13628,7 +15123,9 @@ class RecoveryCoordinator:
                 )
             updated = copy_json_value(checkpoint, "checkpoint")
             claim = _incomplete_recovery_claim_from_checkpoint(updated)
-            if claim is None or claim[0] != claim_id:
+            now = self._clock()
+            _require_aware_datetime(now, "terminal finalization claim clock")
+            if claim is None or claim[0] != claim_id or claim[1] <= now:
                 raise _IncompleteRecoveryClaimLost(
                     "Terminal evidence recovery ownership changed before marker cleanup."
                 )
@@ -13837,6 +15334,24 @@ class RecoveryCoordinator:
         expected_run_epoch: int | None,
     ) -> Session | None:
         """Return the session only while the exact claim and its epoch are owned."""
+        owned = await self._load_owned_incomplete_recovery_claim_snapshot(
+            session_id,
+            claim_id,
+            expected_run_epoch=expected_run_epoch,
+            require_unexpired=False,
+        )
+        return None if owned is None else owned[0]
+
+    async def _load_owned_incomplete_recovery_claim_snapshot(
+        self,
+        session_id: str,
+        claim_id: str,
+        *,
+        expected_run_epoch: int | None,
+        require_unexpired: bool,
+    ) -> tuple[Session, datetime] | None:
+        """Return the exact durable owner and its latest lease expiry."""
+
         if expected_run_epoch is None:
             return None
         checkpoint = await self._session_store.load_checkpoint(session_id)
@@ -13844,9 +15359,499 @@ class RecoveryCoordinator:
         if persisted_claim is None or persisted_claim[0] != claim_id:
             return None
         session = await self._require_session(session_id)
-        if session.run_epoch != expected_run_epoch:
+        if session.run_epoch != expected_run_epoch or (
+            require_unexpired and persisted_claim[1] <= self._clock()
+        ):
             return None
-        return session
+        return session, persisted_claim[1]
+
+    def _new_terminal_evidence_finalization_claim(
+        self,
+    ) -> tuple[str, datetime, dict[str, Any]]:
+        """Prepare one durable lease for a live terminal-evidence finalizer."""
+
+        claimed_at = self._clock()
+        _require_aware_datetime(claimed_at, "terminal finalization claim clock")
+        claim_id = str(uuid4())
+        claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+        return (
+            claim_id,
+            claim_expires_at,
+            {
+                "version": 1,
+                "claim_id": claim_id,
+                "claimed_at": claimed_at.isoformat(),
+                "claim_expires_at": claim_expires_at.isoformat(),
+            },
+        )
+
+    async def _claim_pending_terminal_evidence_finalization(
+        self,
+        *,
+        session: Session,
+        expected_payload: dict[str, Any],
+    ) -> _TerminalFinalizationClaimAcquisition | None:
+        """Claim an unowned pending terminal publication without fencing its session."""
+
+        expected_payload = copy_json_value(
+            expected_payload,
+            "expected_pending_session_interrupt",
+        )
+        claim_id, claim_expires_at, marker = self._new_terminal_evidence_finalization_claim()
+        claim_installed = False
+
+        def require_exact_pending_authority(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> None:
+            if (
+                current_session.id != session.id
+                or current_session.instance_id != session.instance_id
+                or current_session.status is not session.status
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Terminal finalization session authority changed before ownership transfer."
+                )
+            current_payload = (
+                None
+                if checkpoint is None
+                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            )
+            if current_payload != expected_payload:
+                raise SessionRuntimePublicationConflict(
+                    "Terminal finalization interrupt identity changed before ownership transfer."
+                )
+
+        def claim_pending_finalization(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal claim_installed
+            require_exact_pending_authority(current_session, checkpoint)
+            existing_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            now = self._clock()
+            _require_aware_datetime(now, "terminal finalization claim clock")
+            if existing_claim is not None and existing_claim[1] > now:
+                return None
+            assert checkpoint is not None
+            updated = copy_json_value(checkpoint, "checkpoint")
+            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
+                marker,
+                "terminal_finalization_claim",
+            )
+            claim_installed = True
+            return updated
+
+        claim_task = asyncio.create_task(
+            capture_awaitable_outcome(
+                lambda: self._session_store.transform_checkpoint(
+                    session.id,
+                    claim_pending_finalization,
+                )
+            )
+        )
+        outcome = await await_shielded_task_outcome(claim_task)
+        error = outcome.error
+        if error is None:
+            captured = outcome.result
+            if type(captured) is not CapturedAwaitableOutcome:
+                error = RuntimeError(
+                    "Terminal evidence finalization claim transfer returned an invalid outcome."
+                )
+            else:
+                error = captured.error
+        if isinstance(error, asyncio.CancelledError) and outcome.cancellation is None:
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="Terminal evidence finalization claim transfer",
+            )
+        cancellation = outcome.cancellation
+        if isinstance(error, SessionRuntimePublicationConflict):
+            if cancellation is not None:
+                raise cancellation from error
+            raise error
+
+        async def reconcile_claim() -> bool:
+            claim_matches = False
+
+            def inspect_claim(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+            ) -> None:
+                nonlocal claim_matches
+                require_exact_pending_authority(current_session, checkpoint)
+                current_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+                claim_matches = current_claim is not None and current_claim[0] == claim_id
+                return None
+
+            await self._session_store.transform_checkpoint(session.id, inspect_claim)
+            return claim_matches
+
+        if error is not None or cancellation is not None:
+            reconciliation = await await_shielded_task_outcome(
+                asyncio.create_task(reconcile_claim()),
+                cancellation=cancellation,
+            )
+            cancellation = reconciliation.cancellation or cancellation
+            reconciliation_error = reconciliation.error
+            if isinstance(reconciliation_error, asyncio.CancelledError) and (
+                reconciliation.cancellation is None
+            ):
+                reconciliation_error = unexpected_child_cancellation_error(
+                    reconciliation_error,
+                    operation="Terminal evidence finalization claim reconciliation",
+                )
+            if reconciliation_error is not None:
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Terminal finalization claim reconciliation also failed: "
+                        f"{type(reconciliation_error).__name__}."
+                    )
+                    if error is not None:
+                        raise cancellation from BaseExceptionGroup(
+                            "Terminal finalization claim transfer failures",
+                            [error, reconciliation_error],
+                        )
+                    raise cancellation from reconciliation_error
+                if error is not None:
+                    raise BaseExceptionGroup(
+                        "Terminal finalization claim transfer and reconciliation failed.",
+                        [error, reconciliation_error],
+                    ) from None
+                raise reconciliation_error from error
+            claim_installed = reconciliation.result is True
+
+        if cancellation is not None:
+            if claim_installed:
+                process_control = _terminal_finalization_process_control(error)
+                return _TerminalFinalizationClaimAcquisition(
+                    claim_id=claim_id,
+                    claim_expires_at=claim_expires_at,
+                    cancellation=cancellation,
+                    transfer_failure=(
+                        error
+                        if process_control is None or error is None
+                        else _terminal_finalization_failure_without_identity(
+                            error,
+                            process_control,
+                        )
+                    ),
+                    process_control=process_control,
+                )
+            if error is not None:
+                raise cancellation from error
+            raise cancellation
+        if error is not None and not claim_installed:
+            raise error
+        if not claim_installed:
+            return None
+        process_control = _terminal_finalization_process_control(error)
+        return _TerminalFinalizationClaimAcquisition(
+            claim_id=claim_id,
+            claim_expires_at=claim_expires_at,
+            transfer_failure=(
+                None
+                if process_control is None or error is None
+                else _terminal_finalization_failure_without_identity(
+                    error,
+                    process_control,
+                )
+            ),
+            process_control=process_control,
+        )
+
+    def _start_preclaimed_terminal_evidence_heartbeat(
+        self,
+        *,
+        session_id: str,
+        claim_id: str,
+        claim_expires_at: datetime,
+    ) -> tuple[asyncio.Event, asyncio.Task[None]]:
+        """Retain a live claim from atomic interrupt until its run handler owns it."""
+
+        stop = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._heartbeat_incomplete_recovery_claim(
+                session_id=session_id,
+                claim_id=claim_id,
+                claim_expires_at=claim_expires_at,
+                stop=stop,
+            ),
+            name=f"cayu-terminal-finalization-heartbeat:{session_id}",
+        )
+        return stop, heartbeat
+
+    async def _await_preclaimed_terminal_evidence_operation(
+        self,
+        *,
+        heartbeat_task: asyncio.Task[None],
+        operation: Callable[[], Awaitable[_RecoveryResultT]],
+        operation_name: str,
+    ) -> _RecoveryResultT:
+        """Run one pre-finalization operation only while its keeper is live."""
+
+        operation_task = asyncio.create_task(capture_awaitable_outcome(operation))
+        try:
+            done, _pending = await asyncio.wait(
+                {operation_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except BaseException as caller_control:
+            if not operation_task.done():
+                operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            operation_failure: BaseException | None = None
+            if not operation_task.cancelled():
+                captured = operation_task.result()
+                if not isinstance(captured.error, asyncio.CancelledError):
+                    operation_failure = captured.error
+            if (
+                operation_failure is not None
+                and operation_failure is not caller_control
+                and not _attach_exception_cause_preserving_graph(
+                    caller_control,
+                    operation_failure,
+                )
+            ):
+                raise BaseExceptionGroup(
+                    f"{operation_name} and caller control failed concurrently.",
+                    [caller_control, operation_failure],
+                ) from None
+            raise
+        if heartbeat_task in done:
+            try:
+                heartbeat_failure = heartbeat_task.exception()
+            except asyncio.CancelledError as cancellation:
+                heartbeat_failure = unexpected_child_cancellation_error(
+                    cancellation,
+                    operation="Terminal finalization claim heartbeat",
+                )
+            if heartbeat_failure is None:
+                heartbeat_failure = RuntimeError(
+                    "Terminal finalization claim heartbeat stopped unexpectedly."
+                )
+            if not operation_task.done():
+                operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            operation_failure: BaseException | None = None
+            if not operation_task.cancelled():
+                captured = operation_task.result()
+                if not isinstance(captured.error, asyncio.CancelledError):
+                    operation_failure = captured.error
+            if operation_failure is not None and operation_failure is not heartbeat_failure:
+                raise heartbeat_failure from operation_failure
+            raise heartbeat_failure
+        captured = operation_task.result()
+        if captured.error is not None:
+            raise captured.error
+        return cast("_RecoveryResultT", captured.result)
+
+    async def _renew_terminal_evidence_finalization_claim(
+        self,
+        *,
+        session: Session,
+        claim_id: str,
+        expected_payload: dict[str, Any],
+    ) -> tuple[Session, datetime] | None:
+        """Atomically re-prove and renew the complete terminal owner tuple."""
+
+        expected_payload = copy_json_value(
+            expected_payload,
+            "expected_pending_session_interrupt",
+        )
+        renewed: tuple[Session, datetime] | None = None
+
+        def renew_exact_claim(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal renewed
+            if (
+                current_session.id != session.id
+                or current_session.instance_id != session.instance_id
+                or current_session.status is not session.status
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Terminal finalization session authority changed before lease renewal."
+                )
+            current_payload = (
+                None
+                if checkpoint is None
+                else checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            )
+            if current_payload != expected_payload:
+                raise SessionRuntimePublicationConflict(
+                    "Terminal finalization interrupt identity changed before lease renewal."
+                )
+            existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            now = self._clock()
+            _require_aware_datetime(now, "terminal finalization claim clock")
+            if existing is None or existing[0] != claim_id or existing[1] <= now:
+                return None
+            assert checkpoint is not None
+            updated = copy_json_value(checkpoint, "checkpoint")
+            marker = copy_json_value(
+                updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY],
+                "terminal_finalization_claim",
+            )
+            renewed_until = now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+            marker["claim_expires_at"] = renewed_until.isoformat()
+            marker["renewed_at"] = now.isoformat()
+            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = marker
+            renewed = (current_session.model_copy(deep=True), renewed_until)
+            return updated
+
+        await self._session_store.transform_checkpoint(session.id, renew_exact_claim)
+        return renewed
+
+    async def _run_preclaimed_terminal_evidence_finalization(
+        self,
+        *,
+        session: Session,
+        claim_id: str,
+        expected_payload: dict[str, Any],
+        finalization: Callable[[], Awaitable[_RecoveryResultT]],
+    ) -> _RecoveryResultT:
+        """Run the live finalizer under the same lease used by crash recovery."""
+
+        owned_claim = await self._renew_terminal_evidence_finalization_claim(
+            session=session,
+            claim_id=claim_id,
+            expected_payload=expected_payload,
+        )
+        if owned_claim is None:
+            raise _IncompleteRecoveryClaimLost(
+                "Terminal evidence finalization ownership changed before execution."
+            )
+        owned_session, current_claim_expires_at = owned_claim
+        claim = _IncompleteRecoveryClaim(
+            claim_id=claim_id,
+            claim_expires_at=current_claim_expires_at,
+            session_before_fence=owned_session,
+            session=owned_session,
+        )
+        authoritative_failure: BaseException | None = None
+        try:
+            return await self._recover_incomplete_session_with_heartbeat(
+                claim=claim,
+                recovery=finalization,
+            )
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(
+                    (
+                        "terminal evidence finalization claim release",
+                        lambda: self._release_incomplete_recovery_claim(
+                            session.id,
+                            claim_id,
+                        ),
+                    ),
+                ),
+            )
+
+    async def _stream_preclaimed_terminal_evidence_finalization(
+        self,
+        *,
+        session: Session,
+        claim_id: str,
+        expected_payload: dict[str, Any],
+        finalization: AsyncIterator[_RecoveryResultT],
+    ) -> AsyncGenerator[_RecoveryResultT, None]:
+        """Stream a live finalizer while retaining its durable lease."""
+
+        events: asyncio.Queue[_RecoveryResultT] = asyncio.Queue(maxsize=1)
+
+        async def collect_finalization() -> bool:
+            try:
+                async for item in finalization:
+                    await events.put(item)
+                return True
+            finally:
+                close = getattr(finalization, "aclose", None)
+                if close is not None:
+                    await close()
+
+        async def run_owned_finalization() -> CapturedAwaitableOutcome[bool]:
+            return await capture_awaitable_outcome(
+                lambda: self._run_preclaimed_terminal_evidence_finalization(
+                    session=session,
+                    claim_id=claim_id,
+                    expected_payload=expected_payload,
+                    finalization=collect_finalization,
+                )
+            )
+
+        owner = asyncio.create_task(run_owned_finalization())
+        owner_outcome_observed = False
+        pending_get: asyncio.Task[_RecoveryResultT] | None = None
+
+        def require_owner_outcome() -> None:
+            nonlocal owner_outcome_observed
+            captured = owner.result()
+            owner_outcome_observed = True
+            if captured.error is not None:
+                raise captured.error
+            if captured.result is not True:
+                raise RuntimeError("Owned terminal stream returned no completion result.")
+
+        async def stop_owner() -> None:
+            if pending_get is not None and not pending_get.done():
+                pending_get.cancel()
+            if not owner.done():
+                owner.cancel()
+            await asyncio.gather(
+                *(task for task in (pending_get, owner) if task is not None),
+                return_exceptions=True,
+            )
+            if owner_outcome_observed or owner.cancelled():
+                return
+            captured = owner.result()
+            if captured.error is None:
+                return
+            if isinstance(captured.error, asyncio.CancelledError):
+                secondary = exception_cause(captured.error)
+                if secondary is not None:
+                    raise secondary
+                return
+            raise captured.error
+
+        authoritative_failure: BaseException | None = None
+        try:
+            while True:
+                if not events.empty():
+                    yield events.get_nowait()
+                    continue
+                if owner.done():
+                    require_owner_outcome()
+                    return
+                pending_get = asyncio.create_task(events.get())
+                done, _pending = await asyncio.wait(
+                    {pending_get, owner},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if pending_get in done:
+                    item = pending_get.result()
+                    pending_get = None
+                    yield item
+                    continue
+                pending_get.cancel()
+                await asyncio.gather(pending_get, return_exceptions=True)
+                pending_get = None
+                require_owner_outcome()
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=authoritative_failure,
+                steps=(("terminal evidence stream owner shutdown", stop_owner),),
+            )
 
     async def _claim_incomplete_recovery(
         self,
@@ -14269,22 +16274,22 @@ class RecoveryCoordinator:
         self,
         *,
         claim: _IncompleteRecoveryClaim,
-        recovery: Callable[[], Awaitable[IncompleteSessionRecoveryResult]],
-    ) -> IncompleteSessionRecoveryResult:
+        recovery: Callable[[], Awaitable[_RecoveryResultT]],
+    ) -> _RecoveryResultT:
         stop_heartbeat = asyncio.Event()
         recovery_outcome_observed = False
 
-        async def run_recovery() -> CapturedAwaitableOutcome[IncompleteSessionRecoveryResult]:
+        async def run_recovery() -> CapturedAwaitableOutcome[_RecoveryResultT]:
             return await capture_awaitable_outcome(recovery)
 
-        def recovery_outcome() -> IncompleteSessionRecoveryResult:
+        def recovery_outcome() -> _RecoveryResultT:
             nonlocal recovery_outcome_observed
             captured = recovery_task.result()
             recovery_outcome_observed = True
             if captured.error is not None:
                 raise captured.error
             if captured.result is None:
-                raise RuntimeError("Incomplete-session recovery returned no result.")
+                raise RuntimeError("Owned terminal operation returned no result.")
             return captured.result
 
         recovery_task = asyncio.create_task(run_recovery())
@@ -14296,6 +16301,7 @@ class RecoveryCoordinator:
                 stop=stop_heartbeat,
             )
         )
+        recovery_task.add_done_callback(lambda _completed: stop_heartbeat.set())
         authoritative_failure: BaseException | None = None
 
         async def stop_workers() -> None:
@@ -14323,15 +16329,36 @@ class RecoveryCoordinator:
             )
             if heartbeat_task in done:
                 heartbeat_failure = heartbeat_task.exception()
-                if heartbeat_failure is None:
+                if heartbeat_failure is not None:
+                    raise heartbeat_failure
+                if recovery_task not in done:
                     raise RuntimeError(
                         "Incomplete-session recovery claim heartbeat stopped unexpectedly."
                     )
-                raise heartbeat_failure
-            result = recovery_outcome()
-            stop_heartbeat.set()
-            await heartbeat_task
-            return result
+            if recovery_task in done:
+                try:
+                    result = recovery_outcome()
+                except BaseException as recovery_failure:
+                    if heartbeat_task.done() and not heartbeat_task.cancelled():
+                        heartbeat_failure = heartbeat_task.exception()
+                        if (
+                            heartbeat_failure is not None
+                            and heartbeat_failure is not recovery_failure
+                            and not _attach_exception_cause_preserving_graph(
+                                recovery_failure,
+                                heartbeat_failure,
+                            )
+                        ):
+                            raise BaseExceptionGroup(
+                                "Incomplete recovery and claim heartbeat failed concurrently.",
+                                [recovery_failure, heartbeat_failure],
+                            ) from None
+                    raise
+                stop_heartbeat.set()
+                if not heartbeat_task.done():
+                    await heartbeat_task
+                return result
+            raise RuntimeError("Incomplete-session recovery owner produced no outcome.")
         except BaseException as exc:
             authoritative_failure = exc
             raise
@@ -15597,10 +17624,11 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
         )
-        pending_user_input = pending_user_input_from_checkpoint(
+        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
         )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             checkpoint,
@@ -15924,8 +17952,26 @@ class RecoveryCoordinator:
             events.append(copy_event(model_boundary.completion_event))
         checkpoint = await self._session_store.load_checkpoint(session.id)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
+        )
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending_user_input is not None:
+            pause_state = await self._classify_user_input_pause(
+                session=session,
+                checkpoint=checkpoint,
+                input_id=pending_user_input.input_id,
+            )
+            if pause_state not in {
+                UserInputPauseState.ACTIVE,
+                UserInputPauseState.ANSWERING,
+            }:
+                raise SessionRuntimePublicationConflict(
+                    "Pending user-input recovery authority is ambiguous."
+                )
         if pending_tool_round is None and await self.materialize_deferred_input_if_present(
             session.id
         ):
@@ -16184,12 +18230,25 @@ class RecoveryCoordinator:
                 message="Session has a pending tool approval; resolve it with ToolApprovalRequest.",
             )
 
-        pending_user_input = pending_user_input_from_checkpoint(
+        pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
             consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
         )
         if pending_user_input is not None:
+            pause_state = await self._classify_user_input_pause(
+                session=session,
+                checkpoint=checkpoint,
+                input_id=pending_user_input.input_id,
+            )
+            if pause_state not in {
+                UserInputPauseState.ACTIVE,
+                UserInputPauseState.ANSWERING,
+            }:
+                raise SessionRuntimePublicationConflict(
+                    "Pending user-input recovery authority changed before finalization."
+                )
             session = await self._finalize_interrupting_for_recovery(
                 session=session,
                 registered_agent=registered_agent,

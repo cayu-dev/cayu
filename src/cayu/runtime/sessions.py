@@ -2301,7 +2301,7 @@ class _InteractionTransitionReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     record_type: Literal["cayu.interaction-transition"] = "cayu.interaction-transition"
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     session: Session
     event: Event
     from_statuses: tuple[SessionStatus, ...]
@@ -2311,6 +2311,7 @@ class _InteractionTransitionReceipt(BaseModel):
     invocation_session_instance_id: str | None = None
     invocation_active_profile: ActiveInvocationExecutionProfile | None = None
     invocation_authority_state: Literal["active", "released"] | None = None
+    recovery_claim_id: str | None = None
     status_changed: StrictBool
     record_digest: str
 
@@ -2351,11 +2352,26 @@ class _InteractionTransitionReceipt(BaseModel):
         if self.schema_version == 1:
             if carries_invocation_authority or self.invocation_authority_state is not None:
                 raise ValueError("Interaction-transition receipt version conflicts with authority.")
+            if self.recovery_claim_id is not None:
+                raise ValueError("Interaction-transition receipt version conflicts with authority.")
         elif self.schema_version == 2:
             if not carries_invocation_authority or self.invocation_authority_state is not None:
                 raise ValueError("Interaction-transition receipt version conflicts with authority.")
-        elif not carries_invocation_authority or self.invocation_authority_state is None:
-            raise ValueError("Interaction-transition receipt version conflicts with authority.")
+            if self.recovery_claim_id is not None:
+                raise ValueError("Interaction-transition receipt version conflicts with authority.")
+        elif self.schema_version == 3:
+            if (
+                not carries_invocation_authority
+                or self.invocation_authority_state is None
+                or self.recovery_claim_id is not None
+            ):
+                raise ValueError("Interaction-transition receipt version conflicts with authority.")
+        else:
+            if self.recovery_claim_id is None or (
+                carries_invocation_authority != (self.invocation_authority_state is not None)
+            ):
+                raise ValueError("Interaction-transition receipt version conflicts with authority.")
+            require_clean_nonblank(self.recovery_claim_id, "recovery_claim_id")
         if carries_invocation_authority:
             SessionInvocationBinding.validate_session_instance_id(
                 self.invocation_session_instance_id
@@ -4513,6 +4529,8 @@ RuntimePublicationKind = Literal[
     "tool-round",
     "approval-open",
     "approval-close",
+    "user-input-open",
+    "user-input-close",
     "workspace-observation",
 ]
 
@@ -6820,6 +6838,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     REPAIRED_TERMINAL_EVIDENCE = "repaired_terminal_evidence"
     PENDING_APPROVAL = "pending_approval"
     PENDING_USER_INPUT = "pending_user_input"
+    AMBIGUOUS_PENDING_USER_INPUT = "ambiguous_pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
     REPAIRED_WORKSPACE_OBSERVATION = "repaired_workspace_observation"
     REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
@@ -9324,6 +9343,8 @@ class SessionStore(ABC):
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
+        expected_recovery_claim_id: str | None = None,
+        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
         """Atomically publish one interaction state and its session transition.
 
@@ -9332,7 +9353,10 @@ class SessionStore(ABC):
         queued input remains. Repeating the exact complete transition
         reconstructs the committed result without re-evaluating that queue
         boundary. Reusing its event identity with different transition data
-        fails closed.
+        fails closed. A runtime-supplied recovery claim must include the same
+        authoritative clock that issued its lease; implementations sample that
+        clock after acquiring the mutation lock and before first publication.
+        Exact receipt replay remains valid after the lease has settled.
         """
 
     async def load_interaction_transition_receipt(
@@ -9340,16 +9364,20 @@ class SessionStore(ABC):
         session_id: str,
         *,
         transition: InteractionTransitionSpec,
+        expected_recovery_claim_id: str | None = None,
     ) -> InteractionTransitionReceiptResult | None:
         """Load immutable evidence for one exact interaction transition.
 
         Stores that support acknowledgement-loss recovery must implement this
         read-only boundary. The default keeps existing custom stores source
         compatible while making unsupported cancellation reconciliation fail
-        closed instead of issuing another transition publication.
+        closed instead of issuing another transition publication. Claim-bound
+        receipts require the exact original claim and reject a superseding
+        durable claimant, while ordinary lease expiry does not invalidate
+        exact acknowledgement-loss readback.
         """
 
-        del session_id, transition
+        del session_id, transition, expected_recovery_claim_id
         raise NotImplementedError(
             "This session store does not support interaction-transition receipt lookup."
         )
@@ -10158,6 +10186,48 @@ class SessionStore(ABC):
     @abstractmethod
     async def load_events(self, session_id: str) -> list[Event]:
         """Load all events for a session."""
+
+    async def load_user_input_supersession_events(
+        self,
+        session_id: str,
+        input_id: str,
+    ) -> list[Event]:
+        """Load exact interruption evidence for one user-input pause.
+
+        Built-in persistent stores override this with their fixed-size
+        pending-action lookup indexes. The fallback pages complete durable
+        history for correctness without retaining an unbounded result.
+        """
+
+        from cayu.runtime.user_input import USER_INPUT_SUPERSESSION_INTENT_KEY
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        input_id = require_clean_nonblank(input_id, "input_id")
+        selected: list[Event] = []
+        after_sequence = 0
+        while True:
+            records = await self.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_INTERRUPTED,
+                    after_sequence=after_sequence,
+                    limit=5000,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                )
+            )
+            if not records:
+                break
+            for record in records:
+                marker = record.event.payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+                if type(marker) is not dict or marker.get("input_id") != input_id:
+                    continue
+                selected.append(copy_event(record.event))
+                if len(selected) == 2:
+                    return selected
+            after_sequence = records[-1].sequence
+            if len(records) < 5000:
+                break
+        return selected
 
     async def load_tool_round_lifecycle_events(
         self,
@@ -11022,6 +11092,12 @@ class InMemorySessionStore(SessionStore):
         self._pending_action_event_history: dict[
             str,
             dict[str, list[EventRecord]],
+        ] = {}
+        # Supersession lookup remains available after the pause checkpoint and
+        # its general pending-action history are released.
+        self._user_input_supersession_event_records: dict[
+            tuple[str, str],
+            list[EventRecord],
         ] = {}
         self._pending_action_latest_barrier_records: dict[str, EventRecord] = {}
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
@@ -13041,6 +13117,11 @@ class InMemorySessionStore(SessionStore):
             self._pending_action_event_records.pop(session_id, None)
             self._pending_action_index_scopes.pop(session_id, None)
             self._pending_action_latest_barrier_records.pop(session_id, None)
+            self._user_input_supersession_event_records = {
+                key: records
+                for key, records in self._user_input_supersession_event_records.items()
+                if key[0] != session_id
+            }
             self._remove_transcript_search_session_unlocked(session_id)
             self._transcripts.pop(session_id, None)
             self._transcript_interaction_ids.pop(session_id, None)
@@ -13552,7 +13633,15 @@ class InMemorySessionStore(SessionStore):
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
+        expected_recovery_claim_id: str | None = None,
+        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
+        expected_recovery_claim_id, expected_recovery_claim_clock = (
+            _validate_interaction_transition_recovery_claim_parameters(
+                expected_recovery_claim_id=expected_recovery_claim_id,
+                expected_recovery_claim_clock=expected_recovery_claim_clock,
+            )
+        )
         expected_invocation_authority_state = (
             _validate_interaction_transition_invocation_authority_parameters(
                 expected_session_instance_id=expected_session_instance_id,
@@ -13588,13 +13677,14 @@ class InMemorySessionStore(SessionStore):
                     receipt_record,
                     transition=transition,
                 )
-                _validate_interaction_transition_receipt_invocation_authority(
+                _validate_interaction_transition_receipt_authority(
                     receipt,
                     current_session=session,
                     current_checkpoint=self._checkpoints.get(session_id),
                     expected_session_instance_id=expected_session_instance_id,
                     expected_active_invocation_profile=expected_active_invocation_profile,
                     expected_invocation_authority_state=(expected_invocation_authority_state),
+                    expected_recovery_claim_id=expected_recovery_claim_id,
                 )
                 if existing is not None and existing.event != receipt.event:
                     raise RuntimeError(
@@ -13610,6 +13700,18 @@ class InMemorySessionStore(SessionStore):
                 raise RuntimeError(
                     "Interaction transition event exists without its immutable receipt."
                 )
+            if expected_recovery_claim_id is not None:
+                assert expected_recovery_claim_clock is not None
+                active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+                    self._checkpoints.get(session_id),
+                    now=_interaction_transition_recovery_claim_observed_at(
+                        expected_recovery_claim_clock
+                    ),
+                )
+                if active_recovery_claim_id != expected_recovery_claim_id:
+                    raise SessionRunFenced(
+                        "Interaction transition lost its exact terminal recovery claim."
+                    )
             if expected_active_invocation_profile is not None:
                 from cayu.runtime._invocation_lifecycle import (
                     require_invocation_command_authority,
@@ -13708,6 +13810,7 @@ class InMemorySessionStore(SessionStore):
                 invocation_session_instance_id=expected_session_instance_id,
                 invocation_active_profile=expected_active_invocation_profile,
                 invocation_authority_state=expected_invocation_authority_state,
+                recovery_claim_id=expected_recovery_claim_id,
             )
             applied = self._apply_event_append_unlocked(
                 session,
@@ -13762,6 +13865,7 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         *,
         transition: InteractionTransitionSpec,
+        expected_recovery_claim_id: str | None = None,
     ) -> InteractionTransitionReceiptResult | None:
         session_id, copied_transition = _prepare_interaction_transition_receipt_lookup(
             session_id,
@@ -13785,6 +13889,11 @@ class InMemorySessionStore(SessionStore):
             receipt = _reconstruct_interaction_transition_receipt(
                 receipt_record,
                 transition=copied_transition,
+            )
+            _validate_interaction_transition_receipt_recovery_authority(
+                receipt,
+                current_checkpoint=self._checkpoints.get(session_id),
+                expected_recovery_claim_id=expected_recovery_claim_id,
             )
             if existing is not None and existing.event != receipt.event:
                 raise RuntimeError(
@@ -14253,7 +14362,11 @@ class InMemorySessionStore(SessionStore):
         *,
         activity_at: datetime | None = None,
     ) -> Session:
-        from cayu.runtime.pending_actions import retain_pending_action_index_record
+        from cayu.runtime.pending_actions import (
+            pending_action_lookup_key,
+            retain_pending_action_index_record,
+        )
+        from cayu.runtime.user_input import USER_INPUT_SUPERSESSION_INTENT_KEY
 
         session_id = session.id
         existing_ids = self._event_ids[session_id]
@@ -14272,6 +14385,19 @@ class InMemorySessionStore(SessionStore):
             self._event_records.append(record)
             self._event_records_by_id[(session_id, stored_event.id)] = record
             session_records.append(record)
+            if stored_event.type is EventType.SESSION_INTERRUPTED:
+                supersession = stored_event.payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+                superseded_input_id = (
+                    None if type(supersession) is not dict else supersession.get("input_id")
+                )
+                if type(superseded_input_id) is str and superseded_input_id.strip():
+                    lookup_key = pending_action_lookup_key(superseded_input_id)
+                    indexed_supersessions = self._user_input_supersession_event_records.setdefault(
+                        (session_id, lookup_key),
+                        [],
+                    )
+                    if len(indexed_supersessions) < 2:
+                        indexed_supersessions.append(record)
             interaction_id = stored_event.interaction_id
             if interaction_id is not None:
                 self._register_private_authority_alias_unlocked(
@@ -15967,9 +16093,17 @@ class InMemorySessionStore(SessionStore):
             if checkpoint_decode is None
             else checkpoint_decode(session, deepcopy(stored_checkpoint))
         )
+        _validate_user_input_checkpoint_mutation(
+            request,
+            current_checkpoint,
+            session_id=session_id,
+            session_instance_id=session.instance_id,
+            current_run_epoch=session.run_epoch,
+            durable_events_by_id=durable_events_by_id,
+        )
         _validate_tool_round_checkpoint_mutation(request, current_checkpoint)
         durable_tool_events: list[Event] = []
-        tool_round_identity = _tool_round_publication_identity(request)
+        tool_round_identity = _tool_lifecycle_publication_identity(request)
         if tool_round_identity is not None:
             from cayu.runtime.pending_actions import pending_action_lookup_key
 
@@ -16088,6 +16222,25 @@ class InMemorySessionStore(SessionStore):
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return [event.model_copy(deep=True) for event in self._events.get(session_id, [])]
+
+    async def load_user_input_supersession_events(
+        self,
+        session_id: str,
+        input_id: str,
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        input_id = require_clean_nonblank(input_id, "input_id")
+        lookup_key = pending_action_lookup_key(input_id)
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            records = self._user_input_supersession_event_records.get(
+                (session_id, lookup_key),
+                (),
+            )
+            return [copy_event(record.event) for record in records[:2]]
 
     async def load_tool_round_lifecycle_events(
         self,
@@ -20382,6 +20535,41 @@ def _validate_interaction_transition_invocation_authority_parameters(
     return cast('Literal["active", "released"]', expected_invocation_authority_state)
 
 
+def _validate_interaction_transition_recovery_claim_parameters(
+    *,
+    expected_recovery_claim_id: str | None,
+    expected_recovery_claim_clock: Callable[[], datetime] | None,
+) -> tuple[str | None, Callable[[], datetime] | None]:
+    """Require one clock domain for an exact recovery-claim mutation fence."""
+
+    if expected_recovery_claim_id is None:
+        if expected_recovery_claim_clock is not None:
+            raise TypeError("A recovery-claim clock requires an expected recovery claim.")
+        return None, None
+    claim_id = require_clean_nonblank(
+        expected_recovery_claim_id,
+        "expected_recovery_claim_id",
+    )
+    if expected_recovery_claim_clock is None or not callable(expected_recovery_claim_clock):
+        raise TypeError("An expected recovery claim requires its authoritative clock.")
+    return claim_id, expected_recovery_claim_clock
+
+
+def _interaction_transition_recovery_claim_observed_at(
+    clock: Callable[[], datetime],
+) -> datetime:
+    """Sample and normalize the clock that issued the fenced recovery lease."""
+
+    observed_at = clock()
+    if (
+        not isinstance(observed_at, datetime)
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+    ):
+        raise ValueError("expected_recovery_claim_clock must return an aware datetime.")
+    return observed_at.astimezone(UTC)
+
+
 def _interaction_transition_receipt_record(
     *,
     session: Session,
@@ -20394,16 +20582,21 @@ def _interaction_transition_receipt_record(
     invocation_session_instance_id: str | None = None,
     invocation_active_profile: ActiveInvocationExecutionProfile | None = None,
     invocation_authority_state: Literal["active", "released"] = "active",
+    recovery_claim_id: str | None = None,
 ) -> dict[str, Any]:
     if (invocation_session_instance_id is None) != (invocation_active_profile is None):
         raise TypeError("Interaction-transition invocation authority is incomplete.")
     if invocation_active_profile is None and invocation_authority_state != "active":
         raise TypeError("Released interaction authority requires an invocation profile.")
-    schema_version = (
-        3
-        if invocation_authority_state == "released"
-        else (2 if invocation_active_profile is not None else 1)
-    )
+    if recovery_claim_id is not None:
+        recovery_claim_id = require_clean_nonblank(recovery_claim_id, "recovery_claim_id")
+        schema_version = 4
+    else:
+        schema_version = (
+            3
+            if invocation_authority_state == "released"
+            else (2 if invocation_active_profile is not None else 1)
+        )
     ordered_from_statuses = tuple(sorted(from_statuses, key=str))
     payload = {
         "record_type": "cayu.interaction-transition",
@@ -20422,8 +20615,10 @@ def _interaction_transition_receipt_record(
     if invocation_active_profile is not None:
         payload["invocation_session_instance_id"] = invocation_session_instance_id
         payload["invocation_active_profile"] = invocation_active_profile.model_dump(mode="json")
-    if schema_version == 3:
+    if schema_version == 3 or (schema_version == 4 and invocation_active_profile is not None):
         payload["invocation_authority_state"] = invocation_authority_state
+    if recovery_claim_id is not None:
+        payload["recovery_claim_id"] = recovery_claim_id
     receipt = _InteractionTransitionReceipt(
         schema_version=schema_version,
         session=session,
@@ -20434,7 +20629,13 @@ def _interaction_transition_receipt_record(
         model_completion_stage_settlement=model_completion_stage_settlement,
         invocation_session_instance_id=invocation_session_instance_id,
         invocation_active_profile=invocation_active_profile,
-        invocation_authority_state=(invocation_authority_state if schema_version == 3 else None),
+        invocation_authority_state=(
+            invocation_authority_state
+            if schema_version == 3
+            or (schema_version == 4 and invocation_active_profile is not None)
+            else None
+        ),
+        recovery_claim_id=recovery_claim_id,
         status_changed=status_changed,
         record_digest=_canonical_runtime_publication_digest(payload),
     )
@@ -20449,11 +20650,14 @@ def _load_interaction_transition_receipt(record: object) -> _InteractionTransiti
             # Schema-v1 receipts predate the optional settlement field. Keep
             # their exact digest valid while binding the field whenever set.
             digest_payload.pop("model_completion_stage_settlement", None)
-        if receipt.schema_version == 1:
+        if receipt.invocation_active_profile is None:
             digest_payload.pop("invocation_session_instance_id", None)
             digest_payload.pop("invocation_active_profile", None)
-        if receipt.schema_version < 3:
             digest_payload.pop("invocation_authority_state", None)
+        elif receipt.schema_version < 3:
+            digest_payload.pop("invocation_authority_state", None)
+        if receipt.schema_version < 4:
+            digest_payload.pop("recovery_claim_id", None)
         if _canonical_runtime_publication_digest(digest_payload) != receipt.record_digest:
             raise ValueError
     except (TypeError, ValueError) as exc:
@@ -20461,7 +20665,7 @@ def _load_interaction_transition_receipt(record: object) -> _InteractionTransiti
     return receipt
 
 
-def _validate_interaction_transition_receipt_invocation_authority(
+def _validate_interaction_transition_receipt_authority(
     receipt: _InteractionTransitionReceipt,
     *,
     current_session: Session,
@@ -20469,6 +20673,7 @@ def _validate_interaction_transition_receipt_invocation_authority(
     expected_session_instance_id: str | None,
     expected_active_invocation_profile: ActiveInvocationExecutionProfile | None,
     expected_invocation_authority_state: Literal["active", "released"] = "active",
+    expected_recovery_claim_id: str | None = None,
 ) -> None:
     if (
         current_session.id != receipt.session.id
@@ -20482,6 +20687,11 @@ def _validate_interaction_transition_receipt_invocation_authority(
         raise TypeError("Interaction-transition invocation authority is incomplete.")
     if not expects_authority and expected_invocation_authority_state != "active":
         raise TypeError("Released interaction authority requires an invocation profile.")
+    _validate_interaction_transition_receipt_recovery_authority(
+        receipt,
+        current_checkpoint=current_checkpoint,
+        expected_recovery_claim_id=expected_recovery_claim_id,
+    )
     receipt_has_authority = receipt.invocation_active_profile is not None
     if expects_authority != receipt_has_authority:
         raise SessionRunFenced(
@@ -20536,6 +20746,26 @@ def _validate_interaction_transition_receipt_invocation_authority(
         ):
             raise SessionRunFenced(
                 "Interaction-transition receipt lost its active invocation epoch."
+            )
+
+
+def _validate_interaction_transition_receipt_recovery_authority(
+    receipt: _InteractionTransitionReceipt,
+    *,
+    current_checkpoint: dict[str, Any] | None,
+    expected_recovery_claim_id: str | None,
+) -> None:
+    """Bind mutation replay and readback to the same recovery claimant."""
+
+    if receipt.recovery_claim_id != expected_recovery_claim_id:
+        raise SessionRunFenced(
+            "Interaction-transition receipt belongs to another recovery authority."
+        )
+    if expected_recovery_claim_id is not None:
+        current_claim = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
+        if current_claim is not None and current_claim[0] != expected_recovery_claim_id:
+            raise SessionRunFenced(
+                "Interaction-transition receipt was superseded by another recovery authority."
             )
 
 
@@ -21087,17 +21317,20 @@ def _tool_round_event_matches_scope_or_is_ambiguous(
     )
 
 
-def _tool_round_publication_identity(
+def _tool_lifecycle_publication_identity(
     request: RuntimePublicationRequest,
 ) -> tuple[ToolRoundIdentity, tuple[str, ...]] | None:
-    if request.kind != "tool-round":
+    if request.kind not in {"tool-round", "user-input-close"}:
         return None
 
-    round_id = request.intent.get("round_id")
+    round_id_field = "round_id" if request.kind == "tool-round" else "tool_round_id"
+    round_id = request.intent.get(round_id_field)
     raw_tool_call_ids = request.intent.get("tool_call_ids")
     if type(round_id) is not str or not round_id.strip():
-        raise ValueError("A tool-round publication requires a nonblank intent.round_id.")
-    if request.publication_id != f"tool-round:{round_id}":
+        raise ValueError(
+            f"A {request.kind} publication requires a nonblank intent.{round_id_field}."
+        )
+    if request.kind == "tool-round" and request.publication_id != f"tool-round:{round_id}":
         raise ValueError("A tool-round publication_id must be derived from its intent.round_id.")
     model_step_id = request.intent.get("model_step_id")
     model_attempt_id = request.intent.get("model_attempt_id")
@@ -21107,7 +21340,7 @@ def _tool_round_publication_identity(
         or type(model_attempt_id) is not str
         or type(tool_round_id) is not str
     ):
-        raise ValueError("A tool-round publication requires a complete execution identity.")
+        raise ValueError(f"A {request.kind} publication requires a complete execution identity.")
     try:
         execution_identity = ToolRoundIdentity(
             model_step_id=model_step_id,
@@ -21115,18 +21348,29 @@ def _tool_round_publication_identity(
             tool_round_id=tool_round_id,
         )
     except (TypeError, ValueError) as exc:
-        raise ValueError("A tool-round publication execution identity is malformed.") from exc
+        raise ValueError(f"A {request.kind} publication execution identity is malformed.") from exc
     if execution_identity.tool_round_id != round_id:
         raise ValueError(
-            "A tool-round publication intent.round_id conflicts with its execution identity."
+            f"A {request.kind} publication intent.{round_id_field} conflicts with its "
+            "execution identity."
         )
     if type(raw_tool_call_ids) is not list:
-        raise ValueError("A tool-round publication requires intent.tool_call_ids as a list.")
+        raise ValueError(f"A {request.kind} publication requires intent.tool_call_ids as a list.")
     tool_call_ids = _validate_tool_round_call_ids(
         raw_tool_call_ids,
         "intent.tool_call_ids",
     )
     return execution_identity, tool_call_ids
+
+
+def _tool_round_publication_identity(
+    request: RuntimePublicationRequest,
+) -> tuple[ToolRoundIdentity, tuple[str, ...]] | None:
+    """Return identity only for publication of a pending tool-round marker."""
+
+    if request.kind != "tool-round":
+        return None
+    return _tool_lifecycle_publication_identity(request)
 
 
 def _validate_structured_output_auxiliary_integer(
@@ -21348,14 +21592,20 @@ def _validate_tool_round_publication(
     *,
     durable_tool_events: Iterable[Event] | None = None,
 ) -> None:
-    identity = _tool_round_publication_identity(request)
+    """Validate complete lifecycle evidence for every grouped tool result."""
+
+    identity = _tool_lifecycle_publication_identity(request)
     if identity is None:
         return
     execution_identity, tool_call_ids = identity
     round_id = execution_identity.tool_round_id
-    auxiliary = _validate_structured_output_tool_round_auxiliary(
-        request,
-        round_id=round_id,
+    auxiliary = (
+        _validate_structured_output_tool_round_auxiliary(
+            request,
+            round_id=round_id,
+        )
+        if request.kind == "tool-round"
+        else None
     )
 
     if len(request.transcript_messages) not in {1, 2}:
@@ -21579,15 +21829,16 @@ def _validate_tool_round_publication(
                 "A deferred assistant argument projection conflicts with terminal evidence."
             )
 
-    pending_round_deletions = [
-        operation
-        for operation in request.mutation.operations
-        if operation.key == _PENDING_TOOL_ROUND_CHECKPOINT_KEY and operation.action == "delete"
-    ]
-    if len(pending_round_deletions) != 1:
-        raise ValueError(
-            "A tool-round publication must delete exactly one fenced pending round marker."
-        )
+    if request.kind == "tool-round":
+        pending_round_deletions = [
+            operation
+            for operation in request.mutation.operations
+            if operation.key == _PENDING_TOOL_ROUND_CHECKPOINT_KEY and operation.action == "delete"
+        ]
+        if len(pending_round_deletions) != 1:
+            raise ValueError(
+                "A tool-round publication must delete exactly one fenced pending round marker."
+            )
 
 
 def _validate_structured_output_tool_round_marker(
@@ -21810,6 +22061,8 @@ def _validate_tool_round_checkpoint_mutation(
     request: RuntimePublicationRequest,
     checkpoint: dict[str, Any] | None,
 ) -> None:
+    if request.kind != "tool-round":
+        return
     publication_identity = _tool_round_publication_identity(request)
     if publication_identity is None:
         return
@@ -24088,6 +24341,325 @@ def _prepare_runtime_publication(
         expected_transcript_cursor=expected_transcript_cursor,
         checkpoint_codec=_active_runtime_publication_checkpoint_codec(),
     )
+
+
+def _validate_user_input_checkpoint_mutation(
+    request: RuntimePublicationRequest,
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+    session_instance_id: str,
+    current_run_epoch: int,
+    durable_events_by_id: Mapping[str, Event] | None = None,
+) -> None:
+    """Validate the closed atomic publication contract for user-input pauses."""
+
+    if request.kind not in {"user-input-open", "user-input-close"}:
+        return
+    from cayu.runtime.user_input import (
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+        USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+        USER_INPUT_SUPERSESSION_INTENT_KEY,
+        PendingUserInput,
+        UserInputResolutionIntent,
+        pending_user_input_identity,
+        require_resolution_intent_matches_pending,
+    )
+
+    if request.operation_record_mutations:
+        raise ValueError("A user-input publication cannot mutate session-operation records.")
+    operations = {operation.key: operation for operation in request.mutation.operations}
+    schema_operation = operations.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+    if schema_operation is not None:
+        supported_schema_digests = {
+            runtime_publication_checkpoint_value_digest(version)
+            for version in range(1, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1)
+        }
+        if (
+            schema_operation.action != "set"
+            or schema_operation.value != CURRENT_CHECKPOINT_SCHEMA_VERSION
+            or schema_operation.expected_value_digest not in supported_schema_digests | {None}
+        ):
+            raise ValueError("User-input checkpoint schema publication is invalid.")
+    identity_fields = {
+        "schema_version",
+        "session_id",
+        "session_instance_id",
+        "source_interaction_id",
+        "source_run_epoch",
+        "input_id",
+        "tool_call_id",
+        "tool_round_id",
+        "model_step_id",
+        "model_attempt_id",
+        "execution_profile_fingerprint",
+        "pause_digest",
+    }
+    extra_fields = (
+        {"source_round_digest", "event_ids"}
+        if request.kind == "user-input-open"
+        else {
+            "claim_run_epoch",
+            "answer_request_digest",
+            "execution_state",
+            "resolution_request_digest",
+            "tool_call_ids",
+            "event_ids",
+            "referenced_event_ids",
+        }
+    )
+    intent = request.intent
+    if set(intent) != identity_fields | extra_fields or intent.get("schema_version") != 1:
+        raise ValueError("User-input publication intent is malformed.")
+    if (
+        intent.get("session_id") != session_id
+        or intent.get("session_instance_id") != session_instance_id
+        or request.interaction_id != intent.get("source_interaction_id")
+        or request.publication_id != f"{request.kind}:{intent.get('input_id')}"
+    ):
+        raise ValueError("User-input publication identity conflicts with its session.")
+    for field_name in (
+        "session_instance_id",
+        "source_interaction_id",
+        "input_id",
+        "tool_call_id",
+        "tool_round_id",
+        "model_step_id",
+        "model_attempt_id",
+    ):
+        require_clean_nonblank(cast("str", intent.get(field_name)), f"intent.{field_name}")
+    if type(intent.get("source_run_epoch")) is not int or intent["source_run_epoch"] < 0:
+        raise ValueError("User-input publication source_run_epoch is invalid.")
+    for field_name in ("execution_profile_fingerprint", "pause_digest"):
+        _require_raw_sha256_digest(intent.get(field_name))
+    event_ids = intent.get("event_ids")
+    if (
+        type(event_ids) is not list
+        or len(event_ids) != len(set(event_ids))
+        or any(type(event_id) is not str or not event_id for event_id in event_ids)
+        or event_ids != [event.id for event in request.events]
+    ):
+        raise ValueError("User-input publication event identities are malformed.")
+
+    current = {} if checkpoint is None else checkpoint
+    active_profile = active_invocation_execution_profile_from_checkpoint(current)
+    if (
+        active_profile is None
+        or not active_invocation_execution_profile_matches_session_epoch(
+            active_profile,
+            session_id=session_id,
+            run_epoch=current_run_epoch,
+        )
+        or active_profile.interaction_id != intent["source_interaction_id"]
+        or active_profile.profile.fingerprint != intent["execution_profile_fingerprint"]
+    ):
+        raise SessionRuntimePublicationConflict(
+            "User-input publication has no exact active invocation authority."
+        )
+    if request.kind == "user-input-open":
+        if request.transcript_messages or request.referenced_events:
+            raise ValueError("Opening user input cannot append transcript or reference events.")
+        opening_keys = {
+            _PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+            PENDING_USER_INPUT_CHECKPOINT_KEY,
+        }
+        if set(operations) not in {
+            frozenset(opening_keys),
+            frozenset(opening_keys | {CHECKPOINT_SCHEMA_VERSION_KEY}),
+        }:
+            raise ValueError(
+                "Opening user input must replace exactly one pending tool round; "
+                f"got {sorted(operations)}."
+            )
+        if any(
+            key in current
+            for key in (
+                PENDING_USER_INPUT_CHECKPOINT_KEY,
+                USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+                USER_INPUT_SUPERSESSION_INTENT_KEY,
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "A session already carries user-input lifecycle authority."
+            )
+        raw_round = current.get(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+        round_operation = operations[_PENDING_TOOL_ROUND_CHECKPOINT_KEY]
+        pending_operation = operations[PENDING_USER_INPUT_CHECKPOINT_KEY]
+        if (
+            type(raw_round) is not dict
+            or round_operation.action != "delete"
+            or round_operation.expected_value_digest
+            != runtime_publication_checkpoint_value_digest(raw_round)
+            or intent.get("source_round_digest")
+            != runtime_publication_checkpoint_value_digest(raw_round)
+            or pending_operation.action != "set"
+            or pending_operation.expected_value_digest is not None
+            or type(pending_operation.value) is not dict
+        ):
+            raise ValueError("User-input opening mutation is not bound to its source round.")
+        try:
+            pending = PendingUserInput.model_validate(pending_operation.value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("User-input opening checkpoint is malformed.") from exc
+        if any(
+            intent.get(key) != value for key, value in pending_user_input_identity(pending).items()
+        ):
+            raise ValueError("User-input opening checkpoint conflicts with its intent.")
+        if (
+            pending.session_id != session_id
+            or pending.session_instance_id != session_instance_id
+            or pending.source_interaction_id != request.interaction_id
+            or pending.source_run_epoch != current_run_epoch
+            or pending.source_run_epoch != intent["source_run_epoch"]
+            or raw_round.get("tool_round_id") != pending.tool_round_id
+            or raw_round.get("model_step_id") != pending.model_step_id
+            or raw_round.get("model_attempt_id") != pending.model_attempt_id
+            or raw_round.get("source_run_epoch") != pending.source_run_epoch
+            or raw_round.get("execution_profile_fingerprint")
+            != pending.execution_profile_fingerprint
+        ):
+            raise ValueError("User-input opening authority conflicts with its pending round.")
+        if len(request.events) != 2 or [event.type for event in request.events] != [
+            EventType.SESSION_CHECKPOINTED,
+            EventType.SESSION_AWAITING_USER_INPUT,
+        ]:
+            raise ValueError("User-input opening requires checkpoint and awaiting events.")
+        checkpoint_event, awaiting_event = request.events
+        if (
+            checkpoint_event.payload.get("checkpoint") != PENDING_USER_INPUT_CHECKPOINT_KEY
+            or awaiting_event.payload.get("execution_profile_fingerprint")
+            != intent["execution_profile_fingerprint"]
+            or any(
+                event.payload.get(field_name) != intent[field_name]
+                for event in request.events
+                for field_name in ("source_run_epoch", "pause_digest")
+            )
+        ):
+            raise ValueError("User-input opening events conflict with their pause authority.")
+    else:
+        closing_keys = {
+            PENDING_USER_INPUT_CHECKPOINT_KEY,
+            USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+        }
+        if set(operations) not in {
+            frozenset(closing_keys),
+            frozenset(closing_keys | {CHECKPOINT_SCHEMA_VERSION_KEY}),
+        }:
+            raise ValueError("Closing user input must clear exactly its pause and answer claim.")
+        try:
+            raw_pending = current[PENDING_USER_INPUT_CHECKPOINT_KEY]
+            raw_resolution_intent = current[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY]
+            pending = PendingUserInput.model_validate(raw_pending)
+            resolution_intent = UserInputResolutionIntent.model_validate(raw_resolution_intent)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SessionRuntimePublicationConflict(
+                "User-input closure has no exact active pause and answer claim."
+            ) from exc
+        require_resolution_intent_matches_pending(resolution_intent, pending=pending)
+        if any(
+            intent.get(key) != value for key, value in pending_user_input_identity(pending).items()
+        ):
+            raise ValueError("User-input closure intent conflicts with its active pause.")
+        if (
+            pending.session_id != session_id
+            or pending.session_instance_id != session_instance_id
+            or pending.source_interaction_id != request.interaction_id
+            or resolution_intent.claim_run_epoch != current_run_epoch
+            or intent.get("claim_run_epoch") != resolution_intent.claim_run_epoch
+            or intent.get("answer_request_digest") != resolution_intent.answer_request_digest
+            or intent.get("execution_state") != resolution_intent.execution_state
+            or resolution_intent.execution_state != "executing"
+            or intent.get("resolution_request_digest")
+            != resolution_intent.resolution_request_digest
+        ):
+            raise ValueError("User-input closure has invalid resolution authority.")
+        _require_raw_sha256_digest(intent["answer_request_digest"])
+        _require_raw_sha256_digest(intent["resolution_request_digest"])
+        expected_call_ids = [call.tool_call_id for call in pending.tool_calls]
+        if intent.get("tool_call_ids") != expected_call_ids:
+            raise ValueError("User-input closure call identities conflict with its pause.")
+        referenced_event_ids = intent.get("referenced_event_ids")
+        if type(referenced_event_ids) is not list or referenced_event_ids != list(
+            _runtime_publication_referenced_event_ids(request.referenced_events)
+        ):
+            raise ValueError("User-input closure referenced events conflict with its intent.")
+        for key, raw_value in (
+            (PENDING_USER_INPUT_CHECKPOINT_KEY, raw_pending),
+            (USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY, raw_resolution_intent),
+        ):
+            operation = operations[key]
+            if (
+                operation.action != "delete"
+                or operation.expected_value_digest
+                != runtime_publication_checkpoint_value_digest(raw_value)
+            ):
+                raise ValueError("User-input closure is not fenced to its exact checkpoint.")
+        if len(request.events) != 1 or request.events[0].type is not EventType.SESSION_CHECKPOINTED:
+            raise ValueError("User-input closure requires one checkpoint event.")
+        closure_event = request.events[0]
+        if (
+            closure_event.payload.get("checkpoint") != PENDING_USER_INPUT_CHECKPOINT_KEY
+            or closure_event.payload.get("transition") != "answered"
+            or closure_event.payload.get("source_run_epoch") != intent["source_run_epoch"]
+            or closure_event.payload.get("input_id") != pending.input_id
+            or closure_event.payload.get("tool_call_id") != pending.tool_call_id
+            or closure_event.payload.get("pause_digest") != intent["pause_digest"]
+            or closure_event.payload.get("resolution_request_digest")
+            != intent["resolution_request_digest"]
+        ):
+            raise ValueError("User-input closure event conflicts with its intent.")
+        expected_message_count = 2 if pending.assistant_message_state == "quarantined" else 1
+        if len(request.transcript_messages) != expected_message_count:
+            raise ValueError("User-input closure transcript conflicts with its assistant state.")
+        result_message = request.transcript_messages[-1]
+        result_parts = [part for part in result_message.content if isinstance(part, ToolResultPart)]
+        if result_message.role is not MessageRole.TOOL or len(result_parts) != len(
+            result_message.content
+        ):
+            raise ValueError("User-input closure must end with grouped tool results.")
+        if [part.tool_call_id for part in result_parts] != expected_call_ids:
+            raise ValueError("User-input closure result order conflicts with its pause.")
+        if expected_message_count == 2:
+            assistant_message = request.transcript_messages[0]
+            assistant_call_ids = [
+                part.tool_call_id
+                for part in assistant_message.content
+                if isinstance(part, ToolCallPart)
+            ]
+            if (
+                assistant_message.role is not MessageRole.ASSISTANT
+                or assistant_call_ids != expected_call_ids
+            ):
+                raise ValueError(
+                    "User-input closure assistant projection conflicts with its pause."
+                )
+        if durable_events_by_id is not None:
+            if set(durable_events_by_id) != set(referenced_event_ids):
+                raise ValueError("User-input closure is missing durable lifecycle evidence.")
+            for event in durable_events_by_id.values():
+                if (
+                    event.type not in _TOOL_ROUND_LIFECYCLE_EVENT_TYPES
+                    or event.payload.get("input_id") != pending.input_id
+                    or event.payload.get("tool_call_id") not in expected_call_ids
+                    or event.payload.get("tool_round_id") != pending.tool_round_id
+                    or event.payload.get("model_step_id") != pending.model_step_id
+                    or event.payload.get("model_attempt_id") != pending.model_attempt_id
+                ):
+                    raise ValueError(
+                        "User-input closure references conflicting lifecycle evidence."
+                    )
+
+    for event in request.events:
+        if (
+            event.session_id != session_id
+            or event.interaction_id != request.interaction_id
+            or event.payload.get("input_id") != intent["input_id"]
+            or event.payload.get("tool_call_id") != intent["tool_call_id"]
+            or event.payload.get("tool_round_id") != intent["tool_round_id"]
+            or event.payload.get("model_step_id") != intent["model_step_id"]
+            or event.payload.get("model_attempt_id") != intent["model_attempt_id"]
+        ):
+            raise ValueError("User-input publication event conflicts with its authority tuple.")
 
 
 def _validate_workspace_observation_publication(

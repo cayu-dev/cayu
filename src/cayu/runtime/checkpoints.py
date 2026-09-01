@@ -24,7 +24,8 @@ AUTOMATIC_RECALL_CHECKPOINT_KEY = "automatic_recall"
 COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY = "completion_result_event_publications"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_KEY = "runtime_authored_user_message"
 RUNTIME_AUTHORED_USER_MESSAGE_CHECKPOINT_VERSION = 1
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 5
+AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY = "ambiguous_pending_user_input"
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 6
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -321,6 +322,43 @@ def _migrate_checkpoint_v4_to_v5(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_checkpoint_v5_to_v6(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Retain pre-authority user-input pauses as bounded ambiguous state."""
+
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    # Version 5 did not own this spelling. Never authenticate a value supplied
+    # by an older generic checkpoint writer merely because v6 recognizes it.
+    migrated.pop(AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY, None)
+    migrated.pop("user_input_resolution_intent", None)
+    pending_interrupt = migrated.get("pending_session_interrupt")
+    if type(pending_interrupt) is dict:
+        # Version 5 did not own either nested supersession spelling. A generic
+        # writer could place caller-shaped values under the otherwise-valid
+        # pending interrupt root, so neither value may become v6 terminal
+        # authority merely by surviving migration.
+        pending_interrupt.pop("user_input_supersession_intent", None)
+        pending_interrupt.pop("ambiguous_user_input_supersession_intent", None)
+    pending_user_input = migrated.get("pending_user_input")
+    if type(pending_user_input) is dict:
+        # The old pause lacks the session incarnation, run epoch, interaction,
+        # execution profile, and immutable opening receipt required to resume it.
+        # Version 5 could not author the new nested schema or answer-claim root,
+        # either, so a lookalike value remains untrusted. Preserve only
+        # content-bound, secret-free evidence that an explicit operator
+        # transition must retire; never invent executable authority.
+        pending_digest = sha256(
+            canonical_durable_json_bytes(pending_user_input, "pending_user_input")
+        ).hexdigest()
+        migrated.pop("pending_user_input")
+        migrated[AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY] = {
+            "schema_version": 1,
+            "source_checkpoint_digest": pending_digest,
+            "reason": "missing_exact_pause_authority",
+        }
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 6
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
     migrations=(
@@ -343,6 +381,11 @@ _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
             source_version=4,
             target_version=5,
             migrate=_migrate_checkpoint_v4_to_v5,
+        ),
+        CheckpointMigration(
+            source_version=5,
+            target_version=6,
+            migrate=_migrate_checkpoint_v5_to_v6,
         ),
     ),
 )
@@ -436,25 +479,55 @@ def runtime_checkpoint_writer_view(
     )
     if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
         return copy_durable_json_object(current, "checkpoint")
-    if writer_version not in {1, 2, 3, 4}:
+    if writer_version not in {1, 2, 3, 4, 5}:
         raise ValueError("Staged runtime publication uses an unsupported writer schema.")
 
     projected = copy_durable_json_object(current, "checkpoint")
+    if (
+        writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION
+        and AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY in projected
+    ):
+        raise ValueError(
+            "Ambiguous user-input pause authority cannot be represented by an older "
+            f"v{writer_version} writer."
+        )
+    pending_user_input = projected.get("pending_user_input")
+    if writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION and (
+        (type(pending_user_input) is dict and "schema_version" in pending_user_input)
+        or "user_input_resolution_intent" in projected
+    ):
+        raise ValueError(
+            "Exact user-input pause authority cannot be represented by an older "
+            f"v{writer_version} writer."
+        )
+    pending_interrupt = projected.get("pending_session_interrupt")
+    if (
+        writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION
+        and type(pending_interrupt) is dict
+        and (
+            "user_input_supersession_intent" in pending_interrupt
+            or "ambiguous_user_input_supersession_intent" in pending_interrupt
+        )
+    ):
+        raise ValueError(
+            "User-input supersession authority cannot be represented by an older "
+            f"v{writer_version} writer."
+        )
     if writer_version < 4 and WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY in projected:
         raise ValueError(
             "Active workspace-observation recovery state cannot be represented by an "
             f"older v{writer_version} writer."
         )
-    if (
-        writer_version < CURRENT_CHECKPOINT_SCHEMA_VERSION
-        and INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in projected
-    ):
+    if writer_version < 5 and INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY in projected:
         raise ValueError(
             "Invocation lifecycle receipt authority cannot be represented by an older "
             f"v{writer_version} writer."
         )
     if writer_version == 4:
         projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 4
+        return projected
+    if writer_version == 5:
+        projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 5
         return projected
     if writer_version == 3:
         projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 3

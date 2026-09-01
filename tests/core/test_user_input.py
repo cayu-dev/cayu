@@ -34,12 +34,14 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    InterruptSessionRequest,
     ResumeRequest,
     RetryPolicy,
     RunLimits,
     RunRequest,
     RuntimeHook,
     Session,
+    SessionRuntimePublicationConflict,
     SessionStatus,
     StructuredOutputSpec,
     StructuredOutputStrategy,
@@ -56,15 +58,24 @@ from cayu.runtime import (
 )
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import sessions as sessions_module
-from cayu.runtime._event_projection import public_event_sequence
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
 from cayu.runtime.checkpoints import (
+    AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     CheckpointCompatibilityError,
+    decode_runtime_checkpoint,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.execution_profiles import (
     active_invocation_execution_profile_from_checkpoint,
+)
+from cayu.runtime.user_input import (
+    AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+    AmbiguousUserInputPauseAuthorityError,
+    UserInputPauseState,
+    user_input_answer_request_digest,
+    user_input_resolution_request_digest,
 )
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor, StaticVault
@@ -245,6 +256,16 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
         self.block_next_running_transition = False
         self.transition_committed: asyncio.Event | None = None
         self.finish_transition: asyncio.Event | None = None
+        self.block_next_execution_admission = False
+        self.execution_admission_committed: asyncio.Event | None = None
+        self.finish_execution_admission: asyncio.Event | None = None
+        self.fail_next_execution_admission_acknowledgement = False
+        self.execution_admission_acknowledgement_error: BaseException | None = None
+        self.execution_admission_process_control: BaseException | None = None
+        self.execution_admission_reconciliation_error: BaseException | None = None
+        self.block_next_execution_admission_reconciliation = False
+        self.execution_admission_reconciliation_started: asyncio.Event | None = None
+        self.finish_execution_admission_reconciliation: asyncio.Event | None = None
 
     async def transition_status_and_checkpoint(
         self,
@@ -270,6 +291,50 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
             await self.finish_transition.wait()
         return session
 
+    async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+        await super().transform_checkpoint(session_id, checkpoint_transform)
+        checkpoint = await self.load_checkpoint(session_id)
+        intent = None if checkpoint is None else checkpoint.get("user_input_resolution_intent")
+        if type(intent) is not dict or intent.get("execution_state") != "executing":
+            return
+        if self.fail_next_execution_admission_acknowledgement:
+            self.fail_next_execution_admission_acknowledgement = False
+            acknowledgement_error = self.execution_admission_acknowledgement_error
+            self.execution_admission_acknowledgement_error = None
+            if acknowledgement_error is not None:
+                raise acknowledgement_error
+            raise OSError("execution admission acknowledgement lost")
+        if self.block_next_execution_admission_reconciliation:
+            self.block_next_execution_admission_reconciliation = False
+            if (
+                self.execution_admission_reconciliation_started is None
+                or self.finish_execution_admission_reconciliation is None
+            ):
+                raise AssertionError("Reconciliation boundary events were not initialized.")
+            self.execution_admission_reconciliation_started.set()
+            await self.finish_execution_admission_reconciliation.wait()
+            reconciliation_error = self.execution_admission_reconciliation_error
+            self.execution_admission_reconciliation_error = None
+            if reconciliation_error is not None:
+                raise reconciliation_error
+        elif self.execution_admission_reconciliation_error is not None:
+            reconciliation_error = self.execution_admission_reconciliation_error
+            self.execution_admission_reconciliation_error = None
+            raise reconciliation_error
+        if self.execution_admission_process_control is not None:
+            process_control = self.execution_admission_process_control
+            self.execution_admission_process_control = None
+            raise process_control
+        if self.block_next_execution_admission:
+            self.block_next_execution_admission = False
+            if (
+                self.execution_admission_committed is None
+                or self.finish_execution_admission is None
+            ):
+                raise AssertionError("Execution admission boundary events were not initialized.")
+            self.execution_admission_committed.set()
+            await self.finish_execution_admission.wait()
+
 
 class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
     invocation_lifecycle_command_version = 1
@@ -292,6 +357,8 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
+        expected_recovery_claim_id: str | None = None,
+        expected_recovery_claim_clock=None,
     ):
         if self.block_next_interrupted_transition and to_status == SessionStatus.INTERRUPTED:
             self.block_next_interrupted_transition = False
@@ -309,6 +376,8 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
             expected_session_instance_id=expected_session_instance_id,
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
+            expected_recovery_claim_id=expected_recovery_claim_id,
+            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
 
 
@@ -356,6 +425,7 @@ def _crashed_user_input_resume_events(
         Event(
             type=EventType.SESSION_RESUMED,
             session_id=session_id,
+            interaction_id=pause.interaction_id,
             agent_name=pause.agent_name,
             environment_name=pause.environment_name,
             payload={
@@ -369,6 +439,7 @@ def _crashed_user_input_resume_events(
         Event(
             type=EventType.TOOL_CALL_STARTED,
             session_id=session_id,
+            interaction_id=pause.interaction_id,
             agent_name=pause.agent_name,
             environment_name=pause.environment_name,
             tool_name=tool_name,
@@ -436,6 +507,117 @@ def test_ask_user_pauses_the_session() -> None:
     checkpoint = asyncio.run(store.load_checkpoint("s_pause"))
     assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert "pending_user_input" in checkpoint
+
+
+@pytest.mark.parametrize("secret", ["pause_digest", "source_run_epoch"])
+def test_ask_user_open_authority_survives_secret_key_collision(secret: str) -> None:
+    async def run() -> None:
+        session_id = (
+            "s_pause_key_collision_digest"
+            if secret == "pause_digest"
+            else "s_pause_key_collision_epoch"
+        )
+        app, store = _build(
+            [("call_1", "ask_user", {"question": "Continue?"})],
+            secret_redactor=SecretRedactor(secret),
+        )
+        events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        checkpoint_event = next(
+            event
+            for event in events
+            if event.type is EventType.SESSION_CHECKPOINTED
+            and event.payload.get("checkpoint") == "pending_user_input"
+        )
+        awaiting_event = next(
+            event for event in events if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+        for event in (checkpoint_event, awaiting_event):
+            assert "source_run_epoch" in event.payload
+            assert "pause_digest" in event.payload
+
+        private_events = await private_events_for_public_events(
+            store,
+            [checkpoint_event, awaiting_event],
+        )
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        pending = checkpoint["pending_user_input"]
+        receipt = await store.load_runtime_publication_receipt(
+            session_id,
+            f"user-input-open:{pending['input_id']}",
+        )
+        assert receipt is not None
+        assert receipt.intent["pause_digest"] == private_events[0].payload["pause_digest"]
+        assert all(
+            event.payload["source_run_epoch"] == pending["source_run_epoch"]
+            for event in private_events
+        )
+        session = await store.load(session_id)
+        assert session is not None and session.status is SessionStatus.INTERRUPTED
+
+    asyncio.run(run())
+
+
+def test_answered_user_input_transition_survives_secret_collisions() -> None:
+    async def run() -> None:
+        session_id = "s_user_input_close_control_collision"
+        app, store = _build(
+            [("call_1", "ask_user", {"question": "Continue?"})],
+            secret_redactor=SecretRedactor(
+                [
+                    "transition",
+                    "answered",
+                    "resolution_request_digest",
+                    "execution_state",
+                    "claimed",
+                    "executing",
+                ]
+            ),
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        awaiting = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+
+        resolved = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=awaiting.payload["input_id"],
+                    answer="yes",
+                )
+            )
+        )
+        close = next(
+            event
+            for event in resolved
+            if event.type is EventType.SESSION_CHECKPOINTED
+            and event.payload.get("transition") == "answered"
+        )
+        private_close = await private_event_for_public_event(store, close)
+
+        assert close.payload["transition"] == "answered"
+        assert close.payload["pause_digest"] == PRIVATE_EVENT_AUTHORITY
+        assert close.payload["resolution_request_digest"] == PRIVATE_EVENT_AUTHORITY
+        assert private_close.payload["transition"] == "answered"
+        assert len(private_close.payload["pause_digest"]) == 64
+        assert len(private_close.payload["resolution_request_digest"]) == 64
+
+    asyncio.run(run())
 
 
 def test_resolve_user_input_injects_answer_and_continues() -> None:
@@ -534,10 +716,7 @@ def test_resolve_user_input_rejects_versionless_root_with_reserved_authority() -
         with sessions_module._invocation_lifecycle_authority_mutation_scope():
             await store.checkpoint(session_id, versionless)
 
-        with pytest.raises(
-            RuntimeError,
-            match="no durable active invocation execution profile",
-        ):
+        with pytest.raises(AmbiguousUserInputPauseAuthorityError):
             await _drain(
                 app.resolve_user_input(
                     UserInputResponse(
@@ -798,6 +977,297 @@ def test_resolve_user_input_cancellation_after_running_transition_finalizes_clai
         assert checkpoint["pending_user_input"]["input_id"] == private_input_id
         assert store.release_calls[session_id] - releases_before == 1
         assert app._session_control.has_active_tasks(session_id) is False
+
+        checkpoint_before_conflict = await store.load_checkpoint(session_id)
+        session_before_conflict = await store.load(session_id)
+        with pytest.raises(
+            SessionRuntimePublicationConflict,
+            match="already claimed with a different resolution request",
+        ):
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="yes",
+                        max_steps=1,
+                    )
+                )
+            )
+        assert await store.load_checkpoint(session_id) == checkpoint_before_conflict
+        assert await store.load(session_id) == session_before_conflict
+
+    asyncio.run(run())
+
+
+def test_resolve_user_input_execution_admission_acknowledgement_loss_reconciles() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_execution_admission_ack_lost"
+        store = _BlockingCommittedRunningTransitionStore()
+        app, _ = _build(
+            [("call_input", "ask_user", {"question": "Continue?"})],
+            store=store,
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        store.fail_next_execution_admission_acknowledgement = True
+        resolved = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+            )
+        )
+
+        assert resolved[-1].type is EventType.SESSION_COMPLETED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "pending_user_input" not in checkpoint
+        assert "user_input_resolution_intent" not in checkpoint
+
+    asyncio.run(run())
+
+
+def test_resolve_user_input_cancellation_after_execution_admission_is_retryable() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_cancelled_after_execution_admission"
+        store = _BlockingCommittedRunningTransitionStore()
+        app, _ = _build(
+            [("call_input", "ask_user", {"question": "Continue?"})],
+            store=store,
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        response = UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+
+        store.execution_admission_committed = asyncio.Event()
+        store.finish_execution_admission = asyncio.Event()
+        store.block_next_execution_admission = True
+        resolving = asyncio.create_task(_drain(app.resolve_user_input(response)))
+        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=5)
+
+        resolving.cancel("cancel after execution admission committed")
+        store.finish_execution_admission.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await resolving
+        assert raised.value.args == ("cancel after execution admission committed",)
+        assert resolving.cancelled() is True
+
+        interrupted = await store.load(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        assert interrupted is not None and interrupted.status is SessionStatus.INTERRUPTED
+        assert checkpoint is not None
+        assert checkpoint["user_input_resolution_intent"]["execution_state"] == "executing"
+
+        retried = await _drain(app.resolve_user_input(response))
+        assert retried[-1].type is EventType.SESSION_COMPLETED
+        final_checkpoint = await store.load_checkpoint(session_id)
+        assert final_checkpoint is not None
+        assert "pending_user_input" not in final_checkpoint
+        assert "user_input_resolution_intent" not in final_checkpoint
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "resolution_stage",
+    ["answer", "manual-recovery"],
+    ids=["answer", "manual-recovery"],
+)
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["admission", "reconciliation"],
+    ids=["admission", "reconciliation"],
+)
+def test_user_input_execution_admission_preserves_post_commit_process_control(
+    resolution_stage: str,
+    failure_phase: str,
+) -> None:
+    async def run() -> None:
+        session_id = f"s_resolution_process_control_{resolution_stage}"
+        store = _BlockingCommittedRunningTransitionStore()
+        counting = _CountingTool()
+        provider = _ScriptedProvider(
+            [("call_count", "count", {}), ("call_input", "ask_user", {"question": "q"})],
+            final_text="must not dispatch",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        awaiting = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+        input_id = awaiting.payload["input_id"]
+        answer = UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+
+        if resolution_stage == "manual-recovery":
+            await store.append_events(
+                session_id,
+                _crashed_user_input_resume_events(
+                    await private_events_for_public_events(store, paused),
+                    session_id=session_id,
+                    tool_call_id="call_count",
+                ),
+            )
+            stuck = await _drain(app.resolve_user_input(answer))
+            assert stuck[-1].payload.get("manual_recovery_required") is True
+            request = UserInputRecoveryRequest(
+                session_id=session_id,
+                input_id=input_id,
+                answer="a",
+                tool_call_id="call_count",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="verified completed",
+            )
+            operation = app.recover_user_input(request)
+        else:
+            operation = app.resolve_user_input(answer)
+
+        process_control = BaseExceptionGroup(
+            f"execution admission {failure_phase} control",
+            [SystemExit("shutdown after commit"), RuntimeError("settlement evidence")],
+        )
+        if failure_phase == "admission":
+            store.execution_admission_process_control = process_control
+        else:
+            store.fail_next_execution_admission_acknowledgement = True
+            store.execution_admission_reconciliation_error = process_control
+        try:
+            await _drain(operation)
+        except SystemExit as caught:
+            assert caught.args == ("shutdown after commit",)
+            assert caught.__cause__ is not None
+            assert caught.__cause__.subgroup(RuntimeError) is not None
+            if failure_phase == "reconciliation":
+                assert caught.__cause__.subgroup(OSError) is not None
+        else:
+            raise AssertionError("Execution admission suppressed process control.")
+
+        interrupted = await store.load(session_id)
+        checkpoint = await store.load_checkpoint(session_id)
+        assert interrupted is not None and interrupted.status is SessionStatus.INTERRUPTED
+        assert checkpoint is not None
+        assert checkpoint["user_input_resolution_intent"]["execution_state"] == "executing"
+        assert counting.calls == 0
+        assert len(provider.requests) == 1
+
+    asyncio.run(run())
+
+
+def test_user_input_execution_admission_cancellation_retains_reconciliation_failure() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_cancelled_during_failed_reconciliation"
+        store = _BlockingCommittedRunningTransitionStore()
+        counting = _CountingTool()
+        app, _ = _build(
+            [
+                ("call_count", "count", {}),
+                ("call_input", "ask_user", {"question": "Continue?"}),
+            ],
+            tools=[UserInputTool(), counting],
+            store=store,
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        store.fail_next_execution_admission_acknowledgement = True
+        store.execution_admission_reconciliation_error = RuntimeError("reconciliation unavailable")
+        store.execution_admission_reconciliation_started = asyncio.Event()
+        store.finish_execution_admission_reconciliation = asyncio.Event()
+        store.block_next_execution_admission_reconciliation = True
+        resolving = asyncio.create_task(
+            _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+                )
+            )
+        )
+        await asyncio.wait_for(store.execution_admission_reconciliation_started.wait(), timeout=5)
+
+        resolving.cancel("cancel during reconciliation")
+        store.finish_execution_admission_reconciliation.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await resolving
+        assert raised.value.args == ("cancel during reconciliation",)
+        assert resolving.cancelling() == 1
+        assert resolving.cancelled() is True
+        cause = raised.value.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        assert [type(failure) for failure in cause.exceptions] == [OSError, RuntimeError]
+        assert counting.calls == 0
+
+    asyncio.run(run())
+
+
+def test_user_input_execution_admission_deduplicates_reused_failure_identity() -> None:
+    async def run() -> None:
+        session_id = "s_resolution_reused_reconciliation_failure"
+        store = _BlockingCommittedRunningTransitionStore()
+        app, _ = _build(
+            [("call_input", "ask_user", {"question": "Continue?"})],
+            store=store,
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+
+        shared_failure = OSError("shared admission failure")
+        store.fail_next_execution_admission_acknowledgement = True
+        store.execution_admission_acknowledgement_error = shared_failure
+        store.execution_admission_reconciliation_error = shared_failure
+        with pytest.raises(OSError) as raised:
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="yes")
+                )
+            )
+        assert raised.value is shared_failure
+        assert raised.value.__cause__ is not raised.value
 
     asyncio.run(run())
 
@@ -1373,8 +1843,8 @@ def test_ask_user_pauses_whole_round_before_any_tool_runs() -> None:
     assert not any(e.type == EventType.TOOL_CALL_STARTED for e in events)
 
 
-def test_resolve_user_input_rejects_wrong_input_id() -> None:
-    app, _store = _build([("call_1", "ask_user", {"question": "q"})])
+def test_stale_user_input_answer_cannot_clear_current_pause() -> None:
+    app, store = _build([("call_1", "ask_user", {"question": "q"})])
     asyncio.run(
         _collect(
             app,
@@ -1383,6 +1853,9 @@ def test_resolve_user_input_rejects_wrong_input_id() -> None:
             ),
         )
     )
+    checkpoint_before = asyncio.run(store.load_checkpoint("s_bad"))
+    assert checkpoint_before is not None
+    current_input_id = checkpoint_before["pending_user_input"]["input_id"]
     with pytest.raises(ValueError, match="does not match pending input"):
         asyncio.run(
             _drain(
@@ -1391,6 +1864,292 @@ def test_resolve_user_input_rejects_wrong_input_id() -> None:
                 )
             )
         )
+    assert asyncio.run(store.load_checkpoint("s_bad")) == checkpoint_before
+    assert (
+        asyncio.run(
+            store.load_runtime_publication_receipt(
+                "s_bad",
+                f"user-input-close:{current_input_id}",
+            )
+        )
+        is None
+    )
+
+
+def test_exact_answer_retry_replays_after_a_newer_pause_opens() -> None:
+    class TwoQuestionProvider(ModelProvider):
+        name = "two-question"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            request_number = len(self.requests)
+            if request_number <= 2:
+                yield ModelStreamEvent.tool_call(
+                    id=f"call_input_{request_number}",
+                    name="ask_user",
+                    arguments={"question": f"Question {request_number}?"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        session_id = "s_exact_old_answer_after_new_pause"
+        store = InMemorySessionStore()
+        provider = TwoQuestionProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool()],
+        )
+
+        first_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "ask twice")],
+            ),
+        )
+        first_pause = next(
+            event for event in first_events if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+        first_checkpoint = await store.load_checkpoint(session_id)
+        assert first_checkpoint is not None
+        first_private_input_id = first_checkpoint["pending_user_input"]["input_id"]
+        response = UserInputResponse(
+            session_id=session_id,
+            input_id=first_pause.payload["input_id"],
+            answer="first answer",
+        )
+
+        second_events = await _drain(app.resolve_user_input(response))
+        second_pause = next(
+            event for event in second_events if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+        checkpoint_before_retry = await store.load_checkpoint(session_id)
+        assert checkpoint_before_retry is not None
+        assert checkpoint_before_retry["pending_user_input"]["input_id"] != first_private_input_id
+        assert second_pause.payload["input_id"] != first_pause.payload["input_id"]
+        close_receipt = await store.load_runtime_publication_receipt(
+            session_id,
+            f"user-input-close:{first_private_input_id}",
+        )
+        assert close_receipt is not None
+
+        retry_events = await _drain(app.resolve_user_input(response))
+
+        assert len(retry_events) == 1
+        retry_private_event = await private_event_for_public_event(store, retry_events[0])
+        assert retry_private_event.id in close_receipt.appended_event_ids
+        assert await store.load_checkpoint(session_id) == checkpoint_before_retry
+        assert len(provider.requests) == 2
+
+        with pytest.raises(
+            SessionRuntimePublicationConflict,
+            match="conflicting resolution authority",
+        ):
+            await _drain(
+                app.resolve_user_input(response.model_copy(update={"answer": "conflicting retry"}))
+            )
+        assert await store.load_checkpoint(session_id) == checkpoint_before_retry
+        assert len(provider.requests) == 2
+
+    asyncio.run(run())
+
+
+def test_pause_classifier_refreshes_a_stale_snapshot_after_exact_supersession() -> None:
+    async def run() -> None:
+        session_id = "s_stale_pause_classifier"
+        app, store = _build([("call_1", "ask_user", {"question": "Continue?"})])
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "ask")],
+            ),
+        )
+        stale_session = await store.load(session_id)
+        stale_checkpoint = await store.load_checkpoint(session_id)
+        assert stale_session is not None
+        assert stale_checkpoint is not None
+        private_input_id = stale_checkpoint["pending_user_input"]["input_id"]
+
+        interrupted = await _drain(
+            app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="supersede before stale classification",
+                )
+            )
+        )
+        assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
+
+        state = await app._recovery_coordinator._classify_user_input_pause(
+            session=stale_session,
+            checkpoint=stale_checkpoint,
+            input_id=private_input_id,
+        )
+
+        assert state is UserInputPauseState.SUPERSEDED
+        current_checkpoint = await store.load_checkpoint(session_id)
+        assert current_checkpoint is not None
+        assert "pending_user_input" not in current_checkpoint
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        None,
+        AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY,
+        "ambiguous",
+    ],
+)
+def test_supported_pre_authority_pause_is_reported_ambiguous_and_explicitly_retired(
+    secret: str | None,
+) -> None:
+    async def run() -> None:
+        session_id = "s_pre_authority_pause"
+        app, store = _build(
+            [("call_1", "ask_user", {"question": "Historical question?"})],
+            secret_redactor=None if secret is None else SecretRedactor(secret),
+        )
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "ask")],
+            ),
+        )
+        public_pause = next(
+            event for event in pause_events if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+
+        raw_checkpoint = deepcopy(store._checkpoints[session_id])
+        historical_pending = raw_checkpoint["pending_user_input"]
+        for field_name in (
+            "schema_version",
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "source_run_epoch",
+            "execution_profile_fingerprint",
+        ):
+            historical_pending.pop(field_name, None)
+        raw_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 5
+        migrated_checkpoint = decode_runtime_checkpoint(
+            raw_checkpoint,
+            session_id=session_id,
+        )
+        assert migrated_checkpoint is not None
+        store._checkpoints[session_id] = migrated_checkpoint
+
+        migrated = await store.load_checkpoint(session_id)
+        assert migrated is not None
+        assert "pending_user_input" not in migrated
+        assert AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY in migrated
+        recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
+        assert recovery.actions == (IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,)
+        assert await store.load_checkpoint(session_id) == migrated
+
+        with pytest.raises(AmbiguousUserInputPauseAuthorityError):
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id=session_id,
+                        input_id=public_pause.payload["input_id"],
+                        answer="must not execute",
+                    )
+                )
+            )
+
+        interrupt_events = await _drain(
+            app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="retire ambiguous historical pause",
+                )
+            )
+        )
+        assert interrupt_events[-1].type is EventType.SESSION_INTERRUPTED
+        assert interrupt_events[-1].payload["interruption_type"] == "operator_requested"
+        assert (
+            interrupt_events[-1].payload[AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY]["state"]
+            == "ambiguous"
+        )
+        final_checkpoint = await store.load_checkpoint(session_id)
+        assert final_checkpoint is not None
+        assert AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY not in final_checkpoint
+        assert "pending_user_input" not in final_checkpoint
+
+    asyncio.run(run())
+
+
+def test_user_input_close_uses_bounded_round_lifecycle_lookup() -> None:
+    class RecordingLifecycleStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.round_lifecycle_lookups = 0
+
+        async def load_tool_round_lifecycle_events_for_round(
+            self,
+            session_id: str,
+            tool_call_ids: list[str] | tuple[str, ...],
+            *,
+            tool_round_identity: ToolRoundIdentity,
+        ) -> list[Event]:
+            self.round_lifecycle_lookups += 1
+            return await super().load_tool_round_lifecycle_events_for_round(
+                session_id,
+                tool_call_ids,
+                tool_round_identity=tool_round_identity,
+            )
+
+    async def run() -> None:
+        session_id = "s_bounded_user_input_close"
+        store = RecordingLifecycleStore()
+        app, _ = _build(
+            [("call_1", "ask_user", {"question": "Continue?"})],
+            store=store,
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "ask")],
+            ),
+        )
+        awaiting = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        )
+
+        await _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=awaiting.payload["input_id"],
+                    answer="yes",
+                )
+            )
+        )
+
+        assert store.round_lifecycle_lookups == 1
+
+    asyncio.run(run())
 
 
 def test_resolve_user_input_unknown_session_raises() -> None:
@@ -1752,21 +2511,16 @@ def test_fork_of_paused_session_is_rejected() -> None:
 class _FailOnceAppendStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
 
-    # Fails the next round-close append once armed (so the initial run — which also uses this
-    # method to open the tool round — is unaffected).
+    # Fails the next atomic user-input close before commit once armed.
     def __init__(self) -> None:
         super().__init__()
         self.armed = False
 
-    async def append_transcript_messages_and_transform_checkpoint(
-        self, session_id, messages, checkpoint_transform
-    ):
-        if self.armed:
+    async def publish_runtime_publication(self, session_id: str, **kwargs):
+        if self.armed and kwargs["request"].kind == "user-input-close":
             self.armed = False
             raise RuntimeError("simulated append failure")
-        return await super().append_transcript_messages_and_transform_checkpoint(
-            session_id, messages, checkpoint_transform
-        )
+        return await super().publish_runtime_publication(session_id, **kwargs)
 
 
 class _CountingTool(Tool):
@@ -2118,7 +2872,13 @@ def test_recover_user_input_supplies_outcome_and_completes(
     stuck = asyncio.run(
         _drain(
             app.resolve_user_input(
-                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="a",
+                    structured={"answer_detail": "safe"},
+                    metadata={"provided": recovery_message},
+                )
             )
         )
     )
@@ -2283,6 +3043,327 @@ def test_recover_user_input_reconciles_ambiguous_append_acknowledgement() -> Non
     asyncio.run(scenario())
 
 
+def test_recover_user_input_claim_rejects_conflicting_decision_after_lost_acknowledgement() -> None:
+    async def scenario() -> None:
+        session_id = "s_recovery_claim_lost_ack_conflict"
+        store = _BlockingCommittedRunningTransitionStore()
+        counting = _CountingTool()
+        provider = _ScriptedProvider(
+            [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+            final_text="all done",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_events(
+            session_id,
+            _crashed_user_input_resume_events(
+                await private_events_for_public_events(store, paused),
+                session_id=session_id,
+                tool_call_id="call_1",
+            ),
+        )
+        answer_metadata = {"source": "lost-ack-regression"}
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="a",
+                    metadata=answer_metadata,
+                )
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+
+        request = UserInputRecoveryRequest(
+            session_id=session_id,
+            input_id=input_id,
+            answer="a",
+            tool_call_id="call_1",
+            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+            message="verified completed",
+            reason="operator inspected the external system",
+            metadata=answer_metadata,
+        )
+        store.transition_committed = asyncio.Event()
+        store.finish_transition = asyncio.Event()
+        store.block_next_running_transition = True
+        recovering = asyncio.create_task(_drain(app.recover_user_input(request)))
+        await asyncio.wait_for(store.transition_committed.wait(), timeout=5)
+
+        claimed_session = await store.load(session_id)
+        claimed_checkpoint = await store.load_checkpoint(session_id)
+        assert claimed_session is not None
+        assert claimed_session.status is SessionStatus.RUNNING
+        assert claimed_checkpoint is not None
+        claimed_intent = claimed_checkpoint["user_input_resolution_intent"]
+        private_request = request.model_copy(
+            update={"input_id": claimed_checkpoint["pending_user_input"]["input_id"]}
+        )
+        assert claimed_intent["answer_request_digest"] == user_input_answer_request_digest(
+            private_request
+        )
+        assert claimed_intent["resolution_stage"] == "manual-recovery"
+        assert claimed_intent["resolution_request_digest"] == user_input_resolution_request_digest(
+            private_request
+        )
+
+        events_before_conflicts = await store.load_events(session_id)
+        checkpoint_before_conflicts = await store.load_checkpoint(session_id)
+        provider_requests_before_conflicts = list(provider.requests)
+        conflicting_requests = (
+            request.model_copy(update={"message": "verified failed instead"}),
+            request.model_copy(update={"outcome": ToolApprovalRecoveryOutcome.FAILED}),
+            request.model_copy(update={"reason": "different operator evidence"}),
+        )
+        for conflicting_request in conflicting_requests:
+            assert user_input_answer_request_digest(
+                conflicting_request
+            ) == user_input_answer_request_digest(request)
+            assert user_input_resolution_request_digest(
+                conflicting_request
+            ) != user_input_resolution_request_digest(request)
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="different resolution request",
+            ):
+                await _drain(app.recover_user_input(conflicting_request))
+            assert await store.load_checkpoint(session_id) == checkpoint_before_conflicts
+            assert await store.load_events(session_id) == events_before_conflicts
+            assert provider.requests == provider_requests_before_conflicts
+
+        store.finish_transition.set()
+        recovered = await asyncio.wait_for(recovering, timeout=10)
+        assert recovered[-1].type is EventType.SESSION_COMPLETED
+        assert counting.calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_operator_interrupt_supersedes_user_input_manual_recovery_before_execution() -> None:
+    async def scenario() -> None:
+        session_id = "s_recovery_claim_operator_supersession"
+        store = _BlockingCommittedRunningTransitionStore()
+        counting = _CountingTool()
+        provider = _ScriptedProvider(
+            [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+            final_text="must not dispatch",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_events(
+            session_id,
+            _crashed_user_input_resume_events(
+                await private_events_for_public_events(store, paused),
+                session_id=session_id,
+                tool_call_id="call_1",
+            ),
+        )
+        answer_metadata = {"source": "operator-supersession-regression"}
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="a",
+                    metadata=answer_metadata,
+                )
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+        resumed_before_recovery = sum(
+            event.type is EventType.SESSION_RESUMED for event in await store.load_events(session_id)
+        )
+
+        recovery_request = UserInputRecoveryRequest(
+            session_id=session_id,
+            input_id=input_id,
+            answer="a",
+            tool_call_id="call_1",
+            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+            message="verified completed",
+            metadata=answer_metadata,
+        )
+        store.transition_committed = asyncio.Event()
+        store.finish_transition = asyncio.Event()
+        store.block_next_running_transition = True
+        recovering = asyncio.create_task(_drain(app.recover_user_input(recovery_request)))
+        await asyncio.wait_for(store.transition_committed.wait(), timeout=5)
+
+        claimed_checkpoint = await store.load_checkpoint(session_id)
+        assert claimed_checkpoint is not None
+        assert claimed_checkpoint["user_input_resolution_intent"]["execution_state"] == "claimed"
+
+        interrupt_app = CayuApp(session_store=store, enable_logging=False)
+        interrupt_app.register_provider(provider, default=True)
+        interrupt_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        with pytest.raises(TimeoutError, match="still finalizing"):
+            _ = [
+                event
+                async for event in interrupt_app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id=session_id,
+                        reason="operator supersedes manual recovery claim",
+                    )
+                )
+            ]
+
+        store.finish_transition.set()
+        recovery_events = await asyncio.wait_for(recovering, timeout=10)
+        assert recovery_events[-1].type is EventType.SESSION_INTERRUPTED
+        assert recovery_events[-1].payload["interruption_type"] == "operator_requested"
+        assert counting.calls == 0
+        assert len(provider.requests) == 1
+        durable_events = await store.load_events(session_id)
+        assert not any(event.payload.get("manual_recovery") is True for event in durable_events)
+        assert (
+            sum(event.type is EventType.SESSION_RESUMED for event in durable_events)
+            == resumed_before_recovery
+        )
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert "pending_user_input" not in checkpoint
+        assert "user_input_resolution_intent" not in checkpoint
+
+    asyncio.run(scenario())
+
+
+def test_operator_interrupt_cannot_supersede_executing_user_input_manual_recovery() -> None:
+    async def scenario() -> None:
+        session_id = "s_executing_recovery_claim_rejects_operator_supersession"
+        store = _BlockingCommittedRunningTransitionStore()
+        counting = _CountingTool()
+        provider = _ScriptedProvider(
+            [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+            final_text="continued after verified recovery",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_events(
+            session_id,
+            _crashed_user_input_resume_events(
+                await private_events_for_public_events(store, paused),
+                session_id=session_id,
+                tool_call_id="call_1",
+            ),
+        )
+        metadata = {"source": "executing-recovery-supersession-regression"}
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="a",
+                    metadata=metadata,
+                )
+            )
+        )
+        assert stuck[-1].payload.get("manual_recovery_required") is True
+
+        request = UserInputRecoveryRequest(
+            session_id=session_id,
+            input_id=input_id,
+            answer="a",
+            tool_call_id="call_1",
+            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+            message="verified completed",
+            metadata=metadata,
+        )
+        store.execution_admission_committed = asyncio.Event()
+        store.finish_execution_admission = asyncio.Event()
+        store.block_next_execution_admission = True
+        recovering = asyncio.create_task(_drain(app.recover_user_input(request)))
+        await asyncio.wait_for(store.execution_admission_committed.wait(), timeout=5)
+
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["user_input_resolution_intent"]["execution_state"] == "executing"
+
+        interrupt_app = CayuApp(session_store=store, enable_logging=False)
+        interrupt_app.register_provider(provider, default=True)
+        interrupt_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), counting],
+        )
+        with pytest.raises(
+            SessionRuntimePublicationConflict,
+            match="already executing and cannot be superseded",
+        ):
+            await _drain(
+                interrupt_app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id=session_id,
+                        reason="cannot supersede executing manual recovery",
+                    )
+                )
+            )
+
+        assert not any(
+            event.type is EventType.SESSION_INTERRUPTED
+            and event.payload.get("interruption_type") == "operator_requested"
+            for event in await store.load_events(session_id)
+        )
+        store.finish_execution_admission.set()
+        recovered = await asyncio.wait_for(recovering, timeout=10)
+        assert recovered[-1].type is EventType.SESSION_COMPLETED
+        assert counting.calls == 0
+        assert len(provider.requests) == 2
+        assert any(
+            event.payload.get("manual_recovery") is True
+            for event in await store.load_events(session_id)
+        )
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "grouped_cancellation",
     [False, True],
@@ -2403,6 +3484,110 @@ def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
         )
         assert resumed[-1].type == EventType.SESSION_COMPLETED
         assert counting.calls == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("corruption", ["missing", "conflicting"])
+def test_resolve_user_input_requires_exact_manual_recovery_terminal_authority(
+    corruption: str,
+) -> None:
+    class CorruptManualRecoveryStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            corrupted: list[Event] = []
+            for event in events:
+                if event.payload.get("manual_recovery") is not True:
+                    corrupted.append(event)
+                    continue
+                payload = dict(event.payload)
+                if corruption == "missing":
+                    payload.pop("resolution_request_digest")
+                else:
+                    payload["resolution_request_digest"] = "f" * 64
+                corrupted.append(event.model_copy(update={"payload": payload}))
+            await super().append_events(session_id, corrupted)
+
+    async def scenario() -> None:
+        session_id = f"s_manual_recovery_authority_{corruption}"
+        store = CorruptManualRecoveryStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        provider = _ScriptedProvider(
+            [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
+            final_text="all done",
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool(), _CountingTool()],
+        )
+        paused = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in paused if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        await store.append_events(
+            session_id,
+            _crashed_user_input_resume_events(
+                await private_events_for_public_events(store, paused),
+                session_id=session_id,
+                tool_call_id="call_1",
+            ),
+        )
+        stuck = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+            )
+        )
+        assert stuck[-1].payload["manual_recovery_required"] is True
+
+        original_fan_out = app._event_writer.fan_out_persisted
+        failed = False
+
+        async def fail_recovery_fan_out(events: list[Event]) -> list[Event]:
+            nonlocal failed
+            if not failed and any(event.payload.get("manual_recovery") is True for event in events):
+                failed = True
+                raise RuntimeError("manual recovery fan-out failed")
+            return await original_fan_out(events)
+
+        app._event_writer.fan_out_persisted = fail_recovery_fan_out
+        recovered = await _drain(
+            app.recover_user_input(
+                UserInputRecoveryRequest(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="a",
+                    tool_call_id="call_1",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="recovered externally",
+                )
+            )
+        )
+        assert recovered[-1].payload["manual_recovery_persisted"] is True
+
+        checkpoint_before = await store.load_checkpoint(session_id)
+        events_before = await store.load_events(session_id)
+        provider_requests_before = list(provider.requests)
+        with pytest.raises(
+            SessionRuntimePublicationConflict,
+            match="different resolution request",
+        ):
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
+                )
+            )
+        assert await store.load_checkpoint(session_id) == checkpoint_before
+        assert await store.load_events(session_id) == events_before
+        assert provider.requests == provider_requests_before
 
     asyncio.run(scenario())
 
@@ -2784,6 +3969,71 @@ def test_worker_recovery_preserves_pending_user_input() -> None:
     assert interrupted and interrupted[-1].payload["interruption_type"] == "user_input_required"
     assert interrupted[-1].payload["user_input"]["question"] == "which env?"
     assert asyncio.run(store.load("s_crashrec")).status == SessionStatus.INTERRUPTED
+
+
+def test_worker_recovery_rejects_pause_without_exact_open_receipt_as_ambiguous() -> None:
+    class MissingOpenReceiptStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.hide_open_receipt = False
+
+        async def load_runtime_publication_receipt(
+            self,
+            session_id: str,
+            publication_id: str,
+        ):
+            if self.hide_open_receipt and publication_id.startswith("user-input-open:"):
+                return None
+            return await super().load_runtime_publication_receipt(
+                session_id,
+                publication_id,
+            )
+
+    async def run() -> None:
+        session_id = "s_ambiguous_user_input_open_receipt"
+        store = MissingOpenReceiptStore()
+        app, _ = _build(
+            [("call_1", "ask_user", {"question": "which env?"})],
+            store=store,
+        )
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        await rebind_test_invocation(store, session_id)
+        store.hide_open_receipt = True
+        checkpoint_before = await store.load_checkpoint(session_id)
+        transcript_before = await store.load_transcript(session_id)
+        events_before = await store.load_events(session_id)
+
+        with pytest.raises(
+            SessionRuntimePublicationConflict,
+            match="recovery authority is ambiguous",
+        ):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+
+        checkpoint_after = await store.load_checkpoint(session_id)
+        assert checkpoint_after is not None
+        assert checkpoint_after["pending_user_input"] == checkpoint_before["pending_user_input"]
+        assert "user_input_resolution_intent" not in checkpoint_after
+        assert "user_input_supersession_intent" not in checkpoint_after
+        assert await store.load_transcript(session_id) == transcript_before
+        events_after = await store.load_events(session_id)
+        assert events_after[: len(events_before)] == events_before
+        assert all(
+            event.type is EventType.SESSION_RUN_FENCED
+            for event in events_after[len(events_before) :]
+        )
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(

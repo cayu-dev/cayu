@@ -1,6 +1,6 @@
-"""Crash-safe publication for opening and closing one tool approval.
+"""Crash-safe publication for opening and closing one pending runtime action.
 
-Approval checkpoints are security authority, so an ambiguous store response
+Pending-action checkpoints are runtime authority, so an ambiguous store response
 cannot be interpreted as either "committed" or "not committed".  This module
 retains the exact request, reconciles it by its insert-only runtime-publication
 receipt, and replays only identical material.
@@ -32,12 +32,17 @@ from cayu.runtime.sessions import (
     runtime_publication_event_reference,
 )
 
-ApprovalPublicationKind = Literal["approval-open", "approval-close"]
+PendingActionPublicationKind = Literal[
+    "approval-open",
+    "approval-close",
+    "user-input-open",
+    "user-input-close",
+]
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedApprovalPublication:
-    """One immutable approval publication and its first-commit fences."""
+class PreparedPendingActionPublication:
+    """One immutable pending-action publication and its first-commit fences."""
 
     session_id: str
     expected_statuses: frozenset[SessionStatus]
@@ -51,11 +56,11 @@ class PreparedApprovalPublication:
         return _copy_request(self._request)
 
 
-def prepare_approval_publication(
+def prepare_pending_action_publication(
     *,
     session_id: str,
     publication_id: str,
-    kind: ApprovalPublicationKind,
+    kind: PendingActionPublicationKind,
     intent: dict[str, Any],
     source_checkpoint: dict[str, Any] | None,
     target_checkpoint: dict[str, Any] | None,
@@ -65,11 +70,16 @@ def prepare_approval_publication(
     expected_statuses: set[SessionStatus] | frozenset[SessionStatus],
     expected_run_epoch: int,
     expected_transcript_cursor: int,
-) -> PreparedApprovalPublication:
-    """Build and retain one exact approval-boundary request."""
+) -> PreparedPendingActionPublication:
+    """Build and retain one exact pending-action boundary request."""
 
-    if kind not in {"approval-open", "approval-close"}:
-        raise ValueError("Unsupported approval publication kind.")
+    if kind not in {
+        "approval-open",
+        "approval-close",
+        "user-input-open",
+        "user-input-close",
+    }:
+        raise ValueError("Unsupported pending-action publication kind.")
     if type(expected_statuses) not in (set, frozenset) or not expected_statuses:
         raise ValueError("expected_statuses must be a non-empty set.")
     if any(type(status) is not SessionStatus for status in expected_statuses):
@@ -93,7 +103,7 @@ def prepare_approval_publication(
     attributed_events = tuple(attribute_events_to_current_interaction(list(events)))
     interaction_ids = {event.interaction_id for event in (*attributed_events, *referenced_events)}
     if len(interaction_ids) != 1 or None in interaction_ids:
-        raise ValueError("Approval publication evidence requires one interaction identity.")
+        raise ValueError("Pending-action publication evidence requires one interaction identity.")
     interaction_id = next(iter(interaction_ids))
     request = RuntimePublicationRequest(
         publication_id=publication_id,
@@ -110,7 +120,7 @@ def prepare_approval_publication(
     digest = runtime_publication_checkpoint_value_digest(
         {"session_id": session_id, "request": request.model_dump(mode="json")}
     )
-    return PreparedApprovalPublication(
+    return PreparedPendingActionPublication(
         session_id=session_id,
         expected_statuses=frozenset(expected_statuses),
         expected_run_epoch=expected_run_epoch,
@@ -120,8 +130,8 @@ def prepare_approval_publication(
     )
 
 
-async def publish_approval_with_exact_replay(
-    prepared: PreparedApprovalPublication,
+async def publish_pending_action_with_exact_replay(
+    prepared: PreparedPendingActionPublication,
     *,
     session_store: SessionStore,
     event_writer: RuntimeEventWriter,
@@ -129,8 +139,8 @@ async def publish_approval_with_exact_replay(
 ) -> asyncio.CancelledError | None:
     """Publish once and reconcile a lost acknowledgement from the exact receipt."""
 
-    if type(prepared) is not PreparedApprovalPublication:
-        raise TypeError("prepared must be a PreparedApprovalPublication.")
+    if type(prepared) is not PreparedPendingActionPublication:
+        raise TypeError("prepared must be a PreparedPendingActionPublication.")
     request = prepared._request
     if (
         runtime_publication_checkpoint_value_digest(
@@ -138,7 +148,7 @@ async def publish_approval_with_exact_replay(
         )
         != prepared._request_digest
     ):
-        raise RuntimeError("Prepared approval publication request was mutated.")
+        raise RuntimeError("Prepared pending-action publication request was mutated.")
 
     cancellation: asyncio.CancelledError | None = None
     try:
@@ -173,13 +183,13 @@ async def publish_approval_with_exact_replay(
         if isinstance(reconciliation_error, asyncio.CancelledError):
             reconciliation_error = unexpected_child_cancellation_error(
                 reconciliation_error,
-                operation="Approval publication reconciliation",
+                operation="Pending-action publication reconciliation",
             )
         if reconciliation_error is not None:
             if cancellation is not None:
                 add_exception_note_safely(
                     cancellation,
-                    "Approval publication reconciliation failed.",
+                    "Pending-action publication reconciliation failed.",
                 )
                 raise cancellation from reconciliation_error
             raise reconciliation_error from publication_error
@@ -187,7 +197,7 @@ async def publish_approval_with_exact_replay(
             if cancellation is not None:
                 add_exception_note_safely(
                     cancellation,
-                    "Approval publication failed before a durable receipt was reconstructed.",
+                    "Pending-action publication failed before a durable receipt was reconstructed.",
                 )
                 raise cancellation from publication_error
             raise publication_error
@@ -208,7 +218,7 @@ async def publish_approval_with_exact_replay(
 
 
 async def _publish(
-    prepared: PreparedApprovalPublication,
+    prepared: PreparedPendingActionPublication,
     *,
     session_store: SessionStore,
 ) -> asyncio.CancelledError | None:
@@ -227,18 +237,18 @@ async def _publish(
     if isinstance(error, asyncio.CancelledError):
         error = unexpected_child_cancellation_error(
             error,
-            operation="Approval durable publication",
+            operation="Pending-action durable publication",
         )
     if error is not None:
         if outcome.cancellation is not None:
             outcome.cancellation.add_note(
-                "Approval durable publication failed during cancellation."
+                "Pending-action durable publication failed during cancellation."
             )
             raise outcome.cancellation from error
         raise error
     result = outcome.result
     if type(result) is not RuntimePublicationResult:
-        raise RuntimeError("Approval durable publication returned an invalid result.")
+        raise RuntimeError("Pending-action durable publication returned an invalid result.")
     receipt = result.receipt
     request = prepared._request
     if (
@@ -256,7 +266,7 @@ async def _publish(
         or receipt.appended_event_ids != tuple(event.id for event in request.events)
         or receipt.referenced_events != request.referenced_events
     ):
-        raise RuntimeError("Approval publication acknowledgement conflicts with its request.")
+        raise RuntimeError("Pending-action publication acknowledgement conflicts with its request.")
     return outcome.cancellation
 
 
@@ -272,3 +282,9 @@ def _copy_request(request: RuntimePublicationRequest) -> RuntimePublicationReque
         operation_record_mutations=request.operation_record_mutations,
         referenced_events=request.referenced_events,
     )
+
+
+# Approval callers retain narrow names while user input uses the generic owner.
+PreparedApprovalPublication = PreparedPendingActionPublication
+prepare_approval_publication = prepare_pending_action_publication
+publish_approval_with_exact_replay = publish_pending_action_with_exact_replay

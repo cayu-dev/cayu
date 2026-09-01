@@ -126,6 +126,7 @@ from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,
     ExecutionProfileIdentity,
+    active_invocation_execution_profile_from_checkpoint,
     event_with_execution_profile_authority,
     event_with_execution_profile_fingerprint_authority,
 )
@@ -244,9 +245,12 @@ from cayu.runtime.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
     PendingUserInput,
     copy_pending_user_input,
-    pending_user_input_from_checkpoint,
+    event_with_pending_user_input_authority,
+    pending_user_input_digest,
+    pending_user_input_identity,
     public_pending_user_input_event_payload,
     public_pending_user_input_prompt,
+    user_input_lifecycle_authority_from_checkpoint,
 )
 from cayu.runtime.workspace_mutation_attribution import (
     DirectWorkspaceMutationCollector,
@@ -2529,7 +2533,7 @@ class ToolRoundExecutor:
         question: str,
         options: list[str],
         tool_round_identity: ToolRoundIdentity,
-    ) -> tuple[PendingUserInput, Event]:
+    ) -> tuple[PendingUserInput, list[Event]]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         redactor = _redactor_for_tool_calls(
             self._secret_redactor,
@@ -2559,18 +2563,32 @@ class ToolRoundExecutor:
             is not None
         ):
             raise RuntimeError("Session already has a pending tool approval.")
-        if (
-            pending_user_input_from_checkpoint(
-                checkpoint,
-                redactor=self._secret_redactor,
-                consume_on_rejection=True,
-            )
-            is not None
-        ):
+        pending_user_input, _ = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
+        )
+        if pending_user_input is not None:
             raise RuntimeError("Session already has a pending user input.")
-        checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            active_profile is None
+            or active_profile.session_id != session.id
+            or active_profile.run_epoch != session.run_epoch
+            or pending_round.source_run_epoch != session.run_epoch
+            or pending_round.execution_profile_fingerprint != active_profile.profile.fingerprint
+        ):
+            raise RuntimeError("Pending user input has no exact active invocation authority.")
+        execution_profile_fingerprint = pending_round.execution_profile_fingerprint
+        if execution_profile_fingerprint is None:
+            raise RuntimeError("Pending user input has no execution-profile authority.")
 
         pending = PendingUserInput(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            source_interaction_id=active_profile.interaction_id,
+            source_run_epoch=session.run_epoch,
             input_id=str(uuid4()),
             tool_round_id=tool_round_identity.tool_round_id,
             model_step_id=tool_round_identity.model_step_id,
@@ -2586,7 +2604,7 @@ class ToolRoundExecutor:
             workspace_id=_workspace_id(registered_environment),
             task_id=task_id,
             interaction_id=pending_round.interaction_id,
-            execution_profile_fingerprint=pending_round.execution_profile_fingerprint,
+            execution_profile_fingerprint=execution_profile_fingerprint,
             tool_exposure=pending_round.tool_exposure,
             tool_calls=approval_support.pending_tool_call_approvals(
                 tool_calls=tool_calls,
@@ -2613,35 +2631,109 @@ class ToolRoundExecutor:
             field_name="pending_user_input",
             schema_root=PENDING_USER_INPUT_CHECKPOINT_KEY,
         )
-        checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending_payload
-        checkpoint = _require_secret_free_durable_object(
-            checkpoint,
+        source_round_payload = copy_json_value(
+            checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            "pending_tool_round",
+        )
+        target_checkpoint = copy_json_value(checkpoint, "checkpoint")
+        target_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+        target_checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = pending_payload
+        target_checkpoint = _require_secret_free_durable_object(
+            target_checkpoint,
             redactor=redactor,
             field_name="checkpoint",
         )
-        await self._session_store.transform_checkpoint(
-            session.id,
-            self._checkpoint_transform(checkpoint),
-        )
-        return (
-            pending,
-            _event_with_tool_round_authority(
-                Event(
-                    type=EventType.SESSION_CHECKPOINTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    payload={
-                        "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
-                        "input_id": pending.input_id,
-                        "tool_call_id": pending.tool_call_id,
-                        **tool_round_identity.payload(),
-                    },
+        pause_digest = pending_user_input_digest(pending)
+        checkpoint_event = _redact_event_for_invocation(
+            event_with_pending_user_input_authority(
+                _event_with_tool_round_authority(
+                    Event(
+                        type=EventType.SESSION_CHECKPOINTED,
+                        session_id=session.id,
+                        interaction_id=pending.source_interaction_id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload={
+                            "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
+                            "input_id": pending.input_id,
+                            "tool_call_id": pending.tool_call_id,
+                            "source_run_epoch": pending.source_run_epoch,
+                            "pause_digest": pause_digest,
+                            **tool_round_identity.payload(),
+                        },
+                    ),
+                    tool_round_identity,
+                    "input_id",
                 ),
-                tool_round_identity,
-                "input_id",
+                pending,
             ),
+            redactor=redactor,
         )
+        public_question, public_options = public_pending_user_input_prompt(pending)
+        public_prompt_payload = (
+            {}
+            if public_question is None
+            else {"question": public_question, "options": public_options}
+        )
+        public_pending_input = public_pending_user_input_event_payload(pending)
+        awaiting_event = _redact_event_for_invocation(
+            event_with_pending_user_input_authority(
+                _event_with_tool_round_authority(
+                    event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.SESSION_AWAITING_USER_INPUT,
+                            session_id=session.id,
+                            interaction_id=pending.source_interaction_id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=_environment_name(registered_environment),
+                            tool_name=tool_call.name,
+                            payload={
+                                **tool_round_identity.payload(),
+                                "input_id": pending.input_id,
+                                "tool_call_id": pending.tool_call_id,
+                                "source_run_epoch": pending.source_run_epoch,
+                                "pause_digest": pause_digest,
+                                **public_prompt_payload,
+                                "tool_calls": public_pending_input["tool_calls"],
+                            },
+                        ),
+                        active_profile.profile,
+                    ),
+                    tool_round_identity,
+                    "input_id",
+                ),
+                pending,
+            ),
+            redactor=redactor,
+        )
+        events = [checkpoint_event, awaiting_event]
+        transcript_cursor = await self._session_store.load_transcript_cursor(session.id)
+        prepared = approval_publication.prepare_pending_action_publication(
+            session_id=session.id,
+            publication_id=f"user-input-open:{pending.input_id}",
+            kind="user-input-open",
+            intent={
+                **pending_user_input_identity(pending),
+                "source_round_digest": runtime_publication_checkpoint_value_digest(
+                    source_round_payload
+                ),
+                "event_ids": [event.id for event in events],
+            },
+            source_checkpoint=checkpoint,
+            target_checkpoint=target_checkpoint,
+            events=events,
+            expected_statuses={SessionStatus.RUNNING},
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=transcript_cursor,
+        )
+        cancellation = await approval_publication.publish_pending_action_with_exact_replay(
+            prepared,
+            session_store=self._session_store,
+            event_writer=self._event_writer,
+        )
+        if cancellation is not None:
+            raise cancellation
+        return pending, list(prepared.request.events)
 
     async def checkpoint_with_pending_tool_round(
         self,
@@ -6242,6 +6334,7 @@ class ToolRoundRun:
             raise ValueError("Tool-round execution lost frozen invocation authority.")
         self._invocation_context = invocation_context
         self.stopped_for_limit = False
+        self.user_input_pause_superseded = False
 
     @property
     def execution_profile(self) -> ExecutionProfileIdentity | None:
@@ -6263,6 +6356,7 @@ class ToolRoundRun:
             model_attempt_id=tool_round_identity.model_attempt_id,
         )
         self.stopped_for_limit = False
+        self.user_input_pause_superseded = False
         executor = self._executor
         session = self._session
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
@@ -6420,56 +6514,45 @@ class ToolRoundRun:
         )
         if user_input_pause is not None:
             user_input_call, question, options = user_input_pause
-            pending_input, checkpoint_event = await executor.checkpoint_pending_user_input(
-                session=session,
-                registered_agent=self._registered_agent,
-                registered_environment=self._registered_environment,
-                tool_call=user_input_call,
-                tool_calls=tool_calls,
-                policy_outcomes=policy_plan.outcomes,
-                active_taint_by_id=policy_plan.active_taint_labels,
-                task_id=self._task_id,
-                structured_output=self._structured_output,
-                thinking=self._thinking,
-                max_steps=self._max_steps,
-                limits=self._limits,
-                budget_limits=self._budget_limits,
-                retry_policy=self._retry_policy,
-                question=question,
-                options=options,
-                tool_round_identity=tool_round_identity,
-            )
-            public_question, public_options = public_pending_user_input_prompt(pending_input)
-            public_prompt_payload = (
-                {}
-                if public_question is None
-                else {"question": public_question, "options": public_options}
-            )
-            public_pending_input = public_pending_user_input_event_payload(pending_input)
-            yield await executor._event_writer.emit(checkpoint_event)
-            yield await executor._event_writer.emit(
-                _event_with_tool_round_authority(
-                    event_with_execution_profile_authority(
-                        Event(
-                            type=EventType.SESSION_AWAITING_USER_INPUT,
-                            session_id=session.id,
-                            agent_name=self._registered_agent.spec.name,
-                            environment_name=self._environment_name,
-                            tool_name=user_input_call.name,
-                            payload={
-                                **tool_round_identity.payload(),
-                                "input_id": pending_input.input_id,
-                                "tool_call_id": pending_input.tool_call_id,
-                                **public_prompt_payload,
-                                "tool_calls": public_pending_input["tool_calls"],
-                            },
-                        ),
-                        self._execution_profile,
-                    ),
-                    tool_round_identity,
-                    "input_id",
+            try:
+                pending_input, pause_events = await executor.checkpoint_pending_user_input(
+                    session=session,
+                    registered_agent=self._registered_agent,
+                    registered_environment=self._registered_environment,
+                    tool_call=user_input_call,
+                    tool_calls=tool_calls,
+                    policy_outcomes=policy_plan.outcomes,
+                    active_taint_by_id=policy_plan.active_taint_labels,
+                    task_id=self._task_id,
+                    structured_output=self._structured_output,
+                    thinking=self._thinking,
+                    max_steps=self._max_steps,
+                    limits=self._limits,
+                    budget_limits=self._budget_limits,
+                    retry_policy=self._retry_policy,
+                    question=question,
+                    options=options,
+                    tool_round_identity=tool_round_identity,
                 )
-            )
+            except (RuntimeError, ValueError):
+                # A remote worker may claim interruption after the policy
+                # pre-check but before the atomic pause publication. Translate
+                # only positive durable interruption evidence; otherwise keep
+                # the original publication failure authoritative.
+                await executor._session_control.raise_if_interrupted(session.id)
+                raise
+            for pause_event in pause_events:
+                yield pause_event
+            try:
+                await executor._session_control.raise_if_interrupted(session.id)
+            except SessionInterruptedByRequest:
+                # The pause committed, but a remote interruption atomically
+                # superseded it while persisted side effects were delivered.
+                # The pending round no longer exists, so let the outer run owner
+                # finish the operator interruption without treating the pause as
+                # an interrupted ordinary round.
+                self.user_input_pause_superseded = True
+                return
             raise UserInputRequired(pending_input)
 
         if planned_round is None:

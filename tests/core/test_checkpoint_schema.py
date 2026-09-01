@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from hashlib import sha256
 from typing import Any, cast
 
 import pytest
@@ -21,6 +22,7 @@ from cayu import (
     CheckpointCompatibilityError,
     SQLiteSessionStore,
 )
+from cayu._validation import canonical_durable_json_bytes
 from cayu.runtime import InMemorySessionStore
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
@@ -31,6 +33,7 @@ from cayu.runtime._invocation_lifecycle import (
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
     INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
     CheckpointMigration,
     CheckpointMigrationDefinitionError,
@@ -39,7 +42,11 @@ from cayu.runtime.checkpoints import (
     runtime_checkpoint_writer_view,
 )
 from cayu.runtime.context import _compaction_checkpoint
-from cayu.runtime.user_input import pending_user_input_from_checkpoint
+from cayu.runtime.user_input import (
+    AmbiguousUserInputPauseAuthorityError,
+    ambiguous_pending_user_input_from_checkpoint,
+    pending_user_input_from_checkpoint,
+)
 from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationArtifact,
     WorkspaceObservationArtifactState,
@@ -145,7 +152,7 @@ _FROZEN_VERSIONLESS_ROOT_CHECKPOINTS = {
     _FROZEN_VERSIONLESS_ROOT_CHECKPOINTS.items(),
     ids=_FROZEN_VERSIONLESS_ROOT_CHECKPOINTS,
 )
-def test_frozen_versionless_root_payloads_decode_without_data_loss_and_remain_consumable(
+def test_frozen_versionless_root_payloads_decode_and_supported_shapes_remain_consumable(
     fixture_name: str,
     fixture: dict[str, object],
 ) -> None:
@@ -156,6 +163,7 @@ def test_frozen_versionless_root_payloads_decode_without_data_loss_and_remain_co
     without_version = dict(decoded)
     without_version.pop(CHECKPOINT_SCHEMA_VERSION_KEY)
     expected = copy.deepcopy(fixture)
+    source_digest: str | None = None
     if fixture_name in {"pending-tool-round", "user-input"}:
         checkpoint_key = (
             "pending_tool_round" if fixture_name == "pending-tool-round" else "pending_user_input"
@@ -165,11 +173,26 @@ def test_frozen_versionless_root_payloads_decode_without_data_loss_and_remain_co
             assistant_message_state="published",
             quarantined_assistant_message=None,
         )
+        if fixture_name == "user-input":
+            source_digest = sha256(
+                canonical_durable_json_bytes(pending_state, "pending_user_input")
+            ).hexdigest()
+            expected.pop(checkpoint_key)
+            expected[AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY] = {
+                "schema_version": 1,
+                "source_checkpoint_digest": source_digest,
+                "reason": "missing_exact_pause_authority",
+            }
     assert without_version == expected
     if fixture_name == "approval":
         assert approval_support.pending_approval_from_checkpoint(decoded) is not None
     elif fixture_name == "user-input":
-        assert pending_user_input_from_checkpoint(decoded) is not None
+        ambiguous = ambiguous_pending_user_input_from_checkpoint(decoded)
+        assert ambiguous is not None
+        assert source_digest is not None
+        assert ambiguous.source_checkpoint_digest == source_digest
+        with pytest.raises(AmbiguousUserInputPauseAuthorityError):
+            pending_user_input_from_checkpoint(decoded)
     elif fixture_name == "pending-tool-round":
         assert pending_tool_round_from_checkpoint(decoded) is not None
     elif fixture_name == "session-operation":
@@ -188,10 +211,19 @@ def test_versionless_root_checkpoint_is_migrated_to_current_version() -> None:
 
     assert decoded == {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-        "pending_user_input": {
-            "input_id": "input-1",
-            "assistant_message_state": "published",
-            "quarantined_assistant_message": None,
+        AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY: {
+            "schema_version": 1,
+            "source_checkpoint_digest": sha256(
+                canonical_durable_json_bytes(
+                    {
+                        "input_id": "input-1",
+                        "assistant_message_state": "published",
+                        "quarantined_assistant_message": None,
+                    },
+                    "pending_user_input",
+                )
+            ).hexdigest(),
+            "reason": "missing_exact_pause_authority",
         },
         "future_additive_field": {"kept": True},
     }
@@ -199,6 +231,46 @@ def test_versionless_root_checkpoint_is_migrated_to_current_version() -> None:
         "pending_user_input": {"input_id": "input-1"},
         "future_additive_field": {"kept": True},
     }
+
+
+def test_v5_user_input_lookalikes_do_not_become_v6_authority() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 5,
+        "pending_user_input": {
+            "schema_version": 1,
+            "session_id": "caller-shaped-session",
+        },
+        "user_input_resolution_intent": {
+            "schema_version": 1,
+            "answer_request_digest": "a" * 64,
+        },
+        "pending_session_interrupt": {
+            "interruption_type": "operator_requested",
+            "interruption_request_id": "caller-shaped-request",
+            "user_input_supersession_intent": {"schema_version": 1},
+            "ambiguous_user_input_supersession_intent": {"schema_version": 1},
+        },
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v5-lookalike")
+
+    assert decoded is not None
+    assert "pending_user_input" not in decoded
+    assert "user_input_resolution_intent" not in decoded
+    assert ambiguous_pending_user_input_from_checkpoint(decoded) is not None
+    pending_interrupt = cast("dict[str, object]", decoded["pending_session_interrupt"])
+    assert "user_input_supersession_intent" not in pending_interrupt
+    assert "ambiguous_user_input_supersession_intent" not in pending_interrupt
+    assert pending_interrupt == {
+        "interruption_type": "operator_requested",
+        "interruption_request_id": "caller-shaped-request",
+    }
+    source_pending_interrupt = cast(
+        "dict[str, object]",
+        source["pending_session_interrupt"],
+    )
+    assert "user_input_supersession_intent" in source_pending_interrupt
+    assert "ambiguous_user_input_supersession_intent" in source_pending_interrupt
 
 
 def test_versionless_root_checkpoint_has_a_fixed_legacy_version() -> None:
@@ -599,6 +671,59 @@ def test_v2_writer_view_projects_v3_state_without_active_invocation_authority() 
         "future_additive_field": {"kept": True},
     }
     assert source[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("pending_user_input", {"schema_version": 1}),
+        ("user_input_resolution_intent", {"schema_version": 1}),
+    ],
+)
+def test_v5_writer_view_rejects_exact_user_input_authority(
+    field_name: str,
+    value: dict[str, int],
+) -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        field_name: value,
+    }
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        runtime_checkpoint_writer_view(
+            source,
+            writer_version=5,
+            session_id="sess-v5-exact-user-input-writer-view",
+        )
+
+
+@pytest.mark.parametrize("writer_version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "user_input_supersession_intent",
+        "ambiguous_user_input_supersession_intent",
+    ],
+)
+def test_older_writer_view_rejects_user_input_supersession_authority(
+    writer_version: int,
+    field_name: str,
+) -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "pending_session_interrupt": {
+            "interruption_type": "operator_requested",
+            "interruption_request_id": "runtime-owned-request",
+            field_name: {"schema_version": 1},
+        },
+    }
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        runtime_checkpoint_writer_view(
+            source,
+            writer_version=writer_version,
+            session_id="sess-older-user-input-supersession-writer-view",
+        )
 
 
 def test_v1_writer_view_rejects_unrecognized_current_model_publication_pointer() -> None:

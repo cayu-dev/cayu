@@ -10,6 +10,9 @@ from cayu.core.messages import ProviderStatePart, ToolCallPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    InterruptSessionRequest,
     PendingActionQuery,
     RunRequest,
     RuntimePublicationCheckpointOperation,
@@ -37,6 +40,7 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.execution_units import new_model_step_identity
 from cayu.runtime.sessions import SessionStore
+from cayu.runtime.user_input import AmbiguousUserInputPauseAuthorityError
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor
 
@@ -361,13 +365,18 @@ async def assert_versionless_pending_continuation_fails_closed_conformance(
     assert len(pending.actions) + len(pending.issues) == 1
 
     provider = _CompleteProvider()
+    app = _app(store, provider)
+    recovery = await app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(session_id=session_id)
+    )
+    assert recovery.actions == (IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,)
     with pytest.raises(
-        RuntimeError,
-        match="no durable active invocation execution profile",
+        AmbiguousUserInputPauseAuthorityError,
+        match="ambiguous historical authority",
     ):
         _ = [
             event
-            async for event in _app(store, provider).resolve_user_input(
+            async for event in app.resolve_user_input(
                 UserInputResponse(
                     session_id=session_id,
                     input_id=input_id,
@@ -386,6 +395,23 @@ async def assert_versionless_pending_continuation_fails_closed_conformance(
     assert checkpoint["future_additive_field"] == {"kept": True}
     assert "pending_user_input" in checkpoint
     assert ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY in checkpoint
+
+    interrupted = [
+        event
+        async for event in app.interrupt_session(
+            InterruptSessionRequest(
+                session_id=session_id,
+                reason="retire ambiguous historical pause",
+            )
+        )
+    ]
+    assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
+    retired_checkpoint = await store.load_checkpoint(session_id)
+    assert retired_checkpoint is not None
+    assert retired_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+    assert retired_checkpoint["future_additive_field"] == {"kept": True}
+    assert "pending_user_input" not in retired_checkpoint
+    assert "ambiguous_pending_user_input" not in retired_checkpoint
 
 
 async def assert_versionless_noop_transform_stamps_conformance(

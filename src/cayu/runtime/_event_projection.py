@@ -593,6 +593,8 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ): _WORKSPACE_PATH_CHANGE_VALUES,
         ("user_input", "arguments_state"): frozenset({"quarantined"}),
         ("user_input", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+        ("ambiguous_user_input_supersession_intent", "state"): frozenset({"ambiguous"}),
+        ("user_input_supersession_intent", "state"): frozenset({"active", "answering"}),
     },
     **{
         event_type: {
@@ -804,7 +806,10 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             {"pending", "retrying", "released", "recovered", "recovery_required"}
         ),
     },
-    EventType.SESSION_CHECKPOINTED: {("checkpoint",): _SESSION_CHECKPOINT_VALUES},
+    EventType.SESSION_CHECKPOINTED: {
+        ("checkpoint",): _SESSION_CHECKPOINT_VALUES,
+        ("transition",): frozenset({"answered"}),
+    },
     EventType.SESSION_MESSAGE_QUEUED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
     EventType.SESSION_MESSAGE_DELIVERED: {("delivery_mode",): frozenset({"next_turn", "on_idle"})},
     **{
@@ -1459,6 +1464,8 @@ _PENDING_USER_INPUT_FIELD_NAMES = frozenset(
         "question",
         "quarantined_assistant_message",
         "retry_policy",
+        "schema_version",
+        "source_run_epoch",
         "structured_output",
         "task_id",
         "thinking",
@@ -1528,6 +1535,68 @@ _USER_INPUT_NESTED_AUTHORITY_PATHS = frozenset(
     }
     | {
         ("user_input", "tool_calls", "*", "tool_call_id"),
+    }
+)
+_USER_INPUT_SUPERSESSION_FIELD_NAMES = frozenset(
+    {
+        "schema_version",
+        "session_id",
+        "session_instance_id",
+        "source_interaction_id",
+        "source_run_epoch",
+        "input_id",
+        "tool_call_id",
+        "tool_round_id",
+        "model_step_id",
+        "model_attempt_id",
+        "execution_profile_fingerprint",
+        "pause_digest",
+        "state",
+        "claim_run_epoch",
+        "resolution_request_digest",
+    }
+)
+_USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS = frozenset(
+    ("user_input_supersession_intent", field_name)
+    for field_name in _USER_INPUT_SUPERSESSION_FIELD_NAMES
+)
+_USER_INPUT_SUPERSESSION_NESTED_AUTHORITY_PATHS = frozenset(
+    ("user_input_supersession_intent", field_name)
+    for field_name in {
+        "session_id",
+        "session_instance_id",
+        "source_interaction_id",
+        "input_id",
+        "tool_call_id",
+        "tool_round_id",
+        "model_step_id",
+        "model_attempt_id",
+        "execution_profile_fingerprint",
+        "pause_digest",
+        "state",
+        "resolution_request_digest",
+    }
+)
+_AMBIGUOUS_USER_INPUT_SUPERSESSION_FIELD_NAMES = frozenset(
+    {
+        "schema_version",
+        "session_id",
+        "session_instance_id",
+        "source_checkpoint_digest",
+        "state",
+    }
+)
+_AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS = frozenset(
+    ("ambiguous_user_input_supersession_intent", field_name)
+    for field_name in _AMBIGUOUS_USER_INPUT_SUPERSESSION_FIELD_NAMES
+)
+_AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_AUTHORITY_PATHS = frozenset(
+    ("ambiguous_user_input_supersession_intent", field_name)
+    for field_name in {
+        "session_id",
+        "session_instance_id",
+        "source_checkpoint_digest",
+        "state",
     }
 )
 _TOOL_CALL_LIST_NESTED_AUTHORITY_PATHS = frozenset({("tool_calls", "*", "tool_call_id")})
@@ -2376,6 +2445,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             authority_keys={
                 *_TOOL_LINKAGE_AUTHORITY_KEYS,
                 *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
+                "resolution_request_digest",
                 WEB_ACCESS_RESULT_AUTHORITY_FIELD,
                 SHARED_ARTIFACT_RESULT_AUTHORITY_FIELD,
             },
@@ -2852,15 +2922,18 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "interaction_transition_failures interruption_type limit manual_recovery_persisted "
         "manual_recovery_persistence_unknown manual_recovery_required "
         "manual_recovery_stale_live_failure maximum message metadata model_attempt_id "
-        "model_step_id persistence_reconciliation_error_type policy_metadata reason "
+        "model_step_id pause_digest persistence_reconciliation_error_type policy_metadata reason "
         "provider_cancellation_failures "
         "recovered requested_by resolved_by tool_call_id tool_call_metadata_truncated "
         "session_run_operation_id tool_evidence_conflict tool_name tool_round_id "
-        "usage_summary user_input " + terminal_finalization_keys,
+        "source_run_epoch usage_summary user_input user_input_supersession_intent "
+        "ambiguous_user_input_supersession_intent " + terminal_finalization_keys,
         owned_nested_paths=terminal_finalization_owned_paths
         | _resolution_actor_nested_paths("requested_by", "resolved_by")
         | _APPROVAL_NESTED_SCHEMA_PATHS
-        | _USER_INPUT_NESTED_SCHEMA_PATHS,
+        | _USER_INPUT_NESTED_SCHEMA_PATHS
+        | _USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS
+        | _AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_SCHEMA_PATHS,
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -2870,7 +2943,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         authority_keys={"execution_profile_fingerprint", "session_run_operation_id"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         nested_authority_paths=(
-            _APPROVAL_NESTED_AUTHORITY_PATHS | _USER_INPUT_NESTED_AUTHORITY_PATHS
+            _APPROVAL_NESTED_AUTHORITY_PATHS
+            | _USER_INPUT_NESTED_AUTHORITY_PATHS
+            | _USER_INPUT_SUPERSESSION_NESTED_AUTHORITY_PATHS
+            | _AMBIGUOUS_USER_INPUT_SUPERSESSION_NESTED_AUTHORITY_PATHS
         ),
         aliased_nested_authority_paths=_actionable_nested_authority_paths(
             _APPROVAL_NESTED_AUTHORITY_PATHS | _USER_INPUT_NESTED_AUTHORITY_PATHS
@@ -2902,8 +2978,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         untrusted_container_keys={"failures"},
     )
     policies[EventType.SESSION_AWAITING_USER_INPUT] = _observed_policy(
-        "execution_profile_fingerprint input_id model_attempt_id model_step_id options question "
-        "tool_call_id tool_calls tool_round_id",
+        "execution_profile_fingerprint input_id model_attempt_id model_step_id options pause_digest "
+        "question source_run_epoch tool_call_id tool_calls tool_round_id",
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={"input_id", "tool_call_id", "tool_round_id"},
@@ -2921,12 +2997,16 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "last_input_tokens last_total_tokens last_transcript_cursor min_input_tokens "
         "min_total_tokens mode model_attempt_id model_step_id "
         "newly_compacted_message_count operation_id "
-        "previous_compacted_transcript_cursor provider_count_context_window_tokens "
+        "pause_digest previous_compacted_transcript_cursor provider_count_context_window_tokens "
         "provider_count_input_tokens reason recent_message_count request_id "
-        "reserved_output_tokens result_transcript_cursor source_run_epoch "
+        "reserved_output_tokens resolution_request_digest result_transcript_cursor source_run_epoch "
         "source_transcript_cursor tool_call_id tool_round_id "
-        "trigger_estimated_context_tokens",
-        authority_keys={"execution_profile_fingerprint"},
+        "transition trigger_estimated_context_tokens",
+        authority_keys={
+            "execution_profile_fingerprint",
+            "pause_digest",
+            "resolution_request_digest",
+        },
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
     )
@@ -4564,6 +4644,8 @@ def _reject_secret_authority_values(
             "execution_profile_fingerprint",
             "exposure_fingerprint",
             "handoff_id",
+            "pause_digest",
+            "resolution_request_digest",
             *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
         } and (
             event_payload_authority_is_runtime_generated(

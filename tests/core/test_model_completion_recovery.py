@@ -907,6 +907,10 @@ async def _receiptless_pause_tail(
         }
     else:
         pending_pause = PendingUserInput(
+            session_id=session_id,
+            session_instance_id=promoted.session.instance_id,
+            source_interaction_id=staged.completion_event.interaction_id,
+            source_run_epoch=promoted.session.run_epoch,
             input_id=pause_id,
             **identity.payload(),
             tool_call_id=assistant_call.tool_call_id,
@@ -914,6 +918,7 @@ async def _receiptless_pause_tail(
             question="Continue?",
             arguments=assistant_call.arguments,
             agent_name="assistant",
+            execution_profile_fingerprint="e" * 64,
             tool_calls=pending_calls,
         )
         interruption_payload = {
@@ -2564,14 +2569,11 @@ def test_model_boundary_rejects_tool_results_without_publication_receipt() -> No
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("pause_kind", ["approval", "user-input"])
-def test_model_boundary_accepts_exact_receiptless_pause_continuation(
-    pause_kind: str,
-) -> None:
+def test_model_boundary_accepts_exact_receiptless_approval_continuation() -> None:
     async def run() -> None:
         tail = await _receiptless_pause_tail(
-            pause_kind=pause_kind,
-            session_id=f"model-recovery-{pause_kind}-tail",
+            pause_kind="approval",
+            session_id="model-recovery-approval-tail",
         )
         await tail.store.append_events(
             tail.staged.session.id,
@@ -2594,6 +2596,40 @@ def test_model_boundary_accepts_exact_receiptless_pause_continuation(
 
         assert reconciliation.state == "already_promoted"
         assert reconciliation.transcript_cursor == tail.staged.pointer.transcript_end_cursor + 1
+        assert tail.provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_model_boundary_rejects_receiptless_user_input_continuation() -> None:
+    async def run() -> None:
+        tail = await _receiptless_pause_tail(
+            pause_kind="user-input",
+            session_id="model-recovery-user-input-receiptless-tail",
+        )
+        await tail.store.append_events(
+            tail.staged.session.id,
+            [
+                tail.interruption_event,
+                tail.resume_event,
+                *tail.started_events,
+                *tail.terminal_events,
+            ],
+        )
+        await tail.store.append_transcript_messages(
+            tail.staged.session.id,
+            [tail.tool_result_message],
+        )
+        app = _register_runtime(tail.store, tail.provider)
+
+        with pytest.raises(
+            RuntimeError,
+            match="no exact publication authority",
+        ):
+            await app._recovery_coordinator.reconcile_model_completion_boundary(
+                tail.promoted_session
+            )
+
         assert tail.provider.requests == []
 
     asyncio.run(run())

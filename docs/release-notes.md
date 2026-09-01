@@ -460,6 +460,34 @@ a root digest alone cannot start or recover candidate effects. Existing
 materialization now protects its root before provider effects and releases that
 protection only after verified finalization.
 
+- Root checkpoints advance to schema version 6. Existing user-input pauses that
+  predate exact pause authority are retained as bounded ambiguous tombstones:
+  they cannot be resumed, recovery reports them explicitly, and an operator can
+  retire them with the normal session-interruption API without exposing the old
+  prompt or tool arguments.
+
+### External interruption atomically supersedes pending user input
+
+User-input pauses now use exact durable open and close publication receipts
+bound to the session incarnation, source interaction and run epoch, tool-round
+identity, execution profile, pause content, answer request, and complete
+resolution request. Before reconnecting an environment, publishing recovery
+evidence, running hooks, or dispatching sibling tools, an answer or manual-
+recovery claim atomically advances from `claimed` to `executing`. An operator
+interruption can supersede an active pause or a pre-execution claim and retains
+that exact authority in the interruption evidence. Once execution admission
+wins, interruption fails closed instead of falsely reporting supersession, and
+the exact execution owner remains fenced until it reaches a definite outcome.
+The losing pre-execution claim cannot dispatch continuation work, clear a later
+pause, or leave stale `pending_user_input` state behind.
+
+Identical retries after acknowledgement loss replay the original publication;
+conflicting answers fail without mutation. Incomplete-session recovery now
+distinguishes active, answering, answered, superseded, and ambiguous pause
+evidence and fails closed when the required receipt or authority tuple is
+missing. Memory, SQLite, and PostgreSQL stores enforce the same atomic
+publication contract.
+
 ### Classified transient provider failures retry by default
 
 `RetryPolicy()` now permits five total attempts instead of disabling retries.

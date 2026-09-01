@@ -29,6 +29,16 @@ def _identity() -> dict[str, str]:
     }
 
 
+def _user_input_authority() -> dict[str, str | int]:
+    return {
+        "session_id": "session_1",
+        "session_instance_id": "session-instance-1",
+        "source_interaction_id": "interaction-source-1",
+        "source_run_epoch": 1,
+        "execution_profile_fingerprint": "e" * 64,
+    }
+
+
 def _call(
     tool_call_id: str = "call_1",
     *,
@@ -143,6 +153,7 @@ def _user_input_with_unexposed_stage() -> PendingUserInput:
     exposure = _exposure_authority(profile_id="input-only", tool_names=("ask_user",))
     arguments = {"question": "Continue?"}
     return PendingUserInput(
+        **_user_input_authority(),
         input_id="input_1",
         **_identity(),
         tool_call_id="call_input",
@@ -177,6 +188,7 @@ def _user_input_with_unexposed_stage() -> PendingUserInput:
             tool_calls=calls,
         ),
         lambda calls: PendingUserInput(
+            **_user_input_authority(),
             input_id="input_1",
             **_identity(),
             tool_call_id="call_1",
@@ -243,6 +255,7 @@ def test_pending_user_input_pairs_targeted_calls_with_interaction_authority(
     arguments = {"question": "Continue?"}
     with pytest.raises(ValidationError, match="must be present together"):
         PendingUserInput(
+            **_user_input_authority(),
             input_id="input_1",
             **_identity(),
             tool_call_id="call_1",
@@ -275,6 +288,7 @@ def test_pending_user_input_pairs_targeted_calls_with_interaction_authority(
             tool_calls=[_call()],
         ),
         lambda: PendingUserInput(
+            **_user_input_authority(),
             input_id="input_1",
             **_identity(),
             tool_call_id="call_missing",
@@ -305,6 +319,7 @@ def test_pending_pause_state_requires_its_gating_call_in_the_round(build) -> Non
             tool_calls=[_call()],
         ),
         lambda: PendingUserInput(
+            **_user_input_authority(),
             input_id="input_1",
             **_identity(),
             tool_call_id="call_1",

@@ -36,9 +36,10 @@ from cayu.runtime.sessions import (
     SessionStatus,
 )
 from cayu.runtime.user_input import (
+    USER_INPUT_SUPERSESSION_INTENT_KEY,
     PendingUserInput,
-    pending_user_input_from_checkpoint,
     public_pending_user_input_prompt,
+    user_input_lifecycle_authority_from_checkpoint,
 )
 
 PENDING_ACTION_SESSION_STATUSES = frozenset(
@@ -121,7 +122,7 @@ def pending_action_evidence_round_from_checkpoint(
     """Return the one tool round represented by any pending control checkpoint."""
 
     approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-    pending_input = pending_user_input_from_checkpoint(checkpoint)
+    pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
     if approval is not None and pending_round is not None:
         if (
@@ -338,7 +339,7 @@ def pending_action_checkpoint_lookup_ids(
     except (TypeError, ValueError, ValidationError):
         approval = None
     try:
-        pending_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         pending_input = None
     try:
@@ -368,11 +369,13 @@ def pending_action_event_lookup_id(event: Event) -> str | None:
     payload = event.payload
     approval = _object_payload(payload.get("approval"))
     user_input = _object_payload(payload.get("user_input"))
+    user_input_supersession = _object_payload(payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY))
     if event.type in _LEDGER_EVENT_TYPES:
         tool_call_id = _optional_payload_string(payload, "tool_call_id")
         if tool_call_id is not None:
             return tool_call_id
     for value in (
+        _optional_payload_string(user_input_supersession, "input_id"),
         _optional_payload_string(payload, "approval_id"),
         _optional_payload_string(approval, "approval_id"),
         _optional_payload_string(payload, "input_id"),
@@ -837,7 +840,7 @@ def _pending_user_input_checkpoint_call(
     gating_only: bool = False,
 ) -> dict[str, Any] | None:
     try:
-        pending = pending_user_input_from_checkpoint(checkpoint)
+        pending, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):
         return None
     if pending is None or pending.input_id != input_id:
@@ -1244,7 +1247,7 @@ def pending_action_source_is_invalid(
         return True
     try:
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
-        pending_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
     except (TypeError, ValueError, ValidationError):

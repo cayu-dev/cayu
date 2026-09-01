@@ -501,6 +501,7 @@ _STALLED_RECOVERED_ACTIONS = {
     IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,
     IncompleteSessionRecoveryAction.PENDING_APPROVAL,
     IncompleteSessionRecoveryAction.PENDING_USER_INPUT,
+    IncompleteSessionRecoveryAction.AMBIGUOUS_PENDING_USER_INPUT,
 }
 
 

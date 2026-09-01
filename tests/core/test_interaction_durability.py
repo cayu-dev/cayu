@@ -1112,6 +1112,8 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
         expected_session_instance_id=None,
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
+        expected_recovery_claim_id=None,
+        expected_recovery_claim_clock=None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_model_completion_stage_settlements.append(model_completion_stage_settlement)
@@ -1125,6 +1127,8 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
             expected_session_instance_id=expected_session_instance_id,
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
+            expected_recovery_claim_id=expected_recovery_claim_id,
+            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
         if self.remaining_lost_acknowledgements > 0:
             self.remaining_lost_acknowledgements -= 1
@@ -1324,6 +1328,8 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
+        expected_recovery_claim_id: str | None = None,
+        expected_recovery_claim_clock=None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_from_statuses.append(set(from_statuses))
@@ -1338,6 +1344,8 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
             expected_session_instance_id=expected_session_instance_id,
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
+            expected_recovery_claim_id=expected_recovery_claim_id,
+            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
         if not self._lost_acknowledgement:
             self._lost_acknowledgement = True

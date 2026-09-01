@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import StrEnum
+from hashlib import sha256
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -7,6 +9,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
     copy_durable_json_value,
     require_durable_clean_nonblank,
     require_durable_nonblank,
@@ -39,6 +42,7 @@ from cayu.runtime.approvals import (
     copy_resolution_actor,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
+from cayu.runtime.checkpoints import AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -52,6 +56,66 @@ from cayu.runtime.tool_exposure import (
 from cayu.vaults import SecretRedactor, contains_redacted_secret
 
 PENDING_USER_INPUT_CHECKPOINT_KEY = "pending_user_input"
+USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY = "user_input_resolution_intent"
+USER_INPUT_SUPERSESSION_INTENT_KEY = "user_input_supersession_intent"
+AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY = "ambiguous_user_input_supersession_intent"
+
+
+class UserInputPauseState(StrEnum):
+    """Durable lifecycle classification for one exact user-input pause."""
+
+    ACTIVE = "active"
+    ANSWERING = "answering"
+    ANSWERED = "answered"
+    SUPERSEDED = "superseded"
+    AMBIGUOUS = "ambiguous"
+
+
+class AmbiguousUserInputPauseAuthorityError(RuntimeError):
+    """A supported checkpoint retains a pause without executable authority."""
+
+    state = UserInputPauseState.AMBIGUOUS
+
+    def __init__(self, source_checkpoint_digest: str) -> None:
+        self.source_checkpoint_digest = source_checkpoint_digest
+        super().__init__(
+            "Pending user input has ambiguous historical authority and cannot be resumed."
+        )
+
+
+class AmbiguousPendingUserInput(BaseModel):
+    """Content-free tombstone for a pre-authority supported pause."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    source_checkpoint_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    reason: Literal["missing_exact_pause_authority"]
+
+
+class AmbiguousUserInputSupersessionIntent(BaseModel):
+    """Explicit operator retirement of one ambiguous historical pause."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    session_id: str
+    session_instance_id: str
+    source_checkpoint_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    state: Literal["ambiguous"] = "ambiguous"
+
+    @field_validator("session_id", "session_instance_id")
+    @classmethod
+    def validate_nonblank_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class UserInputResponse(BaseModel):
@@ -141,12 +205,18 @@ class PendingUserInput(BaseModel):
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` persist the original
     run's configuration across the pause so resolving the question resumes with the same
     config instead of fresh defaults. A resolution request may restate those values only
-    when they preserve the invocation's frozen execution profile. They are optional so
-    checkpoints written before this state existed still load.
+    when they preserve the invocation's frozen execution profile. Older pauses without
+    exact authority migrate to a separate ambiguous tombstone and never instantiate this
+    executable model.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
+    schema_version: Literal[1] = 1
+    session_id: str
+    session_instance_id: str
+    source_interaction_id: str
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     input_id: str
     tool_round_id: str
     model_step_id: str
@@ -166,8 +236,7 @@ class PendingUserInput(BaseModel):
     workspace_id: str | None = None
     task_id: str | None = None
     interaction_id: str | None = None
-    execution_profile_fingerprint: str | None = Field(
-        default=None,
+    execution_profile_fingerprint: str = Field(
         min_length=64,
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
@@ -186,7 +255,15 @@ class PendingUserInput(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
 
-    @field_validator("input_id", "tool_call_id", "tool_name", "agent_name")
+    @field_validator(
+        "session_id",
+        "session_instance_id",
+        "source_interaction_id",
+        "input_id",
+        "tool_call_id",
+        "tool_name",
+        "agent_name",
+    )
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
@@ -389,11 +466,129 @@ class PendingUserInput(BaseModel):
 
 _RUNTIME_USER_INPUT_IDENTITY_FIELDS = (
     "input_id",
+    "tool_call_id",
     "model_step_id",
     "model_attempt_id",
     "tool_round_id",
 )
 _EXECUTION_PROFILE_FINGERPRINT_FIELD = "execution_profile_fingerprint"
+
+
+class UserInputResolutionIntent(BaseModel):
+    """Immutable request authority retained while one exact pause is resolving."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    session_id: str
+    session_instance_id: str
+    source_interaction_id: str
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    claim_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    input_id: str
+    tool_call_id: str
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
+    execution_profile_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    pause_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    answer_request_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    resolution_stage: Literal["answer", "manual-recovery"]
+    execution_state: Literal["claimed", "executing"]
+    resolution_request_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @field_validator(
+        "session_id",
+        "session_instance_id",
+        "source_interaction_id",
+        "input_id",
+        "tool_call_id",
+    )
+    @classmethod
+    def validate_nonblank_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_round_identity(self) -> UserInputResolutionIntent:
+        ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        return self
+
+
+class UserInputSupersessionIntent(BaseModel):
+    """Bounded proof that an operator interruption closed one exact pause."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    session_id: str
+    session_instance_id: str
+    source_interaction_id: str
+    source_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    input_id: str
+    tool_call_id: str
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
+    execution_profile_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    pause_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    state: Literal["active", "answering"]
+    claim_run_epoch: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    resolution_request_digest: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @field_validator(
+        "session_id",
+        "session_instance_id",
+        "source_interaction_id",
+        "input_id",
+        "tool_call_id",
+    )
+    @classmethod
+    def validate_nonblank_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> UserInputSupersessionIntent:
+        ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        has_claim = self.claim_run_epoch is not None
+        has_request = self.resolution_request_digest is not None
+        if has_claim != has_request or (self.state == "answering") != has_claim:
+            raise ValueError(
+                "User-input supersession answering state requires exact answer-claim authority."
+            )
+        return self
 
 
 def public_pending_user_input_prompt(
@@ -422,6 +617,9 @@ def public_pending_user_input_event_payload(
 
     payload = pending.model_dump(mode="json")
     payload.pop("run_limit_accounting", None)
+    payload.pop("session_id", None)
+    payload.pop("session_instance_id", None)
+    payload.pop("source_interaction_id", None)
     # Interaction identity is private checkpoint authority for targeted
     # continuation. The enclosing event carries its own attested interaction
     # envelope, while this public descriptor deliberately omits targeted-call
@@ -467,9 +665,10 @@ def pending_user_input_interruption_payload(
         raise TypeError("pending must be a PendingUserInput.")
     payload: dict[str, Any] = {
         "user_input": public_pending_user_input_event_payload(pending),
+        "source_run_epoch": pending.source_run_epoch,
+        "pause_digest": pending_user_input_digest(pending),
     }
-    if pending.execution_profile_fingerprint is not None:
-        payload[_EXECUTION_PROFILE_FINGERPRINT_FIELD] = pending.execution_profile_fingerprint
+    payload[_EXECUTION_PROFILE_FINGERPRINT_FIELD] = pending.execution_profile_fingerprint
     return payload
 
 
@@ -534,6 +733,11 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
     if type(pending) is not PendingUserInput:
         raise TypeError("Pending user input must be a PendingUserInput.")
     return PendingUserInput(
+        schema_version=pending.schema_version,
+        session_id=pending.session_id,
+        session_instance_id=pending.session_instance_id,
+        source_interaction_id=pending.source_interaction_id,
+        source_run_epoch=pending.source_run_epoch,
         input_id=pending.input_id,
         tool_round_id=pending.tool_round_id,
         model_step_id=pending.model_step_id,
@@ -579,6 +783,28 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
     )
 
 
+def ambiguous_pending_user_input_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> AmbiguousPendingUserInput | None:
+    """Load the bounded tombstone for a supported pre-authority pause."""
+
+    if checkpoint is None:
+        return None
+    value = checkpoint.get(AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY)
+    if value is None:
+        return None
+    if PENDING_USER_INPUT_CHECKPOINT_KEY in checkpoint:
+        raise ValueError(
+            "Checkpoint contains both exact and ambiguous pending user-input authority."
+        )
+    if type(value) is not dict:
+        raise ValueError("Ambiguous pending user-input checkpoint must be an object.")
+    try:
+        return AmbiguousPendingUserInput.model_validate(value)
+    except (TypeError, ValueError):
+        raise ValueError("Ambiguous pending user-input checkpoint is malformed.") from None
+
+
 def pending_user_input_from_checkpoint(
     checkpoint: dict[str, Any] | None,
     *,
@@ -590,6 +816,9 @@ def pending_user_input_from_checkpoint(
     if checkpoint is None:
         return None
     copied_checkpoint = copy_durable_json_value(checkpoint, "checkpoint")
+    ambiguous = ambiguous_pending_user_input_from_checkpoint(copied_checkpoint)
+    if ambiguous is not None:
+        raise AmbiguousUserInputPauseAuthorityError(ambiguous.source_checkpoint_digest) from None
     value = copied_checkpoint.get(PENDING_USER_INPUT_CHECKPOINT_KEY)
     if value is None:
         return None
@@ -768,3 +997,490 @@ def copy_user_input_recovery_request(
         thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+
+
+def pending_user_input_digest(pending: PendingUserInput) -> str:
+    """Bind every immutable decision-bearing field of one durable pause.
+
+    Terminal stages and the assistant publication projection are separately
+    CAS-owned continuation evidence and may advance while the pause identity
+    remains stable.
+    """
+
+    if type(pending) is not PendingUserInput:
+        raise TypeError("pending must be a PendingUserInput.")
+    document = pending.model_dump(mode="json")
+    document.pop("staged_terminals", None)
+    document.pop("assistant_publication", None)
+    return sha256(
+        canonical_durable_json_bytes(
+            document,
+            "pending_user_input",
+        )
+    ).hexdigest()
+
+
+def pending_user_input_identity(pending: PendingUserInput) -> dict[str, Any]:
+    """Return the complete bounded authority tuple for one pause."""
+
+    if type(pending) is not PendingUserInput:
+        raise TypeError("pending must be a PendingUserInput.")
+    return {
+        "schema_version": 1,
+        "session_id": pending.session_id,
+        "session_instance_id": pending.session_instance_id,
+        "source_interaction_id": pending.source_interaction_id,
+        "source_run_epoch": pending.source_run_epoch,
+        "input_id": pending.input_id,
+        "tool_call_id": pending.tool_call_id,
+        "tool_round_id": pending.tool_round_id,
+        "model_step_id": pending.model_step_id,
+        "model_attempt_id": pending.model_attempt_id,
+        "execution_profile_fingerprint": pending.execution_profile_fingerprint,
+        "pause_digest": pending_user_input_digest(pending),
+    }
+
+
+def user_input_supersession_intent_for(
+    pending: PendingUserInput,
+    *,
+    resolution_intent: UserInputResolutionIntent | None,
+) -> UserInputSupersessionIntent:
+    """Construct the exact operator-owned supersession of one active answer state."""
+
+    if resolution_intent is not None:
+        require_resolution_intent_matches_pending(resolution_intent, pending=pending)
+        if resolution_intent.execution_state != "claimed":
+            raise RuntimeError("Executing user-input resolution authority cannot be superseded.")
+    return UserInputSupersessionIntent(
+        **pending_user_input_identity(pending),
+        state="answering" if resolution_intent is not None else "active",
+        claim_run_epoch=(None if resolution_intent is None else resolution_intent.claim_run_epoch),
+        resolution_request_digest=(
+            None if resolution_intent is None else resolution_intent.resolution_request_digest
+        ),
+    )
+
+
+def ambiguous_user_input_supersession_intent_for(
+    pending: AmbiguousPendingUserInput,
+    *,
+    session_id: str,
+    session_instance_id: str,
+) -> AmbiguousUserInputSupersessionIntent:
+    """Bind explicit operator retirement to one historical pause tombstone."""
+
+    if type(pending) is not AmbiguousPendingUserInput:
+        raise TypeError("pending must be an AmbiguousPendingUserInput.")
+    return AmbiguousUserInputSupersessionIntent(
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+        source_checkpoint_digest=pending.source_checkpoint_digest,
+    )
+
+
+def event_with_user_input_supersession_authority(
+    event: Event,
+    intent: UserInputSupersessionIntent,
+) -> Event:
+    """Attest the bounded string identities in a validated supersession marker."""
+
+    if type(intent) is not UserInputSupersessionIntent:
+        raise TypeError("intent must be a UserInputSupersessionIntent.")
+    nested = event.payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+    expected = intent.model_dump(mode="json", exclude_none=True)
+    if nested != expected:
+        raise ValueError("Interruption event supersession marker changed before attestation.")
+    paths = tuple(
+        (USER_INPUT_SUPERSESSION_INTENT_KEY, field_name)
+        for field_name in (
+            "session_id",
+            "session_instance_id",
+            "source_interaction_id",
+            "input_id",
+            "tool_call_id",
+            "tool_round_id",
+            "model_step_id",
+            "model_attempt_id",
+            "execution_profile_fingerprint",
+            "pause_digest",
+            "state",
+            "resolution_request_digest",
+        )
+        if type(expected.get(field_name)) is str
+    )
+    return event_with_runtime_nested_payload_authority(event, *paths)
+
+
+def event_with_ambiguous_user_input_supersession_authority(
+    event: Event,
+    intent: AmbiguousUserInputSupersessionIntent,
+) -> Event:
+    """Attest content-free retirement evidence created by the runtime."""
+
+    if type(intent) is not AmbiguousUserInputSupersessionIntent:
+        raise TypeError("intent must be an AmbiguousUserInputSupersessionIntent.")
+    nested = event.payload.get(AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY)
+    expected = intent.model_dump(mode="json")
+    if nested != expected:
+        raise ValueError("Ambiguous user-input supersession changed before attestation.")
+    return event_with_runtime_nested_payload_authority(
+        event,
+        *(
+            (AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY, field_name)
+            for field_name in (
+                "session_id",
+                "session_instance_id",
+                "source_checkpoint_digest",
+                "state",
+            )
+        ),
+    )
+
+
+def _user_input_request_payload(
+    request: UserInputResponse | UserInputRecoveryRequest,
+) -> tuple[UserInputResponse | UserInputRecoveryRequest, dict[str, Any]]:
+    """Copy one request and return its shared answer-semantics projection."""
+
+    if type(request) not in (UserInputResponse, UserInputRecoveryRequest):
+        raise TypeError("request must be a user-input resolution request.")
+    if isinstance(request, UserInputResponse):
+        copied: UserInputResponse | UserInputRecoveryRequest = copy_user_input_response(request)
+    else:
+        assert isinstance(request, UserInputRecoveryRequest)
+        copied = copy_user_input_recovery_request(request)
+    document = copied.model_dump(
+        mode="json",
+        include={
+            "session_id",
+            "input_id",
+            "answer",
+            "structured",
+            "artifacts",
+            "metadata",
+            "resolved_by",
+            "max_steps",
+            "limits",
+            "budget_limits",
+            "retry_policy",
+            "structured_output",
+            "thinking",
+        },
+    )
+    document["loop_policies"] = [
+        {
+            "name": require_durable_clean_nonblank(policy.name, "loop_policies.name"),
+            "implementation": (
+                f"{require_durable_clean_nonblank(type(policy).__module__, 'loop_policies.module')}:"
+                f"{require_durable_clean_nonblank(type(policy).__qualname__, 'loop_policies.qualname')}"
+            ),
+            "replay_identity": policy.adoption_replay_identity,
+        }
+        for policy in copied.loop_policies
+    ]
+    return copied, document
+
+
+def user_input_answer_request_digest(
+    request: UserInputResponse | UserInputRecoveryRequest,
+) -> str:
+    """Bind the answer and continuation semantics shared by both entrances."""
+
+    _copied, document = _user_input_request_payload(request)
+    answer_document = {
+        field_name: document[field_name]
+        for field_name in (
+            "session_id",
+            "input_id",
+            "answer",
+            "structured",
+            "artifacts",
+            "metadata",
+            "resolved_by",
+        )
+    }
+    return sha256(
+        canonical_durable_json_bytes(answer_document, "user_input_answer_request")
+    ).hexdigest()
+
+
+def user_input_resolution_request_digest(
+    request: UserInputResponse | UserInputRecoveryRequest,
+) -> str:
+    """Bind every caller field that can affect one exact resolution operation."""
+
+    copied, document = _user_input_request_payload(request)
+    operation: dict[str, Any] = {
+        "kind": "answer" if type(copied) is UserInputResponse else "manual-recovery",
+        "answer": document,
+    }
+    if type(copied) is UserInputRecoveryRequest:
+        operation.update(
+            {
+                "tool_call_id": copied.tool_call_id,
+                "outcome": copied.outcome.value,
+                "message": copied.message,
+                "reason": copied.reason,
+            }
+        )
+    return sha256(
+        canonical_durable_json_bytes(operation, "user_input_resolution_request")
+    ).hexdigest()
+
+
+def user_input_resolution_intent_for(
+    pending: PendingUserInput,
+    *,
+    answer_request_digest: str,
+    resolution_stage: Literal["answer", "manual-recovery"],
+    resolution_request_digest: str,
+    claim_run_epoch: int,
+    execution_state: Literal["claimed", "executing"] = "claimed",
+) -> UserInputResolutionIntent:
+    """Construct the immutable resolution claim for an exact pause."""
+
+    identity = pending_user_input_identity(pending)
+    return UserInputResolutionIntent(
+        **identity,
+        claim_run_epoch=claim_run_epoch,
+        answer_request_digest=answer_request_digest,
+        resolution_stage=resolution_stage,
+        execution_state=execution_state,
+        resolution_request_digest=resolution_request_digest,
+    )
+
+
+def user_input_resolution_intent_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> UserInputResolutionIntent | None:
+    if checkpoint is None:
+        return None
+    copied = copy_durable_json_value(checkpoint, "checkpoint")
+    value = copied.get(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY)
+    if value is None:
+        return None
+    if redactor is not None and durable_value_contains_secret(
+        value,
+        redactor=redactor,
+        path=(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,),
+    ):
+        raise ValueError(
+            "User-input resolution intent contains a workload secret and cannot be executed."
+        )
+    if type(value) is not dict:
+        raise ValueError("User-input resolution intent checkpoint must be an object.")
+    try:
+        return UserInputResolutionIntent.model_validate(value)
+    except Exception:
+        if redactor is None:
+            raise
+        raise ValueError(
+            "User-input resolution intent checkpoint is invalid and cannot be executed."
+        ) from None
+
+
+def require_resolution_intent_matches_pending(
+    intent: UserInputResolutionIntent,
+    *,
+    pending: PendingUserInput,
+    answer_request_digest: str | None = None,
+    resolution_stage: Literal["answer", "manual-recovery"] | None = None,
+    resolution_request_digest: str | None = None,
+) -> None:
+    if type(intent) is not UserInputResolutionIntent:
+        raise TypeError("intent must be a UserInputResolutionIntent.")
+    expected = user_input_resolution_intent_for(
+        pending,
+        answer_request_digest=(
+            intent.answer_request_digest if answer_request_digest is None else answer_request_digest
+        ),
+        resolution_stage=(
+            intent.resolution_stage if resolution_stage is None else resolution_stage
+        ),
+        resolution_request_digest=(
+            intent.resolution_request_digest
+            if resolution_request_digest is None
+            else resolution_request_digest
+        ),
+        claim_run_epoch=intent.claim_run_epoch,
+        execution_state=intent.execution_state,
+    )
+    if intent != expected:
+        raise RuntimeError("User-input resolution intent conflicts with its pending pause.")
+
+
+def user_input_lifecycle_authority_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor | None = None,
+    consume_on_rejection: bool = False,
+    current_run_epoch: int | None = None,
+) -> tuple[PendingUserInput | None, UserInputResolutionIntent | None]:
+    """Load one coherent pause/answer-claim topology from a checkpoint.
+
+    An answer claim is never independent authority: it is meaningful only
+    while its exact pending pause remains present.  Keep this validation at
+    every lifecycle entrance so generic recovery, interruption, and profile
+    admission cannot reinterpret an orphan claim as ordinary checkpoint data.
+    """
+
+    pending = pending_user_input_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+        consume_on_rejection=consume_on_rejection,
+    )
+    intent = user_input_resolution_intent_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if intent is not None:
+        if pending is None:
+            raise RuntimeError("User-input resolution intent has no exact pending pause authority.")
+        require_resolution_intent_matches_pending(intent, pending=pending)
+        if intent.claim_run_epoch <= pending.source_run_epoch:
+            raise RuntimeError("User-input resolution intent does not follow its pause run epoch.")
+    if current_run_epoch is not None:
+        if type(current_run_epoch) is not int or current_run_epoch < 0:
+            raise TypeError("current_run_epoch must be a non-negative integer or None.")
+        if pending is not None:
+            expected_epoch = pending.source_run_epoch if intent is None else intent.claim_run_epoch
+            # The active owner starts at ``expected_epoch``. Exact lifecycle
+            # release and later recovery fences may advance the durable epoch
+            # repeatedly while retaining the same pause or answer request, but
+            # durable pause authority can never originate in a future epoch.
+            if current_run_epoch < expected_epoch:
+                raise RuntimeError("User-input lifecycle conflicts with the session run epoch.")
+    return pending, intent
+
+
+def checkpoint_with_user_input_resolution_intent(
+    checkpoint: dict[str, Any] | None,
+    *,
+    pending: PendingUserInput,
+    answer_request_digest: str,
+    resolution_stage: Literal["answer", "manual-recovery"],
+    resolution_request_digest: str,
+    claim_run_epoch: int,
+    redactor: SecretRedactor,
+    allow_answer_to_manual_recovery: bool = False,
+    allow_manual_recovery_to_answer: bool = False,
+) -> tuple[dict[str, Any], UserInputResolutionIntent]:
+    """Set or validate one exact resolution claim under the session transition lock."""
+
+    if type(allow_answer_to_manual_recovery) is not bool:
+        raise TypeError("allow_answer_to_manual_recovery must be a boolean.")
+    if type(allow_manual_recovery_to_answer) is not bool:
+        raise TypeError("allow_manual_recovery_to_answer must be a boolean.")
+    copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    current_pending = pending_user_input_from_checkpoint(copied, redactor=redactor)
+    if current_pending != pending:
+        raise RuntimeError("Pending user input changed before the answer was claimed.")
+    current_intent = user_input_resolution_intent_from_checkpoint(copied, redactor=redactor)
+    if current_intent is not None:
+        require_resolution_intent_matches_pending(current_intent, pending=pending)
+        if current_intent.answer_request_digest != answer_request_digest:
+            raise RuntimeError(
+                "User input was already claimed with a different resolution request."
+            )
+        same_stage = current_intent.resolution_stage == resolution_stage
+        allowed_stage_transition = (
+            allow_answer_to_manual_recovery
+            and current_intent.resolution_stage == "answer"
+            and resolution_stage == "manual-recovery"
+        ) or (
+            allow_manual_recovery_to_answer
+            and current_intent.resolution_stage == "manual-recovery"
+            and resolution_stage == "answer"
+        )
+        if not same_stage and not allowed_stage_transition:
+            raise RuntimeError(
+                "User input was already claimed with a different resolution request."
+            )
+        if same_stage and current_intent.resolution_request_digest != resolution_request_digest:
+            raise RuntimeError(
+                "User input was already claimed with a different resolution request."
+            )
+        if current_intent.claim_run_epoch == claim_run_epoch:
+            if (
+                not same_stage
+                or current_intent.resolution_request_digest != resolution_request_digest
+            ):
+                raise RuntimeError(
+                    "User input cannot replace resolution authority within one run epoch."
+                )
+            return copied, current_intent
+        current_intent = user_input_resolution_intent_for(
+            pending,
+            answer_request_digest=answer_request_digest,
+            resolution_stage=resolution_stage,
+            resolution_request_digest=resolution_request_digest,
+            claim_run_epoch=claim_run_epoch,
+        )
+        copied[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = current_intent.model_dump(mode="json")
+        return copied, current_intent
+    intent = user_input_resolution_intent_for(
+        pending,
+        answer_request_digest=answer_request_digest,
+        resolution_stage=resolution_stage,
+        resolution_request_digest=resolution_request_digest,
+        claim_run_epoch=claim_run_epoch,
+    )
+    copied[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = intent.model_dump(mode="json")
+    return copied, intent
+
+
+def checkpoint_with_executing_user_input_resolution_intent(
+    checkpoint: dict[str, Any] | None,
+    *,
+    current_run_epoch: int,
+    pending: PendingUserInput,
+    intent: UserInputResolutionIntent,
+    redactor: SecretRedactor,
+) -> tuple[dict[str, Any], UserInputResolutionIntent]:
+    """Atomically admit governed continuation work for one exact resolution claim."""
+
+    if type(current_run_epoch) is not int or current_run_epoch < 0:
+        raise TypeError("current_run_epoch must be a non-negative integer.")
+    if current_run_epoch != intent.claim_run_epoch:
+        raise RuntimeError("User-input resolution lost its claimed run epoch.")
+    copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    current_pending, current_intent = user_input_lifecycle_authority_from_checkpoint(
+        copied,
+        redactor=redactor,
+        current_run_epoch=current_run_epoch,
+    )
+    if current_pending != pending or current_intent is None or current_intent != intent:
+        raise RuntimeError("User-input resolution authority changed before execution admission.")
+    if current_intent.execution_state == "executing":
+        return copied, current_intent
+    executing = current_intent.model_copy(update={"execution_state": "executing"})
+    copied[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = executing.model_dump(mode="json")
+    return copied, executing
+
+
+def checkpoint_without_exact_pending_user_input(
+    checkpoint: dict[str, Any] | None,
+    *,
+    pending: PendingUserInput,
+    intent: UserInputResolutionIntent,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    """Clear only the exact pause and answer claim that own a close publication."""
+
+    copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    current_pending = pending_user_input_from_checkpoint(copied, redactor=redactor)
+    current_intent = user_input_resolution_intent_from_checkpoint(copied, redactor=redactor)
+    if (
+        current_pending is None
+        or current_intent is None
+        or current_pending != pending
+        or current_intent != intent
+    ):
+        raise RuntimeError("Pending user-input authority changed before atomic closure.")
+    require_resolution_intent_matches_pending(current_intent, pending=current_pending)
+    copied.pop(PENDING_USER_INPUT_CHECKPOINT_KEY)
+    copied.pop(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY)
+    return copied

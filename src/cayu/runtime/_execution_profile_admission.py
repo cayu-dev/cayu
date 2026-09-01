@@ -42,7 +42,7 @@ from cayu.runtime.tool_discovery import (
     tool_discovery_execution_profile_material,
 )
 from cayu.runtime.tool_gateway import call_tool_gateway_execution_profile_material
-from cayu.runtime.user_input import pending_user_input_from_checkpoint
+from cayu.runtime.user_input import user_input_lifecycle_authority_from_checkpoint
 from cayu.vaults import SecretRedactor
 
 _MODEL_FINALIZATION_MATERIAL_KIND = "cayu:model-finalization:v2"
@@ -750,6 +750,12 @@ def prepare_execution_profile_continuation(
             "Active invocation execution profile does not match the session run epoch: "
             f"snapshot={snapshot.run_epoch}, session={session.run_epoch}."
         )
+    pending_user_input, _resolution_intent = user_input_lifecycle_authority_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+        consume_on_rejection=True,
+        current_run_epoch=session.run_epoch,
+    )
     pending_profile_fingerprints = {
         pending.execution_profile_fingerprint
         for pending in (
@@ -763,11 +769,7 @@ def prepare_execution_profile_continuation(
                 redactor=redactor,
                 consume_on_rejection=True,
             ),
-            pending_user_input_from_checkpoint(
-                checkpoint,
-                redactor=redactor,
-                consume_on_rejection=True,
-            ),
+            pending_user_input,
         )
         if pending is not None
     }

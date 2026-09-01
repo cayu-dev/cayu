@@ -30,6 +30,8 @@ from tests.core.transcript_search_conformance import (
 )
 
 import cayu.runtime._model_step_executor as model_step_executor_module
+import cayu.runtime._recovery_coordinator as recovery_coordinator_module
+import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.fork_groups as fork_group_module
 import cayu.runtime.sessions as sessions_module
@@ -65,6 +67,7 @@ from cayu import (
     WeightedReciprocalRankFusionConfig,
     runtime_evidence,
 )
+from cayu._exception_groups import iter_exception_tree
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
@@ -230,6 +233,7 @@ from cayu.runtime import (
     ToolRoundIdentity,
     TranscriptQuery,
     UsageRollupQuery,
+    UserInputResponse,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
@@ -242,6 +246,7 @@ from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     REDACTED_CUSTOM_EVENT_TYPE,
     public_event_id,
+    public_event_linkage_id,
     public_event_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -304,6 +309,14 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
 )
 from cayu.runtime.usage import UsageMetrics
+from cayu.runtime.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY,
+    PendingUserInput,
+    user_input_answer_request_digest,
+    user_input_resolution_intent_for,
+    user_input_resolution_request_digest,
+)
 from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationArtifact,
     WorkspaceObservationArtifactState,
@@ -324,6 +337,7 @@ from cayu.tools.shared_artifacts import (
     SharedArtifactPolicy,
     SharedArtifactRef,
 )
+from cayu.tools.user_input import UserInputTool
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace
 
@@ -781,6 +795,10 @@ async def _close_store(store: SessionStore) -> None:
         await close()
 
 
+async def _collect_events(stream: AsyncIterator[Event]) -> list[Event]:
+    return [event async for event in stream]
+
+
 async def _private_event_for_public_event(store: SessionStore, event: Event) -> Event:
     sequence = public_event_sequence(event.id)
     assert sequence is not None
@@ -1182,6 +1200,35 @@ class _ApprovalRecoveryProvider(ModelProvider):
             id="call_policy_recovery",
             name="stateful_effect",
             arguments={"value": "must remain gated"},
+        )
+        yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+
+class _UserInputRecoveryProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self, *, complete_without_tools: bool = False) -> None:
+        self._complete_without_tools = complete_without_tools
+        self.requests: list[ModelRequest] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:session-store-conformance:user-input-recovery-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if self._complete_without_tools:
+            yield ModelStreamEvent.text_delta("answer accepted")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        yield ModelStreamEvent.tool_call(
+            id="call_user_input",
+            name="ask_user",
+            arguments={"question": "Continue?"},
         )
         yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
 
@@ -4978,6 +5025,21 @@ async def _reopen_store(case, store: SessionStore) -> SessionStore:
     )
 
 
+async def _open_peer_store(case, store: SessionStore) -> SessionStore:
+    store_kind, tmp_path, postgres_dsn = case
+    if store_kind == "memory":
+        return store
+    if store_kind == "sqlite":
+        return SQLiteSessionStore(
+            tmp_path / "sessions.sqlite",
+            public_authority_alias_codec=store.public_authority_alias_codec,
+        )
+    return _new_postgres_store(
+        postgres_dsn,
+        public_authority_alias_codec=store.public_authority_alias_codec,
+    )
+
+
 def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
     session_store_case,
 ) -> None:
@@ -7499,6 +7561,3393 @@ def test_session_store_conformance_approval_open_and_close_lost_ack_replay_exact
             assert deferred.interaction_id == later_interaction_id
             assert deferred.source_messages == [later_message]
             assert later_message not in await store.load_transcript(session_id)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_user_input_open_close_process_loss_and_exact_replay(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"user-input-process-loss-{session_store_case[0]}"
+        try:
+            opening_publish = store.publish_runtime_publication
+            lost_ack_kinds: set[str] = set()
+            stale_instance_rejected = False
+            open_event_authority_rejected = False
+
+            async def publish_then_lose_ack(session_id: str, **kwargs):
+                nonlocal open_event_authority_rejected, stale_instance_rejected
+                request = kwargs["request"]
+                if request.kind == "user-input-open" and not open_event_authority_rejected:
+                    checkpoint_before = await store.load_checkpoint(session_id)
+                    events_before = await store.load_events(session_id)
+                    mutations = (
+                        (0, "checkpoint", "pending_tool_round"),
+                        (0, "source_run_epoch", request.intent["source_run_epoch"] + 1),
+                        (
+                            1,
+                            "pause_digest",
+                            "0" * 64 if request.intent["pause_digest"] != "0" * 64 else "1" * 64,
+                        ),
+                        (
+                            1,
+                            "execution_profile_fingerprint",
+                            "0" * 64
+                            if request.intent["execution_profile_fingerprint"] != "0" * 64
+                            else "1" * 64,
+                        ),
+                    )
+                    for event_index, field_name, value in mutations:
+                        malformed_events = list(request.events)
+                        source_event = malformed_events[event_index]
+                        malformed_events[event_index] = source_event.model_copy(
+                            update={"payload": {**source_event.payload, field_name: value}}
+                        )
+                        malformed_request = request.model_copy(
+                            update={"events": tuple(malformed_events)}
+                        )
+                        with pytest.raises(
+                            ValueError,
+                            match="opening events conflict with their pause authority",
+                        ):
+                            await opening_publish(
+                                session_id,
+                                **{**kwargs, "request": malformed_request},
+                            )
+                        assert await store.load_checkpoint(session_id) == checkpoint_before
+                        assert await store.load_events(session_id) == events_before
+                        assert (
+                            await store.load_runtime_publication_receipt(
+                                session_id,
+                                request.publication_id,
+                            )
+                            is None
+                        )
+                    open_event_authority_rejected = True
+                if request.kind == "user-input-open" and not stale_instance_rejected:
+                    stale_instance_rejected = True
+                    stale_instance_id = f"stale-{uuid4()}"
+                    malformed_intent = {
+                        **request.intent,
+                        "session_instance_id": stale_instance_id,
+                    }
+                    malformed_operations = tuple(
+                        operation.model_copy(
+                            update={
+                                "value": {
+                                    **cast("dict[str, Any]", operation.value),
+                                    "session_instance_id": stale_instance_id,
+                                }
+                            }
+                        )
+                        if operation.key == "pending_user_input"
+                        else operation
+                        for operation in request.mutation.operations
+                    )
+                    malformed_request = request.model_copy(
+                        update={
+                            "intent": malformed_intent,
+                            "mutation": request.mutation.model_copy(
+                                update={"operations": malformed_operations}
+                            ),
+                        }
+                    )
+                    with pytest.raises(
+                        (ValueError, SessionRuntimePublicationConflict),
+                        match="session|invocation authority",
+                    ):
+                        await opening_publish(
+                            session_id,
+                            **{**kwargs, "request": malformed_request},
+                        )
+                result = await opening_publish(session_id, **kwargs)
+                kind = request.kind
+                if kind == "user-input-open" and kind not in lost_ack_kinds:
+                    lost_ack_kinds.add(kind)
+                    raise OSError("user-input-open process lost after commit")
+                return result
+
+            store.publish_runtime_publication = publish_then_lose_ack  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            paused = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            ]
+            awaiting = next(
+                event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+            )
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            opened_checkpoint = checkpoint
+            private_input_id = checkpoint["pending_user_input"]["input_id"]
+            open_receipt = await store.load_runtime_publication_receipt(
+                session_id,
+                f"user-input-open:{private_input_id}",
+            )
+            assert open_receipt is not None
+            assert lost_ack_kinds == {"user-input-open"}
+            assert stale_instance_rejected is True
+            assert open_event_authority_rejected is True
+
+            store = await _reopen_store(session_store_case, store)
+            closing_publish = store.publish_runtime_publication
+            omitted_lifecycle_evidence_rejected = False
+            close_event_authority_rejected = False
+
+            async def close_then_lose_ack(session_id: str, **kwargs):
+                nonlocal close_event_authority_rejected, omitted_lifecycle_evidence_rejected
+                request = kwargs["request"]
+                if request.kind == "user-input-close" and not close_event_authority_rejected:
+                    checkpoint_before = await store.load_checkpoint(session_id)
+                    events_before = await store.load_events(session_id)
+                    for field_name, value in (
+                        ("checkpoint", "pending_tool_round"),
+                        ("source_run_epoch", request.intent["source_run_epoch"] + 1),
+                    ):
+                        source_event = request.events[0]
+                        malformed_request = request.model_copy(
+                            update={
+                                "events": (
+                                    source_event.model_copy(
+                                        update={
+                                            "payload": {
+                                                **source_event.payload,
+                                                field_name: value,
+                                            }
+                                        }
+                                    ),
+                                )
+                            }
+                        )
+                        with pytest.raises(
+                            ValueError,
+                            match="closure event conflicts with its intent",
+                        ):
+                            await closing_publish(
+                                session_id,
+                                **{**kwargs, "request": malformed_request},
+                            )
+                        assert await store.load_checkpoint(session_id) == checkpoint_before
+                        assert await store.load_events(session_id) == events_before
+                        assert (
+                            await store.load_runtime_publication_receipt(
+                                session_id,
+                                request.publication_id,
+                            )
+                            is None
+                        )
+                    close_event_authority_rejected = True
+                if request.kind == "user-input-close" and not omitted_lifecycle_evidence_rejected:
+                    omitted_lifecycle_evidence_rejected = True
+                    assert request.referenced_events
+                    retained_references = request.referenced_events[:-1]
+                    malformed_request = request.model_copy(
+                        update={
+                            "intent": {
+                                **request.intent,
+                                "referenced_event_ids": [
+                                    reference.event_id for reference in retained_references
+                                ],
+                            },
+                            "referenced_events": retained_references,
+                        }
+                    )
+                    with pytest.raises(
+                        SessionRuntimePublicationConflict,
+                        match="bind every durable lifecycle event",
+                    ):
+                        await closing_publish(
+                            session_id,
+                            **{**kwargs, "request": malformed_request},
+                        )
+                result = await closing_publish(session_id, **kwargs)
+                kind = request.kind
+                if kind == "user-input-close" and kind not in lost_ack_kinds:
+                    lost_ack_kinds.add(kind)
+                    raise OSError("user-input-close process lost after commit")
+                return result
+
+            store.publish_runtime_publication = close_then_lose_ack  # type: ignore[method-assign]
+            continuation_provider = _UserInputRecoveryProvider(complete_without_tools=True)
+            resumed_app = CayuApp(session_store=store, enable_logging=False)
+            resumed_app.register_provider(continuation_provider, default=True)
+            resumed_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            response = UserInputResponse(
+                session_id=session_id,
+                input_id=awaiting.payload["input_id"],
+                answer="yes",
+                metadata={"source": "conformance"},
+            )
+            resolved = [event async for event in resumed_app.resolve_user_input(response)]
+            assert resolved[-1].type is EventType.SESSION_COMPLETED
+            assert lost_ack_kinds == {"user-input-open", "user-input-close"}
+            assert omitted_lifecycle_evidence_rejected is True
+            assert close_event_authority_rejected is True
+            assert len(continuation_provider.requests) == 1
+            close_receipt = await store.load_runtime_publication_receipt(
+                session_id,
+                f"user-input-close:{private_input_id}",
+            )
+            assert close_receipt is not None
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "user_input_resolution_intent" not in checkpoint
+
+            store = await _reopen_store(session_store_case, store)
+            replay_provider = _UserInputRecoveryProvider(complete_without_tools=True)
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(replay_provider, default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            replayed = [event async for event in replay_app.resolve_user_input(response)]
+            private_replayed = [
+                await _private_event_for_public_event(store, event) for event in replayed
+            ]
+            assert tuple(event.id for event in private_replayed) == (
+                close_receipt.appended_event_ids
+            )
+            assert replay_provider.requests == []
+
+            original_checkpoint_loader = store.load_checkpoint
+
+            async def load_conflicting_open_checkpoint(session_id: str):
+                assert session_id == response.session_id
+                return opened_checkpoint
+
+            store.load_checkpoint = load_conflicting_open_checkpoint  # type: ignore[method-assign]
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="conflicts with durable lifecycle state",
+            ):
+                _ = [event async for event in replay_app.resolve_user_input(response)]
+            store.load_checkpoint = original_checkpoint_loader  # type: ignore[method-assign]
+
+            original_receipt_loader = store.load_runtime_publication_receipt
+
+            async def load_receipt_with_conflicting_open_authority(
+                session_id: str,
+                publication_id: str,
+            ):
+                loaded = await original_receipt_loader(session_id, publication_id)
+                if loaded is None or publication_id != f"user-input-close:{private_input_id}":
+                    return loaded
+                return loaded.model_copy(
+                    update={
+                        "intent": {
+                            **loaded.intent,
+                            "execution_profile_fingerprint": "0" * 64,
+                        }
+                    }
+                )
+
+            store.load_runtime_publication_receipt = (  # type: ignore[method-assign]
+                load_receipt_with_conflicting_open_authority
+            )
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="conflicts with durable lifecycle state",
+            ):
+                _ = [event async for event in replay_app.resolve_user_input(response)]
+            store.load_runtime_publication_receipt = original_receipt_loader  # type: ignore[method-assign]
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="conflicting resolution authority",
+            ):
+                _ = [
+                    event
+                    async for event in replay_app.resolve_user_input(
+                        response.model_copy(update={"answer": "different"})
+                    )
+                ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_user_input_open_close_cancellation_reconstructs_exact_receipts(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"user-input-cancellation-{session_store_case[0]}"
+        try:
+            original_publish = store.publish_runtime_publication
+            open_committed = asyncio.Event()
+            release_open_acknowledgement = asyncio.Event()
+            open_blocked = False
+
+            async def hold_open_acknowledgement(session_id: str, **kwargs):
+                nonlocal open_blocked
+                result = await original_publish(session_id, **kwargs)
+                if kwargs["request"].kind == "user-input-open" and not open_blocked:
+                    open_blocked = True
+                    open_committed.set()
+                    await release_open_acknowledgement.wait()
+                return result
+
+            store.publish_runtime_publication = hold_open_acknowledgement  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            opening = asyncio.create_task(
+                _collect_events(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "ask a question")],
+                        )
+                    )
+                )
+            )
+            await asyncio.wait_for(open_committed.wait(), timeout=5)
+            assert opening.cancelling() == 0
+            opening.cancel("cancel user-input open acknowledgement")
+            assert opening.cancelling() == 1
+            release_open_acknowledgement.set()
+            with pytest.raises(asyncio.CancelledError) as open_cancellation:
+                await opening
+            assert open_cancellation.value.args == ("cancel user-input open acknowledgement",)
+            assert opening.cancelled() is True
+            # The publication owner consumes the request while it settles the
+            # committed child, then raises the preserved cancellation.
+            assert opening.cancelling() == 0
+            store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
+
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            private_input_id = checkpoint["pending_user_input"]["input_id"]
+            open_receipt = await store.load_runtime_publication_receipt(
+                session_id,
+                f"user-input-open:{private_input_id}",
+            )
+            assert open_receipt is not None
+            awaiting_records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_AWAITING_USER_INPUT,
+                )
+            )
+            assert len(awaiting_records) == 1
+            public_input_id = public_event_linkage_id(
+                awaiting_records[0].sequence,
+                "input_id",
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            original_publish = store.publish_runtime_publication
+            close_committed = asyncio.Event()
+            release_close_acknowledgement = asyncio.Event()
+            close_blocked = False
+
+            async def hold_close_acknowledgement(session_id: str, **kwargs):
+                nonlocal close_blocked
+                result = await original_publish(session_id, **kwargs)
+                if kwargs["request"].kind == "user-input-close" and not close_blocked:
+                    close_blocked = True
+                    close_committed.set()
+                    await release_close_acknowledgement.wait()
+                return result
+
+            store.publish_runtime_publication = hold_close_acknowledgement  # type: ignore[method-assign]
+            resumed_provider = _UserInputRecoveryProvider(complete_without_tools=True)
+            resumed_app = CayuApp(session_store=store, enable_logging=False)
+            resumed_app.register_provider(resumed_provider, default=True)
+            resumed_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            response = UserInputResponse(
+                session_id=session_id,
+                input_id=public_input_id,
+                answer="yes",
+                metadata={"source": "cancellation-conformance"},
+            )
+            closing = asyncio.create_task(_collect_events(resumed_app.resolve_user_input(response)))
+            await asyncio.wait_for(close_committed.wait(), timeout=5)
+            assert closing.cancelling() == 0
+            closing.cancel("cancel user-input close acknowledgement")
+            assert closing.cancelling() == 1
+            release_close_acknowledgement.set()
+            with pytest.raises(asyncio.CancelledError) as close_cancellation:
+                await closing
+            assert close_cancellation.value.args == ("cancel user-input close acknowledgement",)
+            assert closing.cancelled() is True
+            assert closing.cancelling() == 0
+            store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
+
+            close_receipt = await store.load_runtime_publication_receipt(
+                session_id,
+                f"user-input-close:{private_input_id}",
+            )
+            assert close_receipt is not None
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "user_input_resolution_intent" not in checkpoint
+            assert resumed_provider.requests == []
+
+            store = await _reopen_store(session_store_case, store)
+            replay_provider = _UserInputRecoveryProvider(complete_without_tools=True)
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(replay_provider, default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            replayed = [event async for event in replay_app.resolve_user_input(response)]
+            private_replayed = [
+                await _private_event_for_public_event(store, event) for event in replayed
+            ]
+            assert tuple(event.id for event in private_replayed) == close_receipt.appended_event_ids
+            assert replay_provider.requests == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_supersedes_fully_paused_user_input(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"user-input-steady-supersession-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            paused = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            ]
+            paused_session = await store.load(session_id)
+            assert paused_session is not None
+            assert paused_session.status is SessionStatus.INTERRUPTED
+            awaiting = next(
+                event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+            )
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            private_input_id = checkpoint["pending_user_input"]["input_id"]
+
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes fully published pause",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                interrupted = await _collect_events(app.interrupt_session(request))
+            assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
+            assert interrupted[-1].payload["interruption_type"] == "operator_requested"
+
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "user_input_resolution_intent" not in checkpoint
+            operator_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(operator_records) == 1
+            marker = operator_records[0].event.payload["user_input_supersession_intent"]
+            assert marker["state"] == "active"
+            assert marker["input_id"] == private_input_id
+
+            store = await _reopen_store(session_store_case, store)
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                replayed = await _collect_events(replay_app.interrupt_session(request))
+            assert replayed[-1].id == interrupted[-1].id
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="superseded by an external interruption",
+            ):
+                _ = [
+                    event
+                    async for event in replay_app.resolve_user_input(
+                        UserInputResponse(
+                            session_id=session_id,
+                            input_id=awaiting.payload["input_id"],
+                            answer="stale",
+                        )
+                    )
+                ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_recovers_user_input_supersession_after_process_loss(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"user-input-supersession-process-loss-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+
+            original_transition = store.transition_status_and_checkpoint
+            process_loss_injected = False
+
+            async def commit_interrupt_then_lose_ack(*args, **kwargs):
+                nonlocal process_loss_injected
+                transitioned = await original_transition(*args, **kwargs)
+                if (
+                    kwargs.get("to_status") is SessionStatus.INTERRUPTING
+                    and not process_loss_injected
+                ):
+                    process_loss_injected = True
+                    raise _SimulatedProcessLoss(
+                        "process stopped after user-input supersession committed"
+                    )
+                return transitioned
+
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                commit_interrupt_then_lose_ack
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(
+                    _SimulatedProcessLoss,
+                    match="after user-input supersession committed",
+                ),
+            ):
+                await _collect_events(app.interrupt_session(request))
+            assert process_loss_injected is True
+            store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
+
+            interrupted = await store.load(session_id)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert interrupted is not None
+            assert interrupted.status is SessionStatus.INTERRUPTING
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            pending_interrupt = checkpoint["pending_session_interrupt"]
+            assert pending_interrupt["interruption_type"] == "operator_requested"
+            assert pending_interrupt["user_input_supersession_intent"]["state"] == "active"
+
+            store = await _reopen_store(session_store_case, store)
+            recovery_app = CayuApp(session_store=store, enable_logging=False)
+            recovery_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            recovery_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                recovered = await _collect_events(recovery_app.interrupt_session(request))
+            assert recovered[-1].type is EventType.SESSION_INTERRUPTED
+            assert recovered[-1].payload["interruption_type"] == "operator_requested"
+
+            finalized = await store.load(session_id)
+            finalized_checkpoint = await store.load_checkpoint(session_id)
+            assert finalized is not None
+            assert finalized.status is SessionStatus.INTERRUPTED
+            assert finalized_checkpoint is not None
+            assert "pending_session_interrupt" not in finalized_checkpoint
+            operator_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(operator_records) == 1
+            assert (
+                operator_records[0].event.id
+                == (await _private_event_for_public_event(store, recovered[-1])).id
+            )
+
+            with session_engine_module.suppress_interruption_cascade():
+                replayed = await _collect_events(recovery_app.interrupt_session(request))
+            assert replayed[-1].id == recovered[-1].id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("preparation_failure_type", "expected_failure_type", "expected_message"),
+    [
+        pytest.param(
+            OSError,
+            OSError,
+            "provider cancellation preparation failed",
+            id="ordinary-failure",
+        ),
+        pytest.param(
+            ValueError,
+            TimeoutError,
+            "Session interruption is still finalizing",
+            id="value-error-reconciliation",
+        ),
+        pytest.param(
+            SessionRuntimePublicationConflict,
+            SessionRuntimePublicationConflict,
+            "provider cancellation preparation failed",
+            id="publication-conflict",
+        ),
+    ],
+)
+def test_session_store_conformance_releases_offline_supersession_claim_after_preparation_failure(
+    session_store_case,
+    preparation_failure_type,
+    expected_failure_type,
+    expected_message: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"offline-supersession-preparation-failure-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+            recovery = app._session_engine._recovery_coordinator
+            original_cancel_provider = recovery.cancel_provider_operation_for_interruption
+
+            async def fail_after_terminal_claim(*args, **kwargs):
+                checkpoint = await store.load_checkpoint(session_id)
+                assert checkpoint is not None
+                assert "incomplete_session_recovery_claim" in checkpoint
+                raise preparation_failure_type("provider cancellation preparation failed")
+
+            recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
+                fail_after_terminal_claim
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(expected_failure_type, match=expected_message),
+            ):
+                await _collect_events(app.interrupt_session(request))
+            recovery.cancel_provider_operation_for_interruption = (  # type: ignore[method-assign]
+                original_cancel_provider
+            )
+
+            retained = await store.load_checkpoint(session_id)
+            assert retained is not None
+            assert "pending_session_interrupt" in retained
+            assert "incomplete_session_recovery_claim" not in retained
+            with session_engine_module.suppress_interruption_cascade():
+                events = await _collect_events(app.interrupt_session(request))
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            assert "incomplete_session_recovery_claim" not in final_checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_claim_loss_does_not_run_unclaimed_abandonment(
+    session_store_case,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"terminal-finalization-claim-loss-{session_store_case[0]}"
+        transition_started = asyncio.Event()
+        never_release_transition = asyncio.Event()
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+            recovery = app._session_engine._recovery_coordinator
+            original_heartbeat = recovery._heartbeat_incomplete_recovery_claim
+            original_publish = store.publish_interaction_transition
+            original_status_transition = store.transition_status_and_checkpoint
+            original_finalize_abandoned = recovery.finalize_abandoned_session_run
+            abandoned_finalization_calls = 0
+
+            async def block_claimed_transition(*args, **kwargs):
+                if kwargs.get("expected_recovery_claim_id") is not None:
+                    transition_started.set()
+                    await never_release_transition.wait()
+                return await original_publish(*args, **kwargs)
+
+            async def block_claimed_status_transition(*args, **kwargs):
+                if kwargs.get("to_status") is SessionStatus.INTERRUPTED:
+                    transition_started.set()
+                    await never_release_transition.wait()
+                return await original_status_transition(*args, **kwargs)
+
+            async def observe_abandoned_finalization(request):
+                nonlocal abandoned_finalization_calls
+                abandoned_finalization_calls += 1
+                return await original_finalize_abandoned(request)
+
+            async def replace_claim_while_transition_waits(
+                *,
+                session_id: str,
+                claim_id: str,
+                claim_expires_at: datetime,
+                stop: asyncio.Event,
+            ) -> None:
+                del claim_expires_at, stop
+                await asyncio.wait_for(transition_started.wait(), timeout=5)
+                replacement_now = datetime.now(UTC)
+
+                def replace_claim(_session, checkpoint):
+                    assert checkpoint is not None
+                    updated = copy.deepcopy(checkpoint)
+                    assert updated["incomplete_session_recovery_claim"]["claim_id"] == claim_id
+                    updated["incomplete_session_recovery_claim"] = {
+                        "version": 1,
+                        "claim_id": "replacement-finalization-owner",
+                        "claimed_at": replacement_now.isoformat(),
+                        "claim_expires_at": (replacement_now + timedelta(minutes=5)).isoformat(),
+                    }
+                    return updated
+
+                await store.transform_checkpoint(session_id, replace_claim)
+                raise recovery_coordinator_module._IncompleteRecoveryClaimLost(
+                    "peer replaced the terminal finalization claim"
+                )
+
+            store.publish_interaction_transition = block_claimed_transition  # type: ignore[method-assign]
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                block_claimed_status_transition
+            )
+            recovery.finalize_abandoned_session_run = (  # type: ignore[method-assign]
+                observe_abandoned_finalization
+            )
+            monkeypatch.setattr(
+                recovery,
+                "_heartbeat_incomplete_recovery_claim",
+                replace_claim_while_transition_waits,
+            )
+
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(
+                    recovery_coordinator_module._IncompleteRecoveryClaimLost,
+                    match="peer replaced",
+                ),
+            ):
+                await _collect_events(app.interrupt_session(request))
+
+            assert abandoned_finalization_calls == 0
+            retained_session = await store.load(session_id)
+            retained_checkpoint = await store.load_checkpoint(session_id)
+            assert retained_session is not None
+            assert retained_session.status is SessionStatus.INTERRUPTING
+            assert retained_checkpoint is not None
+            assert retained_checkpoint["incomplete_session_recovery_claim"]["claim_id"] == (
+                "replacement-finalization-owner"
+            )
+            terminal_records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_INTERRUPTED,
+                )
+            )
+            assert [
+                record.event.payload.get("interruption_type") for record in terminal_records
+            ] == ["user_input_required"]
+
+            def expire_replacement_claim(_session, checkpoint):
+                assert checkpoint is not None
+                updated = copy.deepcopy(checkpoint)
+                expired_at = datetime.now(UTC) - timedelta(minutes=5)
+                marker = updated["incomplete_session_recovery_claim"]
+                assert marker["claim_id"] == "replacement-finalization-owner"
+                marker["claimed_at"] = (expired_at - timedelta(minutes=5)).isoformat()
+                marker["claim_expires_at"] = expired_at.isoformat()
+                return updated
+
+            await store.transform_checkpoint(session_id, expire_replacement_claim)
+            store.publish_interaction_transition = original_publish  # type: ignore[method-assign]
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                original_status_transition
+            )
+            recovery.finalize_abandoned_session_run = (  # type: ignore[method-assign]
+                original_finalize_abandoned
+            )
+            monkeypatch.setattr(
+                recovery,
+                "_heartbeat_incomplete_recovery_claim",
+                original_heartbeat,
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                retried = await _collect_events(app.interrupt_session(request))
+            assert retried[-1].type is EventType.SESSION_INTERRUPTED
+            assert retried[-1].payload["interruption_type"] == "operator_requested"
+        finally:
+            never_release_transition.set()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_unclaimed_interruption_cancellation_is_finalized(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"unclaimed-interruption-cancellation-{session_store_case[0]}"
+        transition_started = asyncio.Event()
+        hold_first_transition = asyncio.Event()
+        try:
+            monkeypatch.setattr(
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
+                2,
+            )
+            monkeypatch.setattr(
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S",
+                0.001,
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await store.create(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+            )
+            original_transition = store.update_status
+            original_finalize = (
+                app._session_engine._recovery_coordinator.finalize_abandoned_session_run
+            )
+            transition_calls = 0
+            finalization_calls = 0
+
+            async def block_first_transition(*args, **kwargs):
+                nonlocal transition_calls
+                transition_calls += 1
+                if transition_calls == 1:
+                    transition_started.set()
+                    await hold_first_transition.wait()
+                return await original_transition(*args, **kwargs)
+
+            async def observe_finalization(request):
+                nonlocal finalization_calls
+                finalization_calls += 1
+                return await original_finalize(request)
+
+            store.update_status = block_first_transition  # type: ignore[method-assign]
+            app._session_engine._recovery_coordinator.finalize_abandoned_session_run = (  # type: ignore[method-assign]
+                observe_finalization
+            )
+            task = asyncio.create_task(
+                _collect_events(
+                    app.interrupt_session(
+                        InterruptSessionRequest(
+                            session_id=session_id,
+                            reason="operator stop",
+                        )
+                    )
+                )
+            )
+            await asyncio.wait_for(transition_started.wait(), timeout=5)
+            task.cancel()
+            assert task.cancelling() == 1
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+            assert finalization_calls == 1
+            retained = await store.load(session_id)
+            assert retained is not None
+            assert retained.status is SessionStatus.INTERRUPTED
+        finally:
+            hold_first_transition.set()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "claim_boundary",
+    [
+        pytest.param("ack-loss", id="commit-then-lose-acknowledgement"),
+        pytest.param("cancellation", id="cancel-after-commit"),
+        pytest.param("generator-exit", id="generator-exit-after-commit"),
+        pytest.param("grouped-control", id="grouped-process-control-after-commit"),
+        pytest.param("payload-conflict", id="conflicting-payload-before-claim"),
+    ],
+)
+def test_session_store_conformance_reconciles_terminal_finalization_claim_transfer(
+    session_store_case,
+    claim_boundary: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"terminal-finalization-claim-{claim_boundary}-{session_store_case[0]}"
+        release_acknowledgement = asyncio.Event()
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+
+            original_transition = store.transition_status_and_checkpoint
+
+            async def commit_supersession_then_stop(*args, **kwargs):
+                transitioned = await original_transition(*args, **kwargs)
+                if kwargs.get("to_status") is SessionStatus.INTERRUPTING:
+                    raise _SimulatedProcessLoss("stop after supersession transition")
+                return transitioned
+
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                commit_supersession_then_stop
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(_SimulatedProcessLoss, match="supersession transition"),
+            ):
+                await _collect_events(app.interrupt_session(request))
+            store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
+
+            def release_abandoned_claim(_session: Session, checkpoint):
+                updated = dict({} if checkpoint is None else checkpoint)
+                updated.pop("incomplete_session_recovery_claim", None)
+                return updated
+
+            await store.transform_checkpoint(session_id, release_abandoned_claim)
+            prepared = await store.load_checkpoint(session_id)
+            assert prepared is not None
+            assert "pending_session_interrupt" in prepared
+            assert "incomplete_session_recovery_claim" not in prepared
+
+            original_transform = store.transform_checkpoint
+            claim_committed = asyncio.Event()
+            injected = False
+
+            async def interrupt_claim_acknowledgement(
+                transformed_session_id: str,
+                transform,
+            ):
+                nonlocal injected
+                before = await store.load_checkpoint(transformed_session_id)
+                claim_transfer_candidate = (
+                    not injected
+                    and before is not None
+                    and "incomplete_session_recovery_claim" not in before
+                    and "pending_session_interrupt" in before
+                )
+                if claim_boundary == "payload-conflict" and claim_transfer_candidate:
+                    injected = True
+
+                    def replace_pending_payload(_session: Session, checkpoint):
+                        updated = dict({} if checkpoint is None else checkpoint)
+                        pending_interrupt = dict(updated["pending_session_interrupt"])
+                        pending_interrupt["reason"] = "conflicting concurrent interrupt"
+                        updated["pending_session_interrupt"] = pending_interrupt
+                        return updated
+
+                    await original_transform(
+                        transformed_session_id,
+                        replace_pending_payload,
+                    )
+                result = await original_transform(transformed_session_id, transform)
+                after = await store.load_checkpoint(transformed_session_id)
+                installed_now = (
+                    not injected
+                    and before is not None
+                    and "incomplete_session_recovery_claim" not in before
+                    and after is not None
+                    and "incomplete_session_recovery_claim" in after
+                    and "pending_session_interrupt" in after
+                )
+                if not installed_now:
+                    return result
+                injected = True
+                claim_committed.set()
+                if claim_boundary == "ack-loss":
+                    raise OSError("terminal claim acknowledgement lost")
+                if claim_boundary == "generator-exit":
+                    raise GeneratorExit("terminal claim transfer stopped")
+                if claim_boundary == "grouped-control":
+                    raise BaseExceptionGroup(
+                        "terminal claim transfer controls",
+                        [
+                            GeneratorExit("terminal claim transfer stopped"),
+                            RuntimeError("terminal claim transfer cleanup failed"),
+                        ],
+                    )
+                await release_acknowledgement.wait()
+                return result
+
+            store.transform_checkpoint = (  # type: ignore[method-assign]
+                interrupt_claim_acknowledgement
+            )
+            if claim_boundary == "ack-loss":
+                with session_engine_module.suppress_interruption_cascade():
+                    events = await _collect_events(app.interrupt_session(request))
+                assert events[-1].type is EventType.SESSION_INTERRUPTED
+            elif claim_boundary == "payload-conflict":
+                with (
+                    session_engine_module.suppress_interruption_cascade(),
+                    pytest.raises(
+                        SessionRuntimePublicationConflict,
+                        match="interrupt identity changed",
+                    ),
+                ):
+                    await _collect_events(app.interrupt_session(request))
+                conflicted = await store.load_checkpoint(session_id)
+                assert conflicted is not None
+                assert "pending_session_interrupt" in conflicted
+                assert "incomplete_session_recovery_claim" not in conflicted
+                records = [
+                    record
+                    for record in await store.query_events(
+                        EventQuery(
+                            session_id=session_id,
+                            event_type=EventType.SESSION_INTERRUPTED,
+                        )
+                    )
+                    if record.event.payload.get("interruption_type") == "operator_requested"
+                ]
+                assert records == []
+                return
+            elif claim_boundary in {"generator-exit", "grouped-control"}:
+                with (
+                    session_engine_module.suppress_interruption_cascade(),
+                    pytest.raises(
+                        GeneratorExit,
+                        match="terminal claim transfer stopped",
+                    ) as process_control,
+                ):
+                    await _collect_events(app.interrupt_session(request))
+                if claim_boundary == "grouped-control":
+                    assert process_control.value.__cause__ is not None
+                    retained_failures = tuple(
+                        candidate
+                        for candidate in iter_exception_tree(process_control.value.__cause__)
+                        if not isinstance(candidate, BaseExceptionGroup)
+                    )
+                    assert (
+                        sum(
+                            isinstance(candidate, RuntimeError)
+                            and str(candidate) == "terminal claim transfer cleanup failed"
+                            for candidate in retained_failures
+                        )
+                        == 1
+                    )
+                store.transform_checkpoint = original_transform  # type: ignore[method-assign]
+                with session_engine_module.suppress_interruption_cascade():
+                    events = await _collect_events(app.interrupt_session(request))
+                assert events[-1].type is EventType.SESSION_INTERRUPTED
+            else:
+                with session_engine_module.suppress_interruption_cascade():
+                    retrying = asyncio.create_task(_collect_events(app.interrupt_session(request)))
+                    await asyncio.wait_for(claim_committed.wait(), timeout=5)
+                    retrying.cancel("cancel terminal claim acknowledgement")
+                    assert retrying.cancelling() == 1
+                    release_acknowledgement.set()
+                    with pytest.raises(asyncio.CancelledError) as cancellation:
+                        await retrying
+                    assert cancellation.value.args == ("cancel terminal claim acknowledgement",)
+                    assert retrying.cancelled() is True
+                after_cancellation = await store.load_checkpoint(session_id)
+                assert after_cancellation is not None
+                assert "pending_session_interrupt" not in after_cancellation
+                assert "incomplete_session_recovery_claim" not in after_cancellation
+                store.transform_checkpoint = original_transform  # type: ignore[method-assign]
+                store = await _reopen_store(session_store_case, store)
+                recovery_app = CayuApp(session_store=store, enable_logging=False)
+                recovery_app.register_provider(_UserInputRecoveryProvider(), default=True)
+                recovery_app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[UserInputTool()],
+                )
+                with session_engine_module.suppress_interruption_cascade():
+                    events = await _collect_events(recovery_app.interrupt_session(request))
+                assert events[-1].type is EventType.SESSION_INTERRUPTED
+
+            assert injected is True
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            assert "incomplete_session_recovery_claim" not in final_checkpoint
+            records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(records) == 1
+        finally:
+            release_acknowledgement.set()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_user_input_supersession_retry_joins_live_finalizer(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        peer_store: SessionStore | None = None
+        owner_release = asyncio.Event()
+        allow_read_handoff = asyncio.Event()
+        tasks: list[asyncio.Task[list[Event]]] = []
+        session_id = f"user-input-supersession-live-finalizer-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+
+            owner_started = asyncio.Event()
+            original_terminal_stream = app._session_engine._emit_terminal_event_with_hooks
+
+            async def hold_owner_before_terminal_event(*args, **kwargs):
+                owner_started.set()
+                await owner_release.wait()
+                async for event in original_terminal_stream(*args, **kwargs):
+                    yield event
+
+            app._session_engine._emit_terminal_event_with_hooks = (  # type: ignore[method-assign]
+                hold_owner_before_terminal_event
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                owner_task = asyncio.create_task(_collect_events(app.interrupt_session(request)))
+                tasks.append(owner_task)
+                await asyncio.wait_for(owner_started.wait(), timeout=5)
+
+                checkpoint = await store.load_checkpoint(session_id)
+                assert checkpoint is not None
+                original_claim = checkpoint["incomplete_session_recovery_claim"]
+                assert "pending_session_interrupt" in checkpoint
+
+                peer_store = await _open_peer_store(session_store_case, store)
+                peer_app = CayuApp(session_store=peer_store, enable_logging=False)
+                peer_app.register_provider(_UserInputRecoveryProvider(), default=True)
+                peer_app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[UserInputTool()],
+                )
+                peer_claim_finished = False
+                join_read_started = asyncio.Event()
+                peer_recovery = peer_app._session_engine._recovery_coordinator
+                original_peer_claim = peer_recovery._claim_incomplete_recovery
+                original_peer_load_checkpoint = peer_store.load_checkpoint
+
+                async def observe_live_owner(*args, **kwargs):
+                    nonlocal peer_claim_finished
+                    claimed = await original_peer_claim(*args, **kwargs)
+                    assert claimed is None
+                    peer_claim_finished = True
+                    return claimed
+
+                async def complete_owner_between_join_reads(loaded_session_id: str):
+                    checkpoint_before_handoff = await original_peer_load_checkpoint(
+                        loaded_session_id
+                    )
+                    if (
+                        peer_claim_finished
+                        and not join_read_started.is_set()
+                        and checkpoint_before_handoff is not None
+                        and "pending_session_interrupt" in checkpoint_before_handoff
+                    ):
+                        join_read_started.set()
+                        await allow_read_handoff.wait()
+                        owner_release.set()
+                        for _attempt in range(100):
+                            checkpoint_after_handoff = await original_peer_load_checkpoint(
+                                loaded_session_id
+                            )
+                            if (
+                                checkpoint_after_handoff is not None
+                                and "pending_session_interrupt" not in checkpoint_after_handoff
+                            ):
+                                return checkpoint_after_handoff
+                            await asyncio.sleep(0.01)
+                        raise TimeoutError("Live terminal finalizer did not clear its marker.")
+                    return checkpoint_before_handoff
+
+                peer_recovery._claim_incomplete_recovery = (  # type: ignore[method-assign]
+                    observe_live_owner
+                )
+                peer_store.load_checkpoint = (  # type: ignore[method-assign]
+                    complete_owner_between_join_reads
+                )
+                retry_task = asyncio.create_task(
+                    _collect_events(peer_app.interrupt_session(request))
+                )
+                tasks.append(retry_task)
+                await asyncio.wait_for(join_read_started.wait(), timeout=5)
+                assert not owner_task.done()
+                assert not retry_task.done()
+                retained = await original_peer_load_checkpoint(session_id)
+                assert retained is not None
+                assert retained["incomplete_session_recovery_claim"] == original_claim
+
+                allow_read_handoff.set()
+                owner_events, retry_events = await asyncio.wait_for(
+                    asyncio.gather(owner_task, retry_task),
+                    timeout=10,
+                )
+                assert owner_events[-1].id == retry_events[-1].id
+
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            assert "incomplete_session_recovery_claim" not in final_checkpoint
+            terminal_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(terminal_records) == 1
+            assert (
+                terminal_records[0].event.id
+                == (await _private_event_for_public_event(store, owner_events[-1])).id
+            )
+        finally:
+            allow_read_handoff.set()
+            owner_release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if peer_store is not None and peer_store is not store:
+                await _close_store(peer_store)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "loss_boundary",
+    [
+        pytest.param("terminal-status", id="after-terminal-status"),
+        pytest.param("terminal-event", id="after-terminal-event"),
+    ],
+)
+@pytest.mark.parametrize(
+    "replay_entrance",
+    [
+        pytest.param("interrupt", id="interrupt-retry"),
+        pytest.param("incomplete-recovery", id="incomplete-recovery"),
+    ],
+)
+def test_session_store_conformance_replays_user_input_supersession_after_terminal_process_loss(
+    session_store_case,
+    loss_boundary: str,
+    replay_entrance: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        peer_store: SessionStore | None = None
+        retry_release: asyncio.Event | None = None
+        retry_tasks: list[asyncio.Task[list[Event]]] = []
+        session_id = (
+            "user-input-terminal-supersession-process-loss-"
+            f"{loss_boundary}-{replay_entrance}-{session_store_case[0]}"
+        )
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            paused = await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            awaiting = next(
+                event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+            )
+
+            process_loss_injected = False
+            if loss_boundary == "terminal-status":
+                engine = app._session_engine
+                original_claimed_status_transition = (
+                    engine._transition_status_under_terminal_finalization_claim
+                )
+
+                async def commit_terminal_status_then_lose_process(*args, **kwargs):
+                    nonlocal process_loss_injected
+                    transitioned = await original_claimed_status_transition(*args, **kwargs)
+                    if (
+                        kwargs.get("to_status") is SessionStatus.INTERRUPTED
+                        and not process_loss_injected
+                    ):
+                        process_loss_injected = True
+                        raise _SimulatedProcessLoss(
+                            "process stopped after terminal status committed"
+                        )
+                    return transitioned
+
+                engine._transition_status_under_terminal_finalization_claim = (  # type: ignore[method-assign]
+                    commit_terminal_status_then_lose_process
+                )
+            else:
+                engine = app._session_engine
+                original_publish_terminal = engine._publish_terminal_event_under_finalization_claim
+
+                async def commit_terminal_event_then_lose_process(*args, **kwargs):
+                    nonlocal process_loss_injected
+                    published = await original_publish_terminal(*args, **kwargs)
+                    if not process_loss_injected:
+                        process_loss_injected = True
+                        raise _SimulatedProcessLoss(
+                            "process stopped after atomic terminal publication"
+                        )
+                    return published
+
+                engine._publish_terminal_event_under_finalization_claim = (  # type: ignore[method-assign]
+                    commit_terminal_event_then_lose_process
+                )
+
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(_SimulatedProcessLoss),
+            ):
+                await _collect_events(app.interrupt_session(request))
+            assert process_loss_injected is True
+
+            interrupted = await store.load(session_id)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert interrupted is not None
+            assert interrupted.status is SessionStatus.INTERRUPTED
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "user_input_resolution_intent" not in checkpoint
+            before_replay = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(before_replay) == (0 if loss_boundary == "terminal-status" else 1)
+            if loss_boundary == "terminal-status":
+                assert (
+                    checkpoint["pending_session_interrupt"]["user_input_supersession_intent"][
+                        "state"
+                    ]
+                    == "active"
+                )
+            else:
+                assert "pending_session_interrupt" not in checkpoint
+
+            if loss_boundary == "terminal-status":
+                engine._transition_status_under_terminal_finalization_claim = (  # type: ignore[method-assign]
+                    original_claimed_status_transition
+                )
+            else:
+                engine._publish_terminal_event_under_finalization_claim = (  # type: ignore[method-assign]
+                    original_publish_terminal
+                )
+            store = await _reopen_store(session_store_case, store)
+            supersession = (
+                checkpoint["pending_session_interrupt"]["user_input_supersession_intent"]
+                if loss_boundary == "terminal-status"
+                else before_replay[0].event.payload["user_input_supersession_intent"]
+            )
+            replay_app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                secret_redactor=SecretRedactor(supersession["input_id"][4:12]),
+            )
+
+            if replay_entrance == "incomplete-recovery" and loss_boundary == "terminal-status":
+                original_receipt_loader = store.load_runtime_publication_receipt
+
+                async def hide_open_receipt(*args, **kwargs):
+                    publication_id = args[1] if len(args) > 1 else kwargs["publication_id"]
+                    if publication_id == f"user-input-open:{supersession['input_id']}":
+                        return None
+                    return await original_receipt_loader(*args, **kwargs)
+
+                store.load_runtime_publication_receipt = (  # type: ignore[method-assign]
+                    hide_open_receipt
+                )
+                with pytest.raises(
+                    SessionRuntimePublicationConflict,
+                    match="no exact durable opening receipt",
+                ):
+                    await replay_app.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(session_id=session_id)
+                    )
+                store.load_runtime_publication_receipt = (  # type: ignore[method-assign]
+                    original_receipt_loader
+                )
+                retained = await store.load_checkpoint(session_id)
+                assert retained is not None
+                assert (
+                    retained["pending_session_interrupt"] == checkpoint["pending_session_interrupt"]
+                )
+            if replay_entrance == "interrupt" and loss_boundary == "terminal-status":
+                peer_store = await _open_peer_store(session_store_case, store)
+                peer_app = CayuApp(
+                    session_store=peer_store,
+                    enable_logging=False,
+                    secret_redactor=SecretRedactor(supersession["input_id"][4:12]),
+                )
+                repair_clear_started = asyncio.Event()
+                release_repair_clear = asyncio.Event()
+                retry_release = release_repair_clear
+                peer_claim_finished = asyncio.Event()
+                recovery = replay_app._session_engine._recovery_coordinator
+                peer_recovery = peer_app._session_engine._recovery_coordinator
+                original_repair_clear = recovery._clear_repaired_pending_interrupt
+                original_peer_claim = peer_recovery._claim_incomplete_recovery
+
+                async def hold_repair_before_marker_clear(*args, **kwargs):
+                    repair_clear_started.set()
+                    await release_repair_clear.wait()
+                    return await original_repair_clear(*args, **kwargs)
+
+                async def observe_competing_claim(*args, **kwargs):
+                    result = await original_peer_claim(*args, **kwargs)
+                    peer_claim_finished.set()
+                    return result
+
+                recovery._clear_repaired_pending_interrupt = (  # type: ignore[method-assign]
+                    hold_repair_before_marker_clear
+                )
+                peer_recovery._claim_incomplete_recovery = (  # type: ignore[method-assign]
+                    observe_competing_claim
+                )
+                with session_engine_module.suppress_interruption_cascade():
+                    first_retry = asyncio.create_task(
+                        _collect_events(replay_app.interrupt_session(request))
+                    )
+                    retry_tasks.append(first_retry)
+                    for _attempt in range(1000):
+                        if repair_clear_started.is_set():
+                            break
+                        if first_retry.done():
+                            await first_retry
+                        await asyncio.sleep(0.01)
+                    assert repair_clear_started.is_set(), "terminal repair did not reach cleanup"
+                    second_retry = asyncio.create_task(
+                        _collect_events(peer_app.interrupt_session(request))
+                    )
+                    retry_tasks.append(second_retry)
+                    await asyncio.wait_for(peer_claim_finished.wait(), timeout=5)
+                    assert not second_retry.done()
+                    release_repair_clear.set()
+                    first_replayed, second_replayed = await asyncio.wait_for(
+                        asyncio.gather(first_retry, second_retry),
+                        timeout=10,
+                    )
+                recovery._clear_repaired_pending_interrupt = (  # type: ignore[method-assign]
+                    original_repair_clear
+                )
+                peer_recovery._claim_incomplete_recovery = (  # type: ignore[method-assign]
+                    original_peer_claim
+                )
+                assert first_replayed[-1].id == second_replayed[-1].id
+                replayed = first_replayed
+            elif replay_entrance == "incomplete-recovery" and loss_boundary == "terminal-status":
+                recovered = await replay_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+                assert recovered.actions == (
+                    IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+                )
+                replayed = [
+                    event
+                    for event in recovered.events
+                    if event.type is EventType.SESSION_INTERRUPTED
+                ]
+                assert len(replayed) == 1
+            else:
+                if replay_entrance == "incomplete-recovery":
+                    recovered = await replay_app.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(session_id=session_id)
+                    )
+                    assert recovered.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+                    assert all(
+                        event.type is not EventType.SESSION_INTERRUPTED
+                        for event in recovered.events
+                    )
+                with session_engine_module.suppress_interruption_cascade():
+                    replayed = await _collect_events(replay_app.interrupt_session(request))
+            assert replayed[-1].type is EventType.SESSION_INTERRUPTED
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            terminal_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(terminal_records) == 1
+            assert (
+                terminal_records[0].event.payload["user_input_supersession_intent"]["input_id"]
+                == supersession["input_id"]
+            )
+            assert (
+                terminal_records[0].event.id
+                == (await _private_event_for_public_event(store, replayed[-1])).id
+            )
+
+            with session_engine_module.suppress_interruption_cascade():
+                exact_retry = await _collect_events(replay_app.interrupt_session(request))
+            assert exact_retry[-1].id == replayed[-1].id
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="superseded by an external interruption",
+            ):
+                await _collect_events(
+                    replay_app.resolve_user_input(
+                        UserInputResponse(
+                            session_id=session_id,
+                            input_id=awaiting.payload["input_id"],
+                            answer="stale",
+                        )
+                    )
+                )
+        finally:
+            if retry_release is not None:
+                retry_release.set()
+            for retry_task in retry_tasks:
+                if not retry_task.done():
+                    retry_task.cancel()
+            if retry_tasks:
+                await asyncio.gather(*retry_tasks, return_exceptions=True)
+            if peer_store is not None and peer_store is not store:
+                await _close_store(peer_store)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        pytest.param("orphan-intent", id="orphan-intent"),
+        pytest.param("future-claim", id="future-claim"),
+    ],
+)
+def test_session_store_conformance_rejects_ambiguous_user_input_claim_topology(
+    session_store_case,
+    corruption: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"user-input-ambiguous-claim-{corruption}-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            session = await store.load(session_id)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert session is not None
+            assert checkpoint is not None
+            pending = PendingUserInput.model_validate(checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY])
+            claim_run_epoch = max(session.run_epoch + 16, pending.source_run_epoch + 1)
+            intent = user_input_resolution_intent_for(
+                pending,
+                answer_request_digest="b" * 64,
+                resolution_stage="answer",
+                resolution_request_digest="c" * 64,
+                claim_run_epoch=claim_run_epoch,
+            )
+
+            def corrupt_claim_topology(_session: Session, current):
+                updated = dict({} if current is None else current)
+                updated[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] = intent.model_dump(
+                    mode="json"
+                )
+                if corruption == "orphan-intent":
+                    updated.pop(PENDING_USER_INPUT_CHECKPOINT_KEY)
+                elif corruption != "future-claim":  # pragma: no cover - exhaustive parameter
+                    raise AssertionError(f"Unknown corruption: {corruption}")
+                return updated
+
+            await store.transform_checkpoint(session_id, corrupt_claim_topology)
+            store = await _reopen_store(session_store_case, store)
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+
+            with pytest.raises(RuntimeError, match="User-input .*authority|session run epoch"):
+                await replay_app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+
+            retained = await store.load_checkpoint(session_id)
+            assert retained is not None
+            assert retained[USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY] == intent.model_dump(
+                mode="json"
+            )
+            if corruption == "orphan-intent":
+                assert PENDING_USER_INPUT_CHECKPOINT_KEY not in retained
+            else:
+                assert retained[PENDING_USER_INPUT_CHECKPOINT_KEY] == pending.model_dump(
+                    mode="json"
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_active_user_input_supersession(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        peer_store: SessionStore | None = None
+        release_handler = asyncio.Event()
+        session_id = f"user-input-active-supersession-{session_store_case[0]}"
+        try:
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
+                timedelta(milliseconds=150),
+            )
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
+                0.02,
+            )
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS",
+                0.01,
+            )
+            awaiting_event_id: str | None = None
+            original_publish = store.publish_runtime_publication
+            original_claim = store.claim_persisted_event_side_effect
+            fan_out_started = asyncio.Event()
+
+            async def remember_awaiting_event(session_id: str, **kwargs):
+                nonlocal awaiting_event_id
+                result = await original_publish(session_id, **kwargs)
+                if kwargs["request"].kind == "user-input-open":
+                    awaiting_event_id = next(
+                        event.id
+                        for event in kwargs["request"].events
+                        if event.type is EventType.SESSION_AWAITING_USER_INPUT
+                    )
+                return result
+
+            async def block_awaiting_fan_out(*, session_id: str, event_id: str):
+                if event_id == awaiting_event_id:
+                    fan_out_started.set()
+                    await asyncio.Event().wait()
+                return await original_claim(session_id=session_id, event_id=event_id)
+
+            store.publish_runtime_publication = remember_awaiting_event  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = block_awaiting_fan_out  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            handler_entered = asyncio.Event()
+            original_handle_interrupted = app._session_engine._handle_session_interrupted
+
+            async def hold_live_handler(*args, **kwargs):
+                handler_entered.set()
+                await release_handler.wait()
+                async for event in original_handle_interrupted(*args, **kwargs):
+                    yield event
+
+            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+                hold_live_handler
+            )
+            running = asyncio.create_task(
+                _collect_events(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "ask a question")],
+                        )
+                    )
+                )
+            )
+            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            private_input_id = checkpoint["pending_user_input"]["input_id"]
+            awaiting_records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_AWAITING_USER_INPUT,
+                )
+            )
+            assert len(awaiting_records) == 1
+            public_input_id = public_event_linkage_id(
+                awaiting_records[0].sequence,
+                "input_id",
+            )
+
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes active pause",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
+                await asyncio.wait_for(handler_entered.wait(), timeout=5)
+                claimed_checkpoint = await store.load_checkpoint(session_id)
+                assert claimed_checkpoint is not None
+                durable_claim = claimed_checkpoint["incomplete_session_recovery_claim"]
+
+                # The live worker is delayed beyond the original lease before
+                # it can enter terminal publication. Its retained handoff must
+                # renew the exact claim rather than letting a peer take it.
+                await asyncio.sleep(0.35)
+                renewed_checkpoint = await store.load_checkpoint(session_id)
+                assert renewed_checkpoint is not None
+                renewed_claim = renewed_checkpoint["incomplete_session_recovery_claim"]
+                assert renewed_claim["claim_id"] == durable_claim["claim_id"]
+                assert renewed_claim["claim_expires_at"] > durable_claim["claim_expires_at"]
+
+                peer_store = await _open_peer_store(session_store_case, store)
+                peer_app = CayuApp(session_store=peer_store, enable_logging=False)
+                peer_app.register_provider(_UserInputRecoveryProvider(), default=True)
+                peer_app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[UserInputTool()],
+                )
+                retrying = asyncio.create_task(_collect_events(peer_app.interrupt_session(request)))
+                await asyncio.sleep(0.05)
+                assert not retrying.done()
+                release_handler.set()
+                run_events, interrupt_events, retry_events = await asyncio.wait_for(
+                    asyncio.gather(running, interrupting, retrying),
+                    timeout=10,
+                )
+            assert retry_events[-1].id == interrupt_events[-1].id
+            assert run_events[-1].type is EventType.SESSION_INTERRUPTED
+            assert interrupt_events[-1].type is EventType.SESSION_INTERRUPTED
+            store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = original_claim  # type: ignore[method-assign]
+
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "user_input_resolution_intent" not in checkpoint
+            operator_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(operator_records) == 1
+            marker = operator_records[0].event.payload["user_input_supersession_intent"]
+            assert marker["state"] == "active"
+            assert marker["input_id"] == private_input_id
+
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session_id,
+                        agent_name="assistant",
+                        payload={
+                            "interruption_type": "supersession_lookup_noise",
+                            "input_id": f"unrelated-input-{index}",
+                        },
+                    )
+                    for index in range(65)
+                ],
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            original_supersession_loader = store.load_user_input_supersession_events
+
+            async def load_conflicting_supersession(
+                session_id: str,
+                input_id: str,
+            ) -> list[Event]:
+                events = await original_supersession_loader(session_id, input_id)
+                assert len(events) == 1
+                event = events[0]
+                supersession = {
+                    **event.payload["user_input_supersession_intent"],
+                    "execution_profile_fingerprint": "0" * 64,
+                }
+                return [
+                    event.model_copy(
+                        update={
+                            "payload": {
+                                **event.payload,
+                                "user_input_supersession_intent": supersession,
+                            }
+                        }
+                    )
+                ]
+
+            store.load_user_input_supersession_events = (  # type: ignore[method-assign]
+                load_conflicting_supersession
+            )
+            with pytest.raises(RuntimeError, match="no pending user input"):
+                _ = [
+                    event
+                    async for event in replay_app.resolve_user_input(
+                        UserInputResponse(
+                            session_id=session_id,
+                            input_id=public_input_id,
+                            answer="stale",
+                        )
+                    )
+                ]
+            store.load_user_input_supersession_events = (  # type: ignore[method-assign]
+                original_supersession_loader
+            )
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="superseded by an external interruption",
+            ):
+                _ = [
+                    event
+                    async for event in replay_app.resolve_user_input(
+                        UserInputResponse(
+                            session_id=session_id,
+                            input_id=public_input_id,
+                            answer="stale",
+                        )
+                    )
+                ]
+        finally:
+            release_handler.set()
+            if peer_store is not None and peer_store is not store:
+                await _close_store(peer_store)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "read_boundary",
+    [
+        pytest.param("session", id="session-read"),
+        pytest.param("checkpoint", id="checkpoint-read"),
+    ],
+)
+def test_session_store_conformance_releases_live_supersession_handoff_after_read_failure(
+    session_store_case,
+    read_boundary: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"live-supersession-read-failure-{read_boundary}-{session_store_case[0]}"
+        interrupting: asyncio.Task[list[Event]] | None = None
+        running: asyncio.Task[list[Event]] | None = None
+        try:
+            awaiting_event_id: str | None = None
+            original_publish = store.publish_runtime_publication
+            original_side_effect_claim = store.claim_persisted_event_side_effect
+            fan_out_started = asyncio.Event()
+
+            async def remember_awaiting_event(session_id: str, **kwargs):
+                nonlocal awaiting_event_id
+                result = await original_publish(session_id, **kwargs)
+                if kwargs["request"].kind == "user-input-open":
+                    awaiting_event_id = next(
+                        event.id
+                        for event in kwargs["request"].events
+                        if event.type is EventType.SESSION_AWAITING_USER_INPUT
+                    )
+                return result
+
+            async def block_awaiting_fan_out(*, session_id: str, event_id: str):
+                if event_id == awaiting_event_id:
+                    fan_out_started.set()
+                    await asyncio.Event().wait()
+                return await original_side_effect_claim(
+                    session_id=session_id,
+                    event_id=event_id,
+                )
+
+            store.publish_runtime_publication = remember_awaiting_event  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = block_awaiting_fan_out  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+
+            original_handler = app._session_engine._handle_session_interrupted
+            handler_finished = asyncio.Event()
+            read_failure_injected = False
+            handoff_read_scope: contextvars.ContextVar[bool] = contextvars.ContextVar(
+                "handoff_read_scope",
+                default=False,
+            )
+
+            async def fail_first_handoff_read(*args, **kwargs):
+                nonlocal read_failure_injected
+                target_session = kwargs["session"]
+                if (
+                    target_session.id
+                    not in app._session_engine._session_control._terminal_finalization_claim_handoffs
+                ):
+                    async for event in original_handler(*args, **kwargs):
+                        yield event
+                    return
+                original_load = store.load
+                original_load_checkpoint = store.load_checkpoint
+
+                async def fail_session_read(loaded_session_id: str):
+                    nonlocal read_failure_injected
+                    if handoff_read_scope.get() and not read_failure_injected:
+                        read_failure_injected = True
+                        raise OSError("live handoff session read failed")
+                    return await original_load(loaded_session_id)
+
+                async def fail_checkpoint_read(loaded_session_id: str):
+                    nonlocal read_failure_injected
+                    if handoff_read_scope.get() and not read_failure_injected:
+                        read_failure_injected = True
+                        raise OSError("live handoff checkpoint read failed")
+                    return await original_load_checkpoint(loaded_session_id)
+
+                if read_boundary == "session":
+                    store.load = fail_session_read  # type: ignore[method-assign]
+                else:
+                    store.load_checkpoint = fail_checkpoint_read  # type: ignore[method-assign]
+                scope_token = handoff_read_scope.set(True)
+                try:
+                    async for event in original_handler(*args, **kwargs):
+                        yield event
+                finally:
+                    handoff_read_scope.reset(scope_token)
+                    store.load = original_load  # type: ignore[method-assign]
+                    store.load_checkpoint = original_load_checkpoint  # type: ignore[method-assign]
+                    handler_finished.set()
+
+            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+                fail_first_handoff_read
+            )
+            running = asyncio.create_task(
+                _collect_events(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "ask a question")],
+                        )
+                    )
+                )
+            )
+            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes active pause",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
+                await asyncio.wait_for(handler_finished.wait(), timeout=5)
+            assert read_failure_injected is True
+            await asyncio.wait_for(
+                asyncio.gather(running, return_exceptions=True),
+                timeout=5,
+            )
+            if not interrupting.done():
+                interrupting.cancel("stop failed interruption observer")
+            await asyncio.gather(interrupting, return_exceptions=True)
+
+            retained = await store.load_checkpoint(session_id)
+            assert retained is not None
+            assert "pending_session_interrupt" in retained
+            assert "incomplete_session_recovery_claim" not in retained
+            assert (
+                session_id
+                not in app._session_engine._session_control._terminal_finalization_claim_handoffs
+            )
+
+            store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = (  # type: ignore[method-assign]
+                original_side_effect_claim
+            )
+            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+                original_handler
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                retried = await _collect_events(app.interrupt_session(request))
+            assert retried[-1].type is EventType.SESSION_INTERRUPTED
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            terminal_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(terminal_records) == 1
+        finally:
+            for task in (interrupting, running):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (interrupting, running) if task is not None),
+                return_exceptions=True,
+            )
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reclaims_unaccepted_live_supersession_handoff(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"unaccepted-live-supersession-handoff-{session_store_case[0]}"
+        running: asyncio.Task[list[Event]] | None = None
+        interrupting: asyncio.Task[list[Event]] | None = None
+        release_fan_out = asyncio.Event()
+        try:
+            monkeypatch.setattr(
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
+                2,
+            )
+            monkeypatch.setattr(
+                session_control_module,
+                "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S",
+                0.001,
+            )
+            awaiting_event_id: str | None = None
+            original_publish = store.publish_runtime_publication
+            original_side_effect_claim = store.claim_persisted_event_side_effect
+            fan_out_started = asyncio.Event()
+
+            async def remember_awaiting_event(session_id: str, **kwargs):
+                nonlocal awaiting_event_id
+                result = await original_publish(session_id, **kwargs)
+                if kwargs["request"].kind == "user-input-open":
+                    awaiting_event_id = next(
+                        event.id
+                        for event in kwargs["request"].events
+                        if event.type is EventType.SESSION_AWAITING_USER_INPUT
+                    )
+                return result
+
+            async def block_awaiting_fan_out(*, session_id: str, event_id: str):
+                if event_id == awaiting_event_id:
+                    fan_out_started.set()
+                    await release_fan_out.wait()
+                return await original_side_effect_claim(
+                    session_id=session_id,
+                    event_id=event_id,
+                )
+
+            store.publish_runtime_publication = remember_awaiting_event  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = block_awaiting_fan_out  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            original_handler = app._session_engine._handle_session_interrupted
+            rejected_before_take = asyncio.Event()
+
+            async def reject_before_handoff_acceptance(*args, **kwargs):
+                rejected_before_take.set()
+                if False:  # pragma: no cover - preserve async-generator shape
+                    yield args, kwargs
+                raise OSError("live handler failed before accepting its handoff")
+
+            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+                reject_before_handoff_acceptance
+            )
+            running = asyncio.create_task(
+                _collect_events(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "ask a question")],
+                        )
+                    )
+                )
+            )
+            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes active pause",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
+                await asyncio.wait_for(rejected_before_take.wait(), timeout=5)
+                await asyncio.wait_for(
+                    asyncio.gather(running, return_exceptions=True),
+                    timeout=5,
+                )
+                await asyncio.wait_for(
+                    asyncio.gather(interrupting, return_exceptions=True),
+                    timeout=10,
+                )
+            assert (
+                session_id
+                not in app._session_engine._session_control._terminal_finalization_claim_handoffs
+            )
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_session_interrupt" in checkpoint
+            assert "incomplete_session_recovery_claim" in checkpoint
+
+            def expire_abandoned_claim(_session, current_checkpoint):
+                assert current_checkpoint is not None
+                updated = copy.deepcopy(current_checkpoint)
+                expired_at = datetime.now(UTC) - timedelta(minutes=5)
+                marker = updated["incomplete_session_recovery_claim"]
+                marker["claimed_at"] = (expired_at - timedelta(minutes=5)).isoformat()
+                marker["claim_expires_at"] = expired_at.isoformat()
+                return updated
+
+            await store.transform_checkpoint(session_id, expire_abandoned_claim)
+
+            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+                original_handler
+            )
+            store.publish_runtime_publication = original_publish  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = (  # type: ignore[method-assign]
+                original_side_effect_claim
+            )
+            release_fan_out.set()
+            with session_engine_module.suppress_interruption_cascade():
+                retried = await _collect_events(app.interrupt_session(request))
+            assert retried[-1].type is EventType.SESSION_INTERRUPTED
+        finally:
+            release_fan_out.set()
+            for task in (running, interrupting):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (running, interrupting) if task is not None),
+                return_exceptions=True,
+            )
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_does_not_dispatch_expired_terminal_finalization_claim(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"expired-terminal-finalization-claim-{session_store_case[0]}"
+        now = {"value": datetime(2026, 8, 31, tzinfo=UTC)}
+        try:
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
+                timedelta(milliseconds=100),
+            )
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                clock=lambda: now["value"],
+            )
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes a paused question",
+            )
+            original_transition = store.transition_status_and_checkpoint
+            transition_delayed = False
+
+            async def expire_claim_after_atomic_transition(*args, **kwargs):
+                nonlocal transition_delayed
+                transitioned = await original_transition(*args, **kwargs)
+                if kwargs.get("to_status") is SessionStatus.INTERRUPTING and not transition_delayed:
+                    transition_delayed = True
+                    now["value"] += timedelta(seconds=1)
+                return transitioned
+
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                expire_claim_after_atomic_transition
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(
+                    recovery_coordinator_module._IncompleteRecoveryClaimLost,
+                    match="expired before live dispatch",
+                ),
+            ):
+                await _collect_events(app.interrupt_session(request))
+            assert transition_delayed is True
+
+            retained_session = await store.load(session_id)
+            retained = await store.load_checkpoint(session_id)
+            assert retained_session is not None
+            assert retained_session.status is SessionStatus.INTERRUPTING
+            assert retained is not None
+            assert "pending_session_interrupt" in retained
+            retained_claim = retained["incomplete_session_recovery_claim"]
+            assert datetime.fromisoformat(retained_claim["claim_expires_at"]) <= now["value"]
+            terminal_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert terminal_records == []
+
+            store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
+            with session_engine_module.suppress_interruption_cascade():
+                retried = await _collect_events(app.interrupt_session(request))
+            assert retried[-1].type is EventType.SESSION_INTERRUPTED
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            assert "incomplete_session_recovery_claim" not in final_checkpoint
+            terminal_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(terminal_records) == 1
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_replaces_expired_recovery_claim_during_pause_supersession(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"expired-pause-supersession-claim-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            paused = await store.load(session_id)
+            assert paused is not None
+            assert paused.status is SessionStatus.INTERRUPTED
+            expired_at = datetime.now(UTC) - timedelta(minutes=5)
+
+            def retain_expired_claim(_session, checkpoint):
+                assert checkpoint is not None
+                updated = copy.deepcopy(checkpoint)
+                updated["incomplete_session_recovery_claim"] = {
+                    "version": 1,
+                    "claim_id": "expired-predecessor",
+                    "claimed_at": (expired_at - timedelta(minutes=5)).isoformat(),
+                    "claim_expires_at": expired_at.isoformat(),
+                }
+                return updated
+
+            await store.transform_checkpoint(session_id, retain_expired_claim)
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes expired recovery owner",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                events = await _collect_events(app.interrupt_session(request))
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+            assert events[-1].payload["interruption_type"] == "operator_requested"
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "pending_session_interrupt" not in checkpoint
+            assert "incomplete_session_recovery_claim" not in checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_status_only_finalization_requires_exact_live_claim(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"status-only-finalization-claim-{session_store_case[0]}"
+        observed_at = datetime(2040, 1, 1, tzinfo=UTC)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "create")],
+                ),
+                identity=_identity(),
+            )
+            interrupting = await store.update_status(created.id, SessionStatus.INTERRUPTING)
+
+            def install_claim(claim_id: str):
+                def transform(_session, checkpoint):
+                    updated = {} if checkpoint is None else copy.deepcopy(checkpoint)
+                    updated["incomplete_session_recovery_claim"] = {
+                        "version": 1,
+                        "claim_id": claim_id,
+                        "claimed_at": observed_at.isoformat(),
+                        "claim_expires_at": (observed_at + timedelta(minutes=5)).isoformat(),
+                    }
+                    return updated
+
+                return transform
+
+            await store.transform_checkpoint(session_id, install_claim("stale-finalizer"))
+            stale_session = interrupting.model_copy(deep=True)
+            await store.transform_checkpoint(session_id, install_claim("replacement-finalizer"))
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                clock=lambda: observed_at,
+            )
+
+            with pytest.raises(
+                SessionRunFenced,
+                match="lost its exact terminal recovery claim",
+            ):
+                await app._session_engine._publish_interaction_transition(
+                    session=stale_session,
+                    agent_name="assistant",
+                    environment_name=None,
+                    to_status=SessionStatus.INTERRUPTED,
+                    expected_recovery_claim_id="stale-finalizer",
+                )
+            retained = await store.load(session_id)
+            assert retained is not None
+            assert retained.status is SessionStatus.INTERRUPTING
+
+            (
+                finalized,
+                event,
+                status_changed,
+            ) = await app._session_engine._publish_interaction_transition(
+                session=stale_session,
+                agent_name="assistant",
+                environment_name=None,
+                to_status=SessionStatus.INTERRUPTED,
+                expected_recovery_claim_id="replacement-finalizer",
+            )
+            assert finalized.status is SessionStatus.INTERRUPTED
+            assert event is None
+            assert status_changed is True
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_interaction_claim_uses_issuer_clock(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"interaction-claim-clock-{session_store_case[0]}"
+        interaction_id = f"interaction-claim-clock-{session_store_case[0]}"
+        issuer_now = {"value": datetime(2040, 1, 1, tzinfo=UTC)}
+        try:
+            started = Event(
+                id=f"evt-{interaction_id}-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+            claimed_at = issuer_now["value"]
+            await store.checkpoint(
+                session_id,
+                {
+                    "incomplete_session_recovery_claim": {
+                        "version": 1,
+                        "claim_id": "issuer-clock-claim",
+                        "claimed_at": claimed_at.isoformat(),
+                        "claim_expires_at": (claimed_at + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            )
+            interrupted = Event(
+                id=f"evt-{interaction_id}-interrupted",
+                type=EventType.INTERACTION_INTERRUPTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            transition = InteractionTransitionSpec(
+                event=interrupted,
+                from_statuses=(SessionStatus.RUNNING,),
+                to_status=SessionStatus.INTERRUPTED,
+            )
+            published = await store.publish_interaction_transition(
+                session_id,
+                event=interrupted,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.INTERRUPTED,
+                expected_recovery_claim_id="issuer-clock-claim",
+                expected_recovery_claim_clock=lambda: issuer_now["value"],
+            )
+            assert published.replayed is False
+            assert published.session.status is SessionStatus.INTERRUPTED
+            loaded_receipt = await store.load_interaction_transition_receipt(
+                session_id,
+                transition=transition,
+                expected_recovery_claim_id="issuer-clock-claim",
+            )
+            assert loaded_receipt is not None
+            assert loaded_receipt.transition == transition
+
+            with pytest.raises(
+                SessionRunFenced,
+                match="another recovery authority",
+            ):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=interrupted,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+            with pytest.raises(
+                SessionRunFenced,
+                match="another recovery authority",
+            ):
+                await store.load_interaction_transition_receipt(
+                    session_id,
+                    transition=transition,
+                )
+            with pytest.raises(
+                SessionRunFenced,
+                match="another recovery authority",
+            ):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=interrupted,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTED,
+                    expected_recovery_claim_id="substituted-claim",
+                    expected_recovery_claim_clock=lambda: issuer_now["value"],
+                )
+
+            issuer_now["value"] += timedelta(hours=1)
+            replayed = await store.publish_interaction_transition(
+                session_id,
+                event=interrupted,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.INTERRUPTED,
+                expected_recovery_claim_id="issuer-clock-claim",
+                expected_recovery_claim_clock=lambda: issuer_now["value"],
+            )
+            assert replayed.replayed is True
+            assert replayed.event == interrupted
+
+            replacement_claimed_at = issuer_now["value"]
+
+            def replace_claim(_session, checkpoint):
+                assert checkpoint is not None
+                updated = copy.deepcopy(checkpoint)
+                updated["incomplete_session_recovery_claim"] = {
+                    "version": 1,
+                    "claim_id": "replacement-claim",
+                    "claimed_at": replacement_claimed_at.isoformat(),
+                    "claim_expires_at": (replacement_claimed_at + timedelta(minutes=5)).isoformat(),
+                }
+                return updated
+
+            await store.transform_checkpoint(session_id, replace_claim)
+            with pytest.raises(
+                SessionRunFenced,
+                match="superseded by another recovery authority",
+            ):
+                await store.load_interaction_transition_receipt(
+                    session_id,
+                    transition=transition,
+                    expected_recovery_claim_id="issuer-clock-claim",
+                )
+            with pytest.raises(
+                SessionRunFenced,
+                match="superseded by another recovery authority",
+            ):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=interrupted,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTED,
+                    expected_recovery_claim_id="issuer-clock-claim",
+                    expected_recovery_claim_clock=lambda: issuer_now["value"],
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_interaction_claim_clock_fatal_signal_releases_writer_transaction(
+    tmp_path,
+) -> None:
+    class FatalClaimClockSignal(BaseException):
+        pass
+
+    async def run() -> None:
+        database = tmp_path / "fatal-interaction-claim-clock.sqlite"
+        store = SQLiteSessionStore(database)
+        peer: SQLiteSessionStore | None = None
+        session_id = "fatal-interaction-claim-clock"
+        interaction_id = "fatal-interaction-claim-clock"
+        observed_at = datetime(2040, 1, 1, tzinfo=UTC)
+        try:
+            started = Event(
+                id=f"evt-{interaction_id}-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+            await store.checkpoint(
+                session_id,
+                {
+                    "incomplete_session_recovery_claim": {
+                        "version": 1,
+                        "claim_id": "fatal-clock-claim",
+                        "claimed_at": observed_at.isoformat(),
+                        "claim_expires_at": (observed_at + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            )
+            interrupted = Event(
+                id=f"evt-{interaction_id}-interrupted",
+                type=EventType.INTERACTION_INTERRUPTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+
+            def fail_clock() -> datetime:
+                raise FatalClaimClockSignal("claim clock stopped")
+
+            with pytest.raises(FatalClaimClockSignal, match="claim clock stopped"):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=interrupted,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTED,
+                    expected_recovery_claim_id="fatal-clock-claim",
+                    expected_recovery_claim_clock=fail_clock,
+                )
+            assert store._connection.in_transaction is False
+
+            published = await store.publish_interaction_transition(
+                session_id,
+                event=interrupted,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.INTERRUPTED,
+                expected_recovery_claim_id="fatal-clock-claim",
+                expected_recovery_claim_clock=lambda: observed_at,
+            )
+            assert published.session.status is SessionStatus.INTERRUPTED
+            assert published.replayed is False
+
+            peer = SQLiteSessionStore(
+                database,
+                public_authority_alias_codec=store.public_authority_alias_codec,
+            )
+            await peer.checkpoint(session_id, {"peer_writer_completed": True})
+            assert await peer.load_checkpoint(session_id) == {"peer_writer_completed": True}
+        finally:
+            if peer is not None:
+                await peer.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "claim_boundary",
+    [
+        pytest.param("status-transition", id="atomic-interrupt-claim-installation"),
+        pytest.param("checkpoint-transform", id="claim-acquisition-or-renewal"),
+    ],
+)
+def test_sqlite_terminal_claim_callback_fatal_signal_releases_writer_transaction(
+    tmp_path,
+    claim_boundary: str,
+) -> None:
+    class FatalClaimCallbackSignal(BaseException):
+        pass
+
+    async def run() -> None:
+        database = tmp_path / f"fatal-{claim_boundary}.sqlite"
+        store = SQLiteSessionStore(database)
+        peer: SQLiteSessionStore | None = None
+        session_id = f"fatal-{claim_boundary}"
+        interaction_id = f"fatal-{claim_boundary}"
+        try:
+            started = Event(
+                id=f"evt-{interaction_id}-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+
+            def fail_claim_callback(_session, _checkpoint):
+                raise FatalClaimCallbackSignal("terminal claim callback stopped")
+
+            with pytest.raises(
+                FatalClaimCallbackSignal,
+                match="terminal claim callback stopped",
+            ):
+                if claim_boundary == "status-transition":
+                    await store.transition_status_and_checkpoint(
+                        session_id,
+                        from_statuses={SessionStatus.RUNNING},
+                        to_status=SessionStatus.INTERRUPTING,
+                        checkpoint_transform=fail_claim_callback,
+                    )
+                else:
+                    await store.transform_checkpoint(session_id, fail_claim_callback)
+            assert store._connection.in_transaction is False
+
+            if claim_boundary == "status-transition":
+                transitioned = await store.transition_status_and_checkpoint(
+                    session_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=lambda _session, checkpoint: checkpoint,
+                )
+                assert transitioned.status is SessionStatus.INTERRUPTING
+            else:
+                await store.transform_checkpoint(
+                    session_id,
+                    lambda _session, checkpoint: {
+                        **({} if checkpoint is None else checkpoint),
+                        "claim_callback_retried": True,
+                    },
+                )
+
+            peer = SQLiteSessionStore(
+                database,
+                public_authority_alias_codec=store.public_authority_alias_codec,
+            )
+            await peer.checkpoint(session_id, {"peer_writer_completed": True})
+            assert await peer.load_checkpoint(session_id) == {"peer_writer_completed": True}
+        finally:
+            if peer is not None:
+                await peer.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_public_interrupt_fatal_claim_callback_releases_writer_transaction(
+    tmp_path,
+) -> None:
+    class FatalClaimCallbackSignal(BaseException):
+        pass
+
+    async def run() -> None:
+        database = tmp_path / "fatal-public-interrupt-claim.sqlite"
+        store = SQLiteSessionStore(database)
+        peer: SQLiteSessionStore | None = None
+        session_id = "fatal-public-interrupt-claim"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+            )
+            original_transition = store.transition_status_and_checkpoint
+
+            async def fail_public_claim_callback(*args, **kwargs):
+                checkpoint_transform = kwargs["checkpoint_transform"]
+
+                def fail_after_claim_validation(session, checkpoint):
+                    checkpoint_transform(session, checkpoint)
+                    raise FatalClaimCallbackSignal("public terminal claim callback stopped")
+
+                return await original_transition(
+                    *args,
+                    **{
+                        **kwargs,
+                        "checkpoint_transform": fail_after_claim_validation,
+                    },
+                )
+
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                fail_public_claim_callback
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(
+                    FatalClaimCallbackSignal,
+                    match="public terminal claim callback stopped",
+                ),
+            ):
+                await _collect_events(
+                    app.interrupt_session(
+                        InterruptSessionRequest(
+                            session_id=session_id,
+                            reason="operator stop",
+                        )
+                    )
+                )
+            assert store._connection.in_transaction is False
+
+            store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
+            with session_engine_module.suppress_interruption_cascade():
+                events = await _collect_events(
+                    app.interrupt_session(
+                        InterruptSessionRequest(
+                            session_id=session_id,
+                            reason="operator stop",
+                        )
+                    )
+                )
+            assert events[-1].type is EventType.SESSION_INTERRUPTED
+
+            peer = SQLiteSessionStore(
+                database,
+                public_authority_alias_codec=store.public_authority_alias_codec,
+            )
+            await peer.checkpoint(session_id, {"peer_writer_completed": True})
+            assert await peer.load_checkpoint(session_id) == {"peer_writer_completed": True}
+        finally:
+            if peer is not None:
+                await peer.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_incomplete_recovery_success_does_not_suppress_simultaneous_claim_loss(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_UserInputRecoveryProvider(), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool()],
+        )
+        session_id = "simultaneous-terminal-recovery-claim-loss"
+        await _collect_events(
+            app.run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "ask a question")],
+                )
+            )
+        )
+        session = await store.load(session_id)
+        assert session is not None
+        recovery = app._session_engine._recovery_coordinator
+        release = asyncio.Event()
+
+        async def lose_claim_with_recovery_completion(**_kwargs):
+            await release.wait()
+            raise recovery_coordinator_module._IncompleteRecoveryClaimLost(
+                "peer replaced the recovery claim"
+            )
+
+        monkeypatch.setattr(
+            recovery,
+            "_heartbeat_incomplete_recovery_claim",
+            lose_claim_with_recovery_completion,
+        )
+
+        async def finish_recovery() -> bool:
+            release.set()
+            await asyncio.sleep(0)
+            return True
+
+        claim = recovery_coordinator_module._IncompleteRecoveryClaim(
+            claim_id="simultaneous-claim",
+            claim_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            session_before_fence=session,
+            session=session,
+        )
+        with pytest.raises(
+            recovery_coordinator_module._IncompleteRecoveryClaimLost,
+            match="peer replaced",
+        ):
+            await recovery._recover_incomplete_session_with_heartbeat(
+                claim=claim,
+                recovery=finish_recovery,
+            )
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_stops_live_finalizer_after_terminal_claim_loss(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        peer_store: SessionStore | None = None
+        session_id = f"lost-live-terminal-finalization-claim-{session_store_case[0]}"
+        release_handler = asyncio.Event()
+        tasks: list[asyncio.Task[list[Event]]] = []
+        try:
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
+                timedelta(milliseconds=150),
+            )
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
+                0.02,
+            )
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS",
+                0.01,
+            )
+            awaiting_event_id: str | None = None
+            original_publish = store.publish_runtime_publication
+            original_side_effect_claim = store.claim_persisted_event_side_effect
+            fan_out_started = asyncio.Event()
+
+            async def remember_awaiting_event(session_id: str, **kwargs):
+                nonlocal awaiting_event_id
+                result = await original_publish(session_id, **kwargs)
+                if kwargs["request"].kind == "user-input-open":
+                    awaiting_event_id = next(
+                        event.id
+                        for event in kwargs["request"].events
+                        if event.type is EventType.SESSION_AWAITING_USER_INPUT
+                    )
+                return result
+
+            async def block_awaiting_fan_out(*, session_id: str, event_id: str):
+                if event_id == awaiting_event_id:
+                    fan_out_started.set()
+                    await asyncio.Event().wait()
+                return await original_side_effect_claim(
+                    session_id=session_id,
+                    event_id=event_id,
+                )
+
+            store.publish_runtime_publication = remember_awaiting_event  # type: ignore[method-assign]
+            store.claim_persisted_event_side_effect = block_awaiting_fan_out  # type: ignore[method-assign]
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            handler_entered = asyncio.Event()
+            original_handler = app._session_engine._handle_session_interrupted
+
+            async def hold_live_handler(*args, **kwargs):
+                if (
+                    kwargs["session"].id
+                    in app._session_engine._session_control._terminal_finalization_claim_handoffs
+                ):
+                    handler_entered.set()
+                    await release_handler.wait()
+                async for event in original_handler(*args, **kwargs):
+                    yield event
+
+            app._session_engine._handle_session_interrupted = (  # type: ignore[method-assign]
+                hold_live_handler
+            )
+            running = asyncio.create_task(
+                _collect_events(
+                    app.run(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "ask a question")],
+                        )
+                    )
+                )
+            )
+            tasks.append(running)
+            await asyncio.wait_for(fan_out_started.wait(), timeout=5)
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes active pause",
+            )
+            with session_engine_module.suppress_interruption_cascade():
+                interrupting = asyncio.create_task(_collect_events(app.interrupt_session(request)))
+                tasks.append(interrupting)
+                await asyncio.wait_for(handler_entered.wait(), timeout=5)
+                checkpoint = await store.load_checkpoint(session_id)
+                assert checkpoint is not None
+                lost_claim = checkpoint["incomplete_session_recovery_claim"]
+                lost_claim_id = lost_claim["claim_id"]
+
+                recovery = app._session_engine._recovery_coordinator
+                original_renew = recovery._renew_incomplete_recovery_claim
+
+                async def lose_live_claim(
+                    renewed_session_id: str,
+                    renewed_claim_id: str,
+                ):
+                    if renewed_session_id == session_id and renewed_claim_id == lost_claim_id:
+                        return None
+                    return await original_renew(
+                        renewed_session_id,
+                        renewed_claim_id,
+                    )
+
+                recovery._renew_incomplete_recovery_claim = (  # type: ignore[method-assign]
+                    lose_live_claim
+                )
+                handoff = (
+                    app._session_engine._session_control._terminal_finalization_claim_handoffs[
+                        session_id
+                    ]
+                )
+                with pytest.raises(recovery_coordinator_module._IncompleteRecoveryClaimLost):
+                    await asyncio.wait_for(
+                        asyncio.shield(handoff.heartbeat_task),
+                        timeout=5,
+                    )
+                await asyncio.sleep(0.2)
+
+                peer_store = await _open_peer_store(session_store_case, store)
+                peer_app = CayuApp(session_store=peer_store, enable_logging=False)
+                peer_app.register_provider(_UserInputRecoveryProvider(), default=True)
+                peer_app.register_agent(
+                    AgentSpec(name="assistant", model="fake-model"),
+                    tools=[UserInputTool()],
+                )
+                peer = asyncio.create_task(_collect_events(peer_app.interrupt_session(request)))
+                tasks.append(peer)
+                peer_events = await asyncio.wait_for(peer, timeout=10)
+                assert peer_events[-1].type is EventType.SESSION_INTERRUPTED
+
+                release_handler.set()
+                run_outcome, interrupt_events = await asyncio.wait_for(
+                    asyncio.gather(running, interrupting, return_exceptions=True),
+                    timeout=10,
+                )
+            assert isinstance(run_outcome, BaseException)
+            assert isinstance(interrupt_events, list)
+            assert interrupt_events[-1].id == peer_events[-1].id
+            final_checkpoint = await store.load_checkpoint(session_id)
+            assert final_checkpoint is not None
+            assert "pending_session_interrupt" not in final_checkpoint
+            assert "incomplete_session_recovery_claim" not in final_checkpoint
+            assert (
+                session_id
+                not in app._session_engine._session_control._terminal_finalization_claim_handoffs
+            )
+            terminal_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert len(terminal_records) == 1
+        finally:
+            release_handler.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if peer_store is not None and peer_store is not store:
+                await _close_store(peer_store)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_answering_user_input_supersession(
+    session_store_case,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"user-input-answering-supersession-{session_store_case[0]}"
+        try:
+            provider = _UserInputRecoveryProvider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            paused = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            ]
+            awaiting = next(
+                event for event in paused if event.type is EventType.SESSION_AWAITING_USER_INPUT
+            )
+            public_input_id = awaiting.payload["input_id"]
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            private_input_id = checkpoint["pending_user_input"]["input_id"]
+
+            claim_committed = asyncio.Event()
+            release_claim_acknowledgement = asyncio.Event()
+            response = UserInputResponse(
+                session_id=session_id,
+                input_id=public_input_id,
+                answer="yes",
+            )
+
+            original_admission = app._recovery_coordinator._admit_user_input_resolution_execution
+
+            async def block_before_execution_admission(*args: Any, **kwargs: Any):
+                current = await store.load_checkpoint(session_id)
+                intent = (
+                    None
+                    if current is None
+                    else current.get(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY)
+                )
+                if type(intent) is dict and intent.get("execution_state") == "claimed":
+                    claim_committed.set()
+                    await release_claim_acknowledgement.wait()
+                return await original_admission(*args, **kwargs)
+
+            monkeypatch.setattr(
+                app._recovery_coordinator,
+                "_admit_user_input_resolution_execution",
+                block_before_execution_admission,
+            )
+
+            async def collect_after_answer_claim() -> list[Event]:
+                return [event async for event in app.resolve_user_input(response)]
+
+            resolving = asyncio.create_task(collect_after_answer_claim())
+            await asyncio.wait_for(claim_committed.wait(), timeout=5)
+            claimed_checkpoint = await store.load_checkpoint(session_id)
+            assert claimed_checkpoint is not None
+            resolution_intent = claimed_checkpoint["user_input_resolution_intent"]
+            assert resolution_intent["execution_state"] == "claimed"
+            private_response = response.model_copy(update={"input_id": private_input_id})
+            assert resolution_intent["answer_request_digest"] == user_input_answer_request_digest(
+                private_response
+            )
+            assert resolution_intent[
+                "resolution_request_digest"
+            ] == user_input_resolution_request_digest(private_response)
+
+            interrupt_app = CayuApp(session_store=store, enable_logging=False)
+            interrupt_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            interrupt_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            with pytest.raises(TimeoutError, match="still finalizing"):
+                _ = [
+                    event
+                    async for event in interrupt_app.interrupt_session(
+                        InterruptSessionRequest(
+                            session_id=session_id,
+                            reason="operator supersedes answer claim",
+                        )
+                    )
+                ]
+            release_claim_acknowledgement.set()
+            resolved = await asyncio.wait_for(resolving, timeout=10)
+            assert resolved[-1].type is EventType.SESSION_INTERRUPTED
+            assert len(provider.requests) == 1
+            assert not any(
+                event.type is EventType.SESSION_RESUMED
+                for event in await store.load_events(session_id)
+            )
+
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            assert "pending_user_input" not in checkpoint
+            assert "user_input_resolution_intent" not in checkpoint
+            operator_records = [
+                record
+                for record in await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SESSION_INTERRUPTED,
+                    )
+                )
+                if record.event.payload.get("interruption_type") == "operator_requested"
+            ]
+            assert operator_records
+            marker = operator_records[-1].event.payload["user_input_supersession_intent"]
+            assert marker["state"] == "answering"
+            assert marker["input_id"] == private_input_id
+            assert marker["claim_run_epoch"] == resolution_intent["claim_run_epoch"]
+            assert (
+                marker["resolution_request_digest"]
+                == (resolution_intent["resolution_request_digest"])
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            replay_app = CayuApp(session_store=store, enable_logging=False)
+            replay_app.register_provider(_UserInputRecoveryProvider(), default=True)
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="superseded by an external interruption",
+            ):
+                _ = [event async for event in replay_app.resolve_user_input(response)]
         finally:
             await _close_store(store)
 

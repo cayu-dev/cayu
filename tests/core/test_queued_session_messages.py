@@ -251,6 +251,8 @@ class CompletionFenceStore(InterruptTrackingStore):
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
+        expected_recovery_claim_id: str | None = None,
+        expected_recovery_claim_clock=None,
     ):
         if only_if_no_queued_messages:
             self.completion_started.set()
@@ -265,6 +267,8 @@ class CompletionFenceStore(InterruptTrackingStore):
             expected_session_instance_id=expected_session_instance_id,
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
+            expected_recovery_claim_id=expected_recovery_claim_id,
+            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
 
 

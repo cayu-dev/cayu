@@ -4803,12 +4803,17 @@ def test_legacy_pending_user_input_rejects_secret_authority_before_recovery() ->
 
     secret = "legacy-user-input-authority-secret-canary"
     pending = PendingUserInput(
+        session_id="session-safe",
+        session_instance_id="session-instance-safe",
+        source_interaction_id="interaction-safe",
+        source_run_epoch=1,
         **tool_round_identity().payload(),
         input_id=secret,
         tool_call_id="call-safe",
         tool_name="safe-tool",
         question="Continue?",
         agent_name="assistant",
+        execution_profile_fingerprint="e" * 64,
         tool_calls=[
             PendingToolCallApproval(
                 tool_call_id="call-safe",
@@ -4840,6 +4845,10 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
     secret = "legacy-user-input-key-secret-canary"
     secret_key = f"prefix-{secret}-suffix"
     pending = PendingUserInput(
+        session_id="session-safe",
+        session_instance_id="session-instance-safe",
+        source_interaction_id="interaction-safe",
+        source_run_epoch=1,
         **tool_round_identity().payload(),
         input_id="input-safe",
         tool_call_id="call-safe",
@@ -4847,6 +4856,7 @@ def test_legacy_pending_user_input_rejects_secret_argument_key_without_mutating_
         question="Continue?",
         arguments={secret_key: "top-level"},
         agent_name="assistant",
+        execution_profile_fingerprint="e" * 64,
         tool_calls=[
             PendingToolCallApproval(
                 tool_call_id="call-safe",

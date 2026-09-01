@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
@@ -49,6 +49,22 @@ class ActiveSessionRun(Generic[UsageTrackerT]):
     turn_completed_event: Event | None = None
     turn_completed_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     out_of_band_events: asyncio.Queue[Event] = field(default_factory=asyncio.Queue)
+
+
+@dataclass
+class TerminalFinalizationClaimHandoff:
+    """Process-local authority joining one interrupt owner to its live run."""
+
+    session_instance_id: str
+    run_epoch: int
+    interruption_request_id: str
+    expected_interrupt_payload: dict[str, Any]
+    claim_id: str
+    eligible_tasks: frozenset[asyncio.Task[Any]]
+    heartbeat_stop: asyncio.Event
+    heartbeat_task: asyncio.Task[None]
+    claimed_by: asyncio.Task[Any] | None = None
+    heartbeat_failure: BaseException | None = None
 
 
 def clear_current_task_cancellation() -> None:
@@ -107,6 +123,7 @@ class SessionControl(Generic[UsageTrackerT]):
         self._sessions_emitting_interrupted: set[str] = set()
         self._sessions_requesting_interruption: set[str] = set()
         self._interrupt_signals: dict[str, asyncio.Event] = {}
+        self._terminal_finalization_claim_handoffs: dict[str, TerminalFinalizationClaimHandoff] = {}
 
     def stream_interrupt_poll(self, session_id: str) -> StreamInterruptPoll:
         return StreamInterruptPoll(self, session_id=session_id)
@@ -272,23 +289,156 @@ class SessionControl(Generic[UsageTrackerT]):
             not task.done() for task in self._active_control_tasks.get(session_id, ())
         )
 
-    def cancel_active_runs(self, session_id: str) -> bool:
+    def _interrupt_targets(self, session_id: str) -> frozenset[asyncio.Task[Any]]:
         current_task = asyncio.current_task()
-        signalled = False
         run_tasks = {
             active_run.runtime_task
             for active_run in self.active_runs(session_id)
             if active_run.runtime_task is not current_task and not active_run.runtime_task.done()
         }
-        # Control tasks supervise phases that have no active run worker. Once a
-        # run worker exists, cancel it exactly once and leave the supervisor
-        # alive to coordinate terminal persistence and owned cleanup.
-        tasks = run_tasks or {
+        if run_tasks:
+            return frozenset(run_tasks)
+        return frozenset(
             task
             for task in self._active_control_tasks.get(session_id, ())
             if task is not current_task and not task.done()
-        }
-        for task in tasks:
+        )
+
+    def register_terminal_finalization_claim_handoff(
+        self,
+        session_id: str,
+        *,
+        session_instance_id: str,
+        run_epoch: int,
+        interruption_request_id: str,
+        expected_interrupt_payload: dict[str, Any],
+        claim_id: str,
+        heartbeat_stop: asyncio.Event,
+        heartbeat_task: asyncio.Task[None],
+    ) -> bool:
+        """Bind an exact durable claim to the tasks about to receive interruption."""
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        targets = self._interrupt_targets(session_id)
+        if not targets:
+            return False
+        existing = self._terminal_finalization_claim_handoffs.get(session_id)
+        if existing is not None and existing.claim_id != claim_id:
+            raise RuntimeError("A different terminal finalization handoff is already active.")
+        handoff = TerminalFinalizationClaimHandoff(
+            session_instance_id=require_clean_nonblank(
+                session_instance_id,
+                "session_instance_id",
+            ),
+            run_epoch=run_epoch,
+            interruption_request_id=require_clean_nonblank(
+                interruption_request_id,
+                "interruption_request_id",
+            ),
+            expected_interrupt_payload=copy_json_value(
+                expected_interrupt_payload,
+                "expected_interrupt_payload",
+            ),
+            claim_id=require_clean_nonblank(claim_id, "claim_id"),
+            eligible_tasks=targets,
+            heartbeat_stop=heartbeat_stop,
+            heartbeat_task=heartbeat_task,
+        )
+        self._terminal_finalization_claim_handoffs[session_id] = handoff
+
+        def observe_heartbeat(completed: asyncio.Task[None]) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except BaseException as failure:
+                handoff.heartbeat_failure = failure
+
+        heartbeat_task.add_done_callback(observe_heartbeat)
+
+        def stop_unaccepted_handoff(_completed: asyncio.Task[Any]) -> None:
+            current = self._terminal_finalization_claim_handoffs.get(session_id)
+            if (
+                current is handoff
+                and current.claimed_by is None
+                and all(target.done() for target in current.eligible_tasks)
+            ):
+                # The durable claim remains available for expiry-based recovery,
+                # but a process-local handoff with no receiving task must never
+                # renew it forever.
+                self._terminal_finalization_claim_handoffs.pop(session_id, None)
+                current.heartbeat_stop.set()
+
+        for target in targets:
+            target.add_done_callback(stop_unaccepted_handoff)
+        return True
+
+    def take_terminal_finalization_claim_handoff(
+        self,
+        session_id: str,
+        *,
+        task: asyncio.Task[Any],
+        session_instance_id: str,
+        run_epoch: int,
+        transferred_from: asyncio.Task[Any] | None = None,
+    ) -> TerminalFinalizationClaimHandoff | None:
+        """Return only the exact claim handed to this interrupted live task."""
+
+        handoff = self._terminal_finalization_claim_handoffs.get(session_id)
+        if handoff is None:
+            return None
+        if (
+            (task not in handoff.eligible_tasks and transferred_from not in handoff.eligible_tasks)
+            or (transferred_from is not None and transferred_from.done())
+            or handoff.session_instance_id != session_instance_id
+            or handoff.run_epoch != run_epoch
+            or handoff.claimed_by not in {None, task}
+        ):
+            return None
+        # Even a failed keeper must transfer its cleanup owner. The receiving
+        # task observes the completed heartbeat before its first store access,
+        # then releases only this exact claim in its finalizer.
+        handoff.claimed_by = task
+        return handoff
+
+    def reclaim_unaccepted_terminal_finalization_claim_handoff(
+        self,
+        session_id: str,
+        *,
+        claim_id: str,
+    ) -> asyncio.Task[None] | None:
+        """Stop one handoff after every eligible receiver has exited."""
+
+        handoff = self._terminal_finalization_claim_handoffs.get(session_id)
+        if handoff is None or handoff.claim_id != claim_id or handoff.claimed_by is not None:
+            return None
+        self._terminal_finalization_claim_handoffs.pop(session_id, None)
+        handoff.heartbeat_stop.set()
+        return handoff.heartbeat_task
+
+    def end_terminal_finalization_claim_handoff(
+        self,
+        session_id: str,
+        *,
+        claim_id: str,
+        task: asyncio.Task[Any] | None = None,
+    ) -> asyncio.Task[None] | None:
+        """Stop and detach one exact process-local claim heartbeat owner."""
+
+        handoff = self._terminal_finalization_claim_handoffs.get(session_id)
+        if (
+            handoff is None
+            or handoff.claim_id != claim_id
+            or (task is not None and handoff.claimed_by not in {None, task})
+        ):
+            return None
+        self._terminal_finalization_claim_handoffs.pop(session_id, None)
+        handoff.heartbeat_stop.set()
+        return handoff.heartbeat_task
+
+    def cancel_active_runs(self, session_id: str) -> bool:
+        signalled = False
+        for task in self._interrupt_targets(session_id):
             task.cancel()
             signalled = True
         return signalled

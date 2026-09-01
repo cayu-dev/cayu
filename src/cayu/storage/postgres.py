@@ -332,6 +332,7 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_checkpoint,
     _initial_transcript_prefix_count,
     _interaction_transition_receipt_record,
+    _interaction_transition_recovery_claim_observed_at,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
     _invocation_terminal_event_receipt_record,
@@ -393,13 +394,15 @@ from cayu.runtime.sessions import (
     _stored_mcp_manifest_baseline,
     _terminal_publication_delete_block_reason,
     _terminal_session_evidence_expected_event_type,
-    _tool_round_publication_identity,
+    _tool_lifecycle_publication_identity,
     _validate_equivalent_queued_session_message,
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
     _validate_interaction_page,
     _validate_interaction_transition_invocation_authority_parameters,
-    _validate_interaction_transition_receipt_invocation_authority,
+    _validate_interaction_transition_receipt_authority,
+    _validate_interaction_transition_receipt_recovery_authority,
+    _validate_interaction_transition_recovery_claim_parameters,
     _validate_invocation_release_settlement_receipt_authority,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
@@ -430,6 +433,7 @@ from cayu.runtime.sessions import (
     _validate_tool_round_call_ids,
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
+    _validate_user_input_checkpoint_mutation,
     apply_fork_system_prompt_replacement,
     build_session_topology_result,
     checkpoint_root_field_projection_from_storage,
@@ -25856,6 +25860,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_session_instance_id: str | None = None,
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
+        expected_recovery_claim_id: str | None = None,
+        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -25864,6 +25870,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 expected_session_instance_id=expected_session_instance_id,
                 expected_active_invocation_profile=expected_active_invocation_profile,
                 expected_invocation_authority_state=expected_invocation_authority_state,
+            )
+        )
+        expected_recovery_claim_id, expected_recovery_claim_clock = (
+            _validate_interaction_transition_recovery_claim_parameters(
+                expected_recovery_claim_id=expected_recovery_claim_id,
+                expected_recovery_claim_clock=expected_recovery_claim_clock,
             )
         )
 
@@ -25906,7 +25918,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             _json_obj(receipt_row[0]),
                             transition=transition,
                         )
-                        _validate_interaction_transition_receipt_invocation_authority(
+                        _validate_interaction_transition_receipt_authority(
                             receipt,
                             current_session=loaded,
                             current_checkpoint=await self._load_checkpoint(cur, session_id),
@@ -25915,6 +25927,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             expected_invocation_authority_state=(
                                 expected_invocation_authority_state
                             ),
+                            expected_recovery_claim_id=expected_recovery_claim_id,
                         )
                         if (
                             existing_row is not None
@@ -25934,6 +25947,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Interaction transition event exists without its immutable receipt."
                         )
+                    if expected_recovery_claim_id is not None:
+                        assert expected_recovery_claim_clock is not None
+                        checkpoint = await self._load_checkpoint(cur, session_id)
+                        active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+                            checkpoint,
+                            now=_interaction_transition_recovery_claim_observed_at(
+                                expected_recovery_claim_clock
+                            ),
+                        )
+                        if active_recovery_claim_id != expected_recovery_claim_id:
+                            raise SessionRunFenced(
+                                "Interaction transition lost its exact terminal recovery claim."
+                            )
                     if expected_active_invocation_profile is not None:
                         from cayu.runtime._invocation_lifecycle import (
                             require_invocation_command_authority,
@@ -26155,6 +26181,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         invocation_session_instance_id=expected_session_instance_id,
                         invocation_active_profile=expected_active_invocation_profile,
                         invocation_authority_state=expected_invocation_authority_state,
+                        recovery_claim_id=expected_recovery_claim_id,
                     )
                     await cur.execute(
                         "INSERT INTO cayu_session_operations "
@@ -26204,6 +26231,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         *,
         transition: InteractionTransitionSpec,
+        expected_recovery_claim_id: str | None = None,
     ) -> InteractionTransitionReceiptResult | None:
         session_id, copied_transition = _prepare_interaction_transition_receipt_lookup(
             session_id,
@@ -26236,6 +26264,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             receipt = _reconstruct_interaction_transition_receipt(
                 _json_obj(receipt_record),
                 transition=copied_transition,
+            )
+            _validate_interaction_transition_receipt_recovery_authority(
+                receipt,
+                current_checkpoint=await self._load_checkpoint(cur, session_id),
+                expected_recovery_claim_id=expected_recovery_claim_id,
             )
             if existing_record is not None and Event(**_json_obj(existing_record)) != receipt.event:
                 raise RuntimeError(
@@ -29377,12 +29410,20 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         if checkpoint_decode is None
                         else checkpoint_decode(loaded, stored_checkpoint)
                     )
+                    _validate_user_input_checkpoint_mutation(
+                        request,
+                        current_checkpoint,
+                        session_id=session_id,
+                        session_instance_id=loaded.instance_id,
+                        current_run_epoch=loaded.run_epoch,
+                        durable_events_by_id=durable_references,
+                    )
                     _validate_tool_round_checkpoint_mutation(
                         request,
                         current_checkpoint,
                     )
                     durable_tool_events: list[Event] = []
-                    tool_round_identity = _tool_round_publication_identity(request)
+                    tool_round_identity = _tool_lifecycle_publication_identity(request)
                     if tool_round_identity is not None:
                         execution_identity, tool_call_ids = tool_round_identity
                         lookup_keys = [
@@ -30051,6 +30092,42 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 ORDER BY session_order ASC
                 """,
                 (session_id,),
+            )
+            rows = await cur.fetchall()
+            return [Event(**_json_obj(row[0])) for row in rows]
+
+    async def load_user_input_supersession_events(
+        self,
+        session_id: str,
+        input_id: str,
+    ) -> list[Event]:
+        from cayu.runtime.pending_actions import pending_action_lookup_key
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        input_id = require_clean_nonblank(input_id, "input_id")
+        lookup_key = pending_action_lookup_key(input_id)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = %s",
+                (session_id,),
+            )
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                "SELECT event FROM cayu_events "
+                "WHERE session_id = %s AND pending_action_lookup_key = %s "
+                "AND event_type = %s "
+                f"AND ({_PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                "AND event -> 'payload' -> 'user_input_supersession_intent' "
+                "->> 'input_id' = %s "
+                "ORDER BY session_order ASC LIMIT 2",
+                (
+                    session_id,
+                    lookup_key,
+                    str(EventType.SESSION_INTERRUPTED),
+                    input_id,
+                ),
             )
             rows = await cur.fetchall()
             return [Event(**_json_obj(row[0])) for row in rows]

@@ -783,10 +783,11 @@ def user_input_resume_events(events: list[Event], input_id: str) -> list[Event]:
 
     The boundary is the FIRST event that marks this pause: either ``session.awaiting_user_input``
     (payload ``input_id``) or a ``session.interrupted`` carrying ``user_input.input_id`` for it.
-    Both are needed: ``pending_user_input`` is checkpointed BEFORE the awaiting event is appended,
-    so a worker that crashed in between has no awaiting event, but recovery finalizes the pause
-    with a durable ``session.interrupted``. Anchoring on that too keeps the retry ledger scoped
-    (rather than empty, which would re-run an already-completed sibling).
+    Both are accepted because a bounded recovery window may begin at the terminal
+    ``session.interrupted`` evidence rather than the earlier atomic open publication. The
+    ``pending_user_input`` checkpoint and awaiting event cannot split: the exact user-input-open
+    receipt publishes them together. Anchoring on the terminal pause too keeps the retry ledger
+    scoped rather than empty, which would re-run an already-completed sibling.
     """
     for index, event in enumerate(events):
         if _event_marks_user_input_pause(event, input_id):
