@@ -2618,6 +2618,89 @@ window passes, while not finding it in a truncated file is `unavailable` because
 the unseen suffix could still contain the text. A truncated artifact listing is
 also `unavailable`; it is never treated as a complete empty scope.
 
+### Runtime-contract replay
+
+Static assertion replay asks whether retained evidence satisfies assertions. It does not run
+the application. **Runtime-contract replay** asks a different, narrower question: if recorded
+model completions and tool results are treated as fixtures, does a candidate Cayu application
+still construct the same model requests, authorize the same tool path, and reach the same
+terminal outcome?
+
+```python
+from cayu import RuntimeReplayDisposition, RuntimeReplayRequest, trajectory_from_session
+
+# Capture an exact runtime-attested trajectory from the durable source store.
+trajectory = await trajectory_from_session(source_app, session_id)
+
+# The candidate can be the current app or another app with the same public agent name.
+report = await candidate_app.replay_session(
+    RuntimeReplayRequest(trajectory=trajectory)
+)
+assert report.disposition is RuntimeReplayDisposition.MATCHED
+```
+
+The source run and its store are read-only. Replay creates a private in-memory session, sends
+recorded assistant messages through a `ModelProvider` adapter, and substitutes every recorded
+`ToolResult`, including artifact-bearing and error results, through the ordinary tool-round
+machinery. Sequential and parallel calls in the recorded round are all matched by logical call
+identity, tool name, exact model-authored arguments, effect, round linkage, and terminal result.
+The candidate's context selection,
+request construction, tool exposure, and tool policy still run. Registered provider dispatch,
+registered tool implementations, environments, runners, workspaces, vaults, and external
+effects do not. This includes tools declared `EXTERNAL`. Replay retains the source session's
+resolved provider/model target rather than re-resolving a possibly different application
+default.
+
+Keyed request identities must have been enabled when the source ran, and the candidate must use
+the same fingerprint key ID and secret. Missing source footprints report `unavailable`; a
+different key reports `unavailable` because the HMACs are not comparable. The default report is
+safe to serialize: it contains redacted execution-profile identities, keyed request identities,
+hashed source/trajectory identities, typed reasons, and source event IDs, but no prompt text,
+transcript content, tool arguments/results, metadata, provider error bodies, or credentials.
+When contextual pricing participates in candidate budget admission, replay serves the exact
+request/completion billing identities retained by source budget reservations. It never invokes
+the provider's billing hook. A source without exact request billing evidence reports
+`source_billing_evidence_unavailable` instead of guessing from completion-time accounting data.
+Date-effective pricing is evaluated at the source session's creation time, keeping replay both
+historically faithful and deterministic.
+
+Completed-session evidence retains the resulting execution-profile identities, but it does not
+retain every caller-owned invocation setting. If the source and candidate profiles differ in a
+component that can be affected by unretained `RunRequest` settings—invocation loop policies,
+thinking, request budget limits, run limits, retry policy, or `max_steps`—replay reports
+`source_invocation_evidence_unavailable`. It never reconstructs those values from candidate
+defaults and mislabels the resulting request/profile difference as candidate drift. Sources using
+the candidate's matching defaults remain replayable.
+
+Schema V1 is deliberately fail-closed and bounded. It accepts one completed fresh session with
+exact runtime-owned text-only caller input, exactly two model steps, and one bounded tool round.
+The default bound is 16 calls and callers may raise it to the hard limit of 256. Normal sequential
+and parallel rounds retain exact finalized argument evidence only after every call's secret scope
+has sealed. If argument publication is disabled, secret redaction changes an argument, or the
+runtime cannot prove the final secret scope complete, replay returns
+`source_tool_argument_evidence_unavailable`; it never executes with a redacted or guessed value.
+Subagents,
+forks, resumes, queued input, approvals, retries, compaction, hooks, custom loop/context/tool
+policies, tool discovery, MCP/runtime/hosted tools, result projection, knowledge injection, and
+registered environments report a typed `unavailable` result. A trajectory reloaded from a
+standalone JSON export has no runtime-owned fresh-input attestation and therefore cannot be used
+for runtime-contract replay; use that export for static assertion replay. Capture the replay
+source directly from its durable session store instead.
+
+These operations make different claims:
+
+- `evaluate_assertions(...)` re-checks captured facts without running an application.
+- `replay_session(...)` re-drives orchestration with recorded provider/tool outcomes and no live
+  effects.
+- A corpus run or **Run on current app** is a fresh evaluation and can call the configured live
+  provider, tools, and environment under its eval limits.
+- A session fork is a new live continuation from retained state, not replay.
+
+A `matched` runtime replay is not model-behavior reproducibility. It does not claim that a model
+would return the recorded completion today, that an external tool would return the recorded
+result, or that two prompts are semantically equivalent beyond the versioned fingerprint
+canonicalization contract.
+
 ## Interop
 
 The default result format is JSON. It is intentionally simple so downstream

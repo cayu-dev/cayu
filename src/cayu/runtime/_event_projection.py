@@ -2388,6 +2388,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "workspace_mutation_capture_status",
     }
     tool_terminal = tool_common | {
+        "arguments_exact",
         "durable_value_error_code",
         "durable_value_error_path",
         "isolated_tool_failure_code",
@@ -3816,7 +3817,12 @@ def _validate_new_terminal_tool_argument_projection(
     if event.type not in _TERMINAL_TOOL_ARGUMENT_EVENT_TYPES:
         return
     state = payload.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
+    arguments_exact = payload.get(tool_argument_publication.ARGUMENTS_EXACT_FIELD)
+    if arguments_exact is not None and type(arguments_exact) is not bool:
+        raise TypeError("Terminal arguments_exact must be a boolean.")
     if state is None:
+        if arguments_exact is not None:
+            raise ValueError("Terminal arguments_exact requires an argument publication state.")
         return
     if state == "finalized":
         if type(payload.get(tool_argument_publication.ARGUMENTS_FIELD)) is not dict:
@@ -3826,6 +3832,8 @@ def _validate_new_terminal_tool_argument_projection(
             raise TypeError("Terminal effective_arguments must be an object.")
         return
     if state == "unavailable":
+        if arguments_exact is True:
+            raise ValueError("Unavailable terminal arguments cannot be exact.")
         if tool_argument_publication.ARGUMENTS_FIELD in payload or "effective_arguments" in payload:
             raise ValueError("Unavailable terminal arguments cannot carry argument objects.")
         return
@@ -3843,25 +3851,30 @@ def _fail_closed_public_terminal_tool_argument_projection(
         return
     original = event.payload
     state = original.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
+    arguments_exact = original.get(tool_argument_publication.ARGUMENTS_EXACT_FIELD)
     if state is None:
         return
     valid = False
     if state == "finalized":
         arguments = original.get(tool_argument_publication.ARGUMENTS_FIELD)
         effective_arguments = original.get("effective_arguments")
-        valid = type(arguments) is dict and (
-            effective_arguments is None or type(effective_arguments) is dict
+        valid = (
+            type(arguments) is dict
+            and (arguments_exact is None or type(arguments_exact) is bool)
+            and (effective_arguments is None or type(effective_arguments) is dict)
         )
     elif state == "unavailable":
         valid = (
             tool_argument_publication.ARGUMENTS_FIELD not in original
             and "effective_arguments" not in original
+            and (arguments_exact is None or arguments_exact is False)
         )
     if valid:
         return
     payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
     payload.pop("effective_arguments", None)
     payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "unavailable"
+    payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
 
 
 def _minimize_public_tool_discovery_result(

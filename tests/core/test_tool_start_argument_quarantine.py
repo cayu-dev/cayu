@@ -2666,8 +2666,9 @@ async def _run_multi_call_secret_scope_scenario(*, max_parallel_tool_calls: int)
     assert len([event for event in events if event.type is EventType.TOOL_CALL_STARTED]) == 2
     terminal_events = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
     assert len(terminal_events) == 2
-    assert all(event.payload["arguments_state"] == "unavailable" for event in terminal_events)
-    assert all("arguments" not in event.payload for event in terminal_events)
+    assert all(event.payload["arguments_state"] == "finalized" for event in terminal_events)
+    assert all(event.payload["arguments_exact"] is False for event in terminal_events)
+    assert all(type(event.payload["arguments"]) is dict for event in terminal_events)
     assert first_secret not in repr(events)
     assert second_secret not in repr(events)
     assert first_secret not in repr(provider.requests[1].messages)
@@ -2697,7 +2698,7 @@ def test_multi_call_rounds_keep_late_secret_scopes_isolated(
 
 
 @pytest.mark.parametrize("max_parallel_tool_calls", [1, 4])
-def test_multi_call_round_omits_arguments_when_only_a_sibling_resolves_the_secret(
+def test_multi_call_round_redacts_arguments_when_only_a_sibling_resolves_the_secret(
     max_parallel_tool_calls: int,
 ) -> None:
     class PublishAfterArgumentsHook(RuntimeHook):
@@ -2780,7 +2781,9 @@ def test_multi_call_round_omits_arguments_when_only_a_sibling_resolves_the_secre
 
         terminal_events = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
         assert len(terminal_events) == 2
-        assert all(event.payload["arguments_state"] == "unavailable" for event in terminal_events)
+        assert all(event.payload["arguments_state"] == "finalized" for event in terminal_events)
+        assert all(event.payload["arguments_exact"] is False for event in terminal_events)
+        assert all(type(event.payload["arguments"]) is dict for event in terminal_events)
         assert hook.arguments == [{}, {}]
         durable_events = await store.load_events(f"late-secret-sibling-{max_parallel_tool_calls}")
         custom_events = [

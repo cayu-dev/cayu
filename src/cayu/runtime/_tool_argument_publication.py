@@ -17,6 +17,7 @@ from cayu.vaults import SecretRedactor
 
 ARGUMENTS_STATE_FIELD = "arguments_state"
 ARGUMENTS_FIELD = "arguments"
+ARGUMENTS_EXACT_FIELD = "arguments_exact"
 ArgumentPublicationState = Literal["quarantined", "finalized", "unavailable"]
 TERMINAL_ARGUMENT_STATES = frozenset({"finalized", "unavailable"})
 
@@ -88,6 +89,21 @@ def unavailable_argument_projection() -> ToolArgumentProjection:
     """Return a fail-closed projection when no sealed invocation scope exists."""
 
     return ToolArgumentProjection(state="unavailable")
+
+
+def argument_projection_is_exact(
+    projection: ToolArgumentProjection,
+    *,
+    private_arguments: dict[str, Any],
+) -> bool:
+    """Return whether a finalized projection preserves the executable object exactly."""
+
+    if type(private_arguments) is not dict:
+        raise TypeError("private_arguments must be an object.")
+    return projection.state == "finalized" and canonical_durable_json_bytes(
+        projection.arguments,
+        "projected_arguments",
+    ) == canonical_durable_json_bytes(private_arguments, "private_arguments")
 
 
 def started_arguments_match_private_call(

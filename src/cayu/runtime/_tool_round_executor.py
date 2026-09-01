@@ -624,6 +624,7 @@ class _ToolRoundPublicationCoordinator:
         self._tool_exposure = (
             None if tool_exposure is None else copy_resolved_tool_exposure_authority(tool_exposure)
         )
+        self._unsafe_tool_call_ids: set[str] = set()
         self._lock = asyncio.Lock()
 
     @property
@@ -633,6 +634,12 @@ class _ToolRoundPublicationCoordinator:
     @property
     def tool_round_identity(self) -> ToolRoundIdentity:
         return copy_tool_round_identity(self._tool_round_identity)
+
+    @property
+    def argument_scope_finalized(self) -> bool:
+        """Return whether every sealed call contributed complete secret evidence."""
+
+        return not self._unsafe_tool_call_ids
 
     def restore_staged_event_authority(self, event: Event) -> Event:
         restored = restore_staged_terminal_authority(
@@ -685,6 +692,8 @@ class _ToolRoundPublicationCoordinator:
 
         async with self._lock:
             self._redactor = self._redactor.merged_with(snapshot.redactor)
+            if snapshot.secret_scope_incomplete:
+                self._unsafe_tool_call_ids.add(tool_call_id)
             await self._session_store.transform_checkpoint(
                 self._session_id,
                 self._checkpoint_transform(
@@ -709,6 +718,8 @@ class _ToolRoundPublicationCoordinator:
             raise ValueError("Staged terminal event belongs to a different session.")
         async with self._lock:
             self._redactor = self._redactor.merged_with(snapshot.redactor)
+            if snapshot.secret_scope_incomplete:
+                self._unsafe_tool_call_ids.add(tool_call_id)
             staged = tool_round_recovery.StagedToolCallTerminal(
                 tool_call_id=tool_call_id,
                 event=_project_staged_terminal_event(event, redactor=self._redactor),
@@ -4750,6 +4761,12 @@ class ToolRoundExecutor:
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
                 **argument_projection.payload_fields(),
+                tool_argument_publication.ARGUMENTS_EXACT_FIELD: (
+                    tool_argument_publication.argument_projection_is_exact(
+                        argument_projection,
+                        private_arguments=model_arguments,
+                    )
+                ),
                 "result": result.model_dump(),
                 **effective_arguments_payload,
                 **execution_outcome.terminal_payload_fields(),
@@ -5765,6 +5782,7 @@ class ToolRoundExecutor:
         event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
         if resolved_argument_projection.state == "unavailable":
             event_payload.pop("effective_arguments", None)
+            event_payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
         event_payload.update(resolved_argument_projection.payload_fields())
         event = event.model_copy(update={"payload": event_payload})
         event = event_with_execution_profile_authority(event, execution_profile)
@@ -6744,6 +6762,27 @@ class ToolRoundRun:
                 argument_projection, hook_argument_projection = (
                     _staged_terminal_argument_projections(staged_event)
                 )
+                registered_tool = self._registered_agent.executable_tool(tool_call.name)
+                if (
+                    len(tool_calls) > 1
+                    and registered_tool is not None
+                    and registered_tool.publish_arguments
+                    and staged_event.type
+                    in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+                ):
+                    argument_projection = tool_argument_publication.finalized_argument_projection(
+                        tool_call.arguments,
+                        redactor=publication_coordinator.redactor,
+                        scope_finalized=publication_coordinator.argument_scope_finalized,
+                    )
+                    staged_payload = dict(staged_event.payload)
+                    staged_payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = (
+                        tool_argument_publication.argument_projection_is_exact(
+                            argument_projection,
+                            private_arguments=tool_call.arguments,
+                        )
+                    )
+                    staged_event = staged_event.model_copy(update={"payload": staged_payload})
                 hooks_already_completed = staged.hooks_state == "completed"
                 allow_modification, publish_before_hooks = (
                     (False, False)
@@ -6808,10 +6847,13 @@ class ToolRoundRun:
             async for event in publish_staged_round_terminals(set(staged_private_outcomes)):
                 yield event
 
-        # Terminal argument projections remain invocation-owned. A multi-call
-        # round therefore omits them, while the separate round scope safely
-        # merges sealed redactors for whole-message publication.
-        publish_arguments_as_unavailable = len(tool_calls) > 1
+        # Static rounds have no late secret-resolution capability and can use
+        # each invocation's sealed projection directly. Dynamic multi-call
+        # rounds stay quarantined until the coordinator has merged every sealed
+        # scope, then publish through that cumulative redactor.
+        publish_arguments_as_unavailable = len(tool_calls) > 1 and (
+            publication_coordinator is not None
+        )
         round_task = asyncio.current_task()
         round_cancellation_baseline = 0 if round_task is None else round_task.cancelling()
         try:

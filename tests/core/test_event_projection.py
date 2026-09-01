@@ -1257,6 +1257,7 @@ def test_pre_execution_projection_removes_every_effective_argument_copy() -> Non
                         **identity,
                         "tool_name": "safe",
                         "arguments": {"private": "original"},
+                        "arguments_exact": True,
                         "effective_arguments": {"private": "modified"},
                     }
                 ]
@@ -1267,6 +1268,7 @@ def test_pre_execution_projection_removes_every_effective_argument_copy() -> Non
 
     assert prepared_start.payload["arguments_state"] == "quarantined"
     assert "arguments" not in prepared_start.payload
+    assert "arguments_exact" not in prepared_start.payload
     assert "effective_arguments" not in prepared_start.payload
     paused_call = prepared_pause.payload["tool_calls"][0]
     assert paused_call["arguments_state"] == "quarantined"
@@ -1278,7 +1280,9 @@ def test_pre_execution_projection_removes_every_effective_argument_copy() -> Non
     "payload",
     [
         {"arguments_state": "finalized"},
+        {"arguments_state": "finalized", "arguments": {}, "arguments_exact": "true"},
         {"arguments_state": "unavailable", "arguments": {}},
+        {"arguments_state": "unavailable", "arguments_exact": True},
         {"arguments_state": "unavailable", "effective_arguments": {}},
         {"arguments_state": "future", "arguments": {}},
     ],
@@ -1304,6 +1308,7 @@ def test_new_terminal_events_reject_contradictory_argument_state(payload: dict[s
     [
         {"arguments_state": "finalized"},
         {"arguments_state": "unavailable", "arguments": {"private": "value"}},
+        {"arguments_state": "unavailable", "arguments_exact": {"malformed": True}},
         {"arguments_state": "unavailable", "effective_arguments": {"private": "value"}},
         {"arguments_state": "future", "arguments": {"private": "value"}},
     ],
@@ -1326,8 +1331,35 @@ def test_legacy_terminal_argument_conflicts_project_fail_closed(
     )
 
     assert public.payload["arguments_state"] == "unavailable"
+    assert public.payload["arguments_exact"] is False
     assert "arguments" not in public.payload
     assert "effective_arguments" not in public.payload
+
+
+def test_terminal_argument_exactness_survives_public_projection() -> None:
+    prepared = prepare_new_runtime_event(
+        Event(
+            type=EventType.TOOL_CALL_COMPLETED,
+            session_id="session",
+            payload={
+                "tool_call_id": "call",
+                "tool_name": "safe",
+                "arguments_state": "finalized",
+                "arguments": {"value": "public"},
+                "arguments_exact": True,
+            },
+        ),
+        redactor=SecretRedactor(),
+    )
+    public = project_runtime_event(
+        prepared,
+        sequence=1,
+        redactor=SecretRedactor(),
+    )
+
+    assert public.payload["arguments"] == {"value": "public"}
+    assert public.payload["arguments_state"] == "finalized"
+    assert public.payload["arguments_exact"] is True
 
 
 def test_proxy_authority_is_non_actionable_and_verified_idempotency_survives_reprepare() -> None:

@@ -574,6 +574,7 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 
 if TYPE_CHECKING:
+    from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
     from cayu.runtime.fork_groups import (
         ForkGroupGate,
         ForkGroupGateSelection,
@@ -3347,6 +3348,13 @@ class CayuApp:
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
+
+    async def replay_session(self, request: RuntimeReplayRequest) -> RuntimeReplayReport:
+        """Re-drive one promoted trajectory against this app without live effects."""
+
+        from cayu.evals.runtime_replay import replay_session
+
+        return await replay_session(self, request)
 
     def _current_work_attempt_execution_owner_id(self) -> str:
         pid = os.getpid()

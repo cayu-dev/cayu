@@ -18,6 +18,7 @@ from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authorit
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._runtime_replay_profile import runtime_replay_profile_source
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
@@ -237,14 +238,15 @@ def resolve_execution_profile_identity(
     tool_implementations_process_local = False
     tool_implementations_application_versioned = False
     for index, tool in enumerate(registered_agent.tools.values()):
+        profile_tool = runtime_replay_profile_source(tool.tool)
         entry, process_local = _behavior_identity_material(
             identity=tool.execution_profile_identity,
-            value=tool.tool,
+            value=profile_tool,
             runtime_version=runtime_version,
             process_identity=process_identity,
             slot=f"tool:{index}:{tool.name}",
             cayu_owned_material=_secret_safe_cayu_owned_material(
-                _cayu_tool_material(tool.tool),
+                _cayu_tool_material(profile_tool),
                 redactor=redactor,
             ),
         )
@@ -256,7 +258,11 @@ def resolve_execution_profile_identity(
     execution_policies_process_local = False
     execution_policies_application_versioned = False
     for tool in registered_agent.tools.values():
-        command_policy = getattr(tool.tool, "command_policy", None)
+        command_policy = getattr(
+            runtime_replay_profile_source(tool.tool),
+            "command_policy",
+            None,
+        )
         if command_policy is None:
             continue
         entry, process_local = _behavior_identity_material(
@@ -456,7 +462,8 @@ def resolve_execution_profile_identity(
             "provider_name": provider_name,
         }
     else:
-        provider_material = _cayu_provider_material(registered_provider.provider)
+        profile_provider = runtime_replay_profile_source(registered_provider.provider)
+        provider_material = _cayu_provider_material(profile_provider)
         safe_provider_material = _secret_safe_cayu_owned_material(
             provider_material,
             redactor=redactor,
@@ -464,7 +471,7 @@ def resolve_execution_profile_identity(
         if provider_material is not None and safe_provider_material is None:
             provider_entry = _process_local_private_material(
                 provider_material,
-                value=registered_provider.provider,
+                value=profile_provider,
                 process_identity=process_identity,
                 slot=f"model-provider:{registered_provider.name}",
             )
@@ -472,7 +479,7 @@ def resolve_execution_profile_identity(
         else:
             provider_entry, provider_process_local = _behavior_identity_material(
                 identity=registered_provider.execution_profile_identity,
-                value=registered_provider.provider,
+                value=profile_provider,
                 runtime_version=runtime_version,
                 process_identity=process_identity,
                 slot=f"model-provider:{registered_provider.name}",
