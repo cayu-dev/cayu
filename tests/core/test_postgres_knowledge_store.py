@@ -20,6 +20,10 @@ from tests.core.knowledge_maintenance_conformance import (
     maintenance_decision,
     maintenance_proposal,
 )
+from tests.core.knowledge_maintenance_governance_conformance import (
+    assert_knowledge_maintenance_governance_conformance,
+    maintenance_governance_publication,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
@@ -108,6 +112,158 @@ _MAINTENANCE_EVALUATION_RESULTS = (
     Path(__file__).resolve().parents[2]
     / "benchmarks/memory/knowledge-maintenance-evaluation-results-v1.json"
 )
+
+
+def test_postgres_maintenance_governance_route_apply_and_replay_are_atomic(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await assert_knowledge_maintenance_governance_conformance(
+                store,
+                access_scope=_REVIEW_SCOPE,
+                prefix="postgres-maintenance-governance-conformance",
+            )
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_77_does_not_infer_governance_for_reviewed_history(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            publication = await maintenance_governance_publication(
+                creator,
+                "postgres-pre-governance-reviewed",
+            )
+            decision = _decision(
+                publication.proposal,
+                kind=KnowledgeMaintenanceDecisionKind.REJECT,
+                suffix="postgres-pre-governance-reviewed",
+            )
+            await creator.apply_maintenance_decision(
+                publication.proposal,
+                decision,
+                access_scope=_REVIEW_SCOPE,
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_maintenance_governance_routes")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 77")
+            await connection.commit()
+
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            await migrator.ensure_schema()
+            assert (
+                await migrator.load_maintenance_decision(
+                    decision.operation_id,
+                    access_scope=_REVIEW_SCOPE,
+                )
+                is not None
+            )
+            assert (
+                await migrator.load_maintenance_governance_route(
+                    decision.operation_id,
+                    access_scope=_REVIEW_SCOPE,
+                )
+                is None
+            )
+            async with migrator._pool.connection() as connection, connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM cayu_knowledge_maintenance_governance_routes"
+                )
+                assert await cursor.fetchone() == (0,)
+        finally:
+            await migrator.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_77_rejects_malformed_governance_storage(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_maintenance_governance_routes")
+                await cursor.execute(
+                    "CREATE TABLE cayu_knowledge_maintenance_governance_routes "
+                    "(operation_id TEXT PRIMARY KEY)"
+                )
+            await connection.commit()
+
+        validator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="maintenance-governance contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
 
 
 def test_postgres_governed_publication_and_review_approval_are_atomic(
@@ -889,6 +1045,7 @@ _TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_knowledge_maintenance_governance_routes",
     "cayu_knowledge_maintenance_proposals",
     "cayu_knowledge_maintenance_decisions",
     "cayu_knowledge_relation_publication_receipts",

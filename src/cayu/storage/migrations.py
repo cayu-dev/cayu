@@ -416,6 +416,10 @@ REVISIONS: tuple[Revision, ...] = (
     # consume that fence and could reauthorize an ABA workerless snapshot, so
     # mixed-version task execution is unsafe.
     Revision(revision=76, kind=RevisionKind.BREAKING, compatible_from=76),
+    # Evaluated maintenance proposals may now retain exact automatic routing
+    # authority. Existing reviewed records are intentionally left untouched;
+    # no automatic authority is inferred from historical data.
+    Revision(revision=77, kind=RevisionKind.BREAKING, compatible_from=77),
 )
 
 #: The revision an empty database is initialized to.

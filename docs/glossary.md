@@ -62,7 +62,7 @@ disambiguates them so a name never sends you down the wrong path.
   `supersedes`, `derived_from`, or symmetric `contradicts` statement between
   exact revisions of two different entries. None of these proves provider
   exposure or automatically changes recall ranking, lifecycle, or truth.
-- **Maintenance routing vs plan draft vs proposal vs decision.** A
+- **Maintenance routing vs plan draft vs proposal vs governance vs decision.** A
   `KnowledgeMaintenanceRouter` turns explicit hints into a bounded exact-revision
   snapshot without making semantic claims. A `KnowledgeMaintenancePlanDraft` is
   strict, read-only planner output submitted to independent evaluation. An
@@ -72,10 +72,15 @@ disambiguates them so a name never sends you down the wrong path.
   accepted-plan record, source evidence, and durable
   `KnowledgeMaintenanceProposal`. The proposal binds that replacement to its
   current source revisions for review but has no activation authority. A
-  `KnowledgeMaintenanceDecision` is an explicit non-model review of that exact
-  proposal fingerprint. The store atomically applies approval or durably records
-  rejection. Candidate discovery, recall ranking, context placement, and provider
-  exposure remain separate concerns.
+  `KnowledgeMaintenanceGovernanceAuthority` is an application policy's exact
+  approve/reject/route decision over that evaluated proposal; it is neither the
+  plan nor the maintenance result. `KnowledgeMaintenanceDecision` is the
+  existing mechanical approve/reject contract used by an explicit reviewer or
+  projected from validated automatic authority.
+  `KnowledgeMaintenanceGovernanceReceipt` attributes the policy outcome;
+  `KnowledgeMaintenanceDecisionReceipt` proves the atomic lifecycle result.
+  Candidate discovery, scheduling, recall ranking, context placement, and
+  provider exposure remain separate concerns.
 - **Curator.** `KnowledgeCurator` is an explicitly invoked application workflow
   that turns bounded source-attributed learning signals into pending proposals
   for review. It is not a background agent, retrieval manager, context manager,

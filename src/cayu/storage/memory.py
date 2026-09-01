@@ -40,6 +40,10 @@ from cayu.embeddings import (
 )
 
 if TYPE_CHECKING:
+    from cayu.knowledge_maintenance_governance import (
+        KnowledgeMaintenanceGovernanceAuthority,
+        KnowledgeMaintenanceGovernanceReceipt,
+    )
     from cayu.knowledge_maintenance_persistence import (
         KnowledgeMaintenanceAcceptedPlan,
         KnowledgeMaintenanceProposalPublication,
@@ -69,6 +73,7 @@ MAX_KNOWLEDGE_MAINTENANCE_SOURCES = 50
 MAX_KNOWLEDGE_MAINTENANCE_BYTES = 256_000
 MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES = 16_384
 MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES = 16_384
+KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY = "cayu_knowledge_maintenance_governance"
 MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES = 16_384
 MAX_KNOWLEDGE_ACTIVATION_CHUNKS = 10_000
 MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS = 10_000
@@ -994,7 +999,7 @@ class KnowledgeEvidence(BaseModel):
 
 
 class KnowledgeGovernanceConfig(BaseModel):
-    """Host-owned mode, policy identity, and execution bound for activation."""
+    """Host-owned mode, policy identity, and execution bound for knowledge authority."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -1037,7 +1042,9 @@ class KnowledgeGovernanceConfig(BaseModel):
         has_identity = self.policy_identity is not None
         has_version = self.policy_version is not None
         if has_identity != has_version:
-            raise ValueError("Activation policy identity and version must be configured together.")
+            raise ValueError(
+                "Knowledge governance policy identity and version must be configured together."
+            )
         if self.mode is KnowledgeGovernanceMode.REVIEWED and has_identity:
             raise ValueError("Reviewed governance cannot configure an automatic policy.")
         if self.mode is not KnowledgeGovernanceMode.REVIEWED and not has_identity:
@@ -4308,6 +4315,30 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support reviewed knowledge maintenance."
         )
 
+    async def record_maintenance_governance_route(
+        self,
+        authority: KnowledgeMaintenanceGovernanceAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceGovernanceReceipt:
+        """Atomically retain route-to-review authority without lifecycle changes."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support maintenance governance routing."
+        )
+
+    async def load_maintenance_governance_route(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceGovernanceReceipt | None:
+        """Load immutable route-to-review attribution in scope."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support maintenance governance routing."
+        )
+
     async def load_maintenance_proposal(
         self,
         proposal_id: str,
@@ -4590,6 +4621,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._maintenance_receipts: dict[str, KnowledgeMaintenanceDecisionReceipt] = {}
         self._maintenance_operation_by_proposal: dict[str, str] = {}
         self._maintenance_access: dict[str, _KnowledgeMaintenanceAccessSnapshot] = {}
+        self._maintenance_governance_routes: dict[str, KnowledgeMaintenanceGovernanceReceipt] = {}
+        self._maintenance_governance_route_access: dict[
+            str, _KnowledgeMaintenanceAccessSnapshot
+        ] = {}
+        self._maintenance_governance_route_by_proposal: dict[str, str] = {}
         self._changes: list[KnowledgeChange] = []
         self._changes_by_sequence: dict[int, KnowledgeChange] = {}
         self._change_access: dict[int, tuple[_KnowledgeChangeAudience, ...]] = {}
@@ -6294,6 +6330,124 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             relation_id=relation.id,
         )
 
+    async def record_maintenance_governance_route(
+        self,
+        authority: KnowledgeMaintenanceGovernanceAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceGovernanceReceipt:
+        from cayu.knowledge_maintenance_governance import (
+            KnowledgeMaintenanceGovernanceAuthority,
+            KnowledgeMaintenanceGovernanceDisposition,
+            KnowledgeMaintenanceGovernanceReceipt,
+            copy_knowledge_maintenance_governance_authority,
+            copy_knowledge_maintenance_governance_receipt,
+            require_knowledge_maintenance_governance_authority_records,
+        )
+
+        if type(authority) is not KnowledgeMaintenanceGovernanceAuthority:
+            raise TypeError("authority must be a KnowledgeMaintenanceGovernanceAuthority.")
+        copied = copy_knowledge_maintenance_governance_authority(authority)
+        if (
+            copied.decision.disposition
+            is not KnowledgeMaintenanceGovernanceDisposition.ROUTE_TO_REVIEW
+        ):
+            raise ValueError("Only route-to-review authority can use this store operation.")
+        scope = self._operation_access_scope(access_scope)
+        if scope != copied.request.access_scope:
+            raise KnowledgeAccessDenied("record_maintenance_governance_route")
+        proposal = copied.request.proposal
+        publication_operation = self._maintenance_proposal_operation_by_id.get(proposal.id)
+        if publication_operation != copied.request.publication_operation_id:
+            raise KnowledgeMaintenanceConflict("proposal_publication_mismatch")
+        assert publication_operation is not None
+        publication = self._maintenance_proposal_publications.get(publication_operation)
+        snapshot = self._maintenance_proposal_publication_access.get(publication_operation)
+        if publication is None or snapshot is None:
+            raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+        stored_proposal, accepted_plan, publication_receipt = publication
+        if (
+            stored_proposal != proposal
+            or stored_proposal.fingerprint != proposal.fingerprint
+            or accepted_plan.fingerprint != copied.request.accepted_plan_fingerprint
+            or publication_receipt.request_sha256 != copied.request.publication_request_sha256
+            or not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot)
+        ):
+            raise KnowledgeMaintenanceConflict("proposal_publication_mismatch")
+        copied = require_knowledge_maintenance_governance_authority_records(
+            copied,
+            stored_proposal,
+            accepted_plan,
+            publication_receipt,
+        )
+
+        existing = self._maintenance_governance_routes.get(copied.request.operation_id)
+        if existing is not None:
+            existing_snapshot = self._maintenance_governance_route_access.get(
+                copied.request.operation_id
+            )
+            if existing_snapshot is None or not _knowledge_scope_allows_maintenance_access_snapshot(
+                scope,
+                existing_snapshot,
+            ):
+                raise KnowledgeAccessDenied("record_maintenance_governance_route")
+            if type(existing) is not KnowledgeMaintenanceGovernanceReceipt:
+                raise KnowledgeMaintenanceConflict("malformed_governance_receipt")
+            if existing.authority != copied:
+                raise KnowledgeMaintenanceConflict("governance_operation_reuse")
+            return copy_knowledge_maintenance_governance_receipt(existing, replayed=True)
+        if copied.request.operation_id in self._maintenance_receipts:
+            raise KnowledgeMaintenanceConflict("governance_operation_reuse")
+        prior_route = self._maintenance_governance_route_by_proposal.get(proposal.id)
+        if prior_route is not None:
+            raise KnowledgeMaintenanceConflict("proposal_already_governed")
+        if proposal.id in self._maintenance_operation_by_proposal:
+            raise KnowledgeMaintenanceConflict("proposal_already_decided")
+
+        committed_at = max(
+            self._clock(),
+            proposal.created_at,
+            publication_receipt.committed_at,
+        )
+        receipt = KnowledgeMaintenanceGovernanceReceipt(
+            operation_id=copied.request.operation_id,
+            proposal_id=proposal.id,
+            proposal_fingerprint=proposal.fingerprint,
+            authority=copied,
+            committed_at=committed_at,
+        )
+        self._maintenance_governance_routes[copied.request.operation_id] = receipt
+        self._maintenance_governance_route_access[copied.request.operation_id] = snapshot
+        self._maintenance_governance_route_by_proposal[proposal.id] = copied.request.operation_id
+        return copy_knowledge_maintenance_governance_receipt(receipt)
+
+    async def load_maintenance_governance_route(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceGovernanceReceipt | None:
+        from cayu.knowledge_maintenance_governance import (
+            KnowledgeMaintenanceGovernanceReceipt,
+            copy_knowledge_maintenance_governance_receipt,
+        )
+
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
+        snapshot = self._maintenance_governance_route_access.get(operation_id)
+        receipt = self._maintenance_governance_routes.get(operation_id)
+        if receipt is None:
+            if snapshot is not None:
+                raise KnowledgeMaintenanceConflict("malformed_governance_receipt")
+            return None
+        if snapshot is None:
+            raise KnowledgeMaintenanceConflict("malformed_governance_receipt")
+        if type(receipt) is not KnowledgeMaintenanceGovernanceReceipt:
+            raise KnowledgeMaintenanceConflict("malformed_governance_receipt")
+        if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+            return None
+        return copy_knowledge_maintenance_governance_receipt(receipt)
+
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -6334,6 +6488,43 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if publication_snapshot is not None and publication_snapshot != snapshot:
                 raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
             publication_snapshot = snapshot
+        if KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata:
+            from cayu.knowledge_maintenance_governance import (
+                governance_authority_from_maintenance_records,
+            )
+
+            if publication_operation is None:
+                raise KnowledgeMaintenanceConflict("governance_requires_published_proposal")
+            governed_record = self._maintenance_proposal_publications.get(publication_operation)
+            if governed_record is None:
+                raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+            governance_authority_from_maintenance_records(
+                governed_record[0],
+                governed_record[1],
+                governed_record[2],
+                decision,
+            )
+        routed_receipt = self._maintenance_governance_routes.get(decision.operation_id)
+        if routed_receipt is not None:
+            routed_snapshot = self._maintenance_governance_route_access.get(decision.operation_id)
+            if routed_snapshot is None or not _knowledge_scope_allows_maintenance_access_snapshot(
+                scope,
+                routed_snapshot,
+            ):
+                raise KnowledgeAccessDenied(operation)
+            raise KnowledgeMaintenanceConflict("operation_reuse")
+        prior_governance_route = self._maintenance_governance_route_by_proposal.get(proposal.id)
+        if (
+            prior_governance_route is not None
+            and KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata
+        ):
+            routed_snapshot = self._maintenance_governance_route_access.get(prior_governance_route)
+            if routed_snapshot is None or not _knowledge_scope_allows_maintenance_access_snapshot(
+                scope,
+                routed_snapshot,
+            ):
+                raise KnowledgeAccessDenied(operation)
+            raise KnowledgeMaintenanceConflict("proposal_already_governed")
         existing_receipt = self._maintenance_receipts.get(decision.operation_id)
         if existing_receipt is not None:
             snapshot = self._maintenance_access.get(decision.operation_id)

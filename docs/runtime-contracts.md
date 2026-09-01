@@ -10560,6 +10560,19 @@ timeouts, exceptions, malformed or oversized output, request-fingerprint
 mismatch, and generator/evaluator/model self-authorization fail closed before
 publication.
 
+The same mode vocabulary governs already-persisted evaluated maintenance through
+`KnowledgeMaintenanceGovernor`, but the authority types are deliberately different.
+A `KnowledgeMaintenanceGovernanceRequest` binds the complete proposal, exact source and
+replacement revisions, relations, accepted-plan/evaluation fingerprints, component
+identities, operation, and enforced scope. In reviewed mode the governor records only
+`route_to_review` and never calls an automatic policy. In policy-automatic or autonomous
+mode an exact application policy may approve, reject, or route. Approval/rejection uses the
+existing atomic maintenance transaction; routing leaves the pending proposal unchanged.
+Exact receipt replay does not call the policy again, and a routed proposal can be completed
+only by a separately attributed explicit review operation. This adds authority for
+maintenance that an application already scheduled; it adds no maintenance scheduler,
+search algorithm, model-facing tool, or provider call.
+
 These concepts remain separate: lifecycle (`pending`, `active`, `archived`, or
 `deleted`) determines retrieval; enrichment/readiness describes whether a
 derived index is usable; source authority describes who supplied evidence;

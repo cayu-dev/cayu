@@ -168,6 +168,22 @@ generation. Terminal workerless replay requires a receipt-capable task store
 because a store without atomic claimed-worker receipts cannot prove whether the
 cleared terminal owner was direct or elected.
 
+### Evaluated knowledge maintenance gains application-owned automatic authority
+
+Applications may now pass an already-persisted and independently evaluated maintenance
+proposal through `KnowledgeMaintenanceGovernor`. Reviewed mode records a durable route and
+leaves the proposal pending without calling an automatic policy. Policy-automatic and
+autonomous modes require an exact application-policy identity and may approve, reject, or
+route the proposal. Approval and rejection reuse the existing atomic replacement,
+supersession, relation, outbox, and receipt transaction; exact retries recover durable
+attribution without rerunning policy code. This changes authority only: Cayu adds no
+maintenance worker, scheduler, discovery algorithm, provider call, or model-facing tool.
+
+Storage revision 77 adds bounded route-to-review attribution across in-memory, SQLite, and
+PostgreSQL knowledge stores. Migration preserves existing reviewed proposals and decisions
+but does not infer or backfill automatic authority, and there is no legacy runtime or
+dual-write path. Stop pre-77 knowledge writers before migration.
+
 ### Evals ship focused onboarding and declarative project judge authority
 
 Three package-shipped guides now lead operators through a first Control Plane

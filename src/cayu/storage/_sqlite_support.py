@@ -3912,6 +3912,30 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_tasks(interrupted_handoff_id)
             WHERE interrupted_handoff_id IS NOT NULL;
     """,
+    77: """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_maintenance_governance_routes (
+            operation_id TEXT COLLATE BINARY PRIMARY KEY,
+            proposal_id TEXT COLLATE BINARY NOT NULL UNIQUE,
+            proposal_fingerprint TEXT COLLATE BINARY NOT NULL CHECK (
+                length(proposal_fingerprint) = 64
+                AND proposal_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            request_sha256 TEXT COLLATE BINARY NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json)
+                AND json_type(receipt_json) = 'object'
+                AND length(CAST(receipt_json AS BLOB)) BETWEEN 1 AND 640000
+            ),
+            access_snapshot_json TEXT NOT NULL CHECK (
+                json_valid(access_snapshot_json)
+                AND json_type(access_snapshot_json) = 'object'
+            )
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -5690,6 +5714,8 @@ def reconcile_schema(
         _validate_revision_73_recall_subscription_schema(connection)
     if current.revision >= 75:
         _validate_revision_75_knowledge_activation_schema(connection)
+    if current.revision >= 77:
+        _validate_revision_77_knowledge_maintenance_governance_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
@@ -7823,6 +7849,68 @@ def _raise_revision_75_sqlite_schema_error(name: str) -> NoReturn:
     )
 
 
+def _validate_revision_77_knowledge_maintenance_governance_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    table = "cayu_knowledge_maintenance_governance_routes"
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    )
+    expected_columns = (
+        ("operation_id", "TEXT", 0, 1),
+        ("proposal_id", "TEXT", 1, 0),
+        ("proposal_fingerprint", "TEXT", 1, 0),
+        ("request_sha256", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+        ("access_snapshot_json", "TEXT", 1, 0),
+    )
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+    required_fragments = (
+        "operation_id text collate binary primary key",
+        "proposal_id text collate binary not null unique",
+        "proposal_fingerprint text collate binary not null",
+        "request_sha256 text collate binary not null",
+        "length(proposal_fingerprint) = 64",
+        "proposal_fingerprint not glob '*[^0-9a-f]*'",
+        "length(request_sha256) = 64",
+        "request_sha256 not glob '*[^0-9a-f]*'",
+        "json_valid(receipt_json)",
+        "json_type(receipt_json) = 'object'",
+        "length(cast(receipt_json as blob)) between 1 and 640000",
+        "json_valid(access_snapshot_json)",
+        "json_type(access_snapshot_json) = 'object'",
+    )
+    unique_proposal = any(
+        int(index_row[2]) == 1
+        and tuple(
+            str(column_row[0])
+            for column_row in connection.execute(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (str(index_row[1]),),
+            )
+        )
+        == ("proposal_id",)
+        for index_row in connection.execute(f"PRAGMA index_list({table})")
+    )
+    if (
+        columns != expected_columns
+        or _sqlite_foreign_key_groups(connection, table)
+        or not unique_proposal
+        or any(fragment not in normalized for fragment in required_fragments)
+    ):
+        raise RuntimeError(
+            "SQLite schema object "
+            f"{table!r} conflicts with Cayu's maintenance-governance contract. "
+            "Run schema_mode=MIGRATE to install revision 77 or recreate the database."
+        )
+
+
 def _validate_revision_44_knowledge_schema(connection: sqlite3.Connection) -> None:
     expected_columns = {
         "cayu_knowledge_index_readiness_events": (
@@ -9901,6 +9989,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_75_knowledge_activation_schema(connection)
         if rev.revision == 76:
             _validate_interrupted_handoff_generation_column(connection)
+        if rev.revision == 77:
+            _validate_revision_77_knowledge_maintenance_governance_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

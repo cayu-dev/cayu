@@ -1071,7 +1071,8 @@ broader access-scope configuration, omitted signals, router limits, and unrelate
 identities. A strict `KnowledgeMaintenancePlanDraft` binds:
 
 - every exact routed source revision;
-- the routing-request, routing-result, planning-configuration, and policy fingerprints;
+- the routing-request, routing-result, routing-configuration, planning-configuration,
+  and policy fingerprints;
 - replacement text, title, kind, aspects, and impact targets, but no model-controlled
   namespace, visibility, status, labels, source authority, or write identity;
 - one typed relation disposition per source using an unpersisted replacement endpoint;
@@ -1247,6 +1248,79 @@ contract. Breaking storage revision 67 adds only the new proposal-publication re
 Existing knowledge revisions are retained, but no proposal, accepted plan, or receipt is
 inferred or backfilled from them. Pre-67 workers cannot share the migrated store; there is
 no dual-write path, legacy proposal interpretation, or compatibility wrapper.
+
+## Policy-governed maintenance authority
+
+`KnowledgeMaintenanceGovernor` is the explicitly invoked authority boundary for one
+already-persisted, independently evaluated maintenance proposal. It does not discover
+duplicates, call a planner or model, poll the store, or start a worker. Applications and
+durable workflows still decide when maintenance should run.
+
+The governor reuses `KnowledgeGovernanceMode` while keeping multi-entry maintenance
+authority separate from single-entry activation authority:
+
+- `reviewed` never calls an automatic policy. It records an exact `route_to_review`
+  receipt, leaves the replacement pending, and keeps the proposal available to
+  `KnowledgeReviewWorkflow.decide_maintenance(...)` under a separate review operation;
+- `policy_automatic` and `autonomous` require an application-owned policy with the exact
+  configured identity and version; and
+- that policy may `approve`, `reject`, or `route_to_review` the exact evaluated proposal.
+
+The policy receives a copied `KnowledgeMaintenanceGovernanceRequest` capped at 512,000
+canonical bytes. It binds the operation, mode, complete proposal and relations, exact
+source and replacement revisions, publication receipt, accepted-plan and evaluation
+fingerprints, planner/evaluator identities, and enforced access scope. Decision annotations
+are capped at 4 KiB. Generator, planner, evaluator, and model output is evidence, never
+authority, and the configured policy identity must differ from every persisted proposal,
+planner, and evaluator authority identity. Missing policy, timeout, cancellation, exception,
+wrong fingerprint, identity mismatch, malformed output, or an oversized contract fails
+closed before lifecycle mutation.
+
+Approval and rejection project the validated application authority into the existing
+atomic maintenance decision transaction. Revisions, relations, change-outbox rows,
+maintenance receipt, and governance attribution therefore commit together or not at all.
+Routing commits only bounded governance attribution and changes no knowledge lifecycle.
+Every exact operation retry reconstructs the committed authority from immutable
+proposal, decision, and receipt records without calling the policy again. A routed proposal
+cannot later be automatically re-authorized; explicit review remains separately attributed
+and never overwrites the routing evidence.
+
+```python
+from cayu import (
+    KnowledgeGovernanceConfig,
+    KnowledgeGovernanceMode,
+    KnowledgeMaintenanceGovernor,
+)
+
+governor = KnowledgeMaintenanceGovernor(
+    knowledge_store,
+    config=KnowledgeGovernanceConfig(
+        mode=KnowledgeGovernanceMode.AUTONOMOUS,
+        policy_identity="acme.maintenance-policy",
+        policy_version="2026-09",
+    ),
+    policy=application_maintenance_policy,
+)
+
+receipt = await governor.govern(
+    operation_id="maintain-customer-facts-42",
+    proposal_id=publication.proposal.id,
+    access_scope=maintenance_scope,
+)
+```
+
+Breaking storage revision 77 adds only route-to-review attribution. Existing reviewed
+proposals and decisions are preserved as reviewed history; migration creates no inferred
+automatic authority, performs no backfill, and adds no legacy read or dual-write path.
+The complete credential-free example and fixed performance gate are:
+
+```bash
+PYTHONPATH=src python examples/knowledge_maintenance_governance.py
+PYTHONPATH=src python scripts/run_knowledge_maintenance_governance_performance.py --check
+```
+
+Recorded evidence lives in
+[`benchmarks/memory/knowledge-maintenance-governance-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-governance-performance-v1.json).
 
 ## Explicit reviewed knowledge curation
 

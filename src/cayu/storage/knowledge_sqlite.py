@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 if TYPE_CHECKING:
+    from cayu.knowledge_maintenance_governance import (
+        KnowledgeMaintenanceGovernanceAuthority,
+        KnowledgeMaintenanceGovernanceReceipt,
+    )
     from cayu.knowledge_maintenance_persistence import (
         KnowledgeMaintenanceAcceptedPlan,
         KnowledgeMaintenanceProposalPublication,
@@ -32,6 +36,7 @@ from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
     KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+    KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY,
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeActivationAuthority,
@@ -208,7 +213,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
         (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
     }
 )
-_SQLITE_MIN_REQUIRED_REVISION = 75
+_SQLITE_MIN_REQUIRED_REVISION = 77
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -1676,6 +1681,149 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             ),
         )
 
+    async def record_maintenance_governance_route(
+        self,
+        authority: KnowledgeMaintenanceGovernanceAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceGovernanceReceipt:
+        from cayu.knowledge_maintenance_governance import (
+            KnowledgeMaintenanceGovernanceAuthority,
+            KnowledgeMaintenanceGovernanceDisposition,
+            KnowledgeMaintenanceGovernanceReceipt,
+            copy_knowledge_maintenance_governance_authority,
+            copy_knowledge_maintenance_governance_receipt,
+            require_knowledge_maintenance_governance_authority_records,
+        )
+
+        if type(authority) is not KnowledgeMaintenanceGovernanceAuthority:
+            raise TypeError("authority must be a KnowledgeMaintenanceGovernanceAuthority.")
+        copied = copy_knowledge_maintenance_governance_authority(authority)
+        if (
+            copied.decision.disposition
+            is not KnowledgeMaintenanceGovernanceDisposition.ROUTE_TO_REVIEW
+        ):
+            raise ValueError("Only route-to-review authority can use this store operation.")
+        scope = self._operation_access_scope(access_scope)
+        if scope != copied.request.access_scope:
+            raise KnowledgeAccessDenied("record_maintenance_governance_route")
+        proposal = copied.request.proposal
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                publication = self._load_maintenance_proposal_record_unlocked(
+                    copied.request.publication_operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if publication is None:
+                    raise KnowledgeMaintenanceConflict("proposal_publication_mismatch")
+                stored_proposal, accepted_plan, publication_receipt, snapshot = publication
+                if (
+                    stored_proposal != proposal
+                    or stored_proposal.fingerprint != proposal.fingerprint
+                    or accepted_plan.fingerprint != copied.request.accepted_plan_fingerprint
+                    or publication_receipt.request_sha256
+                    != copied.request.publication_request_sha256
+                ):
+                    raise KnowledgeMaintenanceConflict("proposal_publication_mismatch")
+                copied = require_knowledge_maintenance_governance_authority_records(
+                    copied,
+                    stored_proposal,
+                    accepted_plan,
+                    publication_receipt,
+                )
+
+                existing = self._load_maintenance_governance_route_unlocked(
+                    copied.request.operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if existing is not None:
+                    if existing.authority != copied:
+                        raise KnowledgeMaintenanceConflict("governance_operation_reuse")
+                    return copy_knowledge_maintenance_governance_receipt(
+                        existing,
+                        replayed=True,
+                    )
+                decision_collision = self._connection.execute(
+                    "SELECT 1 FROM cayu_knowledge_maintenance_decisions WHERE operation_id = ?",
+                    (copied.request.operation_id,),
+                ).fetchone()
+                if decision_collision is not None:
+                    raise KnowledgeMaintenanceConflict("governance_operation_reuse")
+                prior_route = self._connection.execute(
+                    "SELECT operation_id FROM "
+                    "cayu_knowledge_maintenance_governance_routes WHERE proposal_id = ?",
+                    (proposal.id,),
+                ).fetchone()
+                if prior_route is not None:
+                    self._load_maintenance_governance_route_unlocked(
+                        str(prior_route["operation_id"]),
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    raise KnowledgeMaintenanceConflict("proposal_already_governed")
+                prior_decision = self._connection.execute(
+                    "SELECT operation_id FROM cayu_knowledge_maintenance_decisions "
+                    "WHERE proposal_id = ?",
+                    (proposal.id,),
+                ).fetchone()
+                if prior_decision is not None:
+                    self._load_maintenance_record_unlocked(
+                        str(prior_decision["operation_id"]),
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    raise KnowledgeMaintenanceConflict("proposal_already_decided")
+
+                committed_at = max(
+                    self._clock(),
+                    proposal.created_at,
+                    publication_receipt.committed_at,
+                )
+                receipt = KnowledgeMaintenanceGovernanceReceipt(
+                    operation_id=copied.request.operation_id,
+                    proposal_id=proposal.id,
+                    proposal_fingerprint=proposal.fingerprint,
+                    authority=copied,
+                    committed_at=committed_at,
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO cayu_knowledge_maintenance_governance_routes (
+                        operation_id, proposal_id, proposal_fingerprint,
+                        request_sha256, committed_at, receipt_json,
+                        access_snapshot_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receipt.operation_id,
+                        receipt.proposal_id,
+                        receipt.proposal_fingerprint,
+                        copied.request.fingerprint,
+                        sqlite_support.format_datetime(receipt.committed_at),
+                        receipt.model_dump_json(warnings=False),
+                        _knowledge_maintenance_access_snapshot_json(snapshot),
+                    ),
+                )
+                return copy_knowledge_maintenance_governance_receipt(receipt)
+
+    async def load_maintenance_governance_route(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceGovernanceReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
+        async with self._lock:
+            return self._load_maintenance_governance_route_unlocked(
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -1698,6 +1846,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     (proposal.id, proposal.replacement.entry_id),
                 ).fetchall()
                 publication_snapshot: _KnowledgeMaintenanceAccessSnapshot | None = None
+                governance_publication = None
                 for publication_row in publication_rows:
                     publication = self._load_maintenance_proposal_record_unlocked(
                         str(publication_row["operation_id"]),
@@ -1709,6 +1858,41 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     if publication_snapshot is not None and publication_snapshot != publication[3]:
                         raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
                     publication_snapshot = publication[3]
+                    governance_publication = publication
+                if KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata:
+                    from cayu.knowledge_maintenance_governance import (
+                        governance_authority_from_maintenance_records,
+                    )
+
+                    if governance_publication is None:
+                        raise KnowledgeMaintenanceConflict("governance_requires_published_proposal")
+                    governance_authority_from_maintenance_records(
+                        governance_publication[0],
+                        governance_publication[1],
+                        governance_publication[2],
+                        decision,
+                    )
+                routed = self._load_maintenance_governance_route_unlocked(
+                    decision.operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if routed is not None:
+                    raise KnowledgeMaintenanceConflict("operation_reuse")
+                if KNOWLEDGE_MAINTENANCE_GOVERNANCE_METADATA_KEY in decision.metadata:
+                    prior_route = self._connection.execute(
+                        "SELECT operation_id FROM "
+                        "cayu_knowledge_maintenance_governance_routes "
+                        "WHERE proposal_id = ?",
+                        (proposal.id,),
+                    ).fetchone()
+                    if prior_route is not None:
+                        self._load_maintenance_governance_route_unlocked(
+                            str(prior_route["operation_id"]),
+                            access_scope=scope,
+                            deny_inaccessible=True,
+                        )
+                        raise KnowledgeMaintenanceConflict("proposal_already_governed")
                 existing = self._load_maintenance_record_unlocked(
                     decision.operation_id,
                     access_scope=scope,
@@ -4104,6 +4288,56 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 _knowledge_maintenance_access_snapshot_json(access_snapshot),
             ),
         )
+
+    def _load_maintenance_governance_route_unlocked(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> KnowledgeMaintenanceGovernanceReceipt | None:
+        from cayu.knowledge_maintenance_governance import (
+            KnowledgeMaintenanceGovernanceDisposition,
+            KnowledgeMaintenanceGovernanceReceipt,
+            copy_knowledge_maintenance_governance_receipt,
+        )
+
+        row = self._connection.execute(
+            """
+            SELECT proposal_id, proposal_fingerprint, request_sha256,
+                   committed_at, receipt_json, access_snapshot_json
+            FROM cayu_knowledge_maintenance_governance_routes
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = KnowledgeMaintenanceGovernanceReceipt.model_validate_json(row["receipt_json"])
+            snapshot = _parse_knowledge_maintenance_access_snapshot_json(
+                row["access_snapshot_json"]
+            )
+            if (
+                receipt.operation_id != operation_id
+                or receipt.proposal_id != str(row["proposal_id"])
+                or receipt.proposal_fingerprint != str(row["proposal_fingerprint"])
+                or receipt.authority.request.fingerprint != str(row["request_sha256"])
+                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.replayed
+                or receipt.authority.decision.disposition
+                is not KnowledgeMaintenanceGovernanceDisposition.ROUTE_TO_REVIEW
+            ):
+                raise ValueError("Governance route indexes conflict with content.")
+        except KnowledgeMaintenanceConflict:
+            raise
+        except Exception:
+            raise KnowledgeMaintenanceConflict("malformed_governance_receipt") from None
+        if not _knowledge_scope_allows_maintenance_access_snapshot(access_scope, snapshot):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("record_maintenance_governance_route")
+            return None
+        return copy_knowledge_maintenance_governance_receipt(receipt)
 
     def _load_maintenance_record_unlocked(
         self,

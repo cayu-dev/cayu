@@ -1,0 +1,74 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_automatic_reject_p95_ms": 50.0,
+    "memory_receipt_replay_p95_ms": 50.0,
+    "memory_reviewed_route_p95_ms": 50.0,
+    "sqlite_automatic_reject_p95_ms": 100.0,
+    "sqlite_receipt_replay_p95_ms": 100.0,
+    "sqlite_reviewed_route_p95_ms": 100.0,
+    "sqlite_storage_bytes_per_governance_outcome": 131072
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "identical_evaluated_proposals_without_governance_outcomes",
+    "operation_count": 10
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "automatic_reject_latency": {
+        "p50_ms": 28.201709,
+        "p95_ms": 28.915292
+      },
+      "backend": "memory",
+      "control_storage_bytes": null,
+      "governed_storage_bytes": null,
+      "operation_count": 10,
+      "operations_per_mode": 5,
+      "receipt_replay_latency": {
+        "p50_ms": 17.381708,
+        "p95_ms": 22.816333
+      },
+      "reviewed_route_latency": {
+        "p50_ms": 26.762833,
+        "p95_ms": 27.26775
+      },
+      "storage_byte_overhead": null,
+      "storage_bytes_per_governance_outcome": null
+    },
+    {
+      "automatic_reject_latency": {
+        "p50_ms": 45.356667,
+        "p95_ms": 46.816125
+      },
+      "backend": "sqlite",
+      "control_storage_bytes": 1892352,
+      "governed_storage_bytes": 1941504,
+      "operation_count": 10,
+      "operations_per_mode": 5,
+      "receipt_replay_latency": {
+        "p50_ms": 33.665333,
+        "p95_ms": 48.821916
+      },
+      "reviewed_route_latency": {
+        "p50_ms": 45.235375,
+        "p95_ms": 45.7955
+      },
+      "storage_byte_overhead": 49152,
+      "storage_bytes_per_governance_outcome": 4915.2
+    }
+  ],
+  "schema_version": "cayu.knowledge_maintenance_governance_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "automatic_reject_operations": 5,
+    "operation_count": 10,
+    "operations_per_mode": 5,
+    "provider_calls": 0,
+    "reviewed_route_operations": 5
+  }
+}
