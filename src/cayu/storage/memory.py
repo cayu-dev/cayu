@@ -49,6 +49,10 @@ if TYPE_CHECKING:
         KnowledgeMaintenanceProposalPublication,
         KnowledgeMaintenanceProposalPublicationReceipt,
     )
+    from cayu.knowledge_semantic_watch import (
+        KnowledgeSemanticWatchAuthority,
+        KnowledgeSemanticWatchReceipt,
+    )
 
 DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
@@ -4339,6 +4343,26 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support maintenance governance routing."
         )
 
+    async def record_semantic_watch_outcome(
+        self,
+        authority: KnowledgeSemanticWatchAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt:
+        """Atomically retain one exact policy-governed semantic-watch outcome."""
+
+        raise NotImplementedError("This KnowledgeStore does not support semantic-watch outcomes.")
+
+    async def load_semantic_watch_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt | None:
+        """Load immutable semantic-watch attribution for one scoped operation."""
+
+        raise NotImplementedError("This KnowledgeStore does not support semantic-watch outcomes.")
+
     async def load_maintenance_proposal(
         self,
         proposal_id: str,
@@ -4626,6 +4650,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             str, _KnowledgeMaintenanceAccessSnapshot
         ] = {}
         self._maintenance_governance_route_by_proposal: dict[str, str] = {}
+        self._semantic_watch_receipts: dict[str, KnowledgeSemanticWatchReceipt] = {}
+        self._semantic_watch_receipt_access: dict[str, KnowledgeAccessScope] = {}
         self._changes: list[KnowledgeChange] = []
         self._changes_by_sequence: dict[int, KnowledgeChange] = {}
         self._change_access: dict[int, tuple[_KnowledgeChangeAudience, ...]] = {}
@@ -6447,6 +6473,111 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
             return None
         return copy_knowledge_maintenance_governance_receipt(receipt)
+
+    async def record_semantic_watch_outcome(
+        self,
+        authority: KnowledgeSemanticWatchAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt:
+        from cayu.knowledge_semantic_watch import (
+            KnowledgeSemanticWatchAuthority,
+            KnowledgeSemanticWatchConflict,
+            KnowledgeSemanticWatchReceipt,
+            copy_knowledge_semantic_watch_authority,
+            copy_knowledge_semantic_watch_receipt,
+            require_knowledge_semantic_watch_authority_records,
+        )
+
+        if type(authority) is not KnowledgeSemanticWatchAuthority:
+            raise TypeError("authority must be a KnowledgeSemanticWatchAuthority.")
+        copied = copy_knowledge_semantic_watch_authority(authority)
+        scope = self._operation_access_scope(access_scope)
+        if scope != copied.invocation.access_scope:
+            raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+        operation_id = copied.invocation.operation_id
+        existing = self._semantic_watch_receipts.get(operation_id)
+        if existing is not None:
+            stored_scope = self._semantic_watch_receipt_access.get(operation_id)
+            try:
+                if stored_scope is None or type(existing) is not KnowledgeSemanticWatchReceipt:
+                    raise ValueError("Semantic-watch receipt storage is incomplete.")
+                stored_scope = copy_knowledge_access_scope(stored_scope)
+                existing = copy_knowledge_semantic_watch_receipt(existing)
+                if existing.replayed or existing.authority.invocation.access_scope != stored_scope:
+                    raise ValueError("Semantic-watch receipt indexes conflict with content.")
+            except Exception:
+                raise KnowledgeSemanticWatchConflict("malformed_receipt") from None
+            if stored_scope != scope:
+                raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+            if existing.authority.invocation != copied.invocation:
+                raise KnowledgeSemanticWatchConflict("operation_reuse")
+            return copy_knowledge_semantic_watch_receipt(existing, replayed=True)
+        if operation_id in self._semantic_watch_receipt_access:
+            raise KnowledgeSemanticWatchConflict("malformed_receipt")
+        validation_now = self._clock()
+        records = []
+        references = {candidate.reference for candidate in copied.evidence.candidates}
+        for reference in sorted(references, key=lambda item: (item.entry_id, item.revision)):
+            entry = self._current_entry(reference.entry_id)
+            if entry is None or entry.revision != reference.revision:
+                raise KnowledgeSemanticWatchConflict("candidate_stale")
+            if not _knowledge_scope_allows_entry(scope, entry, now=validation_now):
+                raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+            records.append(
+                (
+                    entry,
+                    self._chunks.get((entry.id, entry.revision), ()),
+                )
+            )
+        copied = require_knowledge_semantic_watch_authority_records(
+            copied,
+            records,
+            now=validation_now,
+        )
+        receipt = KnowledgeSemanticWatchReceipt(
+            operation_id=operation_id,
+            invocation_sha256=copied.invocation.fingerprint,
+            request_sha256=copied.decision.request_sha256,
+            authority=copied,
+            committed_at=validation_now,
+        )
+        self._semantic_watch_receipts[operation_id] = receipt
+        self._semantic_watch_receipt_access[operation_id] = copy_knowledge_access_scope(scope)
+        return copy_knowledge_semantic_watch_receipt(receipt)
+
+    async def load_semantic_watch_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt | None:
+        from cayu.knowledge_semantic_watch import (
+            KnowledgeSemanticWatchConflict,
+            KnowledgeSemanticWatchReceipt,
+            copy_knowledge_semantic_watch_receipt,
+        )
+
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_semantic_watch_identity(operation_id, "operation_id")
+        receipt = self._semantic_watch_receipts.get(operation_id)
+        stored_scope = self._semantic_watch_receipt_access.get(operation_id)
+        if receipt is None:
+            if stored_scope is not None:
+                raise KnowledgeSemanticWatchConflict("malformed_receipt")
+            return None
+        try:
+            if stored_scope is None or type(receipt) is not KnowledgeSemanticWatchReceipt:
+                raise ValueError("Semantic-watch receipt storage is incomplete.")
+            stored_scope = copy_knowledge_access_scope(stored_scope)
+            receipt = copy_knowledge_semantic_watch_receipt(receipt)
+            if receipt.replayed or receipt.authority.invocation.access_scope != stored_scope:
+                raise ValueError("Semantic-watch receipt indexes conflict with content.")
+        except Exception:
+            raise KnowledgeSemanticWatchConflict("malformed_receipt") from None
+        if stored_scope != scope:
+            return None
+        return receipt
 
     async def apply_maintenance_decision(
         self,
@@ -11422,6 +11553,10 @@ def _knowledge_relation_identity(value: str, field_name: str) -> str:
 
 
 def _knowledge_maintenance_identity(value: str, field_name: str) -> str:
+    return _bounded_knowledge_identity(value, field_name, max_bytes=256)
+
+
+def _knowledge_semantic_watch_identity(value: str, field_name: str) -> str:
     return _bounded_knowledge_identity(value, field_name, max_bytes=256)
 
 

@@ -26,6 +26,10 @@ if TYPE_CHECKING:
         KnowledgeMaintenanceProposalPublication,
         KnowledgeMaintenanceProposalPublicationReceipt,
     )
+    from cayu.knowledge_semantic_watch import (
+        KnowledgeSemanticWatchAuthority,
+        KnowledgeSemanticWatchReceipt,
+    )
 
 try:
     from psycopg import sql
@@ -768,10 +772,12 @@ from cayu.storage.memory import (
     _knowledge_relation_query_fingerprint,
     _knowledge_relation_semantic_key,
     _knowledge_scope_allows_activation_receipt,
+    _knowledge_scope_allows_entry,
     _knowledge_scope_allows_lineage_endpoint,
     _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
+    _knowledge_semantic_watch_identity,
     _KnowledgeActivationRetirement,
     _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
@@ -2919,6 +2925,26 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
                 AND jsonb_typeof(receipt_json::jsonb) = 'object'
             ),
             access_snapshot JSONB NOT NULL CHECK (jsonb_typeof(access_snapshot) = 'object')
+        )
+        """,
+    ),
+    78: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_semantic_watch_receipts (
+            operation_id TEXT COLLATE "C" PRIMARY KEY,
+            invocation_sha256 TEXT COLLATE "C" NOT NULL
+                CHECK (invocation_sha256 ~ '^[0-9a-f]{64}$'),
+            request_sha256 TEXT COLLATE "C" NOT NULL
+                CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (
+                octet_length(receipt_json) BETWEEN 1 AND 384000
+                AND jsonb_typeof(receipt_json::jsonb) = 'object'
+            ),
+            access_scope JSONB NOT NULL CHECK (
+                octet_length(access_scope::text) BETWEEN 1 AND 384000
+                AND jsonb_typeof(access_scope) = 'object'
+            )
         )
         """,
     ),
@@ -5779,6 +5805,8 @@ class _PostgresStoreBase:
                             await self._validate_interrupted_handoff_generation_column(cur)
                         if self._min_required_revision >= 77:
                             await self._validate_knowledge_maintenance_governance_schema(cur)
+                        if self._min_required_revision >= 78:
+                            await self._validate_knowledge_semantic_watch_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -6010,6 +6038,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_activation_schema(cur)
         if self._min_required_revision >= 77:
             await self._validate_knowledge_maintenance_governance_schema(cur)
+        if self._min_required_revision >= 78:
+            await self._validate_knowledge_semantic_watch_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -6163,6 +6193,8 @@ class _PostgresStoreBase:
             await self._validate_interrupted_handoff_generation_column(cur)
         if revision.revision == 77:
             await self._validate_knowledge_maintenance_governance_schema(cur)
+        if revision.revision == 78:
+            await self._validate_knowledge_semantic_watch_schema(cur)
 
     async def _validate_knowledge_activation_schema(self, cur: Any) -> None:
         table = "cayu_knowledge_activation_receipts"
@@ -6497,6 +6529,84 @@ class _PostgresStoreBase:
             "Postgres schema object "
             f"{name!r} conflicts with Cayu's maintenance-governance contract. "
             "Run `cayu storage migrate` to install revision 77 or recreate the database."
+        )
+
+    async def _validate_knowledge_semantic_watch_schema(self, cur: Any) -> None:
+        table = "cayu_knowledge_semantic_watch_receipts"
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable, collation_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_knowledge_semantic_watch_receipts'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("operation_id", "text", "NO", "C"),
+            ("invocation_sha256", "text", "NO", "C"),
+            ("request_sha256", "text", "NO", "C"),
+            ("committed_at", "timestamp with time zone", "NO", None),
+            ("receipt_json", "text", "NO", None),
+            ("access_scope", "jsonb", "NO", None),
+        ):
+            self._raise_knowledge_semantic_watch_schema_error(table)
+        await cur.execute(
+            """
+            SELECT constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_knowledge_semantic_watch_receipts'
+            """
+        )
+        constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        )
+        required = (
+            ("p", ("primary key (operation_id)",)),
+            ("c", ("invocation_sha256", "^[0-9a-f]{64}$")),
+            ("c", ("request_sha256", "^[0-9a-f]{64}$")),
+            (
+                "c",
+                (
+                    "octet_length(receipt_json)",
+                    "jsonb_typeof((receipt_json)::jsonb)",
+                    "object",
+                    "384000",
+                ),
+            ),
+            (
+                "c",
+                (
+                    "octet_length((access_scope)::text)",
+                    "jsonb_typeof(access_scope)",
+                    "object",
+                    "384000",
+                ),
+            ),
+        )
+        if any(kind == "f" for kind, _definition in constraints) or any(
+            not any(
+                actual_kind == expected_kind
+                and all(fragment in definition for fragment in fragments)
+                for actual_kind, definition in constraints
+            )
+            for expected_kind, fragments in required
+        ):
+            self._raise_knowledge_semantic_watch_schema_error(table)
+
+    @staticmethod
+    def _raise_knowledge_semantic_watch_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's semantic-watch receipt contract. "
+            "Run `cayu storage migrate` to install revision 78 or recreate the database."
         )
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
@@ -13022,6 +13132,18 @@ async def _lock_knowledge_relation_write_identities(
     )
 
 
+async def _lock_knowledge_semantic_watch_write_identities(
+    cur: Any,
+    *,
+    operation_id: str,
+    entry_ids: tuple[str, ...],
+) -> None:
+    """Serialize a watch outcome in the canonical write-category order."""
+
+    await _lock_knowledge_write_identities(cur, operation_ids=(operation_id,))
+    await _lock_knowledge_write_identities(cur, entry_ids=entry_ids)
+
+
 async def _lock_knowledge_maintenance_write_identities(
     cur: Any,
     *,
@@ -15348,7 +15470,7 @@ class PostgresAgentWorkContextStore(_PostgresStoreBase, AgentWorkContextStore):
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 77
+    _min_required_revision = 78
 
     def __init__(
         self,
@@ -17184,6 +17306,131 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             return await self._load_maintenance_governance_route(
+                cur,
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+
+    async def record_semantic_watch_outcome(
+        self,
+        authority: KnowledgeSemanticWatchAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt:
+        from cayu.knowledge_semantic_watch import (
+            KnowledgeSemanticWatchAuthority,
+            KnowledgeSemanticWatchConflict,
+            KnowledgeSemanticWatchReceipt,
+            copy_knowledge_semantic_watch_authority,
+            copy_knowledge_semantic_watch_receipt,
+            require_knowledge_semantic_watch_authority_records,
+        )
+
+        if type(authority) is not KnowledgeSemanticWatchAuthority:
+            raise TypeError("authority must be a KnowledgeSemanticWatchAuthority.")
+        copied = copy_knowledge_semantic_watch_authority(authority)
+        scope = self._operation_access_scope(access_scope)
+        if scope != copied.invocation.access_scope:
+            raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+        operation_id = copied.invocation.operation_id
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await _lock_knowledge_semantic_watch_write_identities(
+                        cur,
+                        operation_id=operation_id,
+                        entry_ids=tuple(
+                            candidate.reference.entry_id for candidate in copied.evidence.candidates
+                        ),
+                    )
+                    existing = await self._load_semantic_watch_receipt(
+                        cur,
+                        operation_id,
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    if existing is not None:
+                        if existing.authority.invocation != copied.invocation:
+                            raise KnowledgeSemanticWatchConflict("operation_reuse")
+                        await conn.commit()
+                        return copy_knowledge_semantic_watch_receipt(existing, replayed=True)
+                    validation_now = self._clock()
+                    records = []
+                    references = {candidate.reference for candidate in copied.evidence.candidates}
+                    for reference in sorted(
+                        references,
+                        key=lambda item: (item.entry_id, item.revision),
+                    ):
+                        entry = await self._load_entry(cur, reference.entry_id)
+                        if entry is None or entry.revision != reference.revision:
+                            raise KnowledgeSemanticWatchConflict("candidate_stale")
+                        if not _knowledge_scope_allows_entry(
+                            scope,
+                            entry,
+                            now=validation_now,
+                        ):
+                            raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+                        records.append(
+                            (
+                                entry,
+                                await self._load_chunks(
+                                    cur,
+                                    entry.id,
+                                    revision=entry.revision,
+                                ),
+                            )
+                        )
+                    copied = require_knowledge_semantic_watch_authority_records(
+                        copied,
+                        records,
+                        now=validation_now,
+                    )
+                    receipt = KnowledgeSemanticWatchReceipt(
+                        operation_id=operation_id,
+                        invocation_sha256=copied.invocation.fingerprint,
+                        request_sha256=copied.decision.request_sha256,
+                        authority=copied,
+                        committed_at=validation_now,
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_knowledge_semantic_watch_receipts (
+                            operation_id, invocation_sha256, request_sha256,
+                            committed_at, receipt_json, access_scope
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                        """,
+                        (
+                            receipt.operation_id,
+                            receipt.invocation_sha256,
+                            receipt.request_sha256,
+                            pg_support.to_utc(receipt.committed_at),
+                            receipt.model_dump_json(warnings=False),
+                            scope.model_dump_json(warnings=False),
+                        ),
+                    )
+                await conn.commit()
+                return copy_knowledge_semantic_watch_receipt(receipt)
+            except UniqueViolation:
+                await conn.rollback()
+                raise KnowledgeSemanticWatchConflict("operation_reuse") from None
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_semantic_watch_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_semantic_watch_identity(operation_id, "operation_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            return await self._load_semantic_watch_receipt(
                 cur,
                 operation_id,
                 access_scope=scope,
@@ -19881,6 +20128,52 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise KnowledgeAccessDenied("record_maintenance_governance_route")
             return None
         return copy_knowledge_maintenance_governance_receipt(receipt)
+
+    async def _load_semantic_watch_receipt(
+        self,
+        cur: Any,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> KnowledgeSemanticWatchReceipt | None:
+        from cayu.knowledge_semantic_watch import (
+            KnowledgeSemanticWatchConflict,
+            KnowledgeSemanticWatchReceipt,
+            copy_knowledge_semantic_watch_receipt,
+        )
+
+        await cur.execute(
+            """
+            SELECT invocation_sha256, request_sha256, committed_at,
+                   receipt_json, access_scope::text
+            FROM cayu_knowledge_semantic_watch_receipts
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = KnowledgeSemanticWatchReceipt.model_validate_json(row[3])
+            stored_scope = KnowledgeAccessScope.model_validate_json(row[4])
+            if (
+                receipt.operation_id != operation_id
+                or receipt.invocation_sha256 != str(row[0])
+                or receipt.request_sha256 != str(row[1])
+                or receipt.committed_at != pg_support.to_utc(row[2])
+                or receipt.replayed
+                or receipt.authority.invocation.access_scope != stored_scope
+            ):
+                raise ValueError("Semantic-watch receipt indexes conflict with content.")
+        except Exception:
+            raise KnowledgeSemanticWatchConflict("malformed_receipt") from None
+        if stored_scope != access_scope:
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+            return None
+        return copy_knowledge_semantic_watch_receipt(receipt)
 
     async def _load_maintenance_record(
         self,

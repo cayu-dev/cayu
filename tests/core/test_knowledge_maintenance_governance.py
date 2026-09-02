@@ -593,8 +593,9 @@ def test_sqlite_revision_77_does_not_infer_governance_for_reviewed_history(
 
     proposal_id, decision_operation_id = asyncio.run(seed())
     with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE cayu_knowledge_semantic_watch_receipts")
         connection.execute("DROP TABLE cayu_knowledge_maintenance_governance_routes")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 77")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 77")
         connection.execute("PRAGMA user_version = 76")
         connection.commit()
 

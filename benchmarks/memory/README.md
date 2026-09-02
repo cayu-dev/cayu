@@ -198,6 +198,26 @@ measures canonical proposal/decision preparation, atomic activation plus archiva
 and relation publication, exact replay, receipt loading, and steady-state SQLite
 bytes. It makes no provider calls.
 
+## Policy-governed semantic-watch overhead
+
+`knowledge-semantic-watch-performance-v1.json` is the hermetic baseline for ten
+lexical observation evaluations, exact receipt replay, and durable outcome storage.
+Regenerate its p50/p95 evidence, or check the fixed p95 and storage ceilings without
+provider calls, with:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_semantic_watch_performance.py \
+  --output benchmarks/memory/knowledge-semantic-watch-performance-v1.json \
+  --check
+```
+
+The control creates identical current-runtime knowledge in the same revision-78 schema
+without watch outcomes; it is not a historical pre-feature binary. The populated lane
+measures access-filtered `RecallEngine` evaluation, application-policy routing, pre-recall
+receipt replay, bounded receipt JSON, and steady-state SQLite bytes. In-memory and SQLite
+provide the credential-free timing matrix; PostgreSQL runs shared behavior, concurrency,
+reopen, migration, malformed-storage, and cancellation/failure tests.
+
 ## Reviewed knowledge-maintenance reference evaluation
 
 `knowledge-maintenance-corpus-v1.json` and

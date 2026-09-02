@@ -420,6 +420,10 @@ REVISIONS: tuple[Revision, ...] = (
     # authority. Existing reviewed records are intentionally left untouched;
     # no automatic authority is inferred from historical data.
     Revision(revision=77, kind=RevisionKind.BREAKING, compatible_from=77),
+    # Semantic-watch evaluations now retain exact application-policy routing
+    # authority. Historical observations are intentionally not evaluated or
+    # inferred, and older writers do not maintain the receipt invariant.
+    Revision(revision=78, kind=RevisionKind.BREAKING, compatible_from=78),
 )
 
 #: The revision an empty database is initialized to.

@@ -177,8 +177,9 @@ def test_postgres_revision_77_does_not_infer_governance_for_reviewed_history(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
             async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_semantic_watch_receipts")
                 await cursor.execute("DROP TABLE cayu_knowledge_maintenance_governance_routes")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 77")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 77")
             await connection.commit()
 
         migrator = PostgresKnowledgeStore(
@@ -1299,6 +1300,32 @@ def test_postgres_relation_write_locks_follow_category_order(
     assert isinstance(relation_identities, list)
     assert relation_identities[0].startswith("knowledge-relation-semantic:")
     assert relation_identities[1] == "knowledge-relation:relation-a"
+
+
+def test_postgres_semantic_watch_write_locks_follow_category_order() -> None:
+    from cayu.storage.postgres import _lock_knowledge_semantic_watch_write_identities
+
+    class RecordingCursor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        async def execute(self, query: str, params: tuple[object, ...]) -> None:
+            self.calls.append((query, params))
+
+    async def run() -> list[tuple[str, tuple[object, ...]]]:
+        cursor = RecordingCursor()
+        await _lock_knowledge_semantic_watch_write_identities(
+            cursor,
+            operation_id="operation-a",
+            entry_ids=("entry-b", "entry-a", "entry-b"),
+        )
+        return cursor.calls
+
+    calls = asyncio.run(run())
+
+    assert len(calls) == 2
+    assert calls[0][1] == (["knowledge-operation:operation-a"],)
+    assert calls[1][1] == (["knowledge-entry:entry-a", "knowledge-entry:entry-b"],)
 
 
 def test_postgres_cancelled_relation_publication_rolls_back_atomically(

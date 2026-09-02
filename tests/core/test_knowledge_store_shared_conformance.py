@@ -26,6 +26,10 @@ from tests.core.knowledge_relation_conformance import (
     assert_knowledge_relation_conformance,
     assert_knowledge_relation_scope_conformance,
 )
+from tests.core.knowledge_semantic_watch_conformance import (
+    assert_knowledge_semantic_watch_conformance,
+    assert_knowledge_semantic_watch_scope_conformance,
+)
 from tests.core.knowledge_store_conformance import (
     CORE_KNOWLEDGE_STORE_SCENARIOS,
     KnowledgeStoreCapabilities,
@@ -261,6 +265,32 @@ def test_knowledge_store_shared_governance_contract(knowledge_store_case) -> Non
                 store,
                 access_scope=_ACCESS_SCOPE,
             )
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_shared_semantic_watch_contract(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            await assert_knowledge_semantic_watch_conformance(store)
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_shared_semantic_watch_scope_contract(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            await assert_knowledge_semantic_watch_scope_conformance(store)
         finally:
             await _close_store(store)
             await _reset_case(knowledge_store_case)

@@ -1322,6 +1322,84 @@ PYTHONPATH=src python scripts/run_knowledge_maintenance_governance_performance.p
 Recorded evidence lives in
 [`benchmarks/memory/knowledge-maintenance-governance-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-governance-performance-v1.json).
 
+## Policy-governed semantic watches
+
+`KnowledgeSemanticWatchEvaluator` is an explicit observation-to-route boundary over
+the existing `RecallEngine`. An application supplies a bounded observation identity and
+text, an exact `KnowledgeAccessScope`, versioned watch and recall-profile identities, and
+an application policy. Recall supplies exact current knowledge revisions and safe ranked
+lane diagnostics, including bounded source-authored match reasons and finite lane-local
+scores for versioned application thresholds. The evaluator rejects results that do not
+bind to the exact recall situation it submitted. Only the policy can return `ignore`,
+`emit`, or `route_to_review`.
+
+A match never proves that a reminder applies, an attack occurred, a fact is correct, or
+an effect is authorized. `emit` means only that the application policy produced a durable
+route. Notification delivery, task creation, tool denial, external effects, and provider
+context remain separate authoritative operations. Recalled text is untrusted data and is
+not promoted into system instructions. The watch path creates no provider conversation;
+an existing semantic-recall lane may still use its configured embedding provider. It does
+not inject context, modify `ContextExposure`, change knowledge lifecycle, or start a
+scheduler, poller, or worker.
+
+The default profile requires the lexical knowledge lane, so deterministic lexical-only
+stores can produce complete evidence while still recording that the optional semantic
+lane was unavailable. Applications that require hybrid coverage list both knowledge
+lanes in `required_channels`; missing, partial, or truncated required evidence can only
+route to review. Candidate limits, fused-head omissions, and result-byte omissions are
+also retained and make the evidence incomplete.
+
+```python
+from cayu import KnowledgeSemanticWatchConfig, KnowledgeSemanticWatchEvaluator
+
+watch = KnowledgeSemanticWatchEvaluator(
+    knowledge_store,
+    recall_engine,
+    config=KnowledgeSemanticWatchConfig(
+        watch_identity="acme.release-watch",
+        watch_version="1",
+        recall_profile_identity="acme.release-recall",
+        recall_profile_version="1",
+        policy_identity="acme.release-policy",
+        policy_version="2026-09",
+        knowledge_namespace="project:acme",
+    ),
+    policy=application_watch_policy,
+)
+
+receipt = await watch.evaluate(
+    operation_id="deployment-watch-42",
+    observation_id="deployment-42",
+    observation_source_type="deployment",
+    observation_source_id="deployment-42",
+    observation_text="Atlas deployment Friday",
+    access_scope=knowledge_scope,
+)
+```
+
+The invocation fingerprint is fixed before recall and binds the observation hash and
+length, access scope, watch, recall profile, policy profile, namespace, aspects, required
+lanes, and candidate bound. Exact committed retries load the receipt before recall or
+policy execution. Concurrent identical invocations converge on the first committed
+outcome; changed invocation material fails closed. The durable receipt retains the hash,
+exact revision references, fusion/rank coverage, policy decision, and store commit time.
+Cayu does not copy raw observation or recalled knowledge text into the receipt; applications
+must likewise keep policy-supplied annotations limited to safe metadata.
+
+Breaking storage revision 78 creates only an empty semantic-watch receipt table. It does
+not evaluate historical observations, infer signals, backfill outcomes, dual-write, or
+install a legacy read path. Stop pre-78 knowledge writers before migration.
+
+The credential-free example and fixed performance gate are:
+
+```bash
+PYTHONPATH=src python examples/knowledge_semantic_watch.py
+PYTHONPATH=src python scripts/run_knowledge_semantic_watch_performance.py --check
+```
+
+Recorded evidence lives in
+[`benchmarks/memory/knowledge-semantic-watch-performance-v1.json`](../benchmarks/memory/knowledge-semantic-watch-performance-v1.json).
+
 ## Explicit reviewed knowledge curation
 
 `KnowledgeCurator` is the provider-neutral, explicitly invoked path from application

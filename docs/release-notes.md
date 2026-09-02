@@ -225,6 +225,28 @@ PostgreSQL knowledge stores. Migration preserves existing reviewed proposals and
 but does not infer or backfill automatic authority, and there is no legacy runtime or
 dual-write path. Stop pre-77 knowledge writers before migration.
 
+### Semantic watches retain evidence without self-authorizing effects
+
+Applications can now explicitly evaluate one bounded observation through the existing
+access-filtered `RecallEngine` and pass exact revision-bound match evidence to a versioned
+application policy. `KnowledgeSemanticWatchEvaluator` durably records `ignore`, `emit`, or
+`route_to_review` attribution and recovers exact retries without rerunning recall or policy.
+The evidence retains bounded match reasons and rejects mismatched recall situations or
+impossible duplicate lane ranks before policy execution. Similarity, ranking, recalled
+text, and model or curator output cannot authorize the route. An emitted route does not
+itself block a tool, send a notification, create a task, call a provider, inject context,
+or perform an external effect.
+
+Lexical-only profiles can explicitly require only the deterministic lexical lane; hybrid
+profiles can require lexical and semantic coverage. Missing or truncated required evidence
+can only route to review, while all optional-lane and omission diagnostics remain visible.
+The framework adds no hidden scheduler, polling loop, watch worker, or standing instruction.
+
+Storage revision 78 adds bounded semantic-watch receipts across in-memory, SQLite, and
+PostgreSQL. Migration creates an empty table and does not evaluate historical observations,
+infer outcomes, backfill records, dual-write, or retain a legacy read path. Stop pre-78
+knowledge writers before migration.
+
 ### Evals ship focused onboarding and declarative project judge authority
 
 Three package-shipped guides now lead operators through a first Control Plane

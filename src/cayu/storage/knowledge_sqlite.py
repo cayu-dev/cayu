@@ -21,6 +21,10 @@ if TYPE_CHECKING:
         KnowledgeMaintenanceProposalPublication,
         KnowledgeMaintenanceProposalPublicationReceipt,
     )
+    from cayu.knowledge_semantic_watch import (
+        KnowledgeSemanticWatchAuthority,
+        KnowledgeSemanticWatchReceipt,
+    )
 
 from cayu._clock import utc_clock
 from cayu._validation import (
@@ -137,10 +141,12 @@ from cayu.storage.memory import (
     _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
     _knowledge_scope_allows_activation_receipt,
+    _knowledge_scope_allows_entry,
     _knowledge_scope_allows_lineage_endpoint,
     _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
+    _knowledge_semantic_watch_identity,
     _KnowledgeActivationRetirement,
     _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
@@ -213,7 +219,7 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
         (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
     }
 )
-_SQLITE_MIN_REQUIRED_REVISION = 77
+_SQLITE_MIN_REQUIRED_REVISION = 78
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -1819,6 +1825,113 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
         async with self._lock:
             return self._load_maintenance_governance_route_unlocked(
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+
+    async def record_semantic_watch_outcome(
+        self,
+        authority: KnowledgeSemanticWatchAuthority,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt:
+        from cayu.knowledge_semantic_watch import (
+            KnowledgeSemanticWatchAuthority,
+            KnowledgeSemanticWatchConflict,
+            KnowledgeSemanticWatchReceipt,
+            copy_knowledge_semantic_watch_authority,
+            copy_knowledge_semantic_watch_receipt,
+            require_knowledge_semantic_watch_authority_records,
+        )
+
+        if type(authority) is not KnowledgeSemanticWatchAuthority:
+            raise TypeError("authority must be a KnowledgeSemanticWatchAuthority.")
+        copied = copy_knowledge_semantic_watch_authority(authority)
+        scope = self._operation_access_scope(access_scope)
+        if scope != copied.invocation.access_scope:
+            raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+        operation_id = copied.invocation.operation_id
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                existing = self._load_semantic_watch_receipt_unlocked(
+                    operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if existing is not None:
+                    if existing.authority.invocation != copied.invocation:
+                        raise KnowledgeSemanticWatchConflict("operation_reuse")
+                    return copy_knowledge_semantic_watch_receipt(existing, replayed=True)
+                validation_now = self._clock()
+                records = []
+                references = {candidate.reference for candidate in copied.evidence.candidates}
+                for reference in sorted(
+                    references,
+                    key=lambda item: (item.entry_id, item.revision),
+                ):
+                    entry = self._load_entry_unlocked(reference.entry_id)
+                    if entry is None or entry.revision != reference.revision:
+                        raise KnowledgeSemanticWatchConflict("candidate_stale")
+                    if not _knowledge_scope_allows_entry(
+                        scope,
+                        entry,
+                        now=validation_now,
+                    ):
+                        raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+                    records.append(
+                        (
+                            entry,
+                            self._load_chunks_unlocked(
+                                entry.id,
+                                revision=entry.revision,
+                            ),
+                        )
+                    )
+                copied = require_knowledge_semantic_watch_authority_records(
+                    copied,
+                    records,
+                    now=validation_now,
+                )
+                receipt = KnowledgeSemanticWatchReceipt(
+                    operation_id=operation_id,
+                    invocation_sha256=copied.invocation.fingerprint,
+                    request_sha256=copied.decision.request_sha256,
+                    authority=copied,
+                    committed_at=validation_now,
+                )
+                try:
+                    self._connection.execute(
+                        """
+                        INSERT INTO cayu_knowledge_semantic_watch_receipts (
+                            operation_id, invocation_sha256, request_sha256,
+                            committed_at, receipt_json, access_scope_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            receipt.operation_id,
+                            receipt.invocation_sha256,
+                            receipt.request_sha256,
+                            sqlite_support.format_datetime(receipt.committed_at),
+                            receipt.model_dump_json(warnings=False),
+                            scope.model_dump_json(warnings=False),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    raise KnowledgeSemanticWatchConflict("operation_reuse") from None
+                return copy_knowledge_semantic_watch_receipt(receipt)
+
+    async def load_semantic_watch_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSemanticWatchReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_semantic_watch_identity(operation_id, "operation_id")
+        async with self._lock:
+            return self._load_semantic_watch_receipt_unlocked(
                 operation_id,
                 access_scope=scope,
                 deny_inaccessible=False,
@@ -4338,6 +4451,50 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 raise KnowledgeAccessDenied("record_maintenance_governance_route")
             return None
         return copy_knowledge_maintenance_governance_receipt(receipt)
+
+    def _load_semantic_watch_receipt_unlocked(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> KnowledgeSemanticWatchReceipt | None:
+        from cayu.knowledge_semantic_watch import (
+            KnowledgeSemanticWatchConflict,
+            KnowledgeSemanticWatchReceipt,
+            copy_knowledge_semantic_watch_receipt,
+        )
+
+        row = self._connection.execute(
+            """
+            SELECT invocation_sha256, request_sha256, committed_at,
+                   receipt_json, access_scope_json
+            FROM cayu_knowledge_semantic_watch_receipts
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = KnowledgeSemanticWatchReceipt.model_validate_json(row["receipt_json"])
+            stored_scope = KnowledgeAccessScope.model_validate_json(row["access_scope_json"])
+            if (
+                receipt.operation_id != operation_id
+                or receipt.invocation_sha256 != str(row["invocation_sha256"])
+                or receipt.request_sha256 != str(row["request_sha256"])
+                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+                or receipt.replayed
+                or receipt.authority.invocation.access_scope != stored_scope
+            ):
+                raise ValueError("Semantic-watch receipt indexes conflict with content.")
+        except Exception:
+            raise KnowledgeSemanticWatchConflict("malformed_receipt") from None
+        if stored_scope != access_scope:
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("record_semantic_watch_outcome")
+            return None
+        return copy_knowledge_semantic_watch_receipt(receipt)
 
     def _load_maintenance_record_unlocked(
         self,

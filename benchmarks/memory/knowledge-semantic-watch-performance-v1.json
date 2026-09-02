@@ -1,0 +1,63 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_evaluation_p95_ms": 50.0,
+    "memory_receipt_replay_p95_ms": 25.0,
+    "sqlite_evaluation_p95_ms": 100.0,
+    "sqlite_receipt_replay_p95_ms": 50.0,
+    "sqlite_storage_bytes_per_outcome": 65536
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "identical_current_runtime_knowledge_without_watch_outcomes",
+    "operation_count": 10
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "control_storage_bytes": null,
+      "evaluation_latency": {
+        "p50_ms": 9.723667,
+        "p95_ms": 10.756625
+      },
+      "max_receipt_json_bytes": 3266,
+      "operation_count": 10,
+      "receipt_replay_latency": {
+        "p50_ms": 2.182083,
+        "p95_ms": 2.584375
+      },
+      "storage_byte_overhead": null,
+      "storage_bytes_per_outcome": null,
+      "watched_storage_bytes": null
+    },
+    {
+      "backend": "sqlite",
+      "control_storage_bytes": 1781760,
+      "evaluation_latency": {
+        "p50_ms": 10.454417,
+        "p95_ms": 11.779
+      },
+      "max_receipt_json_bytes": 3286,
+      "operation_count": 10,
+      "receipt_replay_latency": {
+        "p50_ms": 3.326042,
+        "p95_ms": 3.612
+      },
+      "storage_byte_overhead": 40960,
+      "storage_bytes_per_outcome": 4096.0,
+      "watched_storage_bytes": 1822720
+    }
+  ],
+  "schema_version": "cayu.knowledge_semantic_watch_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "operation_count": 10,
+    "policy_calls": 10,
+    "provider_calls": 0,
+    "replay_policy_calls": 0
+  }
+}

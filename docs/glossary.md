@@ -85,6 +85,12 @@ disambiguates them so a name never sends you down the wrong path.
   that turns bounded source-attributed learning signals into pending proposals
   for review. It is not a background agent, retrieval manager, context manager,
   or automatic truth decider.
+- **Semantic watch.** `KnowledgeSemanticWatchEvaluator` explicitly compares one
+  identified observation with access-filtered recall evidence. The match is only
+  evidence: an application-owned `KnowledgeSemanticWatchPolicy` must choose
+  `ignore`, `emit`, or `route_to_review`. An emitted receipt is a durable route,
+  not a notification, task, tool block, provider instruction, context exposure,
+  or claim that the match is true. Cayu creates no ambient watch loop or worker.
 - **Recall receipt vs context exposure.** A recall receipt proves what a bounded
   retrieval/admission operation selected. A context exposure tracks whether one
   exact composition was merely planned/prepared/dispatched or was positively
