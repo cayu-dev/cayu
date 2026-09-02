@@ -4509,6 +4509,219 @@ def test_run_worker_drains_queue_until_stopped() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    (
+        "reconcile_terminal_receipts",
+        "reclaim_expired_leases",
+        "expects_reconciliation",
+        "expects_reclaim",
+    ),
+    (
+        (False, False, False, False),
+        (True, False, True, False),
+        (False, True, False, True),
+    ),
+)
+def test_run_worker_elects_reconciliation_and_reclaim_roles_independently(
+    monkeypatch: pytest.MonkeyPatch,
+    reconcile_terminal_receipts: bool,
+    reclaim_expired_leases: bool,
+    expects_reconciliation: bool,
+    expects_reclaim: bool,
+) -> None:
+    h = _build([_batch("unused")])
+    reclaim_calls = 0
+    reconciliation_calls = 0
+    original_reclaim = h.tasks.reclaim_expired
+    original_reconcile = h.dispatcher._reconcile_terminal_acknowledgements
+
+    async def count_reclaims(*, query=None, max_reclaims=100):
+        nonlocal reclaim_calls
+        reclaim_calls += 1
+        return await original_reclaim(query=query, max_reclaims=max_reclaims)
+
+    monkeypatch.setattr(h.tasks, "reclaim_expired", count_reclaims)
+
+    async def count_reconciliations(runtime):
+        nonlocal reconciliation_calls
+        reconciliation_calls += 1
+        return await original_reconcile(runtime)
+
+    monkeypatch.setattr(
+        h.dispatcher,
+        "_reconcile_terminal_acknowledgements",
+        count_reconciliations,
+    )
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="role-worker",
+                stop=stop,
+                poll_interval_s=0.01,
+                reconcile_terminal_receipts=reconcile_terminal_receipts,
+                reconciliation_every_s=0.01,
+                reclaim_expired_leases=reclaim_expired_leases,
+                reclaim_every_s=0.01,
+            )
+        )
+        await asyncio.sleep(0.05)
+        stop.set()
+        await worker
+
+    asyncio.run(scenario())
+    assert (reconciliation_calls > 0) is expects_reconciliation
+    assert (reclaim_calls > 0) is expects_reclaim
+
+
+def test_run_worker_recovery_cadence_can_wake_before_claim_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("unused")])
+    two_reconciliations = asyncio.Event()
+    reconciliation_calls = 0
+
+    async def count_reconciliations(_runtime) -> bool:
+        nonlocal reconciliation_calls
+        reconciliation_calls += 1
+        if reconciliation_calls == 2:
+            two_reconciliations.set()
+        return True
+
+    monkeypatch.setattr(
+        h.dispatcher,
+        "_reconcile_terminal_acknowledgements",
+        count_reconciliations,
+    )
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="cadence-worker",
+                stop=stop,
+                poll_interval_s=10.0,
+                reconcile_terminal_receipts=True,
+                reconciliation_every_s=0.02,
+                reclaim_expired_leases=False,
+            )
+        )
+        await asyncio.wait_for(two_reconciliations.wait(), timeout=0.5)
+        stop.set()
+        await worker
+
+    asyncio.run(scenario())
+    assert reconciliation_calls == 2
+
+
+def test_run_worker_preserves_process_next_override_signature() -> None:
+    h = _build([_batch("unused")])
+    stop = asyncio.Event()
+
+    class OverrideDispatcher(TaskStoreDispatcher):
+        calls = 0
+
+        async def process_next(self, runtime, *, worker_id):
+            del runtime, worker_id
+            self.calls += 1
+            stop.set()
+            return None
+
+    dispatcher = OverrideDispatcher(h.tasks)
+
+    async def scenario() -> None:
+        await dispatcher.run_worker(
+            h.app,
+            worker_id="override-worker",
+            stop=stop,
+            poll_interval_s=0.01,
+            reconcile_terminal_receipts=False,
+            reclaim_expired_leases=False,
+        )
+
+    asyncio.run(scenario())
+    assert dispatcher.calls == 1
+
+
+def test_run_worker_suppression_is_scoped_to_its_dispatcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("unused")])
+    stop = asyncio.Event()
+    nested_reconciliation_calls = 0
+
+    async def count_nested_reconciliations(_runtime) -> bool:
+        nonlocal nested_reconciliation_calls
+        nested_reconciliation_calls += 1
+        return True
+
+    monkeypatch.setattr(
+        h.dispatcher,
+        "_reconcile_terminal_acknowledgements",
+        count_nested_reconciliations,
+    )
+
+    class ComposedDispatcher(TaskStoreDispatcher):
+        async def process_next(self, runtime, *, worker_id):
+            try:
+                return await h.dispatcher.process_next(runtime, worker_id=worker_id)
+            finally:
+                stop.set()
+
+    dispatcher = ComposedDispatcher(h.tasks)
+
+    async def scenario() -> None:
+        await dispatcher.run_worker(
+            h.app,
+            worker_id="composed-worker",
+            stop=stop,
+            poll_interval_s=0.01,
+            reconcile_terminal_receipts=False,
+            reclaim_expired_leases=False,
+        )
+
+    asyncio.run(scenario())
+    assert nested_reconciliation_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error_type", "match"),
+    (
+        ({"poll_interval_s": float("nan")}, ValueError, "poll_interval_s"),
+        (
+            {"reconcile_terminal_receipts": 1},
+            TypeError,
+            "reconcile_terminal_receipts",
+        ),
+        ({"reconciliation_every_s": 0.0}, ValueError, "reconciliation_every_s"),
+        ({"reclaim_expired_leases": 1}, TypeError, "reclaim_expired_leases"),
+        ({"reclaim_every_s": float("inf")}, ValueError, "reclaim_every_s"),
+    ),
+)
+def test_run_worker_validates_recovery_economics(
+    overrides: dict[str, Any],
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    h = _build([_batch("unused")])
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        stop.set()
+        with pytest.raises(error_type, match=match):
+            await h.dispatcher.run_worker(
+                h.app,
+                worker_id="validation-worker",
+                stop=stop,
+                **overrides,
+            )
+
+    asyncio.run(scenario())
+
+
 def test_concurrent_terminal_reconciliation_is_single_flight() -> None:
     h = _build([_batch("first answer")])
 

@@ -2842,6 +2842,23 @@ after exact terminal event publication and is removed only after that run epoch
 has released its trailing ownership and the exact task outcome is durable. A
 newer invocation does not become the settlement gate for an older receipt or
 for an exact retry of an already acknowledged terminal dispatch.
+`TaskStoreDispatcher.run_worker(...)` exposes terminal-receipt reconciliation
+and expired-lease reclaim as independent recovery roles. In a shared worker
+pool, applications may elect one or more bounded owners for each role with
+`reconcile_terminal_receipts` and `reclaim_expired_leases`; a non-owner passes
+both as false and performs neither recovery scan through its internal
+`process_next(...)` call. The worker loop uses a task-local suppression boundary,
+so custom dispatcher overrides retain the existing public method signature. The
+roles also have independent
+`reconciliation_every_s` and `reclaim_every_s` cadences. Idle waiting wakes for
+the earliest enabled recovery deadline even when the ordinary claim poll
+interval is longer. A worker that arms new terminal handoff evidence makes its
+own enabled reconciliation immediately eligible, while a separate owner still
+discovers the same durable receipt through bounded store pages. Direct
+`process_next(...)` calls retain startup reconciliation by default; only an
+enclosing worker-loop context disables that duplicate entrance.
+Role election is an application deployment responsibility, and disabling every
+owner can strand acknowledgement recovery or expired queue leases.
 If stalled-session recovery finds runtime-authenticated, deterministic corruption
 in a durable workspace-observation authority tuple, the dispatcher terminally
 fails the claimed queue task. It does not release that task for an unbounded

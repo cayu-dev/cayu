@@ -5,10 +5,12 @@ import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+from math import isfinite
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
@@ -82,6 +84,10 @@ from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
 _DISPATCH_DIAGNOSTIC_MAX_BYTES = 4096
+_RUN_WORKER_RECONCILIATION_DISPATCHER: ContextVar[object | None] = ContextVar(
+    "cayu_dispatch_worker_reconciliation_dispatcher",
+    default=None,
+)
 
 
 class DispatchStatus(StrEnum):
@@ -859,11 +865,17 @@ class TaskStoreDispatcher(Dispatcher):
         """Claim and run one queued dispatch.
 
         Returns ``None`` if the queue is empty, or if the claimed task's payload was
-        malformed (in which case the task is failed before returning).
+        malformed (in which case the task is failed before returning). Direct callers
+        reconcile pending terminal receipts by default. ``run_worker`` suppresses that
+        duplicate entrance in its task-local context because its independently elected
+        periodic role owns that cadence.
         """
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        if self._startup_terminal_receipt_reconciliation_pending:
+        if (
+            _RUN_WORKER_RECONCILIATION_DISPATCHER.get() is not self
+            and self._startup_terminal_receipt_reconciliation_pending
+        ):
             reconciliation_generation = self._terminal_receipt_reconciliation_generation
             try:
                 reconciliation_complete = await self._reconcile_terminal_acknowledgements(
@@ -1531,14 +1543,29 @@ class TaskStoreDispatcher(Dispatcher):
         worker_id: str,
         stop: asyncio.Event,
         poll_interval_s: float = 1.0,
+        reconcile_terminal_receipts: bool = True,
+        reconciliation_every_s: float = 60.0,
+        reclaim_expired_leases: bool = True,
         reclaim_every_s: float = 60.0,
     ) -> None:
-        """Claim-and-run loop until ``stop`` is set, periodically reclaiming dead leases."""
+        """Claim and run until stopped with independently elected recovery roles."""
+
+        if not isfinite(poll_interval_s) or poll_interval_s <= 0:
+            raise ValueError("poll_interval_s must be finite and positive.")
+        if type(reconcile_terminal_receipts) is not bool:
+            raise TypeError("reconcile_terminal_receipts must be a bool.")
+        if not isfinite(reconciliation_every_s) or reconciliation_every_s <= 0:
+            raise ValueError("reconciliation_every_s must be finite and positive.")
+        if type(reclaim_expired_leases) is not bool:
+            raise TypeError("reclaim_expired_leases must be a bool.")
+        if not isfinite(reclaim_every_s) or reclaim_every_s <= 0:
+            raise ValueError("reclaim_every_s must be finite and positive.")
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         loop = asyncio.get_running_loop()
+        next_reconciliation = loop.time()
         next_reclaim = loop.time()
         while not stop.is_set():
-            if loop.time() >= next_reclaim:
+            if reconcile_terminal_receipts and loop.time() >= next_reconciliation:
                 reconciliation_generation = self._terminal_receipt_reconciliation_generation
                 try:
                     reconciliation_complete = await self._reconcile_terminal_acknowledgements(
@@ -1556,6 +1583,8 @@ class TaskStoreDispatcher(Dispatcher):
                         type(exc).__name__,
                         _safe_runtime_text(durable_runtime, str(exc)),
                     )
+                next_reconciliation = loop.time() + reconciliation_every_s
+            if reclaim_expired_leases and loop.time() >= next_reclaim:
                 for task_type in self._claim_task_types():
                     try:
                         await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
@@ -1567,6 +1596,12 @@ class TaskStoreDispatcher(Dispatcher):
                             _safe_runtime_text(durable_runtime, str(exc)),
                         )
                 next_reclaim = loop.time() + reclaim_every_s
+            if stop.is_set():
+                break
+            reconciliation_generation_before_process = (
+                self._terminal_receipt_reconciliation_generation
+            )
+            suppression_token = _RUN_WORKER_RECONCILIATION_DISPATCHER.set(self)
             try:
                 handle = await self.process_next(runtime, worker_id=worker_id)
             except Exception as exc:
@@ -1577,6 +1612,15 @@ class TaskStoreDispatcher(Dispatcher):
                     _safe_runtime_text(durable_runtime, str(exc)),
                 )
                 handle = None
+            finally:
+                _RUN_WORKER_RECONCILIATION_DISPATCHER.reset(suppression_token)
+            if (
+                reconcile_terminal_receipts
+                and self._startup_terminal_receipt_reconciliation_pending
+                and self._terminal_receipt_reconciliation_generation
+                != reconciliation_generation_before_process
+            ):
+                next_reconciliation = 0.0
             # Back off when idle, after a busy-session requeue, or after a lost-lease reclaim —
             # otherwise the just-released/reclaimed task (FIFO-oldest) is re-claimed immediately
             # in a tight loop, re-running the agent with no delay.
@@ -1585,8 +1629,21 @@ class TaskStoreDispatcher(Dispatcher):
                 or handle.metadata.get("requeued")
                 or handle.metadata.get("reclaimed")
             ):
+                idle_wait_s = poll_interval_s
+                if reconcile_terminal_receipts:
+                    idle_wait_s = min(
+                        idle_wait_s,
+                        max(next_reconciliation - loop.time(), 0.0),
+                    )
+                if reclaim_expired_leases:
+                    idle_wait_s = min(
+                        idle_wait_s,
+                        max(next_reclaim - loop.time(), 0.0),
+                    )
+                if idle_wait_s == 0:
+                    continue
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
+                    await asyncio.wait_for(stop.wait(), timeout=idle_wait_s)
 
     async def _acknowledge_terminal_task(
         self,
