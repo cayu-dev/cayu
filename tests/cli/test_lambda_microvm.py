@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from cayu.cli import _guarded_tree_publication as publication
 from cayu.cli import lambda_microvm as sidecar_cli
 from cayu.cli import main
 
@@ -33,6 +34,49 @@ def _copy_source(tmp_path: Path) -> Path:
     resource = tmp_path / "resource"
     shutil.copytree(_SOURCE, resource)
     return resource
+
+
+def _stable_identity_unavailable(*_args: object, **_kwargs: object) -> object:
+    raise publication.GuardedTreePublicationError(
+        "stable_identity_unavailable",
+        "simulated unsupported stable identity",
+    )
+
+
+def test_lambda_descriptorless_cleanup_does_not_require_guarded_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    expected = staging.stat(follow_symlinks=False)
+    monkeypatch.setattr(publication, "_capture_stable_identity", _stable_identity_unavailable)
+
+    sidecar_cli._remove_owned_publication_directory(
+        staging,
+        expected_identity=expected,
+        parent_descriptor=None,
+    )
+
+    assert not staging.exists()
+
+
+def test_lambda_export_retains_pre_migration_identity_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "sidecar"
+    destination.mkdir()
+    (destination / "old.txt").write_text("old\n", encoding="utf-8")
+
+    monkeypatch.setattr(publication, "_capture_stable_identity", _stable_identity_unavailable)
+
+    result = sidecar_cli._export_sidecar(destination, replace=True)
+
+    assert result.destination == destination
+    assert (destination / _MANIFEST).is_file()
+    assert not (destination / "old.txt").exists()
+    assert list(tmp_path.glob(".sidecar.cayu-sidecar-backup-*")) == []
 
 
 def test_lambda_microvm_sidecar_export_is_reproducible(

@@ -1060,9 +1060,12 @@ def _remove_owned_publication_directory(
     parent_descriptor: int | None,
 ) -> None:
     if parent_descriptor is None:
+        staging_guard = _StagingGuard.capture(path)
+        if not os.path.samestat(expected_identity, staging_guard.identity):
+            raise _SidecarArtifactError(f"directory changed during cleanup: {path}")
         _remove_owned_staging_directory(
             path,
-            staging_guard=_StagingGuard(path=path, identity=expected_identity),
+            staging_guard=staging_guard,
         )
         return
 

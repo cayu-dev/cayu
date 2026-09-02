@@ -3672,7 +3672,66 @@ editable dashboard-source bundle. The bundle manifest binds its file inventory t
 Cayu version, exact server contract, generated OpenAPI client, and compiled dashboard asset tree.
 `cayu dashboard eject DESTINATION` validates that complete manifest in memory before writing,
 rejects unsafe or conflicting archive entries, and atomically publishes only to an absent or empty
-non-symlink destination. It performs no network or repository lookup. The extracted project is
+non-symlink destination. A bounded destination-scoped journal binds the exact request, parent,
+original destination, staged tree, and cleanup owner. An exact retry after interruption recovers the
+original tree or the published tree without repopulating it; conflicting identities preserve every
+tree and fail closed. A successful publication retains one bounded terminal receipt per destination
+so process death after commit but before caller acknowledgement remains exactly replayable while the
+sealed published content is unchanged. Publication replay reauthenticates every descendant against
+that receipt. Under the absent-or-empty policy, a changed nonempty destination is application-owned
+and fails closed, while an absent or proven-empty destination retires the stale receipt and starts a
+new publication. Read-only recovery continues to report the historical committed outcome without
+removing post-publication operator edits. A later
+replacement may supersede that receipt only when it names the exact prior request digest under the
+same consumer and replacement policy; stale or unrelated requests remain conflicts. Owned
+trees are moved into an identity-checked cleanup claim before recursive deletion. A bounded durable
+per-entry manifest binds every descendant's relative path, device, inode, type, stable filesystem
+incarnation, mode, and regular-file content. Regular-file hashing compares size, mode, modification
+time, change time, and platform attributes before and after the read; cleanup carries that observation
+to the final destructive check, and Windows repeats the content check while its deletion handle excludes
+new writers. Windows obtains change time from `FILE_BASIC_INFO.ChangeTime`; Python's Windows
+`st_ctime_ns` creation-time value is not mutation evidence. An observed in-place mutation is preserved
+as a cleanup conflict rather than deleted. The
+incarnation requires positive non-reuse evidence:
+Linux combines the filesystem inode generation with `statx` birth time, Windows assigns or reads a
+volume-unique persistent object ID, and Darwin accepts either a nonzero object generation or a volume's
+authenticated guarantee that object IDs are persistent and not recycled. Creation time alone is not
+authority. Windows filesystems without object-ID support fail closed rather than treating a recyclable
+file ID as durable authority. Publication fails closed when the filesystem cannot provide one of these
+proofs. This prevents inode reuse from authenticating a recreated root or descendant, so partial
+cleanup can resume but an entry replaced after the cleanup seal is preserved and reported as a
+conflict when observed at a destructive transition. Every Windows entry carrying the reparse-point
+attribute is rejected, regardless of its reparse tag. POSIX cleanup is
+descriptor-relative and rechecks the exact entry immediately before unlink or removal; POSIX does not
+provide pathname deletion or rename conditional on an open inode. Cayu pins rename sources, validates
+the result, and attempts to restore an unexpected move before reporting the conflict, but code running
+as the same operating-system user that deliberately mutates names or file contents after the final
+observation and before the corresponding kernel namespace operation—or mutates Cayu's unguessable
+private cleanup names outside the cooperative publication boundary—is not contained by this primitive.
+Publication refuses to traverse a mounted root or descendant. The initial
+journal and each cleanup manifest are atomically published from one destination-scoped pending file.
+On a later entrance, an initial pending journal has no independently durable Cayu authority;
+complete, partial, and caller-authored forms are therefore preserved as a bounded conflict rather
+than removed or adopted. A cleanup-manifest pending file remains recoverable because its exact
+authority is already bound by the active journal.
+A private stage interrupted before its owner marker becomes durable is indistinguishable from a
+user-created lookalike, so recovery preserves it as one bounded conflict rather than adopting or
+removing it. The marker is removed before caller population, so its private name remains valid
+application payload. Normal file-tree population is available only through an identity-pinned writer
+that validates the complete path topology and proves the future cleanup authority remains within its
+durable size, 128-level depth, entry, and recoverable-permission limits before writing. Replacement
+likewise proves the original tree is traversable and removable, and that its cleanup authority is
+durably representable, before the journal or namespace can change. Malformed Unicode in journal or
+cleanup-manifest authority is classified as bounded invalid durable metadata rather than escaping as
+a codec or parser failure. Destination spellings follow the native platform contract: Win32 aliases
+and reserved stems are rejected on Windows. POSIX retains spellings only when native lookup semantics
+prove them distinct; case-sensitive Darwin volumes NFC-normalize canonically equivalent spellings
+without case-folding, while an unrecognized filesystem conservatively uses an NFC/casefold alias
+domain rather than risking two durable owners for one destination. Every complete parent-directory
+census used for metadata-owner, pending-metadata, or destination-alias discovery has a total
+inspected-entry limit, including unrelated entries, and fails closed when that limit is exhausted. A
+boundary-cleanup failure is reported without weakening the
+committed receipt. It performs no network or repository lookup. The extracted project is
 application-owned: installation, upgrade, and later Cayu commands never rewrite it. Explicit API
 generation may update that copy, while ordinary drift checking and the browser compatibility gate
 remain read-only. `DashboardConfig.directory`, `mount_cayu(..., dashboard_dir=...)`, and

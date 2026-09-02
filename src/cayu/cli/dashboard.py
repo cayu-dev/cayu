@@ -11,9 +11,8 @@ import os
 import re
 import stat
 import sys
-import uuid
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
@@ -22,6 +21,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
+from cayu.cli import _guarded_tree_publication as _tree_publication
+from cayu.cli._guarded_tree_publication import (
+    DestinationPolicy,
+    GuardedTreePublicationError,
+    GuardedTreeStage,
+    publish_guarded_tree,
+    validate_guarded_tree_files,
+)
 
 _BUNDLE_DIRECTORY = "dashboard_source"
 _BUNDLE_NAME_PATTERN = re.compile(r"cayu-dashboard-source-(?P<version>[^/]+)\.zip\Z")
@@ -39,22 +46,6 @@ _MANIFEST_KEYS = {
 _FILE_KEYS = {"path", "sha256", "size"}
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-_WINDOWS_REPARSE_TAG_NAME_SURROGATE = 0x20000000
-_WINDOWS_INVALID_FILENAME_CHARACTERS = frozenset('<>:"|?*')
-_WINDOWS_PRIVATE_DIRECTORY_SDDL = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-_WINDOWS_RESERVED_FILENAME_STEMS = frozenset(
-    {
-        "aux",
-        "clock$",
-        "con",
-        "conin$",
-        "conout$",
-        "nul",
-        "prn",
-        *(f"com{suffix}" for suffix in "123456789¹²³"),
-        *(f"lpt{suffix}" for suffix in "123456789¹²³"),
-    }
-)
 _MAX_ARCHIVE_FILES = 4096
 _MAX_ARCHIVE_FILE_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -89,41 +80,10 @@ class DashboardSourceError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _DestinationParentGuard:
-    path: Path
-    identity: os.stat_result
-
-    @classmethod
-    def capture(cls, path: Path) -> _DestinationParentGuard:
-        _reject_link_components(path)
-        try:
-            identity = path.stat(follow_symlinks=False)
-        except FileNotFoundError as exc:
-            raise DashboardSourceError(f"destination parent must already exist: {path}") from exc
-        except OSError as exc:
-            raise DashboardSourceError(
-                f"could not inspect destination parent {path}: {exc}"
-            ) from exc
-        if not stat.S_ISDIR(identity.st_mode):
-            raise DashboardSourceError(f"destination parent must be a directory: {path}")
-        return cls(path=path, identity=identity)
-
-    def assert_unchanged(self) -> None:
-        try:
-            _reject_link_components(self.path)
-            current = self.path.stat(follow_symlinks=False)
-        except (DashboardSourceError, OSError) as exc:
-            raise DashboardSourceError(
-                f"destination parent changed during extraction: {self.path}"
-            ) from exc
-        if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(self.identity, current):
-            raise DashboardSourceError(f"destination parent changed during extraction: {self.path}")
-
-
-@dataclass(frozen=True)
 class _StagingGuard:
     path: Path
     identity: os.stat_result
+    stable_identity: _tree_publication._Identity | None
 
     @classmethod
     def capture(cls, path: Path) -> _StagingGuard:
@@ -136,7 +96,24 @@ class _StagingGuard:
             ) from exc
         if not stat.S_ISDIR(identity.st_mode):
             raise DashboardSourceError(f"staging path must be a directory: {path}")
-        return cls(path=path, identity=identity)
+        # Lambda sidecar export continues to use its pre-extraction identity
+        # contract until that publisher migrates to the guarded-tree owner.
+        return cls(path=path, identity=identity, stable_identity=None)
+
+    @classmethod
+    def from_publication(cls, stage: GuardedTreeStage) -> _StagingGuard:
+        path = stage._specialized_path()
+        try:
+            identity = stage.capture_owned_identity()
+        except GuardedTreePublicationError as exc:
+            raise DashboardSourceError(
+                f"staging directory changed during extraction: {path}"
+            ) from exc
+        return cls(
+            path=path,
+            identity=identity,
+            stable_identity=stage._publication_identity,
+        )
 
     def assert_unchanged(self, path: Path | None = None) -> None:
         candidate = self.path if path is None else path
@@ -147,7 +124,24 @@ class _StagingGuard:
             raise DashboardSourceError(
                 f"staging directory changed during extraction: {candidate}"
             ) from exc
-        if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(self.identity, current):
+        if not stat.S_ISDIR(current.st_mode):
+            raise DashboardSourceError(f"staging directory changed during extraction: {candidate}")
+        if self.stable_identity is None:
+            if not os.path.samestat(self.identity, current):
+                raise DashboardSourceError(
+                    f"staging directory changed during extraction: {candidate}"
+                )
+            return
+        try:
+            stable_identity = _tree_publication._capture_stable_identity(
+                current,
+                path=candidate,
+            )
+        except GuardedTreePublicationError as exc:
+            raise DashboardSourceError(
+                f"staging directory changed during extraction: {candidate}"
+            ) from exc
+        if stable_identity != self.stable_identity:
             raise DashboardSourceError(f"staging directory changed during extraction: {candidate}")
 
 
@@ -277,36 +271,46 @@ def eject_dashboard_source(
                 f"expected {artifact.manifest.compiled_dashboard_digest}, "
                 f"found {compiled_digest}"
             )
-    destination = _validate_destination(destination)
-    _reject_link_components(destination.parent)
-    parent_guard = _DestinationParentGuard.capture(destination.parent)
-    staging, staging_guard = _create_staging_directory(
-        destination,
-        parent_guard=parent_guard,
-    )
     try:
-        parent_guard.assert_unchanged()
+        validate_guarded_tree_files(artifact.contents)
+    except GuardedTreePublicationError as exc:
+        raise DashboardSourceError(str(exc)) from exc
+    destination = _validate_destination(destination)
+    _require_existing_destination_parent(destination.parent)
+
+    def populate(staging: GuardedTreeStage) -> None:
+        staging_guard = _StagingGuard.from_publication(staging)
         _write_staging_tree(
-            staging,
+            staging_guard.path,
             artifact.contents,
             staging_guard=staging_guard,
         )
-        staging_guard.assert_unchanged()
-        _publish_staged_tree(
-            staging,
+
+    try:
+        publish_guarded_tree(
             destination,
-            parent_guard=parent_guard,
-            staging_guard=staging_guard,
+            consumer="dashboard_source",
+            request_digest=_dashboard_publication_request_digest(artifact.contents),
+            policy=DestinationPolicy.ABSENT_OR_EMPTY,
+            populate=populate,
         )
-    except BaseException as exc:
-        try:
-            parent_guard.assert_unchanged()
-        except DashboardSourceError as cleanup_error:
-            exc.add_note(f"could not safely remove staging directory {staging}: {cleanup_error}")
-        else:
-            _remove_staging_tree_if_owned(staging_guard, error=exc)
-        raise
+    except GuardedTreePublicationError as exc:
+        message = (
+            f"destination must be empty: {destination}"
+            if exc.code == "destination_not_empty"
+            else str(exc)
+        )
+        if exc.paths:
+            message += "; affected paths: " + ", ".join(repr(path) for path in exc.paths)
+        translated = DashboardSourceError(message)
+        for note in getattr(exc, "__notes__", ()):
+            translated.add_note(note)
+        raise translated from exc
     return DashboardEjectResult(destination=destination, manifest=artifact.manifest)
+
+
+def _dashboard_publication_request_digest(contents: dict[str, bytes]) -> str:
+    return _contents_digest(contents)
 
 
 def validate_dashboard_source_bundle(
@@ -601,15 +605,7 @@ def _validate_path_topology(paths: list[str], *, label: str) -> None:
 
 
 def _is_unsafe_windows_archive_component(component: str) -> bool:
-    if component.endswith((" ", ".")) or component.strip(" ") in {".", ".."}:
-        return True
-    if any(
-        ord(character) < 32 or character in _WINDOWS_INVALID_FILENAME_CHARACTERS
-        for character in component
-    ):
-        return True
-    stem = component.partition(".")[0].rstrip(" ").casefold()
-    return stem in _WINDOWS_RESERVED_FILENAME_STEMS
+    return _tree_publication._is_unsafe_windows_component(component)
 
 
 def _validate_manifest_path(value: Any, *, index: int) -> str:
@@ -709,9 +705,19 @@ def _validate_destination(destination: Path) -> Path:
         )
     if destination.exists() and not destination.is_dir():
         raise DashboardSourceError(f"destination must be a directory: {destination}")
-    if destination.is_dir() and next(destination.iterdir(), None) is not None:
-        raise DashboardSourceError(f"destination must be empty: {destination}")
     return destination
+
+
+def _require_existing_destination_parent(parent: Path) -> None:
+    _reject_link_components(parent)
+    try:
+        identity = parent.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise DashboardSourceError(f"destination parent must already exist: {parent}") from exc
+    except OSError as exc:
+        raise DashboardSourceError(f"could not inspect destination parent {parent}: {exc}") from exc
+    if not stat.S_ISDIR(identity.st_mode):
+        raise DashboardSourceError(f"destination parent must be a directory: {parent}")
 
 
 def _packaged_compiled_dashboard_digest() -> str:
@@ -764,438 +770,15 @@ def _reject_link_components(path: Path) -> None:
             raise DashboardSourceError(
                 f"could not inspect destination path component {component}: {exc}"
             ) from exc
-        if stat.S_ISLNK(identity.st_mode) or _is_windows_name_surrogate(identity):
+        if stat.S_ISLNK(identity.st_mode) or _is_windows_reparse_point(identity):
             raise DashboardSourceError(
                 f"destination must not traverse a symbolic link or junction: {component}"
             )
 
 
-def _is_windows_name_surrogate(value: os.stat_result) -> bool:
+def _is_windows_reparse_point(value: os.stat_result) -> bool:
     file_attributes = getattr(value, "st_file_attributes", 0)
-    reparse_tag = getattr(value, "st_reparse_tag", None)
-    if reparse_tag is not None and reparse_tag & _WINDOWS_REPARSE_TAG_NAME_SURROGATE:
-        return True
-    return bool(file_attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT) and not reparse_tag
-
-
-def _create_staging_directory(
-    destination: Path,
-    *,
-    parent_guard: _DestinationParentGuard,
-) -> tuple[Path, _StagingGuard]:
-    if os.name != "nt":
-        return _create_private_posix_staging_directory(
-            destination,
-            parent_guard=parent_guard,
-        )
-    with _windows_directory_namespace_fence(parent_guard.path):
-        parent_guard.assert_unchanged()
-        staging_guard = _create_private_windows_staging_directory(destination)
-        staging = staging_guard.path
-        try:
-            staging_guard.assert_unchanged()
-            parent_guard.assert_unchanged()
-        except BaseException as exc:
-            _remove_new_empty_staging_after_creation_failure(staging_guard, error=exc)
-            raise
-    return staging, staging_guard
-
-
-def _create_private_posix_staging_directory(
-    destination: Path,
-    *,
-    parent_guard: _DestinationParentGuard,
-) -> tuple[Path, _StagingGuard]:
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        parent_descriptor = os.open(parent_guard.path, directory_flags)
-    except OSError as exc:
-        raise DashboardSourceError(
-            f"destination parent changed during extraction: {parent_guard.path}"
-        ) from exc
-
-    created_name: str | None = None
-    created_identity: os.stat_result | None = None
-    creation_error: BaseException | None = None
-    try:
-        opened_parent_identity = os.fstat(parent_descriptor)
-        if not stat.S_ISDIR(opened_parent_identity.st_mode) or not os.path.samestat(
-            parent_guard.identity, opened_parent_identity
-        ):
-            raise DashboardSourceError(
-                f"destination parent changed during extraction: {parent_guard.path}"
-            )
-        for _attempt in range(100):
-            candidate_name = f".{destination.name}.cayu-dashboard-{uuid.uuid4().hex}"
-            try:
-                os.mkdir(candidate_name, mode=0o700, dir_fd=parent_descriptor)
-            except FileExistsError:
-                continue
-            created_name = candidate_name
-            break
-        if created_name is None:
-            raise DashboardSourceError("could not allocate a private staging directory")
-
-        created_identity = os.stat(
-            created_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        child_descriptor = os.open(
-            created_name,
-            directory_flags,
-            dir_fd=parent_descriptor,
-        )
-        child_error: BaseException | None = None
-        try:
-            opened_child_identity = os.fstat(child_descriptor)
-            if (
-                not stat.S_ISDIR(created_identity.st_mode)
-                or not stat.S_ISDIR(opened_child_identity.st_mode)
-                or not os.path.samestat(created_identity, opened_child_identity)
-            ):
-                raise DashboardSourceError(
-                    f"staging directory changed during extraction: "
-                    f"{parent_guard.path / created_name}"
-                )
-        except BaseException as exc:
-            child_error = exc
-            raise
-        finally:
-            _close_descriptor(child_descriptor, error=child_error)
-
-        staging = parent_guard.path / created_name
-        staging_guard = _StagingGuard(path=staging, identity=created_identity)
-        parent_guard.assert_unchanged()
-        staging_guard.assert_unchanged()
-        return staging, staging_guard
-    except BaseException as exc:
-        creation_error = exc
-        if created_name is not None:
-            _remove_new_empty_posix_staging_after_creation_failure(
-                parent_descriptor,
-                created_name,
-                identity=created_identity,
-                error=exc,
-            )
-        raise
-    finally:
-        _close_descriptor(parent_descriptor, error=creation_error)
-
-
-def _remove_new_empty_posix_staging_after_creation_failure(
-    parent_descriptor: int,
-    name: str,
-    *,
-    identity: os.stat_result | None,
-    error: BaseException,
-) -> None:
-    if identity is None:
-        error.add_note(
-            f"could not safely remove newly created staging directory {name}: "
-            "ownership was not captured"
-        )
-        return
-    try:
-        current = os.stat(
-            name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(identity, current):
-            raise DashboardSourceError("staging directory ownership changed")
-        os.rmdir(name, dir_fd=parent_descriptor)
-    except (DashboardSourceError, OSError) as cleanup_error:
-        error.add_note(
-            f"could not safely remove newly created staging directory {name}: {cleanup_error}"
-        )
-
-
-def _create_private_windows_staging_directory(destination: Path) -> _StagingGuard:
-    import ctypes
-    from ctypes import wintypes
-
-    class _SecurityAttributes(ctypes.Structure):
-        _fields_ = (
-            ("nLength", wintypes.DWORD),
-            ("lpSecurityDescriptor", wintypes.LPVOID),
-            ("bInheritHandle", wintypes.BOOL),
-        )
-
-    windows_ctypes: Any = ctypes
-    advapi32 = windows_ctypes.WinDLL("advapi32", use_last_error=True)
-    convert_security_descriptor = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
-    convert_security_descriptor.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    convert_security_descriptor.restype = wintypes.BOOL
-    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
-    create_directory = kernel32.CreateDirectoryW
-    create_directory.argtypes = (
-        wintypes.LPCWSTR,
-        ctypes.POINTER(_SecurityAttributes),
-    )
-    create_directory.restype = wintypes.BOOL
-    local_free = kernel32.LocalFree
-    local_free.argtypes = (wintypes.LPVOID,)
-    local_free.restype = wintypes.LPVOID
-
-    security_descriptor = wintypes.LPVOID()
-    if not convert_security_descriptor(
-        _WINDOWS_PRIVATE_DIRECTORY_SDDL,
-        1,
-        ctypes.byref(security_descriptor),
-        None,
-    ):
-        error_code = windows_ctypes.get_last_error()
-        raise OSError(
-            error_code,
-            "could not construct a private staging-directory DACL: "
-            f"{windows_ctypes.FormatError(error_code)}",
-        )
-    attributes = _SecurityAttributes(
-        ctypes.sizeof(_SecurityAttributes),
-        security_descriptor,
-        False,
-    )
-    created: Path | None = None
-    created_guard: _StagingGuard | None = None
-    creation_error: BaseException | None = None
-    try:
-        for _attempt in range(100):
-            candidate = destination.parent / (
-                f".{destination.name}.cayu-dashboard-{uuid.uuid4().hex}"
-            )
-            if create_directory(str(candidate), ctypes.byref(attributes)):
-                created = candidate
-                break
-            error_code = windows_ctypes.get_last_error()
-            if error_code not in {80, 183}:
-                raise OSError(
-                    error_code,
-                    f"could not create private staging directory {candidate}: "
-                    f"{windows_ctypes.FormatError(error_code)}",
-                )
-        if created is None:
-            raise DashboardSourceError("could not allocate a private staging directory")
-        created_guard = _StagingGuard.capture(created)
-    except BaseException as exc:
-        creation_error = exc
-        if created is not None:
-            if created_guard is None:
-                exc.add_note(
-                    f"could not safely remove newly created staging directory {created}: "
-                    "ownership was not captured"
-                )
-            else:
-                _remove_new_empty_staging_after_creation_failure(created_guard, error=exc)
-        raise
-    finally:
-        if local_free(security_descriptor):
-            free_error = OSError("could not release the staging-directory security descriptor")
-            if creation_error is not None:
-                creation_error.add_note(str(free_error))
-            else:
-                if created_guard is not None:
-                    _remove_new_empty_staging_after_creation_failure(
-                        created_guard,
-                        error=free_error,
-                    )
-                raise free_error
-
-    if created_guard is None:
-        raise DashboardSourceError("could not capture staging directory ownership")
-    try:
-        _assert_windows_directory_dacl_is_protected(created_guard.path)
-    except BaseException as exc:
-        _remove_new_empty_staging_after_creation_failure(created_guard, error=exc)
-        raise
-    return created_guard
-
-
-def _assert_windows_directory_dacl_is_protected(path: Path) -> None:
-    dacl_present, dacl_protected = _windows_directory_dacl_state(path)
-    if not dacl_present or not dacl_protected:
-        raise DashboardSourceError(
-            f"staging directory does not have a protected private DACL: {path}"
-        )
-
-
-def _assert_windows_directory_dacl_is_inherited(path: Path) -> None:
-    dacl_present, dacl_protected = _windows_directory_dacl_state(path)
-    if not dacl_present or dacl_protected:
-        raise DashboardSourceError(
-            f"published dashboard directory did not inherit parent permissions: {path}"
-        )
-
-
-def _windows_directory_dacl_state(path: Path) -> tuple[bool, bool]:
-    import ctypes
-    from ctypes import wintypes
-
-    windows_ctypes: Any = ctypes
-    advapi32 = windows_ctypes.WinDLL("advapi32", use_last_error=True)
-    get_named_security_info = advapi32.GetNamedSecurityInfoW
-    get_named_security_info.argtypes = (
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.LPVOID),
-        ctypes.POINTER(wintypes.LPVOID),
-    )
-    get_named_security_info.restype = wintypes.DWORD
-    get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
-    get_security_descriptor_control.argtypes = (
-        wintypes.LPVOID,
-        ctypes.POINTER(wintypes.WORD),
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    get_security_descriptor_control.restype = wintypes.BOOL
-    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
-    local_free = kernel32.LocalFree
-    local_free.argtypes = (wintypes.LPVOID,)
-    local_free.restype = wintypes.LPVOID
-
-    dacl = wintypes.LPVOID()
-    security_descriptor = wintypes.LPVOID()
-    error_code = get_named_security_info(
-        ctypes.create_unicode_buffer(str(path)),
-        1,
-        0x4,
-        None,
-        None,
-        ctypes.byref(dacl),
-        None,
-        ctypes.byref(security_descriptor),
-    )
-    if error_code:
-        raise OSError(
-            error_code,
-            f"could not inspect staging-directory DACL for {path}: "
-            f"{windows_ctypes.FormatError(error_code)}",
-        )
-    inspection_error: BaseException | None = None
-    try:
-        control = wintypes.WORD()
-        revision = wintypes.DWORD()
-        if not get_security_descriptor_control(
-            security_descriptor,
-            ctypes.byref(control),
-            ctypes.byref(revision),
-        ):
-            error_code = windows_ctypes.get_last_error()
-            raise OSError(
-                error_code,
-                f"could not inspect staging-directory DACL control for {path}: "
-                f"{windows_ctypes.FormatError(error_code)}",
-            )
-        return bool(dacl), bool(control.value & 0x1000)
-    except BaseException as exc:
-        inspection_error = exc
-        raise
-    finally:
-        if local_free(security_descriptor):
-            free_error = OSError(f"could not release staging-directory DACL metadata for {path}")
-            if inspection_error is not None:
-                inspection_error.add_note(str(free_error))
-            else:
-                raise free_error
-
-
-def _restore_windows_directory_inheritance(path: Path) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    class _Acl(ctypes.Structure):
-        _fields_ = (
-            ("AclRevision", wintypes.BYTE),
-            ("Sbz1", wintypes.BYTE),
-            ("AclSize", wintypes.WORD),
-            ("AceCount", wintypes.WORD),
-            ("Sbz2", wintypes.WORD),
-        )
-
-    windows_ctypes: Any = ctypes
-    advapi32 = windows_ctypes.WinDLL("advapi32", use_last_error=True)
-    initialize_acl = advapi32.InitializeAcl
-    initialize_acl.argtypes = (
-        ctypes.POINTER(_Acl),
-        wintypes.DWORD,
-        wintypes.DWORD,
-    )
-    initialize_acl.restype = wintypes.BOOL
-    set_named_security_info = advapi32.SetNamedSecurityInfoW
-    set_named_security_info.argtypes = (
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.LPVOID,
-        wintypes.LPVOID,
-        wintypes.LPVOID,
-    )
-    set_named_security_info.restype = wintypes.DWORD
-
-    empty_dacl = _Acl()
-    if not initialize_acl(ctypes.byref(empty_dacl), ctypes.sizeof(empty_dacl), 2):
-        error_code = windows_ctypes.get_last_error()
-        raise OSError(
-            error_code,
-            f"could not initialize the published dashboard DACL for {path}: "
-            f"{windows_ctypes.FormatError(error_code)}",
-        )
-    error_code = set_named_security_info(
-        ctypes.create_unicode_buffer(str(path)),
-        1,
-        0x4 | 0x20000000,
-        None,
-        None,
-        ctypes.byref(empty_dacl),
-        None,
-    )
-    if error_code:
-        raise OSError(
-            error_code,
-            f"could not restore inherited permissions on {path}: "
-            f"{windows_ctypes.FormatError(error_code)}",
-        )
-    _assert_windows_directory_dacl_is_inherited(path)
-
-
-def _restore_published_directory_permissions(path: Path) -> None:
-    if os.name == "nt":
-        _restore_windows_directory_inheritance(path)
-
-
-def _remove_new_empty_staging_after_creation_failure(
-    staging_guard: _StagingGuard,
-    *,
-    error: BaseException,
-) -> None:
-    cleanup_path = staging_guard.path.parent / (
-        f".{staging_guard.path.name}.cayu-dashboard-cleanup-{uuid.uuid4().hex}"
-    )
-    try:
-        staging_guard.assert_unchanged()
-        staging_guard.path.rename(cleanup_path)
-        staging_guard.assert_unchanged(cleanup_path)
-        cleanup_path.rmdir()
-    except (DashboardSourceError, OSError) as cleanup_error:
-        error.add_note(
-            "could not safely remove newly created staging directory "
-            f"{staging_guard.path}: {cleanup_error}"
-        )
+    return bool(file_attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _write_staging_tree(
@@ -1241,7 +824,7 @@ def _write_staging_tree_from_fd(
         identity = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(identity.st_mode)
-            or _is_windows_name_surrogate(identity)
+            or _is_windows_reparse_point(identity)
             or not os.path.samestat(staging_guard.identity, identity)
         ):
             raise DashboardSourceError(f"staging directory changed during extraction: {staging}")
@@ -1294,7 +877,7 @@ def _write_staging_file_from_fd(
                 child_identity = os.fstat(child_descriptor)
                 if (
                     not stat.S_ISDIR(child_identity.st_mode)
-                    or _is_windows_name_surrogate(child_identity)
+                    or _is_windows_reparse_point(child_identity)
                     or (
                         expected_identity is not None
                         and not os.path.samestat(expected_identity, child_identity)
@@ -1390,7 +973,7 @@ def _write_staging_tree_on_windows(
                         ) from exc
                     directory_fences.enter_context(_windows_directory_namespace_fence(current))
                     identity = current.stat(follow_symlinks=False)
-                    if not stat.S_ISDIR(identity.st_mode) or _is_windows_name_surrogate(identity):
+                    if not stat.S_ISDIR(identity.st_mode) or _is_windows_reparse_point(identity):
                         raise DashboardSourceError(
                             f"staging directory changed during extraction: {current}"
                         )
@@ -1399,7 +982,7 @@ def _write_staging_tree_on_windows(
                     identity = current.stat(follow_symlinks=False)
                     if (
                         not stat.S_ISDIR(identity.st_mode)
-                        or _is_windows_name_surrogate(identity)
+                        or _is_windows_reparse_point(identity)
                         or not os.path.samestat(expected_identity, identity)
                     ):
                         raise DashboardSourceError(
@@ -1416,96 +999,14 @@ def _write_staging_tree_on_windows(
         staging_guard.assert_unchanged(staging)
 
 
-def _remove_staging_tree_if_owned(
-    staging_guard: _StagingGuard,
-    *,
-    error: BaseException,
-) -> None:
-    try:
-        staging_guard.path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError as cleanup_error:
-        error.add_note(
-            f"could not safely inspect staging directory {staging_guard.path}: {cleanup_error}"
-        )
-        return
-    try:
-        staging_guard.assert_unchanged()
-    except DashboardSourceError as cleanup_error:
-        error.add_note(
-            f"could not safely remove staging directory {staging_guard.path}: {cleanup_error}"
-        )
-        return
-    cleanup_path = staging_guard.path.parent / (
-        f".{staging_guard.path.name}.cayu-dashboard-cleanup-{uuid.uuid4().hex}"
-    )
-    try:
-        staging_guard.path.rename(cleanup_path)
-    except FileNotFoundError:
-        return
-    except OSError as cleanup_error:
-        error.add_note(
-            f"could not safely isolate staging directory {staging_guard.path}: {cleanup_error}"
-        )
-        return
-    try:
-        _remove_owned_staging_directory(cleanup_path, staging_guard=staging_guard)
-    except (DashboardSourceError, OSError) as cleanup_error:
-        error.add_note(f"could not safely remove staging directory {cleanup_path}: {cleanup_error}")
-
-
-def _remove_owned_staging_directory(
-    path: Path,
-    *,
-    staging_guard: _StagingGuard,
-) -> None:
-    if os.name == "nt":
-        _delete_windows_entry_by_handle(
-            path,
-            expected_identity=staging_guard.identity,
-        )
-        return
-    _remove_directory_contents_by_fd(path, staging_guard=staging_guard)
-    staging_guard.assert_unchanged(path)
-    path.rmdir()
-
-
-def _remove_directory_contents_by_fd(
-    path: Path,
-    *,
-    staging_guard: _StagingGuard,
-) -> None:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor = os.open(path, flags)
-    cleanup_error: BaseException | None = None
-    try:
-        identity = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(identity.st_mode)
-            or _is_windows_name_surrogate(identity)
-            or not os.path.samestat(staging_guard.identity, identity)
-        ):
-            raise DashboardSourceError(f"staging directory changed during extraction: {path}")
-        _remove_directory_contents_from_fd(descriptor, path=path, flags=flags)
-    except BaseException as exc:
-        cleanup_error = exc
-        raise
-    finally:
-        _close_descriptor(descriptor, error=cleanup_error)
-
-
 def _remove_directory_contents_from_fd(
     descriptor: int,
     *,
     path: Path,
     flags: int,
 ) -> None:
+    """Compatibility seam for Lambda until its PR-2 publisher migration."""
+
     with os.scandir(descriptor) as entries:
         names = [entry.name for entry in entries]
     for name in names:
@@ -1514,7 +1015,7 @@ def _remove_directory_contents_from_fd(
             identity = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(identity.st_mode) or _is_windows_name_surrogate(identity):
+        if stat.S_ISLNK(identity.st_mode) or _tree_publication._is_windows_reparse_point(identity):
             raise DashboardSourceError(
                 f"staging directory acquired an unsafe link during cleanup: {child_path}"
             )
@@ -1525,7 +1026,7 @@ def _remove_directory_contents_from_fd(
                 opened_identity = os.fstat(child_descriptor)
                 if (
                     not stat.S_ISDIR(opened_identity.st_mode)
-                    or _is_windows_name_surrogate(opened_identity)
+                    or _tree_publication._is_windows_reparse_point(opened_identity)
                     or not os.path.samestat(identity, opened_identity)
                 ):
                     raise DashboardSourceError(
@@ -1558,23 +1059,89 @@ def _remove_directory_contents_from_fd(
         os.unlink(name, dir_fd=descriptor)
 
 
-def _delete_windows_entry_by_handle(
+def _remove_owned_staging_directory(
+    path: Path,
+    *,
+    staging_guard: _StagingGuard,
+) -> None:
+    """Compatibility seam for Lambda until its PR-2 publisher migration."""
+
+    expected = staging_guard.stable_identity
+    if expected is None:
+        if os.name == "nt":
+            _remove_windows_entry_with_legacy_identity(
+                path,
+                expected_identity=staging_guard.identity,
+            )
+            return
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+        cleanup_error: BaseException | None = None
+        try:
+            opened = os.fstat(descriptor)
+            if not os.path.samestat(staging_guard.identity, opened):
+                raise DashboardSourceError(f"staging directory changed during cleanup: {path}")
+            _remove_directory_contents_from_fd(descriptor, path=path, flags=flags)
+        except BaseException as exc:
+            cleanup_error = exc
+            raise
+        finally:
+            _close_descriptor(descriptor, error=cleanup_error)
+        staging_guard.assert_unchanged(path)
+        path.rmdir()
+        return
+    if os.name == "nt":
+        try:
+            _tree_publication._delete_windows_entry_by_handle(path, expected=expected)
+        except GuardedTreePublicationError as exc:
+            raise DashboardSourceError(str(exc)) from exc
+        return
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    cleanup_error: BaseException | None = None
+    try:
+        opened = os.fstat(descriptor)
+        if _tree_publication._capture_stable_identity(opened, descriptor=descriptor) != expected:
+            raise DashboardSourceError(f"staging directory changed during cleanup: {path}")
+        _remove_directory_contents_from_fd(descriptor, path=path, flags=flags)
+    except BaseException as exc:
+        cleanup_error = exc
+        raise
+    finally:
+        _close_descriptor(descriptor, error=cleanup_error)
+    staging_guard.assert_unchanged(path)
+    path.rmdir()
+
+
+def _remove_windows_entry_with_legacy_identity(
     path: Path,
     *,
     expected_identity: os.stat_result,
 ) -> None:
+    """Retain Lambda's current Windows cleanup contract until its migration."""
+
     try:
         identity = path.stat(follow_symlinks=False)
     except OSError as exc:
         raise DashboardSourceError(f"staging entry changed during cleanup: {path}") from exc
     if not os.path.samestat(expected_identity, identity):
         raise DashboardSourceError(f"staging entry changed during cleanup: {path}")
-    if stat.S_ISLNK(identity.st_mode) or _is_windows_name_surrogate(identity):
+    if stat.S_ISLNK(identity.st_mode) or _tree_publication._is_windows_reparse_point(identity):
         raise DashboardSourceError(
             f"staging directory acquired an unsafe link during cleanup: {path}"
         )
 
-    with _windows_deletion_handle(path) as mark_for_deletion:
+    with _tree_publication._windows_deletion_handle(path) as (_handle, mark_for_deletion):
         try:
             opened_identity = path.stat(follow_symlinks=False)
         except OSError as exc:
@@ -1582,7 +1149,7 @@ def _delete_windows_entry_by_handle(
         if (
             not os.path.samestat(identity, opened_identity)
             or stat.S_ISLNK(opened_identity.st_mode)
-            or _is_windows_name_surrogate(opened_identity)
+            or _tree_publication._is_windows_reparse_point(opened_identity)
         ):
             raise DashboardSourceError(f"staging entry changed during cleanup: {path}")
 
@@ -1600,7 +1167,7 @@ def _delete_windows_entry_by_handle(
                     raise DashboardSourceError(
                         f"staging entry changed during cleanup: {child}"
                     ) from exc
-                _delete_windows_entry_by_handle(
+                _remove_windows_entry_with_legacy_identity(
                     child,
                     expected_identity=child_identity,
                 )
@@ -1617,90 +1184,10 @@ def _delete_windows_entry_by_handle(
             not os.path.samestat(opened_identity, current)
             or stat.S_IFMT(opened_identity.st_mode) != stat.S_IFMT(current.st_mode)
             or stat.S_ISLNK(current.st_mode)
-            or _is_windows_name_surrogate(current)
+            or _tree_publication._is_windows_reparse_point(current)
         ):
             raise DashboardSourceError(f"staging entry changed during cleanup: {path}")
         mark_for_deletion()
-
-
-@contextmanager
-def _windows_deletion_handle(path: Path) -> Iterator[Callable[[], None]]:
-    if os.name != "nt":
-        raise DashboardSourceError("Windows cleanup handles require Windows")
-
-    import ctypes
-    from ctypes import wintypes
-
-    class _FileDispositionInfo(ctypes.Structure):
-        _fields_ = (("delete_file", wintypes.BOOLEAN),)
-
-    windows_ctypes: Any = ctypes
-    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
-    set_file_information = kernel32.SetFileInformationByHandle
-    set_file_information.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_int,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-    )
-    set_file_information.restype = wintypes.BOOL
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = (wintypes.HANDLE,)
-    close_handle.restype = wintypes.BOOL
-
-    handle = create_file(
-        str(path),
-        0x00010000 | 0x80,
-        0x1,
-        None,
-        0x3,
-        0x00200000 | 0x02000000,
-        None,
-    )
-    invalid_handle = ctypes.c_void_p(-1).value
-    if handle == invalid_handle:
-        error_code = windows_ctypes.get_last_error()
-        raise OSError(error_code, f"could not pin staging entry during cleanup: {path}")
-
-    def mark_for_deletion() -> None:
-        disposition = _FileDispositionInfo(delete_file=True)
-        if not set_file_information(
-            handle,
-            4,
-            ctypes.byref(disposition),
-            ctypes.sizeof(disposition),
-        ):
-            error_code = windows_ctypes.get_last_error()
-            raise OSError(error_code, f"could not remove staging entry: {path}")
-
-    cleanup_error: BaseException | None = None
-    try:
-        yield mark_for_deletion
-    except BaseException as exc:
-        cleanup_error = exc
-        raise
-    finally:
-        if not close_handle(handle):
-            error_code = windows_ctypes.get_last_error()
-            close_error = OSError(
-                error_code,
-                f"could not release staging cleanup handle {path}",
-            )
-            if cleanup_error is not None:
-                cleanup_error.add_note(str(close_error))
-            else:
-                raise close_error
 
 
 @contextmanager
@@ -1759,347 +1246,6 @@ def _windows_directory_namespace_fence(path: Path) -> Iterator[None]:
                 fence_error.add_note(str(close_error))
             else:
                 raise close_error
-
-
-def _publish_staged_tree(
-    staging: Path,
-    destination: Path,
-    *,
-    parent_guard: _DestinationParentGuard,
-    staging_guard: _StagingGuard,
-) -> None:
-    parent_guard.assert_unchanged()
-    staging_guard.assert_unchanged()
-    _validate_destination(destination)
-    parent_guard.assert_unchanged()
-    staging_guard.assert_unchanged()
-    with _publication_parent_namespace(parent_guard) as parent_descriptor:
-        _publish_staged_tree_in_parent(
-            staging,
-            destination,
-            parent_guard=parent_guard,
-            staging_guard=staging_guard,
-            parent_descriptor=parent_descriptor,
-        )
-
-
-@contextmanager
-def _publication_parent_namespace(
-    parent_guard: _DestinationParentGuard,
-) -> Iterator[int | None]:
-    if os.name == "nt":
-        with _windows_directory_namespace_fence(parent_guard.path):
-            parent_guard.assert_unchanged()
-            yield None
-            parent_guard.assert_unchanged()
-        return
-
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        parent_descriptor = os.open(parent_guard.path, directory_flags)
-    except OSError as exc:
-        raise DashboardSourceError(
-            f"destination parent changed during extraction: {parent_guard.path}"
-        ) from exc
-    publication_error: BaseException | None = None
-    try:
-        opened_parent_identity = os.fstat(parent_descriptor)
-        if not stat.S_ISDIR(opened_parent_identity.st_mode) or not os.path.samestat(
-            parent_guard.identity, opened_parent_identity
-        ):
-            raise DashboardSourceError(
-                f"destination parent changed during extraction: {parent_guard.path}"
-            )
-        yield parent_descriptor
-        parent_guard.assert_unchanged()
-    except BaseException as exc:
-        publication_error = exc
-        raise
-    finally:
-        _close_descriptor(parent_descriptor, error=publication_error)
-
-
-def _publish_staged_tree_in_parent(
-    staging: Path,
-    destination: Path,
-    *,
-    parent_guard: _DestinationParentGuard,
-    staging_guard: _StagingGuard,
-    parent_descriptor: int | None,
-) -> None:
-    original_empty: Path | None = None
-    original_empty_identity: os.stat_result | None = None
-    destination_identity = _publication_entry_identity(
-        destination,
-        parent_descriptor=parent_descriptor,
-    )
-    if destination_identity is not None:
-        _assert_safe_publication_directory(
-            destination_identity,
-            destination=destination,
-        )
-        original_empty = destination.parent / (
-            f".{destination.name}.cayu-dashboard-empty-{uuid.uuid4().hex}"
-        )
-        parent_guard.assert_unchanged()
-        _rename_publication_entry(
-            destination,
-            original_empty,
-            parent_descriptor=parent_descriptor,
-        )
-        try:
-            parent_guard.assert_unchanged()
-            _assert_empty_publication_directory(
-                original_empty,
-                destination=destination,
-                expected_identity=destination_identity,
-                parent_descriptor=parent_descriptor,
-            )
-            original_empty_identity = destination_identity
-        except BaseException as exc:
-            _restore_original_destination(
-                original_empty,
-                destination,
-                parent_descriptor=parent_descriptor,
-                error=exc,
-            )
-            raise
-    try:
-        parent_guard.assert_unchanged()
-        staging_guard.assert_unchanged()
-        _rename_publication_entry(
-            staging,
-            destination,
-            parent_descriptor=parent_descriptor,
-        )
-    except BaseException as exc:
-        if original_empty is not None:
-            _restore_original_destination(
-                original_empty,
-                destination,
-                parent_descriptor=parent_descriptor,
-                error=exc,
-            )
-        raise
-    try:
-        staging_guard.assert_unchanged(destination)
-        parent_guard.assert_unchanged()
-    except BaseException as exc:
-        _preserve_conflicting_destination(
-            destination,
-            parent_guard=parent_guard,
-            parent_descriptor=parent_descriptor,
-            error=exc,
-        )
-        if original_empty is not None:
-            _restore_original_destination(
-                original_empty,
-                destination,
-                parent_descriptor=parent_descriptor,
-                error=exc,
-            )
-        raise
-    if os.name == "nt":
-        try:
-            with _windows_directory_namespace_fence(destination):
-                staging_guard.assert_unchanged(destination)
-                _restore_published_directory_permissions(destination)
-                staging_guard.assert_unchanged(destination)
-            parent_guard.assert_unchanged()
-        except BaseException as exc:
-            _preserve_conflicting_destination(
-                destination,
-                parent_guard=parent_guard,
-                parent_descriptor=parent_descriptor,
-                error=exc,
-            )
-            if original_empty is not None:
-                _restore_original_destination(
-                    original_empty,
-                    destination,
-                    parent_descriptor=parent_descriptor,
-                    error=exc,
-                )
-            raise
-    if original_empty is None:
-        return
-    if original_empty_identity is None:
-        raise DashboardSourceError("original destination ownership was not captured")
-    try:
-        _remove_publication_directory(
-            original_empty,
-            expected_identity=original_empty_identity,
-            parent_descriptor=parent_descriptor,
-        )
-    except (DashboardSourceError, OSError) as exc:
-        raise DashboardSourceError(
-            "original destination cleanup conflicted after publication; "
-            f"the dashboard source remains at {destination}, and the original destination "
-            f"remains at {original_empty}: {exc}"
-        ) from exc
-
-
-def _publication_entry_identity(
-    path: Path,
-    *,
-    parent_descriptor: int | None,
-) -> os.stat_result | None:
-    try:
-        if parent_descriptor is None:
-            return path.stat(follow_symlinks=False)
-        return os.stat(
-            path.name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise DashboardSourceError(
-            f"could not inspect destination during publication: {path}"
-        ) from exc
-
-
-def _assert_safe_publication_directory(
-    identity: os.stat_result,
-    *,
-    destination: Path,
-) -> None:
-    if stat.S_ISLNK(identity.st_mode) or _is_windows_name_surrogate(identity):
-        raise DashboardSourceError(
-            f"destination must not traverse a symbolic link or junction: {destination}"
-        )
-    if not stat.S_ISDIR(identity.st_mode):
-        raise DashboardSourceError(f"destination must be a directory: {destination}")
-
-
-def _assert_empty_publication_directory(
-    path: Path,
-    *,
-    destination: Path,
-    expected_identity: os.stat_result,
-    parent_descriptor: int | None,
-) -> None:
-    if parent_descriptor is None:
-        with _windows_directory_namespace_fence(path):
-            current = _publication_entry_identity(path, parent_descriptor=None)
-            if current is None or not os.path.samestat(expected_identity, current):
-                raise DashboardSourceError(f"destination changed during publication: {destination}")
-            _assert_safe_publication_directory(current, destination=destination)
-            with os.scandir(path) as entries:
-                if next(entries, None) is not None:
-                    raise DashboardSourceError(f"destination must be empty: {destination}")
-        return
-
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(path.name, directory_flags, dir_fd=parent_descriptor)
-    except OSError as exc:
-        raise DashboardSourceError(
-            f"destination changed during publication: {destination}"
-        ) from exc
-    inspection_error: BaseException | None = None
-    try:
-        current = os.fstat(descriptor)
-        if not os.path.samestat(expected_identity, current):
-            raise DashboardSourceError(f"destination changed during publication: {destination}")
-        _assert_safe_publication_directory(current, destination=destination)
-        with os.scandir(descriptor) as entries:
-            if next(entries, None) is not None:
-                raise DashboardSourceError(f"destination must be empty: {destination}")
-    except BaseException as exc:
-        inspection_error = exc
-        raise
-    finally:
-        _close_descriptor(descriptor, error=inspection_error)
-
-
-def _rename_publication_entry(
-    source: Path,
-    destination: Path,
-    *,
-    parent_descriptor: int | None,
-) -> None:
-    if parent_descriptor is None:
-        source.rename(destination)
-        return
-    os.rename(
-        source.name,
-        destination.name,
-        src_dir_fd=parent_descriptor,
-        dst_dir_fd=parent_descriptor,
-    )
-
-
-def _remove_publication_directory(
-    path: Path,
-    *,
-    expected_identity: os.stat_result,
-    parent_descriptor: int | None,
-) -> None:
-    current = _publication_entry_identity(path, parent_descriptor=parent_descriptor)
-    if current is None or not os.path.samestat(expected_identity, current):
-        raise DashboardSourceError(f"original destination changed during cleanup: {path}")
-    _assert_safe_publication_directory(current, destination=path)
-    if parent_descriptor is None:
-        path.rmdir()
-        return
-    os.rmdir(path.name, dir_fd=parent_descriptor)
-
-
-def _preserve_conflicting_destination(
-    destination: Path,
-    *,
-    parent_guard: _DestinationParentGuard,
-    parent_descriptor: int | None,
-    error: BaseException,
-) -> None:
-    preserved = destination.parent / (
-        f".{destination.name}.cayu-dashboard-conflict-{uuid.uuid4().hex}"
-    )
-    try:
-        if parent_descriptor is None:
-            parent_guard.assert_unchanged()
-        _rename_publication_entry(
-            destination,
-            preserved,
-            parent_descriptor=parent_descriptor,
-        )
-    except (DashboardSourceError, OSError) as preserve_error:
-        error.add_note(
-            f"could not preserve the conflicting destination at {destination}: {preserve_error}"
-        )
-        return
-    error.add_note(f"preserved the conflicting destination at {preserved}")
-
-
-def _restore_original_destination(
-    original: Path,
-    destination: Path,
-    *,
-    parent_descriptor: int | None,
-    error: BaseException,
-) -> None:
-    try:
-        _rename_publication_entry(
-            original,
-            destination,
-            parent_descriptor=parent_descriptor,
-        )
-    except OSError as restore_error:
-        error.add_note(
-            f"could not restore the original destination at {destination}: {restore_error}"
-        )
 
 
 def _print_cli_error(exc: BaseException) -> None:

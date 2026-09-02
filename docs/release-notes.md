@@ -225,6 +225,50 @@ PostgreSQL knowledge stores. Migration preserves existing reviewed proposals and
 but does not infer or backfill automatic authority, and there is no legacy runtime or
 dual-write path. Stop pre-77 knowledge writers before migration.
 
+### Dashboard source publication is crash-recoverable
+
+`cayu dashboard eject` now publishes through a bounded destination-scoped transaction journal.
+Exact retries recover an interrupted old-or-new tree and resume owned cleanup, while parent,
+destination, staging, backup, content, link, reparse-point, and case-alias conflicts preserve every
+ambiguous tree and fail closed. A bounded terminal receipt closes post-commit acknowledgement-loss
+windows. Exact publication replay now reauthenticates the sealed descendant content: a changed
+nonempty absent-or-empty destination fails closed, while an absent or proven-empty destination
+retires the stale receipt and is published again. Read-only recovery still preserves later operator
+edits. An authorized replacement must bind its exact predecessor receipt. Destructive cleanup
+first claims the exact owned tree and durably records a bounded per-entry authority manifest before
+deleting descendants. File hashing rejects an in-place size, mode, timestamp, or platform-attribute
+change and carries that observation to the destructive boundary. Durable root and descendant authority
+includes stable filesystem-incarnation evidence in addition to device, inode, and type, so inode reuse
+cannot authenticate a recreated object;
+Linux inode generation plus birth time, Windows volume-unique persistent object IDs, and Darwin
+non-recycled object IDs or generations provide that evidence, while creation time alone is insufficient.
+Windows filesystems without object-ID support and other unsupported filesystems fail closed rather than
+treating recyclable file IDs as authority. Cleanup preserves replacement
+conflicts observed at its destructive transitions, rejects every Windows reparse point regardless of
+tag, and rejects a mounted root or descendant rather than traversing another filesystem; the documented
+POSIX boundary does not claim conditional-by-inode pathname deletion or rename against hostile
+same-owner name or content mutation between the final observation and kernel namespace operation.
+Initial journal and cleanup-manifest publication use one destination-scoped pending file. A later
+entrance cannot authenticate an initial
+pending journal from that record alone, so it preserves complete and partial forms as one bounded
+conflict rather than adopting them. A stage interrupted before its owner marker becomes durable is
+likewise preserved rather than inferred to be Cayu-owned, and the private ownership marker no longer
+reserves a filename inside the caller's published tree.
+Normal stage population uses an identity-pinned bounded writer instead of reopening the private root
+by pathname. Tree and cleanup-authority capacity are checked before population or replacement can
+reach an irreversible transition, including a 128-level traversal bound. Population modes that would
+make the staged tree unauthenticatable or unremovable are rejected before any file is written, and
+replacement proves that the original tree is traversable and removable before creating its journal.
+Win32 alias and reserved-name rules apply to Windows destinations. POSIX destinations retain
+spellings only when native lookup semantics prove them distinct. Case-sensitive Darwin volumes
+NFC-normalize canonical aliases without case-folding; an unrecognized filesystem uses a conservative
+NFC/casefold alias domain so recovery cannot acquire a second owner. Malformed journal and
+cleanup-manifest text is reported through the bounded publication-conflict classifications rather
+than leaking codec or parser failures. Metadata-owner, pending-metadata, and destination-alias parent
+censuses count all inspected entries, including unrelated names, and fail closed at a fixed bound.
+Dashboard bundle validation, output bytes, modes, offline behavior, and the absent-or-empty
+destination policy are unchanged.
+
 ### Semantic watches retain evidence without self-authorizing effects
 
 Applications can now explicitly evaluate one bounded observation through the existing

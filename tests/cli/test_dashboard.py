@@ -3,19 +3,22 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
+from cayu.cli import _guarded_tree_publication as publication_cli
 from cayu.cli import _version, main
 from cayu.cli import dashboard as dashboard_cli
 from cayu.cli.dashboard import DashboardSourceError, eject_dashboard_source
@@ -107,6 +110,30 @@ def test_dashboard_eject_requires_explicit_destination(capsys: pytest.CaptureFix
     assert "invalid choice" not in error
 
 
+def test_dashboard_eject_rejects_unrecoverable_tree_size_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "control-plane"
+    monkeypatch.setattr(publication_cli, "_TREE_ENTRY_LIMIT", 1)
+
+    with pytest.raises(DashboardSourceError, match="entry limit"):
+        eject_dashboard_source(destination)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".cayu-tree-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="colon is reserved by the Win32 namespace")
+def test_dashboard_eject_preserves_native_posix_destination_names(tmp_path: Path) -> None:
+    destination = tmp_path / "dashboard:source"
+
+    result = eject_dashboard_source(destination)
+
+    assert result.destination == destination
+    assert (destination / "package.json").is_file()
+
+
 def test_dashboard_eject_materializes_version_matched_editable_project(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -164,6 +191,151 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
     assert "dashboard_dir=" in output
     assert 'Path("dist")' in output
     assert "my dashboard/dist" not in output
+
+
+def test_dashboard_eject_exact_retry_recovers_published_process_death(tmp_path: Path) -> None:
+    destination = tmp_path / "control-plane"
+    repository_root = Path(__file__).resolve().parents[2]
+    script = f"""
+import os
+from pathlib import Path
+from cayu.cli import _guarded_tree_publication as publication
+from cayu.cli.dashboard import eject_dashboard_source
+
+destination = Path({str(destination)!r})
+def fault(phase):
+    if phase == 'settled':
+        os._exit(87)
+publication._publication_fault = fault
+eject_dashboard_source(destination)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env={**os.environ, "PYTHONPATH": str(repository_root / "src")},
+        check=False,
+    )
+
+    assert completed.returncode == 87
+    assert (destination / "package.json").is_file()
+    assert list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
+
+    result = eject_dashboard_source(destination)
+
+    assert result.destination == destination
+    assert result.manifest.cayu_version == _version()
+    assert list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
+    assert not list(tmp_path.glob(".cayu-tree-backup-*"))
+    assert not list(tmp_path.glob(".cayu-tree-cleanup-*"))
+
+
+@pytest.mark.parametrize(
+    "destination_state",
+    ("unchanged", "modified", "empty", "absent", "recreated_empty"),
+)
+def test_dashboard_eject_exact_retry_authenticates_published_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_state: str,
+) -> None:
+    destination = tmp_path / "control-plane"
+    eject_dashboard_source(destination)
+
+    if destination_state == "modified":
+        (destination / "package.json").write_text("modified\n", encoding="utf-8")
+    elif destination_state == "empty":
+        for child in destination.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    elif destination_state == "absent":
+        shutil.rmtree(destination)
+    elif destination_state == "recreated_empty":
+        shutil.rmtree(destination)
+        destination.mkdir()
+
+    if destination_state in {"unchanged", "modified"}:
+        monkeypatch.setattr(
+            dashboard_cli,
+            "_write_staging_tree",
+            lambda *_args, **_kwargs: pytest.fail(
+                "an unchanged or modified exact retry must not repopulate"
+            ),
+        )
+
+    if destination_state == "modified":
+        with pytest.raises(DashboardSourceError, match="destination must be empty"):
+            eject_dashboard_source(destination)
+        assert (destination / "package.json").read_text(encoding="utf-8") == "modified\n"
+        return
+
+    result = eject_dashboard_source(destination)
+
+    assert result.destination == destination
+    assert (destination / "package.json").is_file()
+
+
+def test_dashboard_eject_request_identity_binds_raw_manifest_bytes(tmp_path: Path) -> None:
+    original_bundle = _packaged_bundle()
+
+    def compact_manifest(
+        member: zipfile.ZipInfo,
+        content: bytes,
+    ) -> tuple[zipfile.ZipInfo, bytes]:
+        if member.filename != "cayu-dashboard-source.json":
+            return member, content
+        manifest = json.loads(content)
+        return member, json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+
+    compact_bundle = _rewrite_bundle(compact_manifest)
+    with (
+        zipfile.ZipFile(io.BytesIO(original_bundle)) as original_archive,
+        zipfile.ZipFile(io.BytesIO(compact_bundle)) as compact_archive,
+    ):
+        original_manifest = original_archive.read("cayu-dashboard-source.json")
+        compact_manifest_bytes = compact_archive.read("cayu-dashboard-source.json")
+
+    assert original_manifest != compact_manifest_bytes
+    assert json.loads(original_manifest) == json.loads(compact_manifest_bytes)
+
+    destination = tmp_path / "control-plane"
+    eject_dashboard_source(destination, bundle_bytes=original_bundle)
+
+    with pytest.raises(
+        DashboardSourceError,
+        match="terminal publication receipt does not authorize this successor request",
+    ):
+        eject_dashboard_source(destination, bundle_bytes=compact_bundle)
+
+    assert (destination / "cayu-dashboard-source.json").read_bytes() == original_manifest
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
+    assert not list(tmp_path.glob(".cayu-tree-backup-*"))
+    assert not list(tmp_path.glob(".cayu-tree-cleanup-*"))
+
+
+def test_dashboard_eject_reports_terminal_publication_boundary_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "control-plane"
+
+    @contextmanager
+    def fail_after_publication(*_args: object, **_kwargs: object) -> Iterator[None]:
+        yield
+        raise OSError("simulated publication lock release failure")
+
+    monkeypatch.setattr(publication_cli, "cooperative_path_lock", fail_after_publication)
+
+    with pytest.raises(DashboardSourceError, match="ownership boundary did not settle") as exc_info:
+        eject_dashboard_source(destination)
+
+    assert isinstance(exc_info.value.__cause__, publication_cli.GuardedTreePublicationError)
+    assert isinstance(exc_info.value.__cause__.__cause__, OSError)
+    assert (destination / "package.json").is_file()
+    assert list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
 
 
 def test_dashboard_eject_refuses_non_empty_destination_without_mutating_it(
@@ -249,7 +421,7 @@ def test_dashboard_eject_anchors_staging_during_transient_parent_link_swap(
     ) -> None:
         nonlocal swapped
         candidate_name = Path(os.fsdecode(path)).name
-        if not swapped and candidate_name.startswith(".control-plane.cayu-dashboard-"):
+        if not swapped and candidate_name.startswith(".cayu-tree-stage-"):
             swapped = True
             parent.rename(displaced_parent)
             try:
@@ -298,12 +470,12 @@ def test_dashboard_eject_refuses_destination_changed_during_staging(
         write_staging_tree_then_mutate_destination,
     )
 
-    with pytest.raises(DashboardSourceError, match="destination must be empty"):
+    with pytest.raises(DashboardSourceError, match="destination content changed"):
         eject_dashboard_source(destination)
 
     assert marker.read_text(encoding="utf-8") == "keep me\n"
     assert sorted(path.name for path in destination.iterdir()) == [marker.name]
-    assert not list(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    assert not list(tmp_path.glob(".cayu-tree-*"))
 
 
 def test_dashboard_eject_refuses_parent_changed_during_staging(
@@ -335,7 +507,7 @@ def test_dashboard_eject_refuses_parent_changed_during_staging(
         write_staging_tree_then_swap_parent,
     )
 
-    with pytest.raises(DashboardSourceError, match="destination parent changed"):
+    with pytest.raises(DashboardSourceError, match="publication parent changed"):
         eject_dashboard_source(destination)
 
     assert not (redirected_parent / "control-plane").exists()
@@ -384,6 +556,43 @@ def test_dashboard_eject_does_not_write_through_replaced_staging_root(
     assert stat.S_IMODE(target.stat().st_mode) == target_mode
     assert owned_staging.is_dir()
     assert list(owned_staging.iterdir()) == []
+    replacement_staging = next(tmp_path.glob(".cayu-tree-stage-*"))
+    assert replacement_staging.is_symlink()
+
+
+def test_dashboard_eject_authenticates_stage_before_callback_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "control-plane"
+    displaced_stage = tmp_path / "displaced-stage"
+    replacement_stage: Path | None = None
+
+    def replace_stage_at_callback_handoff(phase: str) -> None:
+        nonlocal replacement_stage
+        if phase != "stage_created":
+            return
+        stages = list(tmp_path.glob(".cayu-tree-stage-*"))
+        assert len(stages) == 1
+        replacement_stage = stages[0]
+        replacement_stage.rename(displaced_stage)
+        replacement_stage.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        publication_cli,
+        "_publication_fault",
+        replace_stage_at_callback_handoff,
+    )
+
+    with pytest.raises(DashboardSourceError, match="staging directory changed"):
+        eject_dashboard_source(destination)
+
+    assert replacement_stage is not None
+    assert not destination.exists()
+    assert displaced_stage.is_dir()
+    assert list(displaced_stage.iterdir()) == []
+    assert replacement_stage.is_dir()
+    assert list(replacement_stage.iterdir()) == []
 
 
 def test_dashboard_eject_refuses_replaced_staging_tree_before_publication(
@@ -393,40 +602,31 @@ def test_dashboard_eject_refuses_replaced_staging_tree_before_publication(
     destination = tmp_path / "control-plane"
     owned_staging = tmp_path / "owned-staging"
     replacement_marker_name = "replacement-owned.txt"
-    publish_staged_tree = dashboard_cli._publish_staged_tree
+    replaced = False
 
-    def publish_after_replacing_staging(
-        staging: Path,
-        destination: Path,
-        *,
-        parent_guard: dashboard_cli._DestinationParentGuard,
-        staging_guard: dashboard_cli._StagingGuard,
-    ) -> None:
+    def replace_staging_after_seal(phase: str) -> None:
+        nonlocal replaced
+        if phase != "stage_synced" or replaced:
+            return
+        replaced = True
+        staging = next(tmp_path.glob(".cayu-tree-stage-*"))
         staging.rename(owned_staging)
         staging.mkdir()
         (staging / replacement_marker_name).write_text("preserve me\n", encoding="utf-8")
-        publish_staged_tree(
-            staging,
-            destination,
-            parent_guard=parent_guard,
-            staging_guard=staging_guard,
-        )
 
-    monkeypatch.setattr(dashboard_cli, "_publish_staged_tree", publish_after_replacing_staging)
+    monkeypatch.setattr(publication_cli, "_publication_fault", replace_staging_after_seal)
 
-    with pytest.raises(DashboardSourceError, match="staging directory changed") as exc_info:
+    with pytest.raises(DashboardSourceError, match="staging identity") as exc_info:
         eject_dashboard_source(destination)
 
     assert not destination.exists()
-    replacement_staging = next(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    assert replaced
+    replacement_staging = next(tmp_path.glob(".cayu-tree-stage-*"))
     assert (replacement_staging / replacement_marker_name).read_text(encoding="utf-8") == (
         "preserve me\n"
     )
     assert (owned_staging / "package.json").is_file()
-    assert any(
-        "could not safely remove staging directory" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert any("remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ()))
 
 
 @pytest.mark.parametrize("existing_destination", [False, True])
@@ -442,53 +642,45 @@ def test_dashboard_eject_preserves_staging_replaced_inside_final_rename(
         original_destination = destination.stat()
     owned_staging = tmp_path / "owned-staging"
     replacement_marker_name = "replacement-owned.txt"
-    rename = Path.rename
-    rename_publication_entry = dashboard_cli._rename_publication_entry
+    rename_name_no_replace = publication_cli._rename_name_no_replace
 
     def replace_staging_during_publish(
-        path: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
+        parent: publication_cli._Parent,
+        source: str,
+        target: str,
     ) -> None:
-        if (
-            path.name.startswith(".control-plane.cayu-dashboard-")
-            and ".cayu-dashboard-empty-" not in path.name
-            and target == destination
-        ):
-            rename(path, owned_staging)
-            path.mkdir()
-            (path / replacement_marker_name).write_text("preserve me\n", encoding="utf-8")
-        rename_publication_entry(
-            path,
-            target,
-            parent_descriptor=parent_descriptor,
-        )
+        if source.startswith(".cayu-tree-stage-") and target == destination.name:
+            staging = tmp_path / source
+            staging.rename(owned_staging)
+            staging.mkdir()
+            (staging / replacement_marker_name).write_text("preserve me\n", encoding="utf-8")
+        rename_name_no_replace(parent, source, target)
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_rename_publication_entry",
+        publication_cli,
+        "_rename_name_no_replace",
         replace_staging_during_publish,
     )
 
-    with pytest.raises(DashboardSourceError, match="staging directory changed") as exc_info:
+    with pytest.raises(DashboardSourceError, match="staging identity changed") as exc_info:
         eject_dashboard_source(destination)
 
+    replacement_staging = next(tmp_path.glob(".cayu-tree-stage-*"))
+    assert (replacement_staging / replacement_marker_name).read_text(encoding="utf-8") == (
+        "preserve me\n"
+    )
+    assert (owned_staging / "package.json").is_file()
     if original_destination is None:
         assert not destination.exists()
     else:
-        assert destination.is_dir()
         assert os.path.samestat(original_destination, destination.stat())
-        assert not list(destination.iterdir())
-    conflicts = list(tmp_path.glob(".control-plane.cayu-dashboard-conflict-*"))
-    assert len(conflicts) == 1
-    assert (conflicts[0] / replacement_marker_name).read_text(encoding="utf-8") == ("preserve me\n")
-    assert (owned_staging / "package.json").is_file()
-    assert not list(tmp_path.glob(".control-plane.cayu-dashboard-empty-*"))
-    assert any(
-        "preserved the conflicting destination" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert any("remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ()))
+    assert "affected paths" in str(exc_info.value)
+    publication_error = exc_info.value.__cause__
+    assert isinstance(publication_error, publication_cli.GuardedTreePublicationError)
+    settlement_error = publication_error.__cause__
+    assert isinstance(settlement_error, publication_cli.GuardedTreePublicationError)
+    assert set(settlement_error.paths) >= {destination.name, replacement_staging.name}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="exercises descriptor-relative POSIX publication")
@@ -500,41 +692,28 @@ def test_dashboard_eject_anchors_publication_to_validated_parent(
     parent.mkdir()
     displaced_parent = tmp_path / "displaced-parent"
     destination = parent / "control-plane"
-    rename_publication_entry = dashboard_cli._rename_publication_entry
     swapped = False
 
-    def replace_parent_during_publish(
-        source: Path,
-        target: Path,
-        *,
-        parent_descriptor: int | None,
-    ) -> None:
+    def replace_parent_after_staging(phase: str) -> None:
         nonlocal swapped
-        if not swapped and target == destination:
+        if not swapped and phase == "stage_synced":
             swapped = True
             parent.rename(displaced_parent)
             parent.mkdir()
-            (displaced_parent / source.name).rename(parent / source.name)
-        rename_publication_entry(
-            source,
-            target,
-            parent_descriptor=parent_descriptor,
-        )
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_rename_publication_entry",
-        replace_parent_during_publish,
+        publication_cli,
+        "_publication_fault",
+        replace_parent_after_staging,
     )
 
-    with pytest.raises(OSError):
+    with pytest.raises(DashboardSourceError, match="publication parent changed"):
         eject_dashboard_source(destination)
 
     assert swapped
     assert not destination.exists()
     assert not (displaced_parent / destination.name).exists()
-    moved_staging = next(parent.glob(".control-plane.cayu-dashboard-*"))
-    assert (moved_staging / "package.json").is_file()
+    assert list(parent.iterdir()) == []
 
 
 def test_dashboard_eject_refuses_link_introduced_during_publication(
@@ -544,44 +723,31 @@ def test_dashboard_eject_refuses_link_introduced_during_publication(
     destination = tmp_path / "control-plane"
     target = tmp_path / "target"
     target.mkdir()
-    publish_staged_tree_in_parent = dashboard_cli._publish_staged_tree_in_parent
     introduced_link = False
 
-    def publish_after_introducing_link(
-        staging: Path,
-        destination: Path,
-        *,
-        parent_guard: dashboard_cli._DestinationParentGuard,
-        staging_guard: dashboard_cli._StagingGuard,
-        parent_descriptor: int | None,
-    ) -> None:
+    def publish_after_introducing_link(phase: str) -> None:
         nonlocal introduced_link
+        if phase != "stage_synced":
+            return
         try:
             destination.symlink_to(target, target_is_directory=True)
         except OSError:
             pytest.skip("symlinks are unavailable")
         introduced_link = True
-        publish_staged_tree_in_parent(
-            staging,
-            destination,
-            parent_guard=parent_guard,
-            staging_guard=staging_guard,
-            parent_descriptor=parent_descriptor,
-        )
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_publish_staged_tree_in_parent",
+        publication_cli,
+        "_publication_fault",
         publish_after_introducing_link,
     )
 
-    with pytest.raises(DashboardSourceError, match="symbolic link or junction"):
+    with pytest.raises(DashboardSourceError, match="destination appeared"):
         eject_dashboard_source(destination)
 
     assert introduced_link
     assert destination.is_symlink()
     assert list(target.iterdir()) == []
-    assert not list(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    assert len(list(tmp_path.glob(".cayu-tree-stage-*"))) == 1
 
 
 def test_dashboard_eject_refuses_to_clean_replaced_staging_tree(
@@ -615,15 +781,12 @@ def test_dashboard_eject_refuses_to_clean_replaced_staging_tree(
         eject_dashboard_source(destination)
 
     assert not destination.exists()
-    replacement_staging = next(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    replacement_staging = next(tmp_path.glob(".cayu-tree-stage-*"))
     assert (replacement_staging / replacement_marker_name).read_text(encoding="utf-8") == (
         "preserve me\n"
     )
     assert (owned_staging / "package.json").is_file()
-    assert any(
-        "could not safely remove staging directory" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert any("remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ()))
 
 
 @pytest.mark.skipif(
@@ -638,7 +801,7 @@ def test_dashboard_eject_refuses_cleanup_replacement_after_directory_is_pinned(
     owned_cleanup = tmp_path / "owned-cleanup"
     replacement_marker_name = "replacement-owned.txt"
     write_staging_tree = dashboard_cli._write_staging_tree
-    remove_directory_contents_from_fd = dashboard_cli._remove_directory_contents_from_fd
+    remove_directory_contents_from_fd = publication_cli._remove_directory_contents_from_fd
     replaced_cleanup_root = False
 
     def fail_after_writing(
@@ -655,6 +818,9 @@ def test_dashboard_eject_refuses_cleanup_replacement_after_directory_is_pinned(
         *,
         path: Path,
         flags: int,
+        authority: dict[str, publication_cli._CleanupEntry] | None = None,
+        prefix: PurePosixPath | None = None,
+        linux_mount_points: frozenset[str] | None = None,
     ) -> None:
         nonlocal replaced_cleanup_root
         if not replaced_cleanup_root:
@@ -662,11 +828,18 @@ def test_dashboard_eject_refuses_cleanup_replacement_after_directory_is_pinned(
             path.rename(owned_cleanup)
             path.mkdir()
             (path / replacement_marker_name).write_text("preserve me\n", encoding="utf-8")
-        remove_directory_contents_from_fd(descriptor, path=path, flags=flags)
+        remove_directory_contents_from_fd(
+            descriptor,
+            path=path,
+            flags=flags,
+            authority=authority,
+            prefix=PurePosixPath() if prefix is None else prefix,
+            linux_mount_points=linux_mount_points,
+        )
 
     monkeypatch.setattr(dashboard_cli, "_write_staging_tree", fail_after_writing)
     monkeypatch.setattr(
-        dashboard_cli,
+        publication_cli,
         "_remove_directory_contents_from_fd",
         replace_isolated_staging_after_cleanup_is_pinned,
     )
@@ -675,16 +848,13 @@ def test_dashboard_eject_refuses_cleanup_replacement_after_directory_is_pinned(
         eject_dashboard_source(destination)
 
     assert not destination.exists()
-    replacement_cleanup = next(tmp_path.glob(".*.cayu-dashboard-cleanup-*"))
+    replacement_cleanup = next(tmp_path.glob(".cayu-tree-cleanup-*"))
     assert (replacement_cleanup / replacement_marker_name).read_text(encoding="utf-8") == (
         "preserve me\n"
     )
     assert owned_cleanup.is_dir()
-    assert list(owned_cleanup.iterdir()) == []
-    assert any(
-        "could not safely remove staging directory" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert (owned_cleanup / "package.json").is_file()
+    assert any("remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ()))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows directory junction")
@@ -709,7 +879,7 @@ def test_dashboard_eject_refuses_windows_cleanup_junction_replacement(
     junction_probe.rmdir()
 
     write_staging_tree = dashboard_cli._write_staging_tree
-    deletion_handle = dashboard_cli._windows_deletion_handle
+    deletion_handle = publication_cli._windows_deletion_handle
     displaced_scripts = tmp_path / "owned-cleanup-scripts"
     introduced_junction: Path | None = None
 
@@ -725,7 +895,9 @@ def test_dashboard_eject_refuses_windows_cleanup_junction_replacement(
     @contextmanager
     def replace_directory_before_cleanup_handle_open(
         path: Path,
-    ) -> Iterator[Callable[[], None]]:
+        *,
+        read_content: bool = False,
+    ) -> Iterator[tuple[int, Callable[[], None]]]:
         nonlocal introduced_junction
         if path.name == "scripts" and introduced_junction is None:
             path.rename(displaced_scripts)
@@ -739,12 +911,12 @@ def test_dashboard_eject_refuses_windows_cleanup_junction_replacement(
                 displaced_scripts.rename(path)
                 pytest.fail(f"could not create cleanup junction: {result.stderr.strip()}")
             introduced_junction = path
-        with deletion_handle(path) as mark_for_deletion:
-            yield mark_for_deletion
+        with deletion_handle(path, read_content=read_content) as deletion_owner:
+            yield deletion_owner
 
     monkeypatch.setattr(dashboard_cli, "_write_staging_tree", fail_after_writing)
     monkeypatch.setattr(
-        dashboard_cli,
+        publication_cli,
         "_windows_deletion_handle",
         replace_directory_before_cleanup_handle_open,
     )
@@ -754,14 +926,13 @@ def test_dashboard_eject_refuses_windows_cleanup_junction_replacement(
             eject_dashboard_source(destination)
 
         assert introduced_junction is not None
-        assert dashboard_cli._is_windows_name_surrogate(
+        assert dashboard_cli._is_windows_reparse_point(
             introduced_junction.stat(follow_symlinks=False)
         )
         assert external_marker.read_text(encoding="utf-8") == "preserve me\n"
         assert displaced_scripts.is_dir()
         assert any(
-            "could not safely remove staging directory" in note
-            for note in getattr(exc_info.value, "__notes__", ())
+            "remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ())
         )
     finally:
         if introduced_junction is not None:
@@ -770,7 +941,7 @@ def test_dashboard_eject_refuses_windows_cleanup_junction_replacement(
             except FileNotFoundError:
                 pass
             else:
-                if dashboard_cli._is_windows_name_surrogate(junction_identity):
+                if dashboard_cli._is_windows_reparse_point(junction_identity):
                     introduced_junction.rmdir()
 
 
@@ -804,13 +975,10 @@ def test_dashboard_eject_preserves_cleanup_with_preexisting_windows_writer(
     ):
         eject_dashboard_source(destination)
 
-    cleanup_tree = next(tmp_path.glob(".*.cayu-dashboard-cleanup-*"))
+    cleanup_tree = next(tmp_path.glob(".cayu-tree-stage-*"))
     assert (cleanup_tree / "package.json").is_file()
     assert not destination.exists()
-    assert any(
-        "could not safely remove staging directory" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert any("remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ()))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows sharing semantics")
@@ -820,7 +988,7 @@ def test_dashboard_eject_blocks_windows_writer_after_cleanup_is_pinned(
 ) -> None:
     destination = tmp_path / "control-plane"
     write_staging_tree = dashboard_cli._write_staging_tree
-    deletion_handle = dashboard_cli._windows_deletion_handle
+    deletion_handle = publication_cli._windows_deletion_handle
     attempted_write = False
 
     def fail_after_writing(
@@ -835,19 +1003,21 @@ def test_dashboard_eject_blocks_windows_writer_after_cleanup_is_pinned(
     @contextmanager
     def attempt_write_after_cleanup_handle_open(
         path: Path,
-    ) -> Iterator[Callable[[], None]]:
+        *,
+        read_content: bool = False,
+    ) -> Iterator[tuple[int, Callable[[], None]]]:
         nonlocal attempted_write
-        with deletion_handle(path) as mark_for_deletion:
+        with deletion_handle(path, read_content=read_content) as deletion_owner:
             if path.name == "scripts" and not attempted_write:
                 attempted_write = True
                 with pytest.raises(OSError) as exc_info, _windows_directory_write_handle(path):
                     pytest.fail("cleanup handle unexpectedly shared directory writes")
                 assert getattr(exc_info.value, "winerror", None) == 32
-            yield mark_for_deletion
+            yield deletion_owner
 
     monkeypatch.setattr(dashboard_cli, "_write_staging_tree", fail_after_writing)
     monkeypatch.setattr(
-        dashboard_cli,
+        publication_cli,
         "_windows_deletion_handle",
         attempt_write_after_cleanup_handle_open,
     )
@@ -857,10 +1027,9 @@ def test_dashboard_eject_blocks_windows_writer_after_cleanup_is_pinned(
 
     assert attempted_write
     assert not destination.exists()
-    assert not list(tmp_path.glob(".*.cayu-dashboard-cleanup-*"))
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
     assert not any(
-        "could not safely remove staging directory" in note
-        for note in getattr(exc_info.value, "__notes__", ())
+        "remains recoverable" in note for note in getattr(exc_info.value, "__notes__", ())
     )
 
 
@@ -871,27 +1040,21 @@ def test_dashboard_eject_restores_original_empty_destination_after_publish_failu
     destination = tmp_path / "control-plane"
     destination.mkdir(mode=0o700)
     original_stat = destination.stat()
-    rename_publication_entry = dashboard_cli._rename_publication_entry
+    rename_publication_entry = publication_cli._rename_no_replace
 
     def fail_staging_publish(
-        path: Path,
-        target: Path,
+        parent: Any,
+        source: str,
+        target: str,
         *,
-        parent_descriptor: int | None,
+        expected: publication_cli._Identity,
+        label: str,
     ) -> None:
-        if (
-            path.name.startswith(".control-plane.cayu-dashboard-")
-            and ".cayu-dashboard-empty-" not in path.name
-            and target == destination
-        ):
+        if source.startswith(".cayu-tree-stage-") and target == destination.name:
             raise OSError("injected publish failure")
-        rename_publication_entry(
-            path,
-            target,
-            parent_descriptor=parent_descriptor,
-        )
+        rename_publication_entry(parent, source, target, expected=expected, label=label)
 
-    monkeypatch.setattr(dashboard_cli, "_rename_publication_entry", fail_staging_publish)
+    monkeypatch.setattr(publication_cli, "_rename_no_replace", fail_staging_publish)
 
     with pytest.raises(OSError, match="injected publish failure"):
         eject_dashboard_source(destination)
@@ -899,12 +1062,14 @@ def test_dashboard_eject_restores_original_empty_destination_after_publish_failu
     assert destination.is_dir()
     assert os.path.samestat(original_stat, destination.stat())
     assert not list(destination.iterdir())
-    assert not list(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
+    assert not list(tmp_path.glob(".cayu-tree-backup-*"))
+    assert not list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
 
 
 @pytest.mark.parametrize("existing_destination", [False, True])
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows permission publication")
-def test_dashboard_eject_preserves_published_tree_if_permissions_cannot_be_restored(
+def test_dashboard_eject_rolls_back_if_permissions_cannot_be_restored(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing_destination: bool,
@@ -915,31 +1080,33 @@ def test_dashboard_eject_preserves_published_tree_if_permissions_cannot_be_resto
         destination.mkdir()
         original_destination = destination.stat()
 
-    def fail_permission_restore(_path: Path) -> None:
+    def fail_permission_restore(
+        _parent: publication_cli._Parent,
+        _name: str,
+        *,
+        expected: publication_cli._Identity,
+    ) -> None:
+        del expected
         raise OSError("injected permission restore failure")
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_restore_published_directory_permissions",
+        publication_cli,
+        "_finalize_published_tree",
         fail_permission_restore,
     )
 
-    with pytest.raises(OSError, match="injected permission restore failure") as exc_info:
+    with pytest.raises(OSError, match="injected permission restore failure"):
         eject_dashboard_source(destination)
 
-    conflicts = list(tmp_path.glob(".control-plane.cayu-dashboard-conflict-*"))
-    assert len(conflicts) == 1
-    assert (conflicts[0] / "package.json").is_file()
     if original_destination is None:
         assert not destination.exists()
     else:
         assert destination.is_dir()
         assert os.path.samestat(original_destination, destination.stat())
         assert not list(destination.iterdir())
-    assert any(
-        "preserved the conflicting destination" in note
-        for note in getattr(exc_info.value, "__notes__", ())
-    )
+    assert not list(tmp_path.glob(".cayu-tree-stage-*"))
+    assert not list(tmp_path.glob(".cayu-tree-backup-*"))
+    assert not list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))
 
 
 def test_dashboard_eject_preserves_both_trees_when_cleanup_conflicts_after_publication(
@@ -951,38 +1118,30 @@ def test_dashboard_eject_preserves_both_trees_when_cleanup_conflicts_after_publi
     original_stat = destination.stat()
     published_marker = destination / "concurrent-user.txt"
     original_marker_name = "original-user.txt"
-    remove_publication_directory = dashboard_cli._remove_publication_directory
 
-    def mutate_both_trees_before_original_cleanup(
-        path: Path,
-        *,
-        expected_identity: os.stat_result,
-        parent_descriptor: int | None,
-    ) -> None:
-        if ".cayu-dashboard-empty-" in path.name:
-            published_marker.write_text("keep published\n", encoding="utf-8")
-            (path / original_marker_name).write_text("keep original\n", encoding="utf-8")
-        remove_publication_directory(
-            path,
-            expected_identity=expected_identity,
-            parent_descriptor=parent_descriptor,
-        )
+    def mutate_both_trees_before_original_cleanup(phase: str) -> None:
+        if phase != "published":
+            return
+        published_marker.write_text("keep published\n", encoding="utf-8")
+        backup = next(tmp_path.glob(".cayu-tree-backup-*"))
+        (backup / original_marker_name).write_text("keep original\n", encoding="utf-8")
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_remove_publication_directory",
+        publication_cli,
+        "_publication_fault",
         mutate_both_trees_before_original_cleanup,
     )
 
-    with pytest.raises(DashboardSourceError, match="cleanup conflicted after publication"):
+    with pytest.raises(DashboardSourceError, match="original destination changed"):
         eject_dashboard_source(destination)
 
     assert published_marker.read_text(encoding="utf-8") == "keep published\n"
     assert (destination / "package.json").is_file()
-    backups = list(tmp_path.glob(".control-plane.cayu-dashboard-empty-*"))
+    backups = list(tmp_path.glob(".cayu-tree-backup-*"))
     assert len(backups) == 1
     assert (backups[0] / original_marker_name).read_text(encoding="utf-8") == "keep original\n"
     assert os.path.samestat(original_stat, backups[0].stat())
+    assert len(list(tmp_path.glob(".cayu-tree-publication-*.jsonl"))) == 1
 
 
 def test_dashboard_eject_refuses_symlink_destination(tmp_path: Path) -> None:
@@ -1047,18 +1206,12 @@ def test_dashboard_eject_refuses_junction_introduced_during_publication(
     destination = tmp_path / "control-plane"
     target = tmp_path / "target"
     target.mkdir()
-    publish_staged_tree_in_parent = dashboard_cli._publish_staged_tree_in_parent
     introduced_junction = False
 
-    def publish_after_introducing_junction(
-        staging: Path,
-        destination: Path,
-        *,
-        parent_guard: dashboard_cli._DestinationParentGuard,
-        staging_guard: dashboard_cli._StagingGuard,
-        parent_descriptor: int | None,
-    ) -> None:
+    def publish_after_introducing_junction(phase: str) -> None:
         nonlocal introduced_junction
+        if phase != "stage_synced":
+            return
         result = subprocess.run(
             ["cmd.exe", "/d", "/c", "mklink", "/j", str(destination), str(target)],
             check=False,
@@ -1068,26 +1221,19 @@ def test_dashboard_eject_refuses_junction_introduced_during_publication(
         if result.returncode != 0:
             pytest.skip(f"directory junctions are unavailable: {result.stderr.strip()}")
         introduced_junction = True
-        publish_staged_tree_in_parent(
-            staging,
-            destination,
-            parent_guard=parent_guard,
-            staging_guard=staging_guard,
-            parent_descriptor=parent_descriptor,
-        )
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_publish_staged_tree_in_parent",
+        publication_cli,
+        "_publication_fault",
         publish_after_introducing_junction,
     )
 
     try:
-        with pytest.raises(DashboardSourceError, match="symbolic link or junction"):
+        with pytest.raises(DashboardSourceError, match="destination appeared"):
             eject_dashboard_source(destination)
         assert introduced_junction
         assert list(target.iterdir()) == []
-        assert not list(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+        assert len(list(tmp_path.glob(".cayu-tree-stage-*"))) == 1
     finally:
         if destination.exists():
             destination.rmdir()
@@ -1129,17 +1275,17 @@ def test_dashboard_eject_rechecks_lexical_parent_if_link_appears_during_resoluti
     assert list(displaced_parent.iterdir()) == []
 
 
-def test_dashboard_destination_link_detection_recognizes_windows_name_surrogates() -> None:
-    assert dashboard_cli._is_windows_name_surrogate(
+def test_dashboard_destination_link_detection_rejects_every_windows_reparse_point() -> None:
+    assert dashboard_cli._is_windows_reparse_point(
         cast(
             "os.stat_result",
             SimpleNamespace(st_file_attributes=0x400, st_reparse_tag=0xA0000003),
         )
     )
-    assert dashboard_cli._is_windows_name_surrogate(
+    assert dashboard_cli._is_windows_reparse_point(
         cast("os.stat_result", SimpleNamespace(st_file_attributes=0x400))
     )
-    assert not dashboard_cli._is_windows_name_surrogate(
+    assert dashboard_cli._is_windows_reparse_point(
         cast(
             "os.stat_result",
             SimpleNamespace(st_file_attributes=0x400, st_reparse_tag=0x8000001A),
@@ -1202,6 +1348,38 @@ def test_dashboard_eject_quotes_control_characters_in_unsafe_path_error(
     message = str(exc_info.value)
     assert "\\n" in message
     assert "\n" not in message
+
+
+def test_dashboard_eject_publishes_file_matching_internal_owner_marker_name(
+    tmp_path: Path,
+) -> None:
+    marker_name = publication_cli._OWNER_MARKER
+    marker_content = b"application-owned payload\n"
+    with zipfile.ZipFile(io.BytesIO(_packaged_bundle())) as source:
+        contents = {member.filename: source.read(member) for member in source.infolist()}
+    manifest = json.loads(contents.pop("cayu-dashboard-source.json"))
+    contents[marker_name] = marker_content
+    manifest["files"].append(
+        {
+            "path": marker_name,
+            "size": len(marker_content),
+            "sha256": dashboard_cli._sha256(marker_content),
+        }
+    )
+    manifest["files"].sort(key=lambda item: item["path"])
+    manifest["source_digest"] = dashboard_cli._contents_digest(contents)
+    contents["cayu-dashboard-source.json"] = (
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+        for path, content in contents.items():
+            archive.writestr(_ordinary_member(path), content)
+
+    destination = tmp_path / "control-plane"
+    eject_dashboard_source(destination, bundle_bytes=output.getvalue())
+
+    assert (destination / marker_name).read_bytes() == marker_content
 
 
 def test_dashboard_eject_rejects_unsafe_manifest_path_without_partial_output(
@@ -1330,7 +1508,7 @@ def test_dashboard_eject_removes_staging_after_filesystem_failure(
         eject_dashboard_source(destination)
 
     assert not destination.exists()
-    assert not list(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    assert not list(tmp_path.glob(".cayu-tree-*"))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="exercises POSIX descriptor ownership")
@@ -1360,7 +1538,7 @@ def test_dashboard_eject_closes_staging_descriptor_after_chmod_failure(
     with pytest.raises(OSError):
         os.fstat(failed_descriptor)
     assert not destination.exists()
-    assert not list(tmp_path.glob(".control-plane.cayu-dashboard-*"))
+    assert not list(tmp_path.glob(".cayu-tree-*"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows DACL inspection")
@@ -1379,7 +1557,8 @@ def test_dashboard_eject_protects_staging_dacl_before_writing(
         staging_guard: dashboard_cli._StagingGuard,
     ) -> None:
         nonlocal inspected_staging
-        dashboard_cli._assert_windows_directory_dacl_is_protected(staging)
+        dacl_present, dacl_protected = publication_cli._windows_directory_dacl_state(staging)
+        assert dacl_present and dacl_protected
         inspected_staging = True
         write_staging_tree(staging, contents, staging_guard=staging_guard)
 
@@ -1398,73 +1577,79 @@ def test_dashboard_eject_restores_parent_acl_inheritance_after_publication(
 
     eject_dashboard_source(destination)
 
-    dashboard_cli._assert_windows_directory_dacl_is_inherited(destination)
+    publication_cli._assert_windows_directory_dacl_is_inherited(destination)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows namespace sharing semantics")
+def test_dashboard_eject_pins_published_identity_during_permission_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "control-plane"
+    displaced = tmp_path / "displaced-control-plane"
+    restore_inheritance = publication_cli._restore_windows_directory_inheritance
+    replacement_attempted = False
+
+    def restore_after_attempting_replacement(path: Path) -> None:
+        nonlocal replacement_attempted
+        replacement_attempted = True
+        with pytest.raises(OSError):
+            path.rename(displaced)
+        restore_inheritance(path)
+
+    monkeypatch.setattr(
+        publication_cli,
+        "_restore_windows_directory_inheritance",
+        restore_after_attempting_replacement,
+    )
+
+    eject_dashboard_source(destination)
+
+    assert replacement_attempted
+    assert (destination / "package.json").is_file()
+    assert not displaced.exists()
 
 
 def test_windows_staging_creation_uses_native_acl_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    destination = tmp_path / "control-plane"
-    expected = tmp_path / "native-private-staging"
-    parent_guard = dashboard_cli._DestinationParentGuard.capture(destination.parent)
+    expected = tmp_path / f".cayu-tree-stage-{'a' * 32}"
+    native_creation_used = False
 
-    def create_native_staging(candidate: Path) -> dashboard_cli._StagingGuard:
-        assert candidate == destination
-        expected.mkdir()
-        return dashboard_cli._StagingGuard.capture(expected)
+    def create_native_staging(candidate: Path) -> None:
+        nonlocal native_creation_used
+        native_creation_used = True
+        assert candidate == expected
+        candidate.mkdir()
 
-    def reject_posix_staging(*_args: object, **_kwargs: object) -> tuple[Path, object]:
-        pytest.fail("Windows staging must not use the POSIX creation path")
-
-    monkeypatch.setattr(dashboard_cli.os, "name", "nt")
+    monkeypatch.setattr(publication_cli.os, "name", "nt")
     monkeypatch.setattr(
-        dashboard_cli,
+        publication_cli,
         "_windows_directory_namespace_fence",
         lambda _path: nullcontext(),
     )
     monkeypatch.setattr(
-        dashboard_cli,
-        "_create_private_windows_staging_directory",
+        publication_cli,
+        "_create_private_windows_directory",
         create_native_staging,
     )
+    monkeypatch.setattr(publication_cli, "_sync_windows_path", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        dashboard_cli,
-        "_create_private_posix_staging_directory",
-        reject_posix_staging,
+        publication_cli,
+        "_assert_windows_directory_dacl_is_protected",
+        lambda _path: None,
+    )
+    parent = publication_cli._Parent(
+        path=tmp_path,
+        identity=publication_cli._capture_parent(tmp_path),
+        descriptor=None,
     )
 
-    staging, staging_guard = dashboard_cli._create_staging_directory(
-        destination,
-        parent_guard=parent_guard,
-    )
+    publication_cli._create_private_stage(expected, token="a" * 32, parent=parent)
 
-    assert staging == expected
-    assert os.path.samestat(staging_guard.identity, expected.stat())
-
-
-def test_windows_creation_cleanup_preserves_replaced_staging_directory(
-    tmp_path: Path,
-) -> None:
-    staging = tmp_path / ".control-plane.cayu-dashboard-staging"
-    staging.mkdir()
-    staging_guard = dashboard_cli._StagingGuard.capture(staging)
-    owned_staging = tmp_path / "owned-staging"
-    staging.rename(owned_staging)
-    staging.mkdir()
-    error = OSError("injected creation failure")
-
-    dashboard_cli._remove_new_empty_staging_after_creation_failure(
-        staging_guard,
-        error=error,
-    )
-
-    assert staging.is_dir()
-    assert owned_staging.is_dir()
-    assert any(
-        "could not safely remove newly created staging directory" in note
-        for note in getattr(error, "__notes__", ())
-    )
+    assert native_creation_used
+    assert (expected / publication_cli._OWNER_MARKER).read_text(encoding="ascii") == "a" * 32
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows namespace sharing semantics")
@@ -1476,10 +1661,10 @@ def test_dashboard_eject_fences_windows_parent_during_staging_creation(
     parent.mkdir()
     displaced_parent = tmp_path / "displaced-parent"
     destination = parent / "control-plane"
-    create_private_staging = dashboard_cli._create_private_windows_staging_directory
+    create_private_staging = publication_cli._create_private_windows_directory
     attempted_parent_rename = False
 
-    def create_after_attempting_parent_rename(candidate: Path) -> Path:
+    def create_after_attempting_parent_rename(candidate: Path) -> OSError | None:
         nonlocal attempted_parent_rename
         attempted_parent_rename = True
         try:
@@ -1492,8 +1677,8 @@ def test_dashboard_eject_fences_windows_parent_during_staging_creation(
         return create_private_staging(candidate)
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_create_private_windows_staging_directory",
+        publication_cli,
+        "_create_private_windows_directory",
         create_after_attempting_parent_rename,
     )
 
@@ -1512,17 +1697,19 @@ def test_dashboard_eject_fences_windows_parent_during_publication(
     parent.mkdir()
     displaced_parent = tmp_path / "displaced-parent"
     destination = parent / "control-plane"
-    rename_publication_entry = dashboard_cli._rename_publication_entry
+    rename_publication_entry = publication_cli._rename_no_replace
     attempted_parent_rename = False
 
     def publish_after_attempting_parent_rename(
-        source: Path,
-        target: Path,
+        publication_parent: Any,
+        source: str,
+        target: str,
         *,
-        parent_descriptor: int | None,
+        expected: publication_cli._Identity,
+        label: str,
     ) -> None:
         nonlocal attempted_parent_rename
-        if not attempted_parent_rename and target == destination:
+        if not attempted_parent_rename and target == destination.name:
             attempted_parent_rename = True
             try:
                 parent.rename(displaced_parent)
@@ -1532,14 +1719,16 @@ def test_dashboard_eject_fences_windows_parent_during_publication(
                 displaced_parent.rename(parent)
                 pytest.fail("the validated destination parent was not fenced")
         rename_publication_entry(
+            publication_parent,
             source,
             target,
-            parent_descriptor=parent_descriptor,
+            expected=expected,
+            label=label,
         )
 
     monkeypatch.setattr(
-        dashboard_cli,
-        "_rename_publication_entry",
+        publication_cli,
+        "_rename_no_replace",
         publish_after_attempting_parent_rename,
     )
 
