@@ -3382,9 +3382,40 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     binding_policy = _observed_policy(
         "binding_cleanup binding_generation_id binding_type bound_metadata bound_path bound_snapshot "
         "bound_workspace_id configured_workspace_id environment_factory_release error "
-        "error_type execution_profile_fingerprint factory_allocation_action failures final_revision final_snapshot has_bound_runner "
-        "has_configured_runner outcome source_workspace_id terminal_outcome",
-        owned_nested_paths=terminal_finalization_owned_paths,
+        "error_type execution_profile_fingerprint factory_allocation_action failures final_git_receipt final_revision final_snapshot has_bound_runner "
+        "has_configured_runner outcome source_publication_receipt source_workspace_id terminal_outcome",
+        owned_nested_paths=(
+            terminal_finalization_owned_paths
+            | {
+                ("source_publication_receipt", field_name)
+                for field_name in {
+                    "schema",
+                    "receipt_sha256",
+                    "snapshot_sha256",
+                    "destination_workspace_id",
+                    "workload_workspace_id",
+                    "outcome",
+                    "source_conflict_policy",
+                    "sync_back",
+                    "delete_missing",
+                    "copied_files",
+                    "copied_bytes",
+                    "deleted_files",
+                }
+            }
+            | {
+                ("final_git_receipt", field_name)
+                for field_name in {
+                    "schema",
+                    "receipt_sha256",
+                    "request_fingerprint",
+                    "destination_workspace_id",
+                    "workload_workspace_id",
+                    "baseline_revision",
+                    "workspace_revision",
+                }
+            }
+        ),
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={
@@ -3392,6 +3423,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "bound_metadata",
             "environment_factory_release",
             "failures",
+            "final_git_receipt",
             "final_revision",
         },
     )

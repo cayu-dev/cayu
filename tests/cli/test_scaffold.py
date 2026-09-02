@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -423,9 +424,18 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         "build_coding_image.py",
         "docker-coding-build.json",
         "docker-coding-image.json",
+        "domain/coding_product.py",
         "tests/test_project.py",
+        "workflows/coding_product.py",
     }
     assert all((project / path).is_file() for path in expected_support)
+    private_cayu_imports = {
+        path.relative_to(project).as_posix()
+        for path in project.rglob("*.py")
+        if "from cayu._" in path.read_text(encoding="utf-8")
+        or "import cayu._" in path.read_text(encoding="utf-8")
+    }
+    assert private_cayu_imports == set()
     assert (
         subprocess.run(
             ["git", "status", "--porcelain"],
@@ -442,6 +452,8 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     dockerfile = (project / "Dockerfile.coding").read_text(encoding="utf-8")
     builder = (project / "build_coding_image.py").read_text(encoding="utf-8")
     readme = (project / "README.md").read_text(encoding="utf-8")
+    domain_source = (project / "domain" / "coding_product.py").read_text(encoding="utf-8")
+    workflow_source = (project / "workflows" / "coding_product.py").read_text(encoding="utf-8")
     assert "DockerCodingEnvironmentFactory" in composition_source
     assert "DockerWorkspaceTransferLimits" in composition_source
     assert "RunCheckTool" in composition_source
@@ -450,6 +462,9 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "DockerCodingToolchainProfile" in composition_source
     assert "NamedCheck" in composition_source
     assert "_ExactCheckCommandPolicy" in composition_source
+    assert '"docker-coding-image.json",' in composition_source
+    assert "does not match the current schema version 3" in composition_source
+    assert "_PYTHON_TOOLCHAIN_DEPENDENCY_PATHS" in composition_source
     assert "values=list(check_names)" in composition_source
     assert "values=list(command_selectors)" in composition_source
     assert 'code_trust="untrusted"' not in composition_source
@@ -469,6 +484,13 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "Docker is the P1 bounded path" in readme
     assert "#1191" in readme
     assert "does not claim exact" in readme
+    assert "patch_ready_for_delivery" in readme
+    assert "class CodingProductTask" in domain_source
+    assert "class CodingProductApplication" in workflow_source
+    assert "await asyncio.to_thread(" in workflow_source
+    assert "source_git_authority_validator=self._validate_source_git_authority" in workflow_source
+    assert "admit_or_recover_coding_product_request" in workflow_source
+    assert "register_coding_product_contract" in workflow_source
     assert json.loads((project / "docker-coding-image.json").read_text())["content_digest"] is None
     build_configuration = json.loads((project / "docker-coding-build.json").read_text())
     assert build_configuration["cayu_wheel"] is None
@@ -559,6 +581,14 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         "lint-file",
         "python-version",
     ]
+    test_check = primary.tools["run_check"].tool._checks_by_name["test"]
+    assert tuple(test_check.command.argv or ()) == (
+        "/opt/cayu-project/.venv/bin/pytest",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "tests",
+    )
 
     generated_environment = dict(os.environ)
     source_root = str(Path(__file__).resolve().parents[2] / "src")
@@ -569,7 +599,14 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         else os.pathsep.join((source_root, inherited_pythonpath))
     )
     generated_suite = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "tests/test_coding_composition.py"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_architecture.py",
+            "tests/test_coding_composition.py",
+        ],
         cwd=project,
         env=generated_environment,
         check=False,
@@ -578,6 +615,156 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
         timeout=120,
     )
     assert generated_suite.returncode == 0, generated_suite.stdout + generated_suite.stderr
+
+
+def test_generated_docker_builder_uses_one_immutable_input_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bypass_coding_dependency_preflight(monkeypatch)
+    assert (
+        main(
+            [
+                "new",
+                "snapshot-builder",
+                "--composition",
+                "coding",
+                "--coding-execution",
+                "docker",
+                "--coding-toolchain",
+                "python",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    project = tmp_path / "snapshot-builder"
+    build_configuration_path = project / "docker-coding-build.json"
+    build_configuration = json.loads(build_configuration_path.read_text(encoding="utf-8"))
+    build_configuration.update(
+        {
+            "base_image": "python@sha256:" + ("b" * 64),
+            "uv_version": "0.9.0",
+            "debian_snapshot": "20260101T000000Z",
+            "debian_suite": "bookworm",
+            "git_package": "1:2.39.5-0+deb12u2",
+            "ripgrep_package": "13.0.0-4+b2",
+        }
+    )
+    build_configuration_path.write_text(
+        json.dumps(build_configuration, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    image_configuration_path = project / "docker-coding-image.json"
+    empty_image_configuration = image_configuration_path.read_bytes()
+    (project / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    original_lock = (project / "uv.lock").read_bytes()
+    spec = importlib.util.spec_from_file_location(
+        "snapshot_builder_build_coding_image",
+        project / "build_coding_image.py",
+    )
+    assert spec is not None and spec.loader is not None
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    monkeypatch.setattr(builder.shutil, "which", lambda name: "/usr/bin/docker")
+    real_subprocess_run = subprocess.run
+    built_image_id = "sha256:" + ("a" * 64)
+    mutate_during_build = False
+    substitute_tag = False
+    captured_build_contexts: list[dict[str, bytes]] = []
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        nonlocal mutate_during_build, substitute_tag
+        argv = tuple(command)
+        if argv[1] == "build":
+            context = Path(argv[-1])
+            assert context != project
+            captured_build_contexts.append(
+                {
+                    path.relative_to(context).as_posix(): path.read_bytes()
+                    for path in context.rglob("*")
+                    if path.is_file()
+                }
+            )
+            image_id_receipt = Path(argv[argv.index("--iidfile") + 1])
+            image_id_receipt.write_text(built_image_id + "\n", encoding="ascii")
+            if mutate_during_build:
+                (project / "uv.lock").write_bytes(original_lock + b"# changed during build\n")
+            return subprocess.CompletedProcess(command, 0)
+        if argv[1:3] == ("image", "inspect"):
+            if argv[4] == "{{.Architecture}}":
+                assert argv[-1] == built_image_id
+                return subprocess.CompletedProcess(command, 0, stdout=b"amd64\n")
+            assert argv[-1] == build_configuration["image_reference"]
+            tagged_image_id = "sha256:" + (("c" if substitute_tag else "a") * 64)
+            return subprocess.CompletedProcess(
+                command, 0, stdout=(tagged_image_id + "\n").encode("ascii")
+            )
+        if argv[1] == "run":
+            image_argument = argv.index("--entrypoint") + 2
+            assert argv[image_argument] == built_image_id
+            return subprocess.CompletedProcess(command, 0)
+        raise AssertionError(f"unexpected Docker command: {argv}")
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    assert builder.main() == 0
+    recorded = json.loads(image_configuration_path.read_text(encoding="utf-8"))
+    assert recorded["content_digest"] == built_image_id
+    recorded_dependencies = {
+        item["path"]: item["content_sha256"] for item in recorded["dependency_inputs"]
+    }
+    assert recorded_dependencies["uv.lock"] == (
+        "sha256:" + hashlib.sha256(original_lock).hexdigest()
+    )
+    assert captured_build_contexts == [
+        {
+            path: builder._read_project_input(path, max_bytes=limit)
+            for path, limit in builder._BUILD_CONTEXT_INPUT_LIMITS.items()
+        }
+    ]
+    generated_environment = dict(os.environ)
+    source_root = str(Path(__file__).resolve().parents[2] / "src")
+    inherited_pythonpath = generated_environment.get("PYTHONPATH")
+    generated_environment["PYTHONPATH"] = (
+        source_root
+        if inherited_pythonpath is None
+        else os.pathsep.join((source_root, inherited_pythonpath))
+    )
+    configured_self_test = real_subprocess_run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_coding_composition.py::test_image_build_requires_reviewed_pinned_inputs",
+        ],
+        cwd=project,
+        env=generated_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert configured_self_test.returncode == 0, (
+        configured_self_test.stdout + configured_self_test.stderr
+    )
+
+    image_configuration_path.write_bytes(empty_image_configuration)
+    substitute_tag = True
+    with pytest.raises(RuntimeError, match="tag changed"):
+        builder.main()
+    assert image_configuration_path.read_bytes() == empty_image_configuration
+
+    image_configuration_path.write_bytes(empty_image_configuration)
+    substitute_tag = False
+    mutate_during_build = True
+    with pytest.raises(RuntimeError, match="changed during the image build"):
+        builder.main()
+    assert image_configuration_path.read_bytes() == empty_image_configuration
+    assert captured_build_contexts[-1]["uv.lock"] == original_lock
 
 
 def test_coding_execution_requires_the_coding_composition(

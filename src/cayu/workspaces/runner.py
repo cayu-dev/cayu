@@ -82,6 +82,8 @@ import re
 import sys
 import tarfile
 
+SYNC_GIT_MODE_TAR_OWNER = "cayu.git-mode.v1"
+
 # Match RunnerWorkspace's historical pathlib creation behavior: missing
 # directories and files start from the conventional permissive modes, then the
 # guest process's umask determines their effective permissions.
@@ -103,6 +105,23 @@ def close_fd(fd):
         os.close(fd)
     except OSError:
         pass
+
+
+def path_matches_excluded_pattern(path, excluded_path_regexes):
+    normalized_parts = tuple(
+        part.rstrip(" .").casefold()
+        for part in path.replace("\\", "/").split("/")
+        if part not in ("", ".")
+    )
+    return any(
+        pattern.fullmatch("/".join(normalized_parts[:end]))
+        for pattern in excluded_path_regexes
+        for end in range(1, len(normalized_parts) + 1)
+    )
+
+
+def directory_name_key(value):
+    return value.rstrip(" .").casefold()
 
 
 def fail_guard(exc, path=None):
@@ -198,6 +217,7 @@ def collect_files(
     matches,
     ancestor_directories,
     excluded_directory_names,
+    excluded_path_regexes,
 ):
     if os.listdir not in getattr(os, "supports_fd", ()):
         raise GuardPathError("unsupported")
@@ -210,7 +230,9 @@ def collect_files(
     try:
         for name in os.listdir(dir_fd):
             rel_path = name if not prefix else prefix + "/" + name
-            if name.casefold() in excluded_directory_names:
+            if directory_name_key(name) in excluded_directory_names:
+                continue
+            if path_matches_excluded_pattern(rel_path, excluded_path_regexes):
                 continue
             try:
                 entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -235,6 +257,7 @@ def collect_files(
                         matches,
                         ancestor_directories,
                         excluded_directory_names,
+                        excluded_path_regexes,
                     )
                 finally:
                     close_fd(child_fd)
@@ -255,6 +278,9 @@ def list_operation(root_fd):
     limit = int(sys.argv[3])
     payload_limit = int(sys.argv[4])
     excluded_directory_names = frozenset(json.loads(sys.argv[5]))
+    excluded_path_regexes = tuple(
+        re.compile(pattern) for pattern in json.loads(sys.argv[6])
+    )
     matches = []
     collect_files(
         root_fd,
@@ -263,6 +289,7 @@ def list_operation(root_fd):
         matches,
         set(),
         excluded_directory_names,
+        excluded_path_regexes,
     )
     sorted_matches = sorted(matches)
     paths = sorted_matches[:limit]
@@ -295,6 +322,7 @@ def collect_git_entries(
     entries,
     ancestor_directories,
     excluded_directory_names,
+    excluded_path_regexes,
     limit,
 ):
     if os.listdir not in getattr(os, "supports_fd", ()):
@@ -309,7 +337,9 @@ def collect_git_entries(
     try:
         for name in sorted(os.listdir(dir_fd)):
             rel_path = name if not prefix else prefix + "/" + name
-            if name.casefold() in excluded_directory_names:
+            if directory_name_key(name) in excluded_directory_names:
+                continue
+            if path_matches_excluded_pattern(rel_path, excluded_path_regexes):
                 continue
             try:
                 entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -339,6 +369,7 @@ def collect_git_entries(
                         entries,
                         ancestor_directories,
                         excluded_directory_names,
+                        excluded_path_regexes,
                         limit,
                     ):
                         return True
@@ -368,6 +399,9 @@ def git_entries_operation(root_fd):
     limit = int(sys.argv[2])
     payload_limit = int(sys.argv[3])
     excluded_directory_names = frozenset(json.loads(sys.argv[4]))
+    excluded_path_regexes = tuple(
+        re.compile(pattern) for pattern in json.loads(sys.argv[5])
+    )
     entries = []
     truncated = collect_git_entries(
         root_fd,
@@ -375,6 +409,7 @@ def git_entries_operation(root_fd):
         entries,
         set(),
         excluded_directory_names,
+        excluded_path_regexes,
         limit,
     )
     entries.sort(key=lambda item: item["path"])
@@ -440,7 +475,8 @@ def read_tar_operation(root_fd):
                 "workspace_error",
                 f"Workspace files exceed max_total_bytes={max_total_bytes}.",
             )
-        preflight_files.append((rel_path, info.st_dev, info.st_ino, size))
+        git_mode = 0o755 if info.st_mode & 0o111 else 0o644
+        preflight_files.append((rel_path, info.st_dev, info.st_ino, size, git_mode))
     archive_size_bound = total_bytes + archive_overhead_bytes
     if max_archive_bytes is not None and archive_size_bound > max_archive_bytes:
         fail(
@@ -450,7 +486,7 @@ def read_tar_operation(root_fd):
 
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
-        for rel_path, expected_dev, expected_ino, size in preflight_files:
+        for rel_path, expected_dev, expected_ino, size, git_mode in preflight_files:
             parent_fd = None
             leaf_fd = None
             try:
@@ -460,6 +496,7 @@ def read_tar_operation(root_fd):
                     current.st_dev != expected_dev
                     or current.st_ino != expected_ino
                     or current.st_size != size
+                    or (0o755 if current.st_mode & 0o111 else 0o644) != git_mode
                 ):
                     fail(
                         "workspace_error",
@@ -467,6 +504,8 @@ def read_tar_operation(root_fd):
                     )
                 info = tarfile.TarInfo(name=rel_path)
                 info.size = size
+                info.mode = git_mode
+                info.uname = SYNC_GIT_MODE_TAR_OWNER
                 with os.fdopen(leaf_fd, "rb") as file:
                     leaf_fd = None
                     archive.addfile(info, file)
@@ -515,6 +554,17 @@ def validate_tar_member(member, member_paths, member_parent_paths):
     member_parent_paths.update(parts[:index] for index in range(1, len(parts)))
 
 
+def tar_member_git_mode(member):
+    if member.uname != SYNC_GIT_MODE_TAR_OWNER:
+        return None
+    if member.mode not in (0o644, 0o755):
+        fail(
+            "invalid_path",
+            f"Workspace tar member has invalid Git mode authority: {member.name}",
+        )
+    return member.mode
+
+
 def preflight_tar_destination(root_fd, rel_path):
     parent_fd = None
     try:
@@ -532,18 +582,27 @@ def write_tar_operation(root_fd):
     payload = json.loads(sys.stdin.read())
     data = base64.b64decode(payload["tar_base64"], validate=True)
     excluded_directory_names = frozenset(json.loads(sys.argv[2]))
+    excluded_path_regexes = tuple(
+        re.compile(pattern) for pattern in json.loads(sys.argv[3])
+    )
     member_paths = set()
     member_parent_paths = set()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
         for member in archive:
             validate_tar_member(member, member_paths, member_parent_paths)
+            tar_member_git_mode(member)
             if any(
-                part.casefold() in excluded_directory_names
+                directory_name_key(part) in excluded_directory_names
                 for part in member.name.split("/")
             ):
                 fail(
                     "invalid_path",
                     f"Workspace tar member is inside an excluded directory: {member.name}",
+                )
+            if path_matches_excluded_pattern(member.name, excluded_path_regexes):
+                fail(
+                    "invalid_path",
+                    f"Workspace tar member matches an excluded path pattern: {member.name}",
                 )
             extracted = archive.extractfile(member)
             if extracted is None:
@@ -575,6 +634,7 @@ def write_tar_operation(root_fd):
                     leaf_name,
                     parent_fd,
                     member_chunks(extracted),
+                    mode=tar_member_git_mode(member),
                 )
             except GuardPathError as exc:
                 fail_guard(exc, member.name)
@@ -643,6 +703,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         default_read_limit_bytes: int = DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES,
         default_list_limit: int = DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT,
         excluded_directory_names: Iterable[str] = (),
+        excluded_path_patterns: Iterable[str] = (),
         enable_workspace_branches: bool = False,
         branch_operation_timeout_s: int = 300,
         branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
@@ -659,11 +720,20 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         self.default_list_limit = _validate_required_limit(default_list_limit, "default_list_limit")
         self.excluded_directory_names = _validate_excluded_directory_names(excluded_directory_names)
         self._excluded_directory_keys = frozenset(
-            value.casefold() for value in self.excluded_directory_names
+            _directory_name_key(value) for value in self.excluded_directory_names
         )
-        if self.excluded_directory_names and enable_workspace_branches:
+        self.excluded_path_patterns = _validate_excluded_path_patterns(excluded_path_patterns)
+        self._excluded_path_pattern_keys = tuple(
+            _normalized_exclusion_path(pattern) for pattern in self.excluded_path_patterns
+        )
+        self._excluded_path_regexes = tuple(
+            translate_list_pattern(pattern) for pattern in self._excluded_path_pattern_keys
+        )
+        if (
+            self.excluded_directory_names or self.excluded_path_patterns
+        ) and enable_workspace_branches:
             raise ValueError(
-                "RunnerWorkspace excluded directories cannot be combined with workspace branches."
+                "RunnerWorkspace path exclusions cannot be combined with workspace branches."
             )
         if type(enable_workspace_branches) is not bool:
             raise TypeError("RunnerWorkspace enable_workspace_branches must be a bool.")
@@ -982,6 +1052,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             str(effective_limit),
             str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
+            json.dumps(self._excluded_path_regexes),
             output_limit_bytes=_json_list_output_limit(),
         )
         validated = _validate_workspace_list_result(
@@ -989,6 +1060,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             pattern=pattern,
             effective_limit=effective_limit,
             excluded_directory_keys=self._excluded_directory_keys,
+            excluded_path_pattern_keys=self._excluded_path_pattern_keys,
         )
         del result
         if isinstance(validated, Exception):
@@ -1002,12 +1074,14 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             str(effective_limit),
             str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
+            json.dumps(self._excluded_path_regexes),
             output_limit_bytes=_json_list_output_limit(),
         )
         validated = _validate_workspace_git_entry_result(
             result,
             effective_limit=effective_limit,
             excluded_directory_keys=self._excluded_directory_keys,
+            excluded_path_pattern_keys=self._excluded_path_pattern_keys,
         )
         del result
         if isinstance(validated, Exception):
@@ -1017,6 +1091,8 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
     def _require_path_allowed(self, path: str) -> None:
         if _path_has_excluded_directory(path, self._excluded_directory_keys):
             raise ValueError("Workspace path is inside an excluded directory.")
+        if _path_matches_excluded_pattern(path, self._excluded_path_pattern_keys):
+            raise ValueError("Workspace path matches an excluded path pattern.")
 
     async def read_tar_bytes(
         self,
@@ -1088,6 +1164,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         await self._run_json_operation(
             "write_tar",
             json.dumps(tuple(sorted(self._excluded_directory_keys))),
+            json.dumps(self._excluded_path_regexes),
             stdin=json.dumps(payload),
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
@@ -1156,6 +1233,7 @@ def _validate_workspace_list_result(
     pattern: str,
     effective_limit: int,
     excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
 ) -> WorkspaceListResult | TypeError | ValueError:
     paths = result.get("paths")
     total_count = result.get("total_count")
@@ -1176,6 +1254,8 @@ def _validate_workspace_list_result(
         if path != normalized:
             return ValueError("Runner workspace list returned a non-normalized path.")
         if _path_has_excluded_directory(path, excluded_directory_keys):
+            return ValueError("Runner workspace list returned an excluded path.")
+        if _path_matches_excluded_pattern(path, excluded_path_pattern_keys):
             return ValueError("Runner workspace list returned an excluded path.")
         validated_paths.append(path)
 
@@ -1206,6 +1286,7 @@ def _validate_workspace_git_entry_result(
     *,
     effective_limit: int,
     excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
 ) -> WorkspaceGitEntryListResult | TypeError | ValueError:
     raw_entries = result.get("entries")
     total_count = result.get("total_count")
@@ -1235,7 +1316,11 @@ def _validate_workspace_git_entry_result(
             )
         except (TypeError, ValueError):
             return ValueError("Runner workspace returned invalid Git entry evidence.")
-        if path != normalized or _path_has_excluded_directory(path, excluded_directory_keys):
+        if (
+            path != normalized
+            or _path_has_excluded_directory(path, excluded_directory_keys)
+            or _path_matches_excluded_pattern(path, excluded_path_pattern_keys)
+        ):
             return ValueError("Runner workspace returned an inadmissible Git entry path.")
         entries.append(entry)
     if total_count < len(entries) or total_count > effective_limit + 1:
@@ -1278,7 +1363,7 @@ def _validate_excluded_directory_names(values: Iterable[str]) -> tuple[str, ...]
             raise ValueError(
                 "RunnerWorkspace excluded directory names must be single path segments."
             )
-        key = value.casefold()
+        key = _directory_name_key(value)
         if key in normalized:
             raise ValueError(
                 "RunnerWorkspace excluded directory names must be case-insensitively unique."
@@ -1287,8 +1372,57 @@ def _validate_excluded_directory_names(values: Iterable[str]) -> tuple[str, ...]
     return tuple(normalized[key] for key in sorted(normalized))
 
 
+def _validate_excluded_path_patterns(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("RunnerWorkspace excluded_path_patterns must be an iterable of strings.")
+    try:
+        patterns = tuple(values)
+    except TypeError as exc:
+        raise TypeError(
+            "RunnerWorkspace excluded_path_patterns must be an iterable of strings."
+        ) from exc
+    normalized: dict[str, str] = {}
+    for index, pattern in enumerate(patterns):
+        value = require_clean_nonblank(pattern, f"excluded_path_patterns[{index}]")
+        require_durable_text(value, f"excluded_path_patterns[{index}]")
+        if "\\" in value:
+            raise ValueError("RunnerWorkspace excluded path patterns must use POSIX separators.")
+        value = validate_list_pattern(value)
+        key = _normalized_exclusion_path(value)
+        if key in normalized:
+            raise ValueError(
+                "RunnerWorkspace excluded path patterns must be case-insensitively unique."
+            )
+        normalized[key] = value
+    return tuple(normalized[key] for key in sorted(normalized))
+
+
 def _path_has_excluded_directory(path: str, excluded_directory_keys: frozenset[str]) -> bool:
-    return any(part.casefold() in excluded_directory_keys for part in path.split("/"))
+    return any(_directory_name_key(part) in excluded_directory_keys for part in path.split("/"))
+
+
+def _directory_name_key(value: str) -> str:
+    return value.rstrip(" .").casefold()
+
+
+def _normalized_exclusion_path(value: str) -> str:
+    return "/".join(
+        part.rstrip(" .").casefold()
+        for part in value.replace("\\", "/").split("/")
+        if part not in {"", "."}
+    )
+
+
+def _path_matches_excluded_pattern(
+    path: str,
+    excluded_path_pattern_keys: tuple[str, ...],
+) -> bool:
+    normalized_parts = tuple(part for part in _normalized_exclusion_path(path).split("/") if part)
+    return any(
+        matches_list_pattern("/".join(normalized_parts[:end]), pattern)
+        for pattern in excluded_path_pattern_keys
+        for end in range(1, len(normalized_parts) + 1)
+    )
 
 
 def _validate_tar_paths(paths: Sequence[str]) -> tuple[str, ...]:

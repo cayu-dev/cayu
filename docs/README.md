@@ -10,6 +10,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Browser sessions](browser-session.md)
 - [Build a runner](build-a-runner.md)
 - [Cayu Cloud](cayu-cloud.md)
+- [Maintained coding product](coding-product.md)
 - [Console](console.md)
 - [Control plane](control-plane.md)
 - [Cost optimization](cost-optimization.md)

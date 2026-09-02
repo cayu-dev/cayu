@@ -665,6 +665,54 @@ def test_local_workspace_excluded_directories_are_removed_before_limits_and_disp
     assert workspace.branch_capabilities().isolation is False
 
 
+def test_local_workspace_excluded_path_patterns_are_removed_before_limits_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".env").write_text("HOST_TOKEN=secret\n", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ".env.local").write_text("nested secret\n", encoding="utf-8")
+    (nested / "private.PEM").write_text("private key\n", encoding="utf-8")
+    credentials = nested / "credentials"
+    credentials.mkdir()
+    (credentials / "token").write_text("directory secret\n", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("visible\n", encoding="utf-8")
+    workspace = LocalWorkspace(
+        tmp_path,
+        excluded_path_patterns=(
+            ".env",
+            ".env.*",
+            "*.pem",
+            "**/.env",
+            "**/.env.*",
+            "**/*.pem",
+            "credentials",
+            "**/credentials",
+        ),
+    )
+
+    listing = asyncio.run(workspace.list("**/*", limit=1))
+    git_entries = asyncio.run(workspace.list_git_entries(limit=1))
+
+    assert listing.paths == ("visible.txt",)
+    assert listing.total_count == 1
+    assert listing.truncated is False
+    assert tuple(entry.path for entry in git_entries.entries) == ("visible.txt",)
+    assert git_entries.total_count == 1
+    for path in (
+        ".env",
+        "nested/.env.local",
+        "nested/private.PEM",
+        "nested/credentials/token",
+    ):
+        with pytest.raises(ValueError, match="excluded path pattern"):
+            asyncio.run(workspace.read_bytes(path))
+        with pytest.raises(ValueError, match="excluded path pattern"):
+            asyncio.run(workspace.write_bytes(path, b"changed"))
+
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "HOST_TOKEN=secret\n"
+
+
 def test_local_workspace_path_operation_capability_preflight_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -860,6 +908,32 @@ def test_local_workspace_create_uses_conventional_umask_permissions(tmp_path: Pa
         os.umask(previous_umask)
 
     assert stat.S_IMODE((tmp_path / "created.txt").stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+def test_local_workspace_git_mode_replace_rejects_mode_only_cas_drift(tmp_path: Path) -> None:
+    path = tmp_path / "script.sh"
+    path.write_bytes(b"#!/bin/sh\n")
+    path.chmod(0o644)
+    workspace = LocalWorkspace(tmp_path)
+    baseline = asyncio.run(workspace.read_bytes("script.sh"))
+    assert baseline.revision is not None
+    assert baseline.git_mode == "100644"
+    path.chmod(0o755)
+
+    with pytest.raises(workspaces_module.WorkspaceGitModeMismatchError):
+        asyncio.run(
+            workspace.replace_bytes_with_git_mode(
+                "script.sh",
+                b"replacement\n",
+                expected_revision=baseline.revision,
+                expected_git_mode="100644",
+                git_mode="100644",
+            )
+        )
+
+    assert path.read_bytes() == b"#!/bin/sh\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o755
 
 
 def test_conditional_mutations_serialize_filesystem_case_aliases(tmp_path: Path) -> None:

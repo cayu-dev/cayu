@@ -223,6 +223,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Callable
+from fnmatch import fnmatchcase
 from hashlib import sha256
 from pathlib import Path
 
@@ -232,6 +233,7 @@ from cayu import (
     ArtifactStore,
     BackgroundSubagentTaskRegistry,
     CayuApp,
+    CodingGitBaselineAuthority,
     DeleteFileTool,
     DenyPatternRule,
     EditFileTool,
@@ -297,6 +299,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _STATE_ROOT = _PROJECT_ROOT / ".cayu" / "runtime"
 _REVIEWER_ALIAS = REVIEWER_ALIAS
 _PROTECTED_WORKSPACE_DIRECTORY_NAMES = (".cayu", ".git")
+_SOURCE_EXCLUDED_DIRECTORY_NAMES = _PROTECTED_WORKSPACE_DIRECTORY_NAMES
+_SOURCE_EXCLUDED_FILE_PATTERNS: tuple[str, ...] = ()
 _SEARCH_EXCLUDED_DIRECTORIES = (
     ".cayu",
     ".git",
@@ -322,6 +326,7 @@ _DENIED_PATH_PATTERNS = (
 )
 _COMMAND_TIMEOUT_S = 10.0
 _COMMAND_OUTPUT_LIMIT_BYTES = 64 * 1024
+_GIT_AUTHORITY_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024
 _SAFE_LOCAL_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -433,6 +438,7 @@ def _execute_dependency_probe(
     allowed_exit_codes: frozenset[int] = frozenset({0}),
     reject_output_overflow: bool = False,
     capture_output: bool = True,
+    output_limit_bytes: int = _COMMAND_OUTPUT_LIMIT_BYTES,
 ) -> BoundedCommandResult:
     try:
         completed = run_bounded_command(
@@ -440,7 +446,7 @@ def _execute_dependency_probe(
             cwd=cwd,
             env=_command_environment() if environment is None else environment,
             timeout_s=_COMMAND_TIMEOUT_S,
-            output_limit_bytes=_COMMAND_OUTPUT_LIMIT_BYTES,
+            output_limit_bytes=output_limit_bytes,
             capture_output=capture_output,
             reject_output_overflow=reject_output_overflow,
         )
@@ -924,6 +930,223 @@ def configured_workspace_root(override: str | os.PathLike[str] | None = None) ->
     return root
 
 
+def _require_supported_coding_product_git_index(staged_entries: bytes) -> None:
+    """Reject index shapes that the flat source projection cannot reproduce."""
+
+    if staged_entries and not staged_entries.endswith(b"\0"):
+        raise RuntimeError("coding source Git index output is malformed")
+    for record in staged_entries.split(b"\0"):
+        if not record:
+            continue
+        header, separator, path = record.partition(b"\t")
+        fields = header.split()
+        if (
+            not separator
+            or not path
+            or len(fields) != 3
+            or len(fields[0]) != 6
+            or any(character not in b"01234567" for character in fields[0])
+            or len(fields[1]) not in {40, 64}
+            or any(character not in b"0123456789abcdef" for character in fields[1])
+            or fields[2] != b"0"
+        ):
+            raise RuntimeError("coding source Git index output is malformed")
+        if fields[0] == b"160000":
+            raise RuntimeError(
+                "coding source Git submodules are unsupported by the flat source projection"
+            )
+
+
+def _observe_coding_product_git_control(root: Path) -> tuple[str, str, str]:
+    """Observe the committed and index authority that copy-back must not mutate."""
+
+    git = _configured_command("git")
+    environment = _git_command_environment(root)
+    head_result = _execute_dependency_probe(
+        _safe_git_probe_argv(git, "rev-parse", "--verify", "HEAD"),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+    )
+    try:
+        head_revision = head_result.output.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise RuntimeError("coding source Git HEAD is not an ASCII object identity") from None
+    staged_entries = _execute_dependency_probe(
+        _safe_git_probe_argv(git, "ls-files", "--stage", "-z", "--"),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+        output_limit_bytes=_GIT_AUTHORITY_OUTPUT_LIMIT_BYTES,
+    ).output
+    _require_supported_coding_product_git_index(staged_entries)
+    tracked_flags = _execute_dependency_probe(
+        _safe_git_probe_argv(git, "ls-files", "-v", "-z", "--"),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+        output_limit_bytes=_GIT_AUTHORITY_OUTPUT_LIMIT_BYTES,
+    ).output
+    if any(
+        record and (len(record) < 3 or record[:2] != b"H ")
+        for record in tracked_flags.split(b"\0")
+    ):
+        raise RuntimeError(
+            "coding source Git index contains non-default tracked-file flags"
+        )
+    return (
+        head_revision,
+        "sha256:" + sha256(staged_entries).hexdigest(),
+        "sha256:" + sha256(tracked_flags).hexdigest(),
+    )
+
+
+def observe_clean_coding_product_git_baseline(root: Path) -> CodingGitBaselineAuthority:
+    """Bind a clean committed Git baseline before a new product run is admitted."""
+
+    git = _configured_command("git")
+    environment = _git_command_environment(root)
+    head_revision, staged_entries_sha256, tracked_flags_sha256 = (
+        _observe_coding_product_git_control(root)
+    )
+    filter_output = _run_dependency_probe(
+        _safe_git_probe_argv(
+            git,
+            "config",
+            "--includes",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process)$",
+        ),
+        cwd=root,
+        environment=environment,
+        allowed_exit_codes=frozenset({0, 1}),
+        reject_output_overflow=True,
+    )
+    filter_names = _configured_git_filter_names(filter_output)
+    status = _run_dependency_probe(
+        _safe_git_probe_argv(
+            git,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            filter_names=filter_names,
+        ),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+    )
+    unstaged = _run_dependency_probe(
+        _safe_git_probe_argv(
+            git,
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--",
+            filter_names=filter_names,
+        ),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+    )
+    staged = _run_dependency_probe(
+        _safe_git_probe_argv(
+            git,
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--cached",
+            "--unified=3",
+            "--",
+            filter_names=filter_names,
+        ),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+    )
+    if status or unstaged or staged:
+        raise RuntimeError(
+            "a new coding-product run requires a clean committed Git source baseline"
+        )
+    ignored = _run_dependency_probe(
+        _safe_git_probe_argv(
+            git,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+            "--",
+            filter_names=filter_names,
+        ),
+        cwd=root,
+        environment=environment,
+        reject_output_overflow=True,
+    )
+    unexpected_ignored = tuple(
+        path
+        for path in ignored.split("\0")
+        if path and not _source_path_is_excluded(path)
+    )
+    if unexpected_ignored:
+        raise RuntimeError(
+            "coding source contains a Git-ignored path outside the admitted source policy"
+        )
+    if _observe_coding_product_git_control(root) != (
+        head_revision,
+        staged_entries_sha256,
+        tracked_flags_sha256,
+    ):
+        raise RuntimeError("coding source Git authority changed during baseline admission")
+    status_bytes = status.encode("utf-8")
+    diff_bytes = staged.encode("utf-8") + b"\0" + unstaged.encode("utf-8")
+    return CodingGitBaselineAuthority(
+        head_revision=head_revision,
+        staged_entries_sha256=staged_entries_sha256,
+        tracked_flags_sha256=tracked_flags_sha256,
+        status_sha256="sha256:" + sha256(status_bytes).hexdigest(),
+        diff_sha256="sha256:" + sha256(diff_bytes).hexdigest(),
+    )
+
+
+def require_coding_product_git_authority(
+    root: Path,
+    expected: CodingGitBaselineAuthority,
+) -> None:
+    """Reject host HEAD or index drift without treating published worktree bytes as drift."""
+
+    if type(expected) is not CodingGitBaselineAuthority:
+        raise TypeError("expected must be CodingGitBaselineAuthority")
+    observed = _observe_coding_product_git_control(root)
+    if observed != (
+        expected.head_revision,
+        expected.staged_entries_sha256,
+        expected.tracked_flags_sha256,
+    ):
+        raise RuntimeError("coding source Git authority changed after admission")
+
+
+def _source_path_is_excluded(path: str) -> bool:
+    normalized = path.rstrip("/").replace("\\", "/")
+    parts = tuple(part for part in normalized.split("/") if part)
+    if any(part.rstrip(" .").casefold() in _SOURCE_EXCLUDED_DIRECTORY_NAMES for part in parts):
+        return True
+    if not parts:
+        return False
+    return any(
+        fnmatchcase(part.rstrip(" .").casefold(), pattern.casefold())
+        for pattern in _SOURCE_EXCLUDED_FILE_PATTERNS
+        for part in parts
+    )
+
+
 def _knowledge_scope() -> KnowledgeAccessScope:
     return coding_knowledge_scope()
 
@@ -944,7 +1167,7 @@ def _primary_tool_policy() -> ParameterConstrainedToolPolicy:
                 DenyPatternRule("glob", patterns=_DENIED_PATH_PATTERNS),
             ),
             "read_file": _path_rules(required=False),
-            "apply_patch": (RequiredFieldRule("patch"),),
+            "apply_patch": (RequiredFieldRule("operations"),),
             "write_file": _path_rules(required=True),
             "edit_file": _path_rules(required=True),
             "delete_file": _path_rules(required=True),
@@ -1290,6 +1513,24 @@ New code extends the owning canonical modules and imports the composition from
 from operations.coding import build_coding_app, configured_workspace_root
 
 __all__ = ["build_coding_app", "configured_workspace_root"]
+'''
+
+
+_DOCKER_CODING_COMPOSITION_COMPAT_PY = '''"""Compatibility imports for coding."""
+
+from operations.coding import (
+    CodingComposition,
+    build_coding_app,
+    build_coding_composition,
+    configured_workspace_root,
+)
+
+__all__ = [
+    "CodingComposition",
+    "build_coding_app",
+    "build_coding_composition",
+    "configured_workspace_root",
+]
 '''
 
 
@@ -1678,7 +1919,8 @@ PRIMARY_SYSTEM_PROMPT = """You are the primary coding agent for this trusted rep
 
 Work only through the registered bounded tools. Inspect before editing, run the
 admitted focused command selectors when diagnosis needs them, run the relevant
-named checks independently, inspect Git evidence, repair failures, and report
+named checks independently, and finish by running every required named check and
+calling `git_changes` in complete diff mode. Inspect Git evidence, repair failures, and report
 exact command, check, and diff evidence. Use edit_file for one small
 existing-file change, write_file or delete_file for one explicit file, and
 apply_patch for a coherent bounded multi-file change or move. A partial,
@@ -1694,6 +1936,212 @@ REVIEWER_SYSTEM_PROMPT = (
     "Review only the delegated context. Return concise correctness, testing, "
     "and safety findings; do not modify files or delegate again."
 )
+'''
+
+
+_CODING_PRODUCT_DOMAIN_PY = '''"""Application-owned input for one coding-product run."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from cayu import CodingReviewSettlement, CodingSettlementPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class CodingProductTask:
+    """Stable caller authority; retain these IDs when recovering the same run."""
+
+    product_run_id: str
+    session_id: str
+    task_id: str
+    instruction: str
+    source_origin_id: str = "local-git-repository"
+    source_destination_id: str = "local-working-tree"
+    settlement: CodingSettlementPolicy | None = None
+    review_settlement: CodingReviewSettlement | None = None
+'''
+
+
+_CODING_PRODUCT_WORKFLOW_PY = '''"""Authoritative trusted-repository coding-product workflow."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+
+from cayu import (
+    ArtifactStore,
+    CayuApp,
+    CodingGitBaselineAuthority,
+    CodingProductArtifactRepository,
+    CodingProductPublication,
+    CodingProductRunner,
+    CodingRuntimeAuthority,
+    CodingSettlementPolicy,
+    DockerCodingToolchainProfile,
+    Message,
+    RunRequest,
+    Workspace,
+    admit_or_recover_coding_product_request,
+    register_coding_product_contract,
+)
+
+from domain.coding_product import CodingProductTask
+from operations.coding import (
+    observe_clean_coding_product_git_baseline,
+    require_coding_product_git_authority,
+)
+
+
+def _fingerprint(label: str, value: object) -> str:
+    encoded = json.dumps(
+        {"label": label, "value": value},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+class CodingProductApplication:
+    """Project-owned front door from a durable task to patch-ready evidence."""
+
+    def __init__(
+        self,
+        app: CayuApp,
+        *,
+        source_workspace: Workspace,
+        artifact_store: ArtifactStore,
+        toolchain_profile: DockerCodingToolchainProfile,
+        agent_name: str,
+        project_root: str | Path,
+    ) -> None:
+        self.app = app
+        self.source_workspace = source_workspace
+        self.artifact_store = artifact_store
+        self.toolchain_profile = toolchain_profile
+        self.agent_name = agent_name
+        self.project_root = Path(project_root).resolve()
+        self._registered_contracts: set[str] = set()
+
+    async def _validate_source_git_authority(
+        self,
+        expected: CodingGitBaselineAuthority,
+    ) -> None:
+        await asyncio.to_thread(
+            require_coding_product_git_authority,
+            self.project_root,
+            expected,
+        )
+
+    async def run(self, task: CodingProductTask) -> CodingProductPublication:
+        """Run or recover one stable product identity without external delivery."""
+
+        if type(task) is not CodingProductTask:
+            raise TypeError("task must be CodingProductTask.")
+        messages = [Message.text("user", task.instruction)]
+        run_request = RunRequest(
+            agent_name=self.agent_name,
+            messages=messages,
+            session_id=task.session_id,
+            environment_name="coding",
+        )
+        execution_profile = await self.app.inspect_run_execution_profile(run_request)
+        primary = self.app.get_agent(self.agent_name)
+        tool_manifest = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "schema": tool.schema,
+                "effect": tool.effect.value,
+                "parallel_safe": tool.parallel_safe,
+                "workspace_mutation": tool.workspace_mutation,
+                "execution_contract": tool.execution_contract,
+                "execution_profile_identity": (
+                    None
+                    if tool.execution_profile_identity is None
+                    else tool.execution_profile_identity.model_dump(mode="json")
+                ),
+                "command_policy_execution_profile_identity": (
+                    None
+                    if tool.command_policy_execution_profile_identity is None
+                    else tool.command_policy_execution_profile_identity.model_dump(mode="json")
+                ),
+            }
+            for _, tool in sorted(primary.tools.items())
+        ]
+        runtime = CodingRuntimeAuthority(
+            toolchain_profile_id=self.toolchain_profile.profile_id,
+            toolchain_profile_revision=self.toolchain_profile.revision,
+            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            image_fingerprint=self.toolchain_profile.image_identity.fingerprint,
+            dependency_identity=self.toolchain_profile.dependency_identity,
+            execution_profile_fingerprint=execution_profile,
+            tool_manifest_fingerprint=_fingerprint("coding-tools-v1", tool_manifest),
+            tool_policy_fingerprint=_fingerprint(
+                "coding-tool-policy-v1",
+                {"execution_profile": execution_profile},
+            ),
+            approval_policy_fingerprint=_fingerprint(
+                "coding-approval-policy-v1",
+                {"execution_profile": execution_profile},
+            ),
+            redaction_profile_fingerprint=_fingerprint(
+                "coding-redaction-profile-v1",
+                {"execution_profile": execution_profile},
+            ),
+        )
+        repository = CodingProductArtifactRepository(self.artifact_store)
+        try:
+            admitted = await repository.load_request(
+                task.product_run_id,
+                session_id=task.session_id,
+            )
+        except FileNotFoundError:
+            source_git_baseline = await asyncio.to_thread(
+                observe_clean_coding_product_git_baseline,
+                self.project_root,
+            )
+        else:
+            source_git_baseline = admitted.source.git_baseline
+        request = await admit_or_recover_coding_product_request(
+            repository=repository,
+            product_run_id=task.product_run_id,
+            session_id=task.session_id,
+            agent_name=self.agent_name,
+            task_id=task.task_id,
+            messages=messages,
+            source_workspace=self.source_workspace,
+            source_origin_id=task.source_origin_id,
+            source_destination_id=task.source_destination_id,
+            source_git_baseline=source_git_baseline,
+            runtime=runtime,
+            settlement=(
+                task.settlement
+                if task.settlement is not None
+                else CodingSettlementPolicy(
+                    required_checks=("format", "lint", "test"),
+                    reviewer_required=False,
+                    human_approval_required=False,
+                )
+            ),
+        )
+        if request.fingerprint not in self._registered_contracts:
+            await register_coding_product_contract(self.app, request, repository)
+            self._registered_contracts.add(request.fingerprint)
+        return await CodingProductRunner(
+            self.app,
+            source_workspace=self.source_workspace,
+            repository=repository,
+            source_git_authority_validator=self._validate_source_git_authority,
+        ).run(
+            request,
+            run_request,
+            review_settlement=task.review_settlement,
+        )
 '''
 
 
@@ -1759,6 +2207,39 @@ _DOCKER_APP_BUILD = '''def build_app(
         workspace_root=workspace_root,
         artifact_store=artifact_store,
         knowledge_store=knowledge_store,
+    )
+
+
+def build_coding_product_application(
+    *,
+    provider: ModelProvider | None = None,
+    session_store: SessionStore | None = None,
+    task_store: TaskStore | None = None,
+    workspace_root=None,
+    artifact_store=None,
+    knowledge_store=None,
+) -> CodingProductApplication:
+    """Construct the maintained patch-ready coding-product front door."""
+
+    composition = build_coding_composition(
+        primary_agent=_agent_for_provider_override(AGENT, provider),
+        reviewer_agent=_agent_for_provider_override(REVIEWER, provider),
+        reviewer_execution_profile_identity=REVIEWER_EXECUTION_PROFILE_IDENTITY,
+        configured_provider=configured_provider,
+        provider=provider,
+        session_store=session_store,
+        task_store=task_store,
+        workspace_root=workspace_root,
+        artifact_store=artifact_store,
+        knowledge_store=knowledge_store,
+    )
+    return CodingProductApplication(
+        composition.app,
+        source_workspace=composition.source_workspace,
+        artifact_store=composition.artifact_store,
+        toolchain_profile=composition.toolchain_profile,
+        agent_name=AGENT.name,
+        project_root=composition.project_root,
     )
 '''
 
@@ -1842,7 +2323,7 @@ _DOCKER_IMAGE_CONFIG = """{
   "reference": "__PROJECT_NAME__-cayu-coding:local",
   "content_digest": null,
   "profile_id": "__PROJECT_NAME__-python",
-  "profile_revision": "1",
+  "profile_revision": "2",
   "platform_architecture": null,
   "dependency_inputs": null,
   "trusted_build_context_sha256": null
@@ -1856,8 +2337,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -1870,13 +2353,74 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)+(?:[-+._a-zA-Z0-9]*)?\Z")
 _DEBIAN_SNAPSHOT = re.compile(r"[0-9]{8}T[0-9]{6}Z\Z")
 _DEBIAN_SUITE = re.compile(r"[a-z0-9][a-z0-9-]*\Z")
+_BUILD_CONTEXT_INPUT_LIMITS = {
+    ".dockerignore": 1024 * 1024,
+    "Dockerfile.coding": 1024 * 1024,
+    "docker-coding-build.json": 16 * 1024,
+    "pyproject.toml": 1024 * 1024,
+    "uv.lock": 64 * 1024 * 1024,
+}
+_WHEEL_MAX_BYTES = 64 * 1024 * 1024
 
 
-def _configuration() -> dict[str, str]:
+def _read_project_input(relative_path: str, *, max_bytes: int) -> bytes:
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise RuntimeError("trusted build input path is invalid")
+    source = _ROOT
+    metadata = None
     try:
-        raw = _BUILD_CONFIG.read_bytes()
+        for index, part in enumerate(relative.parts):
+            source /= part
+            metadata = source.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError("trusted build inputs cannot contain symlinks")
+            if index < len(relative.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError("trusted build input parent is not a directory")
+        if metadata is None or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("trusted build input is not a regular file")
+        if metadata.st_size > max_bytes:
+            raise RuntimeError("trusted build input exceeds its byte limit")
+        with source.open("rb") as handle:
+            opened_metadata = os.fstat(handle.fileno())
+            chunks = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = handle.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            final_opened_metadata = os.fstat(handle.fileno())
+        content = b"".join(chunks)
+        final_metadata = source.lstat()
+    except RuntimeError:
+        raise
     except OSError:
-        raise RuntimeError("docker-coding-build.json is unavailable") from None
+        raise RuntimeError("trusted build input is unavailable") from None
+    if len(content) > max_bytes:
+        raise RuntimeError("trusted build input exceeds its byte limit")
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    observations = (metadata, opened_metadata, final_opened_metadata, final_metadata)
+    if any(
+        getattr(observation, field) != getattr(metadata, field)
+        for observation in observations[1:]
+        for field in identity_fields
+    ):
+        raise RuntimeError("trusted build input changed while it was being captured")
+    return content
+
+
+def _trusted_build_context_snapshot() -> dict[str, bytes]:
+    return {
+        path: _read_project_input(path, max_bytes=limit)
+        for path, limit in _BUILD_CONTEXT_INPUT_LIMITS.items()
+    }
+
+
+def _configuration(raw: bytes) -> dict[str, str]:
+    if type(raw) is not bytes:
+        raise TypeError("docker-coding-build.json content must be bytes")
     if len(raw) > 16 * 1024:
         raise RuntimeError("docker-coding-build.json exceeds 16384 bytes")
     try:
@@ -1955,57 +2499,34 @@ def _configuration() -> dict[str, str]:
     return value
 
 
-def _verified_cayu_wheel(configuration: dict[str, str]) -> Path | None:
+def _verified_cayu_wheel(configuration: dict[str, str]) -> tuple[str, bytes] | None:
     wheel = configuration.get("cayu_wheel")
     if wheel is None:
         return None
-    source = _ROOT.joinpath(*PurePosixPath(wheel).parts)
     try:
-        metadata = source.lstat()
-    except OSError:
-        raise RuntimeError("configured cayu_wheel is unavailable") from None
-    if (
-        source.is_symlink()
-        or not source.is_file()
-        or metadata.st_size > 64 * 1024 * 1024
-    ):
+        content = _read_project_input(wheel, max_bytes=_WHEEL_MAX_BYTES)
+    except RuntimeError:
         raise RuntimeError(
-            "configured cayu_wheel must be a regular file at most 64 MiB"
-        )
-    digest = hashlib.sha256()
-    try:
-        with source.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError:
-        raise RuntimeError("configured cayu_wheel could not be read") from None
-    observed = "sha256:" + digest.hexdigest()
+            "configured cayu_wheel must be an available regular file at most 64 MiB"
+        ) from None
+    observed = "sha256:" + hashlib.sha256(content).hexdigest()
     if observed != configuration["cayu_wheel_sha256"]:
         raise RuntimeError("configured cayu_wheel does not match cayu_wheel_sha256")
-    return source
+    return wheel, content
 
 
-def _trusted_build_context_inputs(cayu_wheel: Path | None) -> list[dict[str, str]]:
-    inputs = [
-        _ROOT / ".dockerignore",
-        _ROOT / "Dockerfile.coding",
-        _ROOT / "docker-coding-build.json",
-        _ROOT / "pyproject.toml",
-        _ROOT / "uv.lock",
-    ]
-    if cayu_wheel is not None:
-        inputs.append(cayu_wheel)
+def _trusted_build_context_inputs(snapshot: dict[str, bytes]) -> list[dict[str, str]]:
     return [
         {
-            "path": path.relative_to(_ROOT).as_posix(),
-            "content_sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            "path": path,
+            "content_sha256": "sha256:" + hashlib.sha256(snapshot[path]).hexdigest(),
         }
-        for path in inputs
+        for path in sorted(snapshot)
     ]
 
 
-def _trusted_build_context_sha256(cayu_wheel: Path | None) -> str:
-    entries = _trusted_build_context_inputs(cayu_wheel)
+def _trusted_build_context_sha256(snapshot: dict[str, bytes]) -> str:
+    entries = _trusted_build_context_inputs(snapshot)
     encoded = json.dumps(
         entries,
         ensure_ascii=False,
@@ -2015,26 +2536,84 @@ def _trusted_build_context_sha256(cayu_wheel: Path | None) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _write_snapshot(root: Path, snapshot: dict[str, bytes]) -> None:
+    for relative_path, content in snapshot.items():
+        destination = root.joinpath(*PurePosixPath(relative_path).parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+
+
+def _read_built_image_id(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Docker image ID receipt is not a regular file")
+        if metadata.st_size > 128:
+            raise RuntimeError("Docker image ID receipt exceeds its byte limit")
+        raw = path.read_bytes()
+    except RuntimeError:
+        raise
+    except OSError:
+        raise RuntimeError("Docker did not publish its image ID receipt") from None
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    try:
+        image_id = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise RuntimeError("Docker published an invalid image ID receipt") from None
+    if not _DIGEST.fullmatch(image_id):
+        raise RuntimeError("Docker published an invalid image ID receipt")
+    return image_id
+
+
+def _require_project_inputs_unchanged(snapshot: dict[str, bytes]) -> None:
+    for path, expected in snapshot.items():
+        limit = _BUILD_CONTEXT_INPUT_LIMITS.get(path, _WHEEL_MAX_BYTES)
+        try:
+            current = _read_project_input(path, max_bytes=limit)
+        except RuntimeError:
+            raise RuntimeError(
+                "trusted build inputs changed during the image build; rerun it"
+            ) from None
+        if current != expected:
+            raise RuntimeError(
+                "trusted build inputs changed during the image build; rerun it"
+            )
+
+
 def main() -> int:
-    configuration = _configuration()
+    build_context_snapshot = _trusted_build_context_snapshot()
+    configuration = _configuration(
+        build_context_snapshot["docker-coding-build.json"]
+    )
     cayu_wheel = _verified_cayu_wheel(configuration)
-    if not (_ROOT / "uv.lock").is_file():
-        raise RuntimeError(
-            "uv.lock is required; run `uv lock` and review it before building"
-        )
+    trusted_input_snapshot = dict(build_context_snapshot)
+    if cayu_wheel is not None:
+        wheel_path, wheel_content = cayu_wheel
+        trusted_input_snapshot[wheel_path] = wheel_content
     docker = shutil.which("docker")
     if docker is None:
         raise RuntimeError("Docker CLI is unavailable")
-    with tempfile.TemporaryDirectory(prefix="cayu-wheel-context-") as context_raw:
-        wheel_context = Path(context_raw)
+    image_id = None
+    with tempfile.TemporaryDirectory(prefix="cayu-coding-build-") as context_raw:
+        temporary_root = Path(context_raw)
+        build_context = temporary_root / "context"
+        wheel_context = temporary_root / "wheel"
+        image_id_receipt = temporary_root / "image-id"
+        build_context.mkdir()
+        wheel_context.mkdir()
+        _write_snapshot(build_context, build_context_snapshot)
         (wheel_context / ".empty").write_bytes(b"")
         if cayu_wheel is not None:
-            shutil.copyfile(cayu_wheel, wheel_context / cayu_wheel.name)
+            wheel_path, wheel_content = cayu_wheel
+            (wheel_context / PurePosixPath(wheel_path).name).write_bytes(wheel_content)
         command = [
             docker,
             "build",
             "--file",
-            str(_ROOT / "Dockerfile.coding"),
+            str(build_context / "Dockerfile.coding"),
+            "--iidfile",
+            str(image_id_receipt),
             "--tag",
             configuration["image_reference"],
             "--build-context",
@@ -2051,32 +2630,20 @@ def main() -> int:
             f"CAYU_GIT_PACKAGE={configuration['git_package']}",
             "--build-arg",
             f"CAYU_RIPGREP_PACKAGE={configuration['ripgrep_package']}",
-            str(_ROOT),
+            str(build_context),
         ]
         completed = subprocess.run(
             command, cwd=_ROOT, stdin=subprocess.DEVNULL, check=False
         )
+        if completed.returncode == 0:
+            image_id = _read_built_image_id(image_id_receipt)
     if completed.returncode != 0:
         raise RuntimeError(
             f"Docker image build failed with exit code {completed.returncode}"
         )
-    inspected = subprocess.run(
-        [
-            docker,
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            configuration["image_reference"],
-        ],
-        cwd=_ROOT,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=False,
-    )
-    image_id = inspected.stdout.decode("ascii", errors="ignore").strip()
-    if inspected.returncode != 0 or not _DIGEST.fullmatch(image_id):
-        raise RuntimeError("Docker did not return an exact local image ID")
+    if image_id is None:  # pragma: no cover - successful builds require the receipt
+        raise RuntimeError("Docker did not publish its image ID receipt")
+    _require_project_inputs_unchanged(trusted_input_snapshot)
     architecture_probe = subprocess.run(
         [
             docker,
@@ -2084,7 +2651,7 @@ def main() -> int:
             "inspect",
             "--format",
             "{{.Architecture}}",
-            configuration["image_reference"],
+            image_id,
         ],
         cwd=_ROOT,
         stdin=subprocess.DEVNULL,
@@ -2109,7 +2676,7 @@ def main() -> int:
                 "ALL",
                 "--entrypoint",
                 "sh",
-                configuration["image_reference"],
+                image_id,
                 "-c",
                 "test -x /opt/cayu-project/.venv/bin/ruff "
                 "&& test -x /opt/cayu-project/.venv/bin/pytest "
@@ -2136,6 +2703,26 @@ def main() -> int:
         raise RuntimeError(
             "Docker coding image is missing a declared runtime or check executable"
         )
+    _require_project_inputs_unchanged(trusted_input_snapshot)
+    tag_probe = subprocess.run(
+        [
+            docker,
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            configuration["image_reference"],
+        ],
+        cwd=_ROOT,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    tagged_image_id = tag_probe.stdout.decode("ascii", errors="ignore").strip()
+    if tag_probe.returncode != 0 or tagged_image_id != image_id:
+        raise RuntimeError(
+            "Docker coding image tag changed before immutable image settlement"
+        )
     _IMAGE_CONFIG.write_text(
         json.dumps(
             {
@@ -2143,14 +2730,16 @@ def main() -> int:
                 "reference": configuration["image_reference"],
                 "content_digest": image_id,
                 "profile_id": "__PROJECT_NAME__-python",
-                "profile_revision": "1",
+                "profile_revision": "2",
                 "platform_architecture": architecture,
                 # The reviewed wheel is a protected build input, not a runtime
                 # workspace dependency. Its path and digest remain pinned in
                 # docker-coding-build.json and the complete context fingerprint.
-                "dependency_inputs": _trusted_build_context_inputs(None),
+                "dependency_inputs": _trusted_build_context_inputs(
+                    build_context_snapshot
+                ),
                 "trusted_build_context_sha256": _trusted_build_context_sha256(
-                    cayu_wheel
+                    trusted_input_snapshot
                 ),
             },
             indent=2,
@@ -2173,6 +2762,62 @@ if __name__ == "__main__":
 _DOCKER_COMPOSITION_BUILD = r'''
 _DOCKER_IMAGE_CONFIGURATION = _PROJECT_ROOT / "docker-coding-image.json"
 _DOCKER_IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PYTHON_TOOLCHAIN_PROFILE_ID = "__PROJECT_NAME__-python"
+_PYTHON_TOOLCHAIN_PROFILE_REVISION = "2"
+_PYTHON_TOOLCHAIN_DEPENDENCY_PATHS = (
+    ".dockerignore",
+    "Dockerfile.coding",
+    "docker-coding-build.json",
+    "pyproject.toml",
+    "uv.lock",
+)
+_SOURCE_EXCLUDED_DIRECTORY_NAMES = (
+    ".cache",
+    ".cayu",
+    ".git",
+    ".gradle",
+    ".m2",
+    ".next",
+    ".npm",
+    ".pnpm-store",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".runtime",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+)
+_SOURCE_EXCLUDED_FILE_PATTERNS = (
+    ".DS_Store",
+    ".coverage",
+    ".env",
+    ".env.*",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "*.key",
+    "*.p12",
+    "*.pem",
+    "*.pfx",
+    "credentials",
+    "credentials.*",
+    # This application-owned receipt selects the next process's immutable image
+    # and dependency authority. It is read from the host before source admission
+    # and must never enter model-facing source or generic publication.
+    "docker-coding-image.json",
+)
+_SOURCE_EXCLUDED_PATH_PATTERNS = tuple(
+    pattern
+    for file_pattern in _SOURCE_EXCLUDED_FILE_PATTERNS
+    for pattern in (file_pattern, f"**/{file_pattern}")
+)
 _CHECK_EXECUTABLE_ROOT = "/opt/cayu-project/.venv/bin"
 _CHECK_NAMES = ("format", "lint", "test")
 _COMMAND_SELECTOR_NAMES = ("focused-test", "lint-file", "python-version")
@@ -2190,30 +2835,41 @@ _CHECK_LINT_IDENTITY = ExecutionProfileBehaviorIdentity(
 _CHECK_TEST_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_check.test",
     behavior_version="1",
-    implementation_version="1",
+    implementation_version="2",
 )
 _CHECK_COMMAND_POLICY_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_check.command_policy",
     behavior_version="1",
-    implementation_version="1",
+    implementation_version="2",
 )
 _DOCKER_ENVIRONMENT_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_coding.environment",
-    behavior_version="2",
+    behavior_version="9",
     implementation_version="1",
 )
 _DOCKER_BINDING_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_coding.binding",
-    behavior_version="1",
+    behavior_version="9",
     implementation_version="1",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CodingComposition:
+    """Owned runtime components shared by the app and product front doors."""
+
+    app: CayuApp
+    source_workspace: LocalWorkspace
+    artifact_store: ArtifactStore
+    toolchain_profile: DockerCodingToolchainProfile
+    project_root: Path
 
 
 def _python_toolchain_profile(
     image_identity: DockerImageIdentity,
     *,
-    profile_id: str = "__PROJECT_NAME__-python",
-    profile_revision: str = "1",
+    profile_id: str = _PYTHON_TOOLCHAIN_PROFILE_ID,
+    profile_revision: str = _PYTHON_TOOLCHAIN_PROFILE_REVISION,
     platform_architecture: Literal["amd64", "arm64"] = "amd64",
     dependency_inputs: tuple[DockerCodingDependencyInput, ...] = (),
     trusted_build_context_sha256: str | None = None,
@@ -2315,7 +2971,7 @@ def _python_toolchain_profile(
                     "-q",
                     "-p",
                     "no:cacheprovider",
-                    "tests/test_project.py",
+                    "tests",
                 ),
                 max_arguments=0,
                 timeout_seconds=300,
@@ -2435,8 +3091,7 @@ def _read_docker_toolchain_profile() -> DockerCodingToolchainProfile:
         value = json.loads(raw)
     except (UnicodeDecodeError, ValueError):
         raise RuntimeError("docker-coding-image.json is invalid JSON") from None
-    version_one_fields = {"schema_version", "reference", "content_digest"}
-    version_two_fields = {
+    required_fields = {
         "schema_version",
         "reference",
         "content_digest",
@@ -2444,19 +3099,15 @@ def _read_docker_toolchain_profile() -> DockerCodingToolchainProfile:
         "profile_revision",
         "platform_architecture",
         "dependency_inputs",
+        "trusted_build_context_sha256",
     }
-    version_three_fields = version_two_fields | {"trusted_build_context_sha256"}
-    if type(value) is not dict or (
-        not (value.get("schema_version") == "1" and set(value) == version_one_fields)
-        and not (
-            value.get("schema_version") == "2" and set(value) == version_two_fields
-        )
-        and not (
-            value.get("schema_version") == "3" and set(value) == version_three_fields
-        )
+    if (
+        type(value) is not dict
+        or value.get("schema_version") != "3"
+        or set(value) != required_fields
     ):
         raise RuntimeError(
-            "docker-coding-image.json does not match schema version 1, 2, or 3"
+            "docker-coding-image.json does not match the current schema version 3"
         )
     reference = value.get("reference")
     digest = value.get("content_digest")
@@ -2471,25 +3122,20 @@ def _read_docker_toolchain_profile() -> DockerCodingToolchainProfile:
             "docker-coding-image.json contains an invalid immutable image ID"
         )
     image_identity = DockerImageIdentity(reference=reference, content_digest=digest)
-    if value["schema_version"] == "1":
-        return _python_toolchain_profile(image_identity)
     profile_id = value.get("profile_id")
     profile_revision = value.get("profile_revision")
     platform_architecture = value.get("platform_architecture")
     raw_dependencies = value.get("dependency_inputs")
     build_context_sha256 = value.get("trusted_build_context_sha256")
     if (
-        type(profile_id) is not str
-        or type(profile_revision) is not str
+        profile_id != _PYTHON_TOOLCHAIN_PROFILE_ID
+        or profile_revision != _PYTHON_TOOLCHAIN_PROFILE_REVISION
         or platform_architecture not in {"amd64", "arm64"}
         or type(raw_dependencies) is not list
-        or len(raw_dependencies) > 64
+        or len(raw_dependencies) != len(_PYTHON_TOOLCHAIN_DEPENDENCY_PATHS)
         or (
-            value["schema_version"] == "3"
-            and (
-                type(build_context_sha256) is not str
-                or _DOCKER_IMAGE_ID_PATTERN.fullmatch(build_context_sha256) is None
-            )
+            type(build_context_sha256) is not str
+            or _DOCKER_IMAGE_ID_PATTERN.fullmatch(build_context_sha256) is None
         )
     ):
         raise RuntimeError(
@@ -2500,15 +3146,17 @@ def _read_docker_toolchain_profile() -> DockerCodingToolchainProfile:
             DockerCodingDependencyInput.model_validate(item)
             for item in raw_dependencies
         )
+        if tuple(item.path for item in dependency_inputs) != (
+            _PYTHON_TOOLCHAIN_DEPENDENCY_PATHS
+        ):
+            raise ValueError("Built-in dependency authority is incomplete.")
         return _python_toolchain_profile(
             image_identity,
             profile_id=profile_id,
             profile_revision=profile_revision,
             platform_architecture=platform_architecture,
             dependency_inputs=dependency_inputs,
-            trusted_build_context_sha256=(
-                build_context_sha256 if value["schema_version"] == "3" else None
-            ),
+            trusted_build_context_sha256=build_context_sha256,
         )
     except (TypeError, ValueError):
         raise RuntimeError(
@@ -2560,7 +3208,7 @@ def _check_required_executables(checks: tuple[NamedCheck, ...]) -> tuple[str, ..
     )
 
 
-def build_coding_app(
+def build_coding_composition(
     *,
     primary_agent: AgentSpec,
     reviewer_agent: AgentSpec,
@@ -2572,8 +3220,8 @@ def build_coding_app(
     workspace_root: str | os.PathLike[str] | None = None,
     artifact_store: ArtifactStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
-) -> CayuApp:
-    """Build one fresh, process-scoped trusted-repository Docker composition."""
+) -> CodingComposition:
+    """Build one fresh process-scoped trusted-repository Docker composition."""
 
     LocalWorkspace.require_path_operations_supported()
     root = configured_workspace_root(workspace_root)
@@ -2591,7 +3239,8 @@ def build_coding_app(
     source_workspace = LocalWorkspace(
         root,
         workspace_id="coding-source-workspace",
-        excluded_directory_names=(".cayu", ".git", ".runtime"),
+        excluded_directory_names=_SOURCE_EXCLUDED_DIRECTORY_NAMES,
+        excluded_path_patterns=_SOURCE_EXCLUDED_PATH_PATTERNS,
     )
     scope = _knowledge_scope()
     stores = build_coding_stores(
@@ -2695,7 +3344,7 @@ def build_coding_app(
         ListFilesTool(),
         SearchTextTool(
             exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
-            protected_entry_names=(".cayu", ".git", ".runtime"),
+            protected_entry_names=_SOURCE_EXCLUDED_DIRECTORY_NAMES,
         ),
         ReadFileTool(),
         ApplyPatchTool(),
@@ -2768,7 +3417,42 @@ def build_coding_app(
         ),
         provider_override=provider,
     )
-    return app
+    return CodingComposition(
+        app=app,
+        source_workspace=source_workspace,
+        artifact_store=selected_artifact_store,
+        toolchain_profile=toolchain_profile,
+        project_root=root,
+    )
+
+
+def build_coding_app(
+    *,
+    primary_agent: AgentSpec,
+    reviewer_agent: AgentSpec,
+    reviewer_execution_profile_identity: ExecutionProfileBehaviorIdentity | None,
+    configured_provider: Callable[[], ModelProvider],
+    provider: ModelProvider | None = None,
+    session_store: SessionStore | None = None,
+    task_store: TaskStore | None = None,
+    workspace_root: str | os.PathLike[str] | None = None,
+    artifact_store: ArtifactStore | None = None,
+    knowledge_store: KnowledgeStore | None = None,
+) -> CayuApp:
+    """Build the ordinary Cayu application without the product convenience layer."""
+
+    return build_coding_composition(
+        primary_agent=primary_agent,
+        reviewer_agent=reviewer_agent,
+        reviewer_execution_profile_identity=reviewer_execution_profile_identity,
+        configured_provider=configured_provider,
+        provider=provider,
+        session_store=session_store,
+        task_store=task_store,
+        workspace_root=workspace_root,
+        artifact_store=artifact_store,
+        knowledge_store=knowledge_store,
+    ).app
 '''
 
 
@@ -2776,11 +3460,41 @@ _DOCKER_README_APPEND = """
 
 ## Explicit Docker toolchain and command execution
 
+The maintained product front door is
+`app.build_coding_product_application()`. Pass a stable
+`domain.coding_product.CodingProductTask` to its async `run()` method. The
+workflow in `workflows/coding_product.py` binds the task, complete source
+baseline, clean committed Git HEAD and index authority, Docker toolchain,
+application manifests, and exact runtime execution profile before dispatch. A
+new product run rejects a dirty source tree or concealed tracked-file index
+flags. Unsettled recovery reuses and freshly validates its already-admitted
+authority before dispatch. The workflow validates Git control state again after
+execution and immediately before patch-ready publication, then retains lifecycle,
+check, mutation, Git diff, copy-back, review, and final source evidence in the
+configured artifact store.
+Keep the same product, session, and task IDs when reconstructing the application
+to recover a settled result. Use new IDs for a new attempt.
+Application-owned environment adapters must construct their request-bound copy
+seam with `DockerCodingEnvironmentFactory.create_workspace_binding(...)`; do
+not parse private Cayu metadata or import `cayu._*` modules.
+
+`patch_ready_for_delivery` means all application-required checks passed, the
+configured reviewer and human gates settled, source copy-back completed without
+revision conflict, a complete bounded Git diff was retained, and the final
+source revision is known. It never means Cayu committed, pushed, opened a pull
+request, waited for CI, or merged. Those external effects belong to an optional
+delivery layer. The generated default explicitly waives reviewer and human
+approval while requiring `format`, `lint`, and `test`; edit
+`domain/coding_product.py` to make either gate mandatory and supply explicit
+settlement evidence from application-owned review or approval handling.
+
 This variant adds application-owned `format`, `lint`, and `test` checks plus the
 finite `focused-test`, `lint-file`, and `python-version` structured command
 selectors. `run_command` accepts selector plus a bounded string array; the profile
 resolves the exact executable, fixed arguments, paths, workdir, environment, and
-limits. It does not expose a shell, arbitrary executable or argv, `ExecCommandTool`,
+limits. The required `test` check executes the complete `tests/` tree, including
+the maintained composition proof and application-owned regressions beside it.
+It does not expose a shell, arbitrary executable or argv, `ExecCommandTool`,
 PTY, installer, network, publication, commit, push, or credential tool. Named
 required checks remain independent from diagnostic commands. The reviewer remains
 tool-free. Tool exposure, parameter policy, exact command policy, environment
@@ -2812,22 +3526,43 @@ uv run --no-sync pytest -q tests/test_coding_composition.py
 ```
 
 The trusted build may use network access to resolve only the reviewed pinned
-inputs and frozen lock. It records the final local image ID, platform, profile
-revision, and exact Dockerfile/build-config/manifest/lockfile/wheel identities in
-`docker-coding-image.json`. Application construction verifies Docker daemon
-availability, image presence, that exact ID, and dependency freshness before
-provider work. Runtime never installs dependencies. If either dependency input is
-edited, dependency-sensitive checks and commands return an explicit rebuild-required
-result until a new image/profile is adopted. The final runner separately verifies
-the image, network, user, capabilities, filesystem/resource controls, and every
-declared executable before exposing tools.
+inputs and frozen lock. It captures Docker's build-produced immutable image ID,
+probes that exact ID, then records it with the platform, profile revision, and
+exact Dockerfile/build-config/manifest/lockfile/wheel identities in
+`docker-coding-image.json`. The builder copies those bounded inputs into one
+private immutable context, builds only that snapshot, and refuses to record the
+image if any source input or its configured tag changes before settlement.
+The image receipt is application-owned authority: source admission excludes it
+from the model-facing workspace and generic copy-back. Adopt a new receipt only
+by running the reviewed trusted builder outside the coding session.
+Application construction
+verifies Docker daemon availability, image presence, that exact ID, and
+dependency freshness before provider work. Runtime never installs dependencies.
+If either dependency input is edited, dependency-sensitive checks and commands
+return an explicit rebuild-required result until a new image/profile is adopted.
+Named checks verify those inputs both before dispatch and after quiescent
+execution, so a repository check cannot rewrite its own toolchain authority and
+retain a pass. The final runner separately verifies the image, network, user,
+capabilities, filesystem/resource controls, and every declared executable before
+exposing tools.
 
 The host Git repository remains authoritative. Each session gets one unique
 ephemeral `/workspace`; `.git`, `.cayu`, `.runtime`, credentials, sockets,
 devices, and unrelated host files never enter through generic transfer. The
-guest receives a constrained fresh Git baseline. Terminal finalization performs
-bounded revision-checked copy-back and can report conflicts or partial
-publication without claiming success.
+guest receives a constrained fresh Git baseline. Configured generated-output and
+sensitive-file exclusions are enforced before traversal and direct access. A
+new ignored path outside that explicit projection blocks source admission or
+terminal publication instead of disappearing from the retained diff.
+The bounded host-index observer covers the complete admitted source envelope;
+Git submodules are rejected because this flat projection cannot preserve
+gitlink semantics. Regular-file Git modes (`100644` and `100755`) are preserved
+in both directions and authenticated during revision-checked copy-back. Terminal
+finalization compares raw with Git-filtered object identities at both ends. An
+actual text, encoding, ident, or clean-filter transformation on a changed path
+prevents a complete diff claim. It can report conflicts or partial publication
+without claiming success. The ephemeral effective Git configuration is immutable;
+includes and effective clean, smudge, or process filter commands are
+rejected before filtered hashing.
 
 Durable Cayu session state can be resumed, but this P1 path does not claim exact
 continuation of an in-flight container after worker loss. Only mutations already
@@ -2848,6 +3583,14 @@ after Dockerfile, lock, toolchain, or check-executable changes.
 _DOCKER_AGENTS_APPEND = """
 
 ## Docker coding execution invariants
+
+Treat `domain/coding_product.py` as caller-owned authority,
+`workflows/coding_product.py` as orchestration, and `operations/coding.py` as
+runtime composition. Extend those files in place; do not collapse product input,
+runtime wiring, prompts, policies, tools, and evidence into one file. Preserve
+stable caller IDs for recovery and preserve the distinction between
+`patch_ready_for_delivery` and any later commit, push, pull request, CI, or merge
+effect.
 
 Keep Docker execution explicit and trusted-only. Preserve finite named checks and
 structured selectors, the exact-command policy, dependency identities, network
@@ -2882,6 +3625,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2890,15 +3634,17 @@ from typing import Any, Literal
 from operations import coding as composition
 import pytest
 import build_coding_image
-from app import build_app
+from app import build_app, build_coding_product_application
+from domain.coding_product import CodingProductTask
 
 from cayu import (
     CommandPolicyDecision,
     CommandRequest,
+    CodingGitBaselineAuthority,
+    CodingProductState,
     DockerCodingEnvironmentFactory,
-    DockerCodingWorkspaceBinding,
     DockerImageIdentity,
-    DockerWorkspaceTransferLimits,
+    DockerRunner,
     Environment,
     EnvironmentFactoryResult,
     EnvironmentSpec,
@@ -2913,6 +3659,7 @@ from cayu import (
     ExecutionToolRequirementEvidence,
     InMemorySessionStore,
     InMemoryTaskStore,
+    LocalArtifactStore,
     LocalRunner,
     Message,
     ModelProvider,
@@ -2921,12 +3668,11 @@ from cayu import (
     RunCheckTool,
     RunCommandTool,
     RunRequest,
+    RunnerWorkspace,
     ScriptedModelProvider,
+    ToolContext,
     evaluate_execution_admission,
 )
-from cayu.core.tools import ToolContext
-from cayu.runners.docker import DockerRunner
-from cayu.workspaces import RunnerWorkspace
 
 _IMAGE_ID = "sha256:" + ("a" * 64)
 
@@ -2940,21 +3686,168 @@ def _repository(path: Path) -> Path:
         capture_output=True,
         check=True,
     )
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.com"],
+        cwd=path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Cayu Tests"],
+        cwd=path,
+        check=True,
+    )
     (path / "example.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _commit_repository(path, "initial source")
     return path
 
 
-def _admit_test_image(monkeypatch: pytest.MonkeyPatch) -> None:
+def _commit_repository(path: Path, message: str) -> None:
+    subprocess.run(["git", "add", "--all"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=path, check=True)
+
+
+def test_source_admission_excludes_credentials_and_rejects_unscoped_ignored_files(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path / "source-policy")
+    (repository / ".gitignore").write_text(".env\nignored.txt\n", encoding="utf-8")
+    _commit_repository(repository, "declare ignored paths")
+    (repository / ".env").write_text("TOKEN=host-secret\n", encoding="utf-8")
+
+    baseline = composition.observe_clean_coding_product_git_baseline(repository)
+
+    assert baseline.clean is True
+    (repository / "ignored.txt").write_text("not admitted\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="outside the admitted source policy"):
+        composition.observe_clean_coding_product_git_baseline(repository)
+
+
+def test_source_git_authority_rejects_head_and_index_flag_drift(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "git-authority")
+    baseline = composition.observe_clean_coding_product_git_baseline(repository)
+
+    composition.require_coding_product_git_authority(repository, baseline)
+    subprocess.run(
+        ["git", "update-index", "--assume-unchanged", "example.py"],
+        cwd=repository,
+        check=True,
+    )
+    with pytest.raises(RuntimeError, match="non-default tracked-file flags"):
+        composition.require_coding_product_git_authority(repository, baseline)
+
+    subprocess.run(
+        ["git", "update-index", "--no-assume-unchanged", "example.py"],
+        cwd=repository,
+        check=True,
+    )
+    composition.require_coding_product_git_authority(repository, baseline)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "advance authority"],
+        cwd=repository,
+        check=True,
+    )
+    with pytest.raises(RuntimeError, match="changed after admission"):
+        composition.require_coding_product_git_authority(repository, baseline)
+
+
+def test_source_git_authority_supports_a_bounded_large_index(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "large-index-authority")
+    tracked = repository / "tracked" / ("a" * 180)
+    tracked.mkdir(parents=True)
+    for index in range(180):
+        filename = f"authority-padding-{index:04d}-{'b' * 180}.py"
+        (tracked / filename).write_text(
+            f"VALUE = {index}\n",
+            encoding="utf-8",
+        )
+    _commit_repository(repository, "large tracked index")
+    staged_entries = subprocess.run(
+        ["git", "ls-files", "--stage", "-z", "--"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert len(staged_entries) > 64 * 1024
+
+    baseline = composition.observe_clean_coding_product_git_baseline(repository)
+
+    composition.require_coding_product_git_authority(repository, baseline)
+
+
+def test_source_git_authority_rejects_gitlinks(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "gitlink-authority")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{head},vendor/dependency",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    with pytest.raises(RuntimeError, match="submodules are unsupported"):
+        composition.observe_clean_coding_product_git_baseline(repository)
+
+
+def _custom_toolchain_profile(
+    image: DockerImageIdentity,
+) -> composition.DockerCodingToolchainProfile:
+    builtin = composition._python_toolchain_profile(image)
+    repository_version = composition.DockerCodingCommandAuthority(
+        selector="repository-version",
+        revision="1",
+        description="Report the admitted repository client version.",
+        exposure="structured_command",
+        executable="/usr/bin/git",
+        fixed_arguments=("--version",),
+        max_arguments=0,
+        timeout_seconds=10,
+        max_output_bytes=4096,
+    )
+    authorities = tuple(
+        sorted(
+            (*builtin.command_authorities, repository_version),
+            key=lambda authority: authority.selector,
+        )
+    )
+    return composition.DockerCodingToolchainProfile.model_validate(
+        {
+            **builtin.model_dump(mode="python", by_alias=True),
+            "profile_id": "generated-custom-toolchain",
+            "revision": "custom-1",
+            "command_authorities": authorities,
+        }
+    )
+
+
+def _admit_test_image(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    custom_profile: bool = False,
+) -> None:
+    image = DockerImageIdentity(
+        reference="generated-coding:test",
+        content_digest=_IMAGE_ID,
+    )
+    authority = (
+        _custom_toolchain_profile(image)
+        if custom_profile
+        else image
+    )
     monkeypatch.setattr(
         composition,
         "_configured_docker_authority",
-        lambda root: (
-            DockerImageIdentity(
-                reference="generated-coding:test",
-                content_digest=_IMAGE_ID,
-            ),
-            "/usr/bin/docker",
-        ),
+        lambda root: (authority, "/usr/bin/docker"),
     )
     monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
 
@@ -2976,11 +3869,14 @@ def test_generated_docker_composition_is_finite_trusted_and_factory_backed(
     assert registered_environment.factory_backed is True
     factory = registered_environment.factory
     assert isinstance(factory, DockerCodingEnvironmentFactory)
-    assert factory.source_workspace.excluded_directory_names == (
-        ".cayu",
-        ".git",
-        ".runtime",
+    assert set(factory.source_workspace.excluded_directory_names) == set(
+        composition._SOURCE_EXCLUDED_DIRECTORY_NAMES
     )
+    assert set(factory.source_workspace.excluded_path_patterns) == set(
+        composition._SOURCE_EXCLUDED_PATH_PATTERNS
+    )
+    assert "docker-coding-image.json" in factory.source_workspace.excluded_path_patterns
+    assert "**/docker-coding-image.json" in factory.source_workspace.excluded_path_patterns
     assert registered_environment.spec.metadata["network"] == "none"
     assert registered_environment.spec.metadata["binding_profile_identity"]
     untrusted = evaluate_execution_admission(
@@ -3017,6 +3913,8 @@ def test_generated_docker_composition_is_finite_trusted_and_factory_backed(
     assert {check.name for check in run_check.checks} == {"format", "lint", "test"}
     assert all(check.command.kind == "process" for check in run_check.checks)
     assert all(check.command.shell is None for check in run_check.checks)
+    test_check = next(check for check in run_check.checks if check.name == "test")
+    assert tuple(test_check.command.argv or ())[-1] == "tests"
     run_command = primary.tools["run_command"].tool
     assert isinstance(run_command, RunCommandTool)
     assert tuple(selector.selector for selector in run_command.selectors) == (
@@ -3028,8 +3926,53 @@ def test_generated_docker_composition_is_finite_trusted_and_factory_backed(
 
 
 def test_image_build_requires_reviewed_pinned_inputs() -> None:
+    configuration = json.loads(build_coding_image._BUILD_CONFIG.read_bytes())
+    configuration["base_image"] = None
     with pytest.raises(RuntimeError, match="requires a nonblank base_image"):
-        build_coding_image._configuration()
+        build_coding_image._configuration(
+            json.dumps(configuration, sort_keys=True).encode("utf-8")
+        )
+
+
+def test_image_receipt_requires_current_complete_builtin_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt_path = tmp_path / "docker-coding-image.json"
+    receipt = {
+        "schema_version": "3",
+        "reference": "generated-coding:test",
+        "content_digest": _IMAGE_ID,
+        "profile_id": composition._PYTHON_TOOLCHAIN_PROFILE_ID,
+        "profile_revision": composition._PYTHON_TOOLCHAIN_PROFILE_REVISION,
+        "platform_architecture": "amd64",
+        "dependency_inputs": [
+            {"path": path, "content_sha256": "sha256:" + ("b" * 64)}
+            for path in composition._PYTHON_TOOLCHAIN_DEPENDENCY_PATHS
+        ],
+        "trusted_build_context_sha256": "sha256:" + ("c" * 64),
+    }
+    monkeypatch.setattr(composition, "_DOCKER_IMAGE_CONFIGURATION", receipt_path)
+
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    profile = composition._read_docker_toolchain_profile()
+    assert tuple(item.path for item in profile.dependency_inputs) == (
+        composition._PYTHON_TOOLCHAIN_DEPENDENCY_PATHS
+    )
+
+    receipt_path.write_text(
+        json.dumps({**receipt, "schema_version": "2"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="current schema version 3"):
+        composition._read_docker_toolchain_profile()
+
+    receipt_path.write_text(
+        json.dumps({**receipt, "dependency_inputs": []}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="invalid toolchain identity"):
+        composition._read_docker_toolchain_profile()
 
 
 def test_exact_check_policy_denies_changed_argv(
@@ -3091,6 +4034,14 @@ def test_docker_diagnostics_fail_before_provider_request(
             workspace_root=_repository(tmp_path / "source"),
         )
     assert provider.requests == []
+
+
+def test_coding_product_rejects_a_dirty_source_baseline(tmp_path: Path) -> None:
+    source = _repository(tmp_path / "dirty-source")
+    (source / "dirty.txt").write_text("not admitted\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="clean committed Git source baseline"):
+        composition.observe_clean_coding_product_git_baseline(source)
 
 
 class _LocalDockerRunner(DockerRunner):
@@ -3256,16 +4207,52 @@ class _RepairProvider(ModelProvider):
             ("git_changes", {"mode": "diff", "scope": "unstaged"}),
             ("read_file", {"path": "calc.py"}),
             (
-                "edit_file",
+                "apply_patch",
                 {
-                    "path": "calc.py",
-                    "expected_revision": "sha256:"
-                    + hashlib.sha256(failing).hexdigest(),
-                    "edits": [{"old_text": "return a - b", "new_text": "return a + b"}],
+                    "operations": [
+                        {
+                            "type": "update",
+                            "path": "calc.py",
+                            "expected_revision": "sha256:"
+                            + hashlib.sha256(failing).hexdigest(),
+                            "edits": [
+                                {"old_text": "return a - b", "new_text": "return a + b"}
+                            ],
+                        },
+                        {
+                            "type": "update",
+                            "path": "example.py",
+                            "expected_revision": "sha256:"
+                            + hashlib.sha256(b"VALUE = 1\n").hexdigest(),
+                            "edits": [{"old_text": "VALUE = 1", "new_text": "VALUE = 2"}],
+                        },
+                        {
+                            "type": "create",
+                            "path": "created.txt",
+                            "content": "created by coherent patch\n",
+                        },
+                        {
+                            "type": "move",
+                            "from_path": "legacy.txt",
+                            "to_path": "current.txt",
+                            "expected_revision": "sha256:"
+                            + hashlib.sha256(b"legacy\n").hexdigest(),
+                        },
+                        {
+                            "type": "delete",
+                            "path": "obsolete.txt",
+                            "expected_revision": "sha256:"
+                            + hashlib.sha256(b"obsolete\n").hexdigest(),
+                        },
+                    ]
                 },
             ),
+            ("run_check", {"check": "format"}),
+            ("run_check", {"check": "lint"}),
             ("run_check", {"check": "test"}),
-            ("git_changes", {"mode": "diff", "scope": "unstaged"}),
+            ("git_changes", {"mode": "status", "scope": "all"}),
+            ("git_changes", {"mode": "summary", "scope": "all"}),
+            ("git_changes", {"mode": "diff", "scope": "all"}),
         )
         self.step = 0
 
@@ -3290,21 +4277,12 @@ class _RepairProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
-def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
-    tmp_path: Path,
+def _install_fake_docker_factory(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    target: Path,
+    created_runners: list[_LocalDockerRunner],
 ) -> None:
-    _admit_test_image(monkeypatch)
-    source = _repository(tmp_path / "source")
-    original = b"def add(a, b):\n    raise NotImplementedError\n"
-    failing = b"def add(a, b):\n    return a - b\n"
-    repaired = b"def add(a, b):\n    return a + b\n"
-    (source / "calc.py").write_bytes(original)
-    git_head_before = (source / ".git" / "HEAD").read_bytes()
-    target = tmp_path / "target"
-    target.mkdir()
-    created_runners: list[_LocalDockerRunner] = []
-
     async def fake_create(factory, request):
         candidate = _live_candidate(factory)
         runner = _LocalDockerRunner(target, candidate)
@@ -3313,16 +4291,12 @@ def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
             runner,
             workspace_id="generated-docker-target",
             python_executable=sys.executable,
-            excluded_directory_names=(".cayu", ".git", ".runtime"),
+            excluded_directory_names=factory.source_workspace.excluded_directory_names,
+            excluded_path_patterns=factory.source_workspace.excluded_path_patterns,
         )
-        binding = DockerCodingWorkspaceBinding(
+        binding = factory.create_workspace_binding(
+            request,
             target_workspace=workspace,
-            limits=DockerWorkspaceTransferLimits(
-                max_files=100,
-                max_file_bytes=1024 * 1024,
-                max_total_bytes=4 * 1024 * 1024,
-                max_archive_bytes=8 * 1024 * 1024,
-            ),
         )
         environment = Environment(
             EnvironmentSpec(
@@ -3345,6 +4319,30 @@ def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
         )
 
     monkeypatch.setattr(DockerCodingEnvironmentFactory, "create", fake_create)
+
+
+def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _admit_test_image(monkeypatch)
+    source = _repository(tmp_path / "source")
+    original = b"def add(a, b):\n    raise NotImplementedError\n"
+    failing = b"def add(a, b):\n    return a - b\n"
+    repaired = b"def add(a, b):\n    return a + b\n"
+    (source / "calc.py").write_bytes(original)
+    (source / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+    (source / "obsolete.txt").write_text("obsolete\n", encoding="utf-8")
+    _commit_repository(source, "coding scenario baseline")
+    git_head_before = (source / ".git" / "HEAD").read_bytes()
+    target = tmp_path / "target"
+    target.mkdir()
+    created_runners: list[_LocalDockerRunner] = []
+    _install_fake_docker_factory(
+        monkeypatch,
+        target=target,
+        created_runners=created_runners,
+    )
     provider = _RepairProvider(original, failing)
     app = build_app(
         provider=provider,
@@ -3382,8 +4380,13 @@ def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
     assert results["run_command"][0]["structured"]["exit_code"] == 1
     assert results["run_command"][0]["structured"]["toolchain_profile_id"]
     assert "return a - b" in results["git_changes"][0]["content"]
-    assert "return a + b" in results["git_changes"][1]["content"]
+    assert "return a + b" in results["git_changes"][-1]["content"]
     assert (source / "calc.py").read_bytes() == repaired
+    assert (source / "example.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (source / "created.txt").is_file()
+    assert (source / "current.txt").is_file()
+    assert not (source / "legacy.txt").exists()
+    assert not (source / "obsolete.txt").exists()
     assert (source / ".git" / "HEAD").read_bytes() == git_head_before
     assert created_runners
 
@@ -3399,6 +4402,121 @@ def test_fake_provider_edit_fail_inspect_repair_pass_and_copy_back(
     )
     assert '"status":"failed"'.replace(" ", "") in request_record.replace(" ", "")
     assert '"status":"passed"'.replace(" ", "") in request_record.replace(" ", "")
+
+
+@pytest.mark.parametrize("custom_profile", [False, True])
+def test_public_coding_product_path_reaches_patch_ready_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    custom_profile: bool,
+) -> None:
+    _admit_test_image(monkeypatch, custom_profile=custom_profile)
+    source = _repository(tmp_path / "product-source")
+    original = b"def add(a, b):\n    raise NotImplementedError\n"
+    failing = b"def add(a, b):\n    return a - b\n"
+    repaired = b"def add(a, b):\n    return a + b\n"
+    (source / "calc.py").write_bytes(original)
+    (source / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+    (source / "obsolete.txt").write_text("obsolete\n", encoding="utf-8")
+    _commit_repository(source, "coding product baseline")
+    target = tmp_path / "product-target"
+    target.mkdir()
+    created_runners: list[_LocalDockerRunner] = []
+    _install_fake_docker_factory(
+        monkeypatch,
+        target=target,
+        created_runners=created_runners,
+    )
+    provider = _RepairProvider(original, failing)
+    product = build_coding_product_application(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+        workspace_root=source,
+        artifact_store=LocalArtifactStore(
+            tmp_path / "product-artifacts",
+            store_id=f"product-artifacts-{custom_profile}",
+        ),
+    )
+    event_loop_thread = threading.get_ident()
+    workflow_globals = type(product).run.__globals__
+    observed_git_threads: list[int] = []
+    validated_git_threads: list[int] = []
+    observe_git_baseline = workflow_globals["observe_clean_coding_product_git_baseline"]
+    validate_git_authority = workflow_globals["require_coding_product_git_authority"]
+
+    def observe_git_off_loop(root: Path) -> CodingGitBaselineAuthority:
+        observed_git_threads.append(threading.get_ident())
+        return observe_git_baseline(root)
+
+    def validate_git_off_loop(
+        root: Path,
+        expected: CodingGitBaselineAuthority,
+    ) -> None:
+        validated_git_threads.append(threading.get_ident())
+        return validate_git_authority(root, expected)
+
+    monkeypatch.setitem(
+        workflow_globals,
+        "observe_clean_coding_product_git_baseline",
+        observe_git_off_loop,
+    )
+    monkeypatch.setitem(
+        workflow_globals,
+        "require_coding_product_git_authority",
+        validate_git_off_loop,
+    )
+    task = CodingProductTask(
+        product_run_id=f"generated-product-{custom_profile}",
+        session_id=f"generated-product-session-{custom_profile}",
+        task_id=f"generated-product-task-{custom_profile}",
+        instruction="Repair the generated example and retain final evidence.",
+    )
+
+    publication = asyncio.run(product.run(task))
+    provider_request_count = len(provider.requests)
+    recovered = asyncio.run(product.run(task))
+    assert asyncio.run(product.app.drain_environment_cleanups()) is True
+
+    assert (
+        publication.candidate.state is CodingProductState.PATCH_READY_FOR_DELIVERY
+    ), publication.candidate.model_dump_json(indent=2)
+    assert publication.candidate.external_delivery_performed is False
+    assert publication.candidate.git_status is not None
+    assert publication.candidate.git_summary is not None
+    assert publication.candidate.git is not None
+    retained_diff = asyncio.run(
+        product.artifact_store.read_bytes(publication.candidate.git.artifact.artifact_id)
+    )
+    assert b"+created by coherent patch" in retained_diff.content
+    assert publication.candidate.publication.outcome == "copied"
+    assert publication.candidate.initial_git.clean is True
+    assert {check.check for check in publication.candidate.checks} == {
+        "format",
+        "lint",
+        "test",
+    }
+    assert publication.candidate.runtime.toolchain_profile_id == (
+        "generated-custom-toolchain" if custom_profile else "__PROJECT_NAME__-python"
+    )
+    if custom_profile:
+        custom_commands = {
+            authority.selector: authority
+            for authority in product.toolchain_profile.command_authorities
+        }
+        assert "python-version" in custom_commands
+        assert custom_commands["repository-version"].executable == "/usr/bin/git"
+    assert recovered == publication
+    assert len(provider.requests) == provider_request_count
+    assert (source / "calc.py").read_bytes() == repaired
+    assert (source / "created.txt").is_file()
+    assert (source / "current.txt").is_file()
+    assert not (source / "obsolete.txt").exists()
+    assert created_runners
+    assert observed_git_threads
+    assert validated_git_threads
+    assert all(thread_id != event_loop_thread for thread_id in observed_git_threads)
+    assert all(thread_id != event_loop_thread for thread_id in validated_git_threads)
 
 
 async def _collect(events):
@@ -4398,7 +5516,11 @@ def _coding_app_source(source: str, *, app_build: str = _APP_BUILD) -> str:
 def _docker_composition_source(source: str) -> str:
     source = source.replace(
         "import os\n",
-        "import json\nimport os\nimport re\nfrom typing import Literal\n",
+        (
+            "import json\nimport os\nimport re\n"
+            "from dataclasses import dataclass\n"
+            "from typing import Literal\n"
+        ),
         1,
     )
     source = source.replace("    Environment,\n", "", 1)
@@ -4476,7 +5598,16 @@ def _docker_composition_source(source: str) -> str:
 
 
 def _docker_coding_app_source(source: str) -> str:
-    return _coding_app_source(source, app_build=_DOCKER_APP_BUILD)
+    rendered = _coding_app_source(source, app_build=_DOCKER_APP_BUILD)
+    rendered = rendered.replace(
+        "from operations.coding import build_coding_app\n",
+        (
+            "from operations.coding import build_coding_app, build_coding_composition\n"
+            "from workflows.coding_product import CodingProductApplication\n"
+        ),
+        1,
+    )
+    return rendered
 
 
 def _coding_readme_source(source: str) -> str:
@@ -4518,6 +5649,7 @@ def coding_project_files(
     render: Callable[[str], str],
     execution: str | None = None,
     toolchain: str | None = None,
+    command_authority: str | None = None,
     database: str = "sqlite",
 ) -> dict[str, str]:
     """Return the explicit overlay for the opt-in coding composition."""
@@ -4526,8 +5658,12 @@ def coding_project_files(
         raise ValueError("coding execution must be 'docker' or omitted.")
     if toolchain is not None and execution != "docker":
         raise ValueError("coding toolchain requires Docker execution.")
+    if command_authority is not None and execution != "docker":
+        raise ValueError("coding command authority requires Docker execution.")
     if toolchain not in {None, "python"}:
         raise ValueError("coding toolchain must be 'python' or omitted.")
+    if command_authority not in {None, "structured"}:
+        raise ValueError("coding command authority must be 'structured' or omitted.")
     if database not in {"sqlite", "postgres"}:
         raise ValueError("coding database must be 'sqlite' or 'postgres'.")
     coding_storage = (
@@ -4574,11 +5710,13 @@ def coding_project_files(
         "docker-coding-image.json": render(_DOCKER_IMAGE_CONFIG),
         "build_coding_image.py": render(_DOCKER_BUILD_IMAGE_PY),
         "app.py": _docker_coding_app_source(files["app.py"]),
-        "composition.py": _CODING_COMPOSITION_COMPAT_PY,
+        "composition.py": _DOCKER_CODING_COMPOSITION_COMPAT_PY,
         "configuration/coding_storage.py": coding_storage,
         "environments/command_probe.py": render(_COMMAND_PROBE_PY),
         "environments/coding.py": _CODING_ENVIRONMENT_PY,
         "operations/coding.py": render(_docker_composition_source(_COMPOSITION_PY)),
+        "domain/coding_product.py": _CODING_PRODUCT_DOMAIN_PY,
+        "workflows/coding_product.py": _CODING_PRODUCT_WORKFLOW_PY,
         "operations/delegation.py": _CODING_DELEGATION_PY,
         "knowledge/coding.py": _CODING_KNOWLEDGE_PY,
         "policies/coding.py": _CODING_POLICY_PY,

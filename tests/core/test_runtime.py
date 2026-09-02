@@ -51,6 +51,7 @@ import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
 from cayu._exception_groups import iter_exception_tree
+from cayu._validation import canonical_durable_json_bytes
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     FileAttachmentKind,
@@ -88,6 +89,7 @@ from cayu.environments import (
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
+    SyncBinding,
     WorkspaceBinding,
     WorkspaceInstructionsConfig,
     WorkspaceSnapshot,
@@ -7689,6 +7691,158 @@ def test_cayu_app_binding_events_include_workspace_snapshots(tmp_path):
         "metadata": final_snapshot.metadata,
     }
     assert binding.finalize_calls[0]["bound"].snapshot == bind_snapshot
+
+
+def test_source_publication_receipt_is_integrity_linked_to_exact_sync_workspaces():
+    source = MemoryWorkspace("source")
+    target = MemoryWorkspace("target")
+    binding = SyncBinding(
+        target_workspace=target,
+        max_file_bytes=1024,
+        max_total_bytes=4096,
+        source_conflict_policy="require_revision",
+    )
+    snapshot = WorkspaceSnapshot(
+        snapshot_id="snapshot-publication",
+        workspace_id=source.id,
+        version="revision-final",
+        source="sync",
+        metadata={
+            "target_workspace_id": target.id,
+            "outcome": "completed",
+            "source_conflict_policy": "require_revision",
+            "sync_back": "always",
+            "delete_missing": True,
+            "copied_files": 2,
+            "copied_bytes": 32,
+            "deleted_files": 1,
+        },
+    )
+
+    receipt = environment_lifecycle_module._source_publication_receipt_payload(
+        snapshot,
+        binding=binding,
+        destination_workspace_id=source.id,
+        workload_workspace_id=target.id,
+        expected_destination_workspace_id=source.id,
+        expected_workload_workspace_id=target.id,
+    )
+
+    assert receipt is not None
+    material = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    assert (
+        receipt["receipt_sha256"]
+        == "sha256:"
+        + hashlib.sha256(
+            canonical_durable_json_bytes(material, "source_publication_receipt")
+        ).hexdigest()
+    )
+    snapshot_material = {
+        "schema": "cayu.source_publication_snapshot.v1",
+        "destination_workspace_id": source.id,
+        "workload_workspace_id": target.id,
+        "source": "sync",
+        "outcome": "completed",
+        "source_conflict_policy": "require_revision",
+        "sync_back": "always",
+        "delete_missing": True,
+        "copied_files": 2,
+        "copied_bytes": 32,
+        "deleted_files": 1,
+    }
+    assert (
+        receipt["snapshot_sha256"]
+        == "sha256:"
+        + hashlib.sha256(
+            canonical_durable_json_bytes(
+                snapshot_material,
+                "source_publication_snapshot",
+            )
+        ).hexdigest()
+    )
+    assert receipt["destination_workspace_id"] == source.id
+    assert receipt["workload_workspace_id"] == target.id
+    assert (
+        environment_lifecycle_module._source_publication_receipt_payload(
+            WorkspaceSnapshot(
+                snapshot_id=snapshot.snapshot_id,
+                workspace_id="other-source",
+                version=snapshot.version,
+                source=snapshot.source,
+                metadata=snapshot.metadata,
+            ),
+            binding=binding,
+            destination_workspace_id=source.id,
+            workload_workspace_id=target.id,
+            expected_destination_workspace_id=source.id,
+            expected_workload_workspace_id=target.id,
+        )
+        is None
+    )
+
+
+def test_final_git_receipt_rejects_non_docker_sync_binding_authority():
+    source = MemoryWorkspace("source")
+    target = MemoryWorkspace("target")
+
+    class ForgingSyncBinding(SyncBinding):
+        pass
+
+    binding = ForgingSyncBinding(
+        target_workspace=target,
+        max_file_bytes=1024,
+        max_total_bytes=4096,
+        source_conflict_policy="require_revision",
+    )
+    base_result = {
+        "scope": "all",
+        "changes": [],
+        "returned": 0,
+        "offset": 0,
+        "limit": 200,
+        "truncated": False,
+        "truncation_reasons": [],
+        "next_offset": None,
+    }
+    snapshot = WorkspaceSnapshot(
+        snapshot_id="forged-final-git",
+        workspace_id=source.id,
+        version="sha256:" + "c" * 64,
+        source="sync",
+        metadata={
+            "target_workspace_id": target.id,
+            "final_git_evidence": {
+                "request_fingerprint": "sha256:" + "a" * 64,
+                "source_workspace_id": source.id,
+                "baseline_revision": "sha256:" + "b" * 64,
+                "workspace_revision": "sha256:" + "c" * 64,
+                "status": {"structured": {**base_result, "mode": "status"}},
+                "summary": {"structured": {**base_result, "mode": "summary"}},
+                "diff": {
+                    "content": "No textual diff for the selected changes.",
+                    "structured": {
+                        **base_result,
+                        "mode": "diff",
+                        "diff_offset": 0,
+                        "next_diff_offset": None,
+                        "binary_omitted": False,
+                    },
+                },
+            },
+        },
+    )
+
+    assert (
+        environment_lifecycle_module._final_git_receipt_payload(
+            snapshot,
+            binding=binding,
+            destination_workspace_id=source.id,
+            workload_workspace_id=target.id,
+            expected_destination_workspace_id=source.id,
+            expected_workload_workspace_id=target.id,
+        )
+        is None
+    )
 
 
 def test_cayu_app_binding_failure_fails_session_before_start_event():

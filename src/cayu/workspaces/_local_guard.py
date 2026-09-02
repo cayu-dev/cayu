@@ -23,6 +23,7 @@ from typing import BinaryIO, NoReturn
 
 from cayu.workspaces._mutations import move_result_from_identity
 from cayu.workspaces.base import (
+    WorkspaceGitModeMismatchError,
     WorkspaceMoveAmbiguousError,
     WorkspaceMoveResult,
     WorkspaceMoveUnsupportedError,
@@ -466,11 +467,12 @@ def create_regular(
     relative_path: str,
     content: bytes,
     *,
+    mode: int | None = None,
     staging_name: str | None = None,
 ) -> None:
     try:
         with _open_parent(root, relative_path, create=True) as (parent_fd, name):
-            _create_at(parent_fd, name, content, staging_name=staging_name)
+            _create_at(parent_fd, name, content, mode=mode, staging_name=staging_name)
     except _LocalGuardPathError as exc:
         _raise_workspace_path_error(exc, relative_path)
 
@@ -591,6 +593,8 @@ def replace_regular_if_revision(
     content: bytes,
     expected_revision: str,
     *,
+    expected_git_mode: int | None = None,
+    replacement_mode: int | None = None,
     staging_name: str | None = None,
 ) -> tuple[str, str, int]:
     try:
@@ -598,11 +602,18 @@ def replace_regular_if_revision(
             before, mode = _identity_at(parent_fd, name)
             if before[0] != expected_revision:
                 raise WorkspaceRevisionMismatchError(expected_revision, before[0])
+            if expected_git_mode is not None and bool(mode & 0o111) != bool(
+                expected_git_mode & 0o111
+            ):
+                raise WorkspaceGitModeMismatchError(
+                    "100755" if expected_git_mode & 0o111 else "100644",
+                    "100755" if mode & 0o111 else "100644",
+                )
             _replace_at(
                 parent_fd,
                 name,
                 content,
-                mode=mode,
+                mode=mode if replacement_mode is None else replacement_mode,
                 staging_name=staging_name,
             )
             return before

@@ -4,7 +4,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from itertools import islice
-from typing import TypeVar
+from time import perf_counter_ns
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -35,9 +36,18 @@ from cayu.tools.commands import (
     CommandPolicy,
     ExecCommandTool,
 )
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservation,
+    WorkspaceRevisionObservationLimits,
+    WorkspaceRevisionObservationStatus,
+    observe_deterministic_workspace,
+)
+
+if TYPE_CHECKING:
+    from cayu.workspaces.base import Workspace
 
 NAMED_CHECK_DECLARATION_BEHAVIOR_VERSION = "1"
-RUN_CHECK_RESULT_PROJECTION_VERSION = "1"
+RUN_CHECK_RESULT_PROJECTION_VERSION = "4"
 DEFAULT_CHECK_MODEL_OUTPUT_BYTES = 16_000
 MAX_CHECK_MODEL_OUTPUT_BYTES = 50_000
 MAX_NAMED_CHECKS = 128
@@ -177,6 +187,7 @@ class RunCheckTool(Tool):
         command_policy: CommandPolicy,
         max_model_output_bytes: int = DEFAULT_CHECK_MODEL_OUTPUT_BYTES,
         toolchain_profile: DockerCodingToolchainProfile | None = None,
+        workspace_observation_limits: WorkspaceRevisionObservationLimits | None = None,
     ) -> None:
         if isinstance(checks, str | bytes):
             raise TypeError("checks must be an iterable of NamedCheck declarations.")
@@ -241,6 +252,16 @@ class RunCheckTool(Tool):
         self._executor = ExecCommandTool(policy=command_policy)
         self._max_model_output_bytes = owned_model_limit
         self._toolchain_profile = owned_toolchain
+        if (
+            workspace_observation_limits is not None
+            and type(workspace_observation_limits) is not WorkspaceRevisionObservationLimits
+        ):
+            raise TypeError(
+                "workspace_observation_limits must be WorkspaceRevisionObservationLimits or None."
+            )
+        self._workspace_observation_limits = (
+            workspace_observation_limits or WorkspaceRevisionObservationLimits()
+        )
 
     @property
     def checks(self) -> tuple[NamedCheck, ...]:
@@ -268,6 +289,9 @@ class RunCheckTool(Tool):
         material: dict[str, object] = {
             "result_projection_version": RUN_CHECK_RESULT_PROJECTION_VERSION,
             "max_model_output_bytes": self._max_model_output_bytes,
+            "workspace_observation_limits": self._workspace_observation_limits.model_dump(
+                mode="json"
+            ),
             "checks": [check._profile_material() for check in self._checks],
         }
         if self._toolchain_profile is not None:
@@ -287,6 +311,8 @@ class RunCheckTool(Tool):
             check = self._checks_by_name.get(check_name)
             if check is None:
                 raise ValueError("Tool argument `check` must name a declared check.")
+        started_ns = perf_counter_ns()
+        dependency_sensitive = False
 
         if self._toolchain_profile is not None:
             runner_failure = docker_coding_toolchain_runner_admission_failure(
@@ -294,7 +320,7 @@ class RunCheckTool(Tool):
                 profile=self._toolchain_profile,
             )
             if runner_failure is not None:
-                return self._attach_toolchain_evidence(
+                return self._complete_result(
                     check,
                     ToolResult(
                         content=(
@@ -306,9 +332,10 @@ class RunCheckTool(Tool):
                         },
                         is_error=True,
                     ),
+                    started_ns=started_ns,
                 )
             if ctx.workspace is None:
-                return self._attach_toolchain_evidence(
+                return self._complete_result(
                     check,
                     ToolResult(
                         content=f"Check {check.name!r} requires an active admitted workspace.",
@@ -318,6 +345,7 @@ class RunCheckTool(Tool):
                         },
                         is_error=True,
                     ),
+                    started_ns=started_ns,
                 )
             authority = self._toolchain_profile.command_authority(
                 check.name,
@@ -325,32 +353,18 @@ class RunCheckTool(Tool):
             )
             if authority is None:  # pragma: no cover - constructor invariant
                 raise AssertionError("Named check toolchain authority was lost.")
-            if authority.dependency_sensitive:
+            dependency_sensitive = authority.dependency_sensitive
+            if dependency_sensitive:
                 try:
                     await verify_docker_coding_toolchain_dependencies(
                         self._toolchain_profile,
                         ctx.workspace,
                     )
                 except DockerCodingToolchainError as exc:
-                    return self._attach_toolchain_evidence(
+                    return self._complete_result(
                         check,
-                        ToolResult(
-                            content=str(exc),
-                            structured={
-                                **_base_error_evidence(
-                                    check,
-                                    status=(
-                                        "stale_toolchain"
-                                        if exc.code == "dependency_inputs_changed"
-                                        else "toolchain_unavailable"
-                                    ),
-                                ),
-                                "error": exc.code,
-                                "dependency_path_count": exc.path_count,
-                                "dependency_paths_fingerprint": exc.paths_fingerprint,
-                            },
-                            is_error=True,
-                        ),
+                        _toolchain_dependency_failure_result(check, exc),
+                        started_ns=started_ns,
                     )
 
             runner_failure = docker_coding_toolchain_runner_admission_failure(
@@ -358,7 +372,7 @@ class RunCheckTool(Tool):
                 profile=self._toolchain_profile,
             )
             if runner_failure is not None:
-                return self._attach_toolchain_evidence(
+                return self._complete_result(
                     check,
                     ToolResult(
                         content=(
@@ -371,6 +385,7 @@ class RunCheckTool(Tool):
                         },
                         is_error=True,
                     ),
+                    started_ns=started_ns,
                 )
 
         try:
@@ -387,18 +402,77 @@ class RunCheckTool(Tool):
                 include_runner_evidence=True,
             )
         except RunnerExecutionError as exc:
-            return self._attach_toolchain_evidence(check, _execution_failure_result(check, exc))
+            return self._complete_result(
+                check,
+                _execution_failure_result(check, exc),
+                started_ns=started_ns,
+            )
         except TypeError as exc:
             if str(exc) != "Runner returned invalid result type.":
                 raise
-            return self._attach_toolchain_evidence(check, _malformed_execution_result(check))
+            return self._complete_result(
+                check,
+                _malformed_execution_result(check),
+                started_ns=started_ns,
+            )
+        workspace_observation: WorkspaceRevisionObservation | None = None
+        workspace = ctx.workspace
+        workspace_id = None if workspace is None else getattr(workspace, "id", None)
+        if workspace is not None and type(workspace_id) is str and workspace_id == ctx.workspace_id:
+            workspace_observation = await observe_deterministic_workspace(
+                cast("Workspace", workspace),
+                observer="cayu-run-check",
+                limits=self._workspace_observation_limits,
+            )
         try:
-            projected = await self._project_result(ctx, check=check, raw_result=raw_result)
-            return self._attach_toolchain_evidence(check, projected)
+            projected = await self._project_result(
+                ctx,
+                check=check,
+                raw_result=raw_result,
+                workspace_observation=workspace_observation,
+            )
+            if (
+                dependency_sensitive
+                and self._toolchain_profile is not None
+                and workspace is not None
+                and projected.structured is not None
+                and projected.structured.get("workspace_mutation_settlement")
+                in {"complete", "runner_quiescent"}
+            ):
+                try:
+                    await verify_docker_coding_toolchain_dependencies(
+                        self._toolchain_profile,
+                        workspace,
+                    )
+                except DockerCodingToolchainError as exc:
+                    projected = _toolchain_dependency_failure_result(
+                        check,
+                        exc,
+                        result=projected,
+                    )
+            return self._complete_result(check, projected, started_ns=started_ns)
         except TypeError as exc:
             if str(exc) != "Runner returned invalid result type.":
                 raise
-            return self._attach_toolchain_evidence(check, _malformed_execution_result(check))
+            return self._complete_result(
+                check,
+                _malformed_execution_result(check),
+                started_ns=started_ns,
+            )
+
+    def _complete_result(
+        self,
+        check: NamedCheck,
+        result: ToolResult,
+        *,
+        started_ns: int,
+    ) -> ToolResult:
+        """Attach complete bounded timing and optional toolchain authority evidence."""
+
+        structured = {} if result.structured is None else dict(result.structured)
+        structured["duration_ms"] = max(0, (perf_counter_ns() - started_ns) // 1_000_000)
+        completed = result.model_copy(update={"structured": structured})
+        return self._attach_toolchain_evidence(check, completed)
 
     def _attach_toolchain_evidence(
         self,
@@ -429,6 +503,7 @@ class RunCheckTool(Tool):
         *,
         check: NamedCheck,
         raw_result: ToolResult,
+        workspace_observation: WorkspaceRevisionObservation | None,
     ) -> ToolResult:
         structured = raw_result.structured
         error = None if structured is None else structured.get("error")
@@ -491,6 +566,19 @@ class RunCheckTool(Tool):
         )
         mutation_settlement = _required_mutation_settlement(structured)
         cleanup_complete = mutation_settlement in {"complete", "runner_quiescent"}
+        workspace_observation_complete = (
+            type(workspace_observation) is WorkspaceRevisionObservation
+            and workspace_observation.status is WorkspaceRevisionObservationStatus.SUPPORTED
+            and workspace_observation.path_scope == "complete"
+            and workspace_observation.revision is not None
+        )
+        workspace_observation_required = ctx.workspace is not None
+        if (
+            status == "passed"
+            and workspace_observation_required
+            and not workspace_observation_complete
+        ):
+            status = "partial"
         if status not in {"cancelled", "timed_out"}:
             if mutation_settlement == "deferred":
                 status = "partial"
@@ -519,6 +607,17 @@ class RunCheckTool(Tool):
             "output_sha256": output_sha256,
             "output_artifact_status": artifact_status,
             "workspace_mutation_settlement": mutation_settlement,
+            "workspace_observation_status": (
+                "unavailable"
+                if workspace_observation is None
+                else workspace_observation.status.value
+            ),
+            "workspace_observation_detail_code": (
+                None if workspace_observation is None else workspace_observation.detail_code
+            ),
+            "workspace_revision": (
+                None if not workspace_observation_complete else workspace_observation.revision
+            ),
             "cleanup_uncertain": mutation_settlement in {"deferred", "uncertain"},
             "artifacts": artifacts,
         }
@@ -526,6 +625,8 @@ class RunCheckTool(Tool):
             projected["error"] = "workspace_cleanup_deferred"
         elif mutation_settlement == "uncertain":
             projected["error"] = "workspace_cleanup_uncertain"
+        elif workspace_observation_required and not workspace_observation_complete:
+            projected["error"] = "workspace_observation_incomplete"
         return ToolResult(
             content=_model_content(
                 check=check,
@@ -538,7 +639,12 @@ class RunCheckTool(Tool):
             ),
             structured=projected,
             artifacts=artifacts,
-            is_error=timed_out or cancelled or not cleanup_complete,
+            is_error=(
+                timed_out
+                or cancelled
+                or not cleanup_complete
+                or (workspace_observation_required and not workspace_observation_complete)
+            ),
         )
 
 
@@ -753,6 +859,36 @@ def _base_error_evidence(check: NamedCheck, *, status: str) -> dict[str, object]
         "max_output_bytes": check.max_output_bytes,
         "required_executables": list(check.required_executables),
     }
+
+
+def _toolchain_dependency_failure_result(
+    check: NamedCheck,
+    exc: DockerCodingToolchainError,
+    *,
+    result: ToolResult | None = None,
+) -> ToolResult:
+    status = (
+        "stale_toolchain" if exc.code == "dependency_inputs_changed" else "toolchain_unavailable"
+    )
+    structured = (
+        _base_error_evidence(check, status=status)
+        if result is None or result.structured is None
+        else dict(result.structured)
+    )
+    structured.update(
+        {
+            "status": status,
+            "error": exc.code,
+            "dependency_path_count": exc.path_count,
+            "dependency_paths_fingerprint": exc.paths_fingerprint,
+        }
+    )
+    return ToolResult(
+        content=str(exc),
+        structured=structured,
+        artifacts=[] if result is None else result.artifacts,
+        is_error=True,
+    )
 
 
 def _policy_result(check: NamedCheck, raw_result: ToolResult, *, status: str) -> ToolResult:

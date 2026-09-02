@@ -3536,6 +3536,14 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
             "DockerCodingToolchainProfile values in environments/coding.py."
         ),
     )
+    parser.add_argument(
+        "--coding-command-authority",
+        choices=("structured",),
+        help=(
+            "Model-facing command authority for Docker coding. The maintained "
+            "surface accepts only application-owned structured selectors."
+        ),
+    )
 
 
 def _installed_cayu_version() -> str:
@@ -3551,6 +3559,7 @@ def project_files(
     composition: str | None = None,
     coding_execution: str | None = None,
     coding_toolchain: str | None = None,
+    coding_command_authority: str | None = None,
     preset: str | None = None,
     database: str = "sqlite",
     execution: str | None = None,
@@ -3580,6 +3589,8 @@ def project_files(
             database=database,
             provider=provider or "neutral",
             execution=resolved_execution,
+            coding_toolchain=coding_toolchain,
+            coding_command_authority=coding_command_authority,
             with_capabilities=with_capabilities,
             without_capabilities=without_capabilities,
             minimal=minimal,
@@ -3590,6 +3601,15 @@ def project_files(
     template = plan.template_alias
     composition = plan.composition_alias
     coding_execution = plan.execution_alias
+    if coding_toolchain is not None and coding_toolchain != plan.coding_toolchain:
+        raise ValueError("coding_toolchain conflicts with the normalized plan.")
+    if (
+        coding_command_authority is not None
+        and coding_command_authority != plan.coding_command_authority
+    ):
+        raise ValueError("coding_command_authority conflicts with the normalized plan.")
+    coding_toolchain = plan.coding_toolchain
+    coding_command_authority = plan.coding_command_authority
     reviewer_name = f"{resolved_agent_name}-reviewer"
 
     def render(template: str) -> str:
@@ -3682,6 +3702,8 @@ def project_files(
         raise ValueError("coding_execution requires composition='coding'.")
     if coding_toolchain is not None and coding_execution != "docker":
         raise ValueError("coding_toolchain requires coding_execution='docker'.")
+    if coding_command_authority is not None and coding_execution != "docker":
+        raise ValueError("coding_command_authority requires coding_execution='docker'.")
     if plan.database == "postgres":
         files["pyproject.toml"] = (
             files["pyproject.toml"]
@@ -3707,6 +3729,7 @@ def project_files(
                 render=render,
                 execution=coding_execution,
                 toolchain=coding_toolchain,
+                command_authority=coding_command_authority,
                 database=plan.database,
             )
         )
@@ -3864,6 +3887,11 @@ def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan
             "coding_toolchain_requires_docker",
             "--coding-toolchain requires --execution docker",
         )
+    if args.coding_command_authority is not None and execution != "docker":
+        raise ScaffoldPlanError(
+            "coding_command_authority_requires_docker",
+            "--coding-command-authority requires --execution docker",
+        )
     agent_name = name if args.agent_name is None else args.agent_name
     return normalize_application_plan(
         name=name,
@@ -3872,6 +3900,8 @@ def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan
         database=args.database,
         provider=args.provider or "neutral",
         execution=execution,
+        coding_toolchain=args.coding_toolchain,
+        coding_command_authority=args.coding_command_authority,
         with_capabilities=tuple(args.with_capabilities),
         without_capabilities=tuple(args.without_capabilities),
         minimal=args.minimal,
@@ -3888,6 +3918,8 @@ def _agent_context(plan: ApplicationPlan) -> dict[str, object]:
             "database": plan.database,
             "provider": plan.provider,
             "execution": plan.execution,
+            "coding_toolchain": plan.coding_toolchain,
+            "coding_command_authority": plan.coding_command_authority,
             "capabilities": list(plan.capabilities),
         },
         "authoring_map": "uv run --no-sync cayu guide authoring#cayu-map --json",
@@ -4141,6 +4173,7 @@ def run_new(args: argparse.Namespace) -> int:
         files = project_files(
             name,
             coding_toolchain=args.coding_toolchain,
+            coding_command_authority=args.coding_command_authority,
             application_plan=plan,
         )
     except (ScaffoldPlanError, ValueError) as exc:

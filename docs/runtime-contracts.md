@@ -1671,6 +1671,13 @@ Virtual-egress finalization fences new managed command dispatch before its first
 
 Each `SyncBinding` generation captures both the source and target stable resource keys. Finalization, abandonment, deferred release, and mutation-quiescence queries require the supplied bound resources to match those keys before any state transition, workspace mutation, or release.
 
+Successful sync finalization also owns `source_conflict_policy`, `sync_back`,
+and `delete_missing` in its final snapshot metadata. The runtime derives a
+bounded, integrity-linked source-publication receipt from those fixed policy
+values, public source/workload workspace identities, copy/delete counts, and a
+digest of that secret-free settlement snapshot; a dynamic-secret environment
+may suppress the raw private snapshot without suppressing this evidence.
+
 Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positive limit no larger than the caller's hard ceiling or the backend's own default policy. This separate composition hook prevents a safety caller from accidentally increasing a custom backend's ordinary read allowance. Bulk tar export and import are independent nominal contracts. A `BoundedTarReader` implementation must reject logical or conservative raw-archive overflow before allocating or materializing the archive; a `TarWriter` imports caller-validated uncompressed tar bytes. Merely exposing methods with matching names is not sufficient. `RunnerWorkspace` implements both contracts, preflights guest file sizes before allocating its tar buffer, and sizes its runner output allowance from the enforced raw archive ceiling.
 
 `GitRepositoryBinding` is the built-in Git checkout binding. It requires a `LocalWorkspace` or a `RunnerWorkspace` because cloning and fetching require running the `git` executable. For E2B, Microsandbox, and Docker command runners, wrap the runner with `RunnerWorkspace` when the repo should be cloned inside the selected runner environment. On bind, Cayu clones into an empty workspace or fetches an existing Git work tree, verifies the configured remote URL by default, refuses dirty existing repositories by default, checks out the requested ref, fast-forwards to the fetched remote branch when possible, and records repo/ref/branch/commit/dirty metadata in `bound.metadata["git_repository"]` and the bound snapshot. An existing repository without an initial commit is represented with `commit=null` and a snapshot whose `version` is `None`; binding, finalization, and revision observation do not manufacture a commit. It does not merge, rebase, or rewrite divergent clean branches; Git failures in those cases are surfaced so the app or agent can decide how to proceed. On finalize, Cayu records the final commit and dirty state in a final Git `WorkspaceSnapshot`. The binding never commits, pushes, creates branches, or creates pull requests; those are explicit agent/tool or trusted app workflows. Because `repo_url` is durable metadata, HTTP(S) URLs with embedded credentials are rejected; private repository access should use trusted app setup, SSH agent configuration, or a credential helper outside the persisted URL. For untrusted sandbox runners, do not expose long-lived Git credentials through generic shell access; use public repositories, trusted host-side credentials, or a dedicated brokered Git tool. App-provided binding metadata must not use the reserved `git_repository` key.
@@ -8287,6 +8294,54 @@ paths; no successful final snapshot is emitted. Cancellation and other
 supervisory process-control exceptions propagate after the dispatched mutation
 is fenced and are never reclassified as source conflicts. Guest Git metadata
 and the other protected directories are never copied back.
+
+### Maintained coding-product settlement
+
+`CodingProductRunner` is the product layer above an ordinary Cayu app and the
+Docker coding composition. `admit_coding_product_request(...)` observes a
+complete bounded source baseline and returns exact `CodingProductRequest`
+authority over source, task input, runtime identity, and settlement policy. The
+artifact repository publishes that authority immutably before lifecycle work.
+Applications obtain the exact initial execution-profile fingerprint through
+`CayuApp.inspect_run_execution_profile(request)`. Inspection runs the ordinary
+read-only initial preflights without admitting a session or dispatching provider,
+tool, hook, or environment-factory work.
+
+`CodingProductArtifactRepository` stores append-only lifecycle receipts,
+complete bounded source observations, final Git diff bytes, and the terminal
+content-addressed candidate. Before session dispatch, it atomically creates one
+deterministic execution-claim artifact for the product run. Concurrent callers
+therefore cross one compare-and-swap boundary: exactly one caller may proceed,
+and a loser cannot append lifecycle state to the winner. Terminal recovery is
+resolved before this claim and still returns the existing publication.
+`register_coding_product_contract(...)` publishes
+the matching `WorkContract` and registers a deterministic verifier and result
+resolver. The verifier accepts only `patch_ready_for_delivery` with exact
+request/runtime authority, one passing settled receipt for every required named
+check against the final workspace revision, settled mutations, an integrity-linked
+runtime-owned revision-aware source-publication receipt, complete final source
+identity, complete non-omitted Git evidence, and configured reviewer and human
+settlement. Model text and successful tool dispatch are not approval
+authority. Core candidates always assert that external delivery was not
+performed.
+
+The Docker binding re-observes the completed copy-in against the admitted source
+revision, closing the observation-to-copy race. At finalization it rejects
+mutated ephemeral Git `HEAD`, index entries, or tracked-file flags and captures
+bounded status, summary, and exact textual diff bytes itself. It compares that
+evidence with the exact byte-level workspace delta and marks the result partial
+when Git attributes or another projection leaves a copied path unrepresented.
+The runtime seals that evidence and its digest into the finalization receipt only
+for the exact Docker coding binding. Model-invoked Git events cannot replace it;
+public-event redaction invalidates the retained digest and forces reconstruction
+rather than silently changing patch evidence.
+
+Lifecycle recovery returns an existing content-addressed terminal publication
+when its receipt and request authority match. It does not blindly replay active,
+partial, ambiguous, or acknowledgement-uncertain work. Missing or conflicting
+evidence transitions to `reconstruction_required`; baseline drift is a source
+conflict. The complete state vocabulary and generated application ownership are
+documented in [Maintained coding product](coding-product.md).
 
 An isolation boundary separates guest execution from the host or control
 plane. Network denial restricts reachable destinations but does not itself

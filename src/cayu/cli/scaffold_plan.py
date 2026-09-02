@@ -22,6 +22,8 @@ ProviderName = Literal[
     "openai-subscription",
 ]
 ExecutionName = Literal["none", "docker"]
+CodingToolchainName = Literal["python"]
+CodingCommandAuthorityName = Literal["structured"]
 CapabilityStatus = Literal["selectable", "extension-only", "preset-owned"]
 
 
@@ -285,6 +287,8 @@ class ApplicationPlan:
     provider: ProviderName
     execution: ExecutionName
     capabilities: tuple[str, ...]
+    coding_toolchain: CodingToolchainName | None = None
+    coding_command_authority: CodingCommandAuthorityName | None = None
     minimal: bool = False
     convention: int = SCAFFOLD_CONVENTION_VERSION
 
@@ -365,6 +369,10 @@ class ApplicationPlan:
                 "provider": self.provider,
                 "execution": self.execution,
             },
+            "coding": {
+                "toolchain": self.coding_toolchain,
+                "command_authority": self.coding_command_authority,
+            },
             "capabilities": list(self.capabilities),
             "minimal": self.minimal,
             "files": list(files),
@@ -414,6 +422,8 @@ def normalize_application_plan(
     database: str = "sqlite",
     provider: str = "neutral",
     execution: str = "none",
+    coding_toolchain: str | None = None,
+    coding_command_authority: str | None = None,
     with_capabilities: tuple[str, ...] = (),
     without_capabilities: tuple[str, ...] = (),
     minimal: bool = False,
@@ -435,6 +445,34 @@ def normalize_application_plan(
             "minimal_requires_agent",
             "--minimal is supported only by the agent preset",
         )
+    if preset != "coding" and (
+        coding_toolchain is not None or coding_command_authority is not None
+    ):
+        raise ScaffoldPlanError(
+            "coding_options_require_coding",
+            "coding toolchain and command authority require the coding preset",
+        )
+    if execution != "docker" and (
+        coding_toolchain is not None or coding_command_authority is not None
+    ):
+        raise ScaffoldPlanError(
+            "coding_options_require_docker",
+            "coding toolchain and command authority require Docker execution",
+        )
+    if coding_toolchain not in {None, "python"}:
+        raise ScaffoldPlanError(
+            "unknown_coding_toolchain",
+            "coding toolchain must be 'python'",
+        )
+    if coding_command_authority not in {None, "structured"}:
+        raise ScaffoldPlanError(
+            "unknown_coding_command_authority",
+            "coding command authority must be 'structured'",
+        )
+    resolved_coding_toolchain = "python" if preset == "coding" and execution == "docker" else None
+    resolved_coding_command_authority = (
+        "structured" if preset == "coding" and execution == "docker" else None
+    )
     if minimal and database != "sqlite":
         raise ScaffoldPlanError(
             "minimal_database_unsupported",
@@ -515,6 +553,8 @@ def normalize_application_plan(
         provider=cast("ProviderName", provider_spec.name),
         execution=cast("ExecutionName", execution_spec.name),
         capabilities=tuple(sorted(capabilities)),
+        coding_toolchain=resolved_coding_toolchain,
+        coding_command_authority=resolved_coding_command_authority,
         minimal=minimal,
     )
 

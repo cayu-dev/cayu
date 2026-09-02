@@ -3,15 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from hashlib import sha256
 
 import pytest
 
+import cayu.tools.named_checks as named_checks
 from cayu import (
     REDACTED_SECRET,
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     CommandPolicyDecision,
+    DockerCodingCommandAuthority,
+    DockerCodingDependencyInput,
+    DockerCodingToolchainProfile,
+    DockerImageIdentity,
     Environment,
     EnvironmentSpec,
     EventType,
@@ -22,6 +28,7 @@ from cayu import (
     InMemorySessionStore,
     LocalArtifactStore,
     LocalRunner,
+    LocalWorkspace,
     Message,
     ModelStreamEvent,
     NamedCheck,
@@ -41,6 +48,10 @@ from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime.checks import check_manifest
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservationLimits,
+    observe_deterministic_workspace,
+)
 
 
 def _identity(name: str = "project-check") -> ExecutionProfileBehaviorIdentity:
@@ -262,6 +273,8 @@ def test_run_check_reuses_exact_command_preflight_policy_and_runner_boundary() -
     result = _run(tool, runner)
 
     assert result.structured["status"] == "passed"
+    assert type(result.structured["duration_ms"]) is int
+    assert result.structured["duration_ms"] >= 0
     assert runner.resolved == [None]
     assert len(runner.preflights) == 1
     assert len(runner.executions) == 1
@@ -278,6 +291,151 @@ def test_run_check_reuses_exact_command_preflight_policy_and_runner_boundary() -
     }
     assert preflight_options == expected_options
     assert executed_options == expected_options
+
+
+def test_run_check_binds_a_pass_to_the_complete_post_check_workspace_revision(
+    tmp_path,
+) -> None:
+    (tmp_path / "source.py").write_text("VALUE = 1\n", encoding="utf-8")
+    workspace = LocalWorkspace(tmp_path, workspace_id="check-workspace")
+    command = ExecCommand.process(sys.executable, "-c", "pass")
+    tool = RunCheckTool(
+        checks=[_check(command=command)],
+        command_policy=ProcessCommandPolicy(
+            allowed_executables=(sys.executable,),
+            allowed_cwds=(str(tmp_path),),
+        ),
+    )
+    result = asyncio.run(
+        tool.run(
+            ToolContext(
+                session_id="sess_revision_check",
+                workspace_id=workspace.id,
+                workspace=workspace,
+                runner=LocalRunner(tmp_path, inherit_env=False),
+            ),
+            {"check": "test"},
+        )
+    )
+    observed = asyncio.run(
+        observe_deterministic_workspace(
+            workspace,
+            observer="test-check-revision",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+    )
+
+    assert result.structured["status"] == "passed"
+    assert result.structured["workspace_observation_status"] == "supported"
+    assert result.structured["workspace_revision"] == observed.revision
+
+
+def test_run_check_rejects_a_pass_that_changes_toolchain_dependencies(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = tmp_path / "uv.lock"
+    lock_path.write_bytes(b"locked\n")
+    script = "from pathlib import Path; Path('uv.lock').write_bytes(b'changed\\n')"
+    authority = DockerCodingCommandAuthority(
+        selector="test",
+        revision="1",
+        description="Run a dependency-sensitive test.",
+        exposure="named_check",
+        executable=sys.executable,
+        fixed_arguments=("-c", script),
+        max_arguments=0,
+    )
+    profile = DockerCodingToolchainProfile(
+        profile_id="test-python",
+        revision="1",
+        image_identity=DockerImageIdentity(
+            reference="test-python@sha256:" + ("a" * 64),
+        ),
+        platform_architecture="arm64",
+        command_authorities=(authority,),
+        dependency_inputs=(
+            DockerCodingDependencyInput(
+                path="uv.lock",
+                content_sha256="sha256:" + sha256(b"locked\n").hexdigest(),
+            ),
+        ),
+    )
+    workspace = LocalWorkspace(tmp_path, workspace_id="dependency-check-workspace")
+    monkeypatch.setattr(
+        named_checks,
+        "docker_coding_toolchain_runner_admission_failure",
+        lambda _runner, **_kwargs: None,
+    )
+    tool = RunCheckTool(
+        checks=[
+            _check(
+                command=ExecCommand.process(*authority.command_argv()),
+            )
+        ],
+        command_policy=ProcessCommandPolicy(
+            allowed_executables=(sys.executable,),
+            allowed_cwds=(str(tmp_path),),
+        ),
+        toolchain_profile=profile,
+    )
+
+    result = asyncio.run(
+        tool.run(
+            ToolContext(
+                session_id="sess_dependency_mutating_check",
+                workspace_id=workspace.id,
+                workspace=workspace,
+                runner=LocalRunner(tmp_path, inherit_env=False),
+            ),
+            {"check": "test"},
+        )
+    )
+    observed = asyncio.run(
+        observe_deterministic_workspace(
+            workspace,
+            observer="test-check-revision",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+    )
+
+    assert lock_path.read_bytes() == b"changed\n"
+    assert result.is_error is True
+    assert result.structured["status"] == "stale_toolchain"
+    assert result.structured["error"] == "dependency_inputs_changed"
+    assert result.structured["exit_code"] == 0
+    assert result.structured["workspace_revision"] == observed.revision
+    assert result.structured["dependency_path_count"] == 1
+
+
+def test_run_check_rejects_a_mismatched_workspace_observation_identity(tmp_path) -> None:
+    workspace = LocalWorkspace(tmp_path, workspace_id="actual-workspace")
+    command = ExecCommand.process(sys.executable, "-c", "pass")
+    tool = RunCheckTool(
+        checks=[_check(command=command)],
+        command_policy=ProcessCommandPolicy(
+            allowed_executables=(sys.executable,),
+            allowed_cwds=(str(tmp_path),),
+        ),
+    )
+
+    result = asyncio.run(
+        tool.run(
+            ToolContext(
+                session_id="sess_mismatched_check_workspace",
+                workspace_id="different-workspace",
+                workspace=workspace,
+                runner=LocalRunner(tmp_path, inherit_env=False),
+            ),
+            {"check": "test"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured["status"] == "partial"
+    assert result.structured["error"] == "workspace_observation_incomplete"
+    assert result.structured["workspace_observation_status"] == "unavailable"
+    assert result.structured["workspace_revision"] is None
 
 
 @pytest.mark.parametrize(
@@ -304,6 +462,8 @@ def test_run_check_preserves_inline_command_policy_refusals(
 
     assert result.is_error is True
     assert result.structured["status"] == status
+    assert type(result.structured["duration_ms"]) is int
+    assert result.structured["duration_ms"] >= 0
     assert result.structured["error"] == error
     assert ctx._policy_denial_for(tool) is not None
     assert runner.executions == []

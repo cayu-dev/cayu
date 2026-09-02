@@ -56,6 +56,16 @@ def _git(root: Path, *args: str) -> None:
     )
 
 
+def _git_output(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
 def _repository(root: Path) -> None:
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "tests@example.com")
@@ -157,7 +167,10 @@ def test_git_changes_diff_does_not_fall_back_to_all_paths_for_an_empty_page(
 
     assert "secret change" not in past_end.content
     assert "secret change" not in untracked_only.content
-    assert untracked_only.content == "Untracked content omitted:\nuntracked.txt"
+    assert "--- /dev/null" in untracked_only.content
+    assert "+++ b/untracked.txt" in untracked_only.content
+    assert "+untracked" in untracked_only.content
+    assert untracked_only.structured["truncated"] is False
 
 
 def test_git_changes_bounds_structured_status_entries(tmp_path: Path) -> None:
@@ -651,6 +664,41 @@ def test_git_changes_diff_has_deterministic_byte_continuation(tmp_path: Path) ->
     assert second.content != first.content
 
 
+def test_git_changes_preserves_exact_staged_and_unstaged_diff_bytes(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("staged trailing spaces  \n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    tracked.write_text("unstaged trailing spaces   \n", encoding="utf-8")
+    ctx = ToolContext(session_id="session", runner=LocalRunner(tmp_path))
+    expected = _git_output(
+        tmp_path,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--cached",
+        "--unified=3",
+        "--",
+        "tracked.txt",
+    ) + _git_output(
+        tmp_path,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=3",
+        "--",
+        "tracked.txt",
+    )
+
+    result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff", "scope": "all"}))
+
+    assert result.is_error is False
+    assert result.structured["truncated"] is False
+    assert result.content == expected
+
+
 def test_git_changes_omits_forced_text_binary_diff(tmp_path: Path) -> None:
     _repository(tmp_path)
     (tmp_path / ".gitattributes").write_text("*.bin diff\n")
@@ -662,6 +710,18 @@ def test_git_changes_omits_forced_text_binary_diff(tmp_path: Path) -> None:
     ctx = ToolContext(session_id="session", runner=LocalRunner(tmp_path))
 
     result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff"}))
+
+    assert result.is_error is False
+    assert "\0" not in result.content
+    assert result.structured["binary_omitted"] is True
+
+
+def test_git_changes_marks_untracked_binary_content_as_omitted(tmp_path: Path) -> None:
+    _repository(tmp_path)
+    (tmp_path / "untracked.bin").write_bytes(b"new\x00binary")
+    ctx = ToolContext(session_id="session", runner=LocalRunner(tmp_path))
+
+    result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff", "paths": ["untracked.bin"]}))
 
     assert result.is_error is False
     assert "\0" not in result.content

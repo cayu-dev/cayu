@@ -320,6 +320,9 @@ class ArtifactStore(ABC):
         ``artifact_id`` opts into idempotent addressing. Implementations must
         return an existing artifact only when its content and immutable metadata
         match the requested value exactly; a conflicting identity must fail.
+        This decision must be atomic across concurrent callers: for conflicting
+        writes to one identity, at most one value may commit and every loser must
+        observe a conflict rather than replace or acknowledge the winner.
         """
 
     @abstractmethod

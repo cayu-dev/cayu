@@ -17,6 +17,10 @@ from hashlib import sha256
 from math import isfinite
 from typing import Any
 
+from cayu._coding_product_authority import (
+    CODING_PRODUCT_FINAL_GIT_RECEIPT_SCHEMA,
+    is_final_git_result_envelope,
+)
 from cayu._exception_groups import (
     exception_group_children,
     exception_tree_contains,
@@ -42,6 +46,7 @@ from cayu._workspace_mutation import (
 from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
 from cayu.environments import (
     BoundWorkspace,
+    DockerCodingWorkspaceBinding,
     Environment,
     EnvironmentAllocationScope,
     EnvironmentAllocationState,
@@ -61,6 +66,7 @@ from cayu.environments import (
     load_workspace_instructions,
 )
 from cayu.environments.bindings import (
+    SyncBinding,
     _EnvironmentLifecycleBindAttempt,
     _runtime_owned_workspace_observer_name,
 )
@@ -2720,6 +2726,42 @@ class EnvironmentLifecycle:
                                         final_snapshot,
                                         registered_environment=registered_environment,
                                     ),
+                                    "source_publication_receipt": (
+                                        _source_publication_receipt_payload(
+                                            final_snapshot,
+                                            binding=binding,
+                                            destination_workspace_id=base_payload.get(
+                                                "source_workspace_id"
+                                            ),
+                                            workload_workspace_id=base_payload.get(
+                                                "bound_workspace_id"
+                                            ),
+                                            expected_destination_workspace_id=(
+                                                _workspace_object_id(
+                                                    bound_workspace.source_workspace
+                                                )
+                                            ),
+                                            expected_workload_workspace_id=(
+                                                _workspace_object_id(bound_workspace.workspace)
+                                            ),
+                                        )
+                                    ),
+                                    "final_git_receipt": _final_git_receipt_payload(
+                                        final_snapshot,
+                                        binding=binding,
+                                        destination_workspace_id=base_payload.get(
+                                            "source_workspace_id"
+                                        ),
+                                        workload_workspace_id=base_payload.get(
+                                            "bound_workspace_id"
+                                        ),
+                                        expected_destination_workspace_id=(
+                                            _workspace_object_id(bound_workspace.source_workspace)
+                                        ),
+                                        expected_workload_workspace_id=(
+                                            _workspace_object_id(bound_workspace.workspace)
+                                        ),
+                                    ),
                                     "final_revision": _final_workspace_revision_payload(
                                         final_revision,
                                         registered_environment=registered_environment,
@@ -3999,6 +4041,175 @@ def _final_workspace_snapshot_payload(
         # the final revision projection.
         return None
     return _workspace_snapshot_payload(snapshot)
+
+
+def _source_publication_receipt_payload(
+    snapshot: WorkspaceSnapshot | None,
+    *,
+    binding: WorkspaceBinding,
+    destination_workspace_id: object,
+    workload_workspace_id: object,
+    expected_destination_workspace_id: str | None,
+    expected_workload_workspace_id: str | None,
+) -> dict[str, object] | None:
+    """Publish the fixed, secret-free settlement fields owned by ``SyncBinding``."""
+
+    if (
+        not isinstance(binding, SyncBinding)
+        or snapshot is None
+        or snapshot.source != "sync"
+        or expected_destination_workspace_id is None
+        or expected_workload_workspace_id is None
+        or snapshot.workspace_id != expected_destination_workspace_id
+        or snapshot.metadata.get("target_workspace_id") != expected_workload_workspace_id
+    ):
+        return None
+    metadata = snapshot.metadata
+    copied_files = metadata.get("copied_files")
+    copied_bytes = metadata.get("copied_bytes")
+    deleted_files = metadata.get("deleted_files")
+    outcome = metadata.get("outcome")
+    source_conflict_policy = metadata.get("source_conflict_policy")
+    sync_back = metadata.get("sync_back")
+    delete_missing = metadata.get("delete_missing")
+    if (
+        type(destination_workspace_id) is not str
+        or not destination_workspace_id
+        or type(workload_workspace_id) is not str
+        or not workload_workspace_id
+        or type(copied_files) is not int
+        or copied_files < 0
+        or type(copied_bytes) is not int
+        or copied_bytes < 0
+        or type(deleted_files) is not int
+        or deleted_files < 0
+        or type(outcome) is not str
+        or type(source_conflict_policy) is not str
+        or type(sync_back) is not str
+        or type(delete_missing) is not bool
+    ):
+        return None
+    snapshot_payload = {
+        "schema": "cayu.source_publication_snapshot.v1",
+        "destination_workspace_id": destination_workspace_id,
+        "workload_workspace_id": workload_workspace_id,
+        "source": "sync",
+        "outcome": outcome,
+        "source_conflict_policy": source_conflict_policy,
+        "sync_back": sync_back,
+        "delete_missing": delete_missing,
+        "copied_files": copied_files,
+        "copied_bytes": copied_bytes,
+        "deleted_files": deleted_files,
+    }
+    snapshot_sha256 = (
+        "sha256:"
+        + sha256(
+            canonical_durable_json_bytes(snapshot_payload, "source_publication_snapshot")
+        ).hexdigest()
+    )
+    receipt = {
+        "schema": "cayu.source_publication_receipt.v1",
+        "snapshot_sha256": snapshot_sha256,
+        "destination_workspace_id": destination_workspace_id,
+        "workload_workspace_id": workload_workspace_id,
+        "outcome": outcome,
+        "source_conflict_policy": source_conflict_policy,
+        "sync_back": sync_back,
+        "delete_missing": delete_missing,
+        "copied_files": copied_files,
+        "copied_bytes": copied_bytes,
+        "deleted_files": deleted_files,
+    }
+    return {
+        **receipt,
+        "receipt_sha256": "sha256:"
+        + sha256(canonical_durable_json_bytes(receipt, "source_publication_receipt")).hexdigest(),
+    }
+
+
+def _final_git_receipt_payload(
+    snapshot: WorkspaceSnapshot | None,
+    *,
+    binding: WorkspaceBinding,
+    destination_workspace_id: object,
+    workload_workspace_id: object,
+    expected_destination_workspace_id: str | None,
+    expected_workload_workspace_id: str | None,
+) -> dict[str, object] | None:
+    """Publish digest-bound final Git evidence from the Docker sync boundary."""
+
+    if (
+        type(binding) is not DockerCodingWorkspaceBinding
+        or snapshot is None
+        or snapshot.source != "sync"
+        or expected_destination_workspace_id is None
+        or expected_workload_workspace_id is None
+        or snapshot.workspace_id != expected_destination_workspace_id
+        or snapshot.metadata.get("target_workspace_id") != expected_workload_workspace_id
+    ):
+        return None
+    evidence = snapshot.metadata.get("final_git_evidence")
+    if type(evidence) is not dict or set(evidence) != {
+        "request_fingerprint",
+        "source_workspace_id",
+        "baseline_revision",
+        "workspace_revision",
+        "status",
+        "summary",
+        "diff",
+    }:
+        return None
+    request_fingerprint = evidence.get("request_fingerprint")
+    source_workspace_id = evidence.get("source_workspace_id")
+    baseline_revision = evidence.get("baseline_revision")
+    workspace_revision = evidence.get("workspace_revision")
+    status = evidence.get("status")
+    summary = evidence.get("summary")
+    diff = evidence.get("diff")
+    if (
+        type(destination_workspace_id) is not str
+        or not destination_workspace_id
+        or type(workload_workspace_id) is not str
+        or not workload_workspace_id
+        or type(request_fingerprint) is not str
+        or not request_fingerprint
+        or source_workspace_id != expected_destination_workspace_id
+        or type(baseline_revision) is not str
+        or not baseline_revision
+        or type(workspace_revision) is not str
+        or not workspace_revision
+        or type(status) is not dict
+        or set(status) != {"structured"}
+        or type(status.get("structured")) is not dict
+        or not is_final_git_result_envelope(status.get("structured"), mode="status")
+        or type(summary) is not dict
+        or set(summary) != {"structured"}
+        or type(summary.get("structured")) is not dict
+        or not is_final_git_result_envelope(summary.get("structured"), mode="summary")
+        or type(diff) is not dict
+        or set(diff) != {"content", "structured"}
+        or type(diff.get("content")) is not str
+        or type(diff.get("structured")) is not dict
+        or not is_final_git_result_envelope(diff.get("structured"), mode="diff")
+    ):
+        return None
+    receipt = {
+        "schema": CODING_PRODUCT_FINAL_GIT_RECEIPT_SCHEMA,
+        "request_fingerprint": request_fingerprint,
+        "destination_workspace_id": destination_workspace_id,
+        "workload_workspace_id": workload_workspace_id,
+        "baseline_revision": baseline_revision,
+        "workspace_revision": workspace_revision,
+        "status": copy_json_value(status, "final_git_status"),
+        "summary": copy_json_value(summary, "final_git_summary"),
+        "diff": copy_json_value(diff, "final_git_diff"),
+    }
+    return {
+        **receipt,
+        "receipt_sha256": "sha256:"
+        + sha256(canonical_durable_json_bytes(receipt, "final_git_receipt")).hexdigest(),
+    }
 
 
 class _BindingAbandonBlockedByMutationFence:

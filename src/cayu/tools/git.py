@@ -105,7 +105,7 @@ class GitChangesTool(Tool):
     )
 
     def _execution_profile_material(self) -> dict[str, object]:
-        return {}
+        return {"result_projection_version": "2"}
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
@@ -402,15 +402,28 @@ async def _diff_result(
 ) -> ToolResult:
     chunks: list[str] = []
     command_truncated = False
+    capture_limit = diff_offset + max_result_bytes + 1
+    captured_bytes = 0
+
+    def retain_chunk(value: str) -> None:
+        nonlocal captured_bytes
+        if not value:
+            return
+        chunks.append(value)
+        captured_bytes += len(value.encode("utf-8"))
+
     tracked_paths = [entry["path"] for entry in entries if entry["index"] != "?"]
     if tracked_paths:
         for staged in _diff_variants(scope):
+            if captured_bytes >= capture_limit:
+                command_truncated = True
+                break
             result = await _exec_git(
                 runner,
                 _diff_argv(tracked_paths, staged=staged, numstat=False),
                 cwd=cwd,
                 filter_names=filter_names,
-                output_limit_bytes=diff_offset + max_result_bytes + 1,
+                output_limit_bytes=max(1, capture_limit - captured_bytes),
             )
             if isinstance(result, ToolResult):
                 return result
@@ -421,14 +434,35 @@ async def _diff_result(
                     max_result_bytes=max_result_bytes,
                 )
             command_truncated = command_truncated or result.stdout_truncated
-            if result.stdout:
-                chunks.append(result.stdout if result.stdout_truncated else result.stdout.rstrip())
+            retain_chunk(result.stdout)
             if result.stdout_truncated:
                 break
     untracked = [entry["path"] for entry in entries if entry["index"] == "?"]
-    if untracked:
-        chunks.append("Untracked content omitted:\n" + "\n".join(untracked))
-    complete_content = "\n\n".join(chunks) or "No textual diff for the selected changes."
+    null_device = "NUL" if ntpath.splitdrive(cwd)[0] else "/dev/null"
+    for path in untracked:
+        if command_truncated or captured_bytes >= capture_limit:
+            command_truncated = True
+            break
+        result = await _exec_git(
+            runner,
+            _untracked_diff_argv(path, null_device=null_device),
+            cwd=cwd,
+            filter_names=filter_names,
+            output_limit_bytes=max(1, capture_limit - captured_bytes),
+        )
+        if isinstance(result, ToolResult):
+            return result
+        if result.exit_code not in {0, 1}:
+            return _git_failure(
+                result,
+                operation="untracked diff",
+                max_result_bytes=max_result_bytes,
+            )
+        command_truncated = command_truncated or result.stdout_truncated
+        retain_chunk(result.stdout)
+        if result.stdout_truncated:
+            break
+    complete_content = "".join(chunks) or "No textual diff for the selected changes."
     binary_omitted = _diff_contains_binary(complete_content)
     if binary_omitted:
         complete_content = "Binary diff omitted for the selected changes."
@@ -685,7 +719,7 @@ def _status_argv(paths: tuple[str, ...]) -> list[str]:
         "status",
         "--porcelain=v1",
         "-z",
-        "--untracked-files=normal",
+        "--untracked-files=all",
         "--",
         *paths,
     ]
@@ -705,6 +739,20 @@ def _diff_argv(paths: list[str], *, staged: bool, numstat: bool) -> list[str]:
     else:
         argv.append("--unified=3")
     return [*argv, "--", *paths]
+
+
+def _untracked_diff_argv(path: str, *, null_device: str) -> list[str]:
+    return [
+        "diff",
+        "--no-index",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=3",
+        "--",
+        null_device,
+        path,
+    ]
 
 
 def _diff_variants(scope: str) -> tuple[bool, ...]:
@@ -905,8 +953,10 @@ def _page_diff_text(
 
 
 def _diff_contains_binary(content: str) -> bool:
-    return "\ufffd" in content or any(
-        ord(char) < 32 and char not in {"\t", "\n", "\r"} for char in content
+    return (
+        "Binary files " in content
+        or "\ufffd" in content
+        or any(ord(char) < 32 and char not in {"\t", "\n", "\r"} for char in content)
     )
 
 

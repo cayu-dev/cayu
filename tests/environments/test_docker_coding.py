@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import cayu.environments.docker_coding as docker_coding_module
 from cayu import (
     DockerCodingCommandAuthority,
     DockerCodingDependencyInput,
@@ -29,6 +32,10 @@ from cayu import (
     SyncBindingSourceConflictError,
     evaluate_execution_admission,
 )
+from cayu._coding_product_authority import (
+    CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY,
+    CodingProductSourceCopyAuthority,
+)
 from cayu.runners.base import ExecResult
 from cayu.runners.docker import (
     DockerContainerOwnershipError,
@@ -36,6 +43,10 @@ from cayu.runners.docker import (
     DockerRuntimeConfigurationError,
 )
 from cayu.workspaces import LocalWorkspace, RunnerWorkspace
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservationLimits,
+    observe_deterministic_workspace,
+)
 
 _CONTAINER_ID = "a" * 64
 _IMAGE_ID = "sha256:" + ("b" * 64)
@@ -116,6 +127,129 @@ def _inspection(
         },
         "Mounts": [],
     }
+
+
+class _LocalDockerRunner(DockerRunner):
+    """Exercise Docker binding control flow against a local test directory."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(
+            "local-docker-test",
+            default_cwd="/workspace",
+            docker_path="/usr/bin/docker",
+            _container_id=_CONTAINER_ID,
+        )
+        self.local = LocalRunner(root, inherit_env=False)
+        self._test_root = root
+
+    def resolve_cwd(self, cwd: str | None = None) -> str:
+        del cwd
+        return str(self._test_root)
+
+    async def exec(self, command, **kwargs: Any):
+        kwargs["cwd"] = None
+        return await self.local.exec(command, **kwargs)
+
+
+def _coding_product_test_binding(
+    source_root: Path,
+    target_root: Path,
+) -> tuple[
+    _LocalDockerRunner,
+    LocalWorkspace,
+    DockerCodingWorkspaceBinding,
+]:
+    runner = _LocalDockerRunner(target_root)
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+    observation_limits = WorkspaceRevisionObservationLimits()
+    admitted = asyncio.run(
+        observe_deterministic_workspace(
+            source,
+            observer="cayu-coding-product-source",
+            limits=observation_limits,
+        )
+    )
+    assert admitted.revision is not None
+    target = RunnerWorkspace(
+        runner,
+        workspace_id="target",
+        python_executable=sys.executable,
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+    binding = DockerCodingWorkspaceBinding(
+        target_workspace=target,
+        limits=DockerWorkspaceTransferLimits(
+            max_file_bytes=1024,
+            max_total_bytes=4096,
+            max_archive_bytes=64 * 1024,
+        ),
+        source_copy_authority=CodingProductSourceCopyAuthority(
+            request_fingerprint="sha256:" + "a" * 64,
+            source_workspace_id=source.id,
+            baseline_revision=admitted.revision,
+            observation_limits=observation_limits,
+        ),
+    )
+    return runner, source, binding
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX executable modes")
+def test_docker_coding_binding_preserves_executable_modes_both_directions(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_script = source_root / "script.sh"
+    source_script.write_bytes(b"#!/bin/sh\n")
+    source_script.chmod(0o755)
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="mode-round-trip")
+        target_script = target_root / "script.sh"
+        assert target_script.stat().st_mode & 0o777 == 0o755
+        target_script.chmod(0o644)
+        generated = target_root / "generated.sh"
+        generated.write_bytes(b"#!/bin/sh\n")
+        generated.chmod(0o755)
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+
+    asyncio.run(run())
+
+    assert source_script.stat().st_mode & 0o777 == 0o644
+    assert (source_root / "generated.sh").stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX executable modes")
+def test_docker_coding_copy_back_rejects_source_mode_drift(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_script = source_root / "script.sh"
+    source_script.write_bytes(b"#!/bin/sh\n")
+    source_script.chmod(0o644)
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="mode-conflict")
+        source_script.chmod(0o755)
+        (target_root / "script.sh").write_bytes(b"#!/bin/sh\necho changed\n")
+        with pytest.raises(SyncBindingSourceConflictError):
+            await binding.finalize(bound, outcome="completed")
+        binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert source_script.read_bytes() == b"#!/bin/sh\n"
+    assert source_script.stat().st_mode & 0o777 == 0o755
 
 
 def test_strict_docker_runner_uses_typed_restrictions_and_exact_live_evidence(
@@ -444,6 +578,70 @@ def test_docker_coding_factory_rejects_untrusted_before_docker_allocation(
         refusal.capability == "untrusted_code_isolation"
         for refusal in caught.value.decision.refusals
     )
+
+
+def test_docker_coding_factory_publicly_constructs_request_bound_binding(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "example.py").write_text("VALUE = 1\n", encoding="utf-8")
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="factory-source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+    limits = WorkspaceRevisionObservationLimits()
+    observed = asyncio.run(
+        observe_deterministic_workspace(
+            source,
+            observer="cayu-coding-product-source",
+            limits=limits,
+        )
+    )
+    assert observed.revision is not None
+    authority = CodingProductSourceCopyAuthority(
+        request_fingerprint="sha256:" + ("a" * 64),
+        source_workspace_id=source.id,
+        baseline_revision=observed.revision,
+        observation_limits=limits,
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="request-bound-binding",
+        agent_name="agent",
+        environment_name="coding",
+        metadata={CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY: authority.model_dump(mode="json")},
+    )
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=source,
+        image_identity=_image_identity(),
+    )
+    runner = _LocalDockerRunner(target_root)
+    target = RunnerWorkspace(
+        runner,
+        workspace_id="factory-target",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+    )
+
+    binding = factory.create_workspace_binding(request, target_workspace=target)
+    bound = asyncio.run(binding.bind(source, runner, session_id=request.session_id))
+
+    assert isinstance(binding, DockerCodingWorkspaceBinding)
+    assert (target_root / "example.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert binding.abandon(bound) is True
+
+    mismatched = replace(
+        request,
+        metadata={
+            CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY: authority.model_copy(
+                update={"source_workspace_id": "other-source"}
+            ).model_dump(mode="json")
+        },
+    )
+    with pytest.raises(RuntimeError, match="another source workspace"):
+        factory.create_workspace_binding(mismatched, target_workspace=target)
 
 
 def test_toolchain_dependency_drift_refuses_before_docker_allocation(
@@ -897,6 +1095,67 @@ def test_runner_workspace_excludes_protected_directories_before_listing_limits(
         asyncio.run(workspace.read_bytes(".git/objects/0"))
 
 
+def test_runner_workspace_directory_exclusions_match_local_portable_name_semantics(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "build "
+    protected.mkdir()
+    (protected / "artifact.txt").write_text("generated\n", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("source\n", encoding="utf-8")
+    workspace = RunnerWorkspace(
+        LocalRunner(tmp_path, inherit_env=False),
+        python_executable=sys.executable,
+        excluded_directory_names=("build",),
+    )
+
+    listing = asyncio.run(workspace.list("**/*", limit=1))
+    git_entries = asyncio.run(workspace.list_git_entries(limit=1))
+
+    assert listing.paths == ("visible.txt",)
+    assert listing.total_count == 1
+    assert listing.truncated is False
+    assert tuple(entry.path for entry in git_entries.entries) == ("visible.txt",)
+    with pytest.raises(ValueError, match="excluded directory"):
+        asyncio.run(workspace.read_bytes("build /artifact.txt"))
+    with pytest.raises(ValueError, match="case-insensitively unique"):
+        RunnerWorkspace(
+            LocalRunner(tmp_path, inherit_env=False),
+            python_executable=sys.executable,
+            excluded_directory_names=("build", "BUILD."),
+        )
+
+
+def test_runner_workspace_excludes_sensitive_path_patterns_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "private.pem").write_text("secret\n", encoding="utf-8")
+    nested_env = nested / ".env"
+    nested_env.mkdir()
+    (nested_env / "token").write_text("directory secret\n", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("ok\n", encoding="utf-8")
+    workspace = RunnerWorkspace(
+        LocalRunner(tmp_path, inherit_env=False),
+        python_executable=sys.executable,
+        excluded_path_patterns=(".env", "**/.env", "*.pem", "**/*.pem"),
+    )
+
+    result = asyncio.run(workspace.list("**/*", limit=1))
+    git_entries = asyncio.run(workspace.list_git_entries(limit=1))
+
+    assert result.paths == ("visible.txt",)
+    assert result.truncated is False
+    assert tuple(entry.path for entry in git_entries.entries) == ("visible.txt",)
+    with pytest.raises(ValueError, match="excluded path pattern"):
+        asyncio.run(workspace.read_bytes(".env"))
+    with pytest.raises(ValueError, match="excluded path pattern"):
+        asyncio.run(workspace.write_bytes("nested/private.pem", b"changed"))
+    with pytest.raises(ValueError, match="excluded path pattern"):
+        asyncio.run(workspace.read_bytes("nested/.env/token"))
+
+
 def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_paths(
     tmp_path: Path,
 ) -> None:
@@ -913,6 +1172,7 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
     (source_root / ".cayu" / "private.txt").write_text("private", encoding="utf-8")
     (source_root / ".runtime").mkdir()
     (source_root / ".runtime" / "state").write_text("state", encoding="utf-8")
+    (source_root / ".env").write_text("TOKEN=host-secret\n", encoding="utf-8")
     (source_root / "code.py").write_text("value = 1\n", encoding="utf-8")
 
     class LocalDockerRunner(DockerRunner):
@@ -935,12 +1195,18 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
             return await self.local.exec(command, **kwargs)
 
     runner = LocalDockerRunner(target_root)
-    source = LocalWorkspace(source_root, workspace_id="source")
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+        excluded_path_patterns=(".env", "**/.env"),
+    )
     target = RunnerWorkspace(
         runner,
         workspace_id="target",
         python_executable=sys.executable,
         excluded_directory_names=(".cayu", ".git", ".runtime"),
+        excluded_path_patterns=(".env", "**/.env"),
     )
     binding = DockerCodingWorkspaceBinding(
         target_workspace=target,
@@ -957,6 +1223,7 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
         assert not (target_root / ".git" / "objects" / "host-only").exists()
         assert not (target_root / ".cayu").exists()
         assert not (target_root / ".runtime").exists()
+        assert not (target_root / ".env").exists()
         guest_git_config = (target_root / ".git" / "config").read_text(encoding="utf-8")
         assert "hooksPath = /dev/null" in guest_git_config
         assert "fsmonitor = false" in guest_git_config
@@ -984,3 +1251,349 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
     ) == "host git"
     assert (source_root / ".cayu" / "private.txt").read_text(encoding="utf-8") == "private"
     assert (source_root / ".runtime" / "state").read_text(encoding="utf-8") == "state"
+    assert (source_root / ".env").read_text(encoding="utf-8") == "TOKEN=host-secret\n"
+
+
+def test_docker_coding_binding_rejects_copy_in_after_admitted_source_changes(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_file = source_root / "code.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+    source_file.write_text("value = 2\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="conflicts with the admitted source revision"):
+        asyncio.run(binding.bind(source, runner, session_id="stale-copy-in"))
+
+
+def test_docker_coding_binding_rejects_mutated_ephemeral_git_authority(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_file = source_root / "code.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="mutated-git-authority")
+        result = await runner.exec(
+            ExecCommand.process("git", "update-index", "--assume-unchanged", "code.py")
+        )
+        assert result.exit_code == 0
+        (target_root / "code.py").write_text("value = 2\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="ephemeral Git authority changed"):
+            await binding.finalize(bound, outcome="completed")
+        assert binding.abandon(bound) is True
+
+    asyncio.run(run())
+
+    assert source_file.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_docker_coding_rejects_included_filter_before_filter_execution(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_file = source_root / "code.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="included-filter")
+        (target_root / ".git" / "filter.conf").write_text(
+            '[filter "review"]\n\tclean = touch filter-ran; cat\n',
+            encoding="utf-8",
+        )
+        configured = await runner.exec(
+            ExecCommand.process("git", "config", "--local", "include.path", "filter.conf")
+        )
+        assert configured.exit_code == 0
+        (target_root / ".gitattributes").write_text("*.py filter=review\n", encoding="utf-8")
+        source_file_in_guest = target_root / "code.py"
+        source_file_in_guest.write_text("value = 2\n", encoding="utf-8")
+
+        transformed = await docker_coding_module._git_paths_with_transformed_bytes(
+            runner,
+            paths=("code.py",),
+        )
+        assert transformed is None
+        assert not (target_root / "filter-ran").exists()
+        with pytest.raises(RuntimeError, match="ephemeral Git authority changed"):
+            await binding.finalize(bound, outcome="completed")
+        assert binding.abandon(bound) is True
+
+    asyncio.run(run())
+
+    assert not (target_root / "filter-ran").exists()
+    assert source_file.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_docker_coding_binding_captures_exact_final_diff_content(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_file = source_root / "code.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> dict[str, Any]:
+        bound = await binding.bind(source, runner, session_id="exact-final-diff")
+        (target_root / "code.py").write_text("value = 2  \n", encoding="utf-8")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        evidence = snapshot.metadata["final_git_evidence"]
+        assert type(evidence) is dict
+        return evidence
+
+    evidence = asyncio.run(run())
+
+    diff = evidence["diff"]
+    assert type(diff) is dict
+    assert "+value = 2  \n" in diff["content"]
+    assert source_file.read_text(encoding="utf-8") == "value = 2  \n"
+
+
+def test_docker_coding_binding_marks_git_normalized_byte_changes_partial(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
+    source_file = source_root / "normalized.txt"
+    source_file.write_bytes(b"stable\n")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> dict[str, Any]:
+        bound = await binding.bind(source, runner, session_id="normalized-final-diff")
+        (target_root / "normalized.txt").write_bytes(b"stable\r\n")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        evidence = snapshot.metadata["final_git_evidence"]
+        assert type(evidence) is dict
+        return evidence
+
+    evidence = asyncio.run(run())
+
+    summary = evidence["summary"]
+    diff = evidence["diff"]
+    assert type(summary) is dict
+    assert type(diff) is dict
+    summary_changes = summary["structured"]["changes"]
+    normalized = next(change for change in summary_changes if change["path"] == "normalized.txt")
+    assert normalized["count_kind"] == "unknown"
+    assert diff["structured"]["truncated"] is True
+    assert "workspace_delta_unrepresented" in diff["structured"]["truncation_reasons"]
+    assert "normalized.txt" not in diff["content"]
+    assert source_file.read_bytes() == b"stable\r\n"
+
+
+def test_docker_coding_binding_rejects_mixed_text_and_normalized_byte_changes(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
+    source_file = source_root / "normalized.txt"
+    source_file.write_bytes(b"stable\n")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> dict[str, Any]:
+        bound = await binding.bind(source, runner, session_id="mixed-normalized-final-diff")
+        (target_root / "normalized.txt").write_bytes(b"changed\r\n")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        evidence = snapshot.metadata["final_git_evidence"]
+        assert type(evidence) is dict
+        return evidence
+
+    evidence = asyncio.run(run())
+
+    summary = evidence["summary"]
+    diff = evidence["diff"]
+    assert type(summary) is dict
+    assert type(diff) is dict
+    normalized = next(
+        change for change in summary["structured"]["changes"] if change["path"] == "normalized.txt"
+    )
+    assert normalized["count_kind"] == "text"
+    assert "normalized.txt" in diff["content"]
+    assert diff["structured"]["truncated"] is True
+    assert "workspace_delta_unrepresented" in diff["structured"]["truncation_reasons"]
+    assert source_file.read_bytes() == b"changed\r\n"
+
+
+def test_docker_coding_binding_accepts_explicitly_unfiltered_text_bytes(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / ".gitattributes").write_text("*.txt -text\n", encoding="utf-8")
+    source_file = source_root / "raw.txt"
+    source_file.write_bytes(b"stable\n")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> dict[str, Any]:
+        bound = await binding.bind(source, runner, session_id="raw-final-diff")
+        (target_root / "raw.txt").write_bytes(b"changed\r\n")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        evidence = snapshot.metadata["final_git_evidence"]
+        assert type(evidence) is dict
+        return evidence
+
+    evidence = asyncio.run(run())
+
+    diff = evidence["diff"]
+    assert type(diff) is dict
+    assert diff["structured"]["truncated"] is False
+    assert "+changed\r\n" in diff["content"]
+    assert source_file.read_bytes() == b"changed\r\n"
+
+
+def test_docker_coding_binding_rejects_a_normalized_baseline_preimage(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / ".gitattributes").write_text("*.txt text\n", encoding="utf-8")
+    source_file = source_root / "normalized.txt"
+    source_file.write_bytes(b"stable\r\n")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+
+    async def run() -> dict[str, Any]:
+        bound = await binding.bind(source, runner, session_id="normalized-baseline-diff")
+        (target_root / "normalized.txt").write_bytes(b"changed\n")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        evidence = snapshot.metadata["final_git_evidence"]
+        assert type(evidence) is dict
+        return evidence
+
+    evidence = asyncio.run(run())
+
+    diff = evidence["diff"]
+    assert type(diff) is dict
+    assert "normalized.txt" in diff["content"]
+    assert diff["structured"]["truncated"] is True
+    assert "workspace_delta_unrepresented" in diff["structured"]["truncation_reasons"]
+    assert source_file.read_bytes() == b"changed\n"
+
+
+def test_docker_coding_binding_failed_abandon_preserves_finalization_authority(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    substituted_root = tmp_path / "substituted"
+    source_root.mkdir()
+    target_root.mkdir()
+    substituted_root.mkdir()
+    source_file = source_root / "code.py"
+    source_file.write_text("value = 1\n", encoding="utf-8")
+
+    runner, source, binding = _coding_product_test_binding(source_root, target_root)
+    substituted = LocalWorkspace(substituted_root, workspace_id="substituted")
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="failed-abandon")
+        forged = replace(bound, source_workspace=substituted)
+        with pytest.raises(ValueError, match="source workspace"):
+            binding.abandon(forged)
+        (target_root / "code.py").write_text("value = 2\n", encoding="utf-8")
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        assert "final_git_evidence" in snapshot.metadata
+
+    asyncio.run(run())
+
+    assert source_file.read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_docker_coding_binding_refuses_publishable_git_ignored_paths(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    (source_root / "code.py").write_text("value = 1\n", encoding="utf-8")
+
+    class LocalDockerRunner(DockerRunner):
+        def __init__(self, root: Path) -> None:
+            super().__init__(
+                "local-docker-test",
+                default_cwd="/workspace",
+                docker_path="/usr/bin/docker",
+                _container_id=_CONTAINER_ID,
+            )
+            self.local = LocalRunner(root, inherit_env=False)
+            self._test_root = root
+
+        def resolve_cwd(self, cwd: str | None = None) -> str:
+            del cwd
+            return str(self._test_root)
+
+        async def exec(self, command, **kwargs: Any):
+            kwargs["cwd"] = None
+            return await self.local.exec(command, **kwargs)
+
+    runner = LocalDockerRunner(target_root)
+    source = LocalWorkspace(
+        source_root,
+        workspace_id="source",
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+        excluded_path_patterns=(".env", "**/.env"),
+    )
+    target = RunnerWorkspace(
+        runner,
+        workspace_id="target",
+        python_executable=sys.executable,
+        excluded_directory_names=(".cayu", ".git", ".runtime"),
+        excluded_path_patterns=(".env", "**/.env"),
+    )
+    binding = DockerCodingWorkspaceBinding(
+        target_workspace=target,
+        limits=DockerWorkspaceTransferLimits(
+            max_file_bytes=1024,
+            max_total_bytes=4096,
+            max_archive_bytes=32 * 1024,
+        ),
+    )
+
+    async def run() -> None:
+        bound = await binding.bind(source, runner, session_id="ignored-publication")
+        (target_root / "ignored.txt").write_text("hidden mutation\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="Git would omit a source path"):
+            await binding.finalize(bound, outcome="completed")
+        assert binding.abandon(bound) is True
+
+    asyncio.run(run())
+
+    assert not (source_root / "ignored.txt").exists()

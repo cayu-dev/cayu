@@ -515,7 +515,7 @@ def test_app_is_a_composition_root() -> None:
     functions = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
 
     assert classes == []
-    assert functions == ["build_app"]
+    assert functions == __PUBLIC_APP_FACTORIES__
 '''
 
 _CLAUDE_MD = "@AGENTS.md\n"
@@ -637,6 +637,11 @@ def convention_files(
             "CLAUDE.md": _CLAUDE_MD,
         }
     settings = render(_SETTINGS_PY).replace("__DATABASE__", plan.database)
+    public_app_factories = (
+        '["build_app", "build_coding_product_application"]'
+        if plan.preset == "coding" and plan.execution == "docker"
+        else '["build_app"]'
+    )
     files = dict(_OWNERSHIP_FILES)
     files.update(
         {
@@ -657,7 +662,10 @@ def convention_files(
             "tools/registration.py": _TOOLS_REGISTRATION_PY,
             "policies/tools.py": _TOOL_POLICY_PY,
             "tests/test_application.py": _TEST_APPLICATION_PY,
-            "tests/test_architecture.py": _TEST_ARCHITECTURE_PY,
+            "tests/test_architecture.py": _TEST_ARCHITECTURE_PY.replace(
+                "__PUBLIC_APP_FACTORIES__",
+                public_app_factories,
+            ),
             "CLAUDE.md": _CLAUDE_MD,
         }
     )
@@ -676,8 +684,18 @@ def scaffold_contract(plan: ApplicationPlan) -> str:
         f'database = "{plan.database}"\n'
         f'provider = "{plan.provider}"\n'
         f'execution = "{plan.execution}"\n'
-        f"capabilities = [{capabilities}]\n"
-        f"minimal = {minimal}\n"
+        + (
+            ""
+            if plan.coding_toolchain is None
+            else f'coding_toolchain = "{plan.coding_toolchain}"\n'
+        )
+        + (
+            ""
+            if plan.coding_command_authority is None
+            else (f'coding_command_authority = "{plan.coding_command_authority}"\n')
+        )
+        + f"capabilities = [{capabilities}]\n"
+        + f"minimal = {minimal}\n"
     )
 
 
@@ -709,6 +727,10 @@ def _creation_command(plan: ApplicationPlan, *, name: str) -> str:
         "--execution",
         plan.execution,
     ]
+    if plan.coding_toolchain is not None:
+        arguments.extend(("--coding-toolchain", plan.coding_toolchain))
+    if plan.coding_command_authority is not None:
+        arguments.extend(("--coding-command-authority", plan.coding_command_authority))
     defaults = set(preset_spec(plan.preset).default_capabilities)
     selected = set(plan.capabilities)
     for capability in CAPABILITIES:

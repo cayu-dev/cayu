@@ -122,8 +122,16 @@ pytest -q tests/test_coding_composition.py
 python run.py --agent mycoder --message "Implement the requested change."
 ```
 
-The generated repository starts from a clean Git commit and requires `git`, `rg`,
-and the POSIX descriptor-relative filesystem primitives used by secure
+Add `--execution docker` for the maintained GitHub-independent coding product.
+Its `build_coding_product_application()` front door produces durable
+`patch_ready_for_delivery` evidence after required checks, source copy-back, Git
+inspection, and configured review gates settle. It performs no commit, push,
+pull-request, CI, or merge effect. See the
+[maintained coding product](docs/coding-product.md).
+
+The generated repository starts from a clean Git commit, and each new product
+run requires a clean committed Git source baseline. It also requires `git`,
+`rg`, and the POSIX descriptor-relative filesystem primitives used by secure
 `LocalWorkspace` path operations. Unsupported hosts fail during generation or
 application construction. Its local workspace and runner are trusted-host
 development adapters, not a hostile-code sandbox. The default scaffold is the
@@ -565,6 +573,7 @@ Start with the document that matches the job:
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
+| Produce a durable checked patch without external delivery | [Maintained coding product](docs/coding-product.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
 | Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-tech/cayu/blob/main/docs/process-isolated-tools.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |

@@ -36,6 +36,7 @@ from cayu.workspaces import (
     WorkspaceWriterIsolationStatus,
     compare_workspace_revisions,
 )
+from cayu.workspaces.revisions import observe_deterministic_workspace
 
 
 def test_workspace_writer_isolation_defaults_to_unknown(tmp_path) -> None:
@@ -113,6 +114,29 @@ def test_workspace_observation_rejects_duplicate_paths() -> None:
 def test_workspace_observation_rejects_noncanonical_path_aliases() -> None:
     with pytest.raises(ValidationError, match="relative and traversal-free"):
         WorkspacePathRevision(path="directory/./same.txt")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Win32 does not expose POSIX executable bits")
+def test_deterministic_workspace_observation_authenticates_executable_mode(tmp_path) -> None:
+    script = tmp_path / "script.sh"
+    script.write_bytes(b"#!/bin/sh\n")
+    script.chmod(0o644)
+    workspace = LocalWorkspace(tmp_path, workspace_id="mode-workspace")
+    limits = WorkspaceRevisionObservationLimits()
+
+    before = asyncio.run(
+        observe_deterministic_workspace(workspace, observer="mode-test", limits=limits)
+    )
+    script.chmod(0o755)
+    after = asyncio.run(
+        observe_deterministic_workspace(workspace, observer="mode-test", limits=limits)
+    )
+    delta = compare_workspace_revisions(before, after)
+
+    assert before.revision != after.revision
+    assert before.paths[0].worktree_mode == "100644"
+    assert after.paths[0].worktree_mode == "100755"
+    assert [(item.path, item.change) for item in delta.paths] == [("script.sh", "modified")]
 
 
 def test_deterministic_workspace_binding_fails_closed_on_noncanonical_list_path() -> None:

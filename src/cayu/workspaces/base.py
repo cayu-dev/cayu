@@ -330,6 +330,20 @@ class WorkspaceRevisionMismatchError(RuntimeError):
         )
 
 
+class WorkspaceGitModeMismatchError(RuntimeError):
+    """A conditional workspace mutation observed a different Git file mode."""
+
+    def __init__(
+        self, expected_git_mode: WorkspaceGitMode, actual_git_mode: WorkspaceGitMode
+    ) -> None:
+        self.expected_git_mode = expected_git_mode
+        self.actual_git_mode = actual_git_mode
+        super().__init__(
+            "Workspace file Git mode changed: "
+            f"expected {expected_git_mode}, found {actual_git_mode}."
+        )
+
+
 @dataclass(frozen=True)
 class WorkspaceListResult:
     paths: tuple[str, ...]
@@ -671,6 +685,42 @@ class Workspace(ABC):
                 hash_fixed_identity_on_overflow=True,
             ),
         )
+
+
+class WorkspaceGitModeMutator(ABC):
+    """Nominal capability for exact Git executable-mode mutations."""
+
+    @abstractmethod
+    async def write_bytes_with_git_mode(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        git_mode: WorkspaceGitMode,
+    ) -> None:
+        """Write exact bytes and normalize the file to one Git regular-file mode."""
+
+    @abstractmethod
+    async def create_bytes_with_git_mode(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        git_mode: WorkspaceGitMode,
+    ) -> WorkspaceMutationResult:
+        """Create a missing file with an exact Git regular-file mode."""
+
+    @abstractmethod
+    async def replace_bytes_with_git_mode(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+        expected_git_mode: WorkspaceGitMode,
+        git_mode: WorkspaceGitMode,
+    ) -> WorkspaceMutationResult:
+        """Conditionally replace bytes and mode against both prior authorities."""
 
 
 class RunnerBoundWorkspace(Workspace):

@@ -172,7 +172,11 @@ def _verify_coding(
     docker: bool = False,
 ) -> None:
     assert (project / "operations/coding.py").is_file()
-    assert len((project / "composition.py").read_text().splitlines()) < 10
+    compatibility_facade = (project / "composition.py").read_text(encoding="utf-8")
+    assert "from operations.coding import" in compatibility_facade
+    assert ("build_coding_composition" if docker else "build_coding_app") in compatibility_facade
+    assert "class " not in compatibility_facade
+    assert "def " not in compatibility_facade
     if docker:
         assert (project / "Dockerfile.coding").is_file()
         assert (project / "docker-coding-image.json").is_file()

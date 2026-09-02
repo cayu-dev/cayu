@@ -19,6 +19,7 @@ from cayu.workspaces._local_guard import (
     open_regular_for_read,
     replace_regular_if_revision,
     require_absent_regular,
+    restore_regular,
     write_regular,
 )
 from cayu.workspaces._mutations import (
@@ -34,6 +35,8 @@ from cayu.workspaces.base import (
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceGitEntryObservationUnsupportedError,
+    WorkspaceGitMode,
+    WorkspaceGitModeMutator,
     WorkspaceListResult,
     WorkspaceMoveResult,
     WorkspaceMutationResult,
@@ -64,13 +67,13 @@ from cayu.workspaces.branches import (
 )
 
 
-class LocalWorkspace(Workspace):
+class LocalWorkspace(Workspace, WorkspaceGitModeMutator):
     """Filesystem workspace rooted at one local directory.
 
-    ``excluded_directory_names`` removes matching path segments from listing
-    and rejects every direct read, resolution, or mutation beneath them. This
-    opt-in projected view does not advertise workspace branching because a
-    branch must not regain access to excluded source authority.
+    ``excluded_directory_names`` and ``excluded_path_patterns`` remove matching
+    paths from listing and reject every direct read, resolution, or mutation.
+    This opt-in projected view does not advertise workspace branching because
+    a branch must not regain access to excluded source authority.
     """
 
     def __init__(
@@ -79,6 +82,7 @@ class LocalWorkspace(Workspace):
         *,
         workspace_id: str | None = None,
         excluded_directory_names: Iterable[str] = (),
+        excluded_path_patterns: Iterable[str] = (),
         branch_store: WorkspaceBranchStore | None = None,
         branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
     ) -> None:
@@ -99,11 +103,15 @@ class LocalWorkspace(Workspace):
         self._excluded_directory_keys = frozenset(
             _directory_name_key(value) for value in self.excluded_directory_names
         )
-        if self.excluded_directory_names and (
+        self.excluded_path_patterns = _validate_excluded_path_patterns(excluded_path_patterns)
+        self._excluded_path_pattern_keys = tuple(
+            _normalized_exclusion_path(pattern) for pattern in self.excluded_path_patterns
+        )
+        if (self.excluded_directory_names or self.excluded_path_patterns) and (
             branch_store is not None or branch_authority_resolver is not None
         ):
             raise ValueError(
-                "LocalWorkspace excluded directories cannot be combined with "
+                "LocalWorkspace path exclusions cannot be combined with "
                 "workspace branch persistence."
             )
         if branch_store is not None and not isinstance(branch_store, WorkspaceBranchStore):
@@ -158,7 +166,7 @@ class LocalWorkspace(Workspace):
         return validated
 
     def branch_capabilities(self) -> WorkspaceBranchCapabilities:
-        if type(self) is not LocalWorkspace or self.excluded_directory_names:
+        if type(self) is not LocalWorkspace or self._has_path_exclusions:
             return WorkspaceBranchCapabilities()
         durable = (
             self._branch_store is not None
@@ -205,7 +213,7 @@ class LocalWorkspace(Workspace):
         self,
         request: WorkspaceBranchRequest,
     ) -> WorkspaceBranchCreationResult:
-        if self.excluded_directory_names:
+        if self._has_path_exclusions:
             return await Workspace.create_branch(self, request)
         from cayu.workspaces._local_branch import create_local_workspace_branch
 
@@ -219,7 +227,7 @@ class LocalWorkspace(Workspace):
     ) -> WorkspaceBranchRecoveryResult:
         """Recover one durable local branch from store and filesystem evidence."""
 
-        if self.excluded_directory_names:
+        if self._has_path_exclusions:
             raise ValueError(
                 "Local workspace branch recovery is unavailable when directories are excluded."
             )
@@ -256,6 +264,26 @@ class LocalWorkspace(Workspace):
         self._require_path_allowed(relative_path)
         await asyncio.to_thread(_write_file, self.root, relative_path, content)
 
+    async def write_bytes_with_git_mode(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        git_mode: WorkspaceGitMode,
+    ) -> None:
+        if type(content) is not bytes:
+            raise TypeError("Workspace write content must be bytes.")
+        mode = _git_mode_bits(git_mode)
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        await asyncio.to_thread(
+            _write_file_with_mode,
+            self.root,
+            relative_path,
+            content,
+            mode,
+        )
+
     async def delete(self, path: str) -> None:
         relative_path = _validate_workspace_relative_path(path)
         self._require_path_allowed(relative_path)
@@ -267,6 +295,26 @@ class LocalWorkspace(Workspace):
         relative_path = _validate_workspace_relative_path(path)
         self._require_path_allowed(relative_path)
         return await asyncio.to_thread(_create_file, self.root, relative_path, content)
+
+    async def create_bytes_with_git_mode(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        git_mode: WorkspaceGitMode,
+    ) -> WorkspaceMutationResult:
+        if type(content) is not bytes:
+            raise TypeError("Workspace create content must be bytes.")
+        mode = _git_mode_bits(git_mode)
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        return await asyncio.to_thread(
+            _create_file,
+            self.root,
+            relative_path,
+            content,
+            mode,
+        )
 
     async def replace_bytes(
         self,
@@ -286,6 +334,32 @@ class LocalWorkspace(Workspace):
             relative_path,
             content,
             expected_revision,
+        )
+
+    async def replace_bytes_with_git_mode(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+        expected_git_mode: WorkspaceGitMode,
+        git_mode: WorkspaceGitMode,
+    ) -> WorkspaceMutationResult:
+        if type(content) is not bytes:
+            raise TypeError("Workspace replace content must be bytes.")
+        expected_revision = _validate_revision(expected_revision)
+        expected_mode = _git_mode_bits(expected_git_mode)
+        replacement_mode = _git_mode_bits(git_mode)
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        return await asyncio.to_thread(
+            _replace_file,
+            self.root,
+            relative_path,
+            content,
+            expected_revision,
+            expected_mode,
+            replacement_mode,
         )
 
     async def delete_if_revision(
@@ -349,6 +423,7 @@ class LocalWorkspace(Workspace):
             pattern,
             validated_limit,
             self._excluded_directory_keys,
+            self._excluded_path_pattern_keys,
         )
 
     async def list_git_entries(self, *, limit: int) -> WorkspaceGitEntryListResult:
@@ -360,6 +435,7 @@ class LocalWorkspace(Workspace):
             self.root,
             validated_limit,
             self._excluded_directory_keys,
+            self._excluded_path_pattern_keys,
         )
 
     def resolve(self, path: str) -> Path:
@@ -407,6 +483,12 @@ class LocalWorkspace(Workspace):
     def _require_path_allowed(self, relative_path: str) -> None:
         if _path_has_excluded_directory(relative_path, self._excluded_directory_keys):
             raise ValueError("Workspace path is inside an excluded directory.")
+        if _path_matches_excluded_pattern(relative_path, self._excluded_path_pattern_keys):
+            raise ValueError("Workspace path matches an excluded path pattern.")
+
+    @property
+    def _has_path_exclusions(self) -> bool:
+        return bool(self.excluded_directory_names or self.excluded_path_patterns)
 
 
 def _write_file(root: Path, relative_path: str, content: bytes) -> None:
@@ -415,6 +497,19 @@ def _write_file(root: Path, relative_path: str, content: bytes) -> None:
         workspace_path_lock(root, relative_path),
     ):
         write_regular(root, relative_path, content)
+
+
+def _write_file_with_mode(
+    root: Path,
+    relative_path: str,
+    content: bytes,
+    mode: int,
+) -> None:
+    with (
+        workspace_source_lock(root, exclusive=False),
+        workspace_path_lock(root, relative_path),
+    ):
+        restore_regular(root, relative_path, content, mode=mode)
 
 
 def _delete_file(root: Path, relative_path: str) -> None:
@@ -463,12 +558,17 @@ def _read_file(
     )
 
 
-def _create_file(root: Path, relative_path: str, content: bytes) -> WorkspaceMutationResult:
+def _create_file(
+    root: Path,
+    relative_path: str,
+    content: bytes,
+    mode: int | None = None,
+) -> WorkspaceMutationResult:
     with (
         workspace_source_lock(root, exclusive=False),
         workspace_path_lock(root, relative_path),
     ):
-        create_regular(root, relative_path, content)
+        create_regular(root, relative_path, content, mode=mode)
         return mutation_result("create", before=None, after=content)
 
 
@@ -477,6 +577,8 @@ def _replace_file(
     relative_path: str,
     content: bytes,
     expected_revision: str,
+    expected_git_mode: int | None = None,
+    replacement_mode: int | None = None,
 ) -> WorkspaceMutationResult:
     with (
         workspace_source_lock(root, exclusive=False),
@@ -487,8 +589,18 @@ def _replace_file(
             relative_path,
             content,
             expected_revision,
+            expected_git_mode=expected_git_mode,
+            replacement_mode=replacement_mode,
         )
         return mutation_result_from_identities("replace", before=before, after=content)
+
+
+def _git_mode_bits(git_mode: WorkspaceGitMode) -> int:
+    if git_mode == "100644":
+        return 0o644
+    if git_mode == "100755":
+        return 0o755
+    raise ValueError("Workspace git_mode must be 100644 or 100755.")
 
 
 def _delete_file_if_revision(
@@ -535,10 +647,15 @@ def _list_files(
     pattern: str,
     limit: int | None,
     excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
 ) -> WorkspaceListResult:
     with workspace_source_lock(root, exclusive=False):
         collector = _WorkspaceListCollector(limit)
-        for path in _iter_list_file_candidates(root, excluded_directory_keys):
+        for path in _iter_list_file_candidates(
+            root,
+            excluded_directory_keys,
+            excluded_path_pattern_keys,
+        ):
             if _has_symlink_component(root, path):
                 continue
             resolved = path.resolve()
@@ -547,6 +664,8 @@ def _list_files(
                 continue
             relative_path = resolved.relative_to(root).as_posix()
             if _path_has_excluded_directory(relative_path, excluded_directory_keys):
+                continue
+            if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
                 continue
             if not matches_list_pattern(relative_path, pattern):
                 continue
@@ -558,6 +677,7 @@ def _list_git_entries(
     root: Path,
     limit: int,
     excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
 ) -> WorkspaceGitEntryListResult:
     retained: list[tuple[str, WorkspaceGitEntry]] = []
     total_count = 0
@@ -565,6 +685,8 @@ def _list_git_entries(
     def add(path: Path, info: os.stat_result) -> None:
         nonlocal total_count
         relative_path = path.relative_to(root).as_posix()
+        if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
+            return
         if stat.S_ISLNK(info.st_mode):
             target = os.fsencode(os.readlink(path))
             entry = WorkspaceGitEntry(
@@ -600,6 +722,12 @@ def _list_git_entries(
                 if _directory_name_key(name) in excluded_directory_keys:
                     continue
                 path = parent / name
+                relative_path = path.relative_to(root).as_posix()
+                if _path_matches_excluded_pattern(
+                    relative_path,
+                    excluded_path_pattern_keys,
+                ):
+                    continue
                 info = path.lstat()
                 if stat.S_ISLNK(info.st_mode):
                     add(path, info)
@@ -615,6 +743,8 @@ def _list_git_entries(
                 relative_path = path.relative_to(root).as_posix()
                 if _path_has_excluded_directory(relative_path, excluded_directory_keys):
                     continue
+                if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
+                    continue
                 add(path, path.lstat())
     return WorkspaceGitEntryListResult(
         entries=tuple(entry for _path, entry in retained),
@@ -626,8 +756,9 @@ def _list_git_entries(
 def _iter_list_file_candidates(
     root: Path,
     excluded_directory_keys: frozenset[str],
+    excluded_path_pattern_keys: tuple[str, ...],
 ) -> Iterable[Path]:
-    if not excluded_directory_keys:
+    if not excluded_directory_keys and not excluded_path_pattern_keys:
         yield from root.rglob("*")
         return
 
@@ -642,6 +773,10 @@ def _iter_list_file_candidates(
             name
             for name in child_directories
             if _directory_name_key(name) not in excluded_directory_keys
+            and not _path_matches_excluded_pattern(
+                (parent / name).relative_to(root).as_posix(),
+                excluded_path_pattern_keys,
+            )
             and not (parent / name).is_symlink()
         ]
         for filename in filenames:
@@ -682,6 +817,35 @@ def _validate_excluded_directory_names(values: Iterable[str]) -> tuple[str, ...]
     return tuple(validated)
 
 
+def _validate_excluded_path_patterns(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("LocalWorkspace excluded_path_patterns must be an iterable of strings.")
+    try:
+        copied = tuple(values)
+    except TypeError as exc:
+        raise TypeError(
+            "LocalWorkspace excluded_path_patterns must be an iterable of strings."
+        ) from exc
+    validated: list[str] = []
+    seen: set[str] = set()
+    for value in copied:
+        if type(value) is not str:
+            raise TypeError("LocalWorkspace excluded_path_patterns entries must be strings.")
+        value = require_unicode_scalar_text(
+            require_clean_nonblank(value, "excluded path pattern"),
+            "excluded path pattern",
+        )
+        if "\\" in value:
+            raise ValueError("LocalWorkspace excluded path patterns must use POSIX separators.")
+        value = validate_list_pattern(value)
+        normalized = _normalized_exclusion_path(value)
+        if normalized in seen:
+            raise ValueError("LocalWorkspace excluded path patterns must be unique.")
+        seen.add(normalized)
+        validated.append(value)
+    return tuple(validated)
+
+
 def _directory_name_key(value: str) -> str:
     return value.rstrip(" .").casefold()
 
@@ -696,6 +860,30 @@ def _path_has_excluded_directory(
         _directory_name_key(part) in excluded_directory_keys
         for part in relative_path.replace("\\", "/").split("/")
         if part
+    )
+
+
+def _normalized_exclusion_path(value: str) -> str:
+    return "/".join(
+        _directory_name_key(part)
+        for part in value.replace("\\", "/").split("/")
+        if part not in {"", "."}
+    )
+
+
+def _path_matches_excluded_pattern(
+    relative_path: str,
+    excluded_path_pattern_keys: tuple[str, ...],
+) -> bool:
+    if not excluded_path_pattern_keys:
+        return False
+    normalized_parts = tuple(
+        part for part in _normalized_exclusion_path(relative_path).split("/") if part
+    )
+    return any(
+        matches_list_pattern("/".join(normalized_parts[:end]), pattern)
+        for pattern in excluded_path_pattern_keys
+        for end in range(1, len(normalized_parts) + 1)
     )
 
 

@@ -240,6 +240,26 @@ def test_docker_plan_puts_image_construction_before_runtime_verification() -> No
     )
 
 
+def test_docker_coding_plan_records_explicit_toolchain_and_command_authority() -> None:
+    plan = normalize_application_plan(
+        name="coder",
+        agent_name="coder",
+        preset="coding",
+        execution="docker",
+        coding_toolchain="python",
+        coding_command_authority="structured",
+    )
+
+    assert plan.as_dict()["coding"] == {
+        "toolchain": "python",
+        "command_authority": "structured",
+    }
+    files = project_files("coder", application_plan=plan)
+    instructions = files["AGENTS.md"]
+    assert "--coding-toolchain python" in instructions
+    assert "--coding-command-authority structured" in instructions
+
+
 def test_extension_only_capability_fails_before_target_creation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

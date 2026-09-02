@@ -346,13 +346,15 @@ def open_guarded_regular_for_write(name, dir_fd):
     raise OSError("workspace write target changed too often")
 
 
-def write_guarded_regular(name, dir_fd, chunks):
+def write_guarded_regular(name, dir_fd, chunks, mode=None):
     fd = open_guarded_regular_for_write(name, dir_fd)
     try:
         os.ftruncate(fd, 0)
         # CAYU_TEST_AFTER_WRITE_TRUNCATE
         for payload in chunks:
             write_all(fd, payload)
+        if mode is not None:
+            os.fchmod(fd, mode)
     finally:
         os.close(fd)
 

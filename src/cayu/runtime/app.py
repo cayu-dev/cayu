@@ -2890,6 +2890,28 @@ class CayuApp:
 
         return self._session_engine.resolve_initial_model_target(request)
 
+    async def inspect_run_execution_profile(self, request: RunRequest) -> str:
+        """Return the exact initial profile fingerprint without admitting a session.
+
+        The inspection performs the ordinary bounded, read-only run preflights but
+        creates no session and dispatches no provider, tool, hook, or environment
+        factory work. Applications can bind product authority to the returned
+        fingerprint before exposing an advanced execution surface.
+        """
+
+        if type(request) is not RunRequest:
+            raise TypeError("Execution-profile inspection requires a RunRequest.")
+        prepared = await self._session_engine._prepare_initial_run(
+            request,
+            admit_session=False,
+            store_resolved_existing_session_id=request.session_id,
+        )
+        if prepared is None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        return prepared.execution_profile.fingerprint
+
     async def current_prompt_anatomy_sha256(
         self,
         *,

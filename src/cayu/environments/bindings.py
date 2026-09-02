@@ -39,8 +39,11 @@ from cayu.workspaces import (
     RunnerWorkspace,
     TarWriter,
     Workspace,
+    WorkspaceGitMode,
+    WorkspaceGitModeMutator,
     WorkspaceIdentity,
     WorkspacePathRevision,
+    WorkspaceReadResult,
     WorkspaceRevisionObservation,
     WorkspaceRevisionObservationLimits,
     WorkspaceRevisionObservationStatus,
@@ -97,10 +100,23 @@ class SyncBindingContext:
 
 
 @dataclass(frozen=True)
+class _SyncSourceRevision:
+    path: str
+    revision: str
+    git_mode: WorkspaceGitMode | None = None
+
+
+@dataclass(frozen=True)
+class _SyncStagedFile:
+    content: bytes
+    git_mode: WorkspaceGitMode | None = None
+
+
+@dataclass(frozen=True)
 class _SyncBindingState:
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
-    source_revisions: tuple[tuple[str, str], ...]
+    source_revisions: tuple[_SyncSourceRevision, ...]
     source_resource_key: tuple[object, ...]
     target_id: str
     target_resource_key: tuple[object, ...]
@@ -110,6 +126,7 @@ class _SyncBindingState:
 
 DEFAULT_SYNC_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 DEFAULT_SYNC_MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
+_SYNC_GIT_MODE_TAR_OWNER = "cayu.git-mode.v1"
 
 
 SYNC_FINAL_METADATA_KEYS = frozenset(
@@ -1236,6 +1253,7 @@ class SyncBinding(WorkspaceBinding):
         sync_back: SyncBackPolicy = "always",
         delete_missing: bool = True,
         source_conflict_policy: SyncSourceConflictPolicy = "overwrite",
+        preserve_git_modes: bool = False,
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -1278,6 +1296,9 @@ class SyncBinding(WorkspaceBinding):
             raise TypeError("SyncBinding delete_missing must be a bool.")
         self.delete_missing = delete_missing
         self.source_conflict_policy = _validate_source_conflict_policy(source_conflict_policy)
+        if type(preserve_git_modes) is not bool:
+            raise TypeError("SyncBinding preserve_git_modes must be a bool.")
+        self.preserve_git_modes = preserve_git_modes
         if self.source_conflict_policy == "require_revision" and (
             self.max_file_bytes is None or self.max_total_bytes is None
         ):
@@ -1519,13 +1540,14 @@ class SyncBinding(WorkspaceBinding):
                 limit=self.max_files,
                 role="source",
             )
-            source_revisions: tuple[tuple[str, str], ...] = ()
+            source_revisions: tuple[_SyncSourceRevision, ...] = ()
             if self.source_conflict_policy == "require_revision":
                 source_revisions = await _capture_sync_source_revisions(
                     workspace,
                     source_paths,
                     max_file_bytes=cast("int", self.max_file_bytes),
                     max_total_bytes=cast("int", self.max_total_bytes),
+                    preserve_git_modes=self.preserve_git_modes,
                 )
             cleaned_paths: tuple[str, ...] = ()
             if self.clean_target == "always":
@@ -1545,6 +1567,7 @@ class SyncBinding(WorkspaceBinding):
                 max_file_bytes=self.max_file_bytes,
                 max_total_bytes=self.max_total_bytes,
                 max_archive_bytes=self.max_archive_bytes,
+                preserve_git_modes=self.preserve_git_modes,
             )
             if self.source_conflict_policy == "require_revision":
                 await _verify_sync_source_revisions(
@@ -1552,6 +1575,7 @@ class SyncBinding(WorkspaceBinding):
                     source_revisions,
                     max_file_bytes=cast("int", self.max_file_bytes),
                     max_total_bytes=cast("int", self.max_total_bytes),
+                    preserve_git_modes=self.preserve_git_modes,
                 )
             bind_metadata = {
                 **request_metadata,
@@ -1567,6 +1591,7 @@ class SyncBinding(WorkspaceBinding):
                     "sync_back": self.sync_back,
                     "delete_missing": self.delete_missing,
                     "source_conflict_policy": self.source_conflict_policy,
+                    "preserve_git_modes": self.preserve_git_modes,
                     "copied_files": len(source_paths),
                     "copied_bytes": copied_bytes,
                     "cleaned_target_files": len(cleaned_paths),
@@ -1743,6 +1768,7 @@ class SyncBinding(WorkspaceBinding):
                     max_file_bytes=self.max_file_bytes,
                     max_total_bytes=self.max_total_bytes,
                     max_archive_bytes=self.max_archive_bytes,
+                    preserve_git_modes=self.preserve_git_modes,
                 )
                 for path in deleted_paths:
                     await _await_sync_mutation(
@@ -1761,6 +1787,9 @@ class SyncBinding(WorkspaceBinding):
                     **finalize_metadata,
                     "target_workspace_id": bound.workspace.id,
                     "outcome": outcome,
+                    "source_conflict_policy": self.source_conflict_policy,
+                    "sync_back": self.sync_back,
+                    "delete_missing": self.delete_missing,
                     "copied_files": len(copy_back_paths),
                     "copied_bytes": copied_bytes,
                     "deleted_files": len(deleted_paths),
@@ -1785,8 +1814,8 @@ class SyncBinding(WorkspaceBinding):
         target: Workspace,
         copy_back_paths: tuple[str, ...],
         deleted_paths: tuple[str, ...],
-        revisions: tuple[tuple[str, str], ...],
-    ) -> tuple[int, tuple[tuple[str, str], ...]]:
+        revisions: tuple[_SyncSourceRevision, ...],
+    ) -> tuple[int, tuple[_SyncSourceRevision, ...]]:
         max_file_bytes = cast("int", self.max_file_bytes)
         max_total_bytes = cast("int", self.max_total_bytes)
         staged, copied_bytes = await _stage_sync_files(
@@ -1794,13 +1823,15 @@ class SyncBinding(WorkspaceBinding):
             copy_back_paths,
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
+            preserve_git_modes=self.preserve_git_modes,
         )
-        revision_map = dict(revisions)
+        revision_map = {item.path: item for item in revisions}
         await _verify_sync_source_revisions(
             source,
             revisions,
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
+            preserve_git_modes=self.preserve_git_modes,
         )
         applied: list[str] = []
         operations = tuple(sorted(set(copy_back_paths).union(deleted_paths)))
@@ -1809,33 +1840,66 @@ class SyncBinding(WorkspaceBinding):
 
                 async def mutate_and_record(path: str = path) -> None:
                     if path in staged:
-                        content = staged[path]
-                        expected_revision = revision_map.get(path)
-                        if expected_revision is None:
-                            result = await source.create_bytes(path, content)
+                        staged_file = staged[path]
+                        expected = revision_map.get(path)
+                        if self.preserve_git_modes:
+                            if not isinstance(source, WorkspaceGitModeMutator):
+                                raise RuntimeError(
+                                    "SyncBinding Git-mode copy-back requires a mode-aware source."
+                                )
+                            if staged_file.git_mode is None:
+                                raise RuntimeError(
+                                    f"SyncBinding target omitted Git mode authority: {path}"
+                                )
+                            if expected is None:
+                                result = await source.create_bytes_with_git_mode(
+                                    path,
+                                    staged_file.content,
+                                    git_mode=staged_file.git_mode,
+                                )
+                            else:
+                                if expected.git_mode is None:
+                                    raise RuntimeError(
+                                        f"SyncBinding source omitted Git mode authority: {path}"
+                                    )
+                                result = await source.replace_bytes_with_git_mode(
+                                    path,
+                                    staged_file.content,
+                                    expected_revision=expected.revision,
+                                    expected_git_mode=expected.git_mode,
+                                    git_mode=staged_file.git_mode,
+                                )
+                        elif expected is None:
+                            result = await source.create_bytes(path, staged_file.content)
                         else:
                             result = await source.replace_bytes(
                                 path,
-                                content,
-                                expected_revision=expected_revision,
+                                staged_file.content,
+                                expected_revision=expected.revision,
                             )
                         if result.after_revision is None:
                             raise RuntimeError(
                                 "SyncBinding conditional write returned no resulting revision."
                             )
-                        revision_map[path] = result.after_revision
+                        revision_map[path] = _SyncSourceRevision(
+                            path=path,
+                            revision=result.after_revision,
+                            git_mode=staged_file.git_mode if self.preserve_git_modes else None,
+                        )
                     else:
-                        expected_revision = revision_map[path]
+                        expected = revision_map[path]
                         await source.delete_if_revision(
                             path,
-                            expected_revision=expected_revision,
+                            expected_revision=expected.revision,
                         )
                         del revision_map[path]
                     applied.append(path)
                     self._update_conflict_state(
                         state_key,
                         source_paths=tuple(sorted(revision_map)),
-                        source_revisions=tuple(sorted(revision_map.items())),
+                        source_revisions=tuple(
+                            sorted(revision_map.values(), key=lambda item: item.path)
+                        ),
                     )
 
                 await _await_sync_mutation(
@@ -1847,7 +1911,7 @@ class SyncBinding(WorkspaceBinding):
                     path,
                     applied_paths=tuple(applied),
                 ) from exc
-        return copied_bytes, tuple(sorted(revision_map.items()))
+        return copied_bytes, tuple(sorted(revision_map.values(), key=lambda item: item.path))
 
     async def _target_workspace(
         self,
@@ -1959,7 +2023,7 @@ class SyncBinding(WorkspaceBinding):
         state_key: str,
         *,
         source_paths: tuple[str, ...],
-        source_revisions: tuple[tuple[str, str], ...],
+        source_revisions: tuple[_SyncSourceRevision, ...],
     ) -> None:
         with self._state_lock:
             state = self._states.get(state_key)
@@ -1977,7 +2041,7 @@ class SyncBinding(WorkspaceBinding):
         *,
         source_paths: tuple[str, ...],
         target_baseline_paths: tuple[str, ...],
-        source_revisions: tuple[tuple[str, str], ...],
+        source_revisions: tuple[_SyncSourceRevision, ...],
     ) -> None:
         with self._state_lock:
             state = self._states.get(state_key)
@@ -2184,8 +2248,9 @@ async def _capture_sync_source_revisions(
     *,
     max_file_bytes: int,
     max_total_bytes: int,
-) -> tuple[tuple[str, str], ...]:
-    revisions: list[tuple[str, str]] = []
+    preserve_git_modes: bool,
+) -> tuple[_SyncSourceRevision, ...]:
+    revisions: list[_SyncSourceRevision] = []
     observed_bytes = 0
     for path in paths:
         result = await workspace.read_bytes(
@@ -2205,31 +2270,43 @@ async def _capture_sync_source_revisions(
             raise RuntimeError(
                 f"SyncBinding revision-aware copy-back requires source revision support: {path}"
             )
-        revisions.append((path, result.revision))
+        if preserve_git_modes and result.git_mode is None:
+            raise RuntimeError(
+                f"SyncBinding Git-mode copy-back requires source mode support: {path}"
+            )
+        revisions.append(
+            _SyncSourceRevision(
+                path=path,
+                revision=result.revision,
+                git_mode=result.git_mode if preserve_git_modes else None,
+            )
+        )
     return tuple(revisions)
 
 
 async def _verify_sync_source_revisions(
     workspace: Workspace,
-    revisions: tuple[tuple[str, str], ...],
+    revisions: tuple[_SyncSourceRevision, ...],
     *,
     max_file_bytes: int,
     max_total_bytes: int,
+    preserve_git_modes: bool,
 ) -> None:
     try:
         current = await _capture_sync_source_revisions(
             workspace,
-            tuple(path for path, _ in revisions),
+            tuple(item.path for item in revisions),
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
+            preserve_git_modes=preserve_git_modes,
         )
     except Exception as exc:
-        path = revisions[0][0] if revisions else "source-workspace"
+        path = revisions[0].path if revisions else "source-workspace"
         raise SyncBindingSourceConflictError(path) from exc
-    expected = dict(revisions)
-    for path, revision in current:
-        if expected[path] != revision:
-            raise SyncBindingSourceConflictError(path)
+    expected = {item.path: item for item in revisions}
+    for observed in current:
+        if expected[observed.path] != observed:
+            raise SyncBindingSourceConflictError(observed.path)
 
 
 async def _stage_sync_files(
@@ -2238,19 +2315,21 @@ async def _stage_sync_files(
     *,
     max_file_bytes: int,
     max_total_bytes: int,
-) -> tuple[dict[str, bytes], int]:
-    staged: dict[str, bytes] = {}
+    preserve_git_modes: bool,
+) -> tuple[dict[str, _SyncStagedFile], int]:
+    staged: dict[str, _SyncStagedFile] = {}
     total_bytes = 0
     for path in paths:
-        content = await _read_sync_file(
+        result = await _read_sync_file_result(
             workspace,
             path,
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
             copied_bytes=total_bytes,
         )
-        staged[path] = content
-        total_bytes += len(content)
+        git_mode = _require_sync_git_mode(result, path) if preserve_git_modes else None
+        staged[path] = _SyncStagedFile(content=result.content, git_mode=git_mode)
+        total_bytes += len(result.content)
     return staged, total_bytes
 
 
@@ -2292,6 +2371,7 @@ async def _copy_paths(
     max_file_bytes: int | None,
     max_total_bytes: int | None,
     max_archive_bytes: int | None,
+    preserve_git_modes: bool = False,
 ) -> int:
     """Copy files between workspaces, staging whenever a bound is configured.
 
@@ -2305,6 +2385,12 @@ async def _copy_paths(
         return 0
     source_supports_bulk = isinstance(source, BoundedTarReader)
     target_supports_bulk = isinstance(target, TarWriter)
+    if (
+        preserve_git_modes
+        and not target_supports_bulk
+        and not isinstance(target, WorkspaceGitModeMutator)
+    ):
+        raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
     requires_staging = any(
         limit is not None for limit in (max_file_bytes, max_total_bytes, max_archive_bytes)
     )
@@ -2315,6 +2401,7 @@ async def _copy_paths(
             paths=paths,
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
+            preserve_git_modes=preserve_git_modes,
         )
     if source_supports_bulk:
         tar_data = await source.read_tar_bytes(
@@ -2330,6 +2417,7 @@ async def _copy_paths(
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
             max_archive_bytes=max_archive_bytes,
+            preserve_git_modes=preserve_git_modes,
         )
     copied_bytes = _validate_sync_tar(
         tar_data,
@@ -2337,6 +2425,7 @@ async def _copy_paths(
         max_file_bytes=max_file_bytes,
         max_total_bytes=max_total_bytes,
         max_archive_bytes=max_archive_bytes,
+        preserve_git_modes=preserve_git_modes,
     )
     if target_supports_bulk:
         await _await_sync_mutation(
@@ -2344,7 +2433,11 @@ async def _copy_paths(
             operation="SyncBinding target tar write",
         )
     else:
-        await _extract_tar_to_workspace(target, tar_data)
+        await _extract_tar_to_workspace(
+            target,
+            tar_data,
+            preserve_git_modes=preserve_git_modes,
+        )
     return copied_bytes
 
 
@@ -2355,21 +2448,37 @@ async def _copy_paths_per_file(
     paths: tuple[str, ...],
     max_file_bytes: int | None,
     max_total_bytes: int | None,
+    preserve_git_modes: bool = False,
 ) -> int:
     copied_bytes = 0
     for path in paths:
-        content = await _read_sync_file(
+        result = await _read_sync_file_result(
             source,
             path,
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
             copied_bytes=copied_bytes,
         )
-        await _await_sync_mutation(
-            lambda path=path, content=content: target.write_bytes(path, content),
-            operation=f"SyncBinding target write for {path!r}",
-        )
-        copied_bytes += len(content)
+        if preserve_git_modes:
+            if not isinstance(target, WorkspaceGitModeMutator):
+                raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
+            git_mode = _require_sync_git_mode(result, path)
+            await _await_sync_mutation(
+                lambda path=path, result=result, git_mode=git_mode: (
+                    target.write_bytes_with_git_mode(
+                        path,
+                        result.content,
+                        git_mode=git_mode,
+                    )
+                ),
+                operation=f"SyncBinding target Git-mode write for {path!r}",
+            )
+        else:
+            await _await_sync_mutation(
+                lambda path=path, content=result.content: target.write_bytes(path, content),
+                operation=f"SyncBinding target write for {path!r}",
+            )
+        copied_bytes += len(result.content)
     return copied_bytes
 
 
@@ -2380,6 +2489,7 @@ async def _pack_workspace_tar(
     max_file_bytes: int | None,
     max_total_bytes: int | None,
     max_archive_bytes: int | None,
+    preserve_git_modes: bool = False,
 ) -> bytes:
     archive_overhead_bytes = tar_archive_size_bound(0, paths)
     staged_logical_limit: int | None = None
@@ -2393,7 +2503,7 @@ async def _pack_workspace_tar(
     copied_bytes = 0
     with tarfile.open(fileobj=buffer, mode="w") as archive:
         for path in paths:
-            content = await _read_sync_file(
+            result = await _read_sync_file_result(
                 source,
                 path,
                 max_file_bytes=max_file_bytes,
@@ -2402,26 +2512,51 @@ async def _pack_workspace_tar(
                 max_staged_bytes=staged_logical_limit,
                 staged_limit_label=staged_limit_label,
             )
-            copied_bytes += len(content)
+            copied_bytes += len(result.content)
             info = tarfile.TarInfo(name=path)
-            info.size = len(content)
-            archive.addfile(info, io.BytesIO(content))
+            info.size = len(result.content)
+            if preserve_git_modes:
+                git_mode = _require_sync_git_mode(result, path)
+                info.mode = _git_mode_tar_bits(git_mode)
+                info.uname = _SYNC_GIT_MODE_TAR_OWNER
+            archive.addfile(info, io.BytesIO(result.content))
     tar_data = buffer.getvalue()
     _validate_sync_archive_bytes(tar_data, max_archive_bytes=max_archive_bytes)
     return tar_data
 
 
-async def _extract_tar_to_workspace(target: Workspace, tar_data: bytes) -> None:
+async def _extract_tar_to_workspace(
+    target: Workspace,
+    tar_data: bytes,
+    *,
+    preserve_git_modes: bool = False,
+) -> None:
+    if preserve_git_modes and not isinstance(target, WorkspaceGitModeMutator):
+        raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
     with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r") as archive:
         for member in archive.getmembers():
             extracted = archive.extractfile(member)
             if extracted is None:
                 raise RuntimeError(f"SyncBinding tar member could not be read: {member.name}")
             content = extracted.read()
-            await _await_sync_mutation(
-                lambda name=member.name, content=content: target.write_bytes(name, content),
-                operation=f"SyncBinding target write for {member.name!r}",
-            )
+            if preserve_git_modes:
+                git_mode = _tar_member_git_mode(member)
+                mode_target = cast("WorkspaceGitModeMutator", target)
+                await _await_sync_mutation(
+                    lambda name=member.name, content=content, git_mode=git_mode, target=mode_target: (
+                        target.write_bytes_with_git_mode(
+                            name,
+                            content,
+                            git_mode=git_mode,
+                        )
+                    ),
+                    operation=f"SyncBinding target Git-mode write for {member.name!r}",
+                )
+            else:
+                await _await_sync_mutation(
+                    lambda name=member.name, content=content: target.write_bytes(name, content),
+                    operation=f"SyncBinding target write for {member.name!r}",
+                )
 
 
 async def _await_sync_mutation(
@@ -2520,6 +2655,7 @@ def _validate_sync_tar(
     max_file_bytes: int | None,
     max_total_bytes: int | None,
     max_archive_bytes: int | None,
+    preserve_git_modes: bool = False,
 ) -> int:
     if type(tar_data) is not bytes:
         raise TypeError("SyncBinding bulk transfer must produce tar bytes.")
@@ -2533,6 +2669,8 @@ def _validate_sync_tar(
                     raise RuntimeError(
                         f"SyncBinding tar member must be a regular file: {member.name}"
                     )
+                if preserve_git_modes:
+                    _tar_member_git_mode(member)
                 if max_file_bytes is not None and member.size > max_file_bytes:
                     raise RuntimeError(
                         f"SyncBinding file exceeds max_file_bytes={max_file_bytes}: {member.name}"
@@ -2560,6 +2698,28 @@ async def _read_sync_file(
     max_staged_bytes: int | None = None,
     staged_limit_label: str | None = None,
 ) -> bytes:
+    result = await _read_sync_file_result(
+        source,
+        path,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        copied_bytes=copied_bytes,
+        max_staged_bytes=max_staged_bytes,
+        staged_limit_label=staged_limit_label,
+    )
+    return result.content
+
+
+async def _read_sync_file_result(
+    source: Workspace,
+    path: str,
+    *,
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    copied_bytes: int,
+    max_staged_bytes: int | None = None,
+    staged_limit_label: str | None = None,
+) -> WorkspaceReadResult:
     read_limit, limit_label, active_aggregate_limit = _copy_read_limit(
         source,
         max_file_bytes=max_file_bytes,
@@ -2569,6 +2729,8 @@ async def _read_sync_file(
         staged_limit_label=staged_limit_label,
     )
     result = await source.read_bytes(path, max_bytes=read_limit)
+    if type(result) is not WorkspaceReadResult:
+        raise TypeError("SyncBinding source read returned an invalid result.")
     if result.truncated:
         if active_aggregate_limit is not None:
             aggregate_bytes, aggregate_label = active_aggregate_limit
@@ -2590,7 +2752,25 @@ async def _read_sync_file(
             max_bytes=max_staged_bytes,
             limit_label=staged_limit_label,
         )
-    return result.content
+    return result
+
+
+def _require_sync_git_mode(result: WorkspaceReadResult, path: str) -> WorkspaceGitMode:
+    if result.git_mode is None:
+        raise RuntimeError(f"SyncBinding source omitted Git mode authority: {path}")
+    return result.git_mode
+
+
+def _git_mode_tar_bits(git_mode: WorkspaceGitMode) -> int:
+    return 0o755 if git_mode == "100755" else 0o644
+
+
+def _tar_member_git_mode(member: tarfile.TarInfo) -> WorkspaceGitMode:
+    if member.uname != _SYNC_GIT_MODE_TAR_OWNER or member.mode not in {0o644, 0o755}:
+        raise RuntimeError(
+            f"SyncBinding tar member omitted valid Git mode authority: {member.name}"
+        )
+    return "100755" if member.mode == 0o755 else "100644"
 
 
 def _copy_read_limit(

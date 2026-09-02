@@ -250,6 +250,7 @@ class WorkspacePathRevision(BaseModel):
     content_sha256: str | None = None
     index_object_id: str | None = None
     index_mode: str | None = None
+    worktree_mode: str | None = None
     renamed_from: str | None = None
 
     @field_validator("path")
@@ -268,6 +269,7 @@ class WorkspacePathRevision(BaseModel):
         "content_sha256",
         "index_object_id",
         "index_mode",
+        "worktree_mode",
         "renamed_from",
     )
     @classmethod
@@ -279,10 +281,13 @@ class WorkspacePathRevision(BaseModel):
             raise ValueError("Workspace revision rename source must be traversal-free.")
         if info.field_name == "renamed_from" and str(PurePosixPath(text)) != text:
             raise ValueError("Workspace revision rename source must use canonical POSIX spelling.")
-        if info.field_name == "index_mode" and (
+        if info.field_name in {"index_mode", "worktree_mode"} and (
             len(text) != 6 or any(char not in "01234567" for char in text)
         ):
-            raise ValueError("Workspace revision index mode must be a six-digit octal mode.")
+            raise ValueError(
+                f"Workspace revision {info.field_name.replace('_', ' ')} must be a "
+                "six-digit octal mode."
+            )
         return text
 
 
@@ -291,6 +296,7 @@ _WORKSPACE_PATH_REVISION_AUTHORITY_FIELDS = frozenset(
     {
         "content_sha256",
         "index_mode",
+        "worktree_mode",
         "index_object_id",
         "kind",
         "staged",
@@ -430,6 +436,7 @@ def copy_bounded_workspace_revision_observation(
             path.content_sha256,
             path.index_object_id,
             path.index_mode,
+            path.worktree_mode,
             path.renamed_from,
         ):
             serialized_size += _bounded_observation_text_size(
@@ -452,6 +459,7 @@ def copy_bounded_workspace_revision_observation(
                 content_sha256=path.content_sha256,
                 index_object_id=path.index_object_id,
                 index_mode=path.index_mode,
+                worktree_mode=path.worktree_mode,
                 renamed_from=path.renamed_from,
             )
         )
@@ -639,6 +647,7 @@ async def observe_deterministic_workspace(
                 offset=raw_read.offset,
                 revision=raw_read.revision,
                 sha256=raw_read.sha256,
+                git_mode=raw_read.git_mode,
                 source_bytes_read=raw_read.source_bytes_read,
                 redaction_truncated=raw_read.redaction_truncated,
             )
@@ -674,10 +683,18 @@ async def observe_deterministic_workspace(
             working_tree="present",
             kind="file",
             content_sha256=digest,
+            worktree_mode=read.git_mode,
             present=True,
         )
         revisions.append(revision)
-        manifest.append({"path": path, "sha256": digest, "bytes": read.total_bytes})
+        manifest.append(
+            {
+                "path": path,
+                "sha256": digest,
+                "bytes": read.total_bytes,
+                "git_mode": read.git_mode,
+            }
+        )
 
     encoded = _deterministic_workspace_manifest_bytes(manifest)
     if len(encoded) > limits.max_manifest_bytes:

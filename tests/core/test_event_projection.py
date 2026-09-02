@@ -2196,6 +2196,41 @@ def test_fixed_control_registry_covers_mcp_binding_workflow_and_budget_protocols
     assert public_settlement["status"] == "reconciled"
 
 
+def test_final_git_receipt_redaction_preserves_its_original_digest() -> None:
+    receipt_sha256 = "sha256:" + "a" * 64
+    event = Event(
+        type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+        session_id="session",
+        payload={
+            "final_git_receipt": {
+                "schema": "cayu.final_git_receipt.v1",
+                "receipt_sha256": receipt_sha256,
+                "request_fingerprint": "sha256:" + "b" * 64,
+                "destination_workspace_id": "source-workspace",
+                "workload_workspace_id": "workload-workspace",
+                "baseline_revision": "sha256:" + "c" * 64,
+                "workspace_revision": "sha256:" + "d" * 64,
+                "status": {"structured": {"mode": "status"}},
+                "summary": {"structured": {"mode": "summary"}},
+                "diff": {
+                    "content": "private-diff-content",
+                    "structured": {"mode": "diff"},
+                },
+            }
+        },
+    )
+
+    projected = project_runtime_event(
+        event,
+        sequence=1,
+        redactor=SecretRedactor("private-diff-content"),
+    )
+
+    receipt = projected.payload["final_git_receipt"]
+    assert receipt["receipt_sha256"] == receipt_sha256
+    assert receipt["diff"]["content"] == REDACTED_SECRET
+
+
 def test_nested_budget_settlement_authority_rejects_secret_before_redaction() -> None:
     reconciliation = BudgetReconciliation(
         reservation_id="reservation-secret",

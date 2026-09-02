@@ -107,7 +107,9 @@ remain freeform. `AGENTS.md` is the compact authoring and proof contract, while
 `cayu new NAME --preset coding` is the maintained opt-in starter for a
 repository-coding application. It populates `tools/coding.py`,
 `policies/coding.py`, `environments/coding.py`, `operations/coding.py`,
-`knowledge/coding.py`, `prompts/coding.py`, and `agents/registration.py`; root
+`knowledge/coding.py`, `prompts/coding.py`, and `agents/registration.py`; the
+Docker product variant also populates `domain/coding_product.py` and
+`workflows/coding_product.py`. Root
 `composition.py` is only a compatibility import. Those modules register existing
 public APIs for bounded file inspection and mutation, `rg` search, Git change
 review, local artifacts, selected SQLite or Postgres knowledge with pending
@@ -117,6 +119,13 @@ pauses. The generator preflights
 `LocalWorkspace` path operations, then creates a clean initial Git commit so
 change review has a deterministic baseline. Unsupported hosts fail during
 generation or application construction instead of a later tool call.
+
+The Docker variant exposes `app.build_coding_product_application()` as the
+maintained path to a durable `patch_ready_for_delivery` result. That state means
+required checks, source publication, complete Git evidence, and configured
+review gates settled under exact admitted authority. It does not mean Cayu
+committed, pushed, opened a pull request, waited for CI, or merged. See
+[Maintained coding product](coding-product.md).
 
 The composition selects concrete implementations; selection is not authority.
 The registered exposure policy separately decides which tools are model-visible,

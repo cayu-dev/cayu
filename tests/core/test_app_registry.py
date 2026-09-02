@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import pytest
@@ -16,6 +17,8 @@ from cayu import (
     EnvironmentFactoryResult,
     EnvironmentSpec,
     LocalWorkspace,
+    Message,
+    RunRequest,
     ScriptedModelProvider,
     Tool,
     ToolContext,
@@ -65,6 +68,23 @@ def test_empty_registries_are_empty_tuples() -> None:
     assert app.list_agents() == ()
     assert app.list_providers() == ()
     assert app.list_environments() == ()
+
+
+def test_execution_profile_inspection_is_read_only_and_creates_no_session() -> None:
+    app = CayuApp()
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="coder", model="scripted-model"))
+    request = RunRequest(
+        agent_name="coder",
+        session_id="inspection-must-not-create",
+        messages=[Message.text("user", "inspect this exact run")],
+    )
+
+    fingerprint = asyncio.run(app.inspect_run_execution_profile(request))
+    sessions = asyncio.run(app.session_store.list_sessions())
+
+    assert len(fingerprint) == 64
+    assert sessions.sessions == []
 
 
 def test_cayu_app_rejects_duplicate_agents_and_missing_registrations() -> None:
