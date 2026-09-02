@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "14"
+APP_MANIFEST_SCHEMA_VERSION = "15"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -363,6 +363,12 @@ class RequestFootprintConfigManifest(_ManifestModel):
     canonicalization_version: int
 
 
+class RecoveryCleanupPolicyManifest(_ManifestModel):
+    step_timeout_seconds: float
+    overall_timeout_seconds: float
+    max_supervised_tasks: int
+
+
 class RuntimeManifest(_ManifestModel):
     dispatcher: str
     retry_policy: str | None
@@ -380,10 +386,11 @@ class RuntimeManifest(_ManifestModel):
     tool_timeout_seconds: float | None
     max_parallel_tool_calls: int
     max_environment_lifecycle_owners: int
+    recovery_cleanup_policy: RecoveryCleanupPolicyManifest
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["14"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["15"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -486,6 +493,11 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         tool_timeout_seconds=app._tool_timeout_seconds,
         max_parallel_tool_calls=app._max_parallel_tool_calls,
         max_environment_lifecycle_owners=app._max_environment_lifecycle_owners,
+        recovery_cleanup_policy=RecoveryCleanupPolicyManifest(
+            step_timeout_seconds=app._recovery_cleanup_policy.step_timeout_seconds,
+            overall_timeout_seconds=app._recovery_cleanup_policy.overall_timeout_seconds,
+            max_supervised_tasks=app._recovery_cleanup_policy.max_supervised_tasks,
+        ),
     )
     capabilities = _capabilities(
         agents=agents,

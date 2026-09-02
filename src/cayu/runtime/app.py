@@ -351,6 +351,12 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
     public_authority_alias_is_reserved,
 )
+from cayu.runtime.recovery_cleanup import (
+    RecoveryCleanupPolicy,
+    RecoveryCleanupSupervisor,
+    RecoveryCleanupSupervisorSnapshot,
+    copy_recovery_cleanup_policy,
+)
 from cayu.runtime.request_footprints import (
     RequestFootprintConfig,
     copy_request_footprint_config,
@@ -1054,6 +1060,7 @@ class CayuApp:
         tool_timeout_seconds: float | None = None,
         max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
         max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
+        recovery_cleanup_policy: RecoveryCleanupPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         # Resolve once at application startup. Strict deployments fail here,
@@ -1218,6 +1225,8 @@ class CayuApp:
             max_environment_lifecycle_owners,
             "max_environment_lifecycle_owners",
         )
+        self._recovery_cleanup_policy = copy_recovery_cleanup_policy(recovery_cleanup_policy)
+        self._recovery_cleanup_supervisor = RecoveryCleanupSupervisor(self._recovery_cleanup_policy)
         self.session_store = (
             session_store
             if session_store is not None
@@ -1403,6 +1412,7 @@ class CayuApp:
             recover_provider_operation_start=self._recover_provider_operation_start,
             cancel_provider_operation=self._cancel_provider_operation,
             interaction_transition_replay_failures=_interaction_transition_replay_failures,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             runtime_hooks=self._runtime_hooks,
             loop_policies=self._loop_policies,
         )
@@ -1440,6 +1450,7 @@ class CayuApp:
             request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             recovery_coordinator=self._recovery_coordinator,
+            recovery_cleanup_supervisor=self._recovery_cleanup_supervisor,
             background_interruption_coordinator=(self._background_interruption_coordinator),
             secret_redactor=self._secret_redactor,
             clock=self._clock,
@@ -2019,6 +2030,16 @@ class CayuApp:
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         return await self._session_engine.drain_background_interruptions(timeout_s=timeout_s)
+
+    def recovery_cleanup_status(self) -> RecoveryCleanupSupervisorSnapshot:
+        """Return content-free process-local cleanup supervision state."""
+
+        return self._recovery_cleanup_supervisor.snapshot()
+
+    async def drain_recovery_cleanups(self, *, timeout_s: float = 10.0) -> bool:
+        """Wait boundedly for active and outcome-unknown recovery cleanup."""
+
+        return await self._recovery_cleanup_supervisor.drain(timeout_s=timeout_s)
 
     async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle retained environment cleanup without cancelling live mutations."""

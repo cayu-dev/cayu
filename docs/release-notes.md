@@ -89,6 +89,30 @@ guard.
 
 ## Unreleased
 
+### Recovery cleanup now has shared finite deadlines
+
+`CayuApp` now supervises recovery cleanup through a shared
+`RecoveryCleanupPolicy`. The default per-step deadline is 30 seconds, the
+default sequence deadline is 120 seconds, and at most 256 active or
+outcome-unknown tasks are supervised per app. A hanging stream close, finalizer,
+heartbeat stop, claim release, fence release, environment cleanup, or
+supervisor shutdown can no longer hold its caller indefinitely. Independent
+cleanup explicitly grouped into one phase receives a bounded concurrent
+attempt. Ordered steps remain dependency barriers and resume under a reserved
+continuation only after an outcome-unknown predecessor settles. The original
+Runtime failure remains authoritative and typed timeout evidence is attached to
+it.
+
+Timed-out work remains strongly owned until it settles, and its operation's
+durable claim, fence, run-operation, provider-operation, or lifecycle marker
+continues to be the restart authority. Capacity exhaustion fails before an
+untracked cleanup task starts. Operators can inspect content-free counters with
+`CayuApp.recovery_cleanup_status()` and use
+`CayuApp.drain_recovery_cleanups(...)` during bounded shutdown; drain follows
+active-to-retained-to-continuation transitions for the whole configured grace
+period. The application manifest and generator plan advance from schema version
+14 to 15, and the manifest fingerprints the complete cleanup policy.
+
 ### Task continuations retain elected worker authority across recovery entrances
 
 An interrupted task claimed with `claim_interrupted_task_continuation(...)` now

@@ -278,6 +278,12 @@ from cayu.runtime.provider_operations import (
     resolve_provider_operation_stage,
     validate_provider_operation_resolution_outcome_event,
 )
+from cayu.runtime.recovery_cleanup import (
+    RecoveryCleanup,
+    RecoveryCleanupStep,
+    RecoveryCleanupStepInput,
+    RecoveryCleanupSupervisor,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
@@ -665,7 +671,6 @@ logger = logging.getLogger(__name__)
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 EffectiveRetryPolicy = Callable[[RetryPolicy | None], RetryPolicy]
-RecoveryCleanup = Callable[[], Awaitable[None]]
 
 
 def _pending_approval_and_round_for_atomic_claim(
@@ -1019,44 +1024,30 @@ def _attach_exception_cause_preserving_graph(
 async def _run_recovery_cleanup_steps(
     *,
     authoritative_failure: BaseException | None,
-    steps: tuple[tuple[str, RecoveryCleanup], ...],
+    steps: tuple[RecoveryCleanupStepInput, ...],
     cancellation_baseline: int = 0,
+    supervisor: RecoveryCleanupSupervisor | None = None,
 ) -> tuple[tuple[str, BaseException], ...]:
     """Run every handoff cleanup without obscuring its triggering failure.
 
     Once task cancellation starts a continuation handoff, a later ``cancel()``
     must not interrupt finalization or fence release. Run that cleanup in a
     shielded child task which inherits the current run-fence context, and wait
-    through any repeated cancellation requests. ``GeneratorExit`` is different:
-    an explicit ``aclose()`` consumes it, so a cleanup failure must remain visible
-    to the caller instead of being reduced to an exception note.
+    through repeated cancellation requests until the shared finite deadline
+    transfers outcome-unknown ownership. ``GeneratorExit`` is different: an
+    explicit ``aclose()`` consumes it, so a cleanup failure must remain visible to
+    the caller instead of being reduced to an exception note.
     """
-
-    async def run_steps() -> list[tuple[str, BaseException]]:
-        cleanup_failures: list[tuple[str, BaseException]] = []
-        for operation, cleanup in steps:
-            try:
-                await cleanup()
-            except BaseException as cleanup_failure:
-                cleanup_failures.append((operation, cleanup_failure))
-        return cleanup_failures
 
     abandonment = _recovery_abandonment_signal(
         authoritative_failure,
         cancellation_baseline=cancellation_baseline,
     )
-    if isinstance(abandonment, asyncio.CancelledError):
-        cleanup_task = asyncio.create_task(run_steps())
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                # Preserve the first cancellation as the caller-visible outcome,
-                # but do not let later cancellation requests strand durable state.
-                continue
-        cleanup_failures = cleanup_task.result()
-    else:
-        cleanup_failures = await run_steps()
+    cleanup_supervisor = supervisor or RecoveryCleanupSupervisor()
+    cleanup_failures = await cleanup_supervisor.run_steps(
+        steps=steps,
+        shield_caller_cancellation=isinstance(abandonment, asyncio.CancelledError),
+    )
 
     if not cleanup_failures:
         return ()
@@ -1723,6 +1714,7 @@ class RecoveryCoordinator:
         recover_provider_operation_start: RecoverProviderOperationStart,
         cancel_provider_operation: CancelProviderOperation,
         interaction_transition_replay_failures: InteractionTransitionReplayFailures,
+        recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...] = (),
         loop_policies: tuple[LoopPolicy, ...] = (),
     ) -> None:
@@ -1756,10 +1748,27 @@ class RecoveryCoordinator:
         self._recover_provider_operation_start = recover_provider_operation_start
         self._cancel_provider_operation = cancel_provider_operation
         self._interaction_transition_replay_failures = interaction_transition_replay_failures
+        if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
+            raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
+        self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._runtime_hooks = runtime_hooks
         self._loop_policies = loop_policies
         self._workspace_artifact_recovery_operations = BoundedInvocationOperationRegistry(
             max_operations=64
+        )
+
+    async def _run_cleanup_steps(
+        self,
+        *,
+        authoritative_failure: BaseException | None,
+        steps: tuple[RecoveryCleanupStepInput, ...],
+        cancellation_baseline: int = 0,
+    ) -> tuple[tuple[str, BaseException], ...]:
+        return await _run_recovery_cleanup_steps(
+            authoritative_failure=authoritative_failure,
+            steps=steps,
+            cancellation_baseline=cancellation_baseline,
+            supervisor=self._recovery_cleanup_supervisor,
         )
 
     def _reconstruct_invocation_context(
@@ -2222,7 +2231,7 @@ class RecoveryCoordinator:
             _activate_session_run_fence(claimed)
             authoritative_failure = cancellation or error
             try:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=authoritative_failure,
                     steps=(
                         (
@@ -2262,7 +2271,7 @@ class RecoveryCoordinator:
         _activate_session_run_fence(claimed)
         if cancellation is not None:
             try:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=cancellation,
                     steps=(
                         (
@@ -3516,7 +3525,7 @@ class RecoveryCoordinator:
                     ),
                 )
             )
-        await _run_recovery_cleanup_steps(
+        await self._run_cleanup_steps(
             authoritative_failure=authoritative_failure,
             steps=tuple(cleanup_steps),
         )
@@ -3817,7 +3826,7 @@ class RecoveryCoordinator:
                         ),
                     )
                 )
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=exc,
                     steps=tuple(cleanup_steps),
                 )
@@ -3861,7 +3870,7 @@ class RecoveryCoordinator:
                     ),
                 )
             )
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=cancellation,
                 steps=tuple(cleanup_steps),
             )
@@ -10851,7 +10860,7 @@ class RecoveryCoordinator:
                 # corrupt metadata or a runtime mismatch prevents rebuilding
                 # the context, explicitly abandon or transfer that ownership
                 # instead of leaving the caller's exact epoch stranded.
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=failure,
                     steps=(
                         (
@@ -11247,7 +11256,7 @@ class RecoveryCoordinator:
                     reconciled_session,
                     authority,
                 )
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=authoritative_failure,
                     steps=(
                         (
@@ -11305,7 +11314,7 @@ class RecoveryCoordinator:
             invariant_failure = RuntimeError(
                 "Manual tool-round recovery transition did not persist its claim."
             )
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=invariant_failure,
                 steps=(
                     (
@@ -11349,7 +11358,7 @@ class RecoveryCoordinator:
                 await after_admission()
             except BaseException as authority_failure:
                 failure = authority_failure
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=failure,
                     steps=(
                         (
@@ -11379,7 +11388,7 @@ class RecoveryCoordinator:
         if outcome.cancellation is None:
             return claim
 
-        await _run_recovery_cleanup_steps(
+        await self._run_cleanup_steps(
             authoritative_failure=outcome.cancellation,
             steps=(
                 (
@@ -11466,7 +11475,7 @@ class RecoveryCoordinator:
                     # its operator interruption directly even when the session
                     # was already INTERRUPTED; the generic abandoned-session
                     # finalizer deliberately ignores terminal statuses.
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=claim.error,
                         steps=(
                             (
@@ -11482,7 +11491,7 @@ class RecoveryCoordinator:
                 authoritative_failure = exc
                 raise
             finally:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=authoritative_failure,
                     steps=(
                         (
@@ -11688,13 +11697,14 @@ class RecoveryCoordinator:
 
             try:
                 try:
-                    cleanup_failures = await _run_recovery_cleanup_steps(
+                    cleanup_failures = await self._run_cleanup_steps(
                         authoritative_failure=authoritative_failure,
                         steps=(
                             ("manual tool-round recovery event worker stop", stop_recovery_worker),
-                            (
+                            RecoveryCleanupStep(
                                 "manual tool-round recovery interruption watcher stop",
                                 stop_interruption_watcher,
+                                independent_with_previous=True,
                             ),
                             (
                                 "manual tool-round recovery handoff cleanup",
@@ -11815,7 +11825,7 @@ class RecoveryCoordinator:
             authoritative_failure = exc
             raise
         finally:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(("manual tool-round recovery supervisor stop", stop_supervisor),),
             )
@@ -12060,7 +12070,7 @@ class RecoveryCoordinator:
                     yield event
                 return
         except (GeneratorExit, asyncio.CancelledError) as abandonment:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=abandonment,
                 steps=(
                     (
@@ -12091,7 +12101,7 @@ class RecoveryCoordinator:
                         )
                         is not None
                     ):
-                        await _run_recovery_cleanup_steps(
+                        await self._run_cleanup_steps(
                             authoritative_failure=reconciliation_failure,
                             steps=(
                                 (
@@ -12112,7 +12122,7 @@ class RecoveryCoordinator:
                         "Manual tool-round recovery append failed while persistence "
                         "reconciliation was running."
                     )
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=reconciliation.cancellation,
                         steps=(
                             (
@@ -12259,7 +12269,7 @@ class RecoveryCoordinator:
                 ):
                     yield event
             if abandonment is not None:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=exc,
                     steps=(
                         (
@@ -16269,7 +16279,7 @@ class RecoveryCoordinator:
                 claim_release_completed = True
 
         try:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
                     (
@@ -16711,7 +16721,7 @@ class RecoveryCoordinator:
             authoritative_failure = exc
             raise
         finally:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
                     (
@@ -16817,7 +16827,7 @@ class RecoveryCoordinator:
             authoritative_failure = exc
             raise
         finally:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(("terminal evidence stream owner shutdown", stop_owner),),
             )
@@ -17076,7 +17086,7 @@ class RecoveryCoordinator:
                     claim_has_not_dispatched_work=True,
                 )
             elif not replacing_expired_owner:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=exc,
                     steps=(
                         (
@@ -17183,7 +17193,7 @@ class RecoveryCoordinator:
             authoritative_failure = exc
             raise
         finally:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(("incomplete recovery worker shutdown", stop_workers),),
             )

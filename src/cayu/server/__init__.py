@@ -775,6 +775,19 @@ async def _drain_environment_cleanups(app: CayuApp, *, timeout_s: float) -> None
         )
 
 
+async def _drain_recovery_cleanups(app: CayuApp, *, timeout_s: float) -> None:
+    try:
+        drained = await app.drain_recovery_cleanups(timeout_s=timeout_s)
+    except Exception:
+        logger.exception("Failed to drain supervised recovery cleanups during shutdown.")
+        return
+    if not drained:
+        logger.warning(
+            "Supervised recovery cleanups exceeded the %.3fs shutdown grace period.",
+            timeout_s,
+        )
+
+
 async def _drain_knowledge_publications(app: CayuApp, *, timeout_s: float) -> None:
     try:
         drained = await app.drain_knowledge_publications(timeout_s=timeout_s)
@@ -795,6 +808,10 @@ async def _drain_server_owned_work(
 ) -> None:
     try:
         await _drain_background_interruptions(
+            app,
+            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+        )
+        await _drain_recovery_cleanups(
             app,
             timeout_s=lifecycle.interruption_shutdown_grace_seconds,
         )
@@ -960,6 +977,7 @@ def _compose_interruption_drain_lifespan(
                     finally:
                         try:
                             await _drain_background_interruptions(app, timeout_s=timeout_s)
+                            await _drain_recovery_cleanups(app, timeout_s=timeout_s)
                             await _drain_environment_cleanups(app, timeout_s=timeout_s)
                         finally:
                             await _drain_knowledge_publications(

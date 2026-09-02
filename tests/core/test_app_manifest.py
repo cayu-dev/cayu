@@ -23,6 +23,7 @@ from cayu import (
     LocalWorkspace,
     OpenAIWebSearch,
     ProcessCommandPolicy,
+    RecoveryCleanupPolicy,
     RequestFootprintConfig,
     ScriptedModelProvider,
     SecretRedactor,
@@ -157,7 +158,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "14"
+    assert manifest.schema_version == "15"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -194,6 +195,21 @@ def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
 
     assert first.runtime.max_environment_lifecycle_owners == 1
     assert second.runtime.max_environment_lifecycle_owners == 2
+    assert first.fingerprint != second.fingerprint
+
+
+def test_recovery_cleanup_policy_is_manifested_and_fingerprinted() -> None:
+    first = CayuApp(
+        enable_logging=False,
+        recovery_cleanup_policy=RecoveryCleanupPolicy(step_timeout_seconds=1),
+    ).describe()
+    second = CayuApp(
+        enable_logging=False,
+        recovery_cleanup_policy=RecoveryCleanupPolicy(step_timeout_seconds=2),
+    ).describe()
+
+    assert first.runtime.recovery_cleanup_policy.step_timeout_seconds == 1
+    assert second.runtime.recovery_cleanup_policy.step_timeout_seconds == 2
     assert first.fingerprint != second.fingerprint
 
 
@@ -594,7 +610,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "14"
+    assert schema["properties"]["schema_version"]["const"] == "15"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -703,7 +719,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "14",
+                "schema_version": "15",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {
@@ -778,6 +794,11 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                     "tool_timeout_seconds": None,
                     "max_parallel_tool_calls": 1,
                     "max_environment_lifecycle_owners": 256,
+                    "recovery_cleanup_policy": {
+                        "step_timeout_seconds": 30.0,
+                        "overall_timeout_seconds": 120.0,
+                        "max_supervised_tasks": 256,
+                    },
                 },
                 "capabilities": [],
             }

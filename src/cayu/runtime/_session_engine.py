@@ -484,6 +484,7 @@ from cayu.runtime.provider_operations import (
     provider_operation_resolution_outcome_event_id,
     validate_provider_operation_resolution_outcome_event,
 )
+from cayu.runtime.recovery_cleanup import RecoveryCleanup, RecoveryCleanupSupervisor
 from cayu.runtime.request_footprints import (
     PromptContributionManifest,
     RequestFootprintConfig,
@@ -2010,6 +2011,7 @@ async def _run_interaction_transition_cancellation_cleanup_steps(
     cancellation: asyncio.CancelledError,
     *,
     steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...],
+    supervisor: RecoveryCleanupSupervisor,
 ) -> tuple[tuple[str, BaseException], ...]:
     """Keep this cancellation's attempt and cleanup failures jointly visible.
 
@@ -2024,6 +2026,7 @@ async def _run_interaction_transition_cancellation_cleanup_steps(
     cleanup_failures = await _run_recovery_cleanup_steps(
         authoritative_failure=cancellation,
         steps=steps,
+        supervisor=supervisor,
     )
     cleanup_cause = exception_cause(cancellation)
     if (
@@ -4892,6 +4895,7 @@ class SessionEngine:
         request_footprint: RequestFootprintConfig,
         tool_round_executor: ToolRoundExecutor,
         recovery_coordinator: RecoveryCoordinator,
+        recovery_cleanup_supervisor: RecoveryCleanupSupervisor,
         background_interruption_coordinator: BackgroundInterruptionCoordinator,
         secret_redactor: SecretRedactor,
         clock: Callable[[], datetime],
@@ -4929,6 +4933,9 @@ class SessionEngine:
         self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
         self._recovery_coordinator = recovery_coordinator
+        if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
+            raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
+        self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
         self._background_interruption_coordinator = background_interruption_coordinator
         self._secret_redactor = secret_redactor
         self._interaction_lifecycle_publication_authority = object()
@@ -4967,6 +4974,20 @@ class SessionEngine:
             execution_profile_admission.ProcessLocalBehaviorIdentityRegistry()
         )
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
+
+    async def _run_cleanup_steps(
+        self,
+        *,
+        authoritative_failure: BaseException | None,
+        steps: tuple[tuple[str, RecoveryCleanup], ...],
+        cancellation_baseline: int = 0,
+    ) -> tuple[tuple[str, BaseException], ...]:
+        return await _run_recovery_cleanup_steps(
+            authoritative_failure=authoritative_failure,
+            steps=steps,
+            cancellation_baseline=cancellation_baseline,
+            supervisor=self._recovery_cleanup_supervisor,
+        )
 
     def _request_loop_policy_instance_identities(
         self,
@@ -6812,6 +6833,7 @@ class SessionEngine:
 
             await _run_interaction_transition_cancellation_cleanup_steps(
                 cancellation,
+                supervisor=self._recovery_cleanup_supervisor,
                 steps=(
                     (
                         "terminal recovery interaction reconciliation",
@@ -7879,6 +7901,7 @@ class SessionEngine:
 
             diagnostic_failures = await _run_interaction_transition_cancellation_cleanup_steps(
                 cancellation,
+                supervisor=self._recovery_cleanup_supervisor,
                 steps=(
                     (
                         "committed sibling interaction-transition cancellation diagnostics",
@@ -7917,9 +7940,10 @@ class SessionEngine:
             await _run_interaction_transition_cancellation_cleanup_steps(
                 cancellation,
                 steps=cancellation_cleanup_steps,
+                supervisor=self._recovery_cleanup_supervisor,
             )
         else:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=cancellation,
                 steps=cancellation_cleanup_steps,
             )
@@ -10707,7 +10731,7 @@ class SessionEngine:
                 ):
                     yield event
                 return
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=cancellation,
                 steps=(
                     (
@@ -12164,7 +12188,7 @@ class SessionEngine:
             raise
         finally:
             if not initial_event_delivered:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=initial_delivery_failure,
                     steps=(
                         (
@@ -14040,7 +14064,7 @@ class SessionEngine:
                 deferred = asyncio.create_task(finalize_after_pending_store_writes())
                 self._track_detached_session_operation_task(deferred)
 
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
                     (
@@ -14059,7 +14083,7 @@ class SessionEngine:
                     yield event
             raise
         finally:
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=operation_failure,
                 steps=(
                     (
@@ -15315,7 +15339,7 @@ class SessionEngine:
                     )
                 if reclaimed_handoff_heartbeat is not None:
                     terminal_finalization_claim_retained_for_recovery = True
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=authoritative_failure,
                         steps=(
                             (
@@ -15330,7 +15354,7 @@ class SessionEngine:
                     and not terminal_finalization_claim_retained_for_recovery
                 ):
                     claim_id = terminal_finalization_claim_id
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=authoritative_failure,
                         steps=(
                             (
@@ -15609,7 +15633,7 @@ class SessionEngine:
         ) -> None:
             if provider_operation_profile is None:
                 return
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=(
                     (
@@ -15647,7 +15671,7 @@ class SessionEngine:
                         ),
                     )
                 )
-            await _run_recovery_cleanup_steps(
+            await self._run_cleanup_steps(
                 authoritative_failure=authoritative_failure,
                 steps=tuple(steps),
             )
@@ -15832,7 +15856,7 @@ class SessionEngine:
                     yield event
             except BaseException as terminal_failure:
                 if owned_terminal_stream is not None:
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=terminal_failure,
                         steps=(
                             (
@@ -17174,7 +17198,7 @@ class SessionEngine:
                 )
             except BaseException as authority_failure:
                 try:
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=authority_failure,
                         steps=(
                             (
@@ -17366,7 +17390,7 @@ class SessionEngine:
                 ) from None
         except asyncio.CancelledError as cancellation:
             try:
-                await _run_recovery_cleanup_steps(
+                await self._run_cleanup_steps(
                     authoritative_failure=cancellation,
                     steps=(
                         (
@@ -21338,6 +21362,7 @@ class SessionEngine:
 
                 diagnostic_failures = await _run_interaction_transition_cancellation_cleanup_steps(
                     cancellation,
+                    supervisor=self._recovery_cleanup_supervisor,
                     steps=(
                         (
                             "committed interaction-transition cancellation diagnostics",
@@ -21505,10 +21530,11 @@ class SessionEngine:
                     await _run_interaction_transition_cancellation_cleanup_steps(
                         cancellation,
                         steps=cancellation_cleanup_steps,
+                        supervisor=self._recovery_cleanup_supervisor,
                     )
                 )
             else:
-                cancellation_cleanup_failures = await _run_recovery_cleanup_steps(
+                cancellation_cleanup_failures = await self._run_cleanup_steps(
                     authoritative_failure=cancellation,
                     steps=cancellation_cleanup_steps,
                 )
@@ -25207,7 +25233,7 @@ class SessionEngine:
         finally:
             try:
                 if terminal_finalization_claim_id is not None:
-                    await _run_recovery_cleanup_steps(
+                    await self._run_cleanup_steps(
                         authoritative_failure=sys.exception(),
                         steps=(
                             (

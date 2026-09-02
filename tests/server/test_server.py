@@ -8587,6 +8587,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     server = FastAPI()
     cayu_app = CayuApp()
     drain_timeouts = []
+    recovery_drain_timeouts = []
     environment_drain_timeouts = []
     knowledge_drain_timeouts = []
     knowledge_seals = 0
@@ -8604,6 +8605,10 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         environment_drain_timeouts.append(timeout_s)
         return True
 
+    async def drain_recovery_cleanups(*, timeout_s):
+        recovery_drain_timeouts.append(timeout_s)
+        return True
+
     def seal_knowledge_publications():
         nonlocal knowledge_seals
         knowledge_seals += 1
@@ -8613,6 +8618,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         return True
 
     cayu_app.drain_background_interruptions = drain_background_interruptions
+    cayu_app.drain_recovery_cleanups = drain_recovery_cleanups
     cayu_app.drain_environment_cleanups = drain_environment_cleanups
     cayu_app.seal_knowledge_publications = seal_knowledge_publications
     cayu_app.drain_knowledge_publications = drain_knowledge_publications
@@ -8631,6 +8637,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         pass
 
     assert drain_timeouts == [2.5]
+    assert recovery_drain_timeouts == [2.5]
     assert environment_drain_timeouts == [2.5]
     assert knowledge_seals == 1
     assert knowledge_drain_timeouts == [1.5]
