@@ -62,10 +62,6 @@ from cayu import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     ForkExecutionProfileSelection,
-    ForkGroupBranchSpec,
-    ForkGroupCheckpointSelector,
-    ForkGroupEvaluatorSpec,
-    ForkGroupRequest,
     ForkSessionRequest,
     ForkSystemPromptPolicy,
     IncompleteSessionRecoveryAction,
@@ -138,7 +134,6 @@ from cayu.runtime.completion_verifier_profiles import (
 )
 from cayu.runtime.sessions import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
-    ModelCompletionStageRequest,
     run_request_with_runtime_invocation,
 )
 from cayu.runtime.tasks import copy_task
@@ -3815,275 +3810,6 @@ def test_ordinary_worker_and_run_entrances_reject_contracted_tasks_before_execut
     asyncio.run(scenario())
 
 
-def test_fork_group_evaluator_preparation_rejects_contracted_session_authority() -> None:
-    async def scenario() -> None:
-        session_store = InMemorySessionStore()
-        task_store = InMemoryTaskStore()
-        provider = _RecordingProvider()
-        app = CayuApp(
-            session_store=session_store,
-            task_store=task_store,
-            enable_logging=False,
-        )
-        app.register_provider(provider, default=True)
-        app.register_agent(AgentSpec(name="source", model="verified-work-test-model"))
-        app.register_agent(AgentSpec(name="evaluator", model="verified-work-test-model"))
-
-        source_events = [
-            event
-            async for event in app.run(
-                RunRequest(
-                    agent_name="source",
-                    session_id="verified-work-fork-group-source",
-                    causal_budget_id="verified-work-fork-group-budget",
-                    messages=[Message.text("user", "Prepare a fork-group source.")],
-                )
-            )
-        ]
-        assert source_events[-1].type is EventType.SESSION_COMPLETED
-        source_event_count = len(await session_store.load_events("verified-work-fork-group-source"))
-
-        contract = _contract(contract_id="fork-group-evaluator-contract")
-        await task_store.publish_work_contract(contract)
-        evaluator_session_id = "verified-work-fork-group-evaluator"
-        await task_store.create_running_task(
-            TaskCreate(
-                task_id="fork-group-evaluator-contract-task",
-                type="verified-work",
-                session_id=evaluator_session_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(evaluator_session_id),
-        )
-        candidate_output = StructuredOutputSpec(
-            name="verified-work-fork-candidate",
-            json_schema={
-                "type": "object",
-                "properties": {"candidate": {"type": "string"}},
-                "required": ["candidate"],
-                "additionalProperties": False,
-            },
-        )
-        request = ForkGroupRequest(
-            group_id="verified-work-fork-group",
-            source_session_id="verified-work-fork-group-source",
-            source_checkpoint=ForkGroupCheckpointSelector(),
-            causal_budget_id="verified-work-fork-group-budget",
-            branches=(
-                ForkGroupBranchSpec(
-                    branch_id="alpha",
-                    session_id="verified-work-fork-group-alpha",
-                    messages=(Message.text("user", "Candidate alpha."),),
-                    structured_output=candidate_output,
-                ),
-                ForkGroupBranchSpec(
-                    branch_id="beta",
-                    session_id="verified-work-fork-group-beta",
-                    messages=(Message.text("user", "Candidate beta."),),
-                    structured_output=candidate_output,
-                ),
-            ),
-            evaluator=ForkGroupEvaluatorSpec(
-                session_id=evaluator_session_id,
-                agent_name="evaluator",
-            ),
-        )
-
-        with pytest.raises(TaskCompletionDecisionRequired, match="verifier-aware"):
-            await app.run_fork_group(request)
-
-        assert len(provider.requests) == 1
-        assert await session_store.load(evaluator_session_id) is None
-        assert await session_store.load("verified-work-fork-group-alpha") is None
-        assert await session_store.load("verified-work-fork-group-beta") is None
-        assert (
-            len(await session_store.load_events("verified-work-fork-group-source"))
-            == source_event_count
-        )
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("invalid_evaluator", ["missing_agent", "contracted_session"])
-def test_invalid_fork_group_evaluator_does_not_admit_source(
-    invalid_evaluator: str,
-) -> None:
-    async def scenario() -> None:
-        session_store = InMemorySessionStore()
-        task_store = InMemoryTaskStore()
-        app = CayuApp(
-            session_store=session_store,
-            task_store=task_store,
-            enable_logging=False,
-        )
-        app.register_provider(_RecordingProvider(), default=True)
-        app.register_agent(AgentSpec(name="assistant", model="verified-work-test-model"))
-        app.register_agent(AgentSpec(name="evaluator", model="verified-work-test-model"))
-
-        source_id = f"verified-work-invalid-{invalid_evaluator}-group-source"
-        group_id = f"verified-work-invalid-{invalid_evaluator}-group"
-        evaluator_session_id = f"{group_id}-evaluator"
-        await _create_dispatch_test_session(app, source_id)
-        source = await session_store.load(source_id)
-        assert source is not None
-        source_events_before = await session_store.load_events(source_id)
-        source_checkpoint_before = await session_store.load_checkpoint(source_id)
-
-        contract = _contract(contract_id=f"invalid-{invalid_evaluator}-group-contract")
-        await task_store.publish_work_contract(contract)
-        if invalid_evaluator == "contracted_session":
-            await task_store.create_running_task(
-                TaskCreate(
-                    task_id=f"{group_id}-evaluator-task",
-                    type="verified-work",
-                    session_id=evaluator_session_id,
-                    work_contract=contract.reference(),
-                ),
-                session_invocation=unattributed_session_invocation_binding(evaluator_session_id),
-            )
-        candidate_output = StructuredOutputSpec(
-            name=f"{group_id}-candidate",
-            json_schema={
-                "type": "object",
-                "properties": {"candidate": {"type": "string"}},
-                "required": ["candidate"],
-                "additionalProperties": False,
-            },
-        )
-        request = ForkGroupRequest(
-            group_id=group_id,
-            source_session_id=source_id,
-            source_checkpoint=ForkGroupCheckpointSelector(),
-            causal_budget_id=source.causal_budget_id,
-            branches=(
-                ForkGroupBranchSpec(
-                    branch_id="alpha",
-                    session_id=f"{group_id}-alpha",
-                    messages=(Message.text("user", "Candidate alpha."),),
-                    structured_output=candidate_output,
-                ),
-                ForkGroupBranchSpec(
-                    branch_id="beta",
-                    session_id=f"{group_id}-beta",
-                    messages=(Message.text("user", "Candidate beta."),),
-                    structured_output=candidate_output,
-                ),
-            ),
-            evaluator=ForkGroupEvaluatorSpec(
-                session_id=evaluator_session_id,
-                agent_name=(
-                    "missing-evaluator" if invalid_evaluator == "missing_agent" else "evaluator"
-                ),
-            ),
-        )
-
-        expected_error = (
-            pytest.raises(KeyError, match="missing-evaluator")
-            if invalid_evaluator == "missing_agent"
-            else pytest.raises(TaskCompletionDecisionRequired, match="verifier-aware")
-        )
-        with expected_error:
-            await app.run_fork_group(request)
-
-        assert await session_store.load_checkpoint(source_id) == source_checkpoint_before
-        assert await session_store.load_events(source_id) == source_events_before
-        for suffix in ("alpha", "beta", "evaluator"):
-            assert await session_store.load(f"{group_id}-{suffix}") is None
-
-        attached = await task_store.create_running_task(
-            TaskCreate(
-                task_id=f"{group_id}-source-task",
-                type="verified-work",
-                session_id=source_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(source_id),
-        )
-        assert attached.session_id == source_id
-
-    asyncio.run(scenario())
-
-
-def test_active_model_stage_fork_group_does_not_admit_source() -> None:
-    async def scenario() -> None:
-        app, session_store, task_store, _dispatcher, _provider = _dispatch_test_app()
-        app.register_agent(AgentSpec(name="evaluator", model="verified-work-test-model"))
-        source_id = "verified-work-active-stage-group-source"
-        group_id = "verified-work-active-stage-group"
-        await _create_dispatch_test_session(app, source_id)
-        source = await session_store.load(source_id)
-        assert source is not None
-        transcript = await session_store.load_transcript_snapshot(source_id)
-        await session_store.prepare_model_completion_stage(
-            source_id,
-            request=ModelCompletionStageRequest(
-                stage_id="verified-work-active-stage",
-                logical_step_id="verified-work-active-stage-step",
-                dispatch_ordinal=0,
-                intent={},
-            ),
-            expected_statuses={SessionStatus.COMPLETED},
-            expected_run_epoch=source.run_epoch,
-            expected_transcript_cursor=transcript.cursor,
-        )
-        candidate_output = StructuredOutputSpec(
-            name="verified-work-active-stage-candidate",
-            json_schema={
-                "type": "object",
-                "properties": {"candidate": {"type": "string"}},
-                "required": ["candidate"],
-                "additionalProperties": False,
-            },
-        )
-        request = ForkGroupRequest(
-            group_id=group_id,
-            source_session_id=source_id,
-            source_checkpoint=ForkGroupCheckpointSelector(),
-            causal_budget_id=source.causal_budget_id,
-            branches=(
-                ForkGroupBranchSpec(
-                    branch_id="alpha",
-                    session_id=f"{group_id}-alpha",
-                    messages=(Message.text("user", "Candidate alpha."),),
-                    structured_output=candidate_output,
-                ),
-                ForkGroupBranchSpec(
-                    branch_id="beta",
-                    session_id=f"{group_id}-beta",
-                    messages=(Message.text("user", "Candidate beta."),),
-                    structured_output=candidate_output,
-                ),
-            ),
-            evaluator=ForkGroupEvaluatorSpec(
-                session_id=f"{group_id}-evaluator",
-                agent_name="evaluator",
-            ),
-        )
-
-        with pytest.raises(ValueError, match="active model-completion stage"):
-            await app.run_fork_group(request)
-
-        operation_id = "fork-group:" + sha256(group_id.encode("utf-8")).hexdigest()
-        assert await session_store.load_session_operation(source_id, operation_id) is None
-        for suffix in ("alpha", "beta", "evaluator"):
-            assert await session_store.load(f"{group_id}-{suffix}") is None
-
-        contract = _contract(contract_id="active-stage-group-contract")
-        await task_store.publish_work_contract(contract)
-        attached = await task_store.create_running_task(
-            TaskCreate(
-                task_id="active-stage-group-contract-task",
-                type="verified-work",
-                session_id=source_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(source_id),
-        )
-        assert attached.session_id == source_id
-
-    asyncio.run(scenario())
-
-
 def test_direct_and_hook_forks_reject_contracted_sources_without_mutation() -> None:
     async def scenario() -> None:
         app, session_store, task_store, _dispatcher, _provider = _dispatch_test_app()
@@ -4254,119 +3980,11 @@ def test_invalid_direct_fork_does_not_consume_source_contract_authority() -> Non
     asyncio.run(scenario())
 
 
-def test_invalid_fork_group_source_does_not_consume_contract_authority() -> None:
-    class PendingInputProvider(_RecordingProvider):
-        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-            self.requests.append(request)
-            yield ModelStreamEvent.tool_call(
-                id="verified-work-group-pending-input-call",
-                name="ask_user",
-                arguments={"question": "Proceed?"},
-            )
-            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
-
-    async def scenario() -> None:
-        source_id = "verified-work-invalid-group-source"
-        group_id = "verified-work-invalid-source-group"
-        session_store = InMemorySessionStore()
-        seed_app = CayuApp(session_store=session_store, enable_logging=False)
-        seed_app.register_provider(PendingInputProvider(), default=True)
-        seed_app.register_agent(
-            AgentSpec(name="assistant", model="verified-work-test-model"),
-            tools=[UserInputTool()],
-        )
-        async for _ in seed_app.run(
-            RunRequest(
-                agent_name="assistant",
-                session_id=source_id,
-                causal_budget_id="verified-work-invalid-group-budget",
-                messages=[Message.text("user", "Ask for input.")],
-            )
-        ):
-            pass
-        await session_store.update_status(source_id, SessionStatus.FAILED)
-        source = await session_store.load(source_id)
-        assert source is not None
-        checkpoint_before = await session_store.load_checkpoint(source_id)
-        assert checkpoint_before is not None and "pending_user_input" in checkpoint_before
-        events_before = await session_store.load_events(source_id)
-
-        task_store = InMemoryTaskStore()
-        provider = PendingInputProvider()
-        app = CayuApp(
-            session_store=session_store,
-            task_store=task_store,
-            enable_logging=False,
-        )
-        app.register_provider(provider, default=True)
-        app.register_agent(
-            AgentSpec(name="assistant", model="verified-work-test-model"),
-            tools=[UserInputTool()],
-        )
-        candidate_output = StructuredOutputSpec(
-            name="verified-work-invalid-source-candidate",
-            json_schema={
-                "type": "object",
-                "properties": {"candidate": {"type": "string"}},
-                "required": ["candidate"],
-                "additionalProperties": False,
-            },
-        )
-        request = ForkGroupRequest(
-            group_id=group_id,
-            source_session_id=source_id,
-            source_checkpoint=ForkGroupCheckpointSelector(),
-            causal_budget_id=source.causal_budget_id,
-            branches=(
-                ForkGroupBranchSpec(
-                    branch_id="alpha",
-                    session_id=f"{group_id}-alpha",
-                    messages=(Message.text("user", "Candidate alpha."),),
-                    structured_output=candidate_output,
-                ),
-                ForkGroupBranchSpec(
-                    branch_id="beta",
-                    session_id=f"{group_id}-beta",
-                    messages=(Message.text("user", "Candidate beta."),),
-                    structured_output=candidate_output,
-                ),
-            ),
-            evaluator=ForkGroupEvaluatorSpec(
-                session_id=f"{group_id}-evaluator",
-                agent_name="assistant",
-            ),
-        )
-
-        with pytest.raises(RuntimeError, match="awaiting user input cannot be forked"):
-            await app.run_fork_group(request)
-
-        assert provider.requests == []
-        assert await session_store.load_checkpoint(source_id) == checkpoint_before
-        assert await session_store.load_events(source_id) == events_before
-        for suffix in ("alpha", "beta", "evaluator"):
-            assert await session_store.load(f"{group_id}-{suffix}") is None
-
-        contract = _contract(contract_id="invalid-group-source-contract")
-        await task_store.publish_work_contract(contract)
-        attached = await task_store.create_running_task(
-            TaskCreate(
-                task_id="invalid-group-source-contract-task",
-                type="verified-work",
-                session_id=source_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(source_id),
-        )
-        assert attached.session_id == source_id
-
-    asyncio.run(scenario())
-
-
-def test_exact_fork_replay_cannot_weaken_a_later_source_contract() -> None:
+def test_exact_fork_replay_uses_committed_child_after_source_contract_attachment() -> None:
     async def scenario() -> None:
         session_store = InMemorySessionStore()
-        source_id = "verified-work-legacy-fork-source"
-        child_id = "verified-work-legacy-fork-child"
+        source_id = "verified-work-fork-replay-source"
+        child_id = "verified-work-fork-replay-child"
         seed_app = CayuApp(session_store=session_store, enable_logging=False)
         seed_app.register_provider(_RecordingProvider(), default=True)
         seed_app.register_agent(AgentSpec(name="assistant", model="verified-work-test-model"))
@@ -4376,11 +3994,11 @@ def test_exact_fork_replay_cannot_weaken_a_later_source_contract() -> None:
         assert first_events[-1].type is EventType.SESSION_FORKED
 
         task_store = InMemoryTaskStore()
-        contract = _contract(contract_id="legacy-fork-source-contract")
+        contract = _contract(contract_id="fork-replay-source-contract")
         await task_store.publish_work_contract(contract)
         task = await task_store.create_running_task(
             TaskCreate(
-                task_id="legacy-fork-source-contract-task",
+                task_id="fork-replay-source-contract-task",
                 type="verified-work",
                 session_id=source_id,
                 work_contract=contract.reference(),
@@ -4400,9 +4018,9 @@ def test_exact_fork_replay_cannot_weaken_a_later_source_contract() -> None:
         child_before = await session_store.load(child_id)
         child_events_before = await session_store.load_events(child_id)
 
-        with pytest.raises(TaskCompletionDecisionRequired, match="verifier-aware"):
-            await anext(app.fork_session(request))
+        replay_events = [event async for event in app.fork_session(request)]
 
+        assert [event.id for event in replay_events] == [event.id for event in first_events]
         assert await session_store.load(source_id) == source_before
         assert await session_store.load_checkpoint(source_id) == source_checkpoint_before
         assert await session_store.load_events(source_id) == source_events_before
@@ -4595,152 +4213,6 @@ def test_direct_fork_contract_attachment_race_fails_before_child_publication() -
         assert await session_store.load(child_id) is None
         assert await session_store.load_checkpoint(child_id) is None
         assert await task_store.load_task(contracted_task.id) == contracted_task
-
-    asyncio.run(scenario())
-
-
-def test_fork_group_source_contract_and_attachment_race_leave_no_group_record() -> None:
-    class AdmissionBarrierStore(InMemoryTaskStore):
-        verified_work_mutations_are_cancellation_quiescent = True
-        blocked_session_id: str | None = None
-        admission_started: asyncio.Event | None = None
-        allow_admission: asyncio.Event | None = None
-
-        async def admit_ordinary_session_execution(self, session_id: str) -> None:
-            if session_id == self.blocked_session_id:
-                if self.admission_started is None or self.allow_admission is None:
-                    raise AssertionError("Fork-group admission barrier was not configured.")
-                self.admission_started.set()
-                await self.allow_admission.wait()
-            await super().admit_ordinary_session_execution(session_id)
-
-    async def request_for(
-        app: CayuApp,
-        source_id: str,
-        group_id: str,
-    ) -> ForkGroupRequest:
-        source = await app.session_store.load(source_id)
-        assert source is not None
-        candidate_output = StructuredOutputSpec(
-            name=f"{group_id}-candidate",
-            json_schema={
-                "type": "object",
-                "properties": {"candidate": {"type": "string"}},
-                "required": ["candidate"],
-                "additionalProperties": False,
-            },
-        )
-        return ForkGroupRequest(
-            group_id=group_id,
-            source_session_id=source_id,
-            source_checkpoint=ForkGroupCheckpointSelector(),
-            causal_budget_id=source.causal_budget_id,
-            branches=(
-                ForkGroupBranchSpec(
-                    branch_id="alpha",
-                    session_id=f"{group_id}-alpha",
-                    messages=(Message.text("user", "Candidate alpha."),),
-                    structured_output=candidate_output,
-                ),
-                ForkGroupBranchSpec(
-                    branch_id="beta",
-                    session_id=f"{group_id}-beta",
-                    messages=(Message.text("user", "Candidate beta."),),
-                    structured_output=candidate_output,
-                ),
-            ),
-            evaluator=ForkGroupEvaluatorSpec(
-                session_id=f"{group_id}-evaluator",
-                agent_name="assistant",
-            ),
-        )
-
-    async def scenario() -> None:
-        session_store = InMemorySessionStore()
-        task_store = AdmissionBarrierStore()
-        app = CayuApp(
-            session_store=session_store,
-            task_store=task_store,
-            enable_logging=False,
-        )
-        app.register_provider(_RecordingProvider(), default=True)
-        app.register_agent(AgentSpec(name="assistant", model="verified-work-test-model"))
-        contract = _contract(contract_id="fork-group-source-contract")
-        await task_store.publish_work_contract(contract)
-
-        contracted_source_id = "verified-work-contracted-group-source"
-        await _create_dispatch_test_session(app, contracted_source_id)
-        contracted = await task_store.create_running_task(
-            TaskCreate(
-                task_id="contracted-group-source-task",
-                type="verified-work",
-                session_id=contracted_source_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(contracted_source_id),
-        )
-        contracted_request = await request_for(
-            app,
-            contracted_source_id,
-            "verified-work-contracted-group",
-        )
-        contracted_checkpoint_before = await session_store.load_checkpoint(contracted_source_id)
-        contracted_events_before = await session_store.load_events(contracted_source_id)
-        with pytest.raises(TaskCompletionDecisionRequired, match="verifier-aware"):
-            await app.run_fork_group(contracted_request)
-        assert (
-            await session_store.load_checkpoint(contracted_source_id)
-            == contracted_checkpoint_before
-        )
-        assert await session_store.load_events(contracted_source_id) == contracted_events_before
-        for suffix in ("alpha", "beta", "evaluator"):
-            assert await session_store.load(f"verified-work-contracted-group-{suffix}") is None
-        assert await task_store.load_task(contracted.id) == contracted
-
-        racing_source_id = "verified-work-racing-group-source"
-        await _create_dispatch_test_session(app, racing_source_id)
-        racing_request = await request_for(
-            app,
-            racing_source_id,
-            "verified-work-racing-group",
-        )
-        checkpoint_before = await session_store.load_checkpoint(racing_source_id)
-        events_before = await session_store.load_events(racing_source_id)
-        task_store.blocked_session_id = racing_source_id
-        task_store.admission_started = asyncio.Event()
-        task_store.allow_admission = asyncio.Event()
-        group_task = asyncio.create_task(app.run_fork_group(racing_request))
-        await task_store.admission_started.wait()
-        racing_contract_task = await task_store.create_running_task(
-            TaskCreate(
-                task_id="racing-group-source-contract-task",
-                type="verified-work",
-                session_id=racing_source_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(racing_source_id),
-        )
-        task_store.allow_admission.set()
-
-        with pytest.raises(TaskCompletionDecisionRequired, match="verifier-aware"):
-            await group_task
-        assert await session_store.load_checkpoint(racing_source_id) == checkpoint_before
-        assert await session_store.load_events(racing_source_id) == events_before
-        for suffix in ("alpha", "beta", "evaluator"):
-            child_id = f"verified-work-racing-group-{suffix}"
-            assert await session_store.load(child_id) is None
-        assert await task_store.load_task(racing_contract_task.id) == racing_contract_task
-        evaluator_id = "verified-work-racing-group-evaluator"
-        evaluator_contract_task = await task_store.create_running_task(
-            TaskCreate(
-                task_id="rejected-group-evaluator-contract-task",
-                type="verified-work",
-                session_id=evaluator_id,
-                work_contract=contract.reference(),
-            ),
-            session_invocation=unattributed_session_invocation_binding(evaluator_id),
-        )
-        assert await task_store.load_task(evaluator_contract_task.id) == evaluator_contract_task
 
     asyncio.run(scenario())
 

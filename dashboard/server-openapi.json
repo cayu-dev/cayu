@@ -1219,355 +1219,6 @@
         "title": "ApiExecutionTopologyEdge",
         "type": "object"
       },
-      "ApiForkGroupAttemptStatus": {
-        "additionalProperties": false,
-        "description": "Bounded queue and ownership projection for one durable group attempt.",
-        "properties": {
-          "attempt_id": {
-            "maxLength": 256,
-            "title": "Attempt Id",
-            "type": "string"
-          },
-          "attempt_index": {
-            "maximum": 64.0,
-            "minimum": 0.0,
-            "title": "Attempt Index",
-            "type": "integer"
-          },
-          "attempt_request_sha256": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Attempt Request Sha256",
-            "type": "string"
-          },
-          "branch_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Branch Id"
-          },
-          "causal_budget_id": {
-            "maxLength": 512,
-            "title": "Causal Budget Id",
-            "type": "string"
-          },
-          "dispatch_id": {
-            "maxLength": 512,
-            "title": "Dispatch Id",
-            "type": "string"
-          },
-          "dispatch_operation_id": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Dispatch Operation Id",
-            "type": "string"
-          },
-          "dispatch_request_sha256": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Dispatch Request Sha256",
-            "type": "string"
-          },
-          "dispatch_status": {
-            "anyOf": [
-              {
-                "enum": [
-                  "submitted",
-                  "running",
-                  "completed",
-                  "failed",
-                  "interrupted",
-                  "cancelled"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Dispatch Status"
-          },
-          "execution_profile_fingerprint": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Execution Profile Fingerprint",
-            "type": "string"
-          },
-          "idempotency_key": {
-            "maxLength": 256,
-            "title": "Idempotency Key",
-            "type": "string"
-          },
-          "kind": {
-            "enum": [
-              "branch",
-              "replacement",
-              "evaluator"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "lease_expires_at": {
-            "anyOf": [
-              {
-                "maxLength": 64,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lease Expires At"
-          },
-          "lease_owner": {
-            "anyOf": [
-              {
-                "maxLength": 512,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lease Owner"
-          },
-          "replaced_attempt_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Replaced Attempt Id"
-          },
-          "run_epoch": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run Epoch"
-          },
-          "session_id": {
-            "maxLength": 512,
-            "title": "Session Id",
-            "type": "string"
-          },
-          "source_checkpoint_sha256": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Source Checkpoint Sha256",
-            "type": "string"
-          },
-          "task_id": {
-            "maxLength": 512,
-            "title": "Task Id",
-            "type": "string"
-          },
-          "task_status": {
-            "anyOf": [
-              {
-                "enum": [
-                  "pending",
-                  "claimed",
-                  "running",
-                  "paused",
-                  "blocked",
-                  "needs_attention",
-                  "completed",
-                  "failed",
-                  "cancelled"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Task Status"
-          },
-          "task_type": {
-            "maxLength": 256,
-            "title": "Task Type",
-            "type": "string"
-          },
-          "terminal_event_id": {
-            "maxLength": 512,
-            "title": "Terminal Event Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "attempt_id",
-          "attempt_index",
-          "attempt_request_sha256",
-          "session_id",
-          "task_id",
-          "task_type",
-          "dispatch_id",
-          "dispatch_operation_id",
-          "dispatch_request_sha256",
-          "terminal_event_id",
-          "idempotency_key",
-          "source_checkpoint_sha256",
-          "causal_budget_id",
-          "execution_profile_fingerprint",
-          "task_status",
-          "dispatch_status"
-        ],
-        "title": "ApiForkGroupAttemptStatus",
-        "type": "object"
-      },
-      "ApiForkGroupDetail": {
-        "additionalProperties": false,
-        "description": "Read-only group state without branch output or evaluator judgment bodies.",
-        "properties": {
-          "attempts": {
-            "items": {
-              "$ref": "#/components/schemas/ApiForkGroupAttemptStatus"
-            },
-            "maxItems": 81,
-            "title": "Attempts",
-            "type": "array"
-          },
-          "causal_budget_id": {
-            "maxLength": 512,
-            "title": "Causal Budget Id",
-            "type": "string"
-          },
-          "execution_mode": {
-            "enum": [
-              "in-process",
-              "task-dispatch"
-            ],
-            "title": "Execution Mode",
-            "type": "string"
-          },
-          "failure_branch_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Failure Branch Id"
-          },
-          "failure_code": {
-            "anyOf": [
-              {
-                "maxLength": 64,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Failure Code"
-          },
-          "group_id": {
-            "maxLength": 256,
-            "title": "Group Id",
-            "type": "string"
-          },
-          "recovery_status": {
-            "enum": [
-              "coordinator-required",
-              "workers-pending",
-              "workers-active",
-              "workers-held",
-              "attachment-required",
-              "terminal"
-            ],
-            "title": "Recovery Status",
-            "type": "string"
-          },
-          "replayed": {
-            "title": "Replayed",
-            "type": "boolean"
-          },
-          "schema_version": {
-            "const": 1,
-            "title": "Schema Version",
-            "type": "integer"
-          },
-          "selected_attempt_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selected Attempt Id"
-          },
-          "selected_branch_id": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Selected Branch Id"
-          },
-          "source_checkpoint_sha256": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Source Checkpoint Sha256",
-            "type": "string"
-          },
-          "source_session_id": {
-            "maxLength": 512,
-            "title": "Source Session Id",
-            "type": "string"
-          },
-          "state": {
-            "enum": [
-              "created",
-              "branches-running",
-              "awaiting-evaluation",
-              "completed",
-              "failed"
-            ],
-            "title": "State",
-            "type": "string"
-          },
-          "terminal": {
-            "title": "Terminal",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "schema_version",
-          "group_id",
-          "source_session_id",
-          "source_checkpoint_sha256",
-          "causal_budget_id",
-          "execution_mode",
-          "state",
-          "terminal",
-          "recovery_status",
-          "replayed",
-          "attempts"
-        ],
-        "title": "ApiForkGroupDetail",
-        "type": "object"
-      },
       "ApiInteractionSummary": {
         "additionalProperties": false,
         "properties": {
@@ -3367,16 +3018,6 @@
             ],
             "title": "Error"
           },
-          "fork_group": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ApiTaskForkGroupLink"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3537,7 +3178,6 @@
           "completed_at",
           "retry_series",
           "invocation",
-          "fork_group",
           "input",
           "result",
           "error",
@@ -3545,28 +3185,6 @@
           "started_at"
         ],
         "title": "ApiTaskDetail",
-        "type": "object"
-      },
-      "ApiTaskForkGroupLink": {
-        "additionalProperties": false,
-        "description": "Public, routable linkage from a queue task to its durable fork group.",
-        "properties": {
-          "group_id": {
-            "maxLength": 256,
-            "title": "Group Id",
-            "type": "string"
-          },
-          "source_session_id": {
-            "maxLength": 512,
-            "title": "Source Session Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "source_session_id",
-          "group_id"
-        ],
-        "title": "ApiTaskForkGroupLink",
         "type": "object"
       },
       "ApiTaskInvocation": {
@@ -28313,7 +27931,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "42",
+            "default": "43",
             "title": "Contract Version",
             "type": "string"
           },
@@ -32942,7 +32560,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "42",
+            "default": "43",
             "title": "Contract Version",
             "type": "string"
           }
@@ -38652,56 +38270,6 @@
           }
         },
         "summary": "List Session Events"
-      }
-    },
-    "/api/sessions/{session_id}/fork-groups/{group_id}": {
-      "get": {
-        "operationId": "get_fork_group_api_sessions__session_id__fork_groups__group_id__get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "minLength": 1,
-              "title": "Session Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "group_id",
-            "required": true,
-            "schema": {
-              "minLength": 1,
-              "title": "Group Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiForkGroupDetail"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Get Fork Group"
       }
     },
     "/api/sessions/{session_id}/interactions": {

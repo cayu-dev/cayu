@@ -26,6 +26,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._diagnostics import ExceptionDiagnostic
 from cayu.runtime._durable_subagents import (
     DurableSubagentSubmissionIntent,
@@ -37,9 +38,11 @@ from cayu.runtime._durable_subagents import (
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
     ExecutionProfileIdentity,
     ExecutionProfileMismatchError,
     _ExecutionProfileAdmissionRequestRejected,
+    copy_execution_profile_adoption_intent,
 )
 from cayu.runtime.invocation import (
     SessionInvocationBinding,
@@ -54,6 +57,7 @@ from cayu.runtime.sessions import (
     ModelTarget,
     QueuedDispatchTerminalReceipt,
     QueuedDispatchTerminalReceiptQuery,
+    ResumeRequest,
     SessionRunFenced,
     SessionStatusConflict,
 )
@@ -77,6 +81,8 @@ from cayu.runtime.tasks import (
     _terminalize_claimed_task_or_detect_peer_winner,
     task_create_with_runtime_invocation,
 )
+from cayu.runtime.tool_exposure import ToolCapabilityCeiling, copy_tool_capability_ceiling
+from cayu.runtime.tool_grants import TargetedToolGrant, validate_targeted_tool_grants
 from cayu.runtime.workspace_observation_recovery import (
     is_workspace_observation_recovery_rejected,
 )
@@ -111,6 +117,11 @@ class DispatchRequest(BaseModel):
     dispatch_id: str = Field(default_factory=lambda: str(uuid4()))
     task_id: str | None = None
     target: ModelTarget | None = None
+    # None preserves the durable maximum; an explicit subset narrows it permanently.
+    tool_capability_ceiling: ToolCapabilityCeiling | None = None
+    # Fresh grants apply only to the newly admitted ordinary interaction.
+    tool_grants: tuple[TargetedToolGrant, ...] = ()
+    profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
@@ -143,6 +154,35 @@ class DispatchRequest(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("tool_capability_ceiling", mode="before")
+    @classmethod
+    def copy_tool_capability_ceiling(
+        cls,
+        value: object,
+    ) -> ToolCapabilityCeiling | None:
+        if value is None:
+            return None
+        if isinstance(value, ToolCapabilityCeiling):
+            return copy_tool_capability_ceiling(value)
+        return ToolCapabilityCeiling.model_validate(value)
+
+    @field_validator("tool_grants", mode="before")
+    @classmethod
+    def copy_tool_grants(cls, value: object) -> tuple[TargetedToolGrant, ...]:
+        return validate_targeted_tool_grants(value)
+
+    @field_validator("profile_adoption", mode="before")
+    @classmethod
+    def copy_profile_adoption(
+        cls,
+        value: object,
+    ) -> ExecutionProfileAdoptionIntent | None:
+        if value is None:
+            return None
+        if isinstance(value, ExecutionProfileAdoptionIntent):
+            return copy_execution_profile_adoption_intent(value)
+        return ExecutionProfileAdoptionIntent.model_validate(value)
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -252,7 +292,14 @@ class _DurableDispatchRuntime(DispatchRuntime, _SessionInvocationRuntime, Protoc
 
 
 _QUEUED_DISPATCH_RECORD_TYPE = "cayu.queued-dispatch"
-_QUEUED_DISPATCH_SCHEMA_VERSION = 2
+_QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION = 2
+_QUEUED_DISPATCH_INVOCATION_CONTROL_SCHEMA_VERSION = 3
+_QUEUED_DISPATCH_EXACT_FORK_SCHEMA_VERSION = 4
+_QUEUED_DISPATCH_INVOCATION_CONTROL_FIELDS = (
+    "tool_capability_ceiling",
+    "tool_grants",
+    "profile_adoption",
+)
 
 
 class _QueuedDispatchSettlementState(StrEnum):
@@ -318,7 +365,7 @@ class _QueuedDispatchEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     record_type: Literal["cayu.queued-dispatch"] = _QUEUED_DISPATCH_RECORD_TYPE
-    schema_version: Literal[2] = _QUEUED_DISPATCH_SCHEMA_VERSION
+    schema_version: Literal[2, 3, 4] = _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION
     queue_task_id: str
     dispatch_operation_id: str
     terminal_event_id: str
@@ -329,6 +376,7 @@ class _QueuedDispatchEnvelope(BaseModel):
     required_profile: ExecutionProfileIdentity
     operation_kind: Literal["resume", "prepared_subagent"] = "resume"
     prepared_subagent: DurableSubagentSubmissionIntent | None = None
+    exact_fork_source_state_sha256: str | None = None
 
     @field_validator("queue_task_id", "terminal_event_id")
     @classmethod
@@ -374,6 +422,22 @@ class _QueuedDispatchEnvelope(BaseModel):
 
     @model_validator(mode="after")
     def validate_authority_tuple(self) -> _QueuedDispatchEnvelope:
+        if self.exact_fork_source_state_sha256 is not None and (
+            len(self.exact_fork_source_state_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.exact_fork_source_state_sha256
+            )
+        ):
+            raise ValueError("exact_fork_source_state_sha256 must be a lowercase SHA-256 digest.")
+        required_schema_version = _queued_dispatch_schema_version(
+            self.request,
+            exact_fork_source_state_sha256=self.exact_fork_source_state_sha256,
+        )
+        if self.schema_version != required_schema_version:
+            raise ValueError(
+                "Queued dispatch schema version conflicts with its protocol authority."
+            )
         if self.operation_kind == "resume":
             if self.prepared_subagent is not None:
                 raise ValueError("Resume dispatch cannot carry prepared-subagent authority.")
@@ -381,6 +445,10 @@ class _QueuedDispatchEnvelope(BaseModel):
             intent = self.prepared_subagent
             if intent is None:
                 raise ValueError("Prepared-subagent dispatch requires submission authority.")
+            if self.exact_fork_source_state_sha256 is not None:
+                raise ValueError(
+                    "Prepared-subagent dispatch cannot carry exact-fork resume authority."
+                )
             if (
                 self.request != _prepared_subagent_dispatch_request(intent)
                 or self.source_profile != intent.child_execution_profile
@@ -389,7 +457,10 @@ class _QueuedDispatchEnvelope(BaseModel):
                 raise ValueError(
                     "Prepared-subagent dispatch conflicts with its submission authority."
                 )
-        request_sha256 = _queued_dispatch_request_sha256(self.request)
+        request_sha256 = _queued_dispatch_request_sha256(
+            self.request,
+            schema_version=self.schema_version,
+        )
         if self.request_sha256 != request_sha256:
             raise ValueError("Queued dispatch request digest does not match its request.")
         operation_id = _queued_dispatch_operation_id(
@@ -399,6 +470,8 @@ class _QueuedDispatchEnvelope(BaseModel):
             session_instance_fingerprint=self.session_instance_fingerprint,
             source_profile=self.source_profile,
             required_profile=self.required_profile,
+            schema_version=self.schema_version,
+            exact_fork_source_state_sha256=self.exact_fork_source_state_sha256,
         )
         if self.dispatch_operation_id != operation_id:
             raise ValueError(
@@ -495,7 +568,8 @@ class InlineDispatcher(Dispatcher):
 DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
 LEGACY_PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v1"
 PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v2"
-FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX = ".fork-group.v1"
+INVOCATION_CONTROL_DISPATCH_TASK_TYPE_SUFFIX = ".invocation-controls.v3"
+EXACT_FORK_DISPATCH_TASK_TYPE_SUFFIX = ".exact-fork.v4"
 DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
 
 _STALLED_RECOVERED_ACTIONS = {
@@ -554,7 +628,8 @@ class TaskStoreDispatcher(Dispatcher):
             (
                 LEGACY_PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
                 PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
-                FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX,
+                INVOCATION_CONTROL_DISPATCH_TASK_TYPE_SUFFIX,
+                EXACT_FORK_DISPATCH_TASK_TYPE_SUFFIX,
             )
         ):
             raise ValueError("task_type uses a reserved dispatch protocol suffix.")
@@ -562,9 +637,13 @@ class TaskStoreDispatcher(Dispatcher):
             self._task_type + PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
             "prepared_subagent_task_type",
         )
-        self._fork_group_task_type = require_clean_nonblank(
-            self._task_type + FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX,
-            "fork_group_task_type",
+        self._invocation_control_task_type = require_clean_nonblank(
+            self._task_type + INVOCATION_CONTROL_DISPATCH_TASK_TYPE_SUFFIX,
+            "invocation_control_task_type",
+        )
+        self._exact_fork_task_type = require_clean_nonblank(
+            self._task_type + EXACT_FORK_DISPATCH_TASK_TYPE_SUFFIX,
+            "exact_fork_task_type",
         )
         self._next_claim_task_type_index = 0
         self._lease_seconds = lease_seconds
@@ -596,10 +675,16 @@ class TaskStoreDispatcher(Dispatcher):
         return self._prepared_subagent_task_type
 
     @property
-    def fork_group_task_type(self) -> str:
-        """Return the versioned queue namespace reserved for fork-group attempts."""
+    def invocation_control_task_type(self) -> str:
+        """Return the versioned namespace for expanded resume controls."""
 
-        return self._fork_group_task_type
+        return self._invocation_control_task_type
+
+    @property
+    def exact_fork_task_type(self) -> str:
+        """Return the versioned namespace for exact-fork child dispatches."""
+
+        return self._exact_fork_task_type
 
     @property
     def task_store(self) -> TaskStore:
@@ -607,21 +692,15 @@ class TaskStoreDispatcher(Dispatcher):
 
         return self._tasks
 
-    def _claim_task_types(self) -> tuple[str, str, str]:
+    def _claim_task_types(self) -> tuple[str, ...]:
         """Return independently claimable protocol namespaces in fair-poll order."""
 
         return (
             self._prepared_subagent_task_type,
-            self._fork_group_task_type,
+            self._exact_fork_task_type,
+            self._invocation_control_task_type,
             self._task_type,
         )
-
-    def _task_type_for_request(self, request: DispatchRequest) -> str:
-        """Keep fork-group work invisible to workers that predate its authority check."""
-
-        if "fork_group_dispatch" in request.metadata:
-            return self._fork_group_task_type
-        return self._task_type
 
     def _task_type_for_envelope(self, envelope: _QueuedDispatchEnvelope) -> str:
         """Bind each envelope protocol to the only namespace allowed to carry it."""
@@ -629,7 +708,11 @@ class TaskStoreDispatcher(Dispatcher):
         if type(envelope) is not _QueuedDispatchEnvelope:
             raise TypeError("Queued dispatch requires an exact envelope.")
         if envelope.operation_kind == "resume":
-            return self._task_type_for_request(envelope.request)
+            if envelope.schema_version == _QUEUED_DISPATCH_EXACT_FORK_SCHEMA_VERSION:
+                return self._exact_fork_task_type
+            if envelope.schema_version == _QUEUED_DISPATCH_INVOCATION_CONTROL_SCHEMA_VERSION:
+                return self._invocation_control_task_type
+            return self._task_type
         intent = envelope.prepared_subagent
         if intent is None or intent.queue_task_type != self._prepared_subagent_task_type:
             raise ValueError("Prepared subagent dispatch uses an unsupported queue namespace.")
@@ -651,17 +734,22 @@ class TaskStoreDispatcher(Dispatcher):
             )
         request = _runtime_redact_dispatch_request(durable_runtime, request)
         handle_request = request
-        task_type = self._task_type_for_request(request)
-        queue_task_id = _queued_dispatch_task_id(request, task_type=task_type)
+        queue_task_id = _queued_dispatch_task_id(request, task_type=self._task_type)
         existing = await self._tasks.load_task(queue_task_id)
         if existing is not None:
+            task_type = existing.type
             envelope = _existing_queued_dispatch_envelope(
                 existing,
                 task_type=task_type,
             )
-            if envelope is None or not await durable_runtime._queued_dispatch_requests_match(
-                envelope.request,
-                request,
+            if (
+                task_type not in self._claim_task_types()
+                or envelope is None
+                or self._task_type_for_envelope(envelope) != task_type
+                or not await durable_runtime._queued_dispatch_requests_match(
+                    envelope.request,
+                    request,
+                )
             ):
                 raise RuntimeError("Existing task conflicts with the queued dispatch authority.")
             settlement = await durable_runtime._queued_dispatch_settlement_state(envelope)
@@ -703,6 +791,7 @@ class TaskStoreDispatcher(Dispatcher):
         envelope = _copy_queued_dispatch_envelope(envelope)
         if envelope.queue_task_id != queue_task_id:
             raise ValueError("Queued dispatch envelope changed its runtime-owned task identity.")
+        task_type = self._task_type_for_envelope(envelope)
         request = envelope.request
         # The queue task must be session-unbound (``session_id is None``) to be claimable by
         # a worker pool; the target session_id rides inside the serialized request payload.
@@ -1928,6 +2017,17 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
                 model=request.target.model,
             )
         ),
+        tool_capability_ceiling=(
+            None
+            if request.tool_capability_ceiling is None
+            else copy_tool_capability_ceiling(request.tool_capability_ceiling)
+        ),
+        tool_grants=validate_targeted_tool_grants(request.tool_grants),
+        profile_adoption=(
+            None
+            if request.profile_adoption is None
+            else copy_execution_profile_adoption_intent(request.profile_adoption)
+        ),
         metadata=copy_durable_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
@@ -2001,8 +2101,52 @@ def _queued_dispatch_authority_session_id(envelope: _QueuedDispatchEnvelope) -> 
     return envelope.request.session_id
 
 
-def _queued_dispatch_request_sha256(request: DispatchRequest) -> str:
+def _queued_dispatch_schema_version(
+    request: DispatchRequest,
+    *,
+    exact_fork_source_state_sha256: str | None = None,
+) -> Literal[2, 3, 4]:
+    """Select the oldest envelope schema that preserves the request authority."""
+
+    if type(request) is not DispatchRequest:
+        raise TypeError("Queued dispatch requires an exact DispatchRequest.")
+    if exact_fork_source_state_sha256 is not None:
+        return _QUEUED_DISPATCH_EXACT_FORK_SCHEMA_VERSION
+    if (
+        request.tool_capability_ceiling is not None
+        or request.tool_grants
+        or request.profile_adoption is not None
+    ):
+        return _QUEUED_DISPATCH_INVOCATION_CONTROL_SCHEMA_VERSION
+    return _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION
+
+
+def _queued_dispatch_request_payload(
+    request: DispatchRequest,
+    *,
+    schema_version: Literal[2, 3, 4],
+) -> dict[str, Any]:
+    """Project request authority using the selected durable wire contract."""
+
     payload = copy_dispatch_request(request).model_dump(mode="json")
+    if schema_version == _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION:
+        for field_name in _QUEUED_DISPATCH_INVOCATION_CONTROL_FIELDS:
+            payload.pop(field_name)
+        return payload
+    if schema_version in {
+        _QUEUED_DISPATCH_INVOCATION_CONTROL_SCHEMA_VERSION,
+        _QUEUED_DISPATCH_EXACT_FORK_SCHEMA_VERSION,
+    }:
+        return payload
+    raise ValueError("Queued dispatch uses an unsupported schema version.")
+
+
+def _queued_dispatch_request_sha256(
+    request: DispatchRequest,
+    *,
+    schema_version: Literal[2, 3, 4],
+) -> str:
+    payload = _queued_dispatch_request_payload(request, schema_version=schema_version)
     return sha256(canonical_durable_json_bytes(payload, "queued_dispatch.request")).hexdigest()
 
 
@@ -2011,7 +2155,25 @@ def _queued_dispatch_task_id(
     *,
     task_type: str = DEFAULT_DISPATCH_TASK_TYPE,
 ) -> str:
+    """Return one caller-visible dispatch identity across wire namespaces.
+
+    Versioned protocols use separate claim namespaces so older workers cannot
+    consume envelopes whose session authority they do not understand. Transport
+    versioning must not split the caller's ``dispatch_id`` idempotency scope.
+    """
+
     request = copy_dispatch_request(request)
+    task_type = require_clean_nonblank(task_type, "task_type")
+    for suffix in (
+        INVOCATION_CONTROL_DISPATCH_TASK_TYPE_SUFFIX,
+        EXACT_FORK_DISPATCH_TASK_TYPE_SUFFIX,
+    ):
+        if task_type.endswith(suffix):
+            task_type = require_clean_nonblank(
+                task_type.removesuffix(suffix),
+                "dispatch_identity_task_type",
+            )
+            break
     return durable_dispatch_queue_task_id(
         task_type=task_type,
         dispatch_id=request.dispatch_id,
@@ -2026,10 +2188,12 @@ def _queued_dispatch_operation_id(
     session_instance_fingerprint: str,
     source_profile: ExecutionProfileIdentity,
     required_profile: ExecutionProfileIdentity,
+    schema_version: Literal[2, 3, 4],
+    exact_fork_source_state_sha256: str | None = None,
 ) -> str:
     material = {
         "record_type": _QUEUED_DISPATCH_RECORD_TYPE,
-        "schema_version": _QUEUED_DISPATCH_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "queue_task_id": require_durable_clean_nonblank(queue_task_id, "queue_task_id"),
         "dispatch_id": request.dispatch_id,
         "session_id": request.session_id,
@@ -2039,6 +2203,8 @@ def _queued_dispatch_operation_id(
         "source_profile_fingerprint": source_profile.fingerprint,
         "required_profile_fingerprint": required_profile.fingerprint,
     }
+    if exact_fork_source_state_sha256 is not None:
+        material["exact_fork_source_state_sha256"] = exact_fork_source_state_sha256
     return sha256(canonical_durable_json_bytes(material, "queued_dispatch.operation")).hexdigest()
 
 
@@ -2057,11 +2223,19 @@ def _new_queued_dispatch_envelope(
     session_instance_fingerprint: str,
     source_profile: ExecutionProfileIdentity,
     required_profile: ExecutionProfileIdentity,
+    exact_fork_source_state_sha256: str | None = None,
 ) -> _QueuedDispatchEnvelope:
     """Build one immutable envelope from runtime-owned session/profile authority."""
 
     request = copy_dispatch_request(request)
-    request_sha256 = _queued_dispatch_request_sha256(request)
+    schema_version = _queued_dispatch_schema_version(
+        request,
+        exact_fork_source_state_sha256=exact_fork_source_state_sha256,
+    )
+    request_sha256 = _queued_dispatch_request_sha256(
+        request,
+        schema_version=schema_version,
+    )
     operation_id = _queued_dispatch_operation_id(
         queue_task_id=queue_task_id,
         request=request,
@@ -2069,8 +2243,11 @@ def _new_queued_dispatch_envelope(
         session_instance_fingerprint=session_instance_fingerprint,
         source_profile=source_profile,
         required_profile=required_profile,
+        schema_version=schema_version,
+        exact_fork_source_state_sha256=exact_fork_source_state_sha256,
     )
     return _QueuedDispatchEnvelope(
+        schema_version=schema_version,
         queue_task_id=queue_task_id,
         dispatch_operation_id=operation_id,
         terminal_event_id=_queued_dispatch_terminal_event_id(operation_id),
@@ -2079,6 +2256,7 @@ def _new_queued_dispatch_envelope(
         request=request,
         source_profile=source_profile,
         required_profile=required_profile,
+        exact_fork_source_state_sha256=exact_fork_source_state_sha256,
     )
 
 
@@ -2091,7 +2269,10 @@ def _new_prepared_subagent_dispatch_envelope(
 
     intent = copy_durable_subagent_submission_intent(intent)
     request = _prepared_subagent_dispatch_request(intent)
-    request_sha256 = _queued_dispatch_request_sha256(request)
+    request_sha256 = _queued_dispatch_request_sha256(
+        request,
+        schema_version=_QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION,
+    )
     operation_id = _queued_dispatch_operation_id(
         queue_task_id=intent.queue_task_id,
         request=request,
@@ -2099,8 +2280,11 @@ def _new_prepared_subagent_dispatch_envelope(
         session_instance_fingerprint=session_instance_fingerprint,
         source_profile=intent.child_execution_profile,
         required_profile=intent.child_execution_profile,
+        schema_version=_QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION,
+        exact_fork_source_state_sha256=None,
     )
     return _QueuedDispatchEnvelope(
+        schema_version=_QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION,
         queue_task_id=intent.queue_task_id,
         dispatch_operation_id=operation_id,
         terminal_event_id=_queued_dispatch_terminal_event_id(operation_id),
@@ -2235,7 +2419,7 @@ def _queued_dispatch_task_input_matches(
     task_input: dict[str, Any],
     envelope: _QueuedDispatchEnvelope,
 ) -> bool:
-    """Accept exact current authority and the prior schema-v1 resume representation."""
+    """Accept exact in-memory authority or its canonical durable wire representation."""
 
     if type(task_input) is not dict or set(task_input) != {"dispatch"}:
         return False
@@ -2249,10 +2433,21 @@ def _queued_dispatch_task_input_matches(
 def _queued_dispatch_persisted_envelope(
     envelope: _QueuedDispatchEnvelope,
 ) -> dict[str, Any]:
-    """Keep ordinary resume tasks readable by pre-#213 revision-40 workers."""
+    """Persist only fields defined by the envelope's versioned protocol."""
 
     persisted = envelope.model_dump(mode="json")
-    if envelope.operation_kind != "resume" or envelope.prepared_subagent is not None:
+    if envelope.schema_version != _QUEUED_DISPATCH_EXACT_FORK_SCHEMA_VERSION:
+        persisted.pop("exact_fork_source_state_sha256")
+    if envelope.schema_version == _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION:
+        persisted["request"] = _queued_dispatch_request_payload(
+            envelope.request,
+            schema_version=envelope.schema_version,
+        )
+    if (
+        envelope.schema_version != _QUEUED_DISPATCH_COMPAT_SCHEMA_VERSION
+        or envelope.operation_kind != "resume"
+        or envelope.prepared_subagent is not None
+    ):
         return persisted
     return {
         key: value
@@ -2358,6 +2553,25 @@ def redact_dispatch_request(
         field_name="DispatchRequest.structured_output",
     )
 
+    prepared_invocation = session_request_boundary.prepare_resume_request(
+        ResumeRequest(
+            session_id=request.session_id,
+            messages=request.messages,
+            target=request.target,
+            tool_capability_ceiling=request.tool_capability_ceiling,
+            tool_grants=request.tool_grants,
+            profile_adoption=request.profile_adoption,
+            metadata=request.metadata,
+            max_steps=request.max_steps,
+            limits=request.limits,
+            budget_limits=request.budget_limits,
+            retry_policy=request.retry_policy,
+            structured_output=request.structured_output,
+            thinking=request.thinking,
+        ),
+        redactor=redactor,
+    )
+
     for field_name, value in (
         ("limits", request.limits.model_dump(mode="json")),
         (
@@ -2416,6 +2630,9 @@ def redact_dispatch_request(
                 model=request.target.model,
             )
         ),
+        tool_capability_ceiling=prepared_invocation.tool_capability_ceiling,
+        tool_grants=prepared_invocation.tool_grants,
+        profile_adoption=prepared_invocation.profile_adoption,
         metadata=metadata,
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),

@@ -44,6 +44,7 @@ from cayu.runtime import (
     DispatchRequest,
     DispatchStatus,
     EventQuery,
+    ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
     ExecutionProfileDecision,
@@ -53,6 +54,7 @@ from cayu.runtime import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     ForkSessionRequest,
+    ForkSourceSnapshot,
     IncompleteSessionRecoveryAction,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -66,14 +68,17 @@ from cayu.runtime import (
     RunRequest,
     RuntimeHook,
     RuntimeHookContext,
+    Session,
     SessionExecutionSource,
     SessionIdentity,
     SessionInvocation,
     SessionInvocationBinding,
     SessionModelTransition,
+    SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
     StructuredOutputSpec,
+    TargetedToolGrant,
     Task,
     TaskClaimLost,
     TaskCreate,
@@ -84,6 +89,7 @@ from cayu.runtime import (
     TaskStoreDispatcher,
     TaskTerminalizationRequest,
     TaskTerminalKind,
+    ToolCapabilityCeiling,
 )
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
@@ -94,6 +100,7 @@ from cayu.runtime.dispatch import (
     _dispatch_status_after_event,
     _new_queued_dispatch_envelope,
     _queued_dispatch_task_id,
+    _QueuedDispatchAuthorityRejected,
     _QueuedDispatchEnvelope,
     _QueuedDispatchSettlement,
     _QueuedDispatchSettlementState,
@@ -116,8 +123,13 @@ from cayu.runtime.public_authority import (
 from cayu.runtime.sessions import (
     QueuedDispatchTerminalReceipt,
     _checkpoint_with_session_run_operation,
+    _fork_initial_invocation_request_sha256,
     _invocation_lifecycle_authority_mutation_scope,
+    fork_source_state_sha256,
+    fork_source_transcript_sha256,
+    session_fork_profile_relationship,
     session_input_messages_sha256,
+    validate_profiled_fork_evidence,
 )
 from cayu.runtime.tasks import task_create_with_runtime_invocation
 from cayu.runtime.workspace_observation_recovery import (
@@ -443,6 +455,1233 @@ def test_submit_enqueues_pending_task_without_running() -> None:
     assert task.invocation.source is TaskExecutionSource.TASK_DISPATCH
 
 
+def test_exact_session_fork_admits_first_invocation_through_ordinary_dispatch() -> None:
+    h = _build([_batch("source answer"), _batch("child answer")])
+    source_session_id = "sess_independent_fork_source"
+    child_session_id = "sess_independent_fork_child"
+    initial_dispatch_id = "dispatch_independent_fork_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[ForkSourceSnapshot, DispatchHandle, DispatchHandle | None]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        invocation = ResumeRequest(
+            session_id=child_session_id,
+            messages=[Message.text("user", "run independent child")],
+            metadata={"application_branch": "child-a"},
+            max_steps=3,
+        )
+        fork = ForkSessionRequest(
+            source_session_id=source_session_id,
+            session_id=child_session_id,
+            expected_source=source,
+            initial_invocation=invocation,
+            initial_dispatch_id=initial_dispatch_id,
+            metadata={"application_branch": "child-a"},
+        )
+        fork_events = [event async for event in h.app.fork_session(fork)]
+        assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
+        assert fork_events[0].payload["source_run_epoch"] == source.run_epoch
+        assert fork_events[0].payload["source_instance_fingerprint"] == (
+            source.source_instance_fingerprint
+        )
+        assert fork_events[0].payload["source_transcript_cursor"] == (source.transcript_cursor)
+        assert fork_events[0].payload["source_transcript_sha256"] == (source.transcript_sha256)
+        assert fork_events[0].payload["source_checkpoint_sha256"] == (source.checkpoint_sha256)
+        assert fork_events[0].payload["source_execution_profile_fingerprint"] == (
+            source.execution_profile_fingerprint
+        )
+        assert fork_events[0].payload["initial_dispatch_id"] == initial_dispatch_id
+        request = DispatchRequest(
+            session_id=child_session_id,
+            dispatch_id=initial_dispatch_id,
+            messages=invocation.messages,
+            metadata=invocation.metadata,
+            max_steps=invocation.max_steps,
+        )
+        submitted = await h.app.dispatch(request)
+        replayed = await h.app.dispatch(request)
+        assert replayed.metadata["queue_task_id"] == submitted.metadata["queue_task_id"]
+        assert (
+            replayed.metadata["dispatch_operation_id"]
+            == (submitted.metadata["dispatch_operation_id"])
+        )
+        assert replayed.metadata["idempotent_submission"] is True
+        assert len(h.provider.requests) == 1
+        task = await h.tasks.load_task(submitted.metadata["queue_task_id"])
+        assert task is not None
+        assert task.type == h.dispatcher.exact_fork_task_type
+        assert task.input["dispatch"]["schema_version"] == 4
+        assert task.input["dispatch"]["exact_fork_source_state_sha256"] == (
+            fork_source_state_sha256(source)
+        )
+        envelope = _QueuedDispatchEnvelope.model_validate(task.input["dispatch"])
+        for mismatched_commitment in (None, "0" * 64):
+            mismatched_envelope = _new_queued_dispatch_envelope(
+                queue_task_id=envelope.queue_task_id,
+                request=envelope.request,
+                session_instance_fingerprint=envelope.session_instance_fingerprint,
+                source_profile=envelope.source_profile,
+                required_profile=envelope.required_profile,
+                exact_fork_source_state_sha256=mismatched_commitment,
+            )
+            with pytest.raises(
+                _QueuedDispatchAuthorityRejected,
+                match="protocol conflicts with its target fork relationship",
+            ):
+                await h.app._queued_dispatch_settlement_state(mismatched_envelope)
+        mismatched_dispatch_envelope = _new_queued_dispatch_envelope(
+            queue_task_id=envelope.queue_task_id,
+            request=envelope.request.model_copy(
+                update={"dispatch_id": "dispatch_independent_fork_alternate"},
+                deep=True,
+            ),
+            session_instance_fingerprint=envelope.session_instance_fingerprint,
+            source_profile=envelope.source_profile,
+            required_profile=envelope.required_profile,
+            exact_fork_source_state_sha256=envelope.exact_fork_source_state_sha256,
+        )
+        with pytest.raises(
+            _QueuedDispatchAuthorityRejected,
+            match="identity conflicts with the target fork's first invocation",
+        ):
+            await h.app._queued_dispatch_settlement_state(mismatched_dispatch_envelope)
+        assert (
+            await h.tasks.claim_task(
+                "revision-40-worker",
+                TaskQuery(type=_DISPATCH_TASK_TYPE),
+                lease_seconds=300,
+            )
+            is None
+        )
+        completed = await h.dispatcher.process_next(
+            h.app,
+            worker_id="worker_independent_fork_child",
+        )
+        return source, submitted, completed
+
+    source, submitted, completed = asyncio.run(scenario())
+
+    assert source.source_session_id == source_session_id
+    assert source.status is SessionStatus.COMPLETED
+    assert submitted.status is DispatchStatus.SUBMITTED
+    assert completed is not None
+    assert completed.status is DispatchStatus.COMPLETED
+    assert len(h.provider.requests) == 2
+    child = asyncio.run(h.store.load(child_session_id))
+    assert child is not None
+    assert child.parent_session_id == source_session_id
+    assert child.causal_budget_id == source.causal_budget_id
+    assert child.status is SessionStatus.COMPLETED
+    assert child.run_epoch > 0
+    assert child.metadata["cayu:fork_source_snapshot"] == source.model_dump(mode="json")
+    relationship = session_fork_profile_relationship(child)
+    assert relationship is not None
+    assert relationship.schema_version == 2
+    assert relationship.source_state_sha256 == fork_source_state_sha256(source)
+    assert relationship.initial_dispatch_id == initial_dispatch_id
+    assert (
+        child.metadata["cayu:fork_execution_profile"]["source_state_sha256"]
+        == relationship.source_state_sha256
+    )
+
+
+def test_fork_rejects_malformed_egress_transition_before_child_publication() -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_malformed_egress_fork_source"
+    child_session_id = "sess_malformed_egress_fork_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> None:
+        await h.store.checkpoint(
+            source_session_id,
+            {"cayu:egress_authority_transition": {}},
+        )
+
+        with pytest.raises(RuntimeError, match="egress authority transition is malformed"):
+            await h.app.snapshot_fork_source(source_session_id)
+        with pytest.raises(RuntimeError, match="egress authority transition is malformed"):
+            async for _ in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session_id,
+                    session_id=child_session_id,
+                )
+            ):
+                pass
+
+        assert await h.store.load(child_session_id) is None
+
+    asyncio.run(scenario())
+
+
+def test_exact_fork_atomically_rejects_egress_transition_after_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_atomic_egress_fork_source"
+    child_session_id = "sess_atomic_egress_fork_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> None:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        create_profiled_fork = h.store.create_profiled_fork
+
+        async def add_egress_transition_then_create_fork(**kwargs):
+            await h.store.checkpoint(
+                source_session_id,
+                {"cayu:egress_authority_transition": {}},
+            )
+            return await create_profiled_fork(**kwargs)
+
+        monkeypatch.setattr(
+            h.store,
+            "create_profiled_fork",
+            add_egress_transition_then_create_fork,
+        )
+        with pytest.raises(RuntimeError, match="egress authority transition is malformed"):
+            async for _ in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session_id,
+                    session_id=child_session_id,
+                    expected_source=source,
+                )
+            ):
+                pass
+
+        assert await h.store.load(child_session_id) is None
+
+    asyncio.run(scenario())
+
+
+def test_exact_session_fork_preserves_retained_transcript_authority(tmp_path) -> None:
+    store = SQLiteSessionStore(tmp_path / "retained-exact-fork.sqlite")
+    h = _build([_batch("template answer")], session_store=store)
+
+    async def scenario() -> None:
+        async for _ in h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retained_exact_template",
+                messages=[Message.text("user", "establish runtime identity")],
+            )
+        ):
+            pass
+        template = await store.load("sess_retained_exact_template")
+        assert template is not None
+        execution_profile = execution_profile_from_session_metadata(template.metadata)
+        assert execution_profile is not None
+
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_retained_exact_source",
+                messages=[],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+            ),
+            identity=SessionIdentity(
+                provider_name="fake",
+                model="fake-model",
+                runtime_name=template.runtime_name,
+                runtime_version=template.runtime_version,
+                runtime_build_provenance=template.runtime_build_provenance,
+                execution_profile=execution_profile,
+            ),
+        )
+        await store.append_transcript_messages(
+            source.id,
+            [Message.text("user", f"retained-{index}") for index in range(5)],
+        )
+        source = await store.update_status(source.id, SessionStatus.COMPLETED)
+        assert await store.compact_transcript(source.id, keep_last=2) == 3
+
+        retained = await store.load_transcript_snapshot(source.id)
+        assert retained.cursor == 5
+        assert [record.index for record in retained.records] == [3, 4]
+        snapshot = await h.app.snapshot_fork_source(source.id)
+        assert snapshot.transcript_sha256 == fork_source_transcript_sha256(retained)
+
+        events = [
+            event
+            async for event in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="sess_retained_exact_child",
+                    expected_source=snapshot,
+                )
+            )
+        ]
+        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        child_transcript = await store.load_transcript("sess_retained_exact_child")
+        assert [message.content[0].text for message in child_transcript] == [
+            "retained-3",
+            "retained-4",
+        ]
+
+        await store.append_transcript_messages(
+            source.id,
+            [Message.text("user", "retained-5")],
+        )
+        with pytest.raises(ValueError, match="atomic copy validation"):
+            async for _ in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="sess_stale_retained_exact_child",
+                    expected_source=snapshot,
+                )
+            ):
+                pass
+        assert await store.load("sess_stale_retained_exact_child") is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(store.close())
+
+
+def test_fork_source_state_commitment_excludes_redacted_authority_identifiers() -> None:
+    snapshot = ForkSourceSnapshot(
+        source_session_id="private-source-alpha",
+        source_instance_fingerprint="1" * 64,
+        status=SessionStatus.COMPLETED,
+        run_epoch=3,
+        transcript_cursor=7,
+        transcript_sha256="2" * 64,
+        checkpoint_sha256="3" * 64,
+        execution_profile_fingerprint="4" * 64,
+        causal_budget_id="private-budget-alpha",
+    )
+    different_authority = snapshot.model_copy(
+        update={
+            "source_session_id": "private-source-bravo",
+            "causal_budget_id": "private-budget-bravo",
+        },
+        deep=True,
+    )
+
+    assert fork_source_state_sha256(snapshot) == fork_source_state_sha256(different_authority)
+    assert fork_source_state_sha256(snapshot) != fork_source_state_sha256(
+        snapshot.model_copy(update={"run_epoch": snapshot.run_epoch + 1}, deep=True)
+    )
+
+
+def test_ordinary_fork_profile_metadata_preserves_schema_v1_shape() -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_ordinary_profile_shape_source"
+    child_session_id = "sess_ordinary_profile_shape_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> Session:
+        async for _ in h.app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+            )
+        ):
+            pass
+        child = await h.store.load(child_session_id)
+        assert child is not None
+        return child
+
+    child = asyncio.run(scenario())
+    relationship = session_fork_profile_relationship(child)
+
+    assert relationship is not None
+    assert relationship.schema_version == 1
+    assert relationship.source_state_sha256 is None
+    assert "source_state_sha256" not in child.metadata["cayu:fork_execution_profile"]
+    assert (
+        child.metadata["cayu:fork_execution_profile"]["source_environment_allocation_owners"] == []
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "source_environment_allocation_owners",
+        "source_instance_fingerprint",
+        "source_run_epoch",
+        "source_transcript_cursor",
+        "source_transcript_sha256",
+        "source_checkpoint_sha256",
+        "source_execution_profile_fingerprint",
+    ],
+)
+def test_profiled_fork_evidence_binds_exact_source_event_to_child_metadata(
+    field_name: str,
+) -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = f"sess_exact_evidence_source_{field_name}"
+    child_session_id = f"sess_exact_evidence_child_{field_name}"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[Session, list[Event]]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        async for _ in h.app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+                expected_source=source,
+            )
+        ):
+            pass
+        child = await h.store.load(child_session_id)
+        records = await h.store.query_events(EventQuery(session_id=child_session_id))
+        assert child is not None
+        return child, [record.event for record in records]
+
+    child, events = asyncio.run(scenario())
+    relationship = session_fork_profile_relationship(child)
+    fork_event_index = next(
+        index for index, event in enumerate(events) if event.type is EventType.SESSION_FORKED
+    )
+    fork_event = events[fork_event_index]
+    tampered_payload = dict(fork_event.payload)
+    original = tampered_payload[field_name]
+    tampered_payload[field_name] = (
+        original + 1 if type(original) is int else (("0" if original != "0" * 64 else "1") * 64)
+    )
+    events[fork_event_index] = fork_event.model_copy(
+        update={"payload": tampered_payload},
+        deep=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="exact-source evidence conflicts with child metadata",
+    ):
+        validate_profiled_fork_evidence(
+            fork=child,
+            relationship=relationship,
+            events=events,
+        )
+
+
+def test_profiled_fork_evidence_requires_complete_exact_source_event() -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_exact_evidence_complete_source"
+    child_session_id = "sess_exact_evidence_complete_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[Session, list[Event]]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        async for _ in h.app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+                expected_source=source,
+            )
+        ):
+            pass
+        child = await h.store.load(child_session_id)
+        records = await h.store.query_events(EventQuery(session_id=child_session_id))
+        assert child is not None
+        return child, [record.event for record in records]
+
+    child, events = asyncio.run(scenario())
+    relationship = session_fork_profile_relationship(child)
+    fork_event_index = next(
+        index for index, event in enumerate(events) if event.type is EventType.SESSION_FORKED
+    )
+    fork_event = events[fork_event_index]
+    incomplete_payload = dict(fork_event.payload)
+    incomplete_payload.pop("source_checkpoint_sha256")
+    events[fork_event_index] = fork_event.model_copy(
+        update={"payload": incomplete_payload},
+        deep=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="exact-source evidence conflicts with child metadata",
+    ):
+        validate_profiled_fork_evidence(
+            fork=child,
+            relationship=relationship,
+            events=events,
+        )
+
+
+@pytest.mark.parametrize(
+    ("snapshot_field", "event_field"),
+    (
+        ("source_instance_fingerprint", "source_instance_fingerprint"),
+        ("transcript_cursor", "source_transcript_cursor"),
+        ("transcript_sha256", "source_transcript_sha256"),
+        ("checkpoint_sha256", "source_checkpoint_sha256"),
+    ),
+)
+def test_profiled_fork_evidence_rejects_correlated_exact_source_tampering(
+    snapshot_field: str,
+    event_field: str,
+) -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = f"sess_correlated_evidence_source_{snapshot_field}"
+    child_session_id = f"sess_correlated_evidence_child_{snapshot_field}"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[Session, list[Event]]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        async for _ in h.app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+                expected_source=source,
+            )
+        ):
+            pass
+        child = await h.store.load(child_session_id)
+        records = await h.store.query_events(EventQuery(session_id=child_session_id))
+        assert child is not None
+        return child, [record.event for record in records]
+
+    child, events = asyncio.run(scenario())
+    metadata = dict(child.metadata)
+    source_snapshot = dict(metadata["cayu:fork_source_snapshot"])
+    original = source_snapshot[snapshot_field]
+    replacement = (
+        original + 1 if type(original) is int else ("0" if original != "0" * 64 else "1") * 64
+    )
+    source_snapshot[snapshot_field] = replacement
+    metadata["cayu:fork_source_snapshot"] = source_snapshot
+    child = child.model_copy(update={"metadata": metadata}, deep=True)
+    relationship = session_fork_profile_relationship(child)
+    assert relationship is not None
+
+    fork_event_index = next(
+        index for index, event in enumerate(events) if event.type is EventType.SESSION_FORKED
+    )
+    fork_event = events[fork_event_index]
+    tampered_payload = dict(fork_event.payload)
+    tampered_payload[event_field] = replacement
+    events[fork_event_index] = fork_event.model_copy(
+        update={"payload": tampered_payload},
+        deep=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="exact-source evidence conflicts with child metadata",
+    ):
+        validate_profiled_fork_evidence(
+            fork=child,
+            relationship=relationship,
+            events=events,
+        )
+
+
+def test_exact_fork_replay_rejects_correlated_persisted_snapshot_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_correlated_replay_source"
+    child_session_id = "sess_correlated_replay_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> None:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        request = ForkSessionRequest(
+            source_session_id=source_session_id,
+            session_id=child_session_id,
+            expected_source=source,
+        )
+        async for _ in h.app.fork_session(request):
+            pass
+        child = await h.store.load(child_session_id)
+        assert child is not None
+
+        metadata = dict(child.metadata)
+        source_snapshot_document = dict(metadata["cayu:fork_source_snapshot"])
+        source_snapshot_document["source_instance_fingerprint"] = "0" * 64
+        metadata["cayu:fork_source_snapshot"] = source_snapshot_document
+        relationship_document = dict(metadata["cayu:fork_execution_profile"])
+        relationship_document["source_state_sha256"] = fork_source_state_sha256(
+            ForkSourceSnapshot.model_validate(source_snapshot_document)
+        )
+        metadata["cayu:fork_execution_profile"] = relationship_document
+        tampered_child = child.model_copy(update={"metadata": metadata}, deep=True)
+        original_load = h.store.load
+
+        async def load_with_correlated_rewrite(session_id: str) -> Session | None:
+            if session_id == child_session_id:
+                return tampered_child.model_copy(deep=True)
+            return await original_load(session_id)
+
+        monkeypatch.setattr(h.store, "load", load_with_correlated_rewrite)
+
+        with pytest.raises(
+            RuntimeError,
+            match="conflicts with the exact profiled request",
+        ):
+            async for _ in h.app.fork_session(request):
+                pass
+
+    asyncio.run(scenario())
+
+
+def test_exact_session_fork_preserves_initial_digest_under_secret_collision() -> None:
+    source_session_id = "sess_initial_digest_collision_source"
+    child_session_id = "sess_initial_digest_collision_child"
+    initial = ResumeRequest(
+        session_id=child_session_id,
+        messages=[Message.text("user", "run the declared child")],
+    )
+    request_sha256 = _fork_initial_invocation_request_sha256(initial)
+    h = _build(
+        [_batch("source answer")],
+        secret_redactor=SecretRedactor(request_sha256[:12]),
+    )
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[list[Event], Session]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        events = [
+            event
+            async for event in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session_id,
+                    session_id=child_session_id,
+                    expected_source=source,
+                    initial_invocation=initial,
+                    initial_dispatch_id="dispatch_initial_digest_collision",
+                )
+            )
+        ]
+        child = await h.store.load(child_session_id)
+        assert child is not None
+        return events, child
+
+    events, child = asyncio.run(scenario())
+
+    assert [event.type for event in events] == [EventType.SESSION_FORKED]
+    relationship = session_fork_profile_relationship(child)
+    assert relationship is not None
+    assert relationship.initial_invocation_request_sha256 == request_sha256
+
+
+def test_fork_initial_invocation_requires_exact_dispatch_authority() -> None:
+    initial = ResumeRequest(
+        session_id="fork-initial-authority-child",
+        messages=[Message.text("user", "run child")],
+    )
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        ForkSessionRequest(
+            source_session_id="fork-initial-authority-source",
+            session_id=initial.session_id,
+            initial_invocation=initial,
+        )
+    with pytest.raises(ValueError, match="must be supplied together"):
+        ForkSessionRequest(
+            source_session_id="fork-initial-authority-source",
+            session_id=initial.session_id,
+            initial_dispatch_id="fork-initial-authority-dispatch",
+        )
+    with pytest.raises(ValueError, match="exact expected_source"):
+        ForkSessionRequest(
+            source_session_id="fork-initial-authority-source",
+            session_id=initial.session_id,
+            initial_invocation=initial,
+            initial_dispatch_id="fork-initial-authority-dispatch",
+        )
+
+
+@pytest.mark.parametrize(
+    ("task_worker_id", "task_handoff_id"),
+    [
+        ("fork-initial-worker", None),
+        ("fork-initial-worker", "fork-initial-handoff"),
+    ],
+)
+def test_fork_initial_invocation_rejects_task_continuation_authority(
+    task_worker_id: str,
+    task_handoff_id: str | None,
+) -> None:
+    source = ForkSourceSnapshot(
+        source_session_id="fork-task-authority-source",
+        source_instance_fingerprint="1" * 64,
+        status=SessionStatus.COMPLETED,
+        run_epoch=1,
+        transcript_cursor=2,
+        transcript_sha256="2" * 64,
+        checkpoint_sha256="3" * 64,
+        execution_profile_fingerprint="4" * 64,
+        causal_budget_id="fork-task-authority-source",
+    )
+
+    with pytest.raises(ValueError, match="cannot contain task continuation authority"):
+        ForkSessionRequest(
+            source_session_id=source.source_session_id,
+            session_id="fork-task-authority-child",
+            expected_source=source,
+            initial_invocation=ResumeRequest(
+                session_id="fork-task-authority-child",
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                messages=[Message.text("user", "run child")],
+            ),
+            initial_dispatch_id="fork-task-authority-dispatch",
+        )
+
+
+def test_fork_boundary_rejects_unvalidated_task_continuation_authority_before_publication() -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_unvalidated_fork_task_authority_source"
+    child_session_id = "sess_unvalidated_fork_task_authority_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> None:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        malformed = ForkSessionRequest.model_construct(
+            source_session_id=source_session_id,
+            session_id=child_session_id,
+            expected_source=source,
+            initial_invocation=ResumeRequest(
+                session_id=child_session_id,
+                task_worker_id="unvalidated-fork-worker",
+                task_handoff_id="unvalidated-fork-handoff",
+                messages=[Message.text("user", "run child")],
+            ),
+            initial_dispatch_id="unvalidated-fork-dispatch",
+        )
+
+        with pytest.raises(ValueError, match="cannot contain task continuation authority"):
+            async for _ in h.app.fork_session(malformed):
+                pass
+
+        assert await h.store.load(child_session_id) is None
+
+    asyncio.run(scenario())
+
+
+def test_exact_session_fork_rejects_a_different_first_invocation_before_admission() -> None:
+    h = _build([_batch("source answer"), _batch("child answer")])
+    source_session_id = "sess_frozen_invocation_source"
+    child_session_id = "sess_frozen_invocation_child"
+    initial_dispatch_id = "dispatch_exact_frozen_invocation"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[DispatchHandle, DispatchHandle | None]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        initial = ResumeRequest(
+            session_id=child_session_id,
+            messages=[Message.text("user", "execute the declared first invocation")],
+        )
+        async for _ in h.app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+                expected_source=source,
+                initial_invocation=initial,
+                initial_dispatch_id=initial_dispatch_id,
+            )
+        ):
+            pass
+
+        with pytest.raises(SessionRunFenced, match="exact durable dispatch"):
+            async for _ in h.app.resume(
+                ResumeRequest(
+                    session_id=child_session_id,
+                    messages=initial.messages,
+                )
+            ):
+                pass
+
+        mismatched_dispatch = DispatchRequest(
+            session_id=child_session_id,
+            dispatch_id="dispatch_mismatched_frozen_invocation",
+            messages=initial.messages,
+        )
+        mismatched_queue_task_id = _queued_dispatch_task_id(
+            mismatched_dispatch,
+            task_type=_DISPATCH_TASK_TYPE,
+        )
+        with pytest.raises(SessionRunFenced, match="dispatch identity does not match"):
+            await h.app.dispatch(mismatched_dispatch)
+        assert await h.tasks.load_task(mismatched_queue_task_id) is None
+
+        wrong_request = DispatchRequest(
+            session_id=child_session_id,
+            dispatch_id=initial_dispatch_id,
+            messages=[Message.text("user", "execute a different invocation")],
+        )
+        expected_queue_task_id = _queued_dispatch_task_id(
+            wrong_request,
+            task_type=_DISPATCH_TASK_TYPE,
+        )
+        with pytest.raises(SessionRunFenced, match="first invocation does not match"):
+            await h.app.dispatch(wrong_request)
+        assert await h.tasks.load_task(expected_queue_task_id) is None
+
+        unstarted_child = await h.store.load(child_session_id)
+        assert unstarted_child is not None
+        assert unstarted_child.run_epoch == 0
+
+        submitted = await h.app.dispatch(
+            DispatchRequest(
+                session_id=child_session_id,
+                dispatch_id=initial_dispatch_id,
+                messages=initial.messages,
+            )
+        )
+        completed = await h.dispatcher.process_next(
+            h.app,
+            worker_id="worker_exact_frozen_invocation",
+        )
+        return submitted, completed
+
+    submitted, completed = asyncio.run(scenario())
+
+    assert submitted.status is DispatchStatus.SUBMITTED
+    assert completed is not None
+    assert completed.status is DispatchStatus.COMPLETED
+    assert len(h.provider.requests) == 2
+
+
+def test_exact_fork_first_dispatch_is_single_owner_under_concurrent_submission() -> None:
+    h = _build(
+        [
+            _batch("source answer"),
+            _batch("first child answer"),
+            _batch("later child answer"),
+        ]
+    )
+    source_session_id = "sess_single_dispatch_source"
+    child_session_id = "sess_single_dispatch_child"
+    initial_dispatch_id = "dispatch_single_dispatch_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> tuple[DispatchHandle, DispatchHandle, DispatchHandle | None]:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        initial = ResumeRequest(
+            session_id=child_session_id,
+            messages=[Message.text("user", "execute once")],
+        )
+        async for _ in h.app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+                expected_source=source,
+                initial_invocation=initial,
+                initial_dispatch_id=initial_dispatch_id,
+            )
+        ):
+            pass
+
+        exact = DispatchRequest(
+            session_id=child_session_id,
+            dispatch_id=initial_dispatch_id,
+            messages=initial.messages,
+        )
+        alternate = exact.model_copy(
+            update={"dispatch_id": "dispatch_single_dispatch_alternate"},
+            deep=True,
+        )
+        admitted, rejected = await asyncio.gather(
+            h.app.dispatch(exact),
+            h.app.dispatch(alternate),
+            return_exceptions=True,
+        )
+        assert isinstance(admitted, DispatchHandle)
+        assert isinstance(rejected, SessionRunFenced)
+        assert "dispatch identity does not match" in str(rejected)
+        alternate_task_id = _queued_dispatch_task_id(
+            alternate,
+            task_type=_DISPATCH_TASK_TYPE,
+        )
+        assert await h.tasks.load_task(alternate_task_id) is None
+
+        with pytest.raises(SessionRunFenced, match="exact durable dispatch"):
+            async for _ in h.app.dispatch_inline(exact):
+                pass
+
+        replay_a, replay_b = await asyncio.gather(
+            h.app.dispatch(exact),
+            h.app.dispatch(exact),
+        )
+        assert replay_a.metadata["queue_task_id"] == admitted.metadata["queue_task_id"]
+        assert replay_b.metadata["queue_task_id"] == admitted.metadata["queue_task_id"]
+
+        first = await h.dispatcher.process_next(h.app, worker_id="worker-single-dispatch")
+        assert first is not None
+        assert first.status is DispatchStatus.COMPLETED
+
+        later_request = DispatchRequest(
+            session_id=child_session_id,
+            dispatch_id="dispatch_single_dispatch_later",
+            messages=[Message.text("user", "execute later interaction")],
+        )
+        later_submitted = await h.app.dispatch(later_request)
+        later = await h.dispatcher.process_next(
+            h.app,
+            worker_id="worker-single-dispatch-later",
+        )
+        return admitted, later_submitted, later
+
+    admitted, later_submitted, later = asyncio.run(scenario())
+
+    assert admitted.status is DispatchStatus.SUBMITTED
+    assert later_submitted.status is DispatchStatus.SUBMITTED
+    assert later is not None
+    assert later.status is DispatchStatus.COMPLETED
+    assert len(h.provider.requests) == 3
+
+
+@pytest.mark.parametrize(
+    ("requested_causal_budget_id", "expected_alias_field"),
+    (
+        (None, ".session_id."),
+        ("legacy-secret-budget", ".causal_budget_id."),
+    ),
+)
+def test_fork_source_snapshot_aliases_secret_causal_budget_and_round_trips(
+    requested_causal_budget_id: str | None,
+    expected_alias_field: str,
+) -> None:
+    h = _build([_batch("source answer")])
+    private_source_session_id = "legacy-source-secret-session"
+    private_causal_budget_id = requested_causal_budget_id or private_source_session_id
+    child_session_id = "fork-private-budget-child"
+
+    async def scenario() -> tuple[ForkSourceSnapshot, list[Event], Session]:
+        async for _ in h.app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=private_source_session_id,
+                causal_budget_id=requested_causal_budget_id,
+                messages=[Message.text("user", "establish a safe source")],
+            )
+        ):
+            pass
+
+        public_app = CayuApp(
+            session_store=h.store,
+            task_store=h.tasks,
+            dispatcher=h.dispatcher,
+            secret_redactor=SecretRedactor("secret"),
+            enable_logging=False,
+        )
+        public_app.register_provider(h.provider, default=True)
+        public_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        public_source_session_id = public_app.project_session_id_for_exposure(
+            private_source_session_id
+        )
+        snapshot = await public_app.snapshot_fork_source(public_source_session_id)
+        events = [
+            event
+            async for event in public_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=public_source_session_id,
+                    session_id=child_session_id,
+                    expected_source=snapshot,
+                )
+            )
+        ]
+        child = await h.store.load(child_session_id)
+        assert child is not None
+        return snapshot, events, child
+
+    snapshot, events, child = asyncio.run(scenario())
+
+    assert snapshot.source_session_id != private_source_session_id
+    assert snapshot.causal_budget_id != private_causal_budget_id
+    assert expected_alias_field in snapshot.causal_budget_id
+    if requested_causal_budget_id is None:
+        assert snapshot.causal_budget_id == snapshot.source_session_id
+    snapshot_json = snapshot.model_dump_json()
+    assert private_source_session_id not in snapshot_json
+    assert private_causal_budget_id not in snapshot_json
+    assert [event.type for event in events] == [EventType.SESSION_FORKED]
+    assert all(private_source_session_id not in event.model_dump_json() for event in events)
+    assert all(private_causal_budget_id not in event.model_dump_json() for event in events)
+    assert child.parent_session_id == private_source_session_id
+    assert child.causal_budget_id == private_causal_budget_id
+
+
+def test_exact_session_fork_fails_closed_after_source_advances() -> None:
+    h = _build([_batch("checkpoint 14"), _batch("checkpoint 15")])
+    source_session_id = "sess_stale_fork_source"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> None:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        async for _ in h.app.resume(
+            ResumeRequest(
+                session_id=source_session_id,
+                messages=[Message.text("user", "advance trunk")],
+            )
+        ):
+            pass
+        with pytest.raises(SessionRunFenced, match="exact snapshot"):
+            async for _ in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session_id,
+                    session_id="sess_stale_fork_child",
+                    expected_source=source,
+                )
+            ):
+                pass
+
+    asyncio.run(scenario())
+    assert asyncio.run(h.store.load("sess_stale_fork_child")) is None
+
+
+def test_exact_session_fork_atomically_fences_source_incarnation_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("source answer")])
+    source_session_id = "sess_atomic_incarnation_fork_source"
+    child_session_id = "sess_atomic_incarnation_fork_child"
+    _create_resumable_session(h.app, source_session_id)
+
+    async def scenario() -> None:
+        source = await h.app.snapshot_fork_source(source_session_id)
+        create_profiled_fork = h.store.create_profiled_fork
+
+        async def change_incarnation_then_create_fork(**kwargs):
+            async with h.store._lock:
+                current = h.store._sessions[source_session_id]
+                h.store._sessions[source_session_id] = current.model_copy(
+                    update={"instance_id": str(uuid4())}
+                )
+            return await create_profiled_fork(**kwargs)
+
+        monkeypatch.setattr(
+            h.store,
+            "create_profiled_fork",
+            change_incarnation_then_create_fork,
+        )
+        with pytest.raises(SessionRunFenced, match="session incarnation changed"):
+            async for _ in h.app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_session_id,
+                    session_id=child_session_id,
+                    expected_source=source,
+                )
+            ):
+                pass
+
+    asyncio.run(scenario())
+    assert asyncio.run(h.store.load(child_session_id)) is None
+
+
+def test_fork_dispatch_preserves_tool_ceiling_and_interaction_grants() -> None:
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+    provider = FakeProvider([_batch("source answer"), _batch("child answer")])
+    tool = ProfileTool("profile_tool")
+    app = CayuApp(
+        session_store=store,
+        task_store=tasks,
+        dispatcher=dispatcher,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        targeted_tool_mode="call_tool",
+        tools=[tool],
+    )
+
+    async def scenario() -> tuple[DispatchHandle, DispatchHandle | None, str]:
+        source_session_id = "sess_fork_dispatch_controls_source"
+        child_session_id = "sess_fork_dispatch_controls_child"
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=source_session_id,
+                messages=[Message.text("user", "establish checkpoint")],
+            )
+        ):
+            pass
+        source = await app.snapshot_fork_source(source_session_id)
+        ceiling = ToolCapabilityCeiling(tool_names=(tool.spec.name,))
+        grants = (
+            TargetedToolGrant(
+                request_id="fork-dispatch-profile-tool",
+                tool_id="cayu:profile_tool",
+            ),
+        )
+        initial = ResumeRequest(
+            session_id=child_session_id,
+            messages=[Message.text("user", "use the bounded child profile")],
+            tool_capability_ceiling=ceiling,
+            tool_grants=grants,
+        )
+        async for _ in app.fork_session(
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+                expected_source=source,
+                initial_invocation=initial,
+                initial_dispatch_id="dispatch_fork_controls",
+            )
+        ):
+            pass
+        submitted = await app.dispatch(
+            DispatchRequest(
+                session_id=child_session_id,
+                dispatch_id="dispatch_fork_controls",
+                messages=initial.messages,
+                tool_capability_ceiling=initial.tool_capability_ceiling,
+                tool_grants=initial.tool_grants,
+            )
+        )
+        assert (
+            await tasks.claim_task(
+                "revision-40-worker",
+                TaskQuery(type=_DISPATCH_TASK_TYPE),
+                lease_seconds=300,
+            )
+            is None
+        )
+        completed = await dispatcher.process_next(
+            app,
+            worker_id="worker_fork_dispatch_controls",
+        )
+        return submitted, completed, child_session_id
+
+    submitted, completed, child_session_id = asyncio.run(scenario())
+
+    assert submitted.status is DispatchStatus.SUBMITTED
+    assert completed is not None
+    assert completed.status is DispatchStatus.COMPLETED
+    queued = asyncio.run(tasks.load_task(submitted.metadata["queue_task_id"]))
+    assert queued is not None
+    assert queued.type == dispatcher.exact_fork_task_type
+    assert queued.input["dispatch"]["schema_version"] == 4
+    persisted_request = queued.input["dispatch"]["request"]
+    assert persisted_request["tool_capability_ceiling"]["tool_names"] == ["profile_tool"]
+    assert persisted_request["tool_grants"][0]["request_id"] == ("fork-dispatch-profile-tool")
+    grants = asyncio.run(store.list_targeted_tool_grants(child_session_id))
+    assert len(grants) == 1
+    assert grants[0].request_id == "fork-dispatch-profile-tool"
+
+
+def test_queued_dispatch_preserves_authorized_profile_adoption() -> None:
+    class AdoptProfilePolicy(ExecutionProfilePolicy):
+        @property
+        def identity(self) -> str:
+            return "test:dispatch-profile-adoption:v1"
+
+        async def decide(
+            self,
+            request: ExecutionProfilePolicyRequest,
+        ) -> ExecutionProfilePolicyResult:
+            assert request.intent is not None
+            assert request.intent.idempotency_key == "dispatch-upgraded-model"
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The application authorized this child profile.",
+            )
+
+    store = InMemorySessionStore()
+    tasks = InMemoryTaskStore()
+    dispatcher = TaskStoreDispatcher(tasks)
+    provider = FakeProvider([_batch("initial"), _batch("upgraded")])
+    app = CayuApp(
+        session_store=store,
+        task_store=tasks,
+        dispatcher=dispatcher,
+        execution_profile_policy=AdoptProfilePolicy(),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> tuple[DispatchHandle, DispatchHandle | None]:
+        session_id = "sess_dispatch_profile_adoption"
+        async for _ in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "initial")],
+            )
+        ):
+            pass
+        submitted = await app.dispatch(
+            DispatchRequest(
+                session_id=session_id,
+                dispatch_id="dispatch_profile_adoption",
+                messages=[Message.text("user", "use upgraded model")],
+                target=ModelTarget(provider_name="fake", model="upgraded-model"),
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key="dispatch-upgraded-model",
+                    reason="Use the application-approved model.",
+                    requested_by=ResolutionActor(
+                        subject="test-caller",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                ),
+            )
+        )
+        completed = await dispatcher.process_next(
+            app,
+            worker_id="worker_dispatch_profile_adoption",
+        )
+        return submitted, completed
+
+    submitted, completed = asyncio.run(scenario())
+
+    assert submitted.status is DispatchStatus.SUBMITTED
+    assert completed is not None
+    assert completed.status is DispatchStatus.COMPLETED
+    assert provider.requests[-1].model == "upgraded-model"
+    task = asyncio.run(tasks.load_task(submitted.metadata["queue_task_id"]))
+    assert task is not None
+    assert task.type == dispatcher.invocation_control_task_type
+    assert task.input["dispatch"]["schema_version"] == 3
+    assert task.input["dispatch"]["request"]["profile_adoption"]["idempotency_key"] == (
+        "dispatch-upgraded-model"
+    )
+    with pytest.raises(ValueError, match="schema version conflicts"):
+        _QueuedDispatchEnvelope.model_validate({**task.input["dispatch"], "schema_version": 2})
+
+
+@pytest.mark.parametrize("controlled_first", [False, True])
+def test_dispatch_idempotency_spans_protocol_namespaces(controlled_first: bool) -> None:
+    h = _build([_batch("initial"), _batch("queued")])
+    session_id = f"sess_protocol_idempotency_{controlled_first}"
+    dispatch_id = f"dispatch_protocol_idempotency_{controlled_first}"
+    _create_resumable_session(h.app, session_id)
+    compatible = DispatchRequest(
+        session_id=session_id,
+        dispatch_id=dispatch_id,
+        messages=[Message.text("user", "run one durable invocation")],
+    )
+    controlled = compatible.model_copy(
+        update={"tool_capability_ceiling": ToolCapabilityCeiling(tool_names=())},
+        deep=True,
+    )
+    first_request, conflicting_request = (
+        (controlled, compatible) if controlled_first else (compatible, controlled)
+    )
+
+    async def scenario() -> tuple[DispatchHandle, DispatchHandle | None, list[Task]]:
+        submitted = await h.app.dispatch(first_request)
+        with pytest.raises(RuntimeError, match="conflicts with the queued dispatch authority"):
+            await h.app.dispatch(conflicting_request)
+        completed = await h.dispatcher.process_next(
+            h.app,
+            worker_id=f"worker_protocol_idempotency_{controlled_first}",
+        )
+        return submitted, completed, await h.tasks.list_tasks(TaskQuery())
+
+    submitted, completed, tasks = asyncio.run(scenario())
+
+    assert _queued_dispatch_task_id(
+        compatible,
+        task_type=h.dispatcher.task_type,
+    ) == _queued_dispatch_task_id(
+        controlled,
+        task_type=h.dispatcher.invocation_control_task_type,
+    )
+    assert len(tasks) == 1
+    assert tasks[0].id == submitted.metadata["queue_task_id"]
+    assert completed is not None
+    assert completed.status is DispatchStatus.COMPLETED
+    assert len(h.provider.requests) == 2
+
+
 def test_worker_accepts_revision_40_resume_envelope_without_new_default_fields() -> None:
     h = _build([_batch("first answer"), _batch("queued answer")])
     session_id = "sess_prior_revision_40_envelope"
@@ -458,6 +1697,13 @@ def test_worker_accepts_revision_40_resume_envelope_without_new_default_fields()
         persisted = envelope.model_dump(mode="json")
         persisted.pop("operation_kind")
         persisted.pop("prepared_subagent")
+        persisted.pop("exact_fork_source_state_sha256")
+        for field_name in (
+            "tool_capability_ceiling",
+            "tool_grants",
+            "profile_adoption",
+        ):
+            persisted["request"].pop(field_name)
         binding = await h.app.session_invocation_for_dispatch(session_id)
         await h.tasks.create_task(
             task_create_with_runtime_invocation(
@@ -534,6 +1780,13 @@ def test_exact_submit_retry_reuses_one_profile_bound_queue_task() -> None:
     assert second.metadata["idempotent_submission"] is True
     tasks = asyncio.run(h.tasks.list_tasks(TaskQuery(type=_DISPATCH_TASK_TYPE)))
     assert len(tasks) == 1
+    persisted = tasks[0].input["dispatch"]
+    assert persisted["schema_version"] == 2
+    assert not {
+        "tool_capability_ceiling",
+        "tool_grants",
+        "profile_adoption",
+    }.intersection(persisted["request"])
 
     result = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_submit_retry"))
     assert result is not None
@@ -2388,21 +3641,22 @@ def test_sqlite_pruning_retains_terminal_evidence_until_queue_acknowledgement(
         }
         with pytest.raises(ValueError, match="queued dispatch terminal acknowledgement"):
             asyncio.run(sessions.delete_session(session_id))
+        exact_source = asyncio.run(h.app.snapshot_fork_source(session_id))
 
-        async def fork_while_source_receipt_is_retained() -> None:
+        async def fork_from_exact_source(child_session_id: str) -> None:
             async for _ in h.app.fork_session(
                 ForkSessionRequest(
                     source_session_id=session_id,
-                    session_id="sess_queued_terminal_retention_child",
+                    session_id=child_session_id,
                     copy_checkpoint=True,
+                    expected_source=exact_source,
                 )
             ):
                 pass
 
-        asyncio.run(fork_while_source_receipt_is_retained())
-        child_checkpoint = asyncio.run(
-            sessions.load_checkpoint("sess_queued_terminal_retention_child")
-        )
+        retained_receipt_child_id = "sess_queued_terminal_retention_child"
+        asyncio.run(fork_from_exact_source(retained_receipt_child_id))
+        child_checkpoint = asyncio.run(sessions.load_checkpoint(retained_receipt_child_id))
         assert (
             child_checkpoint is None or "queued_dispatch_terminal_receipts" not in child_checkpoint
         )
@@ -2427,6 +3681,16 @@ def test_sqlite_pruning_retains_terminal_evidence_until_queue_acknowledgement(
         assert len(h.provider.requests) == 2
         checkpoint = asyncio.run(sessions.load_checkpoint(session_id))
         assert checkpoint is None or "queued_dispatch_terminal_receipts" not in checkpoint
+
+        # Queue acknowledgement only retires source-owned replay evidence, so the
+        # same exact authority remains valid for a later independent sibling.
+        post_ack_child_id = "sess_queued_terminal_retention_post_ack_child"
+        asyncio.run(fork_from_exact_source(post_ack_child_id))
+        post_ack_checkpoint = asyncio.run(sessions.load_checkpoint(post_ack_child_id))
+        assert (
+            post_ack_checkpoint is None
+            or "queued_dispatch_terminal_receipts" not in post_ack_checkpoint
+        )
     finally:
         asyncio.run(sessions.close())
 
@@ -4186,7 +5450,8 @@ def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:
     [
         "acme.dispatch.prepared-subagent.v1",
         "acme.dispatch.prepared-subagent.v2",
-        "acme.dispatch.fork-group.v1",
+        "acme.dispatch.invocation-controls.v3",
+        "acme.dispatch.exact-fork.v4",
     ],
 )
 def test_dispatch_protocol_task_type_suffixes_are_reserved(task_type: str) -> None:

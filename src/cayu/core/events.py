@@ -109,12 +109,6 @@ class EventType(StrEnum):
     TASK_INTERRUPTED_HANDOFF = "task.interrupted_handoff"
     TASK_COMPLETION_RESULT_RESOLVED = "task.completion_result.resolved"
 
-    FORK_GROUP_CREATED = "fork_group.created"
-    FORK_GROUP_BRANCHES_RUNNING = "fork_group.branches_running"
-    FORK_GROUP_AWAITING_EVALUATION = "fork_group.awaiting_evaluation"
-    FORK_GROUP_COMPLETED = "fork_group.completed"
-    FORK_GROUP_FAILED = "fork_group.failed"
-
     MODEL_STARTED = "model.started"
     MODEL_TEXT_DELTA = "model.text.delta"
     MODEL_THINKING_DELTA = "model.thinking.delta"

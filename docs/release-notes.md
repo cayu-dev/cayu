@@ -168,6 +168,47 @@ generation. Terminal workerless replay requires a receipt-capable task store
 because a store without atomic claimed-worker receipts cannot prove whether the
 cleared terminal owner was direct or elected.
 
+### Session forks are independently dispatchable ordinary sessions
+
+The evaluator-owned `ForkGroup` subsystem, including its API, task namespace,
+events, persistence, evaluator, replacement workflow, dashboard, examples, and
+legacy readers, has been deleted. Applications now snapshot one exact safe
+source, create caller-identified children with frozen first-invocation
+and first-dispatch authority, submit each child through ordinary durable
+dispatch, and consume or
+interrupt each ordinary session independently. Runtime owns exact source and
+profile admission, opaque source-incarnation fencing, bounded authority, retry
+identity, and generic task/session recovery; application code owns grouping,
+evaluation, replacement, and selection. Snapshot rejection detaches transcript
+and checkpoint failures before they cross the public API boundary.
+
+This is a deliberate prerelease breaking replacement with no ForkGroup
+migration or compatibility adapter. The server contract advances from version
+42 to version 43; independently deployed servers, generated clients, and
+dashboards must be upgraded together. Existing saved ForkGroup records are not
+read or migrated.
+
+Default ordinary resume requests retain the revision-40 schema-2 queue wire
+format and base task namespace for rolling-worker handoff. Requests using the
+new tool-ceiling, interaction-grant, or profile-adoption controls use envelope
+schema 3 and a reserved `.invocation-controls.v3` task namespace. Older workers
+do not query that namespace and cannot claim authority they cannot validate;
+current workers fairly consume both generations. Dispatches targeting an exact
+fork child use relationship schema 2, envelope schema 4, and the independent
+`.exact-fork.v4` namespace even when their invocation controls are otherwise
+schema-2-compatible. The envelope binds the child's secret-independent
+source-state commitment, so revision-40 workers cannot claim a child whose
+relationship they cannot parse.
+Each frozen first invocation requires an exact source and one caller-selected
+`initial_dispatch_id` stored in the child relationship and `session.forked`
+evidence. Alternate dispatch IDs, public resume, and inline dispatch cannot race
+or duplicate that first invocation; exact concurrent submissions converge on
+one queue task. Later settled-child interactions remain ordinary resumes.
+Copied recoverable-environment state also retains its authenticated allocation
+owner independently of immediate parent lineage. Multi-generation forks created
+before intermediate execution therefore allocate for the running descendant
+without adopting an ancestor resource, including after ancestor deletion.
+
 ### Evaluated knowledge maintenance gains application-owned automatic authority
 
 Applications may now pass an already-persisted and independently evaluated maintenance
@@ -1753,10 +1794,8 @@ profile through an application policy and an authority-authorized adoption
 intent; the default policy rejects the drift before work. Pre-change serialized
 adoption requests have a different fingerprint and must be resubmitted under
 the new contract. Queued-dispatch envelope authority advances from schema v1 to
-v2, while fork-group operation records and lifecycle event payloads advance
-from schema v2 to v3. Readers accept only the current versions; discard
-pre-change records and recreate disposable prerelease state. No compatibility
-migration is provided.
+v2. Readers accept only the current version; discard pre-change records and
+recreate disposable prerelease state. No compatibility migration is provided.
 
 ### Terminal sessions settle exact model-completion attempts
 
@@ -1920,32 +1959,6 @@ of retrying or heuristically searching for a response. Background storage,
 retention, ZDR, latency, account, model, region, and project-policy tradeoffs are
 documented in `cayu guide providers` and must be accepted explicitly by enabling
 the provider option.
-
-### Fork groups can execute through durable task dispatch
-
-Fork groups can now opt into `execution_mode="task-dispatch"`. Branch,
-replacement, and tool-free evaluator invocations are linked to deterministic
-`TaskStoreDispatcher` tasks before they become claimable, and ordinary workers
-provide leases, heartbeats, reclaim, cancellation, and terminal settlement.
-Fresh coordinators reconstruct the durable graph across in-memory, SQLite, and
-PostgreSQL stores. Workers reject missing links, changed envelopes, stale group
-authority, and execution-profile drift before provider or tool work.
-Task-backed attempts use the reserved `<task_type>.fork-group.v1` queue
-namespace. Workers from before this release do not claim that namespace, so a
-rolling deployment installs the new workers first and enables task-backed fork
-groups only after their worker pool is ready.
-Read-only SDK inspection, a protected bounded server route, `cayu session
-fork-group`, and the packaged task-detail view expose group recovery, attempt,
-task, lease, run-epoch, profile, and terminal state without prompt or output
-bodies.
-
-Fork-group operation records advance to schema version 3. This prerelease
-format intentionally rejects schema-v2 records rather than guessing missing
-task-dispatch authority. Drain or inspect existing fork groups before upgrade,
-or recreate the prerelease store. Mixed coordinator access to schema-v2 and
-schema-v3 records remains unsupported; the versioned worker namespace prevents
-that prerelease record boundary from granting old workers new execution
-authority.
 
 ### Bounded cross-source recall preserves exact evidence and authority
 
@@ -2174,25 +2187,6 @@ arguments and appends a provider-valid error result. Compact snapshot authority
 survives ordinary tool-round recovery and approval or user-input interruption,
 while exposed calls continue through every existing authorization and execution
 control.
-
-### Bounded fork groups are durable public runtime operations
-
-`CayuApp.run_fork_group(...)` now freezes one terminal source checkpoint and
-execution profile, runs 2-16 caller-named sibling sessions under bounded
-parallelism and one causal budget, applies registered deterministic gates, and
-admits only bounded allow-listed evidence to a tool-free evaluator. Lifecycle,
-branch evidence, one validated selection, failures, and exact-request replay
-are durable across in-memory, SQLite, and PostgreSQL session stores. Version 1
-fails the group if any sibling or gate fails while preserving every branch for
-inspection.
-Atomic source digests prevent same-epoch source drift while siblings are being
-created. Revision-fenced lifecycle publication prevents stale coordinators from
-replacing a terminal result, reconciles lost commit acknowledgements, and sends
-nonterminal child sessions through ordinary Cayu recovery after process loss.
-One renewable store-backed execution claim prevents applications sharing a
-store from concurrently resuming the same group. The tool-free evaluator's
-exact execution profile is frozen before durable admission, and extension
-failures are recorded only through bounded, secret-redacted diagnostics.
 
 ### Workspace mutation attribution is explicit and fail-closed
 

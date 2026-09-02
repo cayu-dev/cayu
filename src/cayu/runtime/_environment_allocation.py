@@ -15,6 +15,9 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
 )
+from cayu._validation import (
+    require_durable_clean_nonblank as require_clean_nonblank,
+)
 from cayu.environments import (
     EnvironmentAllocationContext,
     EnvironmentAllocationIntent,
@@ -27,7 +30,12 @@ from cayu.runtime._diagnostics import (
     _attach_runtime_exception_payload,
     _runtime_exception_payload,
 )
-from cayu.runtime.sessions import CheckpointTransform, Session, SessionStore
+from cayu.runtime.sessions import (
+    CheckpointTransform,
+    Session,
+    SessionStore,
+    session_fork_profile_relationship,
+)
 from cayu.vaults import SecretRedactor
 
 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
@@ -41,6 +49,64 @@ _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
 )
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
+
+
+def environment_allocation_parent_session_id(session: Session) -> str | None:
+    """Return authenticated lineage even after a fork source row is deleted."""
+
+    if type(session) is not Session:
+        raise TypeError("Environment allocation lineage requires a Session.")
+    relationship = session_fork_profile_relationship(session)
+    if relationship is not None:
+        return relationship.source_session_id
+    return session.parent_session_id
+
+
+def environment_allocation_source_owner_session_id(
+    session: Session,
+    *,
+    environment_name: str,
+) -> str | None:
+    """Return the authenticated owner of copied state for one environment."""
+
+    if type(session) is not Session:
+        raise TypeError("Environment allocation ownership requires a Session.")
+    environment_name = require_clean_nonblank(environment_name, "environment_name")
+    relationship = session_fork_profile_relationship(session)
+    if relationship is None:
+        return session.parent_session_id
+    return next(
+        (
+            owner.owner_session_id
+            for owner in relationship.source_environment_allocation_owners
+            if owner.environment_name == environment_name
+        ),
+        None,
+    )
+
+
+def require_authorized_environment_allocation_owners(
+    session: Session,
+    owners_by_environment: Mapping[str, str],
+) -> None:
+    """Reject checkpoint owners outside each environment's immutable lineage."""
+
+    if type(session) is not Session:
+        raise TypeError("Environment allocation ownership requires a Session.")
+    if not isinstance(owners_by_environment, Mapping):
+        raise TypeError("Environment allocation owners must be a mapping.")
+    for environment_name, owner_session_id in owners_by_environment.items():
+        environment_name = require_clean_nonblank(environment_name, "environment_name")
+        owner_session_id = require_clean_nonblank(owner_session_id, "owner_session_id")
+        inherited_owner_session_id = environment_allocation_source_owner_session_id(
+            session,
+            environment_name=environment_name,
+        )
+        if owner_session_id != session.id and owner_session_id != inherited_owner_session_id:
+            raise ValueError(
+                "Environment allocation checkpoint owner conflicts with immutable "
+                f"session lineage for environment {environment_name!r}."
+            )
 
 
 @dataclass(frozen=True)
@@ -247,13 +313,14 @@ class EnvironmentAllocationCoordinator:
         self,
         *,
         session_id: str,
-        parent_session_id: str | None,
+        inherited_owner_session_id: str | None,
         environment_name: str,
         scope: EnvironmentAllocationScope,
         existing: EnvironmentAllocationRecord | None,
     ) -> DurableEnvironmentAllocationContext:
         if existing is None or (
-            parent_session_id is not None and existing.intent.session_id == parent_session_id
+            inherited_owner_session_id is not None
+            and existing.intent.session_id == inherited_owner_session_id
         ):
             intent = EnvironmentAllocationIntent(
                 allocation_id=f"ealloc_{uuid4().hex}",
@@ -999,6 +1066,66 @@ def allocation_receipt_from_checkpoint(
     return EnvironmentAllocationReceipt.from_payload(payload)
 
 
+def environment_allocation_owners_from_checkpoint(
+    checkpoint: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Resolve every allocation owner carried by one fork checkpoint."""
+
+    if checkpoint is None:
+        return {}
+    records = checkpoint_object_map(
+        checkpoint,
+        ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
+    )
+    receipts = checkpoint_object_map(
+        checkpoint,
+        ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+    )
+    owner_state = checkpoint_object_map(
+        checkpoint,
+        ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+    )
+    reconnect_state = checkpoint_object_map(
+        checkpoint,
+        ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+    )
+    duplicate_environments = records.keys() & receipts.keys()
+    if duplicate_environments:
+        raise ValueError(
+            "Environment allocation checkpoint contains both a pending intent and a receipt."
+        )
+    owners: dict[str, str] = {}
+    environment_names = sorted(
+        require_clean_nonblank(environment_name, "environment_name")
+        for environment_name in records.keys() | receipts.keys()
+    )
+    for environment_name in environment_names:
+        if environment_name in records:
+            record_payload = records[environment_name]
+            if type(record_payload) is not dict:
+                raise ValueError("Environment allocation record must be an object.")
+            record = EnvironmentAllocationRecord.from_payload(record_payload)
+            if record.intent.environment_name != environment_name:
+                raise ValueError("Environment allocation intent conflicts with its checkpoint key.")
+            owners[environment_name] = record.intent.session_id
+            continue
+        if environment_name not in receipts:
+            raise AssertionError("Environment allocation owner discovery lost its state.")
+        receipt_payload = receipts[environment_name]
+        if type(receipt_payload) is not dict:
+            raise ValueError("Environment allocation receipt must be an object.")
+        receipt = EnvironmentAllocationReceipt.from_payload(receipt_payload)
+        if receipt.intent.environment_name != environment_name:
+            raise ValueError("Environment allocation receipt conflicts with its checkpoint key.")
+        if (
+            owner_state.get(environment_name) != receipt.intent.session_id
+            or reconnect_state.get(environment_name) != receipt.reconnect_metadata
+        ):
+            raise ValueError("Environment allocation receipt has inconsistent ownership state.")
+        owners[environment_name] = receipt.intent.session_id
+    return owners
+
+
 def _publication_payload_matches(
     checkpoint: Mapping[str, Any],
     *,
@@ -1051,10 +1178,14 @@ def _is_inherited_parent_receipt(
     receipt: EnvironmentAllocationReceipt,
     desired: EnvironmentAllocationRecord,
 ) -> bool:
+    source_owner_session_id = environment_allocation_source_owner_session_id(
+        session,
+        environment_name=environment_name,
+    )
     if (
         desired.state is not EnvironmentAllocationState.PREPARED
-        or session.parent_session_id is None
-        or receipt.intent.session_id != session.parent_session_id
+        or source_owner_session_id is None
+        or receipt.intent.session_id != source_owner_session_id
         or receipt.intent.environment_name != environment_name
     ):
         return False
@@ -1080,12 +1211,16 @@ def _is_inherited_parent_record(
     desired: EnvironmentAllocationRecord,
     expected: EnvironmentAllocationRecord | None,
 ) -> bool:
+    source_owner_session_id = environment_allocation_source_owner_session_id(
+        session,
+        environment_name=environment_name,
+    )
     return (
         expected is None
         and existing is not None
         and desired.state is EnvironmentAllocationState.PREPARED
-        and session.parent_session_id is not None
-        and existing.intent.session_id == session.parent_session_id
+        and source_owner_session_id is not None
+        and existing.intent.session_id == source_owner_session_id
         and existing.intent.environment_name == environment_name
     )
 

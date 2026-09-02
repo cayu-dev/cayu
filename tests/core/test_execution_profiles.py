@@ -176,6 +176,7 @@ from cayu.runtime.build_provenance import (
     RuntimeBuildProvenanceOrigin,
 )
 from cayu.runtime.egress_authority_transitions import (
+    EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY,
     _build_transition_record,
     _find_parked_egress_authority_allocation,
     _park_egress_authority_allocation,
@@ -3402,6 +3403,25 @@ def test_policy_can_automatically_adopt_exact_egress_narrowing() -> None:
             event.type for event in await store.load_events(session_id)
         }
         assert EventType.SESSION_COMPLETED in {event.type for event in emitted}
+        transition = await SessionCheckpointEgressAuthorityTransitionStore(store).load(session_id)
+        assert transition is not None
+        assert transition.state is EgressAuthorityTransitionState.ACTIVE
+
+        child_id = "execution-profile-automatic-egress-narrowing-child"
+        source_snapshot = await candidate_app.snapshot_fork_source(session_id)
+        fork_events = await _collect(
+            candidate_app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=session_id,
+                    session_id=child_id,
+                    expected_source=source_snapshot,
+                )
+            )
+        )
+        assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
+        child_checkpoint = await store.load_checkpoint(child_id)
+        assert child_checkpoint is not None
+        assert EGRESS_AUTHORITY_TRANSITION_CHECKPOINT_KEY not in child_checkpoint
 
     asyncio.run(exercise())
 
@@ -6674,6 +6694,20 @@ def test_egress_profile_admission_rejects_transition_changed_after_backend_proof
         assert transition is not None
         assert transition.state is EgressAuthorityTransitionState.AUTHORIZED
         assert transition.target_authority.generation == 3
+
+        with pytest.raises(RuntimeError, match="transition is not settled"):
+            await app.snapshot_fork_source(session_id)
+        child_id = "execution-profile-egress-unsettled-fork-child"
+        with pytest.raises(EgressAuthorityTransitionConflict, match="transition is not settled"):
+            await _collect(
+                app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=session_id,
+                        session_id=child_id,
+                    )
+                )
+            )
+        assert await store.load(child_id) is None
 
     asyncio.run(exercise())
 

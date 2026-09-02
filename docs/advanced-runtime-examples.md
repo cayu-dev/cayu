@@ -15,20 +15,21 @@ For commands, source locations, and contributor guidance, start with the
 
 ## Six executable product stories
 
-### Freeze and evaluate one bounded population
+### Consume independent session forks as they settle
 
-The [bounded fork-group example](../examples/bounded_fork_group/) invokes
-`CayuApp.run_fork_group(...)` directly. It freezes one completed source,
-executes two caller-named sibling sessions under bounded parallelism and a
-shared causal budget, runs an application-owned deterministic contract gate,
-and admits only bounded structured evidence to a tool-free evaluator. The
-judgment covers both branches and selects exactly one.
+The [asynchronous session forks example](../examples/asynchronous_session_forks/)
+captures one exact trunk checkpoint, creates caller-named children from that
+same authority, and admits each first invocation through ordinary durable task
+dispatch. The trunk advances while workers run. The application consumes the
+first completed child immediately, later observes another completion, and
+interrupts a third without affecting its siblings.
 
-The scenario then repeats the same normalized request. Success requires Cayu
-to reconstruct the terminal result and immutable dispositions without another
-model completion. This is the version-1 all-branches-viable path: it does not
-claim failed-sibling evaluation, replacement, distributed dispatch, or
-workspace promotion.
+The deterministic tracer reconstructs producers and workers at controlled
+durability boundaries and proves idempotent fork and dispatch retries. Its
+selection step is ordinary application code: it reads settled child
+transcripts, starts an ordinary evaluator session, and records the selected
+session. Cayu owns no join, quorum, evaluator, replacement, or selection
+policy.
 
 ### Refresh a provider cache, then compact only the checkpoint delta
 

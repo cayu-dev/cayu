@@ -27,7 +27,7 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.sessions import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
-    FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY,
+    FORK_SOURCE_SNAPSHOT_METADATA_KEY,
     MODEL_TARGET_PROJECTION_METADATA_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     CompactSessionRequest,
@@ -403,6 +403,7 @@ def prepare_fork_session_request(
     *,
     redactor: SecretRedactor,
     store_resolved_source_session_id: str | None = None,
+    store_resolved_expected_source_causal_budget_id: str | None = None,
 ) -> ForkSessionRequest:
     request = copy_fork_session_request(request)
     try:
@@ -422,6 +423,33 @@ def prepare_fork_session_request(
                 field_name=field_name,
                 redactor=redactor,
             )
+        require_secret_free_session_authority(
+            request.initial_dispatch_id,
+            field_name="initial_dispatch_id",
+            redactor=redactor,
+            authority_kind="durable dispatch authority",
+        )
+        expected_source = request.expected_source
+        if expected_source is not None:
+            for field_name, value in (
+                ("expected_source.source_session_id", expected_source.source_session_id),
+                ("expected_source.causal_budget_id", expected_source.causal_budget_id),
+            ):
+                require_store_resolved_or_secret_free_session_authority(
+                    value,
+                    store_resolved_value=(
+                        store_resolved_source_session_id
+                        if field_name.endswith("source_session_id")
+                        else store_resolved_expected_source_causal_budget_id
+                    ),
+                    field_name=field_name,
+                    redactor=redactor,
+                )
+        initial_invocation = (
+            None
+            if request.initial_invocation is None
+            else prepare_resume_request(request.initial_invocation, redactor=redactor)
+        )
         profile_adoption = request.profile_adoption
         if profile_adoption is not None:
             require_secret_free_session_authority(
@@ -451,6 +479,7 @@ def prepare_fork_session_request(
                     redactor=redactor,
                 ),
                 "profile_adoption": profile_adoption,
+                "initial_invocation": initial_invocation,
             },
         )
     except ForkAuthorityError:
@@ -465,6 +494,7 @@ def prepare_fork_session_request_with_identity(
     redactor: SecretRedactor,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
     store_resolved_source_session_id: str | None = None,
+    store_resolved_expected_source_causal_budget_id: str | None = None,
 ) -> PreparedForkSessionRequest:
     """Prepare a fork while binding replay to the complete raw request.
 
@@ -485,12 +515,6 @@ def prepare_fork_session_request_with_identity(
             mode="json",
             warnings=False,
         )
-        initial_invocation = raw_request._fork_group_initial_invocation
-        if initial_invocation is not None:
-            request_document = {
-                "request": request_document,
-                "fork_group_initial_invocation_sha256": (initial_invocation.request_sha256),
-            }
         material = canonical_durable_json_bytes(
             request_document,
             "fork_session_request",
@@ -507,6 +531,9 @@ def prepare_fork_session_request_with_identity(
             raw_request,
             redactor=redactor,
             store_resolved_source_session_id=store_resolved_source_session_id,
+            store_resolved_expected_source_causal_budget_id=(
+                store_resolved_expected_source_causal_budget_id
+            ),
         )
         return PreparedForkSessionRequest(
             request=prepared,
@@ -556,7 +583,7 @@ def _require_secret_free_fork_policy_metadata(
         (MODEL_TARGET_PROJECTION_METADATA_KEY, "model-target"),
         (PROMPT_ANATOMY_TRANSITION_METADATA_KEY, "prompt-transition"),
         (FORK_EXECUTION_PROFILE_METADATA_KEY, "fork-profile"),
-        (FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY, "fork-group source"),
+        (FORK_SOURCE_SNAPSHOT_METADATA_KEY, "fork source"),
         (EXECUTION_PROFILE_METADATA_KEY, "execution-profile"),
     ):
         if key in metadata:

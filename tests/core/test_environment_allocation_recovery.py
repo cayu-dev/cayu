@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 from uuid import uuid4
@@ -25,14 +25,21 @@ from cayu import (
     Event,
     EventQuery,
     EventType,
+    ExecutionProfileAdoptionIntent,
+    ForkExecutionProfileSelection,
+    ForkSessionRequest,
     InMemorySessionStore,
     Message,
     PostgresSessionStore,
+    ResolutionActor,
+    ResolutionActorSource,
+    ResumeRequest,
     RunRequest,
     SessionIdentity,
     SessionStore,
     SQLiteSessionStore,
 )
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime._environment_allocation import (
     EnvironmentAllocationCoordinator,
     EnvironmentAllocationReceipt,
@@ -45,7 +52,18 @@ from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
 )
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, project_runtime_event
-from cayu.runtime.sessions import CheckpointTransform, Session
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
+)
+from cayu.runtime.sessions import (
+    CheckpointTransform,
+    Session,
+    session_fork_profile_relationship,
+)
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import SecretRedactor
 
@@ -153,6 +171,35 @@ class _FakeRemoteProvider:
         del self.resources[resource_name]
 
 
+class _CompletingModelProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _AllowProfileAdoption(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "test:allow-environment-profile-adoption:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        del request
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="Exercise environment changes across independently dispatchable forks.",
+            authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+        )
+
+
 class _FakeRemoteFactory(EnvironmentFactory):
     def __init__(
         self,
@@ -167,6 +214,7 @@ class _FakeRemoteFactory(EnvironmentFactory):
         scope_adapter_generation: str = _ADAPTER_GENERATION,
     ) -> None:
         self._provider = provider
+        self.requests: list[EnvironmentFactoryRequest] = []
         self._crash_at = crash_at
         self._provider_metadata = provider_metadata
         self._recovery_entered = recovery_entered
@@ -191,6 +239,7 @@ class _FakeRemoteFactory(EnvironmentFactory):
         request: EnvironmentFactoryRequest,
         allocation: EnvironmentAllocationContext,
     ) -> EnvironmentFactoryResult:
+        self.requests.append(request)
         if self._crash_at == "before_intent":
             raise _SimulatedProcessDeath("before durable allocation intent")
 
@@ -262,6 +311,7 @@ class _FakeRemoteFactory(EnvironmentFactory):
         return self._result(request, resource, allocation=allocation)
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.requests.append(request)
         if request.operation is not EnvironmentFactoryOperation.RECONNECT:
             raise RuntimeError("Fake remote creation requires a durable allocation context.")
         resource_name = request.reconnect_metadata.get("resource_name")
@@ -817,14 +867,14 @@ def test_reaping_fence_recovers_cleanup_crash_windows(
             assert record is not None
             allocation = coordinator.context(
                 session_id=session.id,
-                parent_session_id=None,
+                inherited_owner_session_id=None,
                 environment_name=_ENVIRONMENT_NAME,
                 scope=record.intent.scope,
                 existing=record,
             )
             stale_publisher = coordinator.context(
                 session_id=session.id,
-                parent_session_id=None,
+                inherited_owner_session_id=None,
                 environment_name=_ENVIRONMENT_NAME,
                 scope=record.intent.scope,
                 existing=record,
@@ -896,7 +946,7 @@ def test_reaping_fence_reconstructs_lost_store_acknowledgement() -> None:
         assert record is not None
         allocation = coordinator.context(
             session_id=session.id,
-            parent_session_id=None,
+            inherited_owner_session_id=None,
             environment_name=_ENVIRONMENT_NAME,
             scope=record.intent.scope,
             existing=record,
@@ -1111,6 +1161,466 @@ def test_fork_replaces_only_its_copied_parent_allocation_receipt() -> None:
             ]
             == parent_receipt
         )
+
+    asyncio.run(run())
+
+
+def test_detached_fork_replaces_inherited_allocation_from_immutable_lineage() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        allocation_provider = _FakeRemoteProvider()
+        factory = _FakeRemoteFactory(allocation_provider)
+        model_provider = _CompletingModelProvider()
+        source_id = "detached-allocation-source"
+        child_id = "detached-allocation-child"
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(model_provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name=_ENVIRONMENT_NAME),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="agent", model="fake-model"))
+
+        source_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="agent",
+                    session_id=source_id,
+                    messages=[Message.text("user", "create the source allocation")],
+                )
+            )
+        ]
+        assert EventType.SESSION_COMPLETED in {event.type for event in source_events}
+        source_snapshot = await app.snapshot_fork_source(source_id)
+        fork_events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=child_id,
+                    expected_source=source_snapshot,
+                )
+            )
+        ]
+        assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
+
+        await store.delete_session(source_id)
+        detached_child = await store.load(child_id)
+        assert detached_child is not None
+        assert detached_child.parent_session_id is None
+
+        child_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=child_id,
+                    messages=[Message.text("user", "continue independently")],
+                )
+            )
+        ]
+        assert EventType.ENVIRONMENT_FACTORY_COMPLETED in {event.type for event in child_events}
+        assert EventType.SESSION_COMPLETED in {event.type for event in child_events}
+        assert EventType.ENVIRONMENT_FACTORY_FAILED not in {event.type for event in child_events}
+        assert len(factory.requests) == 2
+        assert factory.requests[1].operation is EnvironmentFactoryOperation.CREATE
+        assert factory.requests[1].parent_session_id == source_id
+        assert len(allocation_provider.create_calls) == 2
+        assert len(model_provider.requests) == 2
+        child_checkpoint = await store.load_checkpoint(child_id)
+        assert child_checkpoint is not None
+        child_receipt = child_checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY][
+            _ENVIRONMENT_NAME
+        ]
+        assert child_receipt["intent"]["session_id"] == child_id
+
+    asyncio.run(run())
+
+
+def test_nested_detached_fork_replaces_inherited_ancestor_allocation() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        allocation_provider = _FakeRemoteProvider()
+        factory = _FakeRemoteFactory(allocation_provider)
+        model_provider = _CompletingModelProvider()
+        source_id = "nested-allocation-source"
+        child_id = "nested-allocation-child"
+        grandchild_id = "nested-allocation-grandchild"
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(model_provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name=_ENVIRONMENT_NAME),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="agent", model="fake-model"))
+
+        source_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="agent",
+                    session_id=source_id,
+                    messages=[Message.text("user", "create the source allocation")],
+                )
+            )
+        ]
+        assert EventType.SESSION_COMPLETED in {event.type for event in source_events}
+
+        source_snapshot = await app.snapshot_fork_source(source_id)
+        _ = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=child_id,
+                    expected_source=source_snapshot,
+                )
+            )
+        ]
+        await store.delete_session(source_id)
+        child = await store.load(child_id)
+        assert child is not None
+        assert child.parent_session_id is None
+
+        child_snapshot = await app.snapshot_fork_source(child_id)
+        _ = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=child_id,
+                    session_id=grandchild_id,
+                    expected_source=child_snapshot,
+                )
+            )
+        ]
+        await store.delete_session(child_id)
+        grandchild = await store.load(grandchild_id)
+        assert grandchild is not None
+        assert grandchild.parent_session_id is None
+        relationship = session_fork_profile_relationship(grandchild)
+        assert relationship is not None
+        assert relationship.schema_version == 2
+        assert relationship.source_session_id == child_id
+        assert {
+            owner.environment_name: owner.owner_session_id
+            for owner in relationship.source_environment_allocation_owners
+        } == {_ENVIRONMENT_NAME: source_id}
+
+        grandchild_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=grandchild_id,
+                    messages=[Message.text("user", "continue the nested fork")],
+                )
+            )
+        ]
+        assert EventType.ENVIRONMENT_FACTORY_COMPLETED in {
+            event.type for event in grandchild_events
+        }
+        assert EventType.SESSION_COMPLETED in {event.type for event in grandchild_events}
+        assert EventType.ENVIRONMENT_FACTORY_FAILED not in {
+            event.type for event in grandchild_events
+        }
+        assert len(factory.requests) == 2
+        assert factory.requests[1].operation is EnvironmentFactoryOperation.CREATE
+        assert factory.requests[1].parent_session_id == child_id
+        assert len(allocation_provider.create_calls) == 2
+        assert len(model_provider.requests) == 2
+        grandchild_checkpoint = await store.load_checkpoint(grandchild_id)
+        assert grandchild_checkpoint is not None
+        grandchild_receipt = grandchild_checkpoint[
+            ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY
+        ][_ENVIRONMENT_NAME]
+        assert grandchild_receipt["intent"]["session_id"] == grandchild_id
+
+    asyncio.run(run())
+
+
+def test_nested_forks_preserve_allocation_owners_for_each_environment() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        allocation_provider = _FakeRemoteProvider()
+        model_provider = _CompletingModelProvider()
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=_AllowProfileAdoption(),
+            enable_logging=False,
+        )
+        app.register_provider(model_provider, default=True)
+        for index, environment_name in enumerate(("env-one", "env-two", "env-three")):
+            app.register_environment_factory(
+                EnvironmentSpec(name=environment_name),
+                _FakeRemoteFactory(allocation_provider),
+                default=index == 0,
+            )
+        app.register_agent(AgentSpec(name="agent", model="fake-model"))
+
+        async def fork_into(
+            source_session_id: str,
+            child_session_id: str,
+            environment_name: str,
+        ) -> None:
+            snapshot = await app.snapshot_fork_source(source_session_id)
+            events = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source_session_id,
+                        session_id=child_session_id,
+                        environment_name=environment_name,
+                        execution_profile_selection=(ForkExecutionProfileSelection.CURRENT_CHILD),
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key=f"adopt-{child_session_id}",
+                            reason="Exercise a multi-environment allocation lineage.",
+                            requested_by=ResolutionActor(
+                                subject="test-caller",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                        expected_source=snapshot,
+                    )
+                )
+            ]
+            assert EventType.SESSION_FORKED in {event.type for event in events}
+
+        source_id = "multi-environment-allocation-source"
+        first_child_id = "multi-environment-allocation-first-child"
+        second_child_id = "multi-environment-allocation-second-child"
+        third_child_id = "multi-environment-allocation-third-child"
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="agent",
+                    session_id=source_id,
+                    environment_name="env-one",
+                    messages=[Message.text("user", "allocate the first environment")],
+                )
+            )
+        ]
+        await fork_into(source_id, first_child_id, "env-two")
+        _ = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=first_child_id,
+                    messages=[Message.text("user", "allocate the second environment")],
+                )
+            )
+        ]
+        await fork_into(first_child_id, second_child_id, "env-three")
+
+        second_child = await store.load(second_child_id)
+        assert second_child is not None
+        second_relationship = session_fork_profile_relationship(second_child)
+        assert second_relationship is not None
+        assert {
+            owner.environment_name: owner.owner_session_id
+            for owner in second_relationship.source_environment_allocation_owners
+        } == {
+            "env-one": source_id,
+            "env-two": first_child_id,
+        }
+
+        await fork_into(second_child_id, third_child_id, "env-one")
+        third_child = await store.load(third_child_id)
+        assert third_child is not None
+        third_relationship = session_fork_profile_relationship(third_child)
+        assert third_relationship is not None
+        assert {
+            owner.environment_name: owner.owner_session_id
+            for owner in third_relationship.source_environment_allocation_owners
+        } == {
+            "env-one": source_id,
+            "env-two": first_child_id,
+        }
+
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=third_child_id,
+                    messages=[Message.text("user", "replace only the first allocation")],
+                )
+            )
+        ]
+        assert EventType.SESSION_COMPLETED in {event.type for event in resumed}
+        assert EventType.ENVIRONMENT_FACTORY_FAILED not in {event.type for event in resumed}
+        checkpoint = await store.load_checkpoint(third_child_id)
+        assert checkpoint is not None
+        receipts = checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY]
+        assert {
+            environment_name: receipt["intent"]["session_id"]
+            for environment_name, receipt in receipts.items()
+        } == {
+            "env-one": third_child_id,
+            "env-two": first_child_id,
+        }
+
+    asyncio.run(run())
+
+
+def test_nested_fork_replaces_inherited_ancestor_pending_allocation() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        allocation_provider = _FakeRemoteProvider()
+        factory = _FakeRemoteFactory(allocation_provider)
+        model_provider = _CompletingModelProvider()
+        source_id = "nested-pending-allocation-source"
+        child_id = "nested-pending-allocation-child"
+        grandchild_id = "nested-pending-allocation-grandchild"
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(model_provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name=_ENVIRONMENT_NAME),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="agent", model="fake-model"))
+
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="agent",
+                    session_id=source_id,
+                    messages=[Message.text("user", "create the source allocation")],
+                )
+            )
+        ]
+        source_checkpoint = await store.load_checkpoint(source_id)
+        assert source_checkpoint is not None
+        source_receipt = EnvironmentAllocationReceipt.from_payload(
+            source_checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY][
+                _ENVIRONMENT_NAME
+            ]
+        )
+        pending = EnvironmentAllocationRecord(
+            intent=source_receipt.intent,
+            state=EnvironmentAllocationState.ACKNOWLEDGED,
+            reconnect_metadata=source_receipt.reconnect_metadata,
+        )
+        source_checkpoint.pop(ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY)
+        source_checkpoint.pop(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
+        source_checkpoint.pop(ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
+        source_checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY] = {
+            _ENVIRONMENT_NAME: pending.to_payload()
+        }
+        await store.checkpoint(source_id, source_checkpoint)
+
+        _ = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=child_id,
+                )
+            )
+        ]
+        grandchild_fork_events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=child_id,
+                    session_id=grandchild_id,
+                )
+            )
+        ]
+        assert [event.type for event in grandchild_fork_events] == [EventType.SESSION_FORKED]
+        assert "source_environment_allocation_owners" not in grandchild_fork_events[0].payload
+        grandchild = await store.load(grandchild_id)
+        assert grandchild is not None
+        relationship = session_fork_profile_relationship(grandchild)
+        assert relationship is not None
+        assert relationship.schema_version == 1
+        assert relationship.source_session_id == child_id
+        assert {
+            owner.environment_name: owner.owner_session_id
+            for owner in relationship.source_environment_allocation_owners
+        } == {_ENVIRONMENT_NAME: source_id}
+        await store.delete_session(source_id)
+        await store.delete_session(child_id)
+
+        grandchild_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=grandchild_id,
+                    messages=[Message.text("user", "continue the nested fork")],
+                )
+            )
+        ]
+        assert EventType.ENVIRONMENT_FACTORY_COMPLETED in {
+            event.type for event in grandchild_events
+        }
+        assert EventType.SESSION_COMPLETED in {event.type for event in grandchild_events}
+        assert EventType.ENVIRONMENT_FACTORY_FAILED not in {
+            event.type for event in grandchild_events
+        }
+        assert len(allocation_provider.create_calls) == 2
+        assert allocation_provider.reap_calls == []
+        grandchild_checkpoint = await store.load_checkpoint(grandchild_id)
+        assert grandchild_checkpoint is not None
+        assert (
+            grandchild_checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY][
+                _ENVIRONMENT_NAME
+            ]["intent"]["session_id"]
+            == grandchild_id
+        )
+
+    asyncio.run(run())
+
+
+def test_fork_rejects_allocation_owner_outside_immutable_lineage() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        allocation_provider = _FakeRemoteProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_CompletingModelProvider(), default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name=_ENVIRONMENT_NAME),
+            _FakeRemoteFactory(allocation_provider),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="agent", model="fake-model"))
+        source_id = "foreign-allocation-owner-source"
+        child_id = "foreign-allocation-owner-child"
+
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="agent",
+                    session_id=source_id,
+                    messages=[Message.text("user", "create the source allocation")],
+                )
+            )
+        ]
+        checkpoint = await store.load_checkpoint(source_id)
+        assert checkpoint is not None
+        forged_owner_id = "unrelated-allocation-owner"
+        forged_receipt = checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY][
+            _ENVIRONMENT_NAME
+        ]
+        forged_receipt["intent"]["session_id"] = forged_owner_id
+        checkpoint[ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY][_ENVIRONMENT_NAME] = (
+            forged_owner_id
+        )
+        await store.checkpoint(source_id, checkpoint)
+
+        with pytest.raises(ValueError, match="immutable session lineage"):
+            async for _ in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=child_id,
+                )
+            ):
+                pass
+        assert await store.load(child_id) is None
+        assert len(allocation_provider.create_calls) == 1
 
     asyncio.run(run())
 
@@ -1495,7 +2005,7 @@ def test_late_duplicate_acknowledgement_reconstructs_already_published_receipt()
         contexts = [
             coordinator.context(
                 session_id=session.id,
-                parent_session_id=None,
+                inherited_owner_session_id=None,
                 environment_name=_ENVIRONMENT_NAME,
                 scope=scope,
                 existing=record,
@@ -1815,7 +2325,7 @@ def test_allocation_acknowledgement_rejects_a_non_object_without_advancing_state
         assert record is not None
         allocation = coordinator.context(
             session_id=session.id,
-            parent_session_id=None,
+            inherited_owner_session_id=None,
             environment_name=_ENVIRONMENT_NAME,
             scope=record.intent.scope,
             existing=record,

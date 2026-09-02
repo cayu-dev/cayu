@@ -263,7 +263,6 @@ from cayu.runtime.costs import (
 )
 from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
-from cayu.runtime.fork_groups import ForkGroupConflict, ForkGroupResult
 from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
@@ -394,7 +393,6 @@ from cayu.server.contracts import (
     TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
     USAGE_ROLLUP_ENDPOINT_RESPONSES,
     AgentsResponse,
-    ApiForkGroupDetail,
     ApiInteractionSummary,
     ApiReviewedKnowledgeEntry,
     ApiSession,
@@ -3737,49 +3735,6 @@ def _serialize_task_retry_series(cayu_app: Any, task: Task) -> dict[str, Any]:
     )
 
 
-def _serialize_task_fork_group_link(cayu_app: Any, task: Task) -> dict[str, str] | None:
-    """Project durable task linkage without reusing redacted task input as authority."""
-
-    dispatch = task.input.get("dispatch")
-    if type(dispatch) is not dict:
-        return None
-    request = dispatch.get("request")
-    if type(request) is not dict:
-        return None
-    metadata = request.get("metadata")
-    if type(metadata) is not dict:
-        return None
-    linkage = metadata.get("fork_group_dispatch")
-    if (
-        type(linkage) is not dict
-        or linkage.get("record_type") != "cayu.fork-group-dispatch"
-        or linkage.get("schema_version") != 1
-    ):
-        return None
-    source_session_id = linkage.get("source_session_id")
-    group_id = linkage.get("group_id")
-    if type(source_session_id) is not str or type(group_id) is not str:
-        return None
-    try:
-        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
-        group_id = require_clean_nonblank(group_id, "group_id")
-    except ValueError:
-        return None
-    if len(source_session_id) > 512 or len(group_id) > 256:
-        return None
-    projected_group_id = _redact_control_plane_json(
-        cayu_app,
-        group_id,
-        "task.fork_group.group_id",
-    )
-    if projected_group_id != group_id:
-        return None
-    return {
-        "source_session_id": cayu_app.project_session_id_for_exposure(source_session_id),
-        "group_id": group_id,
-    }
-
-
 def _serialize_task_detail(cayu_app: Any, task: Task) -> dict[str, Any]:
     return {
         **_serialize_task_list_item(cayu_app, task),
@@ -3806,7 +3761,6 @@ def _serialize_task_detail(cayu_app: Any, task: Task) -> dict[str, Any]:
             ),
             "source": task.invocation.source.value,
         },
-        "fork_group": _serialize_task_fork_group_link(cayu_app, task),
         "input": _redact_control_plane_json(cayu_app, task.input, "task.input"),
         "result": _redact_control_plane_json(cayu_app, task.result, "task.result"),
         "error": _redact_control_plane_json(cayu_app, task.error, "task.error"),
@@ -3816,159 +3770,6 @@ def _serialize_task_detail(cayu_app: Any, task: Task) -> dict[str, Any]:
             "task.metadata",
         ),
         "started_at": task.started_at.isoformat() if task.started_at else None,
-    }
-
-
-def _fork_group_recovery_status(result: ForkGroupResult) -> str:
-    if result.state.value in {"completed", "failed"}:
-        return "terminal"
-    statuses = [attempt.task_status for attempt in result.dispatch_attempts]
-    if any(status in {TaskStatus.CLAIMED, TaskStatus.RUNNING} for status in statuses):
-        return "workers-active"
-    if any(status is TaskStatus.PENDING for status in statuses):
-        return "workers-pending"
-    held = {TaskStatus.PAUSED, TaskStatus.BLOCKED, TaskStatus.NEEDS_ATTENTION}
-    if (
-        statuses
-        and any(status in held for status in statuses)
-        and all(
-            status in held
-            or status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
-            for status in statuses
-        )
-    ):
-        return "workers-held"
-    terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
-    if statuses and all(status in terminal for status in statuses):
-        return "attachment-required"
-    return "coordinator-required"
-
-
-def _serialize_fork_group_detail(cayu_app: Any, result: ForkGroupResult) -> dict[str, Any]:
-    selected = next(
-        (item for item in result.dispositions if item.disposition.value == "selected"),
-        None,
-    )
-    attempts = []
-    for attempt in result.dispatch_attempts:
-        attempts.append(
-            {
-                "kind": attempt.kind.value,
-                "branch_id": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.branch_id,
-                    "fork_group.attempt.branch_id",
-                ),
-                "attempt_id": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.attempt_id,
-                    "fork_group.attempt.attempt_id",
-                ),
-                "attempt_index": attempt.attempt_index,
-                "replaced_attempt_id": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.replaced_attempt_id,
-                    "fork_group.attempt.replaced_attempt_id",
-                ),
-                "attempt_request_sha256": attempt.attempt_request_sha256,
-                "session_id": cayu_app.project_session_id_for_exposure(attempt.session_id),
-                "task_id": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.queue_task_id,
-                    "fork_group.attempt.task_id",
-                ),
-                "task_type": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.queue_task_type,
-                    "fork_group.attempt.task_type",
-                ),
-                "dispatch_id": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.dispatch_id,
-                    "fork_group.attempt.dispatch_id",
-                ),
-                "dispatch_operation_id": attempt.dispatch_operation_id,
-                "dispatch_request_sha256": attempt.dispatch_request_sha256,
-                "terminal_event_id": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.terminal_event_id,
-                    "fork_group.attempt.terminal_event_id",
-                ),
-                "idempotency_key": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.idempotency_key,
-                    "fork_group.attempt.idempotency_key",
-                ),
-                "source_checkpoint_sha256": attempt.source_checkpoint_sha256,
-                "causal_budget_id": cayu_app.project_causal_budget_id_for_exposure(
-                    attempt.causal_budget_id,
-                    session_ids=(result.source.source_session_id, attempt.session_id),
-                ),
-                "execution_profile_fingerprint": attempt.execution_profile_fingerprint,
-                "task_status": (None if attempt.task_status is None else attempt.task_status.value),
-                "dispatch_status": (
-                    None if attempt.dispatch_status is None else attempt.dispatch_status.value
-                ),
-                "run_epoch": attempt.run_epoch,
-                "lease_owner": _redact_control_plane_json(
-                    cayu_app,
-                    attempt.lease_owner,
-                    "fork_group.attempt.lease_owner",
-                ),
-                "lease_expires_at": (
-                    None
-                    if attempt.lease_expires_at is None
-                    else attempt.lease_expires_at.isoformat()
-                ),
-            }
-        )
-    return {
-        "schema_version": 1,
-        "group_id": _redact_control_plane_json(
-            cayu_app,
-            result.group_id,
-            "fork_group.group_id",
-        ),
-        "source_session_id": result.source.source_session_id,
-        "source_checkpoint_sha256": result.source.checkpoint_sha256,
-        "causal_budget_id": cayu_app.project_causal_budget_id_for_exposure(
-            result.source.causal_budget_id,
-            session_ids=(result.source.source_session_id,),
-        ),
-        "execution_mode": result.execution_mode.value,
-        "state": result.state.value,
-        "terminal": result.state.value in {"completed", "failed"},
-        "recovery_status": _fork_group_recovery_status(result),
-        "replayed": result.replayed,
-        "attempts": attempts,
-        "failure_code": None if result.failure is None else result.failure.code.value,
-        "failure_branch_id": (
-            None
-            if result.failure is None
-            else _redact_control_plane_json(
-                cayu_app,
-                result.failure.branch_id,
-                "fork_group.failure.branch_id",
-            )
-        ),
-        "selected_branch_id": (
-            None
-            if selected is None
-            else _redact_control_plane_json(
-                cayu_app,
-                selected.branch_id,
-                "fork_group.selected.branch_id",
-            )
-        ),
-        "selected_attempt_id": (
-            None
-            if selected is None
-            else _redact_control_plane_json(
-                cayu_app,
-                selected.attempt_id,
-                "fork_group.selected.attempt_id",
-            )
-        ),
     }
 
 
@@ -11374,28 +11175,6 @@ def create_router(
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _serialize_session(cayu_app, session)
-
-    @router.get(
-        "/sessions/{session_id}/fork-groups/{group_id}",
-        response_model=ApiForkGroupDetail,
-        dependencies=protected,
-    )
-    async def get_fork_group(
-        session_id: NonBlankString,
-        group_id: NonBlankString,
-    ):
-        try:
-            result = await cayu_app.inspect_fork_group(session_id, group_id)
-        except ForkGroupConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Fork group not found: {group_id}",
-            )
-        return _serialize_fork_group_detail(cayu_app, result)
 
     @router.get("/tasks", response_model=list[ApiTaskListItem], dependencies=protected)
     async def list_tasks(

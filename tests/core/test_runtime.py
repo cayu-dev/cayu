@@ -275,6 +275,8 @@ from cayu.runtime._model_errors import (
 from cayu.runtime._session_engine import _require_native_structured_output_support
 from cayu.runtime.budgets import budget_settlement_id
 from cayu.runtime.checkpoints import (
+    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -17119,6 +17121,26 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
     assert child.tool_capability_ceiling == ToolCapabilityCeiling(tool_names=())
     assert child_provider.requests[0].tools == []
 
+    child_event_ids_before_parent_delete = [
+        event.id for event in asyncio.run(child_store.load_events(child.id))
+    ]
+    asyncio.run(source_store.delete_session(source.id))
+    detached_child = asyncio.run(child_store.load(child.id))
+    assert detached_child is not None
+    assert detached_child.parent_session_id is None
+    detached_replay = asyncio.run(collect_fork_events(child_app, fork_request))
+    assert [event.id for event in detached_replay] == [event.id for event in first_events]
+    assert [event.id for event in asyncio.run(child_store.load_events(child.id))] == (
+        child_event_ids_before_parent_delete
+    )
+    with pytest.raises(RuntimeError, match="conflicts with the exact profiled request"):
+        asyncio.run(
+            collect_fork_events(
+                child_app,
+                fork_request.model_copy(update={"metadata": {"request": "different"}}),
+            )
+        )
+
 
 def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -> None:
     class CrashAfterForkStore(InMemorySessionStore):
@@ -22009,6 +22031,107 @@ def test_fork_does_not_inherit_source_result_event_publication_reservation() -> 
     assert COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY in source_checkpoint
     assert child_checkpoint is not None
     assert COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY not in child_checkpoint
+
+
+@pytest.mark.parametrize(
+    "source_owned_key",
+    (
+        "session_operations",
+        "session_run_operation",
+        "queued_dispatch_terminal_receipts",
+        "prompt_anatomy_transition_intents",
+        COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+        ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+        INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
+        model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+        AUTOMATIC_RECALL_CHECKPOINT_KEY,
+    ),
+)
+def test_fork_source_checkpoint_digest_ignores_source_owned_runtime_state(
+    source_owned_key: str,
+) -> None:
+    from cayu.runtime._fork_source_snapshot import (
+        fork_source_checkpoint_projection,
+        fork_source_checkpoint_sha256,
+    )
+
+    child_state = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "application_checkpoint": 14,
+    }
+
+    source_state = {**child_state, source_owned_key: {"source_owned": True}}
+
+    assert fork_source_checkpoint_projection(source_state) == child_state
+    assert fork_source_checkpoint_sha256(source_state) == fork_source_checkpoint_sha256(child_state)
+
+
+def test_pending_terminal_interruption_blocks_fork_snapshot_and_publication() -> None:
+    async def run() -> tuple[Session | None, Session | None, dict[str, Any] | None]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        source_session_id = "sess_pending_terminal_interruption_fork_guard"
+        child_session_id = "sess_pending_terminal_interruption_fork"
+        await store.create(
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                session_id=source_session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        await store.update_status(source_session_id, SessionStatus.INTERRUPTED)
+        interrupt_payload = {
+            "reason": "operator interruption lost its terminal acknowledgement",
+            "metadata": {"owner": "source"},
+            "interruption_type": "operator_requested",
+            "interruption_request_id": "source-interruption-request",
+        }
+        await store.checkpoint(
+            source_session_id,
+            {"pending_session_interrupt": interrupt_payload},
+        )
+
+        rejection = "incomplete terminal interruption evidence"
+        with pytest.raises(RuntimeError, match=rejection):
+            await app.snapshot_fork_source(source_session_id)
+        with pytest.raises(RuntimeError, match=rejection):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source_session_id,
+                        session_id=child_session_id,
+                    )
+                )
+            ]
+
+        return (
+            await store.load(source_session_id),
+            await store.load(child_session_id),
+            await store.load_checkpoint(source_session_id),
+        )
+
+    source, child, checkpoint = asyncio.run(run())
+
+    assert source is not None
+    assert source.status is SessionStatus.INTERRUPTED
+    assert child is None
+    assert checkpoint == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "pending_session_interrupt": {
+            "reason": "operator interruption lost its terminal acknowledgement",
+            "metadata": {"owner": "source"},
+            "interruption_type": "operator_requested",
+            "interruption_request_id": "source-interruption-request",
+        },
+    }
 
 
 def test_pending_interruption_cascade_blocks_resume_and_fork():

@@ -190,6 +190,12 @@ an explicit durable transition of its own; ordinary reconnect cannot overwrite
 the immutable allocation receipt. A fork that inherits such a receipt cannot
 downgrade to an ordinary factory create; the factory must retain its recoverable
 scope and atomically replace only the fork's copied ownership state.
+The immutable fork relationship records the actual owner of copied state whenever
+it differs from immediate lineage; exact forks always bind it as part of their
+source evidence. The owner may be an earlier ancestor when several forks are
+created before any intermediate child runs. Each descendant still receives its
+immediate source as `parent_session_id`, while allocation replacement remains
+bound to the recorded owner after either source row is deleted.
 
 Every custom `SandboxEgressAdapter` must explicitly set
 `process_external_allocation` to `True` or `False`. Leaving it undeclared fails

@@ -675,170 +675,6 @@ export type ApiExecutionTopologyEdge = {
 };
 
 /**
- * ApiForkGroupAttemptStatus
- *
- * Bounded queue and ownership projection for one durable group attempt.
- */
-export type ApiForkGroupAttemptStatus = {
-    /**
-     * Attempt Id
-     */
-    attempt_id: string;
-    /**
-     * Attempt Index
-     */
-    attempt_index: number;
-    /**
-     * Attempt Request Sha256
-     */
-    attempt_request_sha256: string;
-    /**
-     * Branch Id
-     */
-    branch_id?: string | null;
-    /**
-     * Causal Budget Id
-     */
-    causal_budget_id: string;
-    /**
-     * Dispatch Id
-     */
-    dispatch_id: string;
-    /**
-     * Dispatch Operation Id
-     */
-    dispatch_operation_id: string;
-    /**
-     * Dispatch Request Sha256
-     */
-    dispatch_request_sha256: string;
-    /**
-     * Dispatch Status
-     */
-    dispatch_status: 'submitted' | 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | null;
-    /**
-     * Execution Profile Fingerprint
-     */
-    execution_profile_fingerprint: string;
-    /**
-     * Idempotency Key
-     */
-    idempotency_key: string;
-    /**
-     * Kind
-     */
-    kind: 'branch' | 'replacement' | 'evaluator';
-    /**
-     * Lease Expires At
-     */
-    lease_expires_at?: string | null;
-    /**
-     * Lease Owner
-     */
-    lease_owner?: string | null;
-    /**
-     * Replaced Attempt Id
-     */
-    replaced_attempt_id?: string | null;
-    /**
-     * Run Epoch
-     */
-    run_epoch?: number | null;
-    /**
-     * Session Id
-     */
-    session_id: string;
-    /**
-     * Source Checkpoint Sha256
-     */
-    source_checkpoint_sha256: string;
-    /**
-     * Task Id
-     */
-    task_id: string;
-    /**
-     * Task Status
-     */
-    task_status: 'pending' | 'claimed' | 'running' | 'paused' | 'blocked' | 'needs_attention' | 'completed' | 'failed' | 'cancelled' | null;
-    /**
-     * Task Type
-     */
-    task_type: string;
-    /**
-     * Terminal Event Id
-     */
-    terminal_event_id: string;
-};
-
-/**
- * ApiForkGroupDetail
- *
- * Read-only group state without branch output or evaluator judgment bodies.
- */
-export type ApiForkGroupDetail = {
-    /**
-     * Attempts
-     */
-    attempts: Array<ApiForkGroupAttemptStatus>;
-    /**
-     * Causal Budget Id
-     */
-    causal_budget_id: string;
-    /**
-     * Execution Mode
-     */
-    execution_mode: 'in-process' | 'task-dispatch';
-    /**
-     * Failure Branch Id
-     */
-    failure_branch_id?: string | null;
-    /**
-     * Failure Code
-     */
-    failure_code?: string | null;
-    /**
-     * Group Id
-     */
-    group_id: string;
-    /**
-     * Recovery Status
-     */
-    recovery_status: 'coordinator-required' | 'workers-pending' | 'workers-active' | 'workers-held' | 'attachment-required' | 'terminal';
-    /**
-     * Replayed
-     */
-    replayed: boolean;
-    /**
-     * Schema Version
-     */
-    schema_version: 1;
-    /**
-     * Selected Attempt Id
-     */
-    selected_attempt_id?: string | null;
-    /**
-     * Selected Branch Id
-     */
-    selected_branch_id?: string | null;
-    /**
-     * Source Checkpoint Sha256
-     */
-    source_checkpoint_sha256: string;
-    /**
-     * Source Session Id
-     */
-    source_session_id: string;
-    /**
-     * State
-     */
-    state: 'created' | 'branches-running' | 'awaiting-evaluation' | 'completed' | 'failed';
-    /**
-     * Terminal
-     */
-    terminal: boolean;
-};
-
-/**
  * ApiInteractionSummary
  */
 export type ApiInteractionSummary = {
@@ -1699,7 +1535,6 @@ export type ApiTaskDetail = {
     error: {
         [key: string]: unknown;
     } | null;
-    fork_group: ApiTaskForkGroupLink | null;
     /**
      * Id
      */
@@ -1770,22 +1605,6 @@ export type ApiTaskDetail = {
      * Worker Id
      */
     worker_id: string | null;
-};
-
-/**
- * ApiTaskForkGroupLink
- *
- * Public, routable linkage from a queue task to its durable fork group.
- */
-export type ApiTaskForkGroupLink = {
-    /**
-     * Group Id
-     */
-    group_id: string;
-    /**
-     * Source Session Id
-     */
-    source_session_id: string;
 };
 
 /**
@@ -20297,40 +20116,6 @@ export type ListSessionEventsApiSessionsSessionIdEventsGetResponses = {
 };
 
 export type ListSessionEventsApiSessionsSessionIdEventsGetResponse = ListSessionEventsApiSessionsSessionIdEventsGetResponses[keyof ListSessionEventsApiSessionsSessionIdEventsGetResponses];
-
-export type GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetData = {
-    body?: never;
-    path: {
-        /**
-         * Session Id
-         */
-        session_id: string;
-        /**
-         * Group Id
-         */
-        group_id: string;
-    };
-    query?: never;
-    url: '/api/sessions/{session_id}/fork-groups/{group_id}';
-};
-
-export type GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetError = GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetErrors[keyof GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetErrors];
-
-export type GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetResponses = {
-    /**
-     * Successful Response
-     */
-    200: ApiForkGroupDetail;
-};
-
-export type GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetResponse = GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetResponses[keyof GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetResponses];
 
 export type ListSessionInteractionsApiSessionsSessionIdInteractionsGetData = {
     body?: never;

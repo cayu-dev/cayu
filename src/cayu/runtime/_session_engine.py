@@ -158,6 +158,10 @@ from cayu.runtime._durable_subagents import (
     durable_subagent_worker_incompatible,
     is_durable_subagent_submission_unsettled,
 )
+from cayu.runtime._environment_allocation import (
+    environment_allocation_owners_from_checkpoint,
+    require_authorized_environment_allocation_owners,
+)
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
@@ -170,7 +174,10 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
 )
-from cayu.runtime._fork_source_snapshot import fork_source_checkpoint_sha256
+from cayu.runtime._fork_source_snapshot import (
+    fork_source_checkpoint_sha256,
+    strip_source_owned_fork_checkpoint_state,
+)
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
@@ -331,7 +338,6 @@ from cayu.runtime.budgets import (
 from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.checkpoints import (
     AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY,
-    AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -382,6 +388,7 @@ from cayu.runtime.egress_authority_transitions import (
     _require_parked_egress_authority_allocation,
     require_egress_authority_transition_compatible_with_profile,
     require_exact_egress_authority_transition,
+    require_forkable_egress_authority_transition,
 )
 from cayu.runtime.errors import (
     TerminalEventPublicationUncertain,
@@ -496,8 +503,10 @@ from cayu.runtime.sessions import (
     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION,
     FORK_EXECUTION_PROFILE_METADATA_KEY,
-    FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY,
+    FORK_EXECUTION_PROFILE_ORDINARY_SCHEMA_VERSION,
+    FORK_SOURCE_SNAPSHOT_METADATA_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
@@ -535,6 +544,7 @@ from cayu.runtime.sessions import (
     RuntimePublicationRequest,
     Session,
     SessionForkActiveModelStageConflict,
+    SessionForkEnvironmentAllocationOwner,
     SessionForkProfileRelationship,
     SessionForkSourceNotFound,
     SessionIdentity,
@@ -568,7 +578,8 @@ from cayu.runtime.sessions import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
-    _fork_group_initial_invocation_request_sha256,
+    _fork_initial_invocation_request_sha256,
+    _fork_source_session_instance_fingerprint,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
@@ -595,6 +606,8 @@ from cayu.runtime.sessions import (
     copy_session_runtime_identity,
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
+    fork_source_state_sha256,
+    fork_source_transcript_sha256,
     model_completion_stage_settlement_request,
     queued_session_message_input,
     run_request_authority_is_runtime_generated,
@@ -802,7 +815,7 @@ def _validate_fork_source_checkpoint_state(
     clock: Callable[[], datetime],
     redactor: SecretRedactor,
 ) -> dict[str, Any] | None:
-    """Reject source state that no direct or grouped fork may inherit."""
+    """Reject source state that no direct session fork may inherit."""
 
     claim_now = clock()
     recovery_claim = _incomplete_recovery_claim_from_checkpoint(source_checkpoint)
@@ -824,6 +837,25 @@ def _validate_fork_source_checkpoint_state(
     active_operation_id = _active_session_operation_id(source_checkpoint)
     if active_operation_id is not None:
         raise RuntimeError(f"Session has an active durable operation: {active_operation_id}")
+    _reject_pending_provider_operation_disposition(source_checkpoint)
+    _, source_profile, _ = session_request_boundary.prepare_fork_source_execution_profile(
+        current_source,
+        source_checkpoint,
+    )
+    require_forkable_egress_authority_transition(
+        source_checkpoint,
+        session_id=current_source.id,
+        environment_name=current_source.environment_name,
+        profile_authority=source_profile.egress_authority,
+    )
+    if (
+        source_checkpoint is not None
+        and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in source_checkpoint
+    ):
+        raise RuntimeError(
+            "Session has incomplete terminal interruption evidence. "
+            "Recover the session before forking it."
+        )
     if current_source.status == SessionStatus.INTERRUPTED and not copy_checkpoint:
         raise ValueError("Interrupted sessions cannot be forked without checkpoint state.")
     if current_source.status == SessionStatus.INTERRUPTED and source_checkpoint is None:
@@ -1626,13 +1658,28 @@ def _fork_event_with_runtime_authority(event: Event) -> Event:
     if "initial_invocation_request_sha256" in event.payload:
         payload_fields.extend(
             (
+                "initial_dispatch_id",
                 "initial_invocation_request_sha256",
                 "initial_invocation_profile_fingerprint",
             )
         )
-    return event_with_runtime_payload_authority(
+    if "source_checkpoint_sha256" in event.payload:
+        payload_fields.extend(
+            (
+                "source_instance_fingerprint",
+                "source_transcript_sha256",
+                "source_checkpoint_sha256",
+                "source_execution_profile_fingerprint",
+            )
+        )
+    event = event_with_runtime_payload_authority(
         event_with_runtime_envelope_authority(event, "session_id"),
         *payload_fields,
+    )
+    return event_with_runtime_nested_payload_authority(
+        event,
+        ("source_environment_allocation_owners", "*", "environment_name"),
+        ("source_environment_allocation_owners", "*", "owner_session_id"),
     )
 
 
@@ -3499,8 +3546,7 @@ _TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = "cayu:tool-capability-ceiling-narro
 _MODEL_TARGET_AND_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = (
     "cayu:model-target-and-tool-capability-ceiling-adoption:v1"
 )
-_FORK_GROUP_INITIAL_PROFILE_POLICY_ID = "cayu:fork-group-initial-invocation:v1"
-_FORK_GROUP_TASK_EVALUATOR_PROFILE_POLICY_ID = "cayu:fork-group-task-evaluator:v1"
+_FORK_INITIAL_PROFILE_POLICY_ID = "cayu:fork-initial-invocation:v1"
 _MODEL_TARGET_BUILT_IN_COMPONENTS = frozenset(
     {
         ExecutionProfileComponentClass.PROVIDER_ADAPTER,
@@ -3530,11 +3576,50 @@ def _model_target_and_tool_capability_ceiling_profile_actor() -> ResolutionActor
     )
 
 
-def _fork_group_initial_profile_actor() -> ResolutionActor:
+def _fork_initial_profile_actor() -> ResolutionActor:
     return ResolutionActor(
-        subject="cayu:fork-group-initial-invocation",
+        subject="cayu:fork-initial-invocation",
         source=ResolutionActorSource.SYSTEM,
     )
+
+
+def _require_exact_fork_initial_invocation_profile(
+    session: Session,
+    request: ResumeRequest,
+    *,
+    queued_dispatch_id: str | None,
+) -> ExecutionProfileIdentity | None:
+    """Authenticate the dispatch-only first invocation frozen with an exact fork."""
+
+    relationship = session_fork_profile_relationship(session)
+    if (
+        session.run_epoch != 0
+        or relationship is None
+        or relationship.initial_invocation_request_sha256 is None
+    ):
+        return None
+    if queued_dispatch_id is None:
+        raise SessionRunFenced(
+            "Session fork first invocation must enter through its exact durable dispatch."
+        )
+    queued_dispatch_id = require_clean_nonblank(
+        queued_dispatch_id,
+        "queued_dispatch_id",
+    )
+    if relationship.initial_dispatch_id != queued_dispatch_id:
+        raise SessionRunFenced(
+            "Session fork first invocation dispatch identity does not match the exact fork."
+        )
+    if relationship.initial_invocation_request_sha256 != (
+        _fork_initial_invocation_request_sha256(request)
+    ):
+        raise SessionRunFenced(
+            "Session fork first invocation does not match the exact request frozen "
+            "before child publication."
+        )
+    if relationship.initial_invocation_profile is None:  # pragma: no cover - model invariant
+        raise RuntimeError("Session fork first invocation lost its execution profile.")
+    return relationship.initial_invocation_profile
 
 
 def _execution_profile_policy_actor(policy_identity: str) -> ResolutionActor:
@@ -5068,6 +5153,28 @@ class SessionEngine:
             raise TypeError("Queued dispatch source profile has an invalid type.")
         if type(request) is not DispatchRequest:
             raise TypeError("Queued dispatch profile resolution requires a DispatchRequest.")
+        initial_profile: ExecutionProfileIdentity | None = None
+        if session.run_epoch == 0:
+            initial_profile = _require_exact_fork_initial_invocation_profile(
+                session,
+                ResumeRequest(
+                    session_id=request.session_id,
+                    messages=request.messages,
+                    target=request.target,
+                    tool_capability_ceiling=request.tool_capability_ceiling,
+                    tool_grants=request.tool_grants,
+                    profile_adoption=request.profile_adoption,
+                    metadata=request.metadata,
+                    max_steps=request.max_steps,
+                    limits=request.limits,
+                    budget_limits=request.budget_limits,
+                    retry_policy=request.retry_policy,
+                    structured_output=request.structured_output,
+                    thinking=request.thinking,
+                    loop_policies=request.loop_policies,
+                ),
+                queued_dispatch_id=request.dispatch_id,
+            )
         target = request.target or ModelTarget(
             provider_name=session.provider_name,
             model=session.model,
@@ -5102,8 +5209,10 @@ class SessionEngine:
             max_steps=request.max_steps,
             limits=request.limits,
             retry_policy=self._effective_retry_policy(request.retry_policy),
-            tool_capability_ceiling=_session_tool_capability_ceiling(
-                session,
+            tool_capability_ceiling=resolve_tool_capability_ceiling(
+                request.tool_capability_ceiling,
+                registered_agent.tool_capabilities,
+                maximum=_session_tool_capability_ceiling(session),
             ),
         )
         candidate = execution_profile_with_component(
@@ -5115,29 +5224,18 @@ class SessionEngine:
                 candidate,
                 source_profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
             )
-        relationship = session_fork_profile_relationship(session)
-        if (
-            session.run_epoch == 0
-            and relationship is not None
-            and relationship.initial_invocation_profile is not None
-        ):
-            initial_request = ResumeRequest(
-                session_id=request.session_id,
-                messages=request.messages,
-                target=request.target,
-                metadata=request.metadata,
-                max_steps=request.max_steps,
-                limits=request.limits,
-                budget_limits=request.budget_limits,
-                retry_policy=request.retry_policy,
-                structured_output=request.structured_output,
-                thinking=request.thinking,
-                loop_policies=request.loop_policies,
-            )
-            if relationship.initial_invocation_request_sha256 == (
-                _fork_group_initial_invocation_request_sha256(initial_request)
-            ):
-                return relationship.initial_invocation_profile
+        if initial_profile is not None:
+            if candidate != initial_profile:
+                raise ExecutionProfileMismatchError(
+                    session_id=session.id,
+                    expected_profile_fingerprint=initial_profile.fingerprint,
+                    candidate_profile_fingerprint=candidate.fingerprint,
+                    changed_component_classes=changed_execution_profile_components(
+                        initial_profile,
+                        candidate,
+                    ),
+                )
+            return initial_profile
         return candidate
 
     async def validate_execution_profile_continuation(
@@ -10108,7 +10206,7 @@ class SessionEngine:
         source: Session,
         checkpoint: dict[str, Any] | None,
     ) -> None:
-        """Apply direct-fork source-state rules before a group owns authority."""
+        """Apply source-state rules before an independent child is published."""
 
         if source.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
@@ -15892,6 +15990,7 @@ class SessionEngine:
         run_operation_id: str | None = None,
         terminal_event_id: str | None = None,
         queue_task_id: str | None = None,
+        queued_dispatch_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         # Resume profile admission and the resumed dispatch must observe one
         # application-budget snapshot even if the app configuration is changed
@@ -15931,6 +16030,10 @@ class SessionEngine:
             raise ValueError("A terminal event identity requires a session run operation.")
         if queue_task_id is not None and terminal_event_id is None:
             raise ValueError("A queue task identity requires a terminal event identity.")
+        if (queued_dispatch_id is None) != (run_operation_id is None):
+            raise ValueError(
+                "A queued dispatch identity requires a session run operation and vice versa."
+            )
         (
             requires_completion_decision,
             admission_failure,
@@ -15976,6 +16079,11 @@ class SessionEngine:
             != required_session_instance_fingerprint
         ):
             raise RuntimeError("Queued dispatch target session instance changed.")
+        fork_initial_profile = _require_exact_fork_initial_invocation_profile(
+            loaded_session,
+            request,
+            queued_dispatch_id=queued_dispatch_id,
+        )
         for field_name in (
             "agent_name",
             "provider_name",
@@ -16504,34 +16612,36 @@ class SessionEngine:
                 expected_execution_profile,
                 candidate_execution_profile,
             )
-            fork_relationship = session_fork_profile_relationship(loaded_session)
-            exact_fork_group_initial_invocation = (
-                loaded_session.run_epoch == 0
-                and request.profile_adoption is None
-                and fork_relationship is not None
-                and fork_relationship.initial_invocation_request_sha256
-                == _fork_group_initial_invocation_request_sha256(request)
-                and fork_relationship.initial_invocation_profile == candidate_execution_profile
-            )
-            if exact_fork_group_initial_invocation and changed_profile_components:
+            if (
+                fork_initial_profile is not None
+                and fork_initial_profile != candidate_execution_profile
+            ):
+                raise ExecutionProfileMismatchError(
+                    session_id=loaded_session.id,
+                    expected_profile_fingerprint=fork_initial_profile.fingerprint,
+                    candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
+                    changed_component_classes=changed_execution_profile_components(
+                        fork_initial_profile,
+                        candidate_execution_profile,
+                    ),
+                )
+            if fork_initial_profile is not None and changed_profile_components:
                 execution_profile_decision = _execution_profile_decision_event(
                     session=loaded_session,
                     expected_profile=expected_execution_profile,
                     candidate_profile=candidate_execution_profile,
                     changed_component_classes=changed_profile_components,
                     kind=ExecutionProfileDecisionKind.ADOPTED,
-                    policy_identity=_FORK_GROUP_INITIAL_PROFILE_POLICY_ID,
+                    policy_identity=_FORK_INITIAL_PROFILE_POLICY_ID,
                     policy_reason=(
-                        "The exact invocation was frozen with the durable fork-group "
-                        "branch before child creation."
+                        "The exact invocation was frozen with the durable session fork "
+                        "before child creation."
                     ),
                     authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
                     intent=None,
                     adoption_request_fingerprint=None,
-                    fallback_actor=_fork_group_initial_profile_actor(),
-                    fallback_reason=(
-                        "Apply the runtime-owned initial fork-group branch invocation."
-                    ),
+                    fallback_actor=_fork_initial_profile_actor(),
+                    fallback_reason=("Apply the exact invocation admitted with the session fork."),
                     clock=self._clock,
                 )
             else:
@@ -17483,21 +17593,6 @@ class SessionEngine:
             )
         ):
             raise ValueError("Fork request replay identity is invalid.")
-        source_session = await self.session_store.load(request.source_session_id)
-        if source_session is None:
-            raise session_request_boundary.ForkSourceNotFoundError(
-                "Fork source session was not found."
-            ) from None
-        try:
-            source_session = session_request_boundary.prepare_fork_source_session(
-                source_session,
-                expected_source_session_id=request.source_session_id,
-                store_resolved_source_session_id=store_resolved_source_session_id,
-                redactor=self._secret_redactor,
-            )
-        except ValueError:
-            del source_session
-            raise
         fork_request_sha256 = request_sha256
         runtime_generated_session_id: str | None = None
         destination_session_id = request.session_id
@@ -17510,7 +17605,7 @@ class SessionEngine:
             ).hexdigest()
             runtime_generated_session_id = generate_child_session_id(
                 kind=ChildSessionKind.SESSION_FORK,
-                parent_session_id=source_session.id,
+                parent_session_id=request.source_session_id,
                 logical_spawn_id=logical_fork_id,
             )
             destination_session_id = runtime_generated_session_id
@@ -17528,8 +17623,14 @@ class SessionEngine:
                 if (
                     malformed_relationship
                     or relationship is None
-                    or relationship.source_session_id != source_session.id
+                    or relationship.source_session_id != request.source_session_id
                     or relationship.request_sha256 not in accepted_request_sha256s
+                    or relationship.source_state_sha256
+                    != (
+                        None
+                        if request.expected_source is None
+                        else fork_source_state_sha256(request.expected_source)
+                    )
                 ):
                     existing_descendant = None
                     relationship = None
@@ -17570,40 +17671,72 @@ class SessionEngine:
                     if request.system_prompt_policy is ForkSystemPromptPolicy.CURRENT_AGENT
                     else None
                 )
-                # Exact replay is still an ordinary fork entrance. Atomically
-                # admit the source immediately before checkpoint repair or
-                # public delivery so a concurrently attached work contract
-                # cannot be weakened by replaying an uncontracted descendant.
-                await self._require_ordinary_session_execution(
-                    source_session.id,
-                    admit_session=True,
-                )
                 if succession is not None:
-
-                    def reconcile_surviving_intent(
-                        _current_source: Session,
-                        source_checkpoint: dict[str, Any] | None,
-                    ) -> dict[str, Any] | None:
-                        if source_checkpoint is None:
-                            return None
-                        updated = copy_json_value(source_checkpoint, "checkpoint")
-                        intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
-                            updated,
-                            required=False,
-                        )
-                        if intent_ledger.complete_from_receipt(
-                            succession.receipt,
-                            descendant_created_at=existing_descendant.created_at,
-                            completed_at=self._clock(),
-                        ):
-                            intent_ledger.store_in(updated)
-                        return updated
-
-                    await self.session_store.publish_checkpoint_and_events(
-                        source_session.id,
-                        checkpoint_transform=reconcile_surviving_intent,
-                        events=[],
+                    surviving_source = await self.session_store.load(request.source_session_id)
+                    source_checkpoint = (
+                        None
+                        if surviving_source is None
+                        else await self.session_store.load_checkpoint(request.source_session_id)
                     )
+                    intent_requires_completion = False
+                    try:
+                        if source_checkpoint is not None:
+                            intent_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+                                source_checkpoint,
+                                required=False,
+                            )
+                            intent_requires_completion = intent_ledger.complete_from_receipt(
+                                succession.receipt,
+                                descendant_created_at=existing_descendant.created_at,
+                                completed_at=self._clock(),
+                            )
+                    finally:
+                        if type(source_checkpoint) is dict:
+                            source_checkpoint.clear()
+                        source_checkpoint = None
+                        surviving_source = None
+
+                    if intent_requires_completion:
+                        # A crash may leave the source intent prepared after the
+                        # child commit. Repair that source-owned state when the
+                        # original parent survives; an already completed intent
+                        # and a deleted parent require no source admission.
+                        await self._require_ordinary_session_execution(
+                            request.source_session_id,
+                            admit_session=True,
+                        )
+
+                        def reconcile_surviving_intent(
+                            _current_source: Session,
+                            current_checkpoint: dict[str, Any] | None,
+                        ) -> dict[str, Any] | None:
+                            if current_checkpoint is None:
+                                return None
+                            updated = copy_json_value(current_checkpoint, "checkpoint")
+                            current_ledger = _PromptTransitionIntentLedger.from_checkpoint(
+                                updated,
+                                required=False,
+                            )
+                            if current_ledger.complete_from_receipt(
+                                succession.receipt,
+                                descendant_created_at=existing_descendant.created_at,
+                                completed_at=self._clock(),
+                            ):
+                                current_ledger.store_in(updated)
+                            return updated
+
+                        try:
+                            await self.session_store.publish_checkpoint_and_events(
+                                request.source_session_id,
+                                checkpoint_transform=reconcile_surviving_intent,
+                                events=[],
+                            )
+                        except KeyError:
+                            # Parent deletion is allowed to race exact child
+                            # acknowledgement. Suppress only the proven deletion;
+                            # other source-publication failures remain visible.
+                            if await self.session_store.load(request.source_session_id) is not None:
+                                raise
                 delivered = await self._event_writer.fan_out_persisted(persisted_events)
                 delivered_fork_event = next(
                     (event for event in delivered if event.type is EventType.SESSION_FORKED),
@@ -17613,14 +17746,39 @@ class SessionEngine:
                     raise RuntimeError("Existing profiled fork lost its public fork event.")
                 yield delivered_fork_event
                 return
-        expected_source_snapshot = request._expected_source_snapshot
+        source_session = await self.session_store.load(request.source_session_id)
+        if source_session is None:
+            raise session_request_boundary.ForkSourceNotFoundError(
+                "Fork source session was not found."
+            ) from None
+        try:
+            source_session = session_request_boundary.prepare_fork_source_session(
+                source_session,
+                expected_source_session_id=request.source_session_id,
+                store_resolved_source_session_id=store_resolved_source_session_id,
+                redactor=self._secret_redactor,
+            )
+        except ValueError:
+            del source_session
+            raise
+        # Only first-time creation executes against source authority. Keep the
+        # public preflight on this branch so reconciliation of an already
+        # committed child does not depend on a live parent or its task store.
+        await self._require_ordinary_session_execution(
+            source_session.id,
+            admit_session=False,
+        )
+        expected_source_snapshot = request.expected_source
         if expected_source_snapshot is not None and (
-            source_session.run_epoch != expected_source_snapshot.run_epoch
+            source_session.id != expected_source_snapshot.source_session_id
+            or _fork_source_session_instance_fingerprint(source_session)
+            != expected_source_snapshot.source_instance_fingerprint
+            or source_session.status != expected_source_snapshot.status
+            or source_session.run_epoch != expected_source_snapshot.run_epoch
+            or source_session.causal_budget_id != expected_source_snapshot.causal_budget_id
         ):
             raise SessionRunFenced(
-                "Fork source changed after its coordinator snapshot was frozen: "
-                f"expected run epoch {expected_source_snapshot.run_epoch}, "
-                f"current {source_session.run_epoch}."
+                "Fork source identity or lifecycle changed after its exact snapshot was captured."
             )
         if source_session.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
@@ -17636,6 +17794,11 @@ class SessionEngine:
         if not self.session_store.supports_profiled_forks:
             raise RuntimeError("Session store does not support atomic profiled session forks.")
 
+        environment_name = (
+            request.environment_name
+            if request.environment_name is not None
+            else source_session.environment_name
+        )
         source_checkpoint_for_profile = await self.session_store.load_checkpoint(source_session.id)
         try:
             (
@@ -17646,13 +17809,39 @@ class SessionEngine:
                 source_session,
                 source_checkpoint_for_profile,
             )
+            source_environment_allocation_owners_by_environment = (
+                environment_allocation_owners_from_checkpoint(
+                    source_checkpoint_for_profile,
+                )
+            )
+            require_authorized_environment_allocation_owners(
+                source_session,
+                source_environment_allocation_owners_by_environment,
+            )
         finally:
             source_checkpoint_for_profile = None
+        source_environment_allocation_owners = (
+            tuple(
+                SessionForkEnvironmentAllocationOwner(
+                    environment_name=environment_name,
+                    owner_session_id=owner_session_id,
+                )
+                for environment_name, owner_session_id in (
+                    source_environment_allocation_owners_by_environment.items()
+                )
+            )
+            if request.copy_checkpoint
+            else ()
+        )
+        source_environment_allocation_owner_payload = [
+            owner.model_dump(mode="json") for owner in source_environment_allocation_owners
+        ]
         if expected_source_snapshot is not None and (
-            source_execution_profile.fingerprint != expected_source_snapshot.profile_fingerprint
+            source_execution_profile.fingerprint
+            != expected_source_snapshot.execution_profile_fingerprint
         ):
             raise SessionRunFenced(
-                "Fork source execution profile changed after its coordinator snapshot was frozen."
+                "Fork source execution profile changed after its exact snapshot was captured."
             )
         try:
             source_registered_agent = self._get_registered_agent(source_session.agent_name)
@@ -17691,11 +17880,6 @@ class SessionEngine:
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
         )
-        environment_name = (
-            request.environment_name
-            if request.environment_name is not None
-            else source_session.environment_name
-        )
         try:
             (
                 agent_name,
@@ -17727,23 +17911,18 @@ class SessionEngine:
             environment_lifecycle=self._environment_lifecycle,
         )
 
-        initial_invocation = request._fork_group_initial_invocation
+        initial_invocation = request.initial_invocation
         if initial_invocation is not None and (
-            initial_invocation.request.session_id != destination_session_id
-            or _fork_group_initial_invocation_request_sha256(initial_invocation.request)
-            != initial_invocation.request_sha256
+            initial_invocation.session_id != destination_session_id
         ):
-            raise RuntimeError("Fork-group initial invocation authority is inconsistent.")
-        if request._fork_group_task_evaluator and (
-            initial_invocation is None
-            or request.execution_profile_selection
-            is not ForkExecutionProfileSelection.CURRENT_CHILD
-            or request.system_prompt_policy is not ForkSystemPromptPolicy.CURRENT_AGENT
-            or request.transcript_cursor != 0
-            or request.copy_checkpoint
-        ):
-            raise RuntimeError("Fork-group task evaluator authority is inconsistent.")
-
+            raise RuntimeError("Fork initial invocation authority is inconsistent.")
+        initial_tool_capability_ceiling = effective_tool_capability_ceiling
+        if initial_invocation is not None:
+            initial_tool_capability_ceiling = resolve_tool_capability_ceiling(
+                initial_invocation.tool_capability_ceiling,
+                registered_agent.tool_capabilities,
+                maximum=effective_tool_capability_ceiling,
+            )
         current_child_runtime_identity = SessionRuntimeIdentity(
             runtime_name="cayu",
             runtime_version=_runtime_version(),
@@ -17766,38 +17945,32 @@ class SessionEngine:
                     self._loop_policy_execution_profile_identities
                 ),
                 request_loop_policies=(
-                    () if initial_invocation is None else initial_invocation.request.loop_policies
+                    () if initial_invocation is None else initial_invocation.loop_policies
                 ),
                 request_loop_policy_instance_identities=(
                     ()
                     if initial_invocation is None
                     else self._request_loop_policy_instance_identities(
-                        initial_invocation.request.loop_policies
+                        initial_invocation.loop_policies
                     )
                 ),
                 budget_policy=self._get_budget_policy(),
                 request_budget_limits=(
-                    () if initial_invocation is None else initial_invocation.request.budget_limits
+                    () if initial_invocation is None else initial_invocation.budget_limits
                 ),
                 causal_budget_id=source_session.causal_budget_id,
                 structured_output=(
-                    None
-                    if initial_invocation is None
-                    else initial_invocation.request.structured_output
+                    None if initial_invocation is None else initial_invocation.structured_output
                 ),
-                thinking=(
-                    None if initial_invocation is None else initial_invocation.request.thinking
-                ),
-                max_steps=(
-                    16 if initial_invocation is None else initial_invocation.request.max_steps
-                ),
-                limits=(None if initial_invocation is None else initial_invocation.request.limits),
+                thinking=(None if initial_invocation is None else initial_invocation.thinking),
+                max_steps=(16 if initial_invocation is None else initial_invocation.max_steps),
+                limits=(None if initial_invocation is None else initial_invocation.limits),
                 retry_policy=(
                     self._effective_retry_policy(None)
                     if initial_invocation is None
-                    else self._effective_retry_policy(initial_invocation.request.retry_policy)
+                    else self._effective_retry_policy(initial_invocation.retry_policy)
                 ),
-                tool_capability_ceiling=effective_tool_capability_ceiling,
+                tool_capability_ceiling=initial_tool_capability_ceiling,
                 runtime_identity=current_child_runtime_identity,
             )
             if (
@@ -17846,44 +18019,24 @@ class SessionEngine:
                 source_execution_profile,
                 candidate_execution_profile,
             )
-            if request._fork_group_task_evaluator:
-                execution_profile_decision = _execution_profile_decision_event(
-                    session=decision_session,
-                    expected_profile=source_execution_profile,
-                    candidate_profile=candidate_execution_profile,
-                    changed_component_classes=changed_profile_components,
-                    kind=ExecutionProfileDecisionKind.ADOPTED,
-                    policy_identity=_FORK_GROUP_TASK_EVALUATOR_PROFILE_POLICY_ID,
-                    policy_reason=(
-                        "The durable fork group authorized this exact tool-free evaluator "
-                        "invocation before queue publication."
-                    ),
-                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
-                    intent=request.profile_adoption,
-                    adoption_request_fingerprint=fork_request_sha256,
-                    fallback_actor=None,
-                    fallback_reason="Runtime-owned fork-group evaluator admission.",
-                    clock=self._clock,
-                )
-            else:
-                execution_profile_decision = await self._classify_execution_profile(
-                    session=source_session,
-                    decision_session=decision_session,
-                    expected_profile=source_execution_profile,
-                    candidate_profile=candidate_execution_profile,
-                    changed_component_classes=changed_profile_components,
-                    intent=request.profile_adoption,
-                    adoption_request_fingerprint=fork_request_sha256,
-                    target_changed=(
-                        registered_provider.name != source_session.provider_name
-                        or model != source_session.model
-                    ),
-                    target_provider_name=registered_provider.name,
-                    target_model=model,
-                    source_provider_name=source_session.provider_name,
-                    source_model=source_session.model,
-                    force_authority_review=True,
-                )
+            execution_profile_decision = await self._classify_execution_profile(
+                session=source_session,
+                decision_session=decision_session,
+                expected_profile=source_execution_profile,
+                candidate_profile=candidate_execution_profile,
+                changed_component_classes=changed_profile_components,
+                intent=request.profile_adoption,
+                adoption_request_fingerprint=fork_request_sha256,
+                target_changed=(
+                    registered_provider.name != source_session.provider_name
+                    or model != source_session.model
+                ),
+                target_provider_name=registered_provider.name,
+                target_model=model,
+                source_provider_name=source_session.provider_name,
+                source_model=source_session.model,
+                force_authority_review=True,
+            )
             if execution_profile_decision.kind in {
                 ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
                 ExecutionProfileDecisionKind.REJECTED,
@@ -17935,7 +18088,7 @@ class SessionEngine:
             )
             if unsupported_changes:
                 raise RuntimeError(
-                    "An inherited fork-group branch changed execution authority outside its "
+                    "An inherited fork invocation changed execution authority outside its "
                     "declared initial budget, structured-output, finalization, or tool-ceiling "
                     "semantics: "
                     + ", ".join(component.value for component in unsupported_changes)
@@ -17946,14 +18099,10 @@ class SessionEngine:
             )
             if unavailable_child_components:
                 raise RuntimeError(
-                    "Fork-group initial invocation has unavailable required components: "
+                    "Fork initial invocation has unavailable required components: "
                     + ", ".join(component.value for component in unavailable_child_components)
                 )
             initial_invocation_profile = candidate_execution_profile
-
-        execution_profile_fingerprint_capture = request._execution_profile_fingerprint_capture
-        if execution_profile_fingerprint_capture is not None:
-            execution_profile_fingerprint_capture(selected_execution_profile.fingerprint)
 
         if (
             prompt_workflow.prompt_replacement is not None
@@ -18120,6 +18269,23 @@ class SessionEngine:
             *,
             require_prepared_intent: bool,
         ) -> dict[str, Any] | None:
+            current_allocation_owners_by_environment = (
+                environment_allocation_owners_from_checkpoint(
+                    source_checkpoint,
+                )
+            )
+            require_authorized_environment_allocation_owners(
+                current_source,
+                current_allocation_owners_by_environment,
+            )
+            if (
+                current_allocation_owners_by_environment
+                != source_environment_allocation_owners_by_environment
+            ):
+                raise SessionRunFenced(
+                    "Fork source environment-allocation ownership changed while the "
+                    "fork was being prepared."
+                )
             _, live_source_profile, _ = (
                 session_request_boundary.prepare_fork_source_execution_profile(
                     current_source,
@@ -18127,17 +18293,28 @@ class SessionEngine:
                 )
             )
             if expected_source_snapshot is not None:
-                if live_source_profile.fingerprint != expected_source_snapshot.profile_fingerprint:
+                if (
+                    _fork_source_session_instance_fingerprint(current_source)
+                    != expected_source_snapshot.source_instance_fingerprint
+                ):
                     raise SessionRunFenced(
-                        "Fork source execution profile changed after its coordinator "
-                        "snapshot was frozen."
+                        "Fork source session incarnation changed after its exact snapshot "
+                        "was captured."
+                    )
+                if (
+                    live_source_profile.fingerprint
+                    != expected_source_snapshot.execution_profile_fingerprint
+                ):
+                    raise SessionRunFenced(
+                        "Fork source execution profile changed after its exact snapshot "
+                        "was captured."
                     )
                 if (
                     fork_source_checkpoint_sha256(source_checkpoint)
                     != expected_source_snapshot.checkpoint_sha256
                 ):
                     raise SessionRunFenced(
-                        "Fork source checkpoint changed after its coordinator snapshot was frozen."
+                        "Fork source checkpoint changed after its exact snapshot was captured."
                     )
             source_checkpoint = validate_source_checkpoint(current_source, source_checkpoint)
             if require_prepared_intent:
@@ -18148,42 +18325,10 @@ class SessionEngine:
             if not request.copy_checkpoint:
                 return None
             if fork_checkpoint is not None:
-                fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
-                fork_checkpoint.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
-                fork_checkpoint.pop(
-                    _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
-                    None,
-                )
-                # Result-publication ownership belongs to the source session.
-                # A fork inherits resumable content, never the source's
-                # outstanding event-publication reservation.
-                fork_checkpoint.pop(
-                    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
-                    None,
-                )
-                # Active invocation authority is bound to the source session's
-                # interaction and run epoch, never to the derived child.
-                fork_checkpoint.pop(
-                    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-                    None,
-                )
-                # Lifecycle command receipts authenticate mutations of the
-                # source incarnation. A child cannot replay them and must not
-                # inherit their source-bound session snapshots.
-                fork_checkpoint.pop(
-                    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-                    None,
-                )
-                # A model-step publication receipt belongs to the source session.
-                # The child inherits transcript state, not its reconstruction pointer.
-                fork_checkpoint.pop(
-                    model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
-                    None,
-                )
-                # Automatic recall is scoped to one source-session interaction.
-                # A child inherits the authoritative transcript, but must derive
-                # its own frame from its next real user interaction.
-                fork_checkpoint.pop(AUTOMATIC_RECALL_CHECKPOINT_KEY, None)
+                # Snapshot assertions and the committed child must use one exact
+                # definition of inheritable checkpoint state. Source-owned run,
+                # publication, receipt, and recall records remain with the parent.
+                strip_source_owned_fork_checkpoint_state(fork_checkpoint)
             if not session_request_boundary.fork_checkpoint_is_secret_free(
                 fork_checkpoint,
                 redactor=self._secret_redactor,
@@ -18199,14 +18344,19 @@ class SessionEngine:
                 ) from None
             return fork_checkpoint
 
-        def transcript_validator(messages: tuple[Message, ...]) -> bool:
+        def transcript_validator(
+            messages: tuple[Message, ...],
+            source_snapshot: TranscriptSnapshot,
+        ) -> bool:
             return (
                 (expected_fork_transcript is None or messages == expected_fork_transcript)
                 and (
                     expected_source_snapshot is None
-                    or request._fork_group_task_evaluator
-                    or session_input_messages_sha256(messages)
-                    == expected_source_snapshot.transcript_sha256
+                    or (
+                        source_snapshot.cursor == expected_source_snapshot.transcript_cursor
+                        and fork_source_transcript_sha256(source_snapshot)
+                        == expected_source_snapshot.transcript_sha256
+                    )
                 )
                 and session_request_boundary.fork_transcript_is_secret_free(
                     messages,
@@ -18293,14 +18443,19 @@ class SessionEngine:
             raise
         if expected_source_snapshot is not None:
             authoritative_metadata = copy_json_value(fork_session.metadata, "metadata")
-            authoritative_metadata[FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY] = {
+            authoritative_metadata[FORK_SOURCE_SNAPSHOT_METADATA_KEY] = {
                 "source_session_id": source_session.id,
+                "source_instance_fingerprint": (
+                    expected_source_snapshot.source_instance_fingerprint
+                ),
                 "status": source_session.status.value,
                 "run_epoch": expected_source_snapshot.run_epoch,
                 "transcript_cursor": expected_source_snapshot.transcript_cursor,
                 "transcript_sha256": expected_source_snapshot.transcript_sha256,
                 "checkpoint_sha256": expected_source_snapshot.checkpoint_sha256,
-                "execution_profile_fingerprint": (expected_source_snapshot.profile_fingerprint),
+                "execution_profile_fingerprint": (
+                    expected_source_snapshot.execution_profile_fingerprint
+                ),
                 "causal_budget_id": source_session.causal_budget_id,
             }
             fork_session = fork_session.model_copy(
@@ -18381,6 +18536,7 @@ class SessionEngine:
             "execution_profile_selection": request.execution_profile_selection.value,
             "selected_profile_fingerprint": selected_execution_profile.fingerprint,
             "source_profile_fingerprint": source_execution_profile.fingerprint,
+            "source_environment_allocation_owners": (source_environment_allocation_owner_payload),
             "fork_request_sha256": fork_request_sha256,
             "workspace_lineage": WorkspaceForkLineage(
                 status=(
@@ -18395,12 +18551,30 @@ class SessionEngine:
                 ),
             ).model_dump(mode="json"),
         }
-        if initial_invocation is not None:
-            if initial_invocation_profile is None:
-                raise AssertionError("Fork-group initial invocation lost its frozen profile.")
+        if expected_source_snapshot is not None:
             fork_event_payload.update(
                 {
-                    "initial_invocation_request_sha256": (initial_invocation.request_sha256),
+                    "source_instance_fingerprint": (
+                        expected_source_snapshot.source_instance_fingerprint
+                    ),
+                    "source_run_epoch": expected_source_snapshot.run_epoch,
+                    "source_transcript_cursor": (expected_source_snapshot.transcript_cursor),
+                    "source_transcript_sha256": (expected_source_snapshot.transcript_sha256),
+                    "source_checkpoint_sha256": (expected_source_snapshot.checkpoint_sha256),
+                    "source_execution_profile_fingerprint": (
+                        expected_source_snapshot.execution_profile_fingerprint
+                    ),
+                }
+            )
+        if initial_invocation is not None:
+            if initial_invocation_profile is None:
+                raise AssertionError("Fork initial invocation lost its frozen profile.")
+            fork_event_payload.update(
+                {
+                    "initial_dispatch_id": request.initial_dispatch_id,
+                    "initial_invocation_request_sha256": (
+                        _fork_initial_invocation_request_sha256(initial_invocation)
+                    ),
                     "initial_invocation_profile_fingerprint": (
                         initial_invocation_profile.fingerprint
                     ),
@@ -18489,7 +18663,17 @@ class SessionEngine:
             )
             prepared_events.append(decision_event)
         relationship = SessionForkProfileRelationship(
+            schema_version=(
+                FORK_EXECUTION_PROFILE_ORDINARY_SCHEMA_VERSION
+                if expected_source_snapshot is None
+                else FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION
+            ),
             request_sha256=fork_request_sha256,
+            source_state_sha256=(
+                None
+                if expected_source_snapshot is None
+                else fork_source_state_sha256(expected_source_snapshot)
+            ),
             source_session_id=source_session.id,
             child_session_id=fork_session.id,
             child_agent_name=fork_session.agent_name,
@@ -18511,9 +18695,13 @@ class SessionEngine:
             system_prompt_policy=request.system_prompt_policy,
             selection=request.execution_profile_selection,
             selected_profile=selected_execution_profile,
+            source_environment_allocation_owners=source_environment_allocation_owners,
             initial_invocation_request_sha256=(
-                None if initial_invocation is None else initial_invocation.request_sha256
+                None
+                if initial_invocation is None
+                else _fork_initial_invocation_request_sha256(initial_invocation)
             ),
+            initial_dispatch_id=request.initial_dispatch_id,
             initial_invocation_profile=initial_invocation_profile,
             decision=decision_record,
             fork_event_id=fork_event.id,
@@ -18522,9 +18710,10 @@ class SessionEngine:
         authoritative_metadata[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
             selected_execution_profile
         )
-        authoritative_metadata[FORK_EXECUTION_PROFILE_METADATA_KEY] = relationship.model_dump(
-            mode="json"
-        )
+        relationship_metadata = relationship.model_dump(mode="json")
+        if relationship.source_state_sha256 is None:
+            relationship_metadata.pop("source_state_sha256")
+        authoritative_metadata[FORK_EXECUTION_PROFILE_METADATA_KEY] = relationship_metadata
         fork_session = fork_session.model_copy(
             update={"metadata": authoritative_metadata},
             deep=True,

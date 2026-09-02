@@ -1,8 +1,9 @@
 # Advanced Runtime Examples
 
 Start here when you are evaluating, extending, or asking an agent to work on
-Cayu's advanced examples. The suite contains six provider-portable product
-stories and two deterministic measurement fixtures. Together they serve two
+Cayu's advanced examples. The suite contains five provider-portable product
+stories, one deterministic Runtime tracer, and two deterministic measurement
+fixtures. Together they serve two
 purposes:
 
 1. exercise Cayu against deterministic providers and real provider APIs; and
@@ -21,7 +22,7 @@ cost strategy and governance map, see
 
 | Example | Product idea | Stable runtime evidence | Entry point |
 | --- | --- | --- | --- |
-| `bounded_fork_group` | Preserve a viable sibling, replace one rejected seed, and evaluate the eligible cohort through one durable public coordinator. | Frozen source/profile authority, shared causal budget, application gates and mutation planning, runtime-owned attempt lineage, tool-free bounded evaluation, one immutable selection, and no-work terminal replay. | [README](bounded_fork_group/README.md) · [app](bounded_fork_group/app.py) |
+| `asynchronous_session_forks` | Launch independent children from one exact checkpoint and consume each result when it settles. | Exact shared source authority, early durable dispatch, parent continuation, independently observable completion/failure/interruption, idempotent recovery, and optional application-owned evaluation. | [README](asynchronous_session_forks/README.md) · [app](asynchronous_session_forks/app.py) |
 | `prompt_cache_compaction` | Refresh an expensive provider prefix once, compare it with bounded compaction from the same compactable source, then keep later summaries bounded to the checkpoint delta. | Tool and thinking request-shape parity, a public v2 quality-gated paired report with cache/uncached counters and provenance, two real compaction cycles, bounded incremental input, and explicit separation of session and comparison-only spend. | [README](prompt_cache_compaction/README.md) · [app](prompt_cache_compaction/app.py) |
 | `cache_aware_research_council` | Prepare and compact shared context once, then reduce repeated input while exploring several research strategies independently. | Shared causal budget and lineage, persisted compaction checkpoint, a public v2 quality-gated branch-call report, evaluator weakness, and critique-aware repair. | [README](cache_aware_research_council/README.md) · [app](cache_aware_research_council/app.py) |
 | `counterfactual_approval` | Turn approval latency into useful computation without granting speculative branches authority. | Approved and denied futures are authority-free, stale state is rejected, one analysis is selected as advisory continuation context while the other is ignored, exactly one mutation occurs, and its receipt is recovered after `CayuApp` reconstruction. Both child sessions remain durable and auditable. | [README](counterfactual_approval/README.md) · [app](counterfactual_approval/app.py) |
@@ -58,13 +59,14 @@ the scenario.
 
 ## Run the suite deterministically
 
-The six provider-portable product stories use `ScriptedModelProvider`, call no
-external model API in deterministic mode, and satisfy the same structural
-assertions as their live runs:
+The five provider-portable product stories and the independent-fork tracer call
+no external model API in deterministic mode. Provider-portable stories satisfy
+the same structural assertions as their live runs; the tracer additionally uses
+deterministic barriers and injected durable-store outcomes:
 
 ```bash
 for example in \
-  bounded_fork_group \
+  asynchronous_session_forks \
   prompt_cache_compaction \
   cache_aware_research_council \
   counterfactual_approval \
@@ -90,7 +92,7 @@ uv run pytest -q tests/advanced_examples
 
 ## Run the provider-portable stories with a real provider
 
-The six provider-portable stories support live backends through the same CLI;
+The five provider-portable stories support live backends through the same CLI;
 provider-specific examples document any narrower support in their README:
 
 ```bash
@@ -169,7 +171,7 @@ and semantic envelope passed—not merely that the provider returned text.
 
 | Layer | Cost and prerequisites | Purpose |
 | --- | --- | --- |
-| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for the six product stories and two measurement fixtures. |
+| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for the five provider-portable stories, independent-fork tracer, and two measurement fixtures. |
 | Primary Gemini checks | `GEMINI_API_KEY`; five trials when the registered nightly checks are invoked | Multi-trial verification of the main live-provider path. |
 | OpenAI and Anthropic portability checks | Matching provider key; one trial per registered check | Detect provider-specific tool, structured-output, and usage regressions. |
 | Real repository promotion | Provider key, GitHub authority, Git credentials, and a disposable repository; manual opt-in | Verify clone, real worktrees, commit, push, PR creation, and idempotent recovery. |

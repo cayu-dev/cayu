@@ -581,7 +581,6 @@ _FORK_RUNTIME_SESSION_STATUS_PATHS = frozenset(
             "receipts",
             "result_session",
             "metadata",
-            "cayu:fork_group_source_snapshot",
             "status",
         ),
     }

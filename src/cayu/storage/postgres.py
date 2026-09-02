@@ -25496,7 +25496,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     await cur.execute(
                         """
-                        SELECT message, interaction_id
+                        SELECT session_order, message, interaction_id
                         FROM cayu_transcript_messages
                         WHERE session_id = %s
                           AND session_order <= %s
@@ -25513,19 +25513,40 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     selected_transcript_rows = await cur.fetchall()
                     copied_messages = [
-                        Message(**_json_obj(row[0])) for row in selected_transcript_rows
+                        Message(**_json_obj(row[1])) for row in selected_transcript_rows
                     ]
-                    copied_interaction_ids = [row[1] for row in selected_transcript_rows]
+                    copied_interaction_ids = [row[2] for row in selected_transcript_rows]
+                    source_transcript_snapshot = (
+                        None
+                        if transcript_validator is None
+                        else TranscriptSnapshot(
+                            records=[
+                                TranscriptRecord(
+                                    index=int(row[0]) - 1,
+                                    interaction_id=row[2],
+                                    message=copied_messages[position],
+                                )
+                                for position, row in enumerate(selected_transcript_rows)
+                            ],
+                            cursor=source_transcript_cursor,
+                        )
+                    )
                     selected_transcript_rows.clear()
                     copied_messages, copied_interaction_ids = apply_fork_system_prompt_replacement(
                         copied_messages,
                         copied_interaction_ids,
                         system_prompt_replacement,
                     )
-                    if not fork_transcript_is_accepted(copied_messages, transcript_validator):
+                    if not fork_transcript_is_accepted(
+                        copied_messages,
+                        source_transcript_snapshot,
+                        transcript_validator,
+                    ):
                         copied_messages.clear()
                         copied_messages = []
+                        source_transcript_snapshot = None
                         raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
+                    source_transcript_snapshot = None
 
                     copied_checkpoint = None
                     if checkpoint_transform is not None:

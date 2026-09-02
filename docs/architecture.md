@@ -78,7 +78,6 @@ CayuApp
   -> ModelStepExecutor
   -> ToolRoundExecutor
   -> DurableSubagentCoordinator
-  -> ForkGroupCoordinator
   -> RecoveryCoordinator
   -> SessionEngine
 ```
@@ -94,15 +93,6 @@ modules own their complete lower-level behavior slices.
 receipt, and restart-reconciliation handoff for task-backed subagents. The application
 facade and task dispatcher reach it only through narrow preparation, settlement, and
 acknowledgement operations.
-
-`ForkGroupCoordinator` owns normalized fork-group identity, the renewable durable
-execution claim, branch and evaluator lifecycle, deterministic gate registration,
-and replay convergence across application instances. In task-dispatch mode it also
-owns the durable group-to-slot-to-session-to-queue linkage, while ordinary
-`TaskStoreDispatcher` workers continue to own task claims, leases, heartbeats,
-reclaim, and terminalization. It receives only narrow typed session-orchestration
-callbacks from `CayuApp`; the fork-group module does not import or accept the
-complete application façade.
 
 Some collaborators need to call session orchestration but are constructed before
 `SessionEngine`. `CayuApp` supplies those edges as narrow typed callables; the

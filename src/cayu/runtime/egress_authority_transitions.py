@@ -1652,6 +1652,42 @@ def require_egress_authority_transition_compatible_with_profile(
         )
 
 
+def require_forkable_egress_authority_transition(
+    checkpoint: dict | None,
+    *,
+    session_id: str,
+    environment_name: str | None,
+    profile_authority: EgressAuthorityIdentity | None,
+) -> None:
+    """Reject source-bound egress work that an independent child cannot inherit."""
+
+    session_id = require_durable_clean_nonblank(session_id, "session_id")
+    try:
+        current = _transition_from_checkpoint(checkpoint)
+    except (TypeError, ValueError):
+        raise EgressAuthorityTransitionConflict(
+            "Fork source egress authority transition is malformed."
+        ) from None
+    if current is None:
+        return
+    if current.session_id != session_id or current.environment_name != environment_name:
+        raise EgressAuthorityTransitionConflict(
+            "Fork source egress authority transition belongs to another session environment."
+        )
+    if current.state not in {
+        EgressAuthorityTransitionState.ACTIVE,
+        EgressAuthorityTransitionState.REFUSED,
+    }:
+        raise EgressAuthorityTransitionConflict(
+            "Fork source egress authority transition is not settled; reconcile or refuse "
+            "the cutover before forking."
+        )
+    require_egress_authority_transition_compatible_with_profile(
+        checkpoint,
+        profile_authority,
+    )
+
+
 def _build_transition_record(**values: Any) -> EgressAuthorityTransitionRecord:
     provisional = EgressAuthorityTransitionRecord.model_construct(
         record_type="cayu.egress-authority-transition",

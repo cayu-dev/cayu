@@ -31,10 +31,6 @@ from tests.core.session_operation_fault_conformance import (
 from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
-from tests.core.test_fork_groups import (
-    assert_task_backed_fork_group_store_conformance,
-    assert_viable_fork_group_store_conformance,
-)
 from tests.core.test_provider_operation_offline_recovery import (
     assert_budgeted_offline_provider_operation_recovery,
     assert_offline_provider_operation_recovery,
@@ -358,35 +354,6 @@ def _run(dsn: str, coro_factory) -> object:
             await store.close()
 
     return asyncio.run(runner())
-
-
-def test_postgres_viable_fork_group_store_conformance(postgres_dsn: str) -> None:
-    _run(postgres_dsn, assert_viable_fork_group_store_conformance)
-
-
-def test_postgres_task_backed_fork_group_store_conformance(postgres_dsn: str) -> None:
-    async def runner() -> None:
-        from cayu import PostgresTaskStore
-        from cayu.storage.migrations import SchemaMode
-
-        await _truncate(postgres_dsn)
-        session_store = _new_store(postgres_dsn)
-        task_store = PostgresTaskStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=4,
-            schema_mode=SchemaMode.CREATE,
-        )
-        try:
-            await assert_task_backed_fork_group_store_conformance(
-                session_store,
-                task_store,
-            )
-        finally:
-            await task_store.close()
-            await session_store.close()
-
-    asyncio.run(runner())
 
 
 def test_postgres_session_store_preserves_projected_tool_results(

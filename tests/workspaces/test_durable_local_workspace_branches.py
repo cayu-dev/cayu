@@ -727,7 +727,7 @@ async def _durable_branch(
             environment_name="local",
             binding_generation=binding_generation,
             binding_identity=binding_identity,
-            creating_authority="fork-group:alpha",
+            creating_authority="session-fork:alpha",
             resource_policy="local-cow-defaults-v1",
         ),
     )
@@ -759,7 +759,7 @@ async def _interrupted_durable_creating_branch(
             environment_name="local",
             binding_generation="binding-1",
             binding_identity="workspace-alpha@binding-1",
-            creating_authority="fork-group:alpha",
+            creating_authority="session-fork:alpha",
             resource_policy="local-cow-defaults-v1",
         ),
     )
@@ -1160,7 +1160,7 @@ def test_durable_branch_never_reenters_binding_authority_provider(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -1272,7 +1272,7 @@ def test_creation_reconciles_lost_guarded_store_acknowledgement(tmp_path: Path) 
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -1315,7 +1315,7 @@ def test_creation_guard_is_off_loop_and_preserves_cancellation_when_reconciliati
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -1401,7 +1401,7 @@ def test_creation_retries_after_process_loss_during_staged_capture(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -1512,7 +1512,7 @@ def test_recovery_repeats_capture_after_process_loss_before_guard_dispatch(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -2289,7 +2289,7 @@ def test_creation_failure_is_durable_and_exactly_replayed(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -2423,7 +2423,7 @@ def test_failed_creation_recovery_settles_staging_after_cleanup_owner_loss(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -2488,7 +2488,7 @@ def test_failed_recovery_validates_result_before_removing_retained_staging(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -4668,7 +4668,7 @@ def test_binding_replacement_is_rejected_during_guarded_capture(
                 environment_name="local",
                 binding_generation="binding-1",
                 binding_identity="workspace-alpha@binding-1",
-                creating_authority="fork-group:alpha",
+                creating_authority="session-fork:alpha",
                 resource_policy="local-cow-defaults-v1",
             ),
         )
@@ -4728,7 +4728,7 @@ def test_binding_replacement_is_rejected_during_guarded_capture(
                         environment_name="local",
                         binding_generation="binding-2",
                         binding_identity="workspace-alpha@binding-2",
-                        creating_authority="fork-group:beta",
+                        creating_authority="session-fork:beta",
                         resource_policy="local-cow-defaults-v1",
                     ),
                 }
@@ -5119,7 +5119,7 @@ def test_durable_authority_copy_suppresses_serializer_diagnostics(
             environment_name="local",
             binding_generation="binding-1",
             binding_identity="workspace-alpha@binding-1",
-            creating_authority="fork-group:alpha",
+            creating_authority="session-fork:alpha",
             resource_policy="local-cow-defaults-v1",
         )
         request = WorkspaceBranchRequest(

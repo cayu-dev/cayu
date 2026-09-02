@@ -1574,9 +1574,7 @@ def test_lifecycle_receipt_metadata_trust_fails_closed_per_receipt() -> None:
             )
 
             runtime_snapshot_receipt = copy.deepcopy(raw_receipt)
-            runtime_snapshot_receipt["result_session"]["metadata"][
-                "cayu:fork_group_source_snapshot"
-            ] = {
+            runtime_snapshot_receipt["result_session"]["metadata"]["cayu:fork_source_snapshot"] = {
                 "source_session_id": "fork-source-secret",
                 "status": "completed",
             }

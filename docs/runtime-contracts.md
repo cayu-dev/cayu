@@ -1508,11 +1508,15 @@ Acknowledgement and final reconnect publication reconcile lost store
 acknowledgements by exact durable readback. Final publication atomically
 installs reconnect identity, allocation owner, and an immutable receipt while
 removing the pending intent. Forked sessions replace copied parent allocation
-state only with a fresh child-owned intent. Provider metadata and reconnect
-identity use Cayu's durable JSON contract, are byte bounded, and may not contain
-registered workload secrets. A provider without idempotent create-or-lookup,
-exact ownership evidence, and bounded race-safe cleanup is unsupported and
-must fail before provider mutation.
+state only with a fresh child-owned intent. The immutable fork relationship binds
+a copied allocation owner separately from immediate session lineage whenever
+they differ; exact forks always include that owner in their source evidence. An
+unexecuted fork-of-a-fork can therefore replace state still owned by an earlier
+ancestor without adopting or reaping that ancestor's resource. Provider metadata
+and reconnect identity use Cayu's durable JSON contract, are byte bounded, and
+may not contain registered workload secrets. A provider without idempotent
+create-or-lookup, exact ownership evidence, and bounded race-safe cleanup is
+unsupported and must fail before provider mutation.
 
 Cleanup and publication are mutually exclusive durable transitions. Before a
 recoverable result receives `DISCARD`, Cayu advances the pending intent to
@@ -2488,11 +2492,10 @@ explicit, authority-authorized adoption intent after reviewing the change; do
 not silently reuse the old fingerprint. Because the retry policy is also part
 of serialized resume/adoption authority, an adoption request fingerprint made
 before this change is not replayable as the new request and must be resubmitted
-under the new contract. Queued-dispatch envelopes advance from schema v1 to v2,
-while fork-group operation records and lifecycle event payloads advance from
-schema v2 to v3. Readers accept only the current record version and reject
-older records; recreate disposable prerelease state rather than migrating it
-through a compatibility path.
+under the new contract. Queued-dispatch envelopes advance from schema v1 to v2.
+Readers accept only the current record version and reject older records;
+recreate disposable prerelease state rather than migrating it through a
+compatibility path.
 
 An execution profile and a request footprint are deliberately different records. The profile is pre-dispatch semantic authority and governs admission, retries, recovery, and adoption. A request footprint is post-projection evidence of one concrete provider request and references the governing profile fingerprint. The footprint does not authorize execution, and the profile does not claim byte-for-byte equality with a provider payload. Model attempts, structured-output and compaction lifecycle evidence, usage/cost line items, and runtime-evidence reports carry the same governing fingerprint when that authority is available. Retry and recovery reuse the frozen profile rather than adopting mutable registrations again. Before context construction, provider-owned request analysis, and each actual provider dispatch, Cayu reprojects transparent live context/provider configuration only as a guard against the frozen profile; drift fails the invocation before the changed semantics can be attributed to the old fingerprint. Application-versioned opaque extensions remain responsible for keeping the behavior represented by their declared identity stable.
 
@@ -2694,33 +2697,77 @@ After the parent's durable `session.interrupted` event is persisted, operator-re
 
 Background propagation persists a `pending_interruption_cascade` checkpoint marker until the complete descendant traversal succeeds. A shared app-level worker pool bounds traversal across all roots; workers are not multiplied per parent or tree depth. Root coordinators are bounded by the same limit. Roots whose durable lease belongs to another process move to one deferred supervisor instead of occupying a coordinator. Locally admitted roots waiting for coordinator capacity remain part of the shutdown drain, while external-lease retries do not consume the shutdown grace. A coordinator must atomically acquire a durable, expiring claim and renew it while working; another process cannot start overlapping traversal until that lease expires or is explicitly released. Each new owner also advances a private generation so delayed events from an expired owner can be identified and ignored. Session detail reads the durable marker before applying local scheduling hints, then reports an active lease, a locally queued root, or a newly created marker within its admission grace as `pending`, an expired, recorded-failure, or orphaned marker as `failed`, and no marker as `none`; this prevents a stale external-lease timer from masking completion by another worker. The dashboard shows pending propagation explicitly, exposes Retry only for `failed`, withholds Resume for every outstanding marker, and selects the newest failure generation rather than event arrival order. A retry of a failed cascade emits `session.interruption_cascade_retry_requested` with a unique `retry_request_id` and the retrying actor, reason, and metadata while preserving the original interruption provenance used for descendants. When that retry acquires a generation, its failure or completion event carries the same retry request ID and provenance. Existing-terminal replay and cascade retry use the session's durable agent/environment identity, so an application deployment may remove the historical parent agent without disabling control-plane recovery. If a descendant remains `pending`, `running`, or `interrupting` after an interruption attempt, Cayu releases the claim but retains the marker and emits a bounded `session.interruption_cascade_failed` event on the parent with structured descendant IDs, statuses, and error types; exception messages are not persisted. A later successful retry durably publishes `session.interruption_cascade_completed` before clearing the failed marker, so publication failure leaves retryable state instead of losing the resolution event; first-attempt success clears the marker without adding a redundant event. `CayuApp.resume_pending_interruption_cascades(interrupting_inactive_before=...)` discovers durable work after a process restart through a paginated store query backed by a partial checkpoint index; startup does not scan historical interrupted sessions or load unrelated checkpoints. Interrupted roots are admitted immediately when their claim is available; an `interrupting` parent is filtered by the supplied inactivity threshold and finalized only after the store atomically fences it, preventing a new worker from stealing shutdown from a live owner. Recovery claims existing markers only, so a startup race or repeated idempotent request cannot recreate work another owner already completed. `create_server(...)` reads this threshold from `ServerLifecycleConfig.recovery_inactive_after_seconds`, while `mount_cayu(...)` exposes `interruption_recovery_inactive_after_seconds`; both drain accepted background work during shutdown using the configured grace period, including work scheduled before a later startup-recovery error. Internal timeout and caller cancellation signal claim loss, stop the current worker generation, and detach cancellation-resistant code without extending that grace. Cooperative coordinators may release claims immediately; detached work cannot accept new queue entries and leaves its durable lease to expire for takeover. A hard process loss uses the same lease-expiry recovery boundary.
 
-`CayuApp.run_fork_group(...)` is the public coordinator for one bounded candidate population. A `ForkGroupRequest` names one terminal source session, one shared `causal_budget_id`, 2-16 logical candidate slots with caller-named initial sessions, bounded parallelism, optional registered deterministic gate selections, an explicit `ForkGroupFailurePolicy`, one evaluator session, and an `execution_mode`. The compatible default is `in-process`; `task-dispatch` requires the app and its `TaskStoreDispatcher` to share the exact `TaskStore`. `fail-group` is the compatible failure policy. `evaluate-viable` additionally binds a minimum viable count, a group-wide replacement-attempt limit, replacement parallelism, deterministic gates, and one registered replacement planner selection. Gate and planner selections bind both an application-local ID and a stable implementation identity into the normalized request. The runtime resolves `ForkGroupCheckpointSelector` once to the source's exact status, run epoch, permanent transcript cursor and digest, semantic checkpoint digest, and effective execution-profile fingerprint. It atomically publishes that frozen authority with `fork_group.created`. Each child-creation transaction revalidates the run epoch, transcript digest, semantic checkpoint digest, and effective profile against the frozen authority inside the store's atomic fork boundary; a same-epoch transcript, checkpoint, or profile mutation therefore fails closed instead of silently splitting sibling history. Fork-group and prompt-transition coordinator records are excluded from the semantic checkpoint digest so lifecycle bookkeeping does not mutate the source being frozen. Every attempt is an ordinary profiled transcript/checkpoint fork and enters the normal session, provider, retry, run-limit, and causal-budget paths. Before child creation, the relationship also binds a privacy-safe digest of the exact prepared first invocation and its complete execution profile. The coordinator adds no alternate provider or tool execution engine.
+`CayuApp.snapshot_fork_source(...)` captures caller-visible authority for one safe,
+terminal source: status, run epoch, and a transcript digest that binds both the
+permanent cursor and every retained message's absolute index and content,
+semantic checkpoint digest, effective execution-profile fingerprint, an opaque
+session-incarnation fingerprint, causal-budget identity, and the public source-session
+identity. It double-reads the source around
+the transcript and checkpoint snapshots and fails closed if any authority changes
+during capture. Secret-bearing source and causal-budget authority appears only as
+stable keyed public aliases; fork admission resolves the budget alias against that
+already-resolved source before performing the atomic exact-source comparison.
 
-Fork-group lifecycle is durable on the source session as `created`, `branches-running`, `awaiting-evaluation`, and terminal `completed` or `failed`, with matching typed, schema-versioned events. Each transition increments a durable revision and uses the existing atomic session-operation record seam as a compare-and-swap boundary. Lifecycle event IDs are deterministic from group identity, request digest, revision, and event type. Before executing any nonterminal state, a coordinator atomically acquires and renews one expiring durable execution claim in that same record. Applications sharing a store therefore converge on one owner instead of concurrently creating replacements or resuming the same children; process loss makes the exact group eligible only after the claim expires. A stale coordinator loads the winning revision instead of overwriting it, terminal records are immutable, and a transaction that commits before losing its acknowledgement is reconciled from the exact-or-newer durable revision. Schema-v3 lifecycle payloads identify every attempt, its digest-bound prepared request, logical slot and index, replacement edges, session, status, eligibility, evaluator identity, terminal failure, complete dispositions, selected attempt, and any task-dispatch linkage without copying prompts or outputs. `group_id` is the idempotency key: Cayu binds it to a canonical digest of the complete normalized request, reconstructs an exact retry from the durable operation record and child sessions, and raises `ForkGroupConflict` if the same group ID carries different source, branch, gate, planner, evaluator, budget, mode, or limit material. In-memory, SQLite, and PostgreSQL stores use this same contract. A fresh `CayuApp` around the same stores reconstructs nonterminal queue work or returns a terminal group without repeating provider, tool, gate, planner, evaluator, or disposition work. Terminal replay and read-only inspection validate the stored task envelope and reciprocal group link without requiring the historical evaluator registration to remain in the current application.
+Supplying that `ForkSourceSnapshot` as `ForkSessionRequest.expected_source` makes
+the store validate the same authority inside the transaction that publishes the
+child. Several caller-named siblings can therefore prove they inherited one exact
+source, while a parent continuation after the first fork cannot silently move a
+later sibling to newer state and a deleted/recreated source cannot revive stale
+snapshot authority. Every accepted child retains the exact source snapshot
+in runtime-owned metadata and exposes the non-secret digests on its ordinary
+`session.forked` event. The immutable schema-2 fork relationship binds a digest
+of the snapshot's secret-independent continuity state, so validation and exact
+retry reject correlated drift between the child metadata and its event evidence.
+Source-session and causal-budget identities are excluded from that public
+commitment: the relationship fields and keyed pre-redaction request identity bind
+them independently without publishing an offline oracle for redacted identifiers.
 
-Schema-v3 coordinators reject schema-v2 fork-group operation records because
-those records lack the durable task-dispatch authority needed for safe
-reconstruction. Drain or inspect existing groups before upgrading, or recreate
-the prerelease store; mixed coordinator access to schema-v2 and schema-v3
-records remains unsupported. Task-backed attempts use the reserved
-`<task_type>.fork-group.v1` namespace, which workers from before this feature do
-not claim. A rolling deployment therefore installs capable workers first, then
-enables task-backed fork groups on upgraded coordinators; an older worker cannot
-cross the new group-authority boundary merely because it shares the task store.
+`ForkSessionRequest.initial_invocation` and its required `initial_dispatch_id`
+freeze the child's exact first `ResumeRequest` and sole first-dispatch identity
+before child publication. They require an exact `expected_source`. The invocation's
+messages, tool-capability ceiling and
+interaction-scoped grants, run/token/time/budget limits, retry policy,
+structured-output contract, thinking configuration, and durable application metadata
+become part of the immutable fork relationship. The initial invocation must name the
+caller-selected child, cannot carry process-local loop policies, and cannot replace
+model-target or profile-adoption authority already selected by the fork. Authorized
+child-profile adoption belongs on `ForkSessionRequest.profile_adoption`, not on the
+initial invocation. Application-declared artifact references may travel as bounded
+durable metadata; they do not become Runtime authority. Public `resume(...)` and
+inline dispatch cannot consume this dispatch-only first invocation.
 
-In `task-dispatch` mode, Cayu prepares a child first, then atomically publishes a group link containing the group request digest, logical slot and attempt lineage, child session, queue task type and ID, dispatch and operation IDs, terminal event ID, dispatch request digest, idempotency key, frozen source checkpoint, causal budget, and required execution-profile fingerprint. The derived idempotency key is reauthenticated from the attempt identity whenever the durable graph or worker envelope/link boundary is validated. Only after that link is durable does `TaskStoreDispatcher.submit(...)` create the claimable task in its versioned fork-group namespace. A crash between those publications is recovered by recreating only the exact deterministic task; observing a task without its matching group link is a permanent authority rejection. Workers use the existing task claim, lease, heartbeat, pause, cancellation, reclaim, and terminalization paths. Before governed work they compare the complete queue envelope with the group link and the current registered profile. Missing, malformed, contradictory, stale, or profile-mismatched authority terminally fails the task without a provider or tool call. Group `max_parallelism` bounds unfinished initial work across the shared store; `replacement_parallelism` and the group replacement limit bound replacement publication. Before publishing a terminal group transition, the coordinator cancels every idle linked task and keeps the group explicitly nonterminal while a live owner drains a durable child-session interruption. Only the owning worker's terminal task acknowledgement proves remote quiescence; process loss before that proof therefore leaves no terminal group with claimable or unacknowledged sibling work. `ForkGroupResult.dispatch_attempts` projects task status, dispatch status, run epoch, and current lease owner/expiry for SDK callers. `CayuApp.inspect_fork_group(...)` projects the same state without claiming or advancing work. The protected `GET /api/sessions/{source_session_id}/fork-groups/{group_id}` route omits prompts, outputs, and judgment bodies while exposing bounded group, recovery, task, lease, profile, run-epoch, and terminal status. `cayu session fork-group SOURCE_SESSION_ID GROUP_ID --server-url ...` reads that projection, and the packaged `/cayu/` task detail recognizes linked queue rows and displays their group recovery status. There is no second scheduler or worker protocol.
+The caller then submits the same invocation controls with an ordinary
+`DispatchRequest`. `TaskStoreDispatcher.submit(...)` persists a profile-bound queue
+envelope and returns `submitted` after durable admission, before provider execution.
+The `DispatchRequest.dispatch_id` must equal the relationship's
+`initial_dispatch_id`. Any alternate dispatch identity or different first request is
+fenced before queue publication or session-epoch advancement; concurrent retries of
+the exact identity converge on one task. After that first invocation settles, the
+child accepts ordinary later resume and dispatch identities.
+Exact fork retries converge on the same child relationship, and exact dispatch
+retries converge on the same queue task and operation identity. A crash between the
+two calls is closed by retrying both idempotent operations; no cohort record or
+second scheduler is involved.
 
-Application code registers a `ForkGroupGate` under each stable ID and receives the exact `ForkGroupGateSelection` to place in the request. After a candidate session completes successfully, Cayu verifies that the registered handler still exposes the selected implementation identity, then passes it a bounded `ForkGroupGateRequest` containing only the frozen source identity and copied attempt result. Gate handlers return a bounded `ForkGroupGateDecision`; Cayu persists the pass/fail records and never lets a model override them. A missing, changed, throwing, or malformed gate fails the group before evaluation. In `fail-group`, a negative decision also fails immediately. In `evaluate-viable`, a negative decision makes that attempt ineligible and may trigger replacement. Gates are application-owned deterministic checks, not model judges or a security boundary.
-
-Application code registers a `ForkGroupReplacementPlanner` and places its returned selection in an `evaluate-viable` policy. When the viable count is below the declared minimum, Cayu selects failed or gate-ineligible logical slots in request order and sends the planner a stable `ForkGroupReplacementPlannerRequest`. The request identifies the runtime-derived attempt, attempt index, idempotency key, frozen source, and replaced terminal result. The planner supplies only mutation content: messages, optional current-child profile adoption, run and budget limits, structured-output contract, thinking configuration, and declared artifact references. Cayu derives the new session ID, prepares the content through the normal secret and durability boundaries, and binds a digest of that complete prepared request into both the attempt record and child metadata before forking the exact frozen source. Existing-child recovery compares that digest before accepting the session, so changed messages, limits, schemas, profile intent, thinking, or artifact authority conflict instead of reinterpreting the attempt. Cayu also records the runtime-selected child execution-profile fingerprint and reciprocal replacement lineage. A replacement never rewrites or resumes its predecessor. A child-creation failure after profile selection is published immediately as a durable failed group and attempt with its planned session, request digest, source, budget, runtime-selected profile, bounded diagnostic, and predecessor edge; it does not depend on a child session existing or on a later coordinator transition. A rejected or unavailable current-child profile fails replacement preparation before Cayu admits that plan as an attempt, because neither the rejected candidate nor the source profile may be misrepresented as its execution authority. Replaying or concurrently recovering the same graph repeats the stable planner request and converges on the same child authority. The runtime never chooses how an application mutates, breeds, scores, or promotes candidates.
-
-When the policy's eligible-count condition is satisfied, Cayu creates the evaluator as a fresh session on the same causal budget. It derives an internal agent from the registered evaluator but removes all application tools, workflow tool names, runtime hooks, and loop policies. Creation preflights that isolated registration without admitting the evaluator. After branch execution and deterministic gates establish the exact cohort, the coordinator derives the judgment schema exclusively from eligible logical slots, admits the evaluator with that schema, and atomically persists its exact execution-profile fingerprint with `awaiting-evaluation`; restart or continuation fails closed if mutable registrations or the cohort-bound profile would differ. Compatible `fail-group` evaluation retains the size-bounded `cayu.fork-group-evidence.v1` and judgment shape. `evaluate-viable` uses `cayu.fork-group-evidence.v2`: full bounded evidence appears only for eligible attempts, while failed, gate-ineligible, and superseded attempts appear as bounded terminal summaries with lineage and gate results. Neither schema includes source or branch transcripts. The evaluator names logical branch slots only; Cayu resolves each name to that slot's sole eligible attempt, rejects any incomplete or ineligible set, requires exactly one `selected` disposition, and persists the complete attempt-bound dispositions. Failed and superseded slots are absent from the provider-enforced schema and remain structurally unselectable. Runtime-owned source-snapshot and attempt authority is attached only after ordinary workload metadata redaction.
-
-`fail-group` fails closed when any branch is failed, interrupted, invalid, oversized, budget-exhausted, or gate-rejected, preserving all sibling sessions and evidence. `evaluate-viable` preserves every successful sibling and every terminal predecessor while creating at most the declared number of replacements at the declared parallelism. Failure to reach the minimum viable count, replacement or causal-budget exhaustion, invalid evaluator output, missing authority, or malformed evidence fails closed without any disposition or selection. Evaluator failure likewise preserves the complete attempt graph. Extension and planner failures are projected through bounded, secret-redacted diagnostics before entering branch results or the durable group record. `ForkGroupResult` distinguishes terminal attempt outcome, deterministic eligibility, evaluator disposition, replacement lineage, and optional queue execution state; none of those constitutes application-owned promotion, merge, publication, breeding, or deletion. Workspace promotion and remote copy-on-write branches remain separate capabilities.
+Each child is thereafter an ordinary session. Its task claim, lease, heartbeat,
+handoff, interruption, terminal receipt, lost acknowledgement, and restart recovery
+use the generic dispatch and session paths. Parent and siblings have no shared
+completion barrier: one settled child's transcript, terminal event, task, usage,
+artifacts, and inspection projection are immediately available while other children
+remain pending or running. Applications correlate children through parent lineage,
+the exact source snapshot, causal-budget identity, task identity, labels, and
+metadata; application code alone owns joins, evaluation, replacement, and selection.
 
 `ForkSessionRequest` creates a new session branch from an existing `completed`, `failed`, or `interrupted` session without mutating the source. Every child receives one immutable execution-profile baseline. Omitting `execution_profile_selection`, or selecting `INHERIT_PARENT`, copies the parent's effective durable authority exactly, including an explicitly unavailable component: an invocation-bound profile is authoritative while that exact parent invocation remains represented in its checkpoint; otherwise the parent's current expected session profile is authoritative. This selection does not rewrite the parent's immutable creation baseline or its current expected profile. An inherited-prompt partial fork must retain every durable source system message so the copied transcript and inherited baseline cannot diverge. Selecting `CURRENT_CHILD` instead resolves the complete schema-v5 child profile from the current registered agent, provider, environment, policies, hooks, budgets, context controls, tools, model, and prompt body; it requires `ExecutionProfileAdoptionIntent` and an attributable application-policy authorization before any child, transcript, checkpoint, or event mutation. That review is required even when the candidate profile is structurally equal because `CURRENT_CHILD` explicitly chooses current application authority instead of inheriting the parent's frozen authority. The selected child agent may target a different registered provider; every provider change projects the complete portable transcript and calls the target provider's portability preflight even when the model name is unchanged. The provider change and authorization decision are stored atomically with the fork relationship. Agent, model, or environment overrides and `ForkSystemPromptPolicy.CURRENT_AGENT` require this explicit current-child selection. A rejected, malformed, authority-widening, unavailable, or nonportable current-child selection leaves the parent unchanged and creates neither a runnable child nor partial decision evidence. When the caller omits `session_id`, Cayu derives one opaque parent-and-request-scoped child identity from the prepared request so retries and concurrent submissions converge on the same exact fork across key rotation and process restart.
 
 The store atomically persists the child baseline, immutable parent/child profile relationship, accepted decision actor/policy/reason when applicable, and ordered decision-then-`session.forked` evidence. Exact retry, lost-acknowledgement reconciliation, and concurrent delivery use the caller-selected or runtime-derived child ID plus a digest of the complete pre-redaction fork request and converge on that one relationship across in-memory, SQLite, and PostgreSQL stores. When secret-bearing requests are admitted, the digest is derived through the configured durable authority keyring: distinct raw values that share a redacted representation still conflict, while retained authority keys keep exact replay valid during key rotation. A conflicting request or incomplete evidence fails closed. SQLite pruning retains those content-bound fork events while the relationship exists, so exact replay does not depend on otherwise-prunable history. Deleting a terminal parent may clear the surviving child's live parent foreign key, but the immutable relationship retains the original source identity and remains authoritative for the child's creation profile. Child run, resume, approval continuation, and recovery consult the child's own baseline. A later child-profile adoption changes only the child's expected profile and retains its immutable fork baseline; it never changes the parent baseline or retroactively changes which parent invocation authority the fork selected, and exact replay continues to validate against the creation target rather than the child's mutable current provider/model fields.
+
+When exact snapshot exposure replaces a secret-bearing source or causal-budget
+identity with a public alias, that alias is registered durably before it is returned.
+Source-session and causal-budget aliases are unscoped authority; their registry rows
+remain resolvable after terminal source deletion and across restart while the signing
+key remains accepted. Custom stores that opt into public authority aliases must
+support both fields for exact-fork replay.
 
 Custom `SessionStore` implementations participate only by explicitly setting
 `supports_profiled_forks = True` and implementing `create_profiled_fork(...)`.
@@ -2729,9 +2776,11 @@ transaction that copies the transcript/checkpoint, create the child baseline
 and immutable relationship, append the supplied ordered evidence, and return a
 detached `ProfiledSessionForkResult` describing exactly that commit. It must
 bind the actual transcript cursor, checkpoint-copy outcome, prompt-replacement
-mode, and atomic transcript validator to the matching relationship fields; a
-wrapper cannot change or omit one of those controls while retaining the
-runtime-prepared evidence. It must
+mode, and atomic transcript validator to the matching relationship fields. The
+validator receives both the final child transcript and the atomically selected
+source `TranscriptSnapshot`: its permanent cursor and the retained, absolute-indexed
+records selected for the fork before prompt replacement. A wrapper cannot change or
+omit one of those controls while retaining the runtime-prepared evidence. It must
 reconstruct an exact retry from the existing content-bound relationship and
 events without reevaluating policy or current registrations, while a conflict,
 partial prior commit, malformed acknowledgement, or unsupported capability
@@ -2874,6 +2923,22 @@ evidence expose `dispatch_operation_id`,
 records the profile actually admitted. These values are hashes and contain no
 raw private session identity, prompt, schema, tool, provider configuration, or
 secret material.
+
+Ordinary resume requests that do not use `tool_capability_ceiling`,
+`tool_grants`, or `profile_adoption` retain queued-dispatch envelope schema 2
+and the dispatcher's base task namespace. Their canonical wire representation
+omits those schema-3-only fields, so revision-40 workers can continue a safe
+rolling handoff. A request that uses any expanded invocation control advances
+to envelope schema 3 and the reserved `.invocation-controls.v3` namespace
+derived from the configured base task type. Current workers poll both ordinary
+namespaces; revision-40 workers query only the base namespace and therefore
+cannot claim and terminally reject schema-3 authority they do not understand.
+Every resume targeting an exact-fork child advances to envelope schema 4 and the
+reserved `.exact-fork.v4` namespace, including requests whose controls would
+otherwise fit schema 2. Its operation identity binds the child's source-state
+commitment. Current workers poll that namespace; revision-40 workers cannot claim
+these tasks or encounter the child's schema-2 fork relationship. Prepared durable
+children remain in their independently versioned namespace.
 
 Schema revision 40 is a breaking queued-dispatch deployment boundary. Before
 migrating a shared session/task store, stop every revision-39-or-older dispatch
@@ -3897,7 +3962,7 @@ by `cayu.runtime`. Each mutation must also satisfy the store's explicit
 cancellation-quiescence proof; partial capability implementations fail closed at
 the runtime boundary.
 
-Forking from a contracted session remains rejected before child or group
+Forking from a contracted session remains rejected before child
 publication. This slice defines no implicit inherited or replacement contract:
 a future fork entrance must either bind the complete exact lineage before the
 child executes, or accept an explicit superseding contract version only at a

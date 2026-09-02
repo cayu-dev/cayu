@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import mimetypes
 import os
+import traceback as traceback_module
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -135,6 +136,10 @@ from cayu.runtime._event_projection import (
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._execution_profile_identity_validation import (
     copy_secret_free_execution_profile_behavior_identity,
+)
+from cayu.runtime._fork_source_snapshot import (
+    fork_source_checkpoint_projection,
+    fork_source_checkpoint_sha256,
 )
 from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
@@ -363,6 +368,7 @@ from cayu.runtime.sessions import (
     EventQuery,
     EventRecord,
     ForkSessionRequest,
+    ForkSourceSnapshot,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -386,11 +392,13 @@ from cayu.runtime.sessions import (
     SessionRunFenced,
     SessionStatus,
     SessionStore,
+    TranscriptSnapshot,
     _activate_session_interaction,
     _activate_session_run_fence,
     _checkpoint_after_queued_dispatch_acknowledgement,
     _current_session_interaction_id,
     _deactivate_session_run_fence,
+    _fork_source_session_instance_fingerprint,
     _initial_transcript_pending_interaction_id,
     _queued_dispatch_session_instance_fingerprint,
     _queued_dispatch_terminal_receipts_from_checkpoint,
@@ -403,6 +411,8 @@ from cayu.runtime.sessions import (
     copy_model_completion_manual_recovery_request,
     copy_resume_request,
     copy_session,
+    fork_source_transcript_sha256,
+    session_fork_profile_relationship,
     system_prompt_messages_sha256,
 )
 from cayu.runtime.stop_policy import (
@@ -433,7 +443,6 @@ from cayu.runtime.tasks import (
 )
 from cayu.runtime.tool_catalogue import (
     SEARCH_TOOLS_NAME,
-    ToolCatalogSnapshot,
     ToolDescriptor,
     ToolDescriptorProvenance,
     ToolExecutionContract,
@@ -577,17 +586,125 @@ def _work_attempt_recovery_checkpoint_snapshot_sha256(
 
 if TYPE_CHECKING:
     from cayu.evals.runtime_replay import RuntimeReplayReport, RuntimeReplayRequest
-    from cayu.runtime.fork_groups import (
-        ForkGroupGate,
-        ForkGroupGateSelection,
-        ForkGroupReplacementPlanner,
-        ForkGroupReplacementPlannerSelection,
-        ForkGroupRequest,
-        ForkGroupResult,
-    )
 
 
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
+
+
+def _clear_untrusted_exception_traceback(error: BaseException) -> None:
+    """Best-effort frame clearing that cannot replace the public failure."""
+
+    try:
+        exception_traceback = error.__traceback__
+        if exception_traceback is not None:
+            traceback_module.clear_frames(exception_traceback)
+    except BaseException:
+        return
+
+
+def _render_fork_source_snapshot_failure(
+    value: object,
+    *,
+    redactor: SecretRedactor,
+) -> str:
+    """Best-effort public rendering for an untrusted store failure."""
+
+    try:
+        return redactor.redact_text(str(value)).strip()
+    except BaseException as rendering_error:
+        _clear_untrusted_exception_traceback(rendering_error)
+        return ""
+
+
+def _render_fork_source_snapshot_key_failure(
+    error: KeyError,
+    *,
+    redactor: SecretRedactor,
+    fallback: str,
+) -> str:
+    """Render a conventional KeyError argument without trusting its subclass."""
+
+    try:
+        arguments = error.args
+        if len(arguments) == 1 and type(arguments[0]) is str:
+            return _render_fork_source_snapshot_failure(arguments[0], redactor=redactor)
+    except BaseException as rendering_error:
+        _clear_untrusted_exception_traceback(rendering_error)
+    return fallback
+
+
+def _detached_fork_source_snapshot_failure(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> BaseException:
+    """Return a public failure without retaining source authority or store frames."""
+
+    _clear_untrusted_exception_traceback(error)
+    if isinstance(error, asyncio.CancelledError):
+        return asyncio.CancelledError()
+    message = _render_fork_source_snapshot_failure(error, redactor=redactor)
+    if isinstance(error, SessionRunFenced):
+        return SessionRunFenced(message or "Fork source changed during exact snapshot capture.")
+    if isinstance(error, KeyError):
+        key_message = _render_fork_source_snapshot_key_failure(
+            error,
+            redactor=redactor,
+            fallback=message,
+        )
+        return KeyError(key_message or "Fork source session was not found.")
+    if isinstance(error, ValueError):
+        return ValueError(message or "Fork source snapshot authority is invalid.")
+    if isinstance(error, RuntimeError):
+        return RuntimeError(message or "Fork source snapshot failed.")
+    return RuntimeError("Fork source snapshot failed.")
+
+
+def _fork_source_snapshot_from_material(
+    source: Session,
+    checkpoint: dict[str, Any] | None,
+    transcript: TranscriptSnapshot,
+    *,
+    redactor: SecretRedactor,
+) -> ForkSourceSnapshot:
+    """Validate and digest one store-detached fork-source materialization."""
+
+    messages = tuple(record.message for record in transcript.records)
+    checkpoint_projection: dict[str, Any] = {}
+    try:
+        if not session_request_boundary.fork_transcript_is_secret_free(
+            messages,
+            redactor=redactor,
+        ):
+            raise ValueError(
+                "Fork source transcript contains a workload secret and cannot be copied."
+            ) from None
+        checkpoint_projection = fork_source_checkpoint_projection(checkpoint)
+        if not session_request_boundary.fork_checkpoint_is_secret_free(
+            checkpoint_projection,
+            redactor=redactor,
+        ):
+            raise ValueError(
+                "Fork source checkpoint contains a workload secret and cannot be copied."
+            ) from None
+        _, profile, _ = session_request_boundary.prepare_fork_source_execution_profile(
+            source,
+            checkpoint,
+        )
+        return ForkSourceSnapshot(
+            source_session_id=source.id,
+            source_instance_fingerprint=_fork_source_session_instance_fingerprint(source),
+            status=source.status,
+            run_epoch=source.run_epoch,
+            transcript_cursor=transcript.cursor,
+            transcript_sha256=fork_source_transcript_sha256(transcript),
+            checkpoint_sha256=fork_source_checkpoint_sha256(checkpoint),
+            execution_profile_fingerprint=profile.fingerprint,
+            causal_budget_id=source.causal_budget_id,
+        )
+    finally:
+        messages = ()
+        checkpoint_projection.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1204,7 +1321,6 @@ class CayuApp:
         self._mcp_publication_lock = asyncio.Lock()
         self._refreshable_mcp_toolsets: dict[int, McpToolset] = {}
         self._knowledge_publications_sealed = False
-        self._fork_group_evaluator_agents: dict[str, str] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
         self._artifact_store_registrations_by_id: dict[str, _ArtifactStoreRegistration] = {}
@@ -1362,31 +1478,6 @@ class CayuApp:
             load_session_invocation=self.session_invocation_for_dispatch,
             classify_dispatch_settlement=self._queued_dispatch_settlement_state,
             acknowledge_dispatch=self._acknowledge_queued_dispatch,
-        )
-        from cayu.runtime.fork_groups import ForkGroupCoordinator
-
-        self._fork_group_coordinator = ForkGroupCoordinator(
-            session_store=self._runtime_session_store,
-            secret_redactor=self._secret_redactor,
-            clock=self._clock,
-            resolve_public_session_authority=self._resolve_public_session_authority,
-            fork_session=self.fork_session,
-            run_session=self.run,
-            resume_session=self.resume,
-            recover_incomplete_session=self.recover_incomplete_session,
-            get_session_usage=self.get_session_usage,
-            preflight_evaluator_agent=self._preflight_fork_group_evaluator_agent,
-            prepare_evaluator_agent=self._prepare_fork_group_evaluator_agent,
-            preflight_fork_source=self._preflight_ordinary_fork_source,
-            preflight_fork_source_state=(
-                self._session_engine.preflight_fork_source_checkpoint_state
-            ),
-            admit_fork_source=self._admit_ordinary_fork_source,
-            interrupt_session=self._interrupt_session_private,
-            dispatcher=self.dispatcher,
-            task_store=self.task_store,
-            prepare_queued_dispatch=self._prepare_fork_group_queued_dispatch,
-            dispatch_session=self.dispatch,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -1580,6 +1671,38 @@ class CayuApp:
             return self.project_session_id_for_exposure(value)
         return self._secret_redactor.redact_text(value)
 
+    async def _project_fork_source_authority_for_exposure(
+        self,
+        *,
+        source_session_id: str,
+        causal_budget_id: str,
+    ) -> tuple[str, str]:
+        """Durably project exact source authority before public exposure."""
+
+        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
+        causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+        public_source_session_id = self.project_session_id_for_exposure(source_session_id)
+        if public_source_session_id != source_session_id:
+            await self.session_store.register_public_authority_alias(
+                public_source_session_id,
+                field_name="session_id",
+                private_value=source_session_id,
+            )
+        if causal_budget_id == source_session_id:
+            return public_source_session_id, public_source_session_id
+        if self._secret_redactor.redact_text(causal_budget_id) == causal_budget_id:
+            return public_source_session_id, causal_budget_id
+        public_causal_budget_id = self._require_public_authority_alias_codec().encode(
+            causal_budget_id,
+            field_name="causal_budget_id",
+        )
+        await self.session_store.register_public_authority_alias(
+            public_causal_budget_id,
+            field_name="causal_budget_id",
+            private_value=causal_budget_id,
+        )
+        return public_source_session_id, public_causal_budget_id
+
     def project_interaction_id_for_exposure(
         self,
         value: str,
@@ -1673,6 +1796,66 @@ class CayuApp:
 
         private_value, _store_resolved_value = await self._resolve_public_session_authority(value)
         return private_value
+
+    async def _resolve_fork_source_causal_budget_authority(
+        self,
+        value: str,
+        *,
+        source_session_id: str,
+    ) -> tuple[str, str | None]:
+        """Resolve an exact public budget identity against its private fork source."""
+
+        value = require_clean_nonblank(value, "expected_source.causal_budget_id")
+        source_session_id = require_clean_nonblank(source_session_id, "source_session_id")
+        source = await self.session_store.load(source_session_id)
+        if source is None:
+            parsed = parse_public_authority_alias(value)
+            private_value: str | None = None
+            if parsed is not None and parsed.field_name == "causal_budget_id":
+                private_value = await self.session_store.resolve_public_authority_alias(
+                    value,
+                    field_name="causal_budget_id",
+                )
+            elif parsed is not None and parsed.field_name == "session_id":
+                resolved_session_id = await self.session_store.resolve_public_authority_alias(
+                    value,
+                    field_name="session_id",
+                )
+                if resolved_session_id == source_session_id:
+                    private_value = resolved_session_id
+            return (value, None) if private_value is None else (private_value, private_value)
+        if value == source.causal_budget_id:
+            return value, None
+
+        codec = self._public_authority_alias_codec
+        parsed = parse_public_authority_alias(value)
+        matched = bool(
+            codec is not None
+            and parsed is not None
+            and (
+                (
+                    parsed.field_name == "causal_budget_id"
+                    and codec.matches(
+                        value,
+                        source.causal_budget_id,
+                        field_name="causal_budget_id",
+                    )
+                )
+                or (
+                    source.causal_budget_id == source.id
+                    and parsed.field_name == "session_id"
+                    and codec.matches(
+                        value,
+                        source.causal_budget_id,
+                        field_name="session_id",
+                    )
+                )
+            )
+        )
+        private_value = source.causal_budget_id if matched else value
+        store_resolved_value = source.causal_budget_id if matched else None
+        del source
+        return private_value, store_resolved_value
 
     async def _resolve_public_causal_budget_id(self, value: str) -> str:
         """Disambiguate raw causal-budget authority from a public session alias."""
@@ -2532,218 +2715,6 @@ class CayuApp:
             raise
         del reference, resolver
         return registered
-
-    def register_fork_group_gate(
-        self,
-        gate_id: str,
-        gate: ForkGroupGate,
-    ) -> ForkGroupGateSelection:
-        """Register one application-owned deterministic fork-group gate."""
-
-        return self._fork_group_coordinator.register_gate(gate_id, gate)
-
-    def register_fork_group_replacement_planner(
-        self,
-        planner_id: str,
-        planner: ForkGroupReplacementPlanner,
-    ) -> ForkGroupReplacementPlannerSelection:
-        """Register one application-owned idempotent replacement planner."""
-
-        return self._fork_group_coordinator.register_replacement_planner(
-            planner_id,
-            planner,
-        )
-
-    def _fork_group_evaluator_agent_state(
-        self,
-        *,
-        source_agent_name: str,
-        synthetic_agent_name: str,
-        request_sha256: str,
-    ) -> tuple[runtime_records.RegisteredAgentState, bool]:
-        """Build or validate an isolated evaluator registration without publishing it."""
-
-        original = self._get_registered_agent(source_agent_name)
-        existing = self._agents.get(synthetic_agent_name)
-        if existing is not None:
-            if self._fork_group_evaluator_agents.get(synthetic_agent_name) != request_sha256:
-                raise RuntimeError(
-                    "Fork-group evaluator registration collides with application state."
-                )
-            if (
-                existing.tools
-                or existing.tool_catalogue.descriptors
-                or existing.tool_capabilities
-                or existing.hosted_tools
-                or existing.spec.workflow_tool_names
-                or existing.runtime_hooks
-                or existing.loop_policies
-            ):
-                raise RuntimeError(
-                    "Fork-group evaluator registration is not structurally isolated."
-                )
-            return existing, True
-        evaluator_context_policy = DefaultContextPolicy()
-        empty_tool_catalogue = ToolCatalogSnapshot(descriptor_count=0)
-        return (
-            runtime_records.RegisteredAgentState(
-                spec=original.spec.model_copy(
-                    update={
-                        "name": synthetic_agent_name,
-                        "workflow_tool_names": (),
-                        "metadata": {},
-                        "provider_options": {},
-                    },
-                    deep=True,
-                ),
-                tools=MappingProxyType({}),
-                runtime_tools=MappingProxyType({}),
-                tool_catalogue=empty_tool_catalogue,
-                tool_capabilities=(),
-                all_registered_tool_exposure=ResolvedToolExposure(
-                    profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
-                    catalogue_revision=empty_tool_catalogue.revision,
-                    tools=(),
-                    registered_count=0,
-                    ceiling_count=0,
-                ),
-                tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
-                tool_exposure_policy_execution_profile_identity=None,
-                targeted_tool_mode=None,
-                tool_discovery_mode=None,
-                context_policy=evaluator_context_policy,
-                context_policy_execution_profile_identity=(
-                    copy_secret_free_execution_profile_behavior_identity(
-                        evaluator_context_policy.execution_profile_identity,
-                        redactor=self._secret_redactor,
-                        field_name="context_policy.execution_profile_identity",
-                    )
-                ),
-                hosted_tools=(),
-                context_overflow_policy=None,
-                context_overflow_policy_execution_profile_identity=None,
-                tool_policy=AllowAllToolPolicy(),
-                tool_policy_execution_profile_identity=None,
-                runtime_hooks=(),
-                loop_policies=(),
-                loop_policy_execution_profile_identities=(),
-                execution_requirements=ExecutionRequirements.trusted(),
-                context_behavior_execution_profile_identities=(
-                    _snapshot_context_behavior_execution_profile_identities(
-                        evaluator_context_policy,
-                        None,
-                        redactor=self._secret_redactor,
-                    )
-                ),
-                registration_source=original.registration_source,
-                registration_symbol=original.registration_symbol,
-            ),
-            False,
-        )
-
-    def _register_fork_group_evaluator_agent(
-        self,
-        *,
-        source_agent_name: str,
-        synthetic_agent_name: str,
-        request_sha256: str,
-    ) -> str:
-        """Own one runtime-generated, structurally isolated evaluator registration."""
-
-        evaluator_agent, already_registered = self._fork_group_evaluator_agent_state(
-            source_agent_name=source_agent_name,
-            synthetic_agent_name=synthetic_agent_name,
-            request_sha256=request_sha256,
-        )
-        if already_registered:
-            return synthetic_agent_name
-        self._agents[synthetic_agent_name] = evaluator_agent
-        self._fork_group_evaluator_agents[synthetic_agent_name] = request_sha256
-        return synthetic_agent_name
-
-    def _ensure_fork_group_task_evaluator_environment(self, request: RunRequest) -> None:
-        """Materialize the provider-only environment shared by task workers."""
-
-        from cayu.runtime.fork_groups import _FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT
-
-        if request.environment_name != _FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT:
-            return
-        expected_spec = EnvironmentSpec(
-            name=_FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT,
-            execution_profile_identity=ExecutionProfileBehaviorIdentity(
-                name="cayu:fork-group-task-evaluator-environment",
-                behavior_version="1",
-                implementation_version="1",
-            ),
-        )
-        registered = self._environments.get(_FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT)
-        if registered is None:
-            self.register_environment(Environment(expected_spec))
-            return
-        environment = registered.environment
-        if (
-            registered.spec != expected_spec
-            or registered.factory is not None
-            or environment.workspace is not None
-            or environment.runner is not None
-            or environment.vault is not None
-            or environment.proxy is not None
-            or environment.mcp_servers
-            or environment.workspace_instructions is not None
-        ):
-            raise RuntimeError(
-                "Fork-group task evaluator environment conflicts with runtime authority."
-            )
-
-    async def _preflight_fork_group_evaluator_agent(
-        self,
-        request: RunRequest,
-        source_agent_name: str,
-        request_sha256: str,
-    ) -> tuple[str, str]:
-        """Validate evaluator authority without registration or ordinary admission."""
-
-        self._ensure_fork_group_task_evaluator_environment(request)
-        evaluator_agent, _ = self._fork_group_evaluator_agent_state(
-            source_agent_name=source_agent_name,
-            synthetic_agent_name=request.agent_name,
-            request_sha256=request_sha256,
-        )
-        prepared = await self._session_engine._prepare_initial_run(
-            request,
-            registered_agent_override=evaluator_agent,
-            admit_session=False,
-        )
-        if prepared is None:
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
-        return request.agent_name, prepared.execution_profile.fingerprint
-
-    async def _prepare_fork_group_evaluator_agent(
-        self,
-        request: RunRequest,
-        source_agent_name: str,
-        request_sha256: str,
-        store_resolved_existing_session_id: str | None,
-    ) -> tuple[str, str]:
-        """Freeze the exact tool-free evaluator profile before durable admission."""
-
-        self._ensure_fork_group_task_evaluator_environment(request)
-        synthetic_name = self._register_fork_group_evaluator_agent(
-            source_agent_name=source_agent_name,
-            synthetic_agent_name=request.agent_name,
-            request_sha256=request_sha256,
-        )
-        prepared = await self._session_engine._prepare_initial_run(
-            request,
-            store_resolved_existing_session_id=store_resolved_existing_session_id,
-        )
-        if prepared is None:
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
-        return synthetic_name, prepared.execution_profile.fingerprint
 
     def register_provider(
         self,
@@ -5081,24 +5052,16 @@ class CayuApp:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
+        fork_relationship = session_fork_profile_relationship(session)
         return _new_queued_dispatch_envelope(
             queue_task_id=queue_task_id,
             request=durable_request,
             session_instance_fingerprint=(_queued_dispatch_session_instance_fingerprint(session)),
             source_profile=source_profile,
             required_profile=required_profile,
-        )
-
-    async def _prepare_fork_group_queued_dispatch(
-        self,
-        request: DispatchRequest,
-        queue_task_id: str,
-    ) -> _QueuedDispatchEnvelope:
-        """Bind group linkage before the corresponding queue task is claimable."""
-
-        return await self._prepare_queued_dispatch(
-            request,
-            queue_task_id=queue_task_id,
+            exact_fork_source_state_sha256=(
+                None if fork_relationship is None else fork_relationship.source_state_sha256
+            ),
         )
 
     async def _queued_dispatch_requests_match(
@@ -5275,21 +5238,6 @@ class CayuApp:
             )
         return session.run_epoch > terminal_run_epoch
 
-    async def _require_queued_fork_group_authority(
-        self,
-        envelope: _QueuedDispatchEnvelope,
-    ) -> bool:
-        """Translate a durable group contradiction into permanent queue rejection."""
-
-        from cayu.runtime.fork_groups import ForkGroupConflict
-
-        try:
-            return await self._fork_group_coordinator.require_dispatch_authority(envelope)
-        except ForkGroupConflict as exc:
-            raise _QueuedDispatchAuthorityRejected(
-                "Queued fork-group dispatch authority was rejected."
-            ) from exc
-
     async def _queued_dispatch_settlement_state(
         self,
         envelope: _QueuedDispatchEnvelope,
@@ -5301,7 +5249,6 @@ class CayuApp:
             await self._durable_subagent_coordinator.require_prepared_subagent_parent_authority(
                 envelope
             )
-        await self._require_queued_fork_group_authority(envelope)
         private_session_id, _ = await self._resolve_public_session_authority(
             envelope.request.session_id
         )
@@ -5326,6 +5273,7 @@ class CayuApp:
             raise _QueuedDispatchAuthorityRejected(
                 "Queued dispatch target session instance changed."
             )
+        self._require_queued_dispatch_fork_protocol(session, envelope)
         try:
             run_operation = _session_run_operation_from_checkpoint(checkpoint)
             receipts = _queued_dispatch_terminal_receipts_from_checkpoint(checkpoint)
@@ -5401,6 +5349,36 @@ class CayuApp:
             )
         return _QueuedDispatchSettlement(_QueuedDispatchSettlementState.NOT_ADMITTED)
 
+    @staticmethod
+    def _require_queued_dispatch_fork_protocol(
+        session: Session,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> None:
+        """Bind the queue protocol to the target's immutable fork relationship."""
+
+        try:
+            relationship = session_fork_profile_relationship(session)
+        except (TypeError, ValueError) as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch target fork relationship is malformed."
+            ) from exc
+        expected_source_state_sha256 = (
+            None if relationship is None else relationship.source_state_sha256
+        )
+        if envelope.exact_fork_source_state_sha256 != expected_source_state_sha256:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch protocol conflicts with its target fork relationship."
+            )
+        if (
+            session.run_epoch == 0
+            and relationship is not None
+            and relationship.initial_dispatch_id is not None
+            and envelope.request.dispatch_id != relationship.initial_dispatch_id
+        ):
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued dispatch identity conflicts with the target fork's first invocation."
+            )
+
     async def _dispatch_queued(
         self,
         envelope: _QueuedDispatchEnvelope,
@@ -5409,7 +5387,6 @@ class CayuApp:
 
         envelope = _copy_queued_dispatch_envelope(envelope)
         request = envelope.request
-        fork_group_terminal = await self._require_queued_fork_group_authority(envelope)
         (
             private_session_id,
             store_resolved_session_id,
@@ -5429,6 +5406,7 @@ class CayuApp:
             raise _QueuedDispatchAuthorityRejected(
                 "Queued dispatch target session instance changed."
             )
+        self._require_queued_dispatch_fork_protocol(session, envelope)
         replay_event = await self._load_queued_dispatch_terminal_event(
             private_session_id=private_session_id,
             envelope=envelope,
@@ -5445,11 +5423,6 @@ class CayuApp:
                 )
             yield await self._project_emitted_event_for_public_api(replay_event)
             return
-        if fork_group_terminal:
-            raise _QueuedDispatchAuthorityRejected(
-                "Fork-group terminalization revoked this unfinished dispatch attempt."
-            )
-
         try:
             self._get_registered_agent(session.agent_name)
             self._get_registered_provider(
@@ -5516,6 +5489,9 @@ class CayuApp:
             session_id=request.session_id,
             messages=request.messages,
             target=request.target,
+            tool_capability_ceiling=request.tool_capability_ceiling,
+            tool_grants=request.tool_grants,
+            profile_adoption=request.profile_adoption,
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,
@@ -5561,6 +5537,7 @@ class CayuApp:
             run_operation_id=dispatch_operation_id,
             terminal_event_id=dispatch_terminal_event_id,
             queue_task_id=queue_task_id,
+            queued_dispatch_id=(None if dispatch_operation_id is None else request.dispatch_id),
         )
         async with _close_delegated_event_stream(session_stream) as owned_stream:
             forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -6330,6 +6307,9 @@ class CayuApp:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
         source_session_id: str | None = None
         store_resolved_source_session_id: str | None = None
+        store_resolved_expected_source_causal_budget_id: str | None = None
+        expected_source_causal_budget_id: str | None = None
+        expected_source: ForkSourceSnapshot | None = None
         private_request: ForkSessionRequest | None = None
         events: tuple[Event, ...] | None = None
         try:
@@ -6337,36 +6317,136 @@ class CayuApp:
                 source_session_id,
                 store_resolved_source_session_id,
             ) = await self._resolve_public_session_authority(request.source_session_id)
+            expected_source = request.expected_source
+            if expected_source is not None:
+                (
+                    expected_source_causal_budget_id,
+                    store_resolved_expected_source_causal_budget_id,
+                ) = await self._resolve_fork_source_causal_budget_authority(
+                    expected_source.causal_budget_id,
+                    source_session_id=source_session_id,
+                )
+                expected_source = expected_source.model_copy(
+                    update={
+                        "source_session_id": source_session_id,
+                        "causal_budget_id": expected_source_causal_budget_id,
+                    },
+                    deep=True,
+                )
             private_request = request.model_copy(
-                update={"source_session_id": source_session_id},
+                update={
+                    "source_session_id": source_session_id,
+                    "expected_source": expected_source,
+                },
                 deep=True,
             )
             events = await self._collect_public_fork_events(
                 private_request,
                 store_resolved_source_session_id=store_resolved_source_session_id,
+                store_resolved_expected_source_causal_budget_id=(
+                    store_resolved_expected_source_causal_budget_id
+                ),
             )
         finally:
             del request
             source_session_id = store_resolved_source_session_id = None
+            store_resolved_expected_source_causal_budget_id = None
+            expected_source_causal_budget_id = None
+            expected_source = None
             private_request = None
         if events is None:
             raise RuntimeError("Session fork ended without events or a failure.")
         for event in events:
             yield event
 
-    async def run_fork_group(self, request: ForkGroupRequest) -> ForkGroupResult:
-        """Run or reconstruct one bounded durable fork group."""
+    async def snapshot_fork_source(self, source_session_id: str) -> ForkSourceSnapshot:
+        """Return exact public authority for one currently safe fork source."""
 
-        return await self._fork_group_coordinator.run_group(request)
-
-    async def inspect_fork_group(
-        self,
-        source_session_id: str,
-        group_id: str,
-    ) -> ForkGroupResult | None:
-        """Inspect a durable fork group without claiming or advancing its work."""
-
-        return await self._fork_group_coordinator.inspect_group(source_session_id, group_id)
+        private_session_id = ""
+        source: Session | None = None
+        checkpoint: dict[str, Any] | None = None
+        transcript: TranscriptSnapshot | None = None
+        snapshot: ForkSourceSnapshot | None = None
+        current_source: Session | None = None
+        current_checkpoint: dict[str, Any] | None = None
+        current_transcript: TranscriptSnapshot | None = None
+        current: ForkSourceSnapshot | None = None
+        result: ForkSourceSnapshot | None = None
+        public_source_session_id = ""
+        public_causal_budget_id = ""
+        failure: BaseException | None = None
+        try:
+            private_session_id, _ = await self._resolve_public_session_authority(source_session_id)
+            await self._preflight_ordinary_fork_source(private_session_id)
+            source, checkpoint = await load_runtime_session_checkpoint_snapshot(
+                self._runtime_session_store,
+                private_session_id,
+            )
+            await self._session_engine.preflight_fork_source_checkpoint_state(source, checkpoint)
+            transcript = await self.session_store.load_transcript_snapshot(private_session_id)
+            snapshot = _fork_source_snapshot_from_material(
+                source,
+                checkpoint,
+                transcript,
+                redactor=self._secret_redactor,
+            )
+            # A terminal source may be resumed concurrently with inspection. Re-read all
+            # asserted material and fail closed instead of returning a mixed snapshot.
+            current_source, current_checkpoint = await load_runtime_session_checkpoint_snapshot(
+                self._runtime_session_store,
+                private_session_id,
+            )
+            await self._session_engine.preflight_fork_source_checkpoint_state(
+                current_source,
+                current_checkpoint,
+            )
+            current_transcript = await self.session_store.load_transcript_snapshot(
+                private_session_id
+            )
+            current = _fork_source_snapshot_from_material(
+                current_source,
+                current_checkpoint,
+                current_transcript,
+                redactor=self._secret_redactor,
+            )
+            if current != snapshot:
+                raise SessionRunFenced("Fork source changed while its exact snapshot was captured.")
+            (
+                public_source_session_id,
+                public_causal_budget_id,
+            ) = await self._project_fork_source_authority_for_exposure(
+                source_session_id=private_session_id,
+                causal_budget_id=snapshot.causal_budget_id,
+            )
+            result = snapshot.model_copy(
+                update={
+                    "source_session_id": public_source_session_id,
+                    "causal_budget_id": public_causal_budget_id,
+                },
+                deep=True,
+            )
+        except (asyncio.CancelledError, Exception) as exc:
+            failure = _detached_fork_source_snapshot_failure(
+                exc,
+                redactor=self._secret_redactor,
+            )
+        finally:
+            source_session_id = private_session_id = ""
+            source = current_source = None
+            if type(checkpoint) is dict:
+                checkpoint.clear()
+            checkpoint = None
+            if type(current_checkpoint) is dict:
+                current_checkpoint.clear()
+            current_checkpoint = None
+            transcript = current_transcript = None
+            snapshot = current = None
+            public_source_session_id = public_causal_budget_id = ""
+        if failure is not None:
+            raise failure from None
+        if result is None:  # pragma: no cover - defensive totality guard
+            raise AssertionError("Fork source snapshot capture returned no result.")
+        return result
 
     async def _fork_session_from_runtime_context(
         self,
@@ -6408,6 +6488,7 @@ class CayuApp:
         request: ForkSessionRequest,
         *,
         store_resolved_source_session_id: str | None,
+        store_resolved_expected_source_causal_budget_id: str | None = None,
     ) -> tuple[Event, ...]:
         """Detach fork-authority failures before they cross the public boundary."""
 
@@ -6426,10 +6507,12 @@ class CayuApp:
             except ValueError as exc:
                 failure = ValueError(str(exc))
             if failure is None:
-                await self._preflight_ordinary_fork_source(request.source_session_id)
                 stream = self._fork_session_private(
                     request,
                     store_resolved_source_session_id=store_resolved_source_session_id,
+                    store_resolved_expected_source_causal_budget_id=(
+                        store_resolved_expected_source_causal_budget_id
+                    ),
                 )
                 async with _close_delegated_event_stream(stream) as owned_stream:
                     async for event in owned_stream:
@@ -6445,6 +6528,7 @@ class CayuApp:
         finally:
             del request
             store_resolved_source_session_id = None
+            store_resolved_expected_source_causal_budget_id = None
             stream = owned_stream = None
         if failure is not None:
             projected_events.clear()
@@ -6457,17 +6541,12 @@ class CayuApp:
             admit_session=False,
         )
 
-    async def _admit_ordinary_fork_source(self, session_id: str) -> None:
-        await self._session_engine._require_ordinary_session_execution(
-            session_id,
-            admit_session=True,
-        )
-
     async def _fork_session_private(
         self,
         request: ForkSessionRequest,
         *,
         store_resolved_source_session_id: str | None = None,
+        store_resolved_expected_source_causal_budget_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
@@ -6476,6 +6555,9 @@ class CayuApp:
             redactor=self._secret_redactor,
             public_authority_alias_codec=self._public_authority_alias_codec,
             store_resolved_source_session_id=store_resolved_source_session_id,
+            store_resolved_expected_source_causal_budget_id=(
+                store_resolved_expected_source_causal_budget_id
+            ),
         )
         del request
         stream = self._session_engine.fork_session(

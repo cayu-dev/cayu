@@ -68,6 +68,7 @@ from cayu.runtime import (
     CayuApp,
     ExecutionProfileComponentClass,
     ExecutionProfileMismatchError,
+    ForkSessionRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionsRecoveryRequest,
@@ -1654,6 +1655,55 @@ async def assert_provider_resolution_process_loss_recovery(
     assert provider.adapter.start_calls == (
         1 if action is ProviderOperationResolutionAction.FALLBACK_RETRY else 0
     )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        ProviderOperationResolutionAction.FALLBACK_RETRY,
+        ProviderOperationResolutionAction.FAIL,
+    ],
+)
+def test_fork_rejects_accepted_provider_resolution_pending_recovery(
+    action: ProviderOperationResolutionAction,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        source_session_id, provider = await stage_provider_resolution_process_loss(
+            store,
+            action=action,
+            after_status_transition=False,
+        )
+        pending = await load_pending_provider_operation_disposition(store, source_session_id)
+        assert pending is not None
+
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        rejection = "accepted provider-operation resolution pending"
+
+        with pytest.raises(RuntimeError, match=rejection):
+            await app.snapshot_fork_source(source_session_id)
+
+        child_session_id = f"{source_session_id}-fork"
+        with pytest.raises(RuntimeError, match=rejection):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=source_session_id,
+                        session_id=child_session_id,
+                    )
+                )
+            ]
+        assert await store.load(child_session_id) is None
+
+        assert (
+            await load_pending_provider_operation_disposition(store, source_session_id) == pending
+        )
+        assert provider.adapter.start_calls == 0
+
+    asyncio.run(scenario())
 
 
 async def _commit_partial_provider_progress(

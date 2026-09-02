@@ -105,6 +105,8 @@ from cayu.runtime._environment_allocation import (
     DurableEnvironmentAllocationContext,
     EnvironmentAllocationCoordinator,
     EnvironmentAllocationReceipt,
+    environment_allocation_parent_session_id,
+    environment_allocation_source_owner_session_id,
 )
 from cayu.runtime._environment_allocation import (
     environment_factory_checkpoint_may_be_committed as _environment_factory_checkpoint_may_be_committed,
@@ -1142,6 +1144,11 @@ class EnvironmentLifecycle:
         allocation_checkpoint_may_be_committed = False
         effective_operation = operation
         try:
+            parent_session_id = environment_allocation_parent_session_id(session)
+            source_allocation_owner_session_id = environment_allocation_source_owner_session_id(
+                session,
+                environment_name=environment_name,
+            )
             checkpoint = await self._session_store.load_checkpoint(session.id)
             reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
                 checkpoint,
@@ -1185,7 +1192,7 @@ class EnvironmentLifecycle:
                     None if execution_profile is None else execution_profile.fingerprint
                 ),
                 operation=effective_operation,
-                parent_session_id=session.parent_session_id,
+                parent_session_id=parent_session_id,
                 causal_budget_id=session.causal_budget_id,
                 labels=session.labels,
                 metadata=session_user_metadata(session.metadata),
@@ -1254,7 +1261,7 @@ class EnvironmentLifecycle:
                 else:
                     allocation_context = self._allocation_coordinator.context(
                         session_id=session.id,
-                        parent_session_id=session.parent_session_id,
+                        inherited_owner_session_id=source_allocation_owner_session_id,
                         environment_name=environment_name,
                         scope=allocation_scope,
                         existing=allocation_record,
@@ -4073,7 +4080,7 @@ def _environment_factory_base_payload(
     return {
         "factory_type": type(factory).__name__,
         "requested_environment_name": environment_name,
-        "parent_session_id": session.parent_session_id,
+        "parent_session_id": environment_allocation_parent_session_id(session),
         "causal_budget_id": session.causal_budget_id,
         "labels": copy_label_map(session.labels, "labels"),
     }

@@ -36,7 +36,7 @@ contributor surfaces, not miscellaneous snippets:
 examples/
   ADVANCED_RUNTIME_EXAMPLES.md
   _advanced_support/
-  bounded_fork_group/
+  asynchronous_session_forks/
   cache_aware_research_council/
   counterfactual_approval/
   prompt_cache_compaction/

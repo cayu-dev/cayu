@@ -601,7 +601,8 @@ class _CorruptPreparedDispatchRequestStore(InMemoryTaskStore):
         request["max_steps"] = 1 if current_max_steps is None else int(current_max_steps) + 1
         dispatch["request"] = request
         dispatch["request_sha256"] = _queued_dispatch_request_sha256(
-            DispatchRequest.model_validate(request)
+            DispatchRequest.model_validate(request),
+            schema_version=dispatch["schema_version"],
         )
         return task.model_copy(update={"input": copied_input}, deep=True)
 

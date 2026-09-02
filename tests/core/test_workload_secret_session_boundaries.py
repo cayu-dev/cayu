@@ -23,6 +23,7 @@ from cayu.runtime import (
     ExecutionProfileAdoptionIntent,
     ForkExecutionProfileSelection,
     ForkSessionRequest,
+    ForkSourceSnapshot,
     InMemorySessionStore,
     InterruptSessionRequest,
     InvocationOriginClaim,
@@ -70,6 +71,37 @@ def _current_fork_profile_selection(idempotency_key: str) -> dict[str, object]:
             ),
         ),
     }
+
+
+def test_fork_rejects_secret_bearing_initial_dispatch_authority() -> None:
+    secret = "fork-initial-dispatch-secret"
+    child_session_id = "fork-initial-dispatch-child"
+    request = ForkSessionRequest(
+        source_session_id="fork-initial-dispatch-source",
+        session_id=child_session_id,
+        expected_source=ForkSourceSnapshot(
+            source_session_id="fork-initial-dispatch-source",
+            source_instance_fingerprint="1" * 64,
+            status=SessionStatus.COMPLETED,
+            run_epoch=1,
+            transcript_cursor=1,
+            transcript_sha256="2" * 64,
+            checkpoint_sha256="3" * 64,
+            execution_profile_fingerprint="4" * 64,
+            causal_budget_id="fork-initial-dispatch-budget",
+        ),
+        initial_invocation=ResumeRequest(
+            session_id=child_session_id,
+            messages=[Message.text("user", "run child")],
+        ),
+        initial_dispatch_id=f"dispatch-{secret}",
+    )
+
+    with pytest.raises(ValueError, match="initial_dispatch_id"):
+        prepare_fork_session_request(
+            request,
+            redactor=SecretRedactor(secret),
+        )
 
 
 def test_runtime_attested_subagent_lineage_survives_short_secret_collision() -> None:
@@ -420,6 +452,115 @@ def test_public_alias_for_exact_secret_source_rejects_before_fork_mutation() -> 
 
         assert await store.load("fork-child") is None
         assert await store.load(source.id) is not None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("secret_location", "message_pattern"),
+    (
+        ("transcript", "transcript contains a workload secret"),
+        ("checkpoint", "checkpoint contains a workload secret"),
+    ),
+)
+def test_fork_source_snapshot_rejection_detaches_secret_traceback_state(
+    secret_location: str,
+    message_pattern: str,
+) -> None:
+    secret = f"snapshot-{secret_location}-traceback-secret"
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"snapshot-{secret_location}-source",
+                messages=[Message.text("user", "safe source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        if secret_location == "transcript":
+            await store.append_transcript_messages(
+                source.id,
+                [Message.text("user", secret)],
+            )
+        if secret_location == "checkpoint":
+            await store.checkpoint(
+                source.id,
+                {"application_checkpoint": {"private": secret}},
+            )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(ValueError, match=message_pattern) as exc_info:
+            await app.snapshot_fork_source(source.id)
+
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        _assert_secret_absent_from_cayu_exception(exc_info.value, secret)
+        assert await store.load(source.id) is not None
+
+    asyncio.run(run())
+
+
+def test_fork_source_snapshot_failure_survives_hostile_exception_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "hostile-snapshot-store-secret"
+
+    class HostileStoreError(ValueError):
+        def __str__(self) -> str:
+            raise RuntimeError("hostile exception renderer failed")
+
+        def __repr__(self) -> str:
+            return f"HostileStoreError({secret!r})"
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        source = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="hostile-snapshot-source",
+                messages=[Message.text("user", "safe source")],
+                tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def reject_transcript_snapshot(_session_id: str):
+            raise HostileStoreError()
+
+        monkeypatch.setattr(store, "load_transcript_snapshot", reject_transcript_snapshot)
+
+        with pytest.raises(
+            ValueError, match="Fork source snapshot authority is invalid"
+        ) as exc_info:
+            await app.snapshot_fork_source(source.id)
+
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        _assert_secret_absent_from_cayu_exception(exc_info.value, secret)
 
     asyncio.run(run())
 

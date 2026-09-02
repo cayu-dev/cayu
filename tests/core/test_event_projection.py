@@ -32,6 +32,7 @@ from cayu.core.events import (
     event_with_durable_sequence,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
+    event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
 from cayu.core.tools import ToolEffect
@@ -1053,6 +1054,61 @@ def test_runtime_envelope_authority_survives_short_secret_collisions_only_with_p
     )
     with pytest.raises(ValueError, match=r"event\.session_id"):
         prepare_new_runtime_event(event, redactor=SecretRedactor("-"))
+
+
+def test_fork_initial_invocation_authority_survives_secret_digest_collisions() -> None:
+    request_sha256 = "a" * 64
+    profile_fingerprint = "b" * 64
+    dispatch_id = "fork-id-xyz"
+    event = event_with_runtime_payload_authority(
+        Event(
+            type=EventType.SESSION_FORKED,
+            session_id="fork-child",
+            payload={
+                "initial_dispatch_id": dispatch_id,
+                "initial_invocation_request_sha256": request_sha256,
+                "initial_invocation_profile_fingerprint": profile_fingerprint,
+            },
+        ),
+        "initial_dispatch_id",
+        "initial_invocation_request_sha256",
+        "initial_invocation_profile_fingerprint",
+    )
+    redactor = SecretRedactor(["a", "b"])
+
+    prepared = prepare_new_runtime_event(event, redactor=redactor)
+    public = _project_runtime_event(prepared, sequence=1, redactor=redactor)
+
+    assert prepared.payload["initial_invocation_request_sha256"] == request_sha256
+    assert prepared.payload["initial_invocation_profile_fingerprint"] == profile_fingerprint
+    assert public.payload["initial_dispatch_id"] == dispatch_id
+    assert "initial_invocation_request_sha256" not in public.payload
+    assert "initial_invocation_profile_fingerprint" not in public.payload
+
+
+def test_fork_allocation_owner_evidence_is_exact_private_authority() -> None:
+    evidence = [
+        {
+            "environment_name": "env-one",
+            "owner_session_id": "ancestor-session",
+        }
+    ]
+    event = event_with_runtime_nested_payload_authority(
+        Event(
+            type=EventType.SESSION_FORKED,
+            session_id="forkchild",
+            payload={"source_environment_allocation_owners": evidence},
+        ),
+        ("source_environment_allocation_owners", "*", "environment_name"),
+        ("source_environment_allocation_owners", "*", "owner_session_id"),
+    )
+    redactor = SecretRedactor("-")
+
+    prepared = prepare_new_runtime_event(event, redactor=redactor)
+    public = _project_runtime_event(prepared, sequence=1, redactor=redactor)
+
+    assert prepared.payload["source_environment_allocation_owners"] == evidence
+    assert "source_environment_allocation_owners" not in public.payload
 
 
 def test_runtime_envelope_authority_is_not_acquired_by_deserialization() -> None:

@@ -3691,7 +3691,7 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError("transcript_cursor is greater than source transcript length.")
                 selected_transcript_rows = self._connection.execute(
                     """
-                    SELECT message_json, interaction_id
+                    SELECT session_order, message_json, interaction_id
                     FROM cayu_transcript_messages
                     WHERE session_id = ?
                       AND session_order <= ?
@@ -3710,16 +3710,37 @@ class SQLiteSessionStore(SessionStore):
                     Message(**json.loads(row["message_json"])) for row in selected_transcript_rows
                 ]
                 copied_interaction_ids = [row["interaction_id"] for row in selected_transcript_rows]
+                source_transcript_snapshot = (
+                    None
+                    if transcript_validator is None
+                    else TranscriptSnapshot(
+                        records=[
+                            TranscriptRecord(
+                                index=int(row["session_order"]) - 1,
+                                interaction_id=row["interaction_id"],
+                                message=copied_messages[position],
+                            )
+                            for position, row in enumerate(selected_transcript_rows)
+                        ],
+                        cursor=source_transcript_cursor,
+                    )
+                )
                 selected_transcript_rows.clear()
                 copied_messages, copied_interaction_ids = apply_fork_system_prompt_replacement(
                     copied_messages,
                     copied_interaction_ids,
                     system_prompt_replacement,
                 )
-                if not fork_transcript_is_accepted(copied_messages, transcript_validator):
+                if not fork_transcript_is_accepted(
+                    copied_messages,
+                    source_transcript_snapshot,
+                    transcript_validator,
+                ):
                     copied_messages.clear()
                     copied_messages = []
+                    source_transcript_snapshot = None
                     raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
+                source_transcript_snapshot = None
                 copied_checkpoint = None
                 if checkpoint_transform is not None:
                     checkpoint_input = source_checkpoint

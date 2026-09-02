@@ -972,9 +972,10 @@ PROMPT_ANATOMY_TRANSITION_METADATA_KEY = "cayu:prompt_anatomy_transition"
 PROMPT_ANATOMY_TRANSITION_RECORD_TYPE = "cayu.prompt-anatomy-transition"
 PROMPT_ANATOMY_TRANSITION_SCHEMA_VERSION = 1
 FORK_EXECUTION_PROFILE_METADATA_KEY = "cayu:fork_execution_profile"
-FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_group_source_snapshot"
+FORK_SOURCE_SNAPSHOT_METADATA_KEY = "cayu:fork_source_snapshot"
 FORK_EXECUTION_PROFILE_RECORD_TYPE = "cayu.session-fork-execution-profile"
-FORK_EXECUTION_PROFILE_SCHEMA_VERSION = 1
+FORK_EXECUTION_PROFILE_ORDINARY_SCHEMA_VERSION = 1
+FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION = 2
 SESSION_CREATE_CLAIM_METADATA_KEY = "cayu:session_create_claim"
 RUNTIME_BUILD_PROVENANCE_METADATA_KEY = "cayu:runtime_build_provenance"
 SESSION_CREATE_CLAIM_RECORD_TYPE = "cayu.session-create-claim"
@@ -2507,19 +2508,74 @@ class ForkExecutionProfileSource(StrEnum):
     ACTIVE_INVOCATION = "active_invocation"
 
 
-@dataclass(frozen=True, slots=True)
-class _ForkSourceSnapshotExpectation:
-    run_epoch: int
-    transcript_cursor: int
+class ForkSourceSnapshot(BaseModel):
+    """Exact, caller-visible authority for one safe session-fork source."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    source_session_id: str
+    source_instance_fingerprint: str
+    status: SessionStatus
+    run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    transcript_cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     transcript_sha256: str
     checkpoint_sha256: str
-    profile_fingerprint: str
+    execution_profile_fingerprint: str
+    causal_budget_id: str
+
+    @field_validator("source_session_id", "causal_budget_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator(
+        "source_instance_fingerprint",
+        "transcript_sha256",
+        "checkpoint_sha256",
+        "execution_profile_fingerprint",
+    )
+    @classmethod
+    def validate_digest(cls, value: str, info) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: SessionStatus) -> SessionStatus:
+        if value not in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        }:
+            raise ValueError("A fork source snapshot requires a terminal session status.")
+        return value
 
 
-@dataclass(frozen=True, slots=True)
-class _ForkGroupInitialInvocationExpectation:
-    request: ResumeRequest
-    request_sha256: str
+def fork_source_state_sha256(snapshot: ForkSourceSnapshot) -> str:
+    """Bind secret-independent exact-source continuity into one durable digest.
+
+    Source-session and causal-budget identities are intentionally excluded. They
+    are independently authenticated by the keyed fork-request identity and the
+    child relationship, while including them here would turn this public
+    commitment into an offline oracle for identifiers hidden by redaction.
+    """
+
+    if type(snapshot) is not ForkSourceSnapshot:
+        raise TypeError("snapshot must be a ForkSourceSnapshot.")
+    snapshot_document = snapshot.model_dump(mode="json", warnings=False)
+    snapshot_document.pop("source_session_id")
+    snapshot_document.pop("causal_budget_id")
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "record_type": "cayu.fork-source-state",
+                "schema_version": 1,
+                **snapshot_document,
+            },
+            "fork_source.state",
+        )
+    ).hexdigest()
 
 
 class ForkSessionRequest(BaseModel):
@@ -2539,13 +2595,10 @@ class ForkSessionRequest(BaseModel):
         ForkExecutionProfileSelection.INHERIT_PARENT
     )
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
+    expected_source: ForkSourceSnapshot | None = None
+    initial_invocation: ResumeRequest | None = None
+    initial_dispatch_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    _expected_source_snapshot: _ForkSourceSnapshotExpectation | None = PrivateAttr(default=None)
-    _fork_group_initial_invocation: _ForkGroupInitialInvocationExpectation | None = PrivateAttr(
-        default=None
-    )
-    _fork_group_task_evaluator: bool = PrivateAttr(default=False)
-    _execution_profile_fingerprint_capture: Callable[[str], None] | None = PrivateAttr(default=None)
 
     @field_validator("session_id")
     @classmethod
@@ -2558,7 +2611,13 @@ class ForkSessionRequest(BaseModel):
             return None
         return _require_bounded_session_id(value, info.field_name)
 
-    @field_validator("source_session_id", "agent_name", "model", "environment_name")
+    @field_validator(
+        "source_session_id",
+        "agent_name",
+        "model",
+        "environment_name",
+        "initial_dispatch_id",
+    )
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -2579,7 +2638,7 @@ class ForkSessionRequest(BaseModel):
             TOOL_CAPABILITY_CEILING_METADATA_KEY: "tool-capability-ceiling authority",
             PROMPT_ANATOMY_TRANSITION_METADATA_KEY: "prompt-transition authority",
             FORK_EXECUTION_PROFILE_METADATA_KEY: "fork-profile authority",
-            FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY: "fork-group source authority",
+            FORK_SOURCE_SNAPSHOT_METADATA_KEY: "fork-source authority",
         }
         reserved_key = next(
             (key for key in reserved_authority_kinds if key in copied),
@@ -2613,8 +2672,68 @@ class ForkSessionRequest(BaseModel):
             return copy_execution_profile_adoption_intent(value)
         return ExecutionProfileAdoptionIntent.model_validate(value)
 
+    @field_validator("expected_source", mode="before")
+    @classmethod
+    def copy_expected_source(cls, value: object) -> ForkSourceSnapshot | None:
+        if value is None:
+            return None
+        if isinstance(value, ForkSourceSnapshot):
+            value = value.model_dump(mode="json")
+        return ForkSourceSnapshot.model_validate(value)
+
+    @field_validator("initial_invocation", mode="before")
+    @classmethod
+    def copy_initial_invocation(cls, value: object) -> ResumeRequest | None:
+        if value is None:
+            return None
+        if isinstance(value, ResumeRequest):
+            return copy_resume_request(value)
+        return ResumeRequest.model_validate(value)
+
     @model_validator(mode="after")
     def validate_execution_profile_selection(self) -> ForkSessionRequest:
+        if (
+            self.expected_source is not None
+            and self.expected_source.source_session_id != self.source_session_id
+        ):
+            raise ValueError("expected_source must identify source_session_id exactly.")
+        if self.expected_source is not None and (
+            self.transcript_cursor is not None or not self.copy_checkpoint
+        ):
+            raise ValueError(
+                "An exact expected_source requires the complete transcript and checkpoint."
+            )
+        if self.initial_invocation is not None and (
+            self.session_id is None or self.initial_invocation.session_id != self.session_id
+        ):
+            raise ValueError("initial_invocation requires an explicit matching child session_id.")
+        if (self.initial_invocation is None) != (self.initial_dispatch_id is None):
+            raise ValueError(
+                "initial_invocation and initial_dispatch_id must be supplied together."
+            )
+        if self.initial_invocation is not None and self.expected_source is None:
+            raise ValueError("initial_invocation requires an exact expected_source snapshot.")
+        if self.initial_invocation is not None and (
+            self.initial_invocation.task_worker_id is not None
+            or self.initial_invocation.task_handoff_id is not None
+        ):
+            raise ValueError(
+                "initial_invocation cannot contain task continuation authority because "
+                "durable dispatch cannot reconstruct it."
+            )
+        if self.initial_invocation is not None and (
+            self.initial_invocation.target is not None
+            or self.initial_invocation.profile_adoption is not None
+        ):
+            raise ValueError(
+                "Configure child profile adoption on the fork; initial_invocation cannot "
+                "change the model target or adopt another profile."
+            )
+        if self.initial_invocation is not None and self.initial_invocation.loop_policies:
+            raise ValueError(
+                "initial_invocation cannot contain process-local loop_policies because "
+                "durable dispatch cannot reconstruct them."
+            )
         if self.execution_profile_selection is ForkExecutionProfileSelection.INHERIT_PARENT:
             if self.profile_adoption is not None:
                 raise ValueError("Parent-profile inheritance cannot include profile_adoption.")
@@ -2699,14 +2818,29 @@ class ForkExecutionProfileDecisionRecord(BaseModel):
         return self
 
 
+class SessionForkEnvironmentAllocationOwner(BaseModel):
+    """One canonical environment-allocation owner inherited by a fork."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    environment_name: str
+    owner_session_id: str
+
+    @field_validator("environment_name", "owner_session_id")
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
 class SessionForkProfileRelationship(BaseModel):
     """Immutable, content-bound profile authority for one session fork."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     record_type: Literal["cayu.session-fork-execution-profile"] = FORK_EXECUTION_PROFILE_RECORD_TYPE
-    schema_version: Literal[1] = FORK_EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2]
     request_sha256: str
+    source_state_sha256: str | None = None
     source_session_id: str
     child_session_id: str
     child_agent_name: str
@@ -2730,7 +2864,9 @@ class SessionForkProfileRelationship(BaseModel):
     system_prompt_policy: ForkSystemPromptPolicy
     selection: ForkExecutionProfileSelection
     selected_profile: ExecutionProfileIdentity
+    source_environment_allocation_owners: tuple[SessionForkEnvironmentAllocationOwner, ...]
     initial_invocation_request_sha256: str | None = None
+    initial_dispatch_id: str | None = None
     initial_invocation_profile: ExecutionProfileIdentity | None = None
     decision: ForkExecutionProfileDecisionRecord | None = None
     fork_event_id: str
@@ -2748,7 +2884,11 @@ class SessionForkProfileRelationship(BaseModel):
     def validate_identity_text(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("child_environment_name", "source_active_interaction_id")
+    @field_validator(
+        "child_environment_name",
+        "source_active_interaction_id",
+        "initial_dispatch_id",
+    )
     @classmethod
     def validate_optional_identity_text(
         cls,
@@ -2758,6 +2898,30 @@ class SessionForkProfileRelationship(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("source_environment_allocation_owners", mode="before")
+    @classmethod
+    def copy_environment_allocation_owners(
+        cls,
+        value: object,
+    ) -> tuple[SessionForkEnvironmentAllocationOwner, ...]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            raise ValueError("source_environment_allocation_owners must be a sequence.")
+        owners = tuple(
+            SessionForkEnvironmentAllocationOwner.model_validate(
+                item.model_dump(mode="json")
+                if isinstance(item, SessionForkEnvironmentAllocationOwner)
+                else item
+            )
+            for item in value
+        )
+        environment_names = tuple(owner.environment_name for owner in owners)
+        if environment_names != tuple(sorted(set(environment_names))):
+            raise ValueError(
+                "source_environment_allocation_owners must be sorted by unique "
+                "environment_name values."
+            )
+        return owners
 
     @field_validator(
         "source_profile",
@@ -2779,12 +2943,33 @@ class SessionForkProfileRelationship(BaseModel):
             character not in "0123456789abcdef" for character in self.request_sha256
         ):
             raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
-        if (self.initial_invocation_request_sha256 is None) != (
-            self.initial_invocation_profile is None
-        ):
+        exact_source = self.schema_version == FORK_EXECUTION_PROFILE_EXACT_SOURCE_SCHEMA_VERSION
+        if exact_source != (self.source_state_sha256 is not None):
             raise ValueError(
-                "Fork-group initial invocation authority requires both request and profile."
+                "Fork profile schema version conflicts with its exact-source commitment."
             )
+        if not self.copy_checkpoint and self.source_environment_allocation_owners:
+            raise ValueError("Fork allocation-owner evidence requires copied checkpoint state.")
+        if self.child_session_id in {
+            owner.owner_session_id for owner in self.source_environment_allocation_owners
+        }:
+            raise ValueError("A fork cannot inherit environment allocation state from itself.")
+        if self.source_state_sha256 is not None and (
+            len(self.source_state_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.source_state_sha256)
+        ):
+            raise ValueError("source_state_sha256 must be a lowercase SHA-256 digest.")
+        initial_authority_presence = (
+            self.initial_invocation_request_sha256 is not None,
+            self.initial_dispatch_id is not None,
+            self.initial_invocation_profile is not None,
+        )
+        if any(initial_authority_presence) and not all(initial_authority_presence):
+            raise ValueError(
+                "Fork initial invocation authority requires request, dispatch, and profile."
+            )
+        if self.initial_invocation_request_sha256 is not None and not exact_source:
+            raise ValueError("Fork initial invocation authority requires an exact source.")
         if self.initial_invocation_request_sha256 is not None and (
             len(self.initial_invocation_request_sha256) != 64
             or any(
@@ -2829,7 +3014,7 @@ class SessionForkProfileRelationship(BaseModel):
                     )
                 ):
                     raise ValueError(
-                        "Inherited fork-group initial invocation changes unrelated authority."
+                        "Inherited fork initial invocation changes unrelated authority."
                     )
         else:
             if (
@@ -2844,7 +3029,7 @@ class SessionForkProfileRelationship(BaseModel):
                 and self.initial_invocation_profile != self.selected_profile
             ):
                 raise ValueError(
-                    "Current-child fork-group initial invocation conflicts with its selection."
+                    "Current-child fork initial invocation conflicts with its selection."
                 )
             changed = changed_execution_profile_components(
                 self.source_profile,
@@ -3373,6 +3558,22 @@ def _queued_dispatch_session_instance_fingerprint(session: Session) -> str:
     }
     return sha256(
         canonical_durable_json_bytes(material, "queued_dispatch.session_instance")
+    ).hexdigest()
+
+
+def _fork_source_session_instance_fingerprint(session: Session) -> str:
+    """Identify one exact fork-source incarnation without exposing its private UUID."""
+
+    if type(session) is not Session:
+        raise TypeError("Fork source session identity requires a Session.")
+    material = {
+        "record_type": "cayu.fork-source-session-instance",
+        "schema_version": 1,
+        "session_id": session.id,
+        "instance_id": session.instance_id,
+    }
+    return sha256(
+        canonical_durable_json_bytes(material, "fork_source.session_instance")
     ).hexdigest()
 
 
@@ -4446,7 +4647,6 @@ def checkpoint_root_field_projection_from_storage(
     )
 
 
-ForkTranscriptValidator = Callable[[tuple[Message, ...]], bool]
 ForkCheckpointAuthorityDecoder = Callable[
     [dict[str, Any] | None],
     dict[str, Any] | None,
@@ -4456,27 +4656,6 @@ FORK_TRANSCRIPT_VALIDATION_ERROR = (
     "preflight or contains a workload secret and cannot be copied without "
     "changing durable conversation history."
 )
-
-
-def fork_transcript_is_accepted(
-    messages: list[Message],
-    validator: ForkTranscriptValidator | None,
-) -> bool:
-    """Require explicit positive validation for the exact transcript being copied."""
-
-    if validator is None:
-        return True
-    # A validator is an external callback. Give it an isolated projection so
-    # mutation cannot alter either the source transcript or the messages that
-    # will be committed to the fork.
-    validation_messages = tuple(detach_message(message) for message in messages)
-    try:
-        accepted = validator(validation_messages)
-    except Exception:
-        return False
-    finally:
-        validation_messages = ()
-    return type(accepted) is bool and accepted
 
 
 def transform_fork_checkpoint(
@@ -7717,6 +7896,61 @@ class TranscriptSnapshot(BaseModel):
         return position
 
 
+ForkTranscriptValidator = Callable[[tuple[Message, ...], TranscriptSnapshot], bool]
+
+
+def fork_source_transcript_sha256(snapshot: TranscriptSnapshot) -> str:
+    """Hash the permanent cursor and absolute positions of retained source messages."""
+
+    if type(snapshot) is not TranscriptSnapshot:
+        raise TypeError("snapshot must be a TranscriptSnapshot.")
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "record_type": "cayu.fork-source-transcript",
+                "schema_version": 1,
+                "cursor": snapshot.cursor,
+                "records": [
+                    {
+                        "index": record.index,
+                        "message": record.message.model_dump(mode="json", warnings=False),
+                    }
+                    for record in snapshot.records
+                ],
+            },
+            "fork_source.transcript",
+        )
+    ).hexdigest()
+
+
+def fork_transcript_is_accepted(
+    messages: list[Message],
+    source_snapshot: TranscriptSnapshot | None,
+    validator: ForkTranscriptValidator | None,
+) -> bool:
+    """Require explicit positive validation for one atomic source/copy snapshot."""
+
+    if validator is None:
+        return True
+    if type(source_snapshot) is not TranscriptSnapshot:
+        raise TypeError("source_snapshot must be a TranscriptSnapshot.")
+    # A validator is an external callback. Give it isolated projections so
+    # mutation cannot alter the source transcript, its absolute indexes, or the
+    # messages that will be committed to the child.
+    validation_messages = tuple(detach_message(message) for message in messages)
+    validation_source_snapshot: TranscriptSnapshot | None = TranscriptSnapshot.model_validate(
+        source_snapshot.model_dump(mode="json", warnings=False)
+    )
+    try:
+        accepted = validator(validation_messages, validation_source_snapshot)
+    except Exception:
+        return False
+    finally:
+        validation_messages = ()
+        validation_source_snapshot = None
+    return type(accepted) is bool and accepted
+
+
 class SessionListResult(BaseModel):
     """One page of a session listing plus its keyset cursor and (optional) total count."""
 
@@ -8622,16 +8856,18 @@ def _public_authority_alias_store_key(
     parsed = parse_public_authority_alias(public_alias)
     if parsed is None or parsed.field_name != field_name:
         raise ValueError("Public authority alias is malformed or field-mismatched.")
-    if field_name == "session_id":
+    if field_name in {"session_id", "causal_budget_id"}:
         if scope_session_id is not None:
-            raise ValueError("Session aliases must not have a session scope.")
+            raise ValueError(f"{field_name} aliases must not have a session scope.")
         scope_key = ""
     elif field_name in {"interaction_id", TARGETED_TOOL_REFERENCE_FIELD_NAME}:
         if scope_session_id is None:
             raise ValueError(f"{field_name} aliases require a private session scope.")
         scope_key = require_nonblank(scope_session_id, "scope_session_id")
     else:
-        raise ValueError("field_name must be session_id, interaction_id, or tool_ref.")
+        raise ValueError(
+            "field_name must be session_id, causal_budget_id, interaction_id, or tool_ref."
+        )
     if private_value is not None:
         require_nonblank(private_value, "private_value")
     return field_name, scope_key, public_alias
@@ -12805,6 +13041,21 @@ class InMemorySessionStore(SessionStore):
                 ]
             source_interaction_ids = self._transcript_interaction_ids.get(source_session_id, [])
             copied_interaction_ids = list(source_interaction_ids[: len(copied_transcript)])
+            source_transcript_snapshot = (
+                None
+                if transcript_validator is None
+                else TranscriptSnapshot(
+                    records=[
+                        TranscriptRecord(
+                            index=index,
+                            interaction_id=copied_interaction_ids[index],
+                            message=message,
+                        )
+                        for index, message in enumerate(copied_transcript)
+                    ],
+                    cursor=source_transcript_length,
+                )
+            )
             copied_transcript, copied_interaction_ids = apply_fork_system_prompt_replacement(
                 copied_transcript,
                 copied_interaction_ids,
@@ -12813,10 +13064,16 @@ class InMemorySessionStore(SessionStore):
             # A cursor may intentionally exclude legacy secret-bearing suffix
             # entries. The source store owns those records; this frame does not.
             source_transcript = []
-            if not fork_transcript_is_accepted(copied_transcript, transcript_validator):
+            if not fork_transcript_is_accepted(
+                copied_transcript,
+                source_transcript_snapshot,
+                transcript_validator,
+            ):
                 copied_transcript.clear()
                 copied_transcript = []
+                source_transcript_snapshot = None
                 raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
+            source_transcript_snapshot = None
             copied_checkpoint = None
             if checkpoint_transform is not None:
                 checkpoint_input = (
@@ -19525,120 +19782,32 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
             if request.profile_adoption is None
             else copy_execution_profile_adoption_intent(request.profile_adoption)
         ),
+        expected_source=(
+            None
+            if request.expected_source is None
+            else ForkSourceSnapshot.model_validate(request.expected_source.model_dump(mode="json"))
+        ),
+        initial_invocation=(
+            None
+            if request.initial_invocation is None
+            else copy_resume_request(request.initial_invocation)
+        ),
+        initial_dispatch_id=request.initial_dispatch_id,
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
-    copied._expected_source_snapshot = request._expected_source_snapshot
-    initial_invocation = request._fork_group_initial_invocation
-    copied._fork_group_initial_invocation = (
-        None
-        if initial_invocation is None
-        else _ForkGroupInitialInvocationExpectation(
-            request=copy_resume_request(initial_invocation.request),
-            request_sha256=initial_invocation.request_sha256,
-        )
-    )
-    copied._fork_group_task_evaluator = request._fork_group_task_evaluator
-    copied._execution_profile_fingerprint_capture = request._execution_profile_fingerprint_capture
     return copied
 
 
-def _bind_fork_execution_profile_fingerprint_capture(
-    request: ForkSessionRequest,
-    capture: Callable[[str], None],
-) -> ForkSessionRequest:
-    """Observe the runtime-selected child baseline before fork publication."""
-
-    if type(request) is not ForkSessionRequest:
-        raise TypeError("Session fork requires a ForkSessionRequest.")
-    if not callable(capture):
-        raise TypeError("Fork execution-profile capture must be callable.")
-    copied = copy_fork_session_request(request)
-    copied._execution_profile_fingerprint_capture = capture
-    return copied
-
-
-def _fork_group_initial_invocation_request_sha256(request: ResumeRequest) -> str:
-    """Hash one exact, already-prepared fork-group branch invocation."""
+def _fork_initial_invocation_request_sha256(request: ResumeRequest) -> str:
+    """Hash one exact, already-prepared first invocation for a session fork."""
 
     copied = copy_resume_request(request)
     return sha256(
         canonical_durable_json_bytes(
             copied.model_dump(mode="json", warnings=False),
-            "fork_group_initial_invocation",
+            "fork_initial_invocation",
         )
     ).hexdigest()
-
-
-def _bind_fork_group_initial_invocation(
-    request: ForkSessionRequest,
-    initial_invocation: ResumeRequest,
-) -> ForkSessionRequest:
-    """Bind a coordinator-owned branch fork to its exact first invocation."""
-
-    if type(request) is not ForkSessionRequest:
-        raise TypeError("Session fork requires a ForkSessionRequest.")
-    if type(initial_invocation) is not ResumeRequest:
-        raise TypeError("Fork-group initial invocation requires a ResumeRequest.")
-    copied_invocation = copy_resume_request(initial_invocation)
-    if request.session_id is None or copied_invocation.session_id != request.session_id:
-        raise ValueError("Fork-group initial invocation must target the exact child session.")
-    if copied_invocation.target is not None or copied_invocation.profile_adoption is not None:
-        raise ValueError(
-            "Fork-group initial invocation cannot carry model-target or profile adoption."
-        )
-    copied = copy_fork_session_request(request)
-    copied._fork_group_initial_invocation = _ForkGroupInitialInvocationExpectation(
-        request=copied_invocation,
-        request_sha256=_fork_group_initial_invocation_request_sha256(copied_invocation),
-    )
-    return copied
-
-
-def _bind_fork_group_task_evaluator(request: ForkSessionRequest) -> ForkSessionRequest:
-    """Mark one coordinator-owned tool-free evaluator fork for built-in admission."""
-
-    if type(request) is not ForkSessionRequest:
-        raise TypeError("Fork-group evaluator requires a ForkSessionRequest.")
-    if request._fork_group_initial_invocation is None:
-        raise ValueError("Fork-group evaluator requires exact initial invocation authority.")
-    copied = copy_fork_session_request(request)
-    copied._fork_group_task_evaluator = True
-    return copied
-
-
-def _bind_fork_expected_source_snapshot(
-    request: ForkSessionRequest,
-    *,
-    expected_source_run_epoch: int,
-    expected_source_transcript_cursor: int,
-    expected_source_transcript_sha256: str,
-    expected_source_checkpoint_sha256: str,
-    expected_source_profile_fingerprint: str,
-) -> ForkSessionRequest:
-    """Bind an internal fork to a coordinator-frozen source snapshot."""
-
-    if type(request) is not ForkSessionRequest:
-        raise TypeError("Session fork requires a ForkSessionRequest.")
-    if type(expected_source_run_epoch) is not int or expected_source_run_epoch < 0:
-        raise ValueError("expected_source_run_epoch must be a non-negative integer.")
-    if type(expected_source_transcript_cursor) is not int or expected_source_transcript_cursor < 0:
-        raise ValueError("expected_source_transcript_cursor must be a non-negative integer.")
-    for field_name, value in (
-        ("expected_source_transcript_sha256", expected_source_transcript_sha256),
-        ("expected_source_checkpoint_sha256", expected_source_checkpoint_sha256),
-        ("expected_source_profile_fingerprint", expected_source_profile_fingerprint),
-    ):
-        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-            raise ValueError(f"{field_name} must be a lowercase SHA-256 digest.")
-    copied = copy_fork_session_request(request)
-    copied._expected_source_snapshot = _ForkSourceSnapshotExpectation(
-        run_epoch=expected_source_run_epoch,
-        transcript_cursor=expected_source_transcript_cursor,
-        transcript_sha256=expected_source_transcript_sha256,
-        checkpoint_sha256=expected_source_checkpoint_sha256,
-        profile_fingerprint=expected_source_profile_fingerprint,
-    )
-    return copied
 
 
 def session_fork_profile_relationship(
@@ -20354,7 +20523,10 @@ def validate_profiled_fork_evidence(
     if (
         stored_relationship != relationship
         or relationship.child_session_id != fork.id
-        or relationship.source_session_id != fork.parent_session_id
+        or (
+            fork.parent_session_id is not None
+            and relationship.source_session_id != fork.parent_session_id
+        )
     ):
         raise ValueError("Fork execution-profile relationship conflicts with child metadata.")
     if relationship.selection is ForkExecutionProfileSelection.CURRENT_CHILD:
@@ -20416,6 +20588,56 @@ def validate_profiled_fork_evidence(
     ):
         raise ValueError("Fork targeted-grant reset evidence is inconsistent.")
     payload = fork_event.payload
+    exact_source_snapshot_event_fields = {
+        "source_instance_fingerprint",
+        "source_run_epoch",
+        "source_transcript_cursor",
+        "source_transcript_sha256",
+        "source_checkpoint_sha256",
+        "source_execution_profile_fingerprint",
+    }
+    exact_source_event_fields = exact_source_snapshot_event_fields | {
+        "source_environment_allocation_owners"
+    }
+    source_environment_allocation_owners = [
+        owner.model_dump(mode="json") for owner in relationship.source_environment_allocation_owners
+    ]
+    raw_source_snapshot = fork.metadata.get(FORK_SOURCE_SNAPSHOT_METADATA_KEY)
+    if raw_source_snapshot is None:
+        if (
+            relationship.source_state_sha256 is not None
+            or exact_source_snapshot_event_fields.intersection(payload)
+        ):
+            raise ValueError("Fork event exact-source evidence conflicts with child metadata.")
+    else:
+        try:
+            source_snapshot = ForkSourceSnapshot.model_validate(
+                copy_durable_json_value(raw_source_snapshot, "fork_source_snapshot")
+            )
+        except (TypeError, ValueError):
+            raise ValueError("Fork source snapshot metadata is malformed.") from None
+        if (
+            not exact_source_event_fields.issubset(payload)
+            or relationship.source_state_sha256 is None
+            or fork_source_state_sha256(source_snapshot) != relationship.source_state_sha256
+            or source_snapshot.source_session_id != relationship.source_session_id
+            or source_snapshot.status is not relationship.source_status
+            or source_snapshot.run_epoch != relationship.source_run_epoch
+            or source_snapshot.execution_profile_fingerprint
+            != relationship.source_profile.fingerprint
+            or source_snapshot.causal_budget_id != fork.causal_budget_id
+            or payload.get("source_instance_fingerprint")
+            != source_snapshot.source_instance_fingerprint
+            or payload.get("source_run_epoch") != source_snapshot.run_epoch
+            or payload.get("source_transcript_cursor") != source_snapshot.transcript_cursor
+            or payload.get("source_transcript_sha256") != source_snapshot.transcript_sha256
+            or payload.get("source_checkpoint_sha256") != source_snapshot.checkpoint_sha256
+            or payload.get("source_execution_profile_fingerprint")
+            != source_snapshot.execution_profile_fingerprint
+            or payload.get("source_environment_allocation_owners")
+            != source_environment_allocation_owners
+        ):
+            raise ValueError("Fork event exact-source evidence conflicts with child metadata.")
     if (
         payload.get("source_session_id") != relationship.source_session_id
         or payload.get("source_status") != relationship.source_status.value
@@ -20431,9 +20653,12 @@ def validate_profiled_fork_evidence(
         or payload.get("execution_profile_selection") != relationship.selection.value
         or payload.get("selected_profile_fingerprint") != relationship.selected_profile.fingerprint
         or payload.get("source_profile_fingerprint") != relationship.source_profile.fingerprint
+        or payload.get("source_environment_allocation_owners")
+        != source_environment_allocation_owners
         or payload.get("fork_request_sha256") != relationship.request_sha256
         or payload.get("initial_invocation_request_sha256")
         != relationship.initial_invocation_request_sha256
+        or payload.get("initial_dispatch_id") != relationship.initial_dispatch_id
         or payload.get("initial_invocation_profile_fingerprint")
         != (
             None
