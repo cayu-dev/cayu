@@ -3,9 +3,10 @@
 ``TaskStoreDispatcher.run_worker`` resumes existing sessions from dispatch
 requests. This helper covers the complementary shape used by, for example, the
 PR-reviewer recipe: a worker that claims arbitrary :class:`Task`\\ s and starts a
-*new* session for each. It owns the claim -> heartbeat -> handle -> loop cycle
-plus optional expired-lease reclaim, so a caller only supplies a handler that
-turns a claimed task into an ``app.run(...)``.
+*new* session for each. It adapts task-specific claim, handling, settlement, and
+recovery rules to the shared durable worker scheduler and lease-heartbeat clock,
+so a caller only supplies a handler that turns a claimed task into an
+``app.run(...)``.
 
 The handler owns the task's terminal state. Legacy tasks may run with
 ``RunRequest(task_id=..., task_worker_id=...)`` so the runtime completes/fails the
@@ -30,7 +31,6 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from math import isfinite
 from typing import TYPE_CHECKING, Any, Literal
 
 from cayu._exception_groups import (
@@ -48,6 +48,15 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.core.runtime_authority import SessionRunFenced
+from cayu.runtime._durable_worker_loop import (
+    DurableWorkerCadence,
+    DurableWorkerStep,
+    run_durable_lease_heartbeat,
+    run_durable_worker_loop,
+    validate_worker_interval,
+    wait_or_stop,
+    worker_stop_requested,
+)
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
@@ -218,14 +227,16 @@ async def run_task_worker(
     """
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
-    if not isfinite(poll_interval_s) or poll_interval_s <= 0:
-        raise ValueError("poll_interval_s must be finite and positive.")
+    validate_worker_interval(poll_interval_s, "poll_interval_s")
     if type(recover_interrupted_handoffs) is not bool:
         raise TypeError("recover_interrupted_handoffs must be a bool.")
     if continuation_poll_interval_s is None:
         continuation_poll_interval_s = poll_interval_s
-    elif not isfinite(continuation_poll_interval_s) or continuation_poll_interval_s <= 0:
-        raise ValueError("continuation_poll_interval_s must be finite and positive.")
+    else:
+        validate_worker_interval(
+            continuation_poll_interval_s,
+            "continuation_poll_interval_s",
+        )
     if max_tasks is not None and max_tasks < 0:
         raise ValueError("max_tasks must be non-negative.")
     worker_id = require_clean_nonblank(worker_id, "worker_id")
@@ -284,7 +295,6 @@ async def run_task_worker(
             "cancellation-quiescent continuation claim."
         )
 
-    handled = 0
     expired_handoff_after: tuple[datetime, str] | None = None
     continuation_after: tuple[datetime, str] | None = None
     continuation_scan_scanned = 0
@@ -292,7 +302,34 @@ async def run_task_worker(
     continuation_scan_filtered = 0
     next_interrupted_handoff_recovery_at = 0.0
     next_interrupted_continuation_scan_at = 0.0
-    while (max_tasks is None or handled < max_tasks) and not _is_stopped(stop):
+    reclaim_cadence = DurableWorkerCadence(every_s=None)
+
+    async def reclaim_expired_tasks() -> None:
+        if materialized_work_contract_queue_supported:
+            reclaim_outcome = await capture_task_store_operation(
+                lambda: task_store.reclaim_expired(query=query),
+                operation_name="Expired task-claim reclamation",
+                redactor=app._secret_redactor,
+                mutation_store=task_store,
+                mutation_method_name="reclaim_expired",
+            )
+            if reclaim_outcome.failure is not None:
+                failure = reclaim_outcome.failure
+                del reclaim_outcome
+                raise_task_store_operation_failure(failure)
+            del reclaim_outcome
+        else:
+            await task_store.reclaim_expired(query=query)
+
+    async def run_step(_now: float, handled: int) -> DurableWorkerStep:
+        nonlocal expired_handoff_after
+        nonlocal continuation_after
+        nonlocal continuation_scan_scanned
+        nonlocal continuation_scan_rejected
+        nonlocal continuation_scan_filtered
+        nonlocal next_interrupted_handoff_recovery_at
+        nonlocal next_interrupted_continuation_scan_at
+
         loop = asyncio.get_running_loop()
         if (
             recover_interrupted_handoffs
@@ -317,8 +354,9 @@ async def run_task_worker(
                 expired_handoff_after = recovery_page.next_after
                 next_interrupted_handoff_recovery_at = 0.0
             if _is_stopped(stop):
-                break
+                return DurableWorkerStep(stop=True)
         continuation_activity = False
+        handled_this_step = 0
         if (
             recovered_interrupted_task_handler is not None
             and loop.time() >= next_interrupted_continuation_scan_at
@@ -355,27 +393,19 @@ async def run_task_worker(
                 continuation_after = continuation_page.next_after
                 next_interrupted_continuation_scan_at = 0.0
             if continuation_activity:
-                handled += 1
-                if (max_tasks is not None and handled >= max_tasks) or _is_stopped(stop):
-                    break
+                handled_this_step += 1
+                if (
+                    max_tasks is not None and handled + handled_this_step >= max_tasks
+                ) or _is_stopped(stop):
+                    return DurableWorkerStep(handled=handled_this_step, stop=True)
         if _is_stopped(stop):
-            break
+            return DurableWorkerStep(handled=handled_this_step, stop=True)
         if reclaim:
-            if materialized_work_contract_queue_supported:
-                reclaim_outcome = await capture_task_store_operation(
-                    lambda: task_store.reclaim_expired(query=query),
-                    operation_name="Expired task-claim reclamation",
-                    redactor=app._secret_redactor,
-                    mutation_store=task_store,
-                    mutation_method_name="reclaim_expired",
-                )
-                if reclaim_outcome.failure is not None:
-                    failure = reclaim_outcome.failure
-                    del reclaim_outcome
-                    raise_task_store_operation_failure(failure)
-                del reclaim_outcome
-            else:
-                await task_store.reclaim_expired(query=query)
+            await reclaim_cadence.run_if_due(
+                reclaim_expired_tasks,
+                now=loop.time(),
+                clock=loop.time,
+            )
         if materialized_work_contract_queue_supported:
             claim_outcome = await capture_task_store_operation(
                 lambda: task_store.claim_task(worker_id, query, lease_seconds=lease_seconds),
@@ -398,29 +428,24 @@ async def run_task_worker(
             )
         if task is None:
             if continuation_activity and continuation_after is not None:
-                continue
-            idle_wait_s = poll_interval_s
-            if recovered_interrupted_task_handler is not None and continuation_after is None:
-                continuation_wait_s = max(
-                    next_interrupted_continuation_scan_at - loop.time(),
-                    0.0,
+                return DurableWorkerStep(
+                    handled=handled_this_step,
+                    continue_immediately=True,
                 )
-                idle_wait_s = min(idle_wait_s, continuation_wait_s)
+            wake_deadlines: list[float] = []
+            if recovered_interrupted_task_handler is not None and continuation_after is None:
+                wake_deadlines.append(next_interrupted_continuation_scan_at)
             if (
                 recover_interrupted_handoffs
                 and interrupted_handoff_supported
                 and expired_handoff_after is None
             ):
-                recovery_wait_s = max(
-                    next_interrupted_handoff_recovery_at - loop.time(),
-                    0.0,
-                )
-                idle_wait_s = min(idle_wait_s, recovery_wait_s)
-            if idle_wait_s == 0:
-                continue
-            if await _wait_or_stop(idle_wait_s, stop):
-                break
-            continue
+                wake_deadlines.append(next_interrupted_handoff_recovery_at)
+            return DurableWorkerStep(
+                handled=handled_this_step,
+                idle=True,
+                next_wake_at=min(wake_deadlines) if wake_deadlines else None,
+            )
         task = copy_task(task)
         if task.work_contract is not None:
             task_id = task.id
@@ -443,12 +468,24 @@ async def run_task_worker(
                 del contract, parking_outcome, task, task_id
                 raise_task_store_operation_failure(failure)
             del contract, parking_outcome, task_id
-            handled += 1
-            continue
+            return DurableWorkerStep(
+                handled=handled_this_step + 1,
+                continue_immediately=True,
+            )
         await _handle_with_heartbeat(app, task_store, task, handler, worker_id, lease_seconds)
-        handled += 1
         next_interrupted_continuation_scan_at = 0.0
-    return handled
+        return DurableWorkerStep(
+            handled=handled_this_step + 1,
+            continue_immediately=True,
+        )
+
+    return await run_durable_worker_loop(
+        run_step,
+        poll_interval_s=poll_interval_s,
+        stop=stop,
+        max_handled=max_tasks,
+        wait=_wait_or_stop,
+    )
 
 
 async def _handle_with_heartbeat(
@@ -1945,41 +1982,53 @@ async def _heartbeat_until(
     handoff_id: str | None = None,
     enforce_retry_deadline: bool = False,
 ) -> _TaskHeartbeatOutcome:
-    interval = min(lease_seconds / 3, 1.0)
-    while not stop.is_set():
-        if await _wait_or_stop(interval, stop):
-            return _TaskHeartbeatOutcome.STOPPED
+    async def heartbeat() -> Task | None:
+        return await task_store.heartbeat(
+            task_id,
+            worker_id,
+            handoff_id=handoff_id,
+            extend_seconds=lease_seconds,
+        )
+
+    async def inspect_heartbeat(updated: Task | None) -> _TaskHeartbeatOutcome | None:
+        if updated is not None and (
+            _task_retry_cancellation_requested(updated) or _task_cancellation_requested(updated)
+        ):
+            return _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
+        if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(
+            task_id, worker_id
+        ):
+            return _TaskHeartbeatOutcome.ELAPSED
+        return None
+
+    async def reconcile_heartbeat_failure(
+        heartbeat_error: Exception,
+    ) -> _TaskHeartbeatOutcome | None:
         try:
-            updated = await task_store.heartbeat(
-                task_id,
-                worker_id,
-                handoff_id=handoff_id,
-                extend_seconds=lease_seconds,
-            )
-            if updated is not None and (
-                _task_retry_cancellation_requested(updated) or _task_cancellation_requested(updated)
-            ):
-                return _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
-            if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(
-                task_id, worker_id
-            ):
+            task = await task_store.load_task(task_id)
+        except Exception as reconciliation_error:
+            raise heartbeat_error from reconciliation_error
+        if task is not None and task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            elapsed_receipt = await _load_elapsed_task_retry_receipt(task_store, task)
+            if elapsed_receipt is not None:
                 return _TaskHeartbeatOutcome.ELAPSED
-        except Exception as heartbeat_error:
-            try:
-                task = await task_store.load_task(task_id)
-            except Exception as reconciliation_error:
-                raise heartbeat_error from reconciliation_error
-            if task is not None and task.status in {
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            }:
-                elapsed_receipt = await _load_elapsed_task_retry_receipt(task_store, task)
-                if elapsed_receipt is not None:
-                    return _TaskHeartbeatOutcome.ELAPSED
-                return _TaskHeartbeatOutcome.TERMINAL
-            raise heartbeat_error
-    return _TaskHeartbeatOutcome.STOPPED
+            return _TaskHeartbeatOutcome.TERMINAL
+        raise heartbeat_error
+
+    return await run_durable_lease_heartbeat(
+        heartbeat,
+        lease_seconds=lease_seconds,
+        stop=stop,
+        stopped_outcome=_TaskHeartbeatOutcome.STOPPED,
+        maximum_interval_s=1.0,
+        after_heartbeat=inspect_heartbeat,
+        on_failure=reconcile_heartbeat_failure,
+        wait=_wait_or_stop,
+    )
 
 
 async def _enforce_task_retry_deadline_with_retry(
@@ -2395,16 +2444,9 @@ async def _safe_fail_unfinished(
 
 
 def _is_stopped(stop: asyncio.Event | None) -> bool:
-    return stop is not None and stop.is_set()
+    return worker_stop_requested(stop)
 
 
 async def _wait_or_stop(seconds: float, stop: asyncio.Event | None) -> bool:
     """Sleep for ``seconds`` or until ``stop`` is set. Returns True if stopped."""
-    if stop is None:
-        await asyncio.sleep(seconds)
-        return False
-    try:
-        await asyncio.wait_for(stop.wait(), timeout=seconds)
-        return True
-    except TimeoutError:
-        return False
+    return await wait_or_stop(seconds, stop)

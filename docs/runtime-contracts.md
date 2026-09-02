@@ -2898,6 +2898,23 @@ after exact terminal event publication and is removed only after that run epoch
 has released its trailing ownership and the exact task outcome is durable. A
 newer invocation does not become the settlement gate for an older receipt or
 for an exact retry of an already acknowledged terminal dispatch.
+`TaskStoreDispatcher.run_worker(...)` and `run_task_worker(...)` are adapters
+over one Runtime-owned durable worker scheduler. The shared scheduler owns
+positive poll-interval validation, stop and maximum-work boundaries, immediate
+continuation versus idle disposition, and waiting until the earliest
+adapter-supplied recovery deadline. Runtime-owned worker cadences implement both
+fixed-period dispatcher recovery and the generic task worker's every-cycle
+reclaim policy. Adapters own only their task-specific claim, authority
+validation, handling, and durable settlement rules. A shared lease-heartbeat
+driver calculates the one-third-lease cadence, performs stop-aware waits, and
+delegates successful-update inspection or ambiguous failure reconciliation to
+the adapter. The task-worker adapter applies a one-second maximum heartbeat
+interval because it also observes cancellation and retry deadlines; the
+dispatcher retains its lease-relative best-effort renewal policy. Every terminal
+task mutation remains store-fenced by the exact worker lease, so an evicted
+worker cannot publish a late disposition. New worker-loop timing, wakeup,
+reclaim-cadence, or heartbeat mechanics must be implemented at the shared seam
+rather than copied into both adapters.
 `TaskStoreDispatcher.run_worker(...)` exposes terminal-receipt reconciliation
 and expired-lease reclaim as independent recovery roles. In a shared worker
 pool, applications may elect one or more bounded owners for each role with

@@ -314,6 +314,62 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
     assert observed_heartbeats == [("task-1", "worker-a", 1, pytest.approx(1 / 3))]
 
 
+@pytest.mark.anyio
+async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspection_failure = RuntimeError("deadline read failed")
+    authoritative_store = InMemoryTaskStore()
+    await authoritative_store.create_task(TaskCreate(task_id="task-1", type="job"))
+    renewed = await authoritative_store.claim_task("worker-a", lease_seconds=3)
+    assert renewed is not None
+    terminal = await authoritative_store.complete_task(
+        "task-1",
+        {"ok": True},
+        worker_id="worker-a",
+    )
+    load_task_calls = 0
+
+    class ConcurrentTerminalStore:
+        async def heartbeat(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            handoff_id: str | None = None,
+            extend_seconds: int,
+        ) -> Task:
+            del task_id, worker_id, handoff_id, extend_seconds
+            return renewed
+
+        async def task_retry_deadline_elapsed(self, task_id: str, worker_id: str) -> bool:
+            del task_id, worker_id
+            raise inspection_failure
+
+        async def load_task(self, task_id: str) -> Task:
+            nonlocal load_task_calls
+            del task_id
+            load_task_calls += 1
+            return terminal
+
+    async def advance_clock(_seconds: float, _stop: asyncio.Event) -> bool:
+        return False
+
+    monkeypatch.setattr(task_worker_module, "_wait_or_stop", advance_clock)
+
+    outcome = await task_worker_module._heartbeat_until(
+        ConcurrentTerminalStore(),  # type: ignore[arg-type]
+        "task-1",
+        "worker-a",
+        3,
+        asyncio.Event(),
+        enforce_retry_deadline=True,
+    )
+
+    assert outcome is task_worker_module._TaskHeartbeatOutcome.TERMINAL
+    assert load_task_calls == 1
+
+
 def test_handler_may_finish_cleanup_after_terminalizing_its_task() -> None:
     async def scenario() -> None:
         store = InMemoryTaskStore()

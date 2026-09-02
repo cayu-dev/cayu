@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from math import isfinite
 from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
@@ -34,6 +33,13 @@ from cayu.runtime._durable_subagents import (
     durable_dispatch_queue_task_id,
     is_durable_subagent_authority_rejected,
     is_durable_subagent_worker_incompatible,
+)
+from cayu.runtime._durable_worker_loop import (
+    DurableWorkerCadence,
+    DurableWorkerStep,
+    run_durable_lease_heartbeat,
+    run_durable_worker_loop,
+    validate_worker_interval,
 )
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
@@ -1088,7 +1094,11 @@ class TaskStoreDispatcher(Dispatcher):
 
         if settlement.state is not _QueuedDispatchSettlementState.NOT_ADMITTED:
             status = settlement.terminal_status or DispatchStatus.SUBMITTED
-            heartbeat = asyncio.create_task(self._heartbeat(task.id, worker_id, durable_runtime))
+            heartbeat_stop, heartbeat = self._start_heartbeat(
+                task.id,
+                worker_id,
+                durable_runtime,
+            )
             try:
                 return await self._terminalize(
                     durable_runtime,
@@ -1101,7 +1111,7 @@ class TaskStoreDispatcher(Dispatcher):
                     settlement=settlement,
                 )
             finally:
-                await self._stop_heartbeat(heartbeat)
+                await self._stop_heartbeat(heartbeat_stop, heartbeat)
 
         # Heartbeat in the background so the lease survives long gaps between events (a slow
         # model/tool turn would otherwise let the lease lapse and another worker re-run it).
@@ -1110,7 +1120,11 @@ class TaskStoreDispatcher(Dispatcher):
         # run a second time — and always stops it, including on CancelledError (graceful
         # worker shutdown), which neither except below catches.
         status = DispatchStatus.SUBMITTED
-        heartbeat = asyncio.create_task(self._heartbeat(task.id, worker_id, durable_runtime))
+        heartbeat_stop, heartbeat = self._start_heartbeat(
+            task.id,
+            worker_id,
+            durable_runtime,
+        )
         try:
             try:
                 async for event in durable_runtime._dispatch_queued(envelope):
@@ -1288,7 +1302,7 @@ class TaskStoreDispatcher(Dispatcher):
                 envelope=envelope,
             )
         finally:
-            await self._stop_heartbeat(heartbeat)
+            await self._stop_heartbeat(heartbeat_stop, heartbeat)
 
     async def _reject_claimed_dispatch(
         self,
@@ -1604,23 +1618,48 @@ class TaskStoreDispatcher(Dispatcher):
         task_id: str,
         worker_id: str,
         runtime: _DurableDispatchRuntime,
+        stop: asyncio.Event,
     ) -> None:
         """Extend the lease every ``lease_seconds / 3`` until cancelled (best effort)."""
-        interval = self._lease_seconds / 3
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await self._tasks.heartbeat(task_id, worker_id, extend_seconds=self._lease_seconds)
-            except Exception as exc:
-                logger.warning(
-                    "dispatch heartbeat failed for task %s: error_type=%s error=%s",
-                    task_id,
-                    type(exc).__name__,
-                    _safe_runtime_text(runtime, str(exc)),
-                )
+
+        async def heartbeat() -> Task:
+            return await self._tasks.heartbeat(
+                task_id,
+                worker_id,
+                extend_seconds=self._lease_seconds,
+            )
+
+        async def log_failure(exc: Exception) -> None:
+            logger.warning(
+                "dispatch heartbeat failed for task %s: error_type=%s error=%s",
+                task_id,
+                type(exc).__name__,
+                _safe_runtime_text(runtime, str(exc)),
+            )
+
+        await run_durable_lease_heartbeat(
+            heartbeat,
+            lease_seconds=self._lease_seconds,
+            stop=stop,
+            stopped_outcome=None,
+            on_failure=log_failure,
+        )
+
+    def _start_heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        runtime: _DurableDispatchRuntime,
+    ) -> tuple[asyncio.Event, asyncio.Task[None]]:
+        stop = asyncio.Event()
+        return stop, asyncio.create_task(self._heartbeat(task_id, worker_id, runtime, stop))
 
     @staticmethod
-    async def _stop_heartbeat(heartbeat: asyncio.Task[None]) -> None:
+    async def _stop_heartbeat(
+        stop: asyncio.Event,
+        heartbeat: asyncio.Task[None],
+    ) -> None:
+        stop.set()
         heartbeat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat
@@ -1639,54 +1678,62 @@ class TaskStoreDispatcher(Dispatcher):
     ) -> None:
         """Claim and run until stopped with independently elected recovery roles."""
 
-        if not isfinite(poll_interval_s) or poll_interval_s <= 0:
-            raise ValueError("poll_interval_s must be finite and positive.")
+        validate_worker_interval(poll_interval_s, "poll_interval_s")
         if type(reconcile_terminal_receipts) is not bool:
             raise TypeError("reconcile_terminal_receipts must be a bool.")
-        if not isfinite(reconciliation_every_s) or reconciliation_every_s <= 0:
-            raise ValueError("reconciliation_every_s must be finite and positive.")
+        validate_worker_interval(reconciliation_every_s, "reconciliation_every_s")
         if type(reclaim_expired_leases) is not bool:
             raise TypeError("reclaim_expired_leases must be a bool.")
-        if not isfinite(reclaim_every_s) or reclaim_every_s <= 0:
-            raise ValueError("reclaim_every_s must be finite and positive.")
+        validate_worker_interval(reclaim_every_s, "reclaim_every_s")
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         loop = asyncio.get_running_loop()
-        next_reconciliation = loop.time()
-        next_reclaim = loop.time()
-        while not stop.is_set():
-            if reconcile_terminal_receipts and loop.time() >= next_reconciliation:
-                reconciliation_generation = self._terminal_receipt_reconciliation_generation
+        reconciliation_cadence = DurableWorkerCadence(reconciliation_every_s)
+        reclaim_cadence = DurableWorkerCadence(reclaim_every_s)
+
+        async def reconcile() -> None:
+            reconciliation_generation = self._terminal_receipt_reconciliation_generation
+            try:
+                reconciliation_complete = await self._reconcile_terminal_acknowledgements(
+                    durable_runtime
+                )
+                self._startup_terminal_receipt_reconciliation_pending = (
+                    not reconciliation_complete
+                    or reconciliation_generation != self._terminal_receipt_reconciliation_generation
+                )
+            except Exception as exc:
+                logger.warning(
+                    "dispatch terminal acknowledgement discovery failed: error_type=%s error=%s",
+                    type(exc).__name__,
+                    _safe_runtime_text(durable_runtime, str(exc)),
+                )
+
+        async def reclaim() -> None:
+            for task_type in self._claim_task_types():
                 try:
-                    reconciliation_complete = await self._reconcile_terminal_acknowledgements(
-                        durable_runtime
-                    )
-                    self._startup_terminal_receipt_reconciliation_pending = (
-                        not reconciliation_complete
-                        or reconciliation_generation
-                        != self._terminal_receipt_reconciliation_generation
-                    )
+                    await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
                 except Exception as exc:
                     logger.warning(
-                        "dispatch terminal acknowledgement discovery failed: "
-                        "error_type=%s error=%s",
+                        "dispatch reclaim_expired failed: task_type=%s error_type=%s error=%s",
+                        task_type,
                         type(exc).__name__,
                         _safe_runtime_text(durable_runtime, str(exc)),
                     )
-                next_reconciliation = loop.time() + reconciliation_every_s
-            if reclaim_expired_leases and loop.time() >= next_reclaim:
-                for task_type in self._claim_task_types():
-                    try:
-                        await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
-                    except Exception as exc:
-                        logger.warning(
-                            "dispatch reclaim_expired failed: task_type=%s error_type=%s error=%s",
-                            task_type,
-                            type(exc).__name__,
-                            _safe_runtime_text(durable_runtime, str(exc)),
-                        )
-                next_reclaim = loop.time() + reclaim_every_s
+
+        async def run_step(_now: float, _handled: int) -> DurableWorkerStep:
+            if reconcile_terminal_receipts:
+                await reconciliation_cadence.run_if_due(
+                    reconcile,
+                    now=loop.time(),
+                    clock=loop.time,
+                )
+            if reclaim_expired_leases:
+                await reclaim_cadence.run_if_due(
+                    reclaim,
+                    now=loop.time(),
+                    clock=loop.time,
+                )
             if stop.is_set():
-                break
+                return DurableWorkerStep(stop=True)
             reconciliation_generation_before_process = (
                 self._terminal_receipt_reconciliation_generation
             )
@@ -1709,30 +1756,36 @@ class TaskStoreDispatcher(Dispatcher):
                 and self._terminal_receipt_reconciliation_generation
                 != reconciliation_generation_before_process
             ):
-                next_reconciliation = 0.0
+                reconciliation_cadence.expedite()
             # Back off when idle, after a busy-session requeue, or after a lost-lease reclaim —
             # otherwise the just-released/reclaimed task (FIFO-oldest) is re-claimed immediately
             # in a tight loop, re-running the agent with no delay.
-            if (
+            should_wait = (
                 handle is None
                 or handle.metadata.get("requeued")
                 or handle.metadata.get("reclaimed")
-            ):
-                idle_wait_s = poll_interval_s
-                if reconcile_terminal_receipts:
-                    idle_wait_s = min(
-                        idle_wait_s,
-                        max(next_reconciliation - loop.time(), 0.0),
-                    )
-                if reclaim_expired_leases:
-                    idle_wait_s = min(
-                        idle_wait_s,
-                        max(next_reclaim - loop.time(), 0.0),
-                    )
-                if idle_wait_s == 0:
-                    continue
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=idle_wait_s)
+            )
+            if not should_wait:
+                return DurableWorkerStep(
+                    handled=1,
+                    continue_immediately=True,
+                )
+            wake_deadlines: list[float] = []
+            if reconcile_terminal_receipts and reconciliation_cadence.next_run_at is not None:
+                wake_deadlines.append(reconciliation_cadence.next_run_at)
+            if reclaim_expired_leases and reclaim_cadence.next_run_at is not None:
+                wake_deadlines.append(reclaim_cadence.next_run_at)
+            return DurableWorkerStep(
+                handled=0 if handle is None else 1,
+                idle=True,
+                next_wake_at=min(wake_deadlines) if wake_deadlines else None,
+            )
+
+        await run_durable_worker_loop(
+            run_step,
+            poll_interval_s=poll_interval_s,
+            stop=stop,
+        )
 
     async def _acknowledge_terminal_task(
         self,
