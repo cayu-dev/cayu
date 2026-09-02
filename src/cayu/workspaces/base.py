@@ -7,7 +7,7 @@ from bisect import insort
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, BinaryIO, Literal
 
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners.base import Runner
@@ -635,6 +635,27 @@ class Workspace(ABC):
         """
         return None
 
+    def tar_copy_policy_identity(self) -> tuple[object, ...] | None:
+        """Return an exact, content-free identity for tar copy security policy.
+
+        ``SyncBinding`` only shares a sealed archive when both adapters opt in
+        with stable identities. Implementations must change the identity whenever
+        path exclusions, archive parsing, or extraction policy changes. ``None``
+        conservatively disables sharing for this adapter.
+        """
+
+        return None
+
+    def bounded_tar_stream_reader(self) -> BoundedTarStreamReader | None:
+        """Return an explicit bounded streaming-tar reader capability, if any."""
+
+        return None
+
+    def tar_stream_writer(self) -> TarStreamWriter | None:
+        """Return an explicit streaming-tar writer capability, if any."""
+
+        return None
+
     def branch_capabilities(self) -> WorkspaceBranchCapabilities:
         """Return explicit workspace-branch guarantees for this adapter.
 
@@ -772,12 +793,54 @@ class BoundedTarReader(ABC):
         """Return an uncompressed tar after preflighting every configured limit."""
 
 
+@dataclass(frozen=True, slots=True)
+class TarStreamReadResult:
+    """Content-free accounting for one completed streamed tar export."""
+
+    archive_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.archive_bytes) is not int:
+            raise TypeError("TarStreamReadResult archive_bytes must be an integer.")
+        if self.archive_bytes < 0:
+            raise ValueError("TarStreamReadResult archive_bytes must be non-negative.")
+
+
+class BoundedTarStreamReader(ABC):
+    """Nominal capability for bounded tar production into a caller-owned stream.
+
+    The destination is a binary stream, never a pathname. Implementations must
+    preflight logical and archive limits before emitting archive bytes and must
+    settle delegated reads before returning.
+    """
+
+    @abstractmethod
+    async def read_tar_stream(
+        self,
+        paths: Sequence[str],
+        destination: BinaryIO,
+        *,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_archive_bytes: int | None = None,
+    ) -> TarStreamReadResult:
+        """Write one uncompressed tar to ``destination`` and report its size."""
+
+
 class TarWriter(ABC):
     """Nominal capability for writing a caller-validated bulk tar archive."""
 
     @abstractmethod
     async def write_tar_bytes(self, data: bytes) -> None:
         """Extract caller-validated uncompressed tar data into this workspace."""
+
+
+class TarStreamWriter(ABC):
+    """Nominal capability for extracting a caller-validated tar byte stream."""
+
+    @abstractmethod
+    async def write_tar_stream(self, source: BinaryIO, *, archive_bytes: int) -> None:
+        """Consume exactly ``archive_bytes`` bytes without receiving a host path."""
 
 
 def _validate_absolute_guest_root(path: str, *, owner: str) -> str:

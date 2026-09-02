@@ -310,11 +310,32 @@ The built-in bindings live in `src/cayu/environments/bindings.py`:
 
 `SyncBinding` is policy-driven: `sync_back` (`always`/`on_success`/`never`) controls when changed files
 are copied back, while `clean_target`, `delete_missing`, `pattern`, `max_files`, `max_file_bytes`,
-`max_total_bytes`, and `max_archive_bytes` control the copy. The aggregate cap defaults to 64 MiB of logical file data per
-copy-in or copy-back transfer, while `max_archive_bytes` defaults to 128 MiB for the complete raw
-tar including framing and path metadata. Bulk tar transfers are buffered and runner protocols add
-encoding overhead, so size these controls below the process or sandbox memory ceiling. See the
-`*_sync_binding_live.py` examples below.
+`max_total_bytes`, `max_archive_bytes`, and `preserve_git_modes` control each copy. The per-transfer
+defaults are 64 MiB of logical file data and 128 MiB for the complete raw tar, including framing
+and path metadata.
+Those per-binding limits are independent of the process-wide staging governor. By default, all
+`SyncBinding` instances share a governor with four transfer slots and 512 MiB of byte-weighted
+working-set capacity. Pass the same `SyncBindingStagingCapacity` instance to a group of bindings to
+define another capacity domain:
+
+```python
+from cayu import SyncBinding, SyncBindingStagingCapacity
+
+staging = SyncBindingStagingCapacity(
+    max_concurrency=8,
+    max_staged_bytes=1024 * 1024 * 1024,
+)
+binding = SyncBinding(target_workspace=target, staging_capacity=staging)
+```
+
+Admission reserves the peak archive-plus-transient payload before creating its private spool.
+Runner-backed workspaces stream raw tar bytes without whole-archive JSON/base64 copies. Exact
+revision-aware fan-out can share one sealed archive while consumers are active; weak identities,
+mutable content or executable-mode conflicts, different path/exclusion/mode policies, or different
+copy limits never reuse it.
+`binding.staging_snapshot()` reports bounded content-free queue, byte, peak, reuse, cleanup, and
+wait-duration facts. Durable lifecycle-phase projection remains the responsibility of the
+environment progress contract. See the `*_sync_binding_live.py` examples below.
 
 A `SyncBinding` target plan factory is an identity-resolution boundary, not an
 allocation owner: `target_workspace_plan_factory` returns a

@@ -26,7 +26,14 @@ from cayu.core.tools import ToolContext
 from cayu.environments import SyncBinding
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
-from cayu.workspaces import BoundedTarReader, LocalWorkspace, RunnerWorkspace, TarWriter
+from cayu.workspaces import (
+    BoundedTarReader,
+    BoundedTarStreamReader,
+    LocalWorkspace,
+    RunnerWorkspace,
+    TarStreamWriter,
+    TarWriter,
+)
 from cayu.workspaces._tar import tar_archive_size_bound
 
 
@@ -88,6 +95,13 @@ def _tar_bytes(entries: tuple[tuple[str, bytes], ...]) -> bytes:
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
+
+
+class _BoundedBytesReader(io.BytesIO):
+    def read(self, size: int | None = -1) -> bytes:
+        if size is None or size < 0 or size > 1 << 16:
+            raise AssertionError("tar stream reads must stay bounded")
+        return super().read(size)
 
 
 def _install_directory_open_barrier(
@@ -1214,6 +1228,66 @@ def test_runner_workspace_bulk_tar_round_trip(tmp_path) -> None:
 
     assert (target_root / "a.txt").read_bytes() == b"alpha"
     assert (target_root / "nested" / "b.txt").read_bytes() == b"beta"
+
+
+def test_runner_workspace_streams_tar_without_base64_transport(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = _workspace(source_root)
+    target = _workspace(target_root)
+    asyncio.run(source.write_bytes("a.txt", b"alpha"))
+    asyncio.run(source.write_bytes("nested/b.txt", b"beta"))
+    staged = io.BytesIO()
+
+    assert isinstance(source.bounded_tar_stream_reader(), BoundedTarStreamReader)
+    assert isinstance(target.tar_stream_writer(), TarStreamWriter)
+    read_result = asyncio.run(
+        source.read_tar_stream(
+            ("a.txt", "nested/b.txt"),
+            staged,
+            max_archive_bytes=32 * 1024,
+        )
+    )
+
+    assert read_result.archive_bytes == len(staged.getvalue())
+    stream = _BoundedBytesReader(staged.getvalue())
+    asyncio.run(target.write_tar_stream(stream, archive_bytes=read_result.archive_bytes))
+    assert (target_root / "a.txt").read_bytes() == b"alpha"
+    assert (target_root / "nested" / "b.txt").read_bytes() == b"beta"
+
+
+def test_runner_workspace_streamed_tar_read_enforces_archive_limit(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    asyncio.run(workspace.write_bytes("a.txt", b"content"))
+    destination = io.BytesIO()
+
+    with pytest.raises(RuntimeError, match="exceeds max_archive_bytes"):
+        asyncio.run(
+            workspace.read_tar_stream(
+                ("a.txt",),
+                destination,
+                max_archive_bytes=1024,
+            )
+        )
+
+    assert destination.getvalue() == b""
+
+
+def test_runner_workspace_streamed_tar_write_rejects_wrong_declared_size(tmp_path) -> None:
+    workspace = _workspace(tmp_path)
+    data = _tar_bytes((("a.txt", b"content"),))
+
+    with pytest.raises(RuntimeError, match="ended before its declared size"):
+        asyncio.run(
+            workspace.write_tar_stream(
+                _BoundedBytesReader(data),
+                archive_bytes=len(data) + 1,
+            )
+        )
+
+    assert not (tmp_path / "a.txt").exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor limits")

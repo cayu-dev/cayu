@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, cast
 
@@ -86,6 +88,256 @@ def test_subprocess_command_accepts_exactly_one_command_shape() -> None:
 
     with pytest.raises(ValueError, match="exactly one"):
         SubprocessCommand(argv=["echo"], shell="echo ok")
+
+
+def test_run_subprocess_streams_binary_stdin_and_stdout_without_text_encoding() -> None:
+    source = io.BytesIO(bytes(range(256)) * 32)
+    target = io.BytesIO()
+
+    result = asyncio.run(
+        run_subprocess(
+            SubprocessCommand(
+                argv=[
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()[::-1])",
+                ]
+            ),
+            stdin_stream=source,
+            stdout_stream=target,
+            stdout_limit_bytes=source.getbuffer().nbytes,
+            output_limit_bytes=1024,
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert result.stdout_bytes == source.getbuffer().nbytes
+    assert result.stdout_truncated is False
+    assert target.getvalue() == (bytes(range(256)) * 32)[::-1]
+
+
+def test_run_subprocess_bounds_binary_stdout_while_draining_child() -> None:
+    target = io.BytesIO()
+
+    result = asyncio.run(
+        run_subprocess(
+            SubprocessCommand(
+                argv=[sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 65537)"]
+            ),
+            stdout_stream=target,
+            stdout_limit_bytes=4096,
+            output_limit_bytes=1024,
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout_bytes == 65537
+    assert result.stdout_truncated is True
+    assert target.getvalue() == b"x" * 4096
+
+
+def test_run_subprocess_rejects_paths_as_binary_streams(tmp_path) -> None:
+    async def run() -> None:
+        await run_subprocess(
+            SubprocessCommand(argv=[sys.executable, "-c", "pass"]),
+            stdin_stream=tmp_path / "host-secret",
+        )
+
+    with pytest.raises(TypeError, match="binary stdin"):
+        asyncio.run(run())
+
+
+def test_run_subprocess_settles_child_when_binary_stdin_reader_fails() -> None:
+    class InvalidBinaryInput:
+        def read(self, _size: int) -> str:
+            return "not bytes"
+
+    async def run() -> None:
+        await asyncio.wait_for(
+            run_subprocess(
+                SubprocessCommand(
+                    argv=[sys.executable, "-c", "import sys; sys.stdin.buffer.read()"]
+                ),
+                stdin_stream=InvalidBinaryInput(),  # type: ignore[arg-type]
+            ),
+            timeout=5,
+        )
+
+    with pytest.raises(TypeError, match="must return bytes"):
+        asyncio.run(run())
+
+
+def test_run_subprocess_rejects_empty_text_as_binary_stdin_eof() -> None:
+    class InvalidBinaryInput:
+        def read(self, _size: int) -> str:
+            return ""
+
+    with pytest.raises(TypeError, match="must return bytes"):
+        asyncio.run(
+            run_subprocess(
+                SubprocessCommand(argv=[sys.executable, "-c", "pass"]),
+                stdin_stream=InvalidBinaryInput(),  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_run_subprocess_completes_partial_binary_stdout_writes() -> None:
+    class PartialBinaryOutput:
+        def __init__(self) -> None:
+            self.content = bytearray()
+
+        def write(self, content: bytes) -> int:
+            accepted = max(1, len(content) // 2)
+            self.content.extend(content[:accepted])
+            return accepted
+
+    target = PartialBinaryOutput()
+    result = asyncio.run(
+        run_subprocess(
+            SubprocessCommand(
+                argv=[sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 257)"]
+            ),
+            stdout_stream=target,  # type: ignore[arg-type]
+            stdout_limit_bytes=257,
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout_bytes == 257
+    assert target.content == b"x" * 257
+
+
+def test_run_subprocess_settles_child_when_binary_stdout_writer_fails() -> None:
+    class FailingBinaryOutput:
+        def write(self, _content: bytes) -> int:
+            raise OSError("test binary sink failed")
+
+    async def run() -> None:
+        await asyncio.wait_for(
+            run_subprocess(
+                SubprocessCommand(
+                    argv=[
+                        sys.executable,
+                        "-c",
+                        "import sys; sys.stdout.buffer.write(b'x' * (1 << 20))",
+                    ]
+                ),
+                stdout_stream=FailingBinaryOutput(),  # type: ignore[arg-type]
+            ),
+            timeout=5,
+        )
+
+    with pytest.raises(OSError, match="test binary sink failed"):
+        asyncio.run(run())
+
+
+def test_run_subprocess_blocking_binary_input_keeps_event_loop_responsive_and_owned() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingBinaryInput:
+        def read(self, _size: int) -> bytes:
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test binary input was not released")
+            return b""
+
+    async def run() -> None:
+        release_timer = threading.Timer(1, release.set)
+        release_timer.start()
+        started_at = time.monotonic()
+        operation = asyncio.create_task(
+            run_subprocess(
+                SubprocessCommand(
+                    argv=[sys.executable, "-c", "import sys; sys.stdin.buffer.read()"]
+                ),
+                stdin_stream=BlockingBinaryInput(),
+            )
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert time.monotonic() - started_at < 0.5
+
+            operation.cancel("cancel blocked binary input")
+            await asyncio.sleep(0.05)
+            assert not operation.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="cancel blocked binary input"):
+                await operation
+        finally:
+            release.set()
+            release_timer.cancel()
+            release_timer.join(timeout=1)
+
+    asyncio.run(run())
+
+
+def test_run_subprocess_blocking_binary_output_keeps_event_loop_responsive_and_owned() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingBinaryOutput:
+        def write(self, content: bytes) -> int:
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test binary output was not released")
+            return len(content)
+
+    async def run() -> None:
+        release_timer = threading.Timer(1, release.set)
+        release_timer.start()
+        started_at = time.monotonic()
+        operation = asyncio.create_task(
+            run_subprocess(
+                SubprocessCommand(
+                    argv=[sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x')"]
+                ),
+                stdout_stream=BlockingBinaryOutput(),
+            )
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert time.monotonic() - started_at < 0.5
+
+            operation.cancel("cancel blocked binary output")
+            await asyncio.sleep(0.05)
+            assert not operation.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="cancel blocked binary output"):
+                await operation
+        finally:
+            release.set()
+            release_timer.cancel()
+            release_timer.join(timeout=1)
+
+    asyncio.run(run())
+
+
+def test_local_runner_binary_stream_capability(tmp_path) -> None:
+    source = io.BytesIO(b"\x00archive\xff")
+    target = io.BytesIO()
+    runner = LocalRunner(tmp_path)
+
+    result = asyncio.run(
+        runner.exec_stream(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+            ),
+            stdin=source,
+            stdout=target,
+            stdout_limit_bytes=1024,
+        )
+    )
+
+    assert result.exit_code == 0
+    assert target.getvalue() == b"\x00archive\xff"
 
 
 def test_local_runner_redacts_split_output_before_bounding(tmp_path) -> None:

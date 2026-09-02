@@ -5,7 +5,9 @@ import contextlib
 import os
 import signal
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO, TypeVar
 
 from cayu._validation import require_durable_clean_nonblank, require_durable_text
 from cayu.runners._redacted_output import RedactedOutputCapture
@@ -29,6 +31,41 @@ _TASKKILL_ENV_KEYS = (
     "TMP",
     "USERPROFILE",
 )
+
+_BinaryIOResultT = TypeVar("_BinaryIOResultT")
+
+
+class _BinaryOutputCapture:
+    """Write a subprocess byte channel directly into a bounded caller sink."""
+
+    def __init__(self, stream: BinaryIO, *, limit: int | None) -> None:
+        self.stream = stream
+        self.limit = limit
+        self.total_bytes = 0
+        self.written_bytes = 0
+        self.truncated = False
+
+    async def append(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        writable = len(chunk)
+        if self.limit is not None:
+            writable = min(writable, max(0, self.limit - self.written_bytes))
+            self.truncated = self.truncated or writable < len(chunk)
+        if writable:
+            content = chunk[:writable]
+            offset = 0
+            while offset < writable:
+                pending = content[offset:]
+                written = await _run_binary_stream_io(
+                    lambda pending=pending: self.stream.write(pending),
+                    operation="Binary subprocess stdout write",
+                )
+                if written is None:
+                    written = len(pending)
+                if type(written) is not int or written <= 0 or written > len(pending):
+                    raise OSError("Binary stdout stream returned an invalid write count.")
+                offset += written
+            self.written_bytes += writable
 
 
 def validate_runner_env_name(value: str, field_name: str) -> str:
@@ -118,6 +155,9 @@ async def run_subprocess(
     env: dict[str, str] | None = None,
     timeout_s: int | None = None,
     stdin: str | None = None,
+    stdin_stream: BinaryIO | None = None,
+    stdout_stream: BinaryIO | None = None,
+    stdout_limit_bytes: int | None = None,
     output_limit_bytes: int | None = None,
     output_redactor: SecretRedactor | None = None,
     start_new_session: bool | None = None,
@@ -134,6 +174,15 @@ async def run_subprocess(
     del command
     timeout = validate_timeout(timeout_s)
     standard_input = validate_stdin(stdin)
+    binary_input = validate_binary_input_stream(stdin_stream)
+    binary_output = validate_binary_output_stream(stdout_stream)
+    if standard_input is not None and binary_input is not None:
+        raise ValueError("Subprocess accepts either text stdin or binary stdin, not both.")
+    if binary_output is None and stdout_limit_bytes is not None:
+        raise ValueError("Subprocess stdout_limit_bytes requires a binary stdout stream.")
+    binary_output_limit = (
+        None if stdout_limit_bytes is None else validate_output_limit(stdout_limit_bytes)
+    )
     input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
     output_limit = validate_output_limit(output_limit_bytes)
     if output_redactor is not None and not isinstance(output_redactor, SecretRedactor):
@@ -217,24 +266,51 @@ async def run_subprocess(
         )
 
     stdout = RedactedOutputCapture(redactor=redactor, limit=output_limit)
+    binary_stdout = (
+        None
+        if binary_output is None
+        else _BinaryOutputCapture(binary_output, limit=binary_output_limit)
+    )
     stderr = RedactedOutputCapture(redactor=redactor, limit=output_limit)
-    stdin_task = asyncio.create_task(_write_stdin(process, input_bytes))
-    stdout_task = asyncio.create_task(_read_limited(process.stdout, stdout))
+    stdin_task = asyncio.create_task(_write_stdin(process, input_bytes, input_stream=binary_input))
+    stdout_task = asyncio.create_task(
+        _read_limited(process.stdout, stdout)
+        if binary_stdout is None
+        else _read_binary_limited(process.stdout, binary_stdout)
+    )
     stderr_task = asyncio.create_task(_read_limited(process.stderr, stderr))
     wait_task = asyncio.create_task(process.wait())
     try:
-        await asyncio.wait_for(asyncio.shield(wait_task), timeout=timeout)
-        timed_out = False
-    except TimeoutError:
-        timed_out = True
-        await _kill_timed_out_process(
-            process,
-            process_group=use_new_session,
-            stdin_task=stdin_task,
-            stdout_task=stdout_task,
-            stderr_task=stderr_task,
-            wait_task=wait_task,
+        completed, _ = await asyncio.wait(
+            (stdin_task, stdout_task, stderr_task, wait_task),
+            timeout=timeout,
+            return_when=asyncio.FIRST_EXCEPTION,
         )
+        io_failure = _completed_subprocess_task_failure(
+            (stdin_task, stdout_task, stderr_task, wait_task),
+            completed=completed,
+        )
+        if io_failure is not None:
+            await _cleanup_failed_subprocess_io(
+                process,
+                process_group=use_new_session,
+                stdin_task=stdin_task,
+                stdout_task=stdout_task,
+                stderr_task=stderr_task,
+                wait_task=wait_task,
+                io_failure=io_failure,
+            )
+            raise io_failure
+        timed_out = wait_task not in completed
+        if timed_out:
+            await _kill_timed_out_process(
+                process,
+                process_group=use_new_session,
+                stdin_task=stdin_task,
+                stdout_task=stdout_task,
+                stderr_task=stderr_task,
+                wait_task=wait_task,
+            )
     except asyncio.CancelledError:
         await _cleanup_cancelled_process(
             process,
@@ -253,20 +329,28 @@ async def run_subprocess(
         # output drain too so a daemonizing grandchild that inherited the pipes
         # cannot hold the read tasks open past the wall-clock limit.
         await _bounded_drain(
-            process, stdout_task, stderr_task, wait_task, captures=(stdout, stderr)
+            process,
+            stdout_task,
+            stderr_task,
+            wait_task,
+            captures=(stdout if binary_stdout is None else binary_stdout, stderr),
         )
     else:
         await asyncio.gather(stdout_task, stderr_task)
     return ExecResult(
-        stdout=stdout.text(),
+        stdout="" if binary_stdout is not None else stdout.text(),
         stderr=stderr.text(),
         exit_code=process.returncode
         if process.returncode is not None
         else (-1 if timed_out else 0),
         timed_out=timed_out,
-        stdout_truncated=stdout.truncated,
+        stdout_truncated=(
+            binary_stdout.truncated if binary_stdout is not None else stdout.truncated
+        ),
         stderr_truncated=stderr.truncated,
-        stdout_bytes=stdout.total_bytes,
+        stdout_bytes=(
+            binary_stdout.total_bytes if binary_stdout is not None else stdout.total_bytes
+        ),
         stderr_bytes=stderr.total_bytes,
     )
 
@@ -358,6 +442,26 @@ def validate_stdin(stdin: str | None) -> str | None:
     return stdin
 
 
+def validate_binary_input_stream(stream: BinaryIO | None) -> BinaryIO | None:
+    if stream is None:
+        return None
+    if isinstance(stream, (str, bytes, bytearray, memoryview, os.PathLike)) or not callable(
+        getattr(stream, "read", None)
+    ):
+        raise TypeError("Subprocess binary stdin must be a readable binary stream or None.")
+    return stream
+
+
+def validate_binary_output_stream(stream: BinaryIO | None) -> BinaryIO | None:
+    if stream is None:
+        return None
+    if isinstance(stream, (str, bytes, bytearray, memoryview, os.PathLike)) or not callable(
+        getattr(stream, "write", None)
+    ):
+        raise TypeError("Subprocess binary stdout must be a writable binary stream or None.")
+    return stream
+
+
 def validate_output_limit(output_limit_bytes: int | None) -> int | None:
     if output_limit_bytes is None:
         return None
@@ -366,6 +470,24 @@ def validate_output_limit(output_limit_bytes: int | None) -> int | None:
     if output_limit_bytes <= 0:
         raise ValueError("Runner output_limit_bytes must be greater than zero.")
     return output_limit_bytes
+
+
+def _completed_subprocess_task_failure(
+    tasks: tuple[asyncio.Task, ...],
+    *,
+    completed: set[asyncio.Task],
+) -> BaseException | None:
+    """Return the first task failure in stable channel order."""
+
+    for task in tasks:
+        if task not in completed:
+            continue
+        if task.cancelled():
+            return RuntimeError("Subprocess I/O task was cancelled unexpectedly.")
+        failure = task.exception()
+        if failure is not None:
+            return failure
+    return None
 
 
 def _redact_and_bound_exec_result(
@@ -508,9 +630,42 @@ async def _cleanup_cancelled_process(
         with contextlib.suppress(OSError):
             process.kill()
     finally:
-        await _cleanup_io_tasks_resisting_cancellation(
-            stdin_task, stdout_task, stderr_task, wait_task
+        try:
+            await _cleanup_io_tasks_resisting_cancellation(
+                stdin_task, stdout_task, stderr_task, wait_task
+            )
+        finally:
+            # A cancelled reader may stop after its last data chunk but before
+            # consuming EOF. The child is already terminal here, so close the
+            # remaining pipe transports while their event loop is still alive.
+            _detach_process(process)
+
+
+async def _cleanup_failed_subprocess_io(
+    process: asyncio.subprocess.Process,
+    *,
+    process_group: bool,
+    stdin_task: asyncio.Task[None],
+    stdout_task: asyncio.Task[None],
+    stderr_task: asyncio.Task[None],
+    wait_task: asyncio.Task[int],
+    io_failure: BaseException,
+) -> None:
+    """Settle a child after a caller-owned stream fails, preserving cancellation."""
+
+    cleanup_task = asyncio.create_task(
+        _cleanup_cancelled_process(
+            process,
+            process_group=process_group,
+            stdin_task=stdin_task,
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            wait_task=wait_task,
         )
+    )
+    cancellation = await _await_task_resisting_cancellation(cleanup_task)
+    if cancellation is not None:
+        raise cancellation from io_failure
 
 
 async def _kill_process_and_wait(
@@ -526,7 +681,7 @@ async def _kill_process_and_wait(
 
 
 async def _await_task_resisting_cancellation(
-    task: asyncio.Task[None],
+    task: asyncio.Task[_BinaryIOResultT],
 ) -> asyncio.CancelledError | None:
     """Let a bounded cleanup task finish, remembering repeated caller cancellation."""
     cancellation: asyncio.CancelledError | None = None
@@ -553,6 +708,36 @@ async def _await_task_resisting_cancellation(
         )
         cancellation.__cause__ = task_exception
     return cancellation
+
+
+async def _run_binary_stream_io(
+    operation_factory: Callable[[], _BinaryIOResultT],
+    *,
+    operation: str,
+) -> _BinaryIOResultT:
+    """Run caller-owned blocking stream I/O without blocking the event loop.
+
+    A Python thread cannot be force-stopped safely. If the surrounding I/O task
+    is cancelled, retain ownership and wait until the exact delegated call has
+    settled before propagating cancellation, so a staging lease cannot be
+    released while the thread can still access its stream.
+    """
+
+    io_task = asyncio.create_task(asyncio.to_thread(operation_factory))
+    cancellation = await _await_task_resisting_cancellation(io_task)
+    try:
+        result = io_task.result()
+    except BaseException as io_error:
+        if cancellation is not None:
+            cancellation.add_note(
+                f"{operation} failed while caller cancellation was pending: "
+                f"{type(io_error).__name__}: {io_error}"
+            )
+            raise cancellation from io_error
+        raise
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 async def _cleanup_io_tasks_resisting_cancellation(
@@ -592,7 +777,7 @@ async def _bounded_drain(
     stderr_task: asyncio.Task[None],
     wait_task: asyncio.Task[int],
     *,
-    captures: tuple[RedactedOutputCapture, ...],
+    captures: tuple[RedactedOutputCapture | _BinaryOutputCapture, ...],
 ) -> None:
     """Await the post-kill exit + read tasks under a wall-clock bound.
 
@@ -662,6 +847,8 @@ async def _cleanup_io_tasks(*tasks: asyncio.Task) -> None:
 async def _write_stdin(
     process: asyncio.subprocess.Process,
     input_bytes: bytes | None,
+    *,
+    input_stream: BinaryIO | None = None,
 ) -> None:
     if process.stdin is None:
         return
@@ -669,6 +856,18 @@ async def _write_stdin(
         if input_bytes is not None:
             process.stdin.write(input_bytes)
             await process.stdin.drain()
+        elif input_stream is not None:
+            while True:
+                chunk = await _run_binary_stream_io(
+                    lambda: input_stream.read(1 << 16),
+                    operation="Binary subprocess stdin read",
+                )
+                if type(chunk) is not bytes:
+                    raise TypeError("Subprocess binary stdin stream must return bytes.")
+                if not chunk:
+                    break
+                process.stdin.write(chunk)
+                await process.stdin.drain()
         process.stdin.close()
         await process.stdin.wait_closed()
     except (BrokenPipeError, ConnectionResetError):
@@ -692,3 +891,16 @@ async def _read_limited(
     except BaseException:
         out.abort()
         raise
+
+
+async def _read_binary_limited(
+    stream: asyncio.StreamReader | None,
+    out: _BinaryOutputCapture,
+) -> None:
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(1 << 16)
+        if not chunk:
+            return
+        await out.append(chunk)

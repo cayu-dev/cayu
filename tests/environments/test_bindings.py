@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -11,7 +13,7 @@ import time
 from contextlib import suppress
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import pytest
 from tests.environments.sync_ownership_assertions import assert_sync_resources_owned
@@ -24,6 +26,9 @@ from cayu.environments import (
     NoWorkspaceBinding,
     SyncBinding,
     SyncBindingContext,
+    SyncBindingSourceConflictError,
+    SyncBindingStagingCapacity,
+    SyncBindingStagingCapacityError,
     SyncTargetWorkspacePlan,
     WorkspaceBinding,
     WorkspaceSnapshot,
@@ -41,9 +46,12 @@ from cayu.runtime._environment_operation_boundary import await_environment_opera
 from cayu.vaults import SecretRedactor
 from cayu.workspaces import (
     BoundedTarReader,
+    BoundedTarStreamReader,
     E2BWorkspace,
     LocalWorkspace,
     RunnerWorkspace,
+    TarStreamReadResult,
+    TarStreamWriter,
     TarWriter,
     Workspace,
     WorkspaceListResult,
@@ -3234,6 +3242,133 @@ class _CountingLocalRunner(LocalRunner):
         self.exec_calls += 1
         return await super().exec(*args, **kwargs)
 
+    async def exec_stream(self, *args: Any, **kwargs: Any) -> ExecResult:
+        self.exec_calls += 1
+        return await super().exec_stream(*args, **kwargs)
+
+
+class _FirstReadBarrierLocalWorkspace(LocalWorkspace):
+    def __init__(self, *args: Any, first_read_barrier: asyncio.Barrier, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._first_read_barrier = first_read_barrier
+        self._read_calls = 0
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        result = await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+        self._read_calls += 1
+        if self._read_calls == 1:
+            await self._first_read_barrier.wait()
+        return result
+
+
+class _OpaqueRevisionFirstReadBarrierLocalWorkspace(_FirstReadBarrierLocalWorkspace):
+    def __init__(self, *args: Any, revision: str, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._revision = revision
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        result = await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+        return replace(result, revision=self._revision)
+
+
+class _HeldTarWrites:
+    def __init__(self, expected: int) -> None:
+        self.expected = expected
+        self.started = 0
+        self.all_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.started += 1
+        if self.started == self.expected:
+            self.all_started.set()
+        await self.release.wait()
+
+
+class _HoldingTarStreamWorkspace(LocalWorkspace, TarStreamWriter):
+    def __init__(self, *args: Any, held_writes: _HeldTarWrites, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._held_writes = held_writes
+        self.received_bytes = 0
+
+    def tar_stream_writer(self) -> TarStreamWriter:
+        return self
+
+    async def write_tar_stream(self, source: BinaryIO, *, archive_bytes: int) -> None:
+        assert not isinstance(source, (str, bytes, Path))
+        await self._held_writes.wait()
+        received = 0
+        while chunk := source.read(1 << 16):
+            received += len(chunk)
+        if received != archive_bytes:
+            raise RuntimeError("test target received the wrong archive size")
+        self.received_bytes = received
+
+
+class _RejectingTarStreamWorkspace(LocalWorkspace, TarStreamWriter):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.write_calls = 0
+
+    def tar_stream_writer(self) -> TarStreamWriter:
+        return self
+
+    async def write_tar_stream(self, source: BinaryIO, *, archive_bytes: int) -> None:
+        del source, archive_bytes
+        self.write_calls += 1
+        raise AssertionError("stale archive must not reach target materialization")
+
+
+class _OverflowingTarStreamWorkspace(LocalWorkspace, BoundedTarStreamReader):
+    def bounded_tar_stream_reader(self) -> BoundedTarStreamReader:
+        return self
+
+    async def read_tar_stream(
+        self,
+        paths,
+        destination: BinaryIO,
+        *,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_archive_bytes: int | None = None,
+    ) -> TarStreamReadResult:
+        del paths, max_file_bytes, max_total_bytes
+        assert max_archive_bytes is not None
+        written = 0
+        while written <= max_archive_bytes:
+            written += destination.write(b"x" * 1024)
+        return TarStreamReadResult(archive_bytes=written)
+
+
+class _MutatingSecondReadLocalWorkspace(LocalWorkspace):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._read_calls = 0
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        self._read_calls += 1
+        if self._read_calls == 2:
+            (self.root / path).write_bytes(b"changed-after-observation")
+        return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
 
 class _UnofficialBulkLocalWorkspace(LocalWorkspace):
     """Workspace with tar-shaped methods but without the explicit contract."""
@@ -3294,6 +3429,32 @@ class _ReaderOnlyBulkLocalWorkspace(LocalWorkspace, BoundedTarReader):
         if max_archive_bytes is not None and len(data) > max_archive_bytes:
             raise RuntimeError("tar exceeds max_archive_bytes")
         return data
+
+
+class _OverrunningBulkLocalWorkspace(_ReaderOnlyBulkLocalWorkspace):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.admitted_archive_bytes: int | None = None
+
+    async def read_tar_bytes(
+        self,
+        paths: tuple[str, ...],
+        *,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_archive_bytes: int | None = None,
+    ) -> bytes:
+        self.admitted_archive_bytes = max_archive_bytes
+        archive = await super().read_tar_bytes(
+            paths,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            max_archive_bytes=None,
+        )
+        # Trailing zero records are valid tar padding. This deliberately broken
+        # compatibility adapter ignores its admitted cap to exercise the caller's
+        # independent aggregate-capacity enforcement.
+        return archive + bytes(64 * 1024)
 
 
 class _WriterOnlyBulkLocalWorkspace(LocalWorkspace, TarWriter):
@@ -3392,6 +3553,111 @@ def test_sync_binding_rejects_raw_tar_bytes_beyond_archive_cap() -> None:
         )
 
 
+def test_sync_binding_rejects_legacy_tar_beyond_admitted_reservation_without_leaking(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source-overrunning-bulk"
+    target_root = tmp_path / "target-overrunning-bulk"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_bytes(b"x")
+    (target_root / "sentinel.txt").write_bytes(b"keep")
+    paths = ("a.txt",)
+    archive_reservation = tar_archive_size_bound(1, paths)
+    capacity = SyncBindingStagingCapacity(
+        max_concurrency=1,
+        max_staged_bytes=archive_reservation * 2,
+    )
+    source = _OverrunningBulkLocalWorkspace(source_root, workspace_id="overrunning-source")
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="overrunning-target"),
+        max_files=1,
+        max_file_bytes=1,
+        max_total_bytes=1,
+        max_archive_bytes=128 * 1024,
+        clean_target="never",
+        staging_capacity=capacity,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds its admitted archive reservation"):
+        asyncio.run(binding.bind(source, None, session_id="sess-overrunning-bulk"))
+
+    assert source.admitted_archive_bytes == archive_reservation
+    assert (target_root / "sentinel.txt").read_bytes() == b"keep"
+    assert not (target_root / "a.txt").exists()
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+    assert snapshot.archive_references == 0
+    assert snapshot.total_archive_cleanups == 1
+
+
+def test_sync_binding_releases_extracted_member_buffer_before_its_capacity_lease(
+    monkeypatch,
+) -> None:
+    destroyed_members = 0
+    release_observations: list[int] = []
+
+    class TrackedMember:
+        def __del__(self) -> None:
+            nonlocal destroyed_members
+            destroyed_members += 1
+
+    class ObservedLease:
+        def __init__(self, lease: Any) -> None:
+            self._lease = lease
+
+        def release(self) -> None:
+            release_observations.append(destroyed_members)
+            self._lease.release()
+
+    class ObservedCapacity(SyncBindingStagingCapacity):
+        async def _reserve_bytes(self, amount: int) -> Any:
+            lease = await super()._reserve_bytes(amount)
+            return ObservedLease(lease) if amount == 1 else lease
+
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w") as archive_writer:
+        info = tarfile.TarInfo(name="a.txt")
+        info.size = 1
+        archive_writer.addfile(info, io.BytesIO(b"x"))
+    tar_data = tar_buffer.getvalue()
+    capacity = ObservedCapacity(
+        max_concurrency=1,
+        max_staged_bytes=len(tar_data) + 1,
+    )
+    monkeypatch.setattr(
+        bindings_module,
+        "_read_sync_tar_member",
+        lambda _archive, _member: TrackedMember(),
+    )
+
+    async def run() -> None:
+        archive_lease = await capacity._reserve_bytes(len(tar_data))
+        archive = bindings_module._SealedTarArchive(
+            io.BytesIO(tar_data),
+            archive_bytes=len(tar_data),
+            logical_bytes=1,
+            capacity_lease=archive_lease,
+        )
+        try:
+            await bindings_module._extract_tar_to_workspace(
+                StubWorkspace(),
+                archive,
+                staging_capacity=capacity,
+                transient_reserved=False,
+            )
+        finally:
+            archive.close()
+
+    asyncio.run(run())
+
+    assert release_observations == [1]
+    assert destroyed_members == 1
+    assert capacity.snapshot().staged_bytes == 0
+
+
 class _PolicyLimitedLocalWorkspace(LocalWorkspace):
     """Workspace whose explicit reads can override a private default policy."""
 
@@ -3479,6 +3745,870 @@ def test_sync_binding_bulk_transfers_runner_workspace_files(tmp_path) -> None:
         "bravo"
     ) + len("charlie")
     assert binding._states == {}
+
+
+@pytest.mark.stress
+def test_sync_binding_100_way_large_source_fanout_stays_bounded_and_reuses_archive(
+    tmp_path,
+) -> None:
+    worker_count = 100
+    payload = b"immutable-runtime" * 16_384
+    assert len(payload) > 256 * 1024
+    capacity = SyncBindingStagingCapacity(
+        max_concurrency=worker_count,
+        max_staged_bytes=2 * 1024 * 1024,
+    )
+
+    async def run() -> None:
+        held_writes = _HeldTarWrites(worker_count)
+        bindings: list[SyncBinding] = []
+        tasks: list[asyncio.Task[BoundWorkspace]] = []
+        targets: list[_HoldingTarStreamWorkspace] = []
+        for index in range(worker_count):
+            source_root = tmp_path / f"source-{index}"
+            target_root = tmp_path / f"target-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "runtime.txt").write_bytes(payload)
+            source = LocalWorkspace(
+                source_root,
+                workspace_id=f"source-{index}",
+            )
+            target = _HoldingTarStreamWorkspace(
+                target_root,
+                workspace_id=f"target-{index}",
+                held_writes=held_writes,
+            )
+            binding = SyncBinding(
+                target_workspace=target,
+                max_files=1,
+                max_file_bytes=512 * 1024,
+                max_total_bytes=512 * 1024,
+                max_archive_bytes=1024 * 1024,
+                source_conflict_policy="require_revision",
+                staging_capacity=capacity,
+            )
+            bindings.append(binding)
+            targets.append(target)
+            tasks.append(
+                asyncio.create_task(binding.bind(source, None, session_id=f"sess-fanout-{index}"))
+            )
+
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
+        snapshot = capacity.snapshot()
+        assert snapshot.active_transfers == worker_count
+        assert snapshot.shared_archives == 1
+        assert snapshot.archive_references == worker_count
+        assert snapshot.staged_bytes <= snapshot.max_staged_bytes
+        assert snapshot.total_archive_builds == 1
+        assert snapshot.total_archive_reuses == worker_count - 1
+
+        held_writes.release.set()
+        bounds = await asyncio.gather(*tasks)
+        assert all(target.received_bytes > 0 for target in targets)
+        for binding, bound in zip(bindings, bounds, strict=True):
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+    assert snapshot.archive_references == 0
+    assert snapshot.peak_active_transfers == worker_count
+    assert snapshot.peak_staged_bytes <= snapshot.max_staged_bytes
+
+
+@pytest.mark.stress
+def test_sync_binding_100_way_large_fanout_queues_at_configured_concurrency(
+    tmp_path,
+) -> None:
+    worker_count = 100
+    admitted_count = 4
+    payload = b"bounded-runtime" * 18_000
+    assert len(payload) > 256 * 1024
+    capacity = SyncBindingStagingCapacity(
+        max_concurrency=admitted_count,
+        max_staged_bytes=2 * 1024 * 1024,
+    )
+
+    async def run() -> None:
+        held_writes = _HeldTarWrites(admitted_count)
+        bindings: list[SyncBinding] = []
+        tasks: list[asyncio.Task[BoundWorkspace]] = []
+        for index in range(worker_count):
+            source_root = tmp_path / f"queued-source-{index}"
+            target_root = tmp_path / f"queued-target-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "runtime.txt").write_bytes(payload)
+            binding = SyncBinding(
+                target_workspace=_HoldingTarStreamWorkspace(
+                    target_root,
+                    workspace_id=f"queued-target-{index}",
+                    held_writes=held_writes,
+                ),
+                max_files=1,
+                max_file_bytes=512 * 1024,
+                max_total_bytes=512 * 1024,
+                max_archive_bytes=1024 * 1024,
+                source_conflict_policy="require_revision",
+                staging_capacity=capacity,
+            )
+            bindings.append(binding)
+            tasks.append(
+                asyncio.create_task(
+                    binding.bind(
+                        LocalWorkspace(source_root, workspace_id=f"queued-source-{index}"),
+                        None,
+                        session_id=f"sess-queued-fanout-{index}",
+                    )
+                )
+            )
+
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=10)
+        deadline = asyncio.get_running_loop().time() + 10
+        while capacity.snapshot().waiting_transfers != worker_count - admitted_count:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("100-way SyncBinding fanout did not reach its bounded queue")
+            await asyncio.sleep(0.01)
+        queued = capacity.snapshot()
+        assert queued.active_transfers == admitted_count
+        assert queued.waiting_transfers == worker_count - admitted_count
+        assert queued.staged_bytes <= queued.max_staged_bytes
+
+        held_writes.release.set()
+        bounds = await asyncio.gather(*tasks)
+        for binding, bound in zip(bindings, bounds, strict=True):
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.waiting_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+    assert snapshot.archive_references == 0
+    assert snapshot.peak_active_transfers == admitted_count
+    assert snapshot.total_transfer_admissions == worker_count
+    assert snapshot.peak_staged_bytes <= snapshot.max_staged_bytes
+
+
+def test_sync_binding_cancellation_retains_capacity_until_stream_writer_settles(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"immutable-runtime")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=64 * 1024)
+
+    async def run() -> None:
+        held_writes = _HeldTarWrites(1)
+        source = LocalWorkspace(source_root, workspace_id="source")
+        target = _HoldingTarStreamWorkspace(
+            target_root,
+            workspace_id="target",
+            held_writes=held_writes,
+        )
+        binding = SyncBinding(
+            target_workspace=target,
+            max_files=1,
+            max_file_bytes=1024,
+            max_total_bytes=1024,
+            max_archive_bytes=32 * 1024,
+            source_conflict_policy="require_revision",
+            staging_capacity=capacity,
+        )
+        task = asyncio.create_task(binding.bind(source, None, session_id="sess-cancel-stream"))
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        before_cancel = capacity.snapshot()
+        assert before_cancel.active_transfers == 1
+        assert before_cancel.staged_bytes > 0
+
+        task.cancel("cancel binding")
+        await asyncio.sleep(0)
+        assert not task.done()
+        during_settlement = capacity.snapshot()
+        assert during_settlement.active_transfers == 1
+        assert during_settlement.staged_bytes == before_cancel.staged_bytes
+
+        held_writes.release.set()
+        with pytest.raises(asyncio.CancelledError, match="cancel binding"):
+            await task
+
+    asyncio.run(run())
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+
+
+def test_sync_binding_source_observation_retains_capacity_until_read_settles(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source-observation-read-cancel"
+    target_root = tmp_path / "target-observation-read-cancel"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"runtime")
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingReadLocalWorkspace(LocalWorkspace):
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            started.set()
+            if not await asyncio.to_thread(release.wait, 5):
+                raise TimeoutError("test source read was not released")
+            return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
+    source = BlockingReadLocalWorkspace(
+        source_root,
+        workspace_id="source-observation-read-cancel",
+    )
+    target = LocalWorkspace(target_root, workspace_id="target-observation-read-cancel")
+    capacity = SyncBindingStagingCapacity(
+        max_concurrency=1,
+        max_staged_bytes=64 * 1024,
+    )
+    binding = SyncBinding(
+        target_workspace=target,
+        max_files=1,
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_archive_bytes=32 * 1024,
+        clean_target="never",
+        source_conflict_policy="require_revision",
+        staging_capacity=capacity,
+    )
+
+    async def run() -> None:
+        bind_task = asyncio.create_task(
+            binding.bind(source, None, session_id="sess-observation-read-cancel")
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            before_cancel = capacity.snapshot()
+            assert before_cancel.active_transfers == 1
+            assert before_cancel.staged_bytes > 0
+
+            bind_task.cancel("cancel source observation read")
+            await asyncio.sleep(0)
+            assert not bind_task.done()
+            during_settlement = capacity.snapshot()
+            assert during_settlement.active_transfers == 1
+            assert during_settlement.staged_bytes == before_cancel.staged_bytes
+
+            release.set()
+            with pytest.raises(asyncio.CancelledError, match="cancel source observation read"):
+                await bind_task
+        finally:
+            release.set()
+
+    asyncio.run(run())
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+    assert not (target_root / "runtime.txt").exists()
+
+
+def test_sync_binding_reobserves_cache_hits_before_target_materialization(tmp_path) -> None:
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
+    first_target_root = tmp_path / "first-target"
+    second_target_root = tmp_path / "second-target"
+    for root in (first_source_root, second_source_root, first_target_root, second_target_root):
+        root.mkdir()
+    for root in (first_source_root, second_source_root):
+        (root / "runtime.txt").write_bytes(b"immutable-runtime")
+    capacity = SyncBindingStagingCapacity(max_concurrency=2, max_staged_bytes=64 * 1024)
+
+    async def run() -> None:
+        held_writes = _HeldTarWrites(1)
+        first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+        first_target = _HoldingTarStreamWorkspace(
+            first_target_root,
+            workspace_id="first-target",
+            held_writes=held_writes,
+        )
+        first_binding = SyncBinding(
+            target_workspace=first_target,
+            max_files=1,
+            max_file_bytes=1024,
+            max_total_bytes=1024,
+            max_archive_bytes=32 * 1024,
+            source_conflict_policy="require_revision",
+            staging_capacity=capacity,
+        )
+        first_task = asyncio.create_task(
+            first_binding.bind(first_source, None, session_id="sess-cache-owner")
+        )
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+
+        second_source = _MutatingSecondReadLocalWorkspace(
+            second_source_root,
+            workspace_id="second-source",
+        )
+        second_target = _RejectingTarStreamWorkspace(
+            second_target_root,
+            workspace_id="second-target",
+        )
+        second_binding = SyncBinding(
+            target_workspace=second_target,
+            max_files=1,
+            max_file_bytes=1024,
+            max_total_bytes=1024,
+            max_archive_bytes=32 * 1024,
+            source_conflict_policy="require_revision",
+            staging_capacity=capacity,
+        )
+        with pytest.raises(SyncBindingSourceConflictError):
+            await second_binding.bind(second_source, None, session_id="sess-cache-conflict")
+        assert second_target.write_calls == 0
+        assert capacity.snapshot().total_archive_reuses == 1
+
+        held_writes.release.set()
+        first_bound = await first_task
+        first_binding.abandon(first_bound)
+
+    asyncio.run(run())
+
+    assert capacity.snapshot().staged_bytes == 0
+    assert capacity.snapshot().shared_archives == 0
+
+
+def test_sync_binding_archive_reuse_key_includes_every_copy_limit(tmp_path) -> None:
+    capacity = SyncBindingStagingCapacity(max_concurrency=2, max_staged_bytes=128 * 1024)
+
+    async def run() -> None:
+        first_reads = asyncio.Barrier(2)
+        held_writes = _HeldTarWrites(2)
+        bindings: list[SyncBinding] = []
+        tasks: list[asyncio.Task[BoundWorkspace]] = []
+        for index, max_file_bytes in enumerate((1024, 2048)):
+            source_root = tmp_path / f"source-policy-{index}"
+            target_root = tmp_path / f"target-policy-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "runtime.txt").write_bytes(b"immutable-runtime")
+            source = _FirstReadBarrierLocalWorkspace(
+                source_root,
+                workspace_id=f"source-policy-{index}",
+                first_read_barrier=first_reads,
+            )
+            target = _HoldingTarStreamWorkspace(
+                target_root,
+                workspace_id=f"target-policy-{index}",
+                held_writes=held_writes,
+            )
+            binding = SyncBinding(
+                target_workspace=target,
+                max_files=1,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=2048,
+                max_archive_bytes=32 * 1024,
+                source_conflict_policy="require_revision",
+                staging_capacity=capacity,
+            )
+            bindings.append(binding)
+            tasks.append(
+                asyncio.create_task(binding.bind(source, None, session_id=f"sess-policy-{index}"))
+            )
+
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        snapshot = capacity.snapshot()
+        assert snapshot.shared_archives == 2
+        assert snapshot.total_archive_builds == 2
+        assert snapshot.total_archive_reuses == 0
+        held_writes.release.set()
+        bounds = await asyncio.gather(*tasks)
+        for binding, bound in zip(bindings, bounds, strict=True):
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert capacity.snapshot().shared_archives == 0
+    assert capacity.snapshot().staged_bytes == 0
+
+
+def test_sync_binding_archive_reuse_key_includes_workspace_exclusion_policy(tmp_path) -> None:
+    exclusion_policies = (
+        ((), ()),
+        (("private",), ()),
+        ((), ("**/*.secret",)),
+    )
+    capacity = SyncBindingStagingCapacity(
+        max_concurrency=len(exclusion_policies),
+        max_staged_bytes=192 * 1024,
+    )
+
+    async def run() -> None:
+        first_reads = asyncio.Barrier(len(exclusion_policies))
+        held_writes = _HeldTarWrites(len(exclusion_policies))
+        bindings: list[SyncBinding] = []
+        tasks: list[asyncio.Task[BoundWorkspace]] = []
+        for index, (directory_exclusions, path_exclusions) in enumerate(exclusion_policies):
+            source_root = tmp_path / f"source-exclusion-{index}"
+            target_root = tmp_path / f"target-exclusion-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "runtime.txt").write_bytes(b"immutable-runtime")
+            source = _FirstReadBarrierLocalWorkspace(
+                source_root,
+                workspace_id=f"source-exclusion-{index}",
+                excluded_directory_names=directory_exclusions,
+                excluded_path_patterns=path_exclusions,
+                first_read_barrier=first_reads,
+            )
+            target = _HoldingTarStreamWorkspace(
+                target_root,
+                workspace_id=f"target-exclusion-{index}",
+                held_writes=held_writes,
+            )
+            binding = SyncBinding(
+                target_workspace=target,
+                max_files=1,
+                max_file_bytes=1024,
+                max_total_bytes=1024,
+                max_archive_bytes=32 * 1024,
+                source_conflict_policy="require_revision",
+                staging_capacity=capacity,
+            )
+            bindings.append(binding)
+            tasks.append(
+                asyncio.create_task(
+                    binding.bind(source, None, session_id=f"sess-exclusion-{index}")
+                )
+            )
+
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        snapshot = capacity.snapshot()
+        assert snapshot.shared_archives == len(exclusion_policies)
+        assert snapshot.total_archive_builds == len(exclusion_policies)
+        assert snapshot.total_archive_reuses == 0
+        held_writes.release.set()
+        bounds = await asyncio.gather(*tasks)
+        for binding, bound in zip(bindings, bounds, strict=True):
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert capacity.snapshot().staged_bytes == 0
+
+
+def test_sync_binding_archive_reuse_identity_includes_preserved_git_mode(tmp_path) -> None:
+    capacity = SyncBindingStagingCapacity(max_concurrency=2, max_staged_bytes=128 * 1024)
+
+    async def run() -> None:
+        first_reads = asyncio.Barrier(2)
+        held_writes = _HeldTarWrites(2)
+        bindings: list[SyncBinding] = []
+        tasks: list[asyncio.Task[BoundWorkspace]] = []
+        for index, mode in enumerate((0o644, 0o755)):
+            source_root = tmp_path / f"source-mode-{index}"
+            target_root = tmp_path / f"target-mode-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            source_path = source_root / "runtime.txt"
+            source_path.write_bytes(b"same-content-different-mode")
+            source_path.chmod(mode)
+            source = _FirstReadBarrierLocalWorkspace(
+                source_root,
+                workspace_id=f"source-mode-{index}",
+                first_read_barrier=first_reads,
+            )
+            target = _HoldingTarStreamWorkspace(
+                target_root,
+                workspace_id=f"target-mode-{index}",
+                held_writes=held_writes,
+            )
+            binding = SyncBinding(
+                target_workspace=target,
+                max_files=1,
+                max_file_bytes=1024,
+                max_total_bytes=1024,
+                max_archive_bytes=32 * 1024,
+                source_conflict_policy="require_revision",
+                preserve_git_modes=True,
+                staging_capacity=capacity,
+            )
+            bindings.append(binding)
+            tasks.append(
+                asyncio.create_task(binding.bind(source, None, session_id=f"sess-mode-{index}"))
+            )
+
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        snapshot = capacity.snapshot()
+        assert snapshot.shared_archives == 2
+        assert snapshot.total_archive_builds == 2
+        assert snapshot.total_archive_reuses == 0
+        held_writes.release.set()
+        bounds = await asyncio.gather(*tasks)
+        for binding, bound in zip(bindings, bounds, strict=True):
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert capacity.snapshot().staged_bytes == 0
+
+
+def test_sync_binding_archive_reuse_key_includes_opaque_source_revisions(tmp_path) -> None:
+    capacity = SyncBindingStagingCapacity(max_concurrency=2, max_staged_bytes=128 * 1024)
+
+    async def run() -> None:
+        first_reads = asyncio.Barrier(2)
+        held_writes = _HeldTarWrites(2)
+        bindings: list[SyncBinding] = []
+        tasks: list[asyncio.Task[BoundWorkspace]] = []
+        for index in range(2):
+            source_root = tmp_path / f"source-revision-{index}"
+            target_root = tmp_path / f"target-revision-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "runtime.txt").write_bytes(b"same-content-different-revision")
+            source = _OpaqueRevisionFirstReadBarrierLocalWorkspace(
+                source_root,
+                workspace_id=f"source-revision-{index}",
+                first_read_barrier=first_reads,
+                revision=f"opaque-revision-{index}",
+            )
+            target = _HoldingTarStreamWorkspace(
+                target_root,
+                workspace_id=f"target-revision-{index}",
+                held_writes=held_writes,
+            )
+            binding = SyncBinding(
+                target_workspace=target,
+                max_files=1,
+                max_file_bytes=1024,
+                max_total_bytes=1024,
+                max_archive_bytes=32 * 1024,
+                source_conflict_policy="require_revision",
+                staging_capacity=capacity,
+            )
+            bindings.append(binding)
+            tasks.append(
+                asyncio.create_task(binding.bind(source, None, session_id=f"sess-revision-{index}"))
+            )
+
+        await asyncio.wait_for(held_writes.all_started.wait(), timeout=5)
+        snapshot = capacity.snapshot()
+        assert snapshot.shared_archives == 2
+        assert snapshot.total_archive_builds == 2
+        assert snapshot.total_archive_reuses == 0
+        held_writes.release.set()
+        bounds = await asyncio.gather(*tasks)
+        for binding, bound in zip(bindings, bounds, strict=True):
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert capacity.snapshot().staged_bytes == 0
+
+
+def test_sync_binding_independent_builders_reserve_peak_working_set_atomically(tmp_path) -> None:
+    paths = ("runtime.txt",)
+    archive_reservation = tar_archive_size_bound(1024, paths)
+    capacity = SyncBindingStagingCapacity(
+        max_concurrency=2,
+        max_staged_bytes=archive_reservation * 2,
+    )
+
+    async def run() -> None:
+        first_reads = asyncio.Barrier(2)
+
+        async def bind_one(index: int) -> tuple[SyncBinding, BoundWorkspace]:
+            source_root = tmp_path / f"source-atomic-{index}"
+            target_root = tmp_path / f"target-atomic-{index}"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / paths[0]).write_bytes(bytes([index + 1]) * 1024)
+            source = _FirstReadBarrierLocalWorkspace(
+                source_root,
+                workspace_id=f"source-atomic-{index}",
+                first_read_barrier=first_reads,
+            )
+            binding = SyncBinding(
+                target_workspace=LocalWorkspace(
+                    target_root,
+                    workspace_id=f"target-atomic-{index}",
+                ),
+                max_files=1,
+                max_file_bytes=1024,
+                max_total_bytes=1024,
+                max_archive_bytes=archive_reservation,
+                source_conflict_policy="require_revision",
+                staging_capacity=capacity,
+            )
+            bound = await binding.bind(source, None, session_id=f"sess-atomic-{index}")
+            return binding, bound
+
+        results = await asyncio.wait_for(
+            asyncio.gather(*(bind_one(index) for index in range(2))),
+            timeout=5,
+        )
+        for binding, bound in results:
+            binding.abandon(bound)
+
+    asyncio.run(run())
+
+    snapshot = capacity.snapshot()
+    assert snapshot.total_archive_builds == 2
+    assert snapshot.total_archive_cleanups == 2
+    assert snapshot.peak_staged_bytes <= snapshot.max_staged_bytes
+    assert snapshot.staged_bytes == 0
+
+
+def test_sync_binding_rejects_insufficient_aggregate_capacity_before_source_read_or_clean(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source-capacity-reject"
+    target_root = tmp_path / "target-capacity-reject"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"runtime")
+    (target_root / "sentinel.txt").write_bytes(b"keep")
+    source = _FirstReadBarrierLocalWorkspace(
+        source_root,
+        workspace_id="source-capacity-reject",
+        first_read_barrier=asyncio.Barrier(1),
+    )
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="target-capacity-reject"),
+        max_files=1,
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_archive_bytes=32 * 1024,
+        staging_capacity=SyncBindingStagingCapacity(
+            max_concurrency=1,
+            max_staged_bytes=512,
+        ),
+    )
+
+    with pytest.raises(SyncBindingStagingCapacityError, match="capacity=512"):
+        asyncio.run(binding.bind(source, None, session_id="sess-capacity-reject"))
+
+    assert source._read_calls == 0
+    assert (target_root / "sentinel.txt").read_bytes() == b"keep"
+    snapshot = binding.staging_snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+
+
+def test_sync_binding_aggregate_capacity_remains_authoritative_without_copy_limits(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source-unlimited-capacity"
+    target_root = tmp_path / "target-unlimited-capacity"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"xx")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=1)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(
+            target_root,
+            workspace_id="target-unlimited-capacity",
+        ),
+        max_files=1,
+        max_file_bytes=None,
+        max_total_bytes=None,
+        max_archive_bytes=None,
+        clean_target="never",
+        staging_capacity=capacity,
+    )
+
+    with pytest.raises(RuntimeError, match="aggregate staging capacity=1"):
+        asyncio.run(
+            binding.bind(
+                LocalWorkspace(
+                    source_root,
+                    workspace_id="source-unlimited-capacity",
+                ),
+                None,
+                session_id="sess-unlimited-capacity",
+            )
+        )
+
+    assert not (target_root / "runtime.txt").exists()
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.peak_staged_bytes == 1
+
+
+def test_sync_binding_aggregate_capacity_limits_peak_not_total_transfer_bytes(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source-unlimited-sequential-capacity"
+    target_root = tmp_path / "target-unlimited-sequential-capacity"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "first.txt").write_bytes(b"one")
+    (source_root / "second.txt").write_bytes(b"two")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=4)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(
+            target_root,
+            workspace_id="target-unlimited-sequential-capacity",
+        ),
+        max_files=2,
+        max_file_bytes=None,
+        max_total_bytes=None,
+        max_archive_bytes=None,
+        clean_target="never",
+        staging_capacity=capacity,
+    )
+
+    bound = asyncio.run(
+        binding.bind(
+            LocalWorkspace(
+                source_root,
+                workspace_id="source-unlimited-sequential-capacity",
+            ),
+            None,
+            session_id="sess-unlimited-sequential-capacity",
+        )
+    )
+
+    assert (target_root / "first.txt").read_bytes() == b"one"
+    assert (target_root / "second.txt").read_bytes() == b"two"
+    snapshot = capacity.snapshot()
+    assert snapshot.staged_bytes == 0
+    assert snapshot.peak_staged_bytes == 4
+    assert binding.abandon(bound)
+
+
+def test_sync_binding_private_archive_spool_is_restrictive(tmp_path, monkeypatch) -> None:
+    source_root = tmp_path / "source-private-spool"
+    target_root = tmp_path / "target-private-spool"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"runtime")
+    observed_modes: list[int] = []
+    real_temporary_file = bindings_module.tempfile.TemporaryFile
+
+    def private_temporary_file(*args: Any, **kwargs: Any):
+        spool = real_temporary_file(*args, **kwargs)
+        observed_modes.append(stat.S_IMODE(os.fstat(spool.fileno()).st_mode))
+        return spool
+
+    monkeypatch.setattr(bindings_module.tempfile, "TemporaryFile", private_temporary_file)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="target-private-spool"),
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_archive_bytes=32 * 1024,
+    )
+
+    bound = asyncio.run(
+        binding.bind(
+            LocalWorkspace(source_root, workspace_id="source-private-spool"),
+            None,
+            session_id="sess-private-spool",
+        )
+    )
+    binding.abandon(bound)
+
+    assert observed_modes == [0o600]
+
+
+def test_sync_binding_weak_tar_policy_identity_disables_archive_reuse(tmp_path) -> None:
+    source_root = tmp_path / "source-weak-policy"
+    target_root = tmp_path / "target-weak-policy"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source-weak-policy")
+    target = StubWorkspace()
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="target-weak-policy"),
+        max_file_bytes=1024,
+        source_conflict_policy="require_revision",
+    )
+
+    assert source.tar_copy_policy_identity() is not None
+    assert target.tar_copy_policy_identity() is None
+    assert binding._archive_policy(("runtime.txt",), source=source, target=target) is None
+
+
+def test_sync_binding_target_failure_releases_exact_staging_capacity(tmp_path) -> None:
+    source_root = tmp_path / "source-target-failure"
+    target_root = tmp_path / "target-target-failure"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"runtime")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=64 * 1024)
+    binding = SyncBinding(
+        target_workspace=_RejectingTarStreamWorkspace(
+            target_root,
+            workspace_id="target-target-failure",
+        ),
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_archive_bytes=32 * 1024,
+        staging_capacity=capacity,
+    )
+
+    with pytest.raises(AssertionError, match="stale archive"):
+        asyncio.run(
+            binding.bind(
+                LocalWorkspace(source_root, workspace_id="source-target-failure"),
+                None,
+                session_id="sess-target-failure",
+            )
+        )
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.shared_archives == 0
+    assert snapshot.archive_references == 0
+    assert snapshot.total_archive_builds == 1
+    assert snapshot.total_archive_cleanups == 1
+
+
+def test_sync_binding_bounds_stream_adapter_before_private_spool_growth(tmp_path) -> None:
+    source_root = tmp_path / "source-stream-overflow"
+    target_root = tmp_path / "target-stream-overflow"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "runtime.txt").write_bytes(b"runtime")
+    capacity = SyncBindingStagingCapacity(max_concurrency=1, max_staged_bytes=64 * 1024)
+    binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="target-stream-overflow"),
+        max_file_bytes=1024,
+        max_total_bytes=1024,
+        max_archive_bytes=32 * 1024,
+        staging_capacity=capacity,
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds its admitted archive reservation"):
+        asyncio.run(
+            binding.bind(
+                _OverflowingTarStreamWorkspace(
+                    source_root,
+                    workspace_id="source-stream-overflow",
+                ),
+                None,
+                session_id="sess-stream-overflow",
+            )
+        )
+
+    snapshot = capacity.snapshot()
+    assert snapshot.active_transfers == 0
+    assert snapshot.staged_bytes == 0
+    assert snapshot.total_archive_builds == 1
+    assert snapshot.total_archive_cleanups == 1
 
 
 def test_sync_binding_bulk_transfer_respects_max_file_bytes(tmp_path) -> None:
@@ -3847,11 +4977,13 @@ def test_binding_constructors_validate_values() -> None:
     invalid_clean_target: Any = "sometimes"
     invalid_sync_back: Any = "sometimes"
     invalid_delete_missing: Any = "yes"
+    invalid_staging_capacity: Any = object()
 
     assert SyncBinding().max_total_bytes == 64 * 1024 * 1024
     assert SyncBinding(max_total_bytes=None).max_total_bytes is None
     assert SyncBinding().max_archive_bytes == 128 * 1024 * 1024
     assert SyncBinding(max_archive_bytes=None).max_archive_bytes is None
+    assert SyncBinding().staging_capacity is SyncBinding().staging_capacity
 
     with pytest.raises(TypeError, match="default_path"):
         NativeBinding(default_path=invalid_path)
@@ -3890,6 +5022,8 @@ def test_binding_constructors_validate_values() -> None:
         SyncBinding(sync_back=invalid_sync_back)
     with pytest.raises(TypeError, match="delete_missing"):
         SyncBinding(delete_missing=invalid_delete_missing)
+    with pytest.raises(TypeError, match="staging_capacity"):
+        SyncBinding(staging_capacity=invalid_staging_capacity)
 
 
 def test_copy_bound_workspace_defensively_copies_metadata_and_snapshot() -> None:

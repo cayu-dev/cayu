@@ -1,5 +1,13 @@
 """Environment contracts."""
 
+from cayu.environments._sync_staging import (
+    DEFAULT_SYNC_BINDING_STAGING_CAPACITY,
+    DEFAULT_SYNC_STAGING_MAX_BYTES,
+    DEFAULT_SYNC_STAGING_MAX_CONCURRENCY,
+    SyncBindingStagingCapacity,
+    SyncBindingStagingCapacityError,
+    SyncBindingStagingSnapshot,
+)
 from cayu.environments.admission import (
     EXECUTION_CAPABILITY_EVIDENCE_SCHEMA,
     EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS,
@@ -86,6 +94,9 @@ from cayu.environments.factory import (
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS",
+    "DEFAULT_SYNC_BINDING_STAGING_CAPACITY",
+    "DEFAULT_SYNC_STAGING_MAX_BYTES",
+    "DEFAULT_SYNC_STAGING_MAX_CONCURRENCY",
     "DEFAULT_WORKSPACE_INSTRUCTIONS_MAX_BYTES",
     "DEFAULT_WORKSPACE_INSTRUCTION_PATHS",
     "DOCKER_CODING_COMMAND_AUTHORITY_SCHEMA",
@@ -138,6 +149,9 @@ __all__ = [
     "SyncBinding",
     "SyncBindingContext",
     "SyncBindingSourceConflictError",
+    "SyncBindingStagingCapacity",
+    "SyncBindingStagingCapacityError",
+    "SyncBindingStagingSnapshot",
     "SyncTargetWorkspacePlan",
     "WorkspaceBinding",
     "WorkspaceInstructions",

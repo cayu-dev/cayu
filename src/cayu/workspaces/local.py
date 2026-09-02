@@ -153,6 +153,13 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator):
     def resource_key(self) -> tuple[object, ...]:
         return _local_resource_key(self.root)
 
+    def tar_copy_policy_identity(self) -> tuple[object, ...]:
+        return (
+            "cayu-local-workspace-tar-v2",
+            tuple(sorted(self._excluded_directory_keys)),
+            tuple(sorted(self._excluded_path_pattern_keys)),
+        )
+
     @staticmethod
     def require_path_operations_supported() -> None:
         """Require the primitives used by secure path-addressed operations."""

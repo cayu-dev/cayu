@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -16,6 +18,12 @@ _REQUIRE_DOCKER_RUNNER_ENV_VAR = "CAYU_REQUIRE_DOCKER_RUNNER"
 _SEARCH_TEXT_IMAGE = "cayu-search-text-live:local"
 
 pytestmark = pytest.mark.process
+
+
+class _FailingBinarySink(io.BytesIO):
+    def write(self, content: Any, /) -> int:
+        del content
+        raise OSError("intentional live Docker sink failure")
 
 
 def _docker_path_or_skip() -> str:
@@ -87,6 +95,57 @@ def test_real_docker_runner_executes_and_cleans_up_timed_out_command() -> None:
             assert ok.exit_code == 0
             assert ok.stdout == "docker-live-ok"
             assert ok.timed_out is False
+
+            stream_payload = b"binary\x00payload\xff"
+            stream_output = io.BytesIO()
+            streamed = await runner.exec_stream(
+                ExecCommand.process("cat"),
+                stdin=io.BytesIO(stream_payload),
+                stdout=stream_output,
+                stdout_limit_bytes=len(stream_payload),
+            )
+            assert streamed.exit_code == 0
+            assert streamed.stdout == ""
+            assert streamed.stdout_bytes == len(stream_payload)
+            assert stream_output.getvalue() == stream_payload
+
+            marker = f"/tmp/cayu-stream-failure-{uuid4().hex}.pid"
+            with pytest.raises(
+                OSError, match="intentional live Docker sink failure"
+            ) as stream_failure:
+                await runner.exec_stream(
+                    ExecCommand.process(
+                        "sh",
+                        "-c",
+                        f"echo $$ > {marker}; printf x; while :; do sleep 1; done",
+                    ),
+                    stdout=_FailingBinarySink(),
+                    stdout_limit_bytes=1,
+                )
+            assert getattr(stream_failure.value, "artifacts", None) == [
+                {
+                    "type": "cayu.runner_cleanup.v1",
+                    "adapter": "docker",
+                    "action": "kill_command",
+                    "status": "completed",
+                    "timeout_s": 5.0,
+                }
+            ]
+            settled = await runner.exec(
+                ExecCommand.process(
+                    "sh",
+                    "-c",
+                    (
+                        f"if ! test -f {marker}; then exit 0; fi; "
+                        f"pid=$(cat {marker}); "
+                        'if ! kill -0 "$pid" 2>/dev/null; then exit 0; fi; '
+                        "state=$(awk '{print $3}' \"/proc/$pid/stat\"); "
+                        'test "$state" = Z'
+                    ),
+                )
+            )
+            assert settled.exit_code == 0
+            await runner.exec(ExecCommand.process("rm", "-f", marker))
 
             shell_failure = await runner.exec(
                 ExecCommand.bash("printf 'validation failed\\n'; exit 23")

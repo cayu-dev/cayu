@@ -12,6 +12,7 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    BinaryIO,
     ClassVar,
     Literal,
     LiteralString,
@@ -133,6 +134,38 @@ class RunnerWorkspaceCapability(ABC):
     @abstractmethod
     def resource_key(self) -> tuple[object, ...]:
         """Stable identity of the sandbox that backs this capability."""
+
+
+class RunnerBinaryStreamCapability(ABC):
+    """Nominal runner capability for bounded binary standard-I/O transfers.
+
+    Binary streams are control-plane transport inputs and outputs. Implementations
+    consume from and write to the caller-owned objects without closing them and
+    must settle every delegated read, write, and child process before returning,
+    including after cancellation or timeout. Paths are deliberately not accepted:
+    remote adapters receive bytes through their transport, never host filenames.
+    """
+
+    @abstractmethod
+    async def exec_stream(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: BinaryIO | None = None,
+        stdout: BinaryIO | None = None,
+        stdout_limit_bytes: int | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        """Execute with optional binary stdin/stdout streams.
+
+        ``stdout_limit_bytes`` is a hard capture limit for the binary channel.
+        Bytes beyond it are drained but not written and set ``stdout_truncated``.
+        Text stderr remains redacted and bounded by ``output_limit_bytes``.
+        """
 
 
 class RemoteWorkspaceBranchCapability(RunnerWorkspaceCapability):

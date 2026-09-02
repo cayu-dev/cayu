@@ -135,6 +135,18 @@ share the same contract. See the credential-free
 [`durable_knowledge_enrichment.py`](../examples/durable_knowledge_enrichment.py)
 fresh-process example.
 
+### SyncBinding fan-out has an aggregate staging ceiling
+
+`SyncBinding` copy-in and copy-back now share a configurable process-local
+concurrency and byte governor (four transfers and 512 MiB by default). Tar data
+uses private file-backed spooling and explicit raw binary streams for local and
+Docker runner workspaces, eliminating whole-archive base64/JSON copies on that
+path. Exact revision-aware concurrent fan-out can reuse one sealed archive when
+source revisions, content, executable modes, paths, the complete exclusion
+policy, format, and every copy limit match; mutable or weak sources fail closed.
+`SyncBinding.staging_snapshot()` exposes bounded, content-free queue,
+reservation, reuse, cleanup, and wait metrics.
+
 ### Task continuations retain elected worker authority across recovery entrances
 
 An interrupted task claimed with `claim_interrupted_task_continuation(...)` now

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import posixpath
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, BinaryIO
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -18,6 +19,7 @@ from cayu.runners import (
     LocalRunner,
     RemoteWorkspaceBranchCapability,
     Runner,
+    RunnerBinaryStreamCapability,
 )
 from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
@@ -31,7 +33,10 @@ from cayu.workspaces._guest_guard import (
 from cayu.workspaces._tar import tar_archive_size_bound
 from cayu.workspaces.base import (
     BoundedTarReader,
+    BoundedTarStreamReader,
     RunnerBoundWorkspace,
+    TarStreamReadResult,
+    TarStreamWriter,
     TarWriter,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
@@ -81,6 +86,7 @@ import json
 import re
 import sys
 import tarfile
+import tempfile
 
 SYNC_GIT_MODE_TAR_OWNER = "cayu.git-mode.v1"
 
@@ -93,8 +99,14 @@ GUARDED_FILE_CREATE_MODE = 0o666
 # CAYU_TEST_BOUNDED_TAR_MEMBER_READS
 
 
+_BINARY_STDOUT = False
+
+
 def fail(error_type, message):
-    print(json.dumps({"ok": False, "error_type": error_type, "message": message}))
+    print(
+        json.dumps({"ok": False, "error_type": error_type, "message": message}),
+        file=sys.stderr if _BINARY_STDOUT else sys.stdout,
+    )
     sys.exit(1)
 
 
@@ -441,7 +453,7 @@ def git_entries_operation(root_fd):
     sys.stdout.write(payload)
 
 
-def read_tar_operation(root_fd):
+def read_tar_preflight(root_fd):
     payload = json.loads(sys.stdin.read())
     rel_paths = payload["paths"]
     max_file_bytes = payload["max_file_bytes"]
@@ -484,8 +496,11 @@ def read_tar_operation(root_fd):
             f"Workspace tar exceeds max_archive_bytes={max_archive_bytes}.",
         )
 
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
+    return rel_paths, preflight_files, total_bytes
+
+
+def write_tar_from_workspace(root_fd, preflight_files, fileobj, mode):
+    with tarfile.open(fileobj=fileobj, mode=mode) as archive:
         for rel_path, expected_dev, expected_ino, size, git_mode in preflight_files:
             parent_fd = None
             leaf_fd = None
@@ -516,12 +531,23 @@ def read_tar_operation(root_fd):
             finally:
                 close_fd(leaf_fd)
                 close_fd(parent_fd)
+
+
+def read_tar_operation(root_fd):
+    rel_paths, preflight_files, total_bytes = read_tar_preflight(root_fd)
+    buffer = io.BytesIO()
+    write_tar_from_workspace(root_fd, preflight_files, buffer, "w")
     print(json.dumps({
         "ok": True,
         "tar_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
         "file_count": len(rel_paths),
         "total_bytes": total_bytes,
     }))
+
+
+def read_tar_stream_operation(root_fd):
+    _, preflight_files, _ = read_tar_preflight(root_fd)
+    write_tar_from_workspace(root_fd, preflight_files, sys.stdout.buffer, "w|")
 
 
 def member_chunks(extracted):
@@ -578,16 +604,16 @@ def preflight_tar_destination(root_fd, rel_path):
         close_fd(parent_fd)
 
 
-def write_tar_operation(root_fd):
-    payload = json.loads(sys.stdin.read())
-    data = base64.b64decode(payload["tar_base64"], validate=True)
-    excluded_directory_names = frozenset(json.loads(sys.argv[2]))
-    excluded_path_regexes = tuple(
-        re.compile(pattern) for pattern in json.loads(sys.argv[3])
-    )
+def write_tar_file(
+    root_fd,
+    fileobj,
+    excluded_directory_names,
+    excluded_path_regexes,
+):
     member_paths = set()
     member_parent_paths = set()
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
+    fileobj.seek(0)
+    with tarfile.open(fileobj=fileobj, mode="r") as archive:
         for member in archive:
             validate_tar_member(member, member_paths, member_parent_paths)
             tar_member_git_mode(member)
@@ -619,7 +645,8 @@ def write_tar_operation(root_fd):
 
     written_bytes = 0
     written_files = 0
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
+    fileobj.seek(0)
+    with tarfile.open(fileobj=fileobj, mode="r") as archive:
         for member in archive:
             extracted = archive.extractfile(member)
             if extracted is None:
@@ -646,8 +673,51 @@ def write_tar_operation(root_fd):
     print(json.dumps({"ok": True, "files": written_files, "bytes": written_bytes}))
 
 
+def write_tar_operation(root_fd):
+    payload = json.loads(sys.stdin.read())
+    data = base64.b64decode(payload["tar_base64"], validate=True)
+    excluded_directory_names = frozenset(json.loads(sys.argv[2]))
+    excluded_path_regexes = tuple(
+        re.compile(pattern) for pattern in json.loads(sys.argv[3])
+    )
+    write_tar_file(
+        root_fd,
+        io.BytesIO(data),
+        excluded_directory_names,
+        excluded_path_regexes,
+    )
+
+
+def write_tar_stream_operation(root_fd):
+    excluded_directory_names = frozenset(json.loads(sys.argv[2]))
+    excluded_path_regexes = tuple(
+        re.compile(pattern) for pattern in json.loads(sys.argv[3])
+    )
+    expected_bytes = int(sys.argv[4])
+    if expected_bytes < 0:
+        fail("workspace_error", "Workspace tar byte count must be non-negative.")
+    with tempfile.TemporaryFile(mode="w+b", prefix="cayu-workspace-tar-") as staged:
+        remaining = expected_bytes
+        while remaining:
+            chunk = sys.stdin.buffer.read(min(remaining, 1 << 16))
+            if not chunk:
+                fail("workspace_error", "Workspace tar stream ended before its declared size.")
+            staged.write(chunk)
+            remaining -= len(chunk)
+        if sys.stdin.buffer.read(1):
+            fail("workspace_error", "Workspace tar stream exceeded its declared size.")
+        write_tar_file(
+            root_fd,
+            staged,
+            excluded_directory_names,
+            excluded_path_regexes,
+        )
+
+
 def main():
+    global _BINARY_STDOUT
     operation = sys.argv[1]
+    _BINARY_STDOUT = operation == "read_tar_stream"
     root_fd = None
     try:
         root_fd = open_guard_root(".", operation in ("list", "git_entries"))
@@ -664,8 +734,12 @@ def main():
                 git_entries_operation(root_fd)
             elif operation == "read_tar":
                 read_tar_operation(root_fd)
+            elif operation == "read_tar_stream":
+                read_tar_stream_operation(root_fd)
             elif operation == "write_tar":
                 write_tar_operation(root_fd)
+            elif operation == "write_tar_stream":
+                write_tar_stream_operation(root_fd)
             else:
                 raise ValueError("Unknown runner workspace operation: " + operation)
     except GuardPathError as exc:
@@ -681,7 +755,13 @@ main()
 )
 
 
-class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
+class RunnerWorkspace(
+    RunnerBoundWorkspace,
+    BoundedTarReader,
+    TarWriter,
+    BoundedTarStreamReader,
+    TarStreamWriter,
+):
     """Workspace whose descriptor-guarded file operations execute through a runner.
 
     The configured ``cwd`` is trusted operator input. Each operation pins that
@@ -1094,6 +1174,90 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         if _path_matches_excluded_pattern(path, self._excluded_path_pattern_keys):
             raise ValueError("Workspace path matches an excluded path pattern.")
 
+    def tar_copy_policy_identity(self) -> tuple[object, ...]:
+        return (
+            "cayu-runner-workspace-tar-v2",
+            tuple(sorted(self._excluded_directory_keys)),
+            tuple(sorted(self._excluded_path_pattern_keys)),
+        )
+
+    def bounded_tar_stream_reader(self) -> BoundedTarStreamReader | None:
+        return self if isinstance(self._runner, RunnerBinaryStreamCapability) else None
+
+    def tar_stream_writer(self) -> TarStreamWriter | None:
+        return self if isinstance(self._runner, RunnerBinaryStreamCapability) else None
+
+    async def read_tar_stream(
+        self,
+        paths: Sequence[str],
+        destination: BinaryIO,
+        *,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_archive_bytes: int | None = None,
+    ) -> TarStreamReadResult:
+        """Stream one preflight-bounded uncompressed tar into a private sink."""
+
+        runner = self._runner
+        if not isinstance(runner, RunnerBinaryStreamCapability):
+            raise RuntimeError("RunnerWorkspace runner does not support binary streams.")
+        if isinstance(destination, (str, bytes, bytearray, memoryview)) or not callable(
+            getattr(destination, "write", None)
+        ):
+            raise TypeError("RunnerWorkspace tar destination must be a binary stream.")
+        validated_paths = _validate_tar_paths(paths)
+        for path in validated_paths:
+            self._require_path_allowed(path)
+        per_file_limit = (
+            self.default_read_limit_bytes
+            if max_file_bytes is None
+            else _validate_required_limit(max_file_bytes, "max_file_bytes")
+        )
+        total_limit = _validate_optional_limit(max_total_bytes, "max_total_bytes")
+        archive_limit = _validate_optional_limit(max_archive_bytes, "max_archive_bytes")
+        archive_overhead_bytes = tar_archive_size_bound(0, validated_paths)
+        logical_size_bound = per_file_limit * len(validated_paths)
+        if total_limit is not None:
+            logical_size_bound = min(logical_size_bound, total_limit)
+        raw_size_bound = tar_archive_size_bound(logical_size_bound, validated_paths)
+        if archive_limit is not None:
+            raw_size_bound = min(raw_size_bound, archive_limit)
+        payload = {
+            "paths": list(validated_paths),
+            "max_file_bytes": per_file_limit,
+            "max_total_bytes": total_limit,
+            "max_archive_bytes": archive_limit,
+            "archive_overhead_bytes": archive_overhead_bytes,
+        }
+        result = await runner.exec_stream(
+            ExecCommand.process(
+                self.python_executable,
+                "-c",
+                _RUNNER_WORKSPACE_PROGRAM,
+                "read_tar_stream",
+            ),
+            cwd=self.cwd,
+            stdin=io.BytesIO(json.dumps(payload).encode("utf-8")),
+            stdout=destination,
+            stdout_limit_bytes=raw_size_bound,
+            output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+        )
+        if result.stdout_truncated:
+            raise RuntimeError("Runner workspace tar exceeded its transfer limit.")
+        if result.exit_code != 0:
+            try:
+                error_payload = _parse_json_object(result.stderr)
+            except (RuntimeError, TypeError):
+                raise RuntimeError(
+                    f"Runner workspace operation failed with exit code {result.exit_code}: "
+                    f"{result.stderr.strip()}"
+                ) from None
+            _raise_workspace_error(error_payload)
+        archive_bytes = result.stdout_bytes
+        if type(archive_bytes) is not int or archive_bytes < 0:
+            raise RuntimeError("Runner workspace stream returned invalid byte accounting.")
+        return TarStreamReadResult(archive_bytes=archive_bytes)
+
     async def read_tar_bytes(
         self,
         paths: Sequence[str],
@@ -1168,6 +1332,53 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             stdin=json.dumps(payload),
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
+
+    async def write_tar_stream(self, source: BinaryIO, *, archive_bytes: int) -> None:
+        """Stream a tar through runner stdin and spool it privately in the guest."""
+
+        runner = self._runner
+        if not isinstance(runner, RunnerBinaryStreamCapability):
+            raise RuntimeError("RunnerWorkspace runner does not support binary streams.")
+        if isinstance(source, (str, bytes, bytearray, memoryview)) or not callable(
+            getattr(source, "read", None)
+        ):
+            raise TypeError("RunnerWorkspace tar source must be a binary stream.")
+        if type(archive_bytes) is not int:
+            raise TypeError("RunnerWorkspace archive_bytes must be an integer.")
+        if archive_bytes < 0:
+            raise ValueError("RunnerWorkspace archive_bytes must be non-negative.")
+        result = await runner.exec_stream(
+            ExecCommand.process(
+                self.python_executable,
+                "-c",
+                _RUNNER_WORKSPACE_PROGRAM,
+                "write_tar_stream",
+                json.dumps(tuple(sorted(self._excluded_directory_keys))),
+                json.dumps(self._excluded_path_regexes),
+                str(archive_bytes),
+            ),
+            cwd=self.cwd,
+            stdin=source,
+            output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+        )
+        if result.stdout_truncated:
+            raise RuntimeError("Runner workspace operation output exceeded its transfer limit.")
+        try:
+            payload = _parse_json_object(result.stdout)
+        except RuntimeError:
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"Runner workspace operation failed with exit code {result.exit_code}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                ) from None
+            raise
+        if payload.get("ok") is not True:
+            _raise_workspace_error(payload)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Runner workspace operation failed with exit code {result.exit_code}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
 
     async def _run_json_operation(
         self,

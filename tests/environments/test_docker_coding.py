@@ -150,6 +150,10 @@ class _LocalDockerRunner(DockerRunner):
         kwargs["cwd"] = None
         return await self.local.exec(command, **kwargs)
 
+    async def exec_stream(self, command, **kwargs: Any):
+        kwargs["cwd"] = None
+        return await self.local.exec_stream(command, **kwargs)
+
 
 def _coding_product_test_binding(
     source_root: Path,
@@ -1194,6 +1198,10 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
             kwargs["cwd"] = None
             return await self.local.exec(command, **kwargs)
 
+        async def exec_stream(self, command, **kwargs: Any):
+            kwargs["cwd"] = None
+            return await self.local.exec_stream(command, **kwargs)
+
     runner = LocalDockerRunner(target_root)
     source = LocalWorkspace(
         source_root,
@@ -1213,7 +1221,7 @@ def test_docker_coding_binding_uses_ephemeral_git_and_never_copies_protected_pat
         limits=DockerWorkspaceTransferLimits(
             max_file_bytes=1024,
             max_total_bytes=4096,
-            max_archive_bytes=16 * 1024,
+            max_archive_bytes=32 * 1024,
         ),
     )
 
@@ -1563,6 +1571,10 @@ def test_docker_coding_binding_refuses_publishable_git_ignored_paths(
         async def exec(self, command, **kwargs: Any):
             kwargs["cwd"] = None
             return await self.local.exec(command, **kwargs)
+
+        async def exec_stream(self, command, **kwargs: Any):
+            kwargs["cwd"] = None
+            return await self.local.exec_stream(command, **kwargs)
 
     runner = LocalDockerRunner(target_root)
     source = LocalWorkspace(

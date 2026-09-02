@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 
 from cayu._validation import require_durable_nonblank
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
@@ -21,6 +21,8 @@ from cayu.runners._subprocess import (
     merge_runner_env_overrides,
     remove_runner_env,
     run_subprocess,
+    validate_binary_input_stream,
+    validate_binary_output_stream,
     validate_output_limit,
     validate_runner_env_remove,
     validate_stdin,
@@ -31,6 +33,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerBinaryStreamCapability,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     copy_exec_command,
@@ -70,7 +73,7 @@ SAFE_LOCAL_ENV_KEYS = (
 )
 
 
-class LocalRunner(Runner):
+class LocalRunner(Runner, RunnerBinaryStreamCapability):
     """Executes local commands with cwd restricted under one root.
 
     This is not a sandbox. Commands still run with the permissions of the
@@ -232,6 +235,37 @@ class LocalRunner(Runner):
         del command, redactor, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
 
+    async def exec_stream(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: BinaryIO | None = None,
+        stdout: BinaryIO | None = None,
+        stdout_limit_bytes: int | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if stdin is None and stdout is None:
+            raise ValueError("LocalRunner exec_stream requires binary stdin or stdout.")
+        operation = self._exec(
+            command,
+            output_redactor=SecretRedactor(),
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=None,
+            output_limit_bytes=output_limit_bytes,
+            stdin_stream=stdin,
+            stdout_stream=stdout,
+            stdout_limit_bytes=stdout_limit_bytes,
+        )
+        del command, cwd, env, env_remove, timeout_s, stdin, stdout, output_limit_bytes
+        return await operation
+
     @_clean_runner_preflight
     def preflight_exec(
         self,
@@ -343,7 +377,18 @@ class LocalRunner(Runner):
         timeout_s: int | None,
         stdin: str | None,
         output_limit_bytes: int | None,
+        stdin_stream: BinaryIO | None = None,
+        stdout_stream: BinaryIO | None = None,
+        stdout_limit_bytes: int | None = None,
     ) -> ExecResult:
+        binary_input = validate_binary_input_stream(stdin_stream)
+        binary_output = validate_binary_output_stream(stdout_stream)
+        if binary_input is not None and stdin is not None:
+            raise ValueError("LocalRunner accepts either text stdin or binary stdin, not both.")
+        if binary_output is None and stdout_limit_bytes is not None:
+            raise ValueError("LocalRunner stdout_limit_bytes requires binary stdout.")
+        if stdout_limit_bytes is not None:
+            validate_output_limit(stdout_limit_bytes)
         try:
             (
                 subprocess_command,
@@ -404,6 +449,9 @@ class LocalRunner(Runner):
             env=environment,
             timeout_s=timeout,
             stdin=standard_input,
+            stdin_stream=binary_input,
+            stdout_stream=binary_output,
+            stdout_limit_bytes=stdout_limit_bytes,
             output_limit_bytes=output_limit,
             output_redactor=invocation_redactor,
         )

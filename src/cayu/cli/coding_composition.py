@@ -4164,6 +4164,18 @@ class _LocalDockerRunner(DockerRunner):
             result.stdout = result.stdout.replace(str(self.root), "/workspace")
         return result
 
+    async def exec_stream(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+        local_command = command
+        if command.kind == "process" and command.argv is not None:
+            local_command = ExecCommand.process(
+                *(
+                    str(self.root) if value == "/workspace" else value
+                    for value in command.argv
+                )
+            )
+        kwargs["cwd"] = None
+        return await self.local.exec_stream(local_command, **kwargs)
+
     async def exec_redacted(
         self,
         command: ExecCommand,

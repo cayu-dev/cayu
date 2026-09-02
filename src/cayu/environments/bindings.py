@@ -10,13 +10,14 @@ import json
 import ntpath
 import shutil
 import tarfile
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, BinaryIO, Literal, NoReturn, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -32,11 +33,21 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
+from cayu.environments._sync_staging import (
+    DEFAULT_SYNC_BINDING_STAGING_CAPACITY,
+    SyncBindingStagingCapacity,
+    SyncBindingStagingCapacityError,
+    SyncBindingStagingSnapshot,
+    _CapacityLease,
+    _SealedTarArchive,
+)
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces import (
     BoundedTarReader,
+    BoundedTarStreamReader,
     LocalWorkspace,
     RunnerWorkspace,
+    TarStreamWriter,
     TarWriter,
     Workspace,
     WorkspaceGitMode,
@@ -107,12 +118,6 @@ class _SyncSourceRevision:
 
 
 @dataclass(frozen=True)
-class _SyncStagedFile:
-    content: bytes
-    git_mode: WorkspaceGitMode | None = None
-
-
-@dataclass(frozen=True)
 class _SyncBindingState:
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
@@ -122,6 +127,60 @@ class _SyncBindingState:
     target_resource_key: tuple[object, ...]
     phase: Literal["active", "finalizing"] = "active"
     defer_finalize_release: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _SyncSourceObservation:
+    revisions: tuple[_SyncSourceRevision, ...]
+    content_sha256: str
+    logical_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SyncArchivePolicy:
+    format_version: str
+    paths: tuple[str, ...]
+    pattern: str
+    max_files: int
+    max_file_bytes: int | None
+    max_total_bytes: int | None
+    max_archive_bytes: int | None
+    clean_target: SyncTargetCleanPolicy
+    sync_back: SyncBackPolicy
+    delete_missing: bool
+    source_conflict_policy: SyncSourceConflictPolicy
+    preserve_git_modes: bool
+    source_tar_policy_identity: tuple[object, ...]
+    target_tar_policy_identity: tuple[object, ...]
+
+
+class _BoundedSyncArchiveWriter:
+    """Limit an adapter-owned tar stream before it can grow the private spool."""
+
+    def __init__(self, destination: BinaryIO, *, max_bytes: int) -> None:
+        self._destination = destination
+        self._max_bytes = max_bytes
+        self.bytes_written = 0
+
+    def write(self, content: bytes) -> int:
+        if type(content) is not bytes:
+            raise TypeError("SyncBinding tar stream writes must be bytes.")
+        next_size = self.bytes_written + len(content)
+        if next_size > self._max_bytes:
+            raise RuntimeError(
+                "SyncBinding tar stream exceeds its admitted archive reservation: "
+                f"required>{self._max_bytes}."
+            )
+        written = self._destination.write(content)
+        if written is None:
+            written = len(content)
+        if type(written) is not int or written != len(content):
+            raise OSError("SyncBinding private archive spool accepted only part of a write.")
+        self.bytes_written = next_size
+        return written
+
+    def flush(self) -> None:
+        self._destination.flush()
 
 
 DEFAULT_SYNC_MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -1229,7 +1288,8 @@ class SyncBinding(WorkspaceBinding):
     (RunnerWorkspace implements both). Bounded generic transfers are staged
     before destination writes. ``max_total_bytes`` bounds logical file bytes,
     while ``max_archive_bytes`` independently bounds raw tar bytes; pass
-    ``None`` for a limit to opt out of that bound.
+    ``None`` for a limit to opt out of that per-transfer bound. The aggregate
+    ``staging_capacity`` remains authoritative for every transfer.
     Per-bind state is keyed by an opaque owner generation. Both resources remain
     reserved until that exact generation finalizes successfully or is explicitly
     abandoned; elapsed time is not evidence that a live binding released them.
@@ -1254,6 +1314,7 @@ class SyncBinding(WorkspaceBinding):
         delete_missing: bool = True,
         source_conflict_policy: SyncSourceConflictPolicy = "overwrite",
         preserve_git_modes: bool = False,
+        staging_capacity: SyncBindingStagingCapacity | None = None,
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -1299,6 +1360,13 @@ class SyncBinding(WorkspaceBinding):
         if type(preserve_git_modes) is not bool:
             raise TypeError("SyncBinding preserve_git_modes must be a bool.")
         self.preserve_git_modes = preserve_git_modes
+        if staging_capacity is not None and not isinstance(
+            staging_capacity, SyncBindingStagingCapacity
+        ):
+            raise TypeError(
+                "SyncBinding staging_capacity must be a SyncBindingStagingCapacity or None."
+            )
+        self.staging_capacity = staging_capacity or DEFAULT_SYNC_BINDING_STAGING_CAPACITY
         if self.source_conflict_policy == "require_revision" and (
             self.max_file_bytes is None or self.max_total_bytes is None
         ):
@@ -1308,6 +1376,49 @@ class SyncBinding(WorkspaceBinding):
             )
         self._state_lock = threading.Lock()
         self._states: dict[str, _SyncBindingState] = {}
+
+    def _archive_policy(
+        self,
+        paths: tuple[str, ...],
+        *,
+        source: Workspace,
+        target: Workspace,
+    ) -> _SyncArchivePolicy | None:
+        source_tar_policy_identity = source.tar_copy_policy_identity()
+        target_tar_policy_identity = target.tar_copy_policy_identity()
+        if source_tar_policy_identity is None or target_tar_policy_identity is None:
+            return None
+        for owner, identity in (
+            ("source", source_tar_policy_identity),
+            ("target", target_tar_policy_identity),
+        ):
+            try:
+                hash(identity)
+            except TypeError:
+                raise TypeError(
+                    f"SyncBinding {owner} tar_copy_policy_identity must be hashable."
+                ) from None
+        return _SyncArchivePolicy(
+            format_version="cayu-sync-tar-v1",
+            paths=paths,
+            pattern=self.pattern,
+            max_files=self.max_files,
+            max_file_bytes=self.max_file_bytes,
+            max_total_bytes=self.max_total_bytes,
+            max_archive_bytes=self.max_archive_bytes,
+            clean_target=self.clean_target,
+            sync_back=self.sync_back,
+            delete_missing=self.delete_missing,
+            source_conflict_policy=self.source_conflict_policy,
+            preserve_git_modes=self.preserve_git_modes,
+            source_tar_policy_identity=source_tar_policy_identity,
+            target_tar_policy_identity=target_tar_policy_identity,
+        )
+
+    def staging_snapshot(self) -> SyncBindingStagingSnapshot:
+        """Return content-free process-local staging capacity state."""
+
+        return self.staging_capacity.snapshot()
 
     async def bind(
         self,
@@ -1534,49 +1645,74 @@ class SyncBinding(WorkspaceBinding):
                     lambda: _run_sync_target_provisioner(target_provision),
                     operation="SyncBinding target provisioning",
                 )
-            source_paths = await _list_workspace_paths(
-                workspace,
-                self.pattern,
-                limit=self.max_files,
-                role="source",
-            )
-            source_revisions: tuple[_SyncSourceRevision, ...] = ()
-            if self.source_conflict_policy == "require_revision":
-                source_revisions = await _capture_sync_source_revisions(
+            staging_transfer = await self.staging_capacity._acquire_transfer()
+            try:
+                source_paths = await _list_workspace_paths(
                     workspace,
-                    source_paths,
-                    max_file_bytes=cast("int", self.max_file_bytes),
-                    max_total_bytes=cast("int", self.max_total_bytes),
-                    preserve_git_modes=self.preserve_git_modes,
-                )
-            cleaned_paths: tuple[str, ...] = ()
-            if self.clean_target == "always":
-                cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
-                target_baseline_paths: tuple[str, ...] = ()
-            else:
-                target_baseline_paths = await _list_workspace_paths(
-                    target,
                     self.pattern,
                     limit=self.max_files,
-                    role="target",
+                    role="source",
                 )
-            copied_bytes = await _copy_paths(
-                source=workspace,
-                target=target,
-                paths=source_paths,
-                max_file_bytes=self.max_file_bytes,
-                max_total_bytes=self.max_total_bytes,
-                max_archive_bytes=self.max_archive_bytes,
-                preserve_git_modes=self.preserve_git_modes,
-            )
-            if self.source_conflict_policy == "require_revision":
-                await _verify_sync_source_revisions(
-                    workspace,
-                    source_revisions,
-                    max_file_bytes=cast("int", self.max_file_bytes),
-                    max_total_bytes=cast("int", self.max_total_bytes),
+                source_observation: _SyncSourceObservation | None = None
+                source_revisions: tuple[_SyncSourceRevision, ...] = ()
+                if self.source_conflict_policy == "require_revision":
+                    source_observation = await _capture_sync_source_revisions(
+                        workspace,
+                        source_paths,
+                        max_file_bytes=cast("int", self.max_file_bytes),
+                        max_total_bytes=cast("int", self.max_total_bytes),
+                        preserve_git_modes=self.preserve_git_modes,
+                        staging_capacity=self.staging_capacity,
+                    )
+                    source_revisions = source_observation.revisions
+                _require_sync_copy_staging_capacity(
+                    source=workspace,
+                    target=target,
+                    paths=source_paths,
+                    max_file_bytes=self.max_file_bytes,
+                    max_total_bytes=self.max_total_bytes,
+                    max_archive_bytes=self.max_archive_bytes,
+                    staging_capacity=self.staging_capacity,
+                    requires_source_observation=source_observation is not None,
+                )
+                cleaned_paths: tuple[str, ...] = ()
+                if self.clean_target == "always":
+                    cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
+                    target_baseline_paths: tuple[str, ...] = ()
+                else:
+                    target_baseline_paths = await _list_workspace_paths(
+                        target,
+                        self.pattern,
+                        limit=self.max_files,
+                        role="target",
+                    )
+                copied_bytes = await _copy_paths(
+                    source=workspace,
+                    target=target,
+                    paths=source_paths,
+                    max_file_bytes=self.max_file_bytes,
+                    max_total_bytes=self.max_total_bytes,
+                    max_archive_bytes=self.max_archive_bytes,
                     preserve_git_modes=self.preserve_git_modes,
+                    staging_capacity=self.staging_capacity,
+                    source_observation=source_observation,
+                    archive_policy=self._archive_policy(
+                        source_paths,
+                        source=workspace,
+                        target=target,
+                    ),
                 )
+                if source_observation is not None:
+                    await _verify_sync_source_revisions(
+                        workspace,
+                        source_revisions,
+                        max_file_bytes=cast("int", self.max_file_bytes),
+                        max_total_bytes=cast("int", self.max_total_bytes),
+                        preserve_git_modes=self.preserve_git_modes,
+                        staging_capacity=self.staging_capacity,
+                    )
+            finally:
+                staging_transfer.release()
             bind_metadata = {
                 **request_metadata,
                 "sync_binding": {
@@ -1587,6 +1723,9 @@ class SyncBinding(WorkspaceBinding):
                     "max_file_bytes": self.max_file_bytes,
                     "max_total_bytes": self.max_total_bytes,
                     "max_archive_bytes": self.max_archive_bytes,
+                    "staging_max_concurrency": self.staging_capacity.max_concurrency,
+                    "staging_max_bytes": self.staging_capacity.max_staged_bytes,
+                    "reuse_sealed_archives": self.staging_capacity.reuse_sealed_archives,
                     "clean_target": self.clean_target,
                     "sync_back": self.sync_back,
                     "delete_missing": self.delete_missing,
@@ -1736,7 +1875,9 @@ class SyncBinding(WorkspaceBinding):
             raise ValueError("SyncBinding finalize requires a bound workspace.")
         source_workspace = bound.source_workspace
         state_key, state = self._begin_sync_finalize(bound)
+        staging_transfer: _CapacityLease | None = None
         try:
+            staging_transfer = await self.staging_capacity._acquire_transfer()
             target_paths = await _list_workspace_paths(
                 bound.workspace,
                 self.pattern,
@@ -1759,6 +1900,7 @@ class SyncBinding(WorkspaceBinding):
                     copy_back_paths=copy_back_paths,
                     deleted_paths=deleted_paths,
                     revisions=state.source_revisions,
+                    staging_capacity=self.staging_capacity,
                 )
             else:
                 copied_bytes = await _copy_paths(
@@ -1769,6 +1911,9 @@ class SyncBinding(WorkspaceBinding):
                     max_total_bytes=self.max_total_bytes,
                     max_archive_bytes=self.max_archive_bytes,
                     preserve_git_modes=self.preserve_git_modes,
+                    staging_capacity=self.staging_capacity,
+                    source_observation=None,
+                    archive_policy=None,
                 )
                 for path in deleted_paths:
                     await _await_sync_mutation(
@@ -1798,6 +1943,9 @@ class SyncBinding(WorkspaceBinding):
         except BaseException:
             self._restore_sync_state(state_key)
             raise
+        finally:
+            if staging_transfer is not None:
+                staging_transfer.release()
         self._complete_sync_finalize(
             state_key,
             source_paths=synced_source_paths,
@@ -1815,103 +1963,156 @@ class SyncBinding(WorkspaceBinding):
         copy_back_paths: tuple[str, ...],
         deleted_paths: tuple[str, ...],
         revisions: tuple[_SyncSourceRevision, ...],
+        staging_capacity: SyncBindingStagingCapacity,
     ) -> tuple[int, tuple[_SyncSourceRevision, ...]]:
         max_file_bytes = cast("int", self.max_file_bytes)
         max_total_bytes = cast("int", self.max_total_bytes)
-        staged, copied_bytes = await _stage_sync_files(
-            target,
-            copy_back_paths,
-            max_file_bytes=max_file_bytes,
-            max_total_bytes=max_total_bytes,
-            preserve_git_modes=self.preserve_git_modes,
-        )
-        revision_map = {item.path: item for item in revisions}
-        await _verify_sync_source_revisions(
-            source,
-            revisions,
-            max_file_bytes=max_file_bytes,
-            max_total_bytes=max_total_bytes,
-            preserve_git_modes=self.preserve_git_modes,
-        )
-        applied: list[str] = []
-        operations = tuple(sorted(set(copy_back_paths).union(deleted_paths)))
-        for path in operations:
-            try:
+        archive: _SealedTarArchive | None = None
+        archive_reader: BinaryIO | None = None
+        tar: tarfile.TarFile | None = None
+        try:
+            members: dict[str, tarfile.TarInfo] = {}
+            copied_bytes = 0
+            if copy_back_paths:
+                archive_reservation = _sync_archive_reservation_bound(
+                    copy_back_paths,
+                    max_file_bytes=max_file_bytes,
+                    max_total_bytes=max_total_bytes,
+                    max_archive_bytes=self.max_archive_bytes,
+                )
+                if archive_reservation is None:
+                    raise AssertionError("Revision-aware SyncBinding requires finite staging.")
+                staging_capacity._record_archive_build()
+                archive = await _pack_workspace_tar(
+                    source=target,
+                    source_stream=target.bounded_tar_stream_reader(),
+                    paths=copy_back_paths,
+                    max_file_bytes=max_file_bytes,
+                    max_total_bytes=max_total_bytes,
+                    max_archive_bytes=self.max_archive_bytes,
+                    archive_reservation=archive_reservation,
+                    staging_capacity=staging_capacity,
+                    minimum_transient_bytes=max_file_bytes,
+                    preserve_git_modes=self.preserve_git_modes,
+                )
+                copied_bytes = archive.logical_bytes
+                archive_reader = archive.open_reader()
+                tar = tarfile.open(  # noqa: SIM115 - closed in the lifecycle finally below
+                    fileobj=archive_reader,
+                    mode="r",
+                )
+                members = {member.name: member for member in tar}
+            revision_map = {item.path: item for item in revisions}
+            await _verify_sync_source_revisions(
+                source,
+                revisions,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+                preserve_git_modes=self.preserve_git_modes,
+                staging_capacity=None if archive is not None else staging_capacity,
+            )
+            applied: list[str] = []
+            operations = tuple(sorted(set(copy_back_paths).union(deleted_paths)))
+            for path in operations:
+                try:
 
-                async def mutate_and_record(path: str = path) -> None:
-                    if path in staged:
-                        staged_file = staged[path]
-                        expected = revision_map.get(path)
-                        if self.preserve_git_modes:
-                            if not isinstance(source, WorkspaceGitModeMutator):
-                                raise RuntimeError(
-                                    "SyncBinding Git-mode copy-back requires a mode-aware source."
-                                )
-                            if staged_file.git_mode is None:
-                                raise RuntimeError(
-                                    f"SyncBinding target omitted Git mode authority: {path}"
-                                )
-                            if expected is None:
-                                result = await source.create_bytes_with_git_mode(
-                                    path,
-                                    staged_file.content,
-                                    git_mode=staged_file.git_mode,
-                                )
-                            else:
-                                if expected.git_mode is None:
+                    async def mutate_and_record(path: str = path) -> None:
+                        if path in members:
+                            if archive is None or tar is None:
+                                raise AssertionError("SyncBinding staged archive is unavailable.")
+                            member = members[path]
+                            content = await _await_sync_mutation(
+                                lambda tar=tar, member=member: asyncio.to_thread(
+                                    _read_sync_tar_member,
+                                    tar,
+                                    member,
+                                ),
+                                operation=(
+                                    f"SyncBinding revision archive read for {member.name!r}"
+                                ),
+                            )
+                            expected = revision_map.get(path)
+                            git_mode = (
+                                _tar_member_git_mode(member) if self.preserve_git_modes else None
+                            )
+                            if self.preserve_git_modes:
+                                if not isinstance(source, WorkspaceGitModeMutator):
                                     raise RuntimeError(
-                                        f"SyncBinding source omitted Git mode authority: {path}"
+                                        "SyncBinding Git-mode copy-back requires a mode-aware "
+                                        "source."
                                     )
-                                result = await source.replace_bytes_with_git_mode(
+                                if git_mode is None:
+                                    raise AssertionError(
+                                        "SyncBinding validated Git mode authority is unavailable."
+                                    )
+                                if expected is None:
+                                    result = await source.create_bytes_with_git_mode(
+                                        path,
+                                        content,
+                                        git_mode=git_mode,
+                                    )
+                                else:
+                                    if expected.git_mode is None:
+                                        raise RuntimeError(
+                                            f"SyncBinding source omitted Git mode authority: {path}"
+                                        )
+                                    result = await source.replace_bytes_with_git_mode(
+                                        path,
+                                        content,
+                                        expected_revision=expected.revision,
+                                        expected_git_mode=expected.git_mode,
+                                        git_mode=git_mode,
+                                    )
+                            elif expected is None:
+                                result = await source.create_bytes(path, content)
+                            else:
+                                result = await source.replace_bytes(
                                     path,
-                                    staged_file.content,
+                                    content,
                                     expected_revision=expected.revision,
-                                    expected_git_mode=expected.git_mode,
-                                    git_mode=staged_file.git_mode,
                                 )
-                        elif expected is None:
-                            result = await source.create_bytes(path, staged_file.content)
+                            if result.after_revision is None:
+                                raise RuntimeError(
+                                    "SyncBinding conditional write returned no resulting revision."
+                                )
+                            revision_map[path] = _SyncSourceRevision(
+                                path=path,
+                                revision=result.after_revision,
+                                git_mode=git_mode,
+                            )
                         else:
-                            result = await source.replace_bytes(
+                            expected = revision_map[path]
+                            await source.delete_if_revision(
                                 path,
-                                staged_file.content,
                                 expected_revision=expected.revision,
                             )
-                        if result.after_revision is None:
-                            raise RuntimeError(
-                                "SyncBinding conditional write returned no resulting revision."
-                            )
-                        revision_map[path] = _SyncSourceRevision(
-                            path=path,
-                            revision=result.after_revision,
-                            git_mode=staged_file.git_mode if self.preserve_git_modes else None,
+                            del revision_map[path]
+                        applied.append(path)
+                        self._update_conflict_state(
+                            state_key,
+                            source_paths=tuple(sorted(revision_map)),
+                            source_revisions=tuple(
+                                sorted(revision_map.values(), key=lambda item: item.path)
+                            ),
                         )
-                    else:
-                        expected = revision_map[path]
-                        await source.delete_if_revision(
-                            path,
-                            expected_revision=expected.revision,
-                        )
-                        del revision_map[path]
-                    applied.append(path)
-                    self._update_conflict_state(
-                        state_key,
-                        source_paths=tuple(sorted(revision_map)),
-                        source_revisions=tuple(
-                            sorted(revision_map.values(), key=lambda item: item.path)
-                        ),
-                    )
 
-                await _await_sync_mutation(
-                    mutate_and_record,
-                    operation=f"SyncBinding conditional source mutation for {path!r}",
-                )
-            except Exception as exc:
-                raise SyncBindingSourceConflictError(
-                    path,
-                    applied_paths=tuple(applied),
-                ) from exc
-        return copied_bytes, tuple(sorted(revision_map.values(), key=lambda item: item.path))
+                    await _await_sync_mutation(
+                        mutate_and_record,
+                        operation=f"SyncBinding conditional source mutation for {path!r}",
+                    )
+                except Exception as exc:
+                    raise SyncBindingSourceConflictError(
+                        path,
+                        applied_paths=tuple(applied),
+                    ) from exc
+            return copied_bytes, tuple(sorted(revision_map.values(), key=lambda item: item.path))
+        finally:
+            if tar is not None:
+                tar.close()
+            if archive_reader is not None:
+                archive_reader.close()
+            if archive is not None:
+                archive.close()
 
     async def _target_workspace(
         self,
@@ -2249,39 +2450,73 @@ async def _capture_sync_source_revisions(
     max_file_bytes: int,
     max_total_bytes: int,
     preserve_git_modes: bool,
-) -> tuple[_SyncSourceRevision, ...]:
+    staging_capacity: SyncBindingStagingCapacity | None = None,
+    retained_staged_bytes: int = 0,
+) -> _SyncSourceObservation:
     revisions: list[_SyncSourceRevision] = []
+    manifest: list[tuple[str, str, int, WorkspaceGitMode | None]] = []
     observed_bytes = 0
     for path in paths:
-        result = await workspace.read_bytes(
-            path,
-            max_bytes=workspace.bounded_read_limit(max_file_bytes),
-        )
-        if result.truncated:
+        read_reservation = workspace.bounded_read_limit(max_file_bytes)
+        read_lease: _CapacityLease | None = None
+        if staging_capacity is not None:
+            required = retained_staged_bytes + read_reservation
+            if required > staging_capacity.max_staged_bytes:
+                raise SyncBindingStagingCapacityError(
+                    "SyncBinding retained archive plus source observation exceeds staged byte "
+                    f"capacity: required={required}, "
+                    f"capacity={staging_capacity.max_staged_bytes}."
+                )
+            read_lease = await staging_capacity._reserve_bytes(read_reservation)
+        try:
+            result = await _await_sync_mutation(
+                lambda path=path, read_reservation=read_reservation: workspace.read_bytes(
+                    path,
+                    max_bytes=read_reservation,
+                ),
+                operation=f"SyncBinding source observation read for {path!r}",
+            )
+            if type(result) is not WorkspaceReadResult:
+                raise TypeError("SyncBinding source read returned an invalid result.")
+            content_sha256 = hashlib.sha256(result.content).hexdigest()
+            truncated = result.truncated
+            total_bytes = result.total_bytes
+            revision = result.revision
+            git_mode = result.git_mode
+            del result
+        finally:
+            if read_lease is not None:
+                read_lease.release()
+        if truncated:
             raise RuntimeError(
                 f"SyncBinding source file exceeds max_file_bytes={max_file_bytes}: {path}"
             )
-        observed_bytes += result.total_bytes
+        observed_bytes += total_bytes
         if observed_bytes > max_total_bytes:
             raise RuntimeError(
                 f"SyncBinding source files exceed max_total_bytes={max_total_bytes}."
             )
-        if result.revision is None:
+        if revision is None:
             raise RuntimeError(
                 f"SyncBinding revision-aware copy-back requires source revision support: {path}"
             )
-        if preserve_git_modes and result.git_mode is None:
+        if preserve_git_modes and git_mode is None:
             raise RuntimeError(
                 f"SyncBinding Git-mode copy-back requires source mode support: {path}"
             )
-        revisions.append(
-            _SyncSourceRevision(
-                path=path,
-                revision=result.revision,
-                git_mode=result.git_mode if preserve_git_modes else None,
-            )
+        observed_revision = _SyncSourceRevision(
+            path=path,
+            revision=revision,
+            git_mode=git_mode if preserve_git_modes else None,
         )
-    return tuple(revisions)
+        revisions.append(observed_revision)
+        manifest.append((path, content_sha256, total_bytes, observed_revision.git_mode))
+    encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return _SyncSourceObservation(
+        revisions=tuple(revisions),
+        content_sha256=hashlib.sha256(encoded).hexdigest(),
+        logical_bytes=observed_bytes,
+    )
 
 
 async def _verify_sync_source_revisions(
@@ -2291,6 +2526,8 @@ async def _verify_sync_source_revisions(
     max_file_bytes: int,
     max_total_bytes: int,
     preserve_git_modes: bool,
+    staging_capacity: SyncBindingStagingCapacity | None = None,
+    retained_staged_bytes: int = 0,
 ) -> None:
     try:
         current = await _capture_sync_source_revisions(
@@ -2299,38 +2536,16 @@ async def _verify_sync_source_revisions(
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
             preserve_git_modes=preserve_git_modes,
+            staging_capacity=staging_capacity,
+            retained_staged_bytes=retained_staged_bytes,
         )
     except Exception as exc:
         path = revisions[0].path if revisions else "source-workspace"
         raise SyncBindingSourceConflictError(path) from exc
     expected = {item.path: item for item in revisions}
-    for observed in current:
+    for observed in current.revisions:
         if expected[observed.path] != observed:
             raise SyncBindingSourceConflictError(observed.path)
-
-
-async def _stage_sync_files(
-    workspace: Workspace,
-    paths: tuple[str, ...],
-    *,
-    max_file_bytes: int,
-    max_total_bytes: int,
-    preserve_git_modes: bool,
-) -> tuple[dict[str, _SyncStagedFile], int]:
-    staged: dict[str, _SyncStagedFile] = {}
-    total_bytes = 0
-    for path in paths:
-        result = await _read_sync_file_result(
-            workspace,
-            path,
-            max_file_bytes=max_file_bytes,
-            max_total_bytes=max_total_bytes,
-            copied_bytes=total_bytes,
-        )
-        git_mode = _require_sync_git_mode(result, path) if preserve_git_modes else None
-        staged[path] = _SyncStagedFile(content=result.content, git_mode=git_mode)
-        total_bytes += len(result.content)
-    return staged, total_bytes
 
 
 async def _list_workspace_paths(
@@ -2372,19 +2587,18 @@ async def _copy_paths(
     max_total_bytes: int | None,
     max_archive_bytes: int | None,
     preserve_git_modes: bool = False,
+    staging_capacity: SyncBindingStagingCapacity,
+    source_observation: _SyncSourceObservation | None,
+    archive_policy: _SyncArchivePolicy | None,
 ) -> int:
-    """Copy files between workspaces, staging whenever a bound is configured.
-
-    Nominal bulk capabilities keep runner-backed workspaces at O(1) execs.
-    Generic copies with any byte limit are staged as a bounded tar so a limit
-    failure occurs before the first copied-file write. Only an explicitly
-    unbounded generic copy uses the incremental per-file fallback.
-    """
+    """Copy files through one capacity-owned, private, immutable tar spool."""
 
     if not paths:
         return 0
-    source_supports_bulk = isinstance(source, BoundedTarReader)
-    target_supports_bulk = isinstance(target, TarWriter)
+    source_stream = source.bounded_tar_stream_reader()
+    target_stream = target.tar_stream_writer()
+    source_supports_bulk = source_stream is not None or isinstance(source, BoundedTarReader)
+    target_supports_bulk = target_stream is not None or isinstance(target, TarWriter)
     if (
         preserve_git_modes
         and not target_supports_bulk
@@ -2402,43 +2616,128 @@ async def _copy_paths(
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
             preserve_git_modes=preserve_git_modes,
+            staging_capacity=staging_capacity,
         )
-    if source_supports_bulk:
-        tar_data = await source.read_tar_bytes(
-            paths,
-            max_file_bytes=max_file_bytes,
-            max_total_bytes=max_total_bytes,
-            max_archive_bytes=max_archive_bytes,
-        )
-    else:
-        tar_data = await _pack_workspace_tar(
-            source,
-            paths,
-            max_file_bytes=max_file_bytes,
-            max_total_bytes=max_total_bytes,
-            max_archive_bytes=max_archive_bytes,
-            preserve_git_modes=preserve_git_modes,
-        )
-    copied_bytes = _validate_sync_tar(
-        tar_data,
+    archive_reservation = _sync_archive_reservation_bound(
         paths,
         max_file_bytes=max_file_bytes,
         max_total_bytes=max_total_bytes,
         max_archive_bytes=max_archive_bytes,
-        preserve_git_modes=preserve_git_modes,
     )
-    if target_supports_bulk:
-        await _await_sync_mutation(
-            lambda: target.write_tar_bytes(tar_data),
-            operation="SyncBinding target tar write",
+    if archive_reservation is None:
+        return await _copy_paths_per_file(
+            source=source,
+            target=target,
+            paths=paths,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            preserve_git_modes=preserve_git_modes,
+            staging_capacity=staging_capacity,
         )
-    else:
-        await _extract_tar_to_workspace(
-            target,
-            tar_data,
+    minimum_transient_bytes = _sync_transfer_transient_reservation_bound(
+        target=target,
+        target_stream=target_stream,
+        paths=paths,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_archive_bytes=max_archive_bytes,
+        archive_reservation=archive_reservation,
+        requires_source_observation=source_observation is not None,
+    )
+
+    async def build_archive() -> _SealedTarArchive:
+        archive = await _pack_workspace_tar(
+            source=source,
+            source_stream=source_stream,
+            paths=paths,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            max_archive_bytes=max_archive_bytes,
+            archive_reservation=archive_reservation,
+            staging_capacity=staging_capacity,
+            minimum_transient_bytes=minimum_transient_bytes,
             preserve_git_modes=preserve_git_modes,
         )
-    return copied_bytes
+        if source_observation is not None:
+            try:
+                await _verify_sync_source_revisions(
+                    source,
+                    source_observation.revisions,
+                    max_file_bytes=cast("int", max_file_bytes),
+                    max_total_bytes=cast("int", max_total_bytes),
+                    preserve_git_modes=preserve_git_modes,
+                    staging_capacity=None,
+                )
+            except BaseException:
+                archive.close()
+                raise
+        return archive
+
+    if source_observation is not None and archive_policy is not None:
+        cache_key = (
+            source_observation.revisions,
+            source_observation.content_sha256,
+            source_observation.logical_bytes,
+            archive_policy,
+        )
+    else:
+        cache_key = object()
+    reference = await staging_capacity._acquire_archive(cache_key, build_archive)
+    archive = reference.archive
+    try:
+        if source_observation is not None and not reference.is_builder:
+            await _verify_sync_source_revisions(
+                source,
+                source_observation.revisions,
+                max_file_bytes=cast("int", max_file_bytes),
+                max_total_bytes=cast("int", max_total_bytes),
+                preserve_git_modes=preserve_git_modes,
+                staging_capacity=staging_capacity,
+                retained_staged_bytes=archive.archive_bytes,
+            )
+        if target_stream is not None:
+            reader = archive.open_reader()
+            try:
+                await _await_sync_mutation(
+                    lambda: target_stream.write_tar_stream(
+                        reader,
+                        archive_bytes=archive.archive_bytes,
+                    ),
+                    operation="SyncBinding target tar stream write",
+                )
+            finally:
+                reader.close()
+        elif isinstance(target, TarWriter):
+            duplicate_lease = (
+                None
+                if reference.is_builder
+                else await _reserve_archive_duplicate(staging_capacity, archive)
+            )
+            reader = archive.open_reader()
+            try:
+                tar_data = await _await_sync_mutation(
+                    lambda: asyncio.to_thread(reader.read),
+                    operation="SyncBinding compatibility archive read",
+                )
+                await _await_sync_mutation(
+                    lambda: target.write_tar_bytes(tar_data),
+                    operation="SyncBinding target tar write",
+                )
+            finally:
+                reader.close()
+                if duplicate_lease is not None:
+                    duplicate_lease.release()
+        else:
+            await _extract_tar_to_workspace(
+                target,
+                archive,
+                staging_capacity=staging_capacity,
+                transient_reserved=reference.is_builder,
+                preserve_git_modes=preserve_git_modes,
+            )
+        return archive.logical_bytes
+    finally:
+        reference.release()
 
 
 async def _copy_paths_per_file(
@@ -2449,114 +2748,564 @@ async def _copy_paths_per_file(
     max_file_bytes: int | None,
     max_total_bytes: int | None,
     preserve_git_modes: bool = False,
+    staging_capacity: SyncBindingStagingCapacity,
 ) -> int:
     copied_bytes = 0
     for path in paths:
-        result = await _read_sync_file_result(
+        policy_read_limit, _, _ = _copy_read_limit(
             source,
-            path,
             max_file_bytes=max_file_bytes,
             max_total_bytes=max_total_bytes,
             copied_bytes=copied_bytes,
+            max_staged_bytes=None,
+            staged_limit_label=None,
         )
-        if preserve_git_modes:
-            if not isinstance(target, WorkspaceGitModeMutator):
-                raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
-            git_mode = _require_sync_git_mode(result, path)
-            await _await_sync_mutation(
-                lambda path=path, result=result, git_mode=git_mode: (
-                    target.write_bytes_with_git_mode(
-                        path,
-                        result.content,
-                        git_mode=git_mode,
-                    )
+        capacity_read_limit = _bounded_workspace_read_limit(
+            source,
+            staging_capacity.max_staged_bytes,
+        )
+        read_limit = (
+            capacity_read_limit
+            if policy_read_limit is None
+            else min(policy_read_limit, capacity_read_limit)
+        )
+        read_lease = await staging_capacity._reserve_bytes(read_limit)
+        result: WorkspaceReadResult | None = None
+        try:
+            result = await _await_sync_mutation(
+                lambda path=path, read_limit=read_limit: source.read_bytes(
+                    path,
+                    max_bytes=read_limit,
                 ),
-                operation=f"SyncBinding target Git-mode write for {path!r}",
+                operation=f"SyncBinding source file read for {path!r}",
             )
-        else:
-            await _await_sync_mutation(
-                lambda path=path, content=result.content: target.write_bytes(path, content),
-                operation=f"SyncBinding target write for {path!r}",
+            if type(result) is not WorkspaceReadResult:
+                raise TypeError("SyncBinding source read returned an invalid result.")
+            if result.truncated:
+                _raise_sync_file_read_limit(
+                    path,
+                    result.total_bytes,
+                    max_file_bytes=max_file_bytes,
+                    max_total_bytes=max_total_bytes,
+                    copied_bytes=copied_bytes,
+                    max_retained_bytes=staging_capacity.max_staged_bytes,
+                )
+            if len(result.content) > staging_capacity.max_staged_bytes:
+                raise RuntimeError(
+                    "SyncBinding files exceed aggregate staging capacity="
+                    f"{staging_capacity.max_staged_bytes}."
+                )
+            _validate_sync_total_bytes(
+                copied_bytes + len(result.content),
+                max_total_bytes=max_total_bytes,
             )
-        copied_bytes += len(result.content)
+            if max_file_bytes is not None and len(result.content) > max_file_bytes:
+                raise RuntimeError(
+                    f"SyncBinding file exceeds max_file_bytes={max_file_bytes}: {path}"
+                )
+            if preserve_git_modes:
+                if not isinstance(target, WorkspaceGitModeMutator):
+                    raise RuntimeError(
+                        "SyncBinding Git-mode transfer requires a mode-aware target."
+                    )
+                git_mode = _require_sync_git_mode(result, path)
+                await _await_sync_mutation(
+                    lambda path=path, result=result, git_mode=git_mode: (
+                        target.write_bytes_with_git_mode(
+                            path,
+                            result.content,
+                            git_mode=git_mode,
+                        )
+                    ),
+                    operation=f"SyncBinding target Git-mode write for {path!r}",
+                )
+            else:
+                await _await_sync_mutation(
+                    lambda path=path, content=result.content: target.write_bytes(path, content),
+                    operation=f"SyncBinding target write for {path!r}",
+                )
+            copied_bytes += len(result.content)
+        finally:
+            result = None
+            read_lease.release()
     return copied_bytes
 
 
+def _raise_sync_file_read_limit(
+    path: str,
+    total_bytes: int,
+    *,
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    copied_bytes: int,
+    max_retained_bytes: int,
+) -> NoReturn:
+    if total_bytes > max_retained_bytes:
+        raise RuntimeError(
+            f"SyncBinding files exceed aggregate staging capacity={max_retained_bytes}."
+        )
+    if max_file_bytes is not None and total_bytes > max_file_bytes:
+        raise RuntimeError(f"SyncBinding file exceeds max_file_bytes={max_file_bytes}: {path}")
+    if max_total_bytes is not None and copied_bytes + total_bytes > max_total_bytes:
+        raise RuntimeError(f"SyncBinding files exceed max_total_bytes={max_total_bytes}.")
+    raise RuntimeError(f"SyncBinding file exceeds the workspace read limit: {path}")
+
+
 async def _pack_workspace_tar(
+    *,
     source: Workspace,
+    source_stream: BoundedTarStreamReader | None,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+    archive_reservation: int,
+    staging_capacity: SyncBindingStagingCapacity,
+    minimum_transient_bytes: int = 0,
+    preserve_git_modes: bool = False,
+) -> _SealedTarArchive:
+    archive_overhead_bytes = tar_archive_size_bound(0, paths)
+    if max_archive_bytes is not None and archive_overhead_bytes > max_archive_bytes:
+        raise RuntimeError(f"SyncBinding tar exceeds max_archive_bytes={max_archive_bytes}.")
+    builder_transient_bytes = _sync_archive_builder_transient_reservation_bound(
+        source=source,
+        source_stream=source_stream,
+        paths=paths,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_archive_bytes=max_archive_bytes,
+        archive_reservation=archive_reservation,
+    )
+    working_reservation = archive_reservation + max(
+        builder_transient_bytes,
+        minimum_transient_bytes,
+    )
+    # Reserve the builder's peak working set in one admission. Reserving the
+    # archive first and its transient read buffer later can deadlock when several
+    # independent builders collectively fill the shared capacity.
+    archive_lease = await staging_capacity._reserve_bytes(working_reservation)
+    spool: BinaryIO | None = None
+    try:
+        spool = tempfile.TemporaryFile(  # noqa: SIM115 - ownership moves to sealed archive
+            mode="w+b",
+            prefix="cayu-sync-tar-",
+        )
+        active_spool: BinaryIO = spool
+        if source_stream is not None:
+            bounded_destination = _BoundedSyncArchiveWriter(
+                active_spool,
+                max_bytes=archive_reservation,
+            )
+            result = await _await_sync_mutation(
+                lambda: source_stream.read_tar_stream(
+                    paths,
+                    cast("BinaryIO", bounded_destination),
+                    max_file_bytes=max_file_bytes,
+                    max_total_bytes=max_total_bytes,
+                    max_archive_bytes=max_archive_bytes,
+                ),
+                operation="SyncBinding source tar stream read",
+            )
+            archive_bytes = result.archive_bytes
+            if archive_bytes != bounded_destination.bytes_written:
+                raise RuntimeError(
+                    "SyncBinding streamed tar byte accounting did not match emitted bytes."
+                )
+        elif isinstance(source, BoundedTarReader):
+            tar_data = await _await_sync_mutation(
+                lambda: source.read_tar_bytes(
+                    paths,
+                    max_file_bytes=max_file_bytes,
+                    max_total_bytes=max_total_bytes,
+                    max_archive_bytes=archive_reservation,
+                ),
+                operation="SyncBinding compatibility source tar read",
+            )
+            if type(tar_data) is not bytes:
+                raise TypeError("SyncBinding compatibility tar reader must return bytes.")
+            archive_bytes = len(tar_data)
+            if archive_bytes > archive_reservation:
+                raise RuntimeError(
+                    "SyncBinding compatibility tar exceeds its admitted archive reservation: "
+                    f"required={archive_bytes}, capacity={archive_reservation}."
+                )
+            await _await_sync_mutation(
+                lambda: asyncio.to_thread(active_spool.write, tar_data),
+                operation="SyncBinding compatibility archive spool write",
+            )
+            del tar_data
+        else:
+            copied_bytes = 0
+            staged_logical_limit = (
+                None if max_archive_bytes is None else max_archive_bytes - archive_overhead_bytes
+            )
+            with tarfile.open(fileobj=active_spool, mode="w|") as tar:
+                for path in paths:
+                    result = await _read_sync_file_result(
+                        source,
+                        path,
+                        max_file_bytes=max_file_bytes,
+                        max_total_bytes=max_total_bytes,
+                        copied_bytes=copied_bytes,
+                        max_staged_bytes=staged_logical_limit,
+                        staged_limit_label=(
+                            None
+                            if max_archive_bytes is None
+                            else f"max_archive_bytes={max_archive_bytes}"
+                        ),
+                    )
+                    copied_bytes += len(result.content)
+                    info = tarfile.TarInfo(name=path)
+                    info.size = len(result.content)
+                    if preserve_git_modes:
+                        git_mode = _require_sync_git_mode(result, path)
+                        info.mode = _git_mode_tar_bits(git_mode)
+                        info.uname = _SYNC_GIT_MODE_TAR_OWNER
+                    await _await_sync_mutation(
+                        lambda tar=tar, info=info, result=result: asyncio.to_thread(
+                            tar.addfile,
+                            info,
+                            io.BytesIO(result.content),
+                        ),
+                        operation=f"SyncBinding private archive write for {path!r}",
+                    )
+                    del result
+            active_spool.seek(0, io.SEEK_END)
+            archive_bytes = active_spool.tell()
+        active_spool.seek(0, io.SEEK_END)
+        if active_spool.tell() != archive_bytes:
+            raise RuntimeError("SyncBinding streamed tar byte accounting did not match its spool.")
+        copied_bytes = await _await_sync_mutation(
+            lambda: asyncio.to_thread(
+                _validate_sync_tar_stream,
+                active_spool,
+                archive_bytes=archive_bytes,
+                paths=paths,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+                max_archive_bytes=max_archive_bytes,
+                preserve_git_modes=preserve_git_modes,
+            ),
+            operation="SyncBinding private archive validation",
+        )
+        sealed = _SealedTarArchive(
+            active_spool,
+            archive_bytes=archive_bytes,
+            logical_bytes=copied_bytes,
+            capacity_lease=archive_lease,
+        )
+        spool = None
+        return sealed
+    except BaseException:
+        try:
+            if spool is not None:
+                try:
+                    spool.close()
+                finally:
+                    archive_lease.record_archive_cleanup()
+        finally:
+            archive_lease.release()
+        raise
+
+
+async def _extract_tar_to_workspace(
+    target: Workspace,
+    archive: _SealedTarArchive,
+    *,
+    staging_capacity: SyncBindingStagingCapacity,
+    transient_reserved: bool,
+    preserve_git_modes: bool = False,
+) -> None:
+    if preserve_git_modes and not isinstance(target, WorkspaceGitModeMutator):
+        raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
+    reader = archive.open_reader()
+    try:
+        with tarfile.open(fileobj=reader, mode="r") as tar:
+            for member in tar:
+                if (
+                    not transient_reserved
+                    and archive.archive_bytes + member.size > staging_capacity.max_staged_bytes
+                ):
+                    raise SyncBindingStagingCapacityError(
+                        "SyncBinding archive plus extracted file exceeds staged byte capacity: "
+                        f"required={archive.archive_bytes + member.size}, "
+                        f"capacity={staging_capacity.max_staged_bytes}."
+                    )
+                content_lease = (
+                    None
+                    if transient_reserved
+                    else await staging_capacity._reserve_bytes(member.size)
+                )
+                try:
+                    content = await _await_sync_mutation(
+                        lambda tar=tar, member=member: asyncio.to_thread(
+                            _read_sync_tar_member,
+                            tar,
+                            member,
+                        ),
+                        operation=f"SyncBinding private archive read for {member.name!r}",
+                    )
+                    try:
+                        if preserve_git_modes:
+                            git_mode = _tar_member_git_mode(member)
+                            mode_target = cast("WorkspaceGitModeMutator", target)
+                            await _await_sync_mutation(
+                                lambda name=member.name, content=content, git_mode=git_mode, mode_target=mode_target: (
+                                    mode_target.write_bytes_with_git_mode(
+                                        name,
+                                        content,
+                                        git_mode=git_mode,
+                                    )
+                                ),
+                                operation=(
+                                    f"SyncBinding target Git-mode write for {member.name!r}"
+                                ),
+                            )
+                        else:
+                            await _await_sync_mutation(
+                                lambda name=member.name, content=content: target.write_bytes(
+                                    name, content
+                                ),
+                                operation=f"SyncBinding target write for {member.name!r}",
+                            )
+                    finally:
+                        # The next member read may allocate before assigning the
+                        # next loop value. Drop this buffer while its byte lease
+                        # still accounts for it, including after a failed write.
+                        del content
+                finally:
+                    if content_lease is not None:
+                        content_lease.release()
+    finally:
+        reader.close()
+
+
+def _read_sync_tar_member(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        raise RuntimeError(f"SyncBinding tar member could not be read: {member.name}")
+    try:
+        return extracted.read()
+    finally:
+        extracted.close()
+
+
+async def _reserve_archive_duplicate(
+    staging_capacity: SyncBindingStagingCapacity,
+    archive: _SealedTarArchive,
+) -> _CapacityLease:
+    required = archive.archive_bytes * 2
+    if required > staging_capacity.max_staged_bytes:
+        raise SyncBindingStagingCapacityError(
+            "SyncBinding compatibility tar copy exceeds staged byte capacity: "
+            f"required={required}, capacity={staging_capacity.max_staged_bytes}."
+        )
+    return await staging_capacity._reserve_bytes(archive.archive_bytes)
+
+
+def _sync_archive_reservation_bound(
     paths: tuple[str, ...],
     *,
     max_file_bytes: int | None,
     max_total_bytes: int | None,
     max_archive_bytes: int | None,
-    preserve_git_modes: bool = False,
-) -> bytes:
-    archive_overhead_bytes = tar_archive_size_bound(0, paths)
-    staged_logical_limit: int | None = None
-    staged_limit_label: str | None = None
+) -> int | None:
+    logical_bounds: list[int] = []
+    if max_file_bytes is not None:
+        logical_bounds.append(max_file_bytes * len(paths))
+    if max_total_bytes is not None:
+        logical_bounds.append(max_total_bytes)
+    raw_bounds = [tar_archive_size_bound(min(logical_bounds), paths)] if logical_bounds else []
     if max_archive_bytes is not None:
-        if archive_overhead_bytes > max_archive_bytes:
-            raise RuntimeError(f"SyncBinding tar exceeds max_archive_bytes={max_archive_bytes}.")
-        staged_logical_limit = max_archive_bytes - archive_overhead_bytes
-        staged_limit_label = f"max_archive_bytes={max_archive_bytes}"
-    buffer = io.BytesIO()
-    copied_bytes = 0
-    with tarfile.open(fileobj=buffer, mode="w") as archive:
-        for path in paths:
-            result = await _read_sync_file_result(
-                source,
-                path,
-                max_file_bytes=max_file_bytes,
-                max_total_bytes=max_total_bytes,
-                copied_bytes=copied_bytes,
-                max_staged_bytes=staged_logical_limit,
-                staged_limit_label=staged_limit_label,
-            )
-            copied_bytes += len(result.content)
-            info = tarfile.TarInfo(name=path)
-            info.size = len(result.content)
-            if preserve_git_modes:
-                git_mode = _require_sync_git_mode(result, path)
-                info.mode = _git_mode_tar_bits(git_mode)
-                info.uname = _SYNC_GIT_MODE_TAR_OWNER
-            archive.addfile(info, io.BytesIO(result.content))
-    tar_data = buffer.getvalue()
-    _validate_sync_archive_bytes(tar_data, max_archive_bytes=max_archive_bytes)
-    return tar_data
+        raw_bounds.append(max_archive_bytes)
+    return min(raw_bounds) if raw_bounds else None
 
 
-async def _extract_tar_to_workspace(
-    target: Workspace,
-    tar_data: bytes,
+def _sync_file_reservation_bound(
     *,
-    preserve_git_modes: bool = False,
-) -> None:
-    if preserve_git_modes and not isinstance(target, WorkspaceGitModeMutator):
-        raise RuntimeError("SyncBinding Git-mode transfer requires a mode-aware target.")
-    with tarfile.open(fileobj=io.BytesIO(tar_data), mode="r") as archive:
-        for member in archive.getmembers():
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                raise RuntimeError(f"SyncBinding tar member could not be read: {member.name}")
-            content = extracted.read()
-            if preserve_git_modes:
-                git_mode = _tar_member_git_mode(member)
-                mode_target = cast("WorkspaceGitModeMutator", target)
-                await _await_sync_mutation(
-                    lambda name=member.name, content=content, git_mode=git_mode, target=mode_target: (
-                        target.write_bytes_with_git_mode(
-                            name,
-                            content,
-                            git_mode=git_mode,
-                        )
+    copied_bytes: int,
+    archive_overhead_bytes: int,
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+) -> int:
+    bounds: list[int] = []
+    if max_file_bytes is not None:
+        bounds.append(max_file_bytes)
+    if max_total_bytes is not None:
+        bounds.append(max(0, max_total_bytes - copied_bytes))
+    if max_archive_bytes is not None:
+        bounds.append(max(0, max_archive_bytes - archive_overhead_bytes - copied_bytes))
+    if not bounds:
+        raise AssertionError("A staged SyncBinding transfer requires a finite read bound.")
+    return min(bounds)
+
+
+def _sync_transfer_transient_reservation_bound(
+    *,
+    target: Workspace,
+    target_stream: TarStreamWriter | None,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+    archive_reservation: int,
+    requires_source_observation: bool,
+) -> int:
+    transient_bounds = [0]
+    if requires_source_observation:
+        if max_file_bytes is None:
+            raise AssertionError("Revision-aware SyncBinding requires a finite file bound.")
+        transient_bounds.append(max_file_bytes)
+    if target_stream is None:
+        if isinstance(target, TarWriter):
+            transient_bounds.append(archive_reservation)
+        else:
+            transient_bounds.append(
+                max(
+                    1,
+                    _sync_file_reservation_bound(
+                        copied_bytes=0,
+                        archive_overhead_bytes=tar_archive_size_bound(0, paths),
+                        max_file_bytes=max_file_bytes,
+                        max_total_bytes=max_total_bytes,
+                        max_archive_bytes=max_archive_bytes,
                     ),
-                    operation=f"SyncBinding target Git-mode write for {member.name!r}",
                 )
-            else:
-                await _await_sync_mutation(
-                    lambda name=member.name, content=content: target.write_bytes(name, content),
-                    operation=f"SyncBinding target write for {member.name!r}",
-                )
+            )
+    return max(transient_bounds)
+
+
+def _sync_archive_builder_transient_reservation_bound(
+    *,
+    source: Workspace,
+    source_stream: BoundedTarStreamReader | None,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+    archive_reservation: int,
+) -> int:
+    if source_stream is not None:
+        return 0
+    if isinstance(source, BoundedTarReader):
+        return archive_reservation
+    return max(
+        1,
+        _sync_file_reservation_bound(
+            copied_bytes=0,
+            archive_overhead_bytes=tar_archive_size_bound(0, paths),
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            max_archive_bytes=max_archive_bytes,
+        ),
+    )
+
+
+def _require_sync_copy_staging_capacity(
+    *,
+    source: Workspace,
+    target: Workspace,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+    staging_capacity: SyncBindingStagingCapacity,
+    requires_source_observation: bool,
+) -> None:
+    if not paths:
+        return
+    source_stream = source.bounded_tar_stream_reader()
+    target_stream = target.tar_stream_writer()
+    source_supports_bulk = source_stream is not None or isinstance(source, BoundedTarReader)
+    target_supports_bulk = target_stream is not None or isinstance(target, TarWriter)
+    requires_staging = any(
+        limit is not None for limit in (max_file_bytes, max_total_bytes, max_archive_bytes)
+    )
+    if not source_supports_bulk and not target_supports_bulk and not requires_staging:
+        return
+    archive_reservation = _sync_archive_reservation_bound(
+        paths,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_archive_bytes=max_archive_bytes,
+    )
+    if archive_reservation is None:
+        return
+    consumer_transient_bytes = _sync_transfer_transient_reservation_bound(
+        target=target,
+        target_stream=target_stream,
+        paths=paths,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_archive_bytes=max_archive_bytes,
+        archive_reservation=archive_reservation,
+        requires_source_observation=requires_source_observation,
+    )
+    builder_transient_bytes = _sync_archive_builder_transient_reservation_bound(
+        source=source,
+        source_stream=source_stream,
+        paths=paths,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        max_archive_bytes=max_archive_bytes,
+        archive_reservation=archive_reservation,
+    )
+    required = archive_reservation + max(
+        consumer_transient_bytes,
+        builder_transient_bytes,
+    )
+    if required > staging_capacity.max_staged_bytes:
+        raise SyncBindingStagingCapacityError(
+            "SyncBinding transfer peak exceeds staged byte capacity: "
+            f"required={required}, capacity={staging_capacity.max_staged_bytes}."
+        )
+
+
+def _validate_sync_tar_stream(
+    source: BinaryIO,
+    *,
+    archive_bytes: int,
+    paths: tuple[str, ...],
+    max_file_bytes: int | None,
+    max_total_bytes: int | None,
+    max_archive_bytes: int | None,
+    preserve_git_modes: bool = False,
+) -> int:
+    if max_archive_bytes is not None and archive_bytes > max_archive_bytes:
+        raise RuntimeError(f"SyncBinding tar exceeds max_archive_bytes={max_archive_bytes}.")
+    copied_bytes = 0
+    member_names: list[str] = []
+    source.seek(0)
+    try:
+        with tarfile.open(fileobj=source, mode="r") as tar:
+            for member in tar:
+                if not member.isreg():
+                    raise RuntimeError(
+                        f"SyncBinding tar member must be a regular file: {member.name}"
+                    )
+                if preserve_git_modes:
+                    _tar_member_git_mode(member)
+                if max_file_bytes is not None and member.size > max_file_bytes:
+                    raise RuntimeError(
+                        f"SyncBinding file exceeds max_file_bytes={max_file_bytes}: {member.name}"
+                    )
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    raise RuntimeError(f"SyncBinding tar member could not be read: {member.name}")
+                try:
+                    while extracted.read(1 << 16):
+                        pass
+                finally:
+                    extracted.close()
+                member_names.append(member.name)
+                copied_bytes += member.size
+                _validate_sync_total_bytes(copied_bytes, max_total_bytes=max_total_bytes)
+    except tarfile.TarError as exc:
+        raise RuntimeError("SyncBinding bulk transfer returned an invalid tar archive.") from exc
+    if sorted(member_names) != sorted(paths):
+        raise RuntimeError("SyncBinding bulk transfer paths do not match the requested files.")
+    return copied_bytes
 
 
 async def _await_sync_mutation(
@@ -2564,14 +3313,14 @@ async def _await_sync_mutation(
     *,
     operation: str,
 ) -> _MutationResultT:
-    """Keep a dispatched workspace mutation fenced until it is quiescent.
+    """Keep a dispatched workspace operation fenced until it is quiescent.
 
     Workspace implementations can delegate filesystem or SDK work to a thread.
-    Cancelling the await does not prove that work stopped. Run each mutation in
+    Cancelling the await does not prove that work stopped. Run each operation in
     a shielded child task and defer propagation of caller cancellation or fatal
-    signals until the child has a terminal outcome, so SyncBinding cannot
-    release or restore ownership while an old mutation can still affect a new
-    owner.
+    signals until the child has a terminal outcome, so SyncBinding cannot release
+    staging capacity or restore ownership while old work can still consume a
+    staged object or affect a new owner.
     """
 
     # Deliver a cancellation already pending at entry before dispatching work.
@@ -2728,7 +3477,10 @@ async def _read_sync_file_result(
         max_staged_bytes=max_staged_bytes,
         staged_limit_label=staged_limit_label,
     )
-    result = await source.read_bytes(path, max_bytes=read_limit)
+    result = await _await_sync_mutation(
+        lambda: source.read_bytes(path, max_bytes=read_limit),
+        operation=f"SyncBinding source file read for {path!r}",
+    )
     if type(result) is not WorkspaceReadResult:
         raise TypeError("SyncBinding source read returned an invalid result.")
     if result.truncated:

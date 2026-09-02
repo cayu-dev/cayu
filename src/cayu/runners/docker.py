@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Literal, cast
+from typing import BinaryIO, Literal, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -46,6 +46,8 @@ from cayu.runners._subprocess import (
     copy_runner_env,
     remove_runner_env,
     run_subprocess,
+    validate_binary_input_stream,
+    validate_binary_output_stream,
     validate_output_limit,
     validate_runner_env_remove,
     validate_stdin,
@@ -56,6 +58,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerBinaryStreamCapability,
     _clean_runner_preflight,
     _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
@@ -684,7 +687,10 @@ async def _run_docker(
 def _supervised_command_script(command_script: str, pid_file: str) -> str:
     quoted_state_dir = shlex.quote(posixpath.dirname(pid_file))
     setsid_body = _supervised_command_body(command_script, pid_file=pid_file, process_group=True)
-    fallback_body = _supervised_command_body(command_script, pid_file=pid_file, process_group=False)
+    # Some minimal images lack ``setsid -w``, while Docker still gives the exec
+    # shell its own process group. Detect that authority from procfs instead of
+    # recording PID-only cleanup and stranding the shell's descendants.
+    fallback_body = _supervised_command_body(command_script, pid_file=pid_file, process_group=None)
     return (
         f"mkdir -p {quoted_state_dir}; "
         "if setsid -w true >/dev/null 2>&1; then "
@@ -699,13 +705,25 @@ def _supervised_command_body(
     command_script: str,
     *,
     pid_file: str,
-    process_group: bool,
+    process_group: bool | None,
 ) -> str:
     quoted_pid_file = shlex.quote(pid_file)
     quoted_command_script = shlex.quote(command_script)
-    process_group_flag = "1" if process_group else "0"
+    if process_group is None:
+        process_group_probe = (
+            "process_group=0; "
+            "if read observed_pid observed_comm observed_state observed_parent "
+            "observed_group ignored < /proc/$$/stat 2>/dev/null "
+            '&& test "$observed_pid" = "$$" && test "$observed_group" = "$$"; '
+            "then process_group=1; fi; "
+        )
+        process_group_value = '"$process_group"'
+    else:
+        process_group_probe = ""
+        process_group_value = f'"{1 if process_group else 0}"'
     return (
-        f'printf \'%s %s\\n\' "$$" "{process_group_flag}" > {quoted_pid_file} || exit 1; '
+        process_group_probe
+        + f"printf '%s %s\\n' \"$$\" {process_group_value} > {quoted_pid_file} || exit 1; "
         f"sh -c {quoted_command_script}; "
         "status=$?; "
         f"rm -f {quoted_pid_file}; "
@@ -789,7 +807,7 @@ class _DockerCommandHandle:
         return probe.exit_code == 1
 
 
-class DockerRunner(Runner):
+class DockerRunner(Runner, RunnerBinaryStreamCapability):
     """Executes commands inside a plain Docker container via the ``docker`` CLI.
 
     Isolation is a parameter: pass ``runtime="runsc"`` (gVisor) or ``"kata"``
@@ -1567,6 +1585,37 @@ class DockerRunner(Runner):
         del command, redactor, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
 
+    async def exec_stream(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: BinaryIO | None = None,
+        stdout: BinaryIO | None = None,
+        stdout_limit_bytes: int | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if stdin is None and stdout is None:
+            raise ValueError("DockerRunner exec_stream requires binary stdin or stdout.")
+        operation = self._exec(
+            command,
+            output_redactor=SecretRedactor(),
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=None,
+            output_limit_bytes=output_limit_bytes,
+            stdin_stream=stdin,
+            stdout_stream=stdout,
+            stdout_limit_bytes=stdout_limit_bytes,
+        )
+        del command, cwd, env, env_remove, timeout_s, stdin, stdout, output_limit_bytes
+        return await operation
+
     @_clean_runner_preflight
     def preflight_exec(
         self,
@@ -1661,7 +1710,18 @@ class DockerRunner(Runner):
         timeout_s: int | None,
         stdin: str | None,
         output_limit_bytes: int | None,
+        stdin_stream: BinaryIO | None = None,
+        stdout_stream: BinaryIO | None = None,
+        stdout_limit_bytes: int | None = None,
     ) -> ExecResult:
+        binary_input = validate_binary_input_stream(stdin_stream)
+        binary_output = validate_binary_output_stream(stdout_stream)
+        if binary_input is not None and stdin is not None:
+            raise ValueError("DockerRunner accepts either text stdin or binary stdin, not both.")
+        if binary_output is None and stdout_limit_bytes is not None:
+            raise ValueError("DockerRunner stdout_limit_bytes requires binary stdout.")
+        if stdout_limit_bytes is not None:
+            validate_output_limit(stdout_limit_bytes)
         try:
             (
                 owned_command,
@@ -1732,7 +1792,7 @@ class DockerRunner(Runner):
                 owned_command,
                 cwd=working_dir,
                 env_file=env_file,
-                has_stdin=standard_input is not None,
+                has_stdin=standard_input is not None or binary_input is not None,
                 pid_file=pid_file,
                 direct_process_supervisor=(
                     self._runtime_evidence is not None
@@ -1751,10 +1811,29 @@ class DockerRunner(Runner):
                     env=host_env,
                     timeout_s=timeout,
                     stdin=standard_input,
+                    stdin_stream=binary_input,
+                    stdout_stream=binary_output,
+                    stdout_limit_bytes=stdout_limit_bytes,
                     output_limit_bytes=output_limit,
                     output_redactor=invocation_redactor,
                 )
             except asyncio.CancelledError as exc:
+                cleanup = await cleanup_runner_command_with_diagnostic(
+                    self,
+                    handle=handle,
+                    adapter="docker",
+                    timeout_s=self.cancel_timeout_s,
+                    policy=self.cancellation_cleanup,
+                )
+                self._apply_cleanup_result(cleanup)
+                attach_cancellation_artifacts(exc, [cleanup.artifact])
+                raise
+            except Exception as exc:
+                # A local Docker CLI transport or binary-stream failure does not
+                # prove that the supervised guest command stopped. Settle it with
+                # the same policy as an interrupted caller before returning the
+                # primary failure; otherwise a failed source/sink can strand work
+                # in the container while the runner still appears reusable.
                 cleanup = await cleanup_runner_command_with_diagnostic(
                     self,
                     handle=handle,

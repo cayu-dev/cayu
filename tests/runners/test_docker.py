@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 from typing import Any
@@ -342,6 +343,9 @@ def test_build_exec_argv_process():
     assert "whois x.ai" in argv[7]
     assert " & " not in argv[7]
     assert "> /tmp/cayu-docker-commands/cmd.pid || exit 1" in argv[7]
+    assert argv[7].count('"$$" "1"') == 1
+    assert 'test "$observed_group" = "$$"' in argv[7]
+    assert '"$$" "$process_group"' in argv[7]
 
 
 def test_build_exec_argv_strict_process_uses_fixed_python_supervisor() -> None:
@@ -440,6 +444,123 @@ def test_exec_forwards_to_run_subprocess(monkeypatch):
     assert calls["kwargs"]["output_limit_bytes"] == 999
     # env boundary: host docker process inherits host env (PATH present).
     assert "PATH" in calls["kwargs"]["env"]
+
+
+def test_exec_stream_forwards_binary_streams_without_host_paths(monkeypatch) -> None:
+    calls: dict[str, Any] = {}
+    source = io.BytesIO(b"tar-input")
+    target = io.BytesIO()
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls["argv"] = command.argv
+        calls["kwargs"] = kwargs
+        kwargs["stdout_stream"].write(b"tar-output")
+        return ExecResult(stdout_bytes=10)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    result = asyncio.run(
+        runner.exec_stream(
+            ExecCommand.process("python3", "-c", "pass"),
+            stdin=source,
+            stdout=target,
+            stdout_limit_bytes=1024,
+        )
+    )
+
+    assert result.stdout_bytes == 10
+    assert target.getvalue() == b"tar-output"
+    assert calls["argv"][2] == "-i"
+    assert calls["kwargs"]["stdin_stream"] is source
+    assert calls["kwargs"]["stdout_stream"] is target
+    assert calls["kwargs"]["stdout_limit_bytes"] == 1024
+
+
+def test_exec_stream_failure_settles_remote_command_and_preserves_primary_error(
+    monkeypatch,
+) -> None:
+    issued: list[list[str]] = []
+    stream_error = OSError("test binary sink failed")
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        issued.append(command.argv)
+        if "kill -TERM" in command.argv[-1]:
+            return ExecResult()
+        raise stream_error
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    with pytest.raises(OSError) as exc_info:
+        asyncio.run(
+            runner.exec_stream(
+                ExecCommand.process("sh", "-c", "printf output; sleep 999"),
+                stdout=io.BytesIO(),
+            )
+        )
+
+    assert exc_info.value is stream_error
+    assert runner._exec_closed is False
+    assert len(issued) == 2
+    assert "setsid" in issued[0][-1]
+    assert "kill -TERM" in issued[1][-1]
+    assert getattr(stream_error, "artifacts", None) == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "docker",
+            "action": "kill_command",
+            "status": "completed",
+            "timeout_s": 5.0,
+        }
+    ]
+
+
+def test_exec_stream_failure_latches_runner_when_remote_settlement_is_unproven(
+    monkeypatch,
+) -> None:
+    issued: list[list[str]] = []
+    stream_error = OSError("test binary source failed")
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        issued.append(command.argv)
+        if "kill -TERM" in command.argv[-1]:
+            return ExecResult(exit_code=1)
+        if command.argv[-1].startswith("test -f"):
+            return ExecResult(exit_code=0)
+        raise stream_error
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    with pytest.raises(OSError) as exc_info:
+        asyncio.run(
+            runner.exec_stream(
+                ExecCommand.process("sh", "-c", "printf output; sleep 999"),
+                stdout=io.BytesIO(),
+            )
+        )
+
+    assert exc_info.value is stream_error
+    assert runner._exec_closed is True
+    assert runner._exec_closed_reason == (
+        "docker command cleanup did not complete; command state is unknown"
+    )
+    assert len(issued) == 4
+    assert getattr(stream_error, "artifacts", None) == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "docker",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error": "kill returned false",
+        }
+    ]
+    with pytest.raises(RuntimeError, match="DockerRunner is closed"):
+        asyncio.run(runner.exec(ExecCommand.process("true")))
 
 
 def test_exec_redacted_forwards_invocation_redactor_to_subprocess_capture(monkeypatch) -> None:
