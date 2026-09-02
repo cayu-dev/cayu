@@ -220,6 +220,15 @@ class _PrivateArgumentsGatewayRememberTool(_GatewayRememberTool):
         return False
 
 
+class _FailingGatewayRememberTool(_GatewayRememberTool):
+    spec = _GatewayRememberTool.spec.model_copy(update={"effect": ToolEffect.EXTERNAL})
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx
+        self.calls.append(dict(args))
+        raise RuntimeError("expected targeted tool failure")
+
+
 class _GatewayOtherTool(Tool):
     spec = ToolSpec(
         name="other",
@@ -406,6 +415,156 @@ class _NativeOpenAITransport:
         raise AssertionError("Native targeted test dispatched an unexpected model step.")
 
 
+class _GatewayHistoryEchoOpenAITransport:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.rematerialized_reference: str | None = None
+        self.compacted_reference: str | None = None
+
+    @staticmethod
+    def _function_call_events(
+        *,
+        response_id: str,
+        item_id: str,
+        call_id: str,
+        arguments: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        arguments_json = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+        item = {
+            "type": "function_call",
+            "id": item_id,
+            "call_id": call_id,
+            "name": "call_tool",
+            "arguments": arguments_json,
+            "status": "completed",
+        }
+        return (
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {**item, "arguments": ""},
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "output_index": 0,
+                "name": "call_tool",
+                "arguments": arguments_json,
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "model": "fake-model",
+                    "status": "completed",
+                    "output": [item],
+                    "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+                },
+            },
+        )
+
+    async def stream_response_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        del url, headers, timeout_s, stream_idle_timeout_s
+        copied = dict(payload)
+        self.calls.append(copied)
+        if len(self.calls) == 1:
+            context_text = next(
+                part["text"]
+                for item in copied["input"]
+                if item.get("role") == "user"
+                for part in item.get("content", ())
+                if part.get("type") == "input_text"
+                and part.get("text", "").startswith("Cayu runtime targeted-tool context")
+            )
+            [descriptor] = json.loads(context_text.rsplit("\n", 1)[1])["tools"]
+            for event in self._function_call_events(
+                response_id="resp_gateway_first",
+                item_id="fc_gateway_first",
+                call_id="gateway-first",
+                arguments={
+                    "tool_ref": descriptor["tool_ref"],
+                    "arguments": {"fact": "Execute exactly once."},
+                },
+            ):
+                yield event
+            return
+        if len(self.calls) == 2:
+            historical = next(
+                item
+                for item in copied["input"]
+                if item.get("type") == "function_call" and item.get("call_id") == "gateway-first"
+            )
+            historical_arguments = json.loads(historical["arguments"])
+            self.rematerialized_reference = historical_arguments["tool_ref"]
+            assert self.rematerialized_reference.startswith("cayu_provider_history_v1.")
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "status_code": 400,
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": "compact this deterministic history",
+                    },
+                },
+            }
+            return
+        if len(self.calls) == 3:
+            historical = next(
+                item
+                for item in copied["input"]
+                if item.get("type") == "function_call" and item.get("call_id") == "gateway-first"
+            )
+            historical_arguments = json.loads(historical["arguments"])
+            self.compacted_reference = historical_arguments["tool_ref"]
+            assert self.compacted_reference == self.rematerialized_reference
+            for event in self._function_call_events(
+                response_id="resp_gateway_echo",
+                item_id="fc_gateway_echo",
+                call_id="gateway-echo",
+                arguments={
+                    "tool_ref": self.rematerialized_reference,
+                    "arguments": {"fact": "Must stay unauthorized."},
+                },
+            ):
+                yield event
+            return
+        if len(self.calls) == 4:
+            yield {"type": "response.output_text.delta", "delta": "done"}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_gateway_done",
+                    "model": "fake-model",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "done",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 20, "output_tokens": 1, "total_tokens": 21},
+                },
+            }
+            return
+        raise AssertionError("Gateway history echo dispatched an unexpected model step.")
+
+
 class _FinalOpenAITransport:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -562,14 +721,13 @@ class _MultiCallGatewayProvider(_Provider):
             "outer-call-1",
         ]
         assert all(part.tool_name == "call_tool" for part in (*assistant_calls, *tool_results))
-        assert all(
-            part.arguments
-            == {
+        assert [part.arguments for part in assistant_calls] == [
+            {
                 "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
-                "arguments": {},
+                "arguments": {"fact": f"Fact {index}."},
             }
-            for part in assistant_calls
-        )
+            for index in range(2)
+        ]
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
@@ -1607,6 +1765,85 @@ def test_openai_native_does_not_authorize_an_unprojected_registered_name(
     asyncio.run(run())
 
 
+def test_openai_gateway_history_token_is_wire_only_and_cannot_authorize_a_new_call(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        transport = _GatewayHistoryEchoOpenAITransport()
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+        )
+        tool = _GatewayRememberTool()
+        policy = _RecordingPolicy()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="call_tool",
+            tools=(tool,),
+            tool_policy=policy,
+            context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        session_id = "targeted-openai-gateway-history-echo"
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Use the targeted tool once.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember",
+                            tool_id="cayu:remember",
+                            max_calls=2,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED, {
+            "errors": [
+                (event.type, event.payload)
+                for event in events
+                if "error" in event.payload or event.type is EventType.SESSION_FAILED
+            ],
+            "calls": transport.calls,
+        }
+        assert tool.calls == [{"fact": "Execute exactly once."}]
+        assert len(policy.requests) == 1
+        [record] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert record.used_calls == 1
+        assert record.remaining_calls == 1
+        [rejected] = [
+            event
+            for event in await targeted_store.load_events(session_id)
+            if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+        ]
+        assert (
+            rejected.payload["rejection_reason"] == TargetedToolUseRejectionReason.MALFORMED.value
+        )
+        transcript_json = json.dumps(
+            [
+                message.model_dump(mode="json")
+                for message in await targeted_store.load_transcript(session_id)
+            ]
+        )
+        assert TARGETED_TOOL_TRANSCRIPT_REFERENCE in transcript_json
+        assert transport.rematerialized_reference is not None
+        assert transport.compacted_reference == transport.rematerialized_reference
+        assert transport.rematerialized_reference not in transcript_json
+
+    asyncio.run(run())
+
+
 async def _drop_postgres_cayu_tables(dsn: str) -> None:
     import psycopg
     from psycopg import sql
@@ -1701,7 +1938,7 @@ def test_background_call_tool_reference_survives_short_secret_collision(targeted
     "projection_case",
     ("private_tool", "multi_call_round"),
 )
-def test_call_tool_preserves_unavailable_argument_projections(
+def test_call_tool_publishes_only_safe_argument_projections(
     targeted_store,
     projection_case: str,
 ) -> None:
@@ -1748,7 +1985,11 @@ def test_call_tool_preserves_unavailable_argument_projections(
         )
         terminals = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
         assert len(terminals) == (2 if multi_call else 1)
-        assert all(event.payload["arguments_state"] == "unavailable" for event in terminals)
+        assert all(
+            event.payload["arguments_state"] == ("finalized" if multi_call else "unavailable")
+            for event in terminals
+        )
+        assert all(event.payload["arguments_exact"] is multi_call for event in terminals)
         transcript = await targeted_store.load_transcript(session_id)
         assistant_calls = [
             part
@@ -1758,14 +1999,169 @@ def test_call_tool_preserves_unavailable_argument_projections(
             if part.type == "tool_call"
         ]
         assert len(assistant_calls) == len(terminals)
-        assert all(
-            part.arguments
-            == {
-                "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
-                "arguments": {},
-            }
-            for part in assistant_calls
+        assert [part.arguments for part in assistant_calls] == (
+            [
+                {
+                    "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                    "arguments": {"fact": f"Fact {index}."},
+                }
+                for index in range(2)
+            ]
+            if multi_call
+            else [
+                {
+                    "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                    "arguments": {},
+                }
+            ]
         )
+
+    asyncio.run(run())
+
+
+def test_failed_multi_call_gateway_terminals_restore_targeted_authority(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        session_id = "targeted-call-tool-failed-multi-call"
+        provider = _MultiCallGatewayProvider()
+        tool = _FailingGatewayRememberTool()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="call_tool",
+            tools=(tool,),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Try both requested facts.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-facts",
+                            tool_id="cayu:remember",
+                            max_calls=2,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == [{"fact": "Fact 0."}, {"fact": "Fact 1."}]
+        terminals = [event for event in events if event.type is EventType.TOOL_CALL_FAILED]
+        assert len(terminals) == 2
+        assert all(event.tool_name == "remember" for event in terminals)
+        assert all(event.payload["dispatch_kind"] == "gateway" for event in terminals)
+        assert all(event.payload["model_tool_name"] == "call_tool" for event in terminals)
+        transcript = await targeted_store.load_transcript(session_id)
+        results = [
+            part
+            for message in transcript
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        ]
+        assert len(results) == 2
+        assert all(result.tool_name == "call_tool" for result in results)
+
+    asyncio.run(run())
+
+
+def test_failed_multi_call_gateway_authority_survives_sqlite_reopen(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        database = tmp_path / "targeted-gateway-recovery.db"
+        session_id = "targeted-call-tool-failed-reopened"
+        store = SQLiteSessionStore(database, public_authority_alias_codec=_codec())
+        provider = _MultiCallGatewayProvider()
+        tool = _FailingGatewayRememberTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="call_tool",
+            tools=(tool,),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Try both requested facts.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-facts",
+                            tool_id="cayu:remember",
+                            max_calls=2,
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        await store.close()
+
+        reopened = SQLiteSessionStore(database, public_authority_alias_codec=_codec())
+        try:
+            durable_events = await reopened.load_events(session_id)
+            [record] = await reopened.list_targeted_tool_grants(session_id)
+            started_by_call = {
+                event.payload["tool_call_id"]: event
+                for event in durable_events
+                if event.type is EventType.TOOL_CALL_STARTED
+            }
+            terminals = [
+                event for event in durable_events if event.type is EventType.TOOL_CALL_FAILED
+            ]
+            assert len(started_by_call) == len(terminals) == 2
+            authority_fields = (
+                "dispatch_kind",
+                "model_tool_name",
+                "grant_id",
+                "use_id",
+                "effective_tool_id",
+                "catalogue_revision",
+                "descriptor_version",
+                "schema_fingerprint",
+                "arguments_sha256",
+                "invocation_id",
+            )
+            for terminal in terminals:
+                started = started_by_call[terminal.payload["tool_call_id"]]
+                assert {
+                    field_name: terminal.payload[field_name] for field_name in authority_fields
+                } == {field_name: started.payload[field_name] for field_name in authority_fields}
+                assert terminal.payload["grant_id"] == record.grant_id
+            public_json = json.dumps(
+                {
+                    "events": [event.model_dump(mode="json") for event in durable_events],
+                    "transcript": [
+                        message.model_dump(mode="json")
+                        for message in await reopened.load_transcript(session_id)
+                    ],
+                }
+            )
+            assert record.tool_ref not in public_json
+            assert TARGETED_TOOL_TRANSCRIPT_REFERENCE in public_json
+        finally:
+            await reopened.close()
 
     asyncio.run(run())
 

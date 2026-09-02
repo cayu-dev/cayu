@@ -2312,6 +2312,12 @@ provider call id, canonical argument digest, grant, and stable invocation id are
 atomically bound exactly like the gateway form. The transcript keeps the native
 function name and direct argument object and returns an ordinary correlated
 `function_call_output`; no private reference enters either provider item.
+When a provider requires prior gateway calls to be replayed in its wire history,
+Cayu deterministically rematerializes the fixed transcript placeholder as a
+provider-history token. That token exists only in the outbound provider request:
+it is never stored, never grants execution authority, and is rejected if a model
+copies it into a new `call_tool` invocation. Retry and context-overflow
+reconstruction derive the same token from the retained outer call identity.
 Invalid arguments, scope or catalogue drift, expiry, revocation, exhaustion,
 and replay mismatch return a provider-valid error result without policy,
 approval, hooks, secrets, environment access, or target execution. Lifecycle

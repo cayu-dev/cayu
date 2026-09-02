@@ -76,6 +76,7 @@ from cayu.runtime.execution_profiles import execution_profile_from_session_metad
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_discovery import search_tools_spec
 from cayu.runtime.tool_gateway import call_tool_spec
+from cayu.runtime.tool_grants import TARGETED_TOOL_TRANSCRIPT_REFERENCE
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -6694,6 +6695,65 @@ def _targeted_projection_fixture() -> tuple[Message, TargetedToolProjectionReque
         ),
     )
     return marker, projection
+
+
+@pytest.mark.parametrize(
+    ("reasoning_state", "chain"),
+    (("inline", True), ("server", False)),
+)
+def test_openai_rematerializes_redacted_call_tool_history_as_non_authority(
+    reasoning_state: str,
+    chain: bool,
+) -> None:
+    arguments = {
+        "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+        "arguments": {"query": "history must not become executable"},
+    }
+    assistant = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ToolCallPart(
+                tool_call_id="call_history",
+                tool_name=CALL_TOOL_NAME,
+                arguments=arguments,
+            ),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "function_call",
+                    "call_id": "call_history",
+                    "name": CALL_TOOL_NAME,
+                    "arguments": json.dumps(arguments),
+                    "status": "completed",
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "search"),
+            assistant,
+            Message.tool_result(
+                tool_call_id="call_history",
+                tool_name=CALL_TOOL_NAME,
+                content="done",
+            ),
+        ],
+        tools=[call_tool_spec()],
+    )
+
+    payload = build_openai_payload(
+        request,
+        reasoning_state=reasoning_state,
+        chain=chain,
+    )
+
+    history_call = next(item for item in payload["input"] if item.get("type") == "function_call")
+    rematerialized = json.loads(history_call["arguments"])
+    assert rematerialized["tool_ref"].startswith("cayu_provider_history_v1.")
+    assert TARGETED_TOOL_TRANSCRIPT_REFERENCE not in history_call["arguments"]
+    assert assistant.content[0].arguments == arguments
 
 
 def _native_cache_anchor_fields() -> dict[str, object]:

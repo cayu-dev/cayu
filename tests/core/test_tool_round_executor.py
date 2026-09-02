@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from tests.core._execution_profile_fixtures import rebind_test_invocation
@@ -14,7 +15,10 @@ from tests.core._execution_profile_fixtures import rebind_test_invocation
 import cayu.runtime._invocation_secrets as invocation_secrets
 from cayu._exception_groups import iter_exception_tree
 from cayu.core import AgentSpec, Event, EventType, Message
-from cayu.core.events import event_payload_authority_is_runtime_generated
+from cayu.core.events import (
+    event_payload_authority_is_runtime_generated,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import RunnerExecutionError, attach_cancellation_artifacts
@@ -33,12 +37,15 @@ from cayu.runtime import (
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _web_access_results as web_access_results
 from cayu.runtime import sessions as sessions_module
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_round_executor import (
+    ToolRoundExecutor,
     ToolRoundRun,
     _copy_agent_spec,
     _project_staged_terminal_event,
+    _restore_targeted_tool_invocation_event_authority,
     _ToolRoundPublicationCoordinator,
 )
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
@@ -49,11 +56,280 @@ from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     unexposed_tool_result,
 )
+from cayu.runtime.tool_grants import (
+    ResolvedTargetedToolInvocation,
+    tool_reference_use_id,
+)
 from cayu.tools._runner import sanitize_runner_failure_group
 from cayu.tools.web import WebFetchTool
 from cayu.vaults import SecretRedactor
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
+
+_TARGETED_AUTHORITY_CONFLICTS = (
+    ("dispatch_kind", None),
+    ("dispatch_kind", "native"),
+    ("model_tool_name", "remember"),
+    ("grant_id", f"sha256:{'a' * 64}"),
+    ("use_id", f"sha256:{'b' * 64}"),
+    ("effective_tool_id", "cayu:other"),
+    ("catalogue_revision", f"sha256:{'d' * 64}"),
+    ("descriptor_version", f"sha256:{'e' * 64}"),
+    ("schema_fingerprint", f"sha256:{'f' * 64}"),
+    ("arguments_sha256", f"sha256:{'7' * 64}"),
+    ("invocation_id", "other-invocation"),
+)
+
+
+def _resolved_gateway_tool_call() -> runtime_records.ToolCallRequest:
+    grant_id = f"sha256:{'1' * 64}"
+    arguments_sha256 = f"sha256:{'6' * 64}"
+    use_id = tool_reference_use_id(
+        grant_id=grant_id,
+        session_id="session-targeted-authority",
+        interaction_id="interaction-targeted-authority",
+        model_step_id="model-step-targeted-authority",
+        outer_tool_call_id="call-targeted-authority",
+        arguments_sha256=arguments_sha256,
+        invocation_id="invocation-targeted-authority",
+    )
+    invocation = ResolvedTargetedToolInvocation(
+        dispatch_kind="gateway",
+        model_tool_name="call_tool",
+        tool_ref="cayu_authority_v1.test-targeted-authority",
+        grant_id=grant_id,
+        use_id=use_id,
+        session_id="session-targeted-authority",
+        interaction_id="interaction-targeted-authority",
+        tool_id="cayu:remember",
+        effective_tool_name="remember",
+        catalogue_revision=f"sha256:{'3' * 64}",
+        descriptor_version=f"sha256:{'4' * 64}",
+        schema_fingerprint=f"sha256:{'5' * 64}",
+        model_step_id="model-step-targeted-authority",
+        outer_tool_call_id="call-targeted-authority",
+        arguments_sha256=arguments_sha256,
+        invocation_id="invocation-targeted-authority",
+    )
+    return runtime_records.ToolCallRequest(
+        id=invocation.outer_tool_call_id,
+        name=invocation.effective_tool_name,
+        arguments={"fact": "remember"},
+        targeted_tool_grant_id=grant_id,
+        model_tool_name=invocation.model_tool_name,
+        targeted_tool_invocation=invocation,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "conflicting_value"),
+    _TARGETED_AUTHORITY_CONFLICTS,
+)
+def test_restored_targeted_terminal_rejects_every_retained_authority_conflict(
+    field_name: str,
+    conflicting_value: object,
+) -> None:
+    tool_call = _resolved_gateway_tool_call()
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-targeted-authority",
+        tool_name=tool_call.name,
+        payload={
+            "tool_call_id": tool_call.id,
+            field_name: conflicting_value,
+            "result": {"content": "failed", "is_error": True},
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="conflicts with its durable invocation authority",
+    ):
+        _restore_targeted_tool_invocation_event_authority(terminal, tool_call)
+
+
+@pytest.mark.parametrize(
+    ("event_tool_name", "event_tool_call_id"),
+    (("other", "call-targeted-authority"), ("remember", "other-call")),
+)
+def test_restored_targeted_terminal_rejects_resolved_invocation_identity_conflict(
+    event_tool_name: str,
+    event_tool_call_id: str,
+) -> None:
+    tool_call = _resolved_gateway_tool_call()
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-targeted-authority",
+        tool_name=event_tool_name,
+        payload={
+            "tool_call_id": event_tool_call_id,
+            "result": {"content": "failed", "is_error": True},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="conflicts with its resolved invocation"):
+        _restore_targeted_tool_invocation_event_authority(terminal, tool_call)
+
+
+def test_restored_targeted_terminal_accepts_only_attested_private_projection() -> None:
+    tool_call = _resolved_gateway_tool_call()
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-targeted-authority",
+        tool_name=tool_call.name,
+        payload={
+            "tool_call_id": tool_call.id,
+            "grant_id": tool_call.targeted_tool_invocation.grant_id,
+            "result": {"content": "failed", "is_error": True},
+        },
+    )
+    attested = event_with_runtime_payload_authority(terminal, "grant_id")
+    projected = attested.model_copy(
+        update={
+            "payload": {
+                **attested.payload,
+                "grant_id": PRIVATE_EVENT_AUTHORITY,
+            }
+        }
+    )
+
+    restored = _restore_targeted_tool_invocation_event_authority(projected, tool_call)
+
+    assert restored.payload["grant_id"] == tool_call.targeted_tool_invocation.grant_id
+
+
+class _NoExecutableToolAgent:
+    def executable_tool(self, _tool_name: str) -> None:
+        return None
+
+
+async def _stage_targeted_terminal_from_publication_entrance(
+    terminal: Event,
+    tool_call: runtime_records.ToolCallRequest,
+) -> list[Event]:
+    executor = object.__new__(ToolRoundExecutor)
+    executor._secret_redactor = SecretRedactor()
+    staged: list[Event] = []
+
+    async def stage(event: Event, *_args: object) -> None:
+        staged.append(event)
+
+    async for _ in executor.emit_tool_call_result_with_hooks(
+        event=terminal,
+        session=SimpleNamespace(id=terminal.session_id),
+        registered_agent=_NoExecutableToolAgent(),
+        registered_environment=None,
+        tool_call=tool_call,
+        result=ToolResult(content="failed", is_error=True),
+        task_id=None,
+        deferred_terminal_stager=stage,
+        publication_snapshot=object(),
+    ):
+        raise AssertionError("Deferred terminal staging unexpectedly yielded an event.")
+    return staged
+
+
+@pytest.mark.parametrize(
+    ("field_name", "conflicting_value"),
+    _TARGETED_AUTHORITY_CONFLICTS,
+)
+def test_tool_result_publication_rejects_retained_authority_before_staging(
+    field_name: str,
+    conflicting_value: object,
+) -> None:
+    tool_call = _resolved_gateway_tool_call()
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-targeted-authority",
+        tool_name=tool_call.name,
+        payload={
+            "tool_call_id": tool_call.id,
+            field_name: conflicting_value,
+            "result": {"content": "failed", "is_error": True},
+        },
+    )
+
+    async def run() -> None:
+        with pytest.raises(
+            RuntimeError,
+            match="conflicts with its durable invocation authority",
+        ):
+            await _stage_targeted_terminal_from_publication_entrance(terminal, tool_call)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("event_tool_name", "event_tool_call_id"),
+    (("other", "call-targeted-authority"), ("remember", "other-call")),
+)
+def test_tool_result_publication_rejects_resolved_identity_before_staging(
+    event_tool_name: str,
+    event_tool_call_id: str,
+) -> None:
+    tool_call = _resolved_gateway_tool_call()
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-targeted-authority",
+        tool_name=event_tool_name,
+        payload={
+            "tool_call_id": event_tool_call_id,
+            "result": {"content": "failed", "is_error": True},
+        },
+    )
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="conflicts with its resolved invocation"):
+            await _stage_targeted_terminal_from_publication_entrance(terminal, tool_call)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("retained_projection", ("absent", "attested_private"))
+def test_tool_result_publication_restores_only_safe_authority_before_staging(
+    retained_projection: str,
+) -> None:
+    tool_call = _resolved_gateway_tool_call()
+    terminal = Event(
+        type=EventType.TOOL_CALL_FAILED,
+        session_id="session-targeted-authority",
+        tool_name=tool_call.name,
+        payload={
+            "tool_call_id": tool_call.id,
+            "result": {"content": "failed", "is_error": True},
+        },
+    )
+    if retained_projection == "attested_private":
+        invocation = tool_call.targeted_tool_invocation
+        assert invocation is not None
+        terminal = event_with_runtime_payload_authority(
+            terminal.model_copy(
+                update={
+                    "payload": {
+                        **terminal.payload,
+                        "grant_id": invocation.grant_id,
+                    }
+                }
+            ),
+            "grant_id",
+        ).model_copy(
+            update={
+                "payload": {
+                    **terminal.payload,
+                    "grant_id": PRIVATE_EVENT_AUTHORITY,
+                }
+            }
+        )
+
+    [staged] = asyncio.run(_stage_targeted_terminal_from_publication_entrance(terminal, tool_call))
+    expected = tool_call.targeted_tool_invocation
+    assert expected is not None
+    assert staged.payload["grant_id"] == expected.grant_id
+    assert event_payload_authority_is_runtime_generated(
+        staged,
+        field_name="grant_id",
+        value=expected.grant_id,
+    )
 
 
 class _FakeProvider(ModelProvider):

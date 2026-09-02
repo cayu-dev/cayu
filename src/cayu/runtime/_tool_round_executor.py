@@ -52,6 +52,7 @@ from cayu.core.events import (
     EventType,
     copy_event,
     event_payload_authority_is_runtime_generated,
+    event_retains_runtime_payload_authority,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
@@ -98,6 +99,7 @@ from cayu.runtime._assistant_tool_round_publication import (
 from cayu.runtime._checkpoint_redaction import (
     require_secret_free_durable_object as _require_secret_free_durable_object,
 )
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._interruption_coordinator import (
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
@@ -523,6 +525,43 @@ def _event_with_targeted_tool_invocation_authority(
         event,
         *_TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS,
     )
+
+
+def _restore_targeted_tool_invocation_event_authority(
+    event: Event,
+    tool_call: runtime_records.ToolCallRequest,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> Event:
+    """Rebind one terminal returned through a durable checkpoint callback."""
+
+    invocation = tool_call.targeted_tool_invocation
+    if invocation is None:
+        return event
+    if event.tool_name != tool_call.name or event.payload.get("tool_call_id") != tool_call.id:
+        raise RuntimeError("Targeted tool terminal conflicts with its resolved invocation.")
+    expected = _targeted_tool_invocation_payload(tool_call)
+    for field_name, expected_value in expected.items():
+        observed = event.payload.get(field_name)
+        retained_authority = event_retains_runtime_payload_authority(
+            event,
+            field_name=field_name,
+            value=expected_value,
+        )
+        redacted_attested_authority = retained_authority and (
+            observed == PRIVATE_EVENT_AUTHORITY
+            or (redactor is not None and observed == redactor.redact_json(expected_value))
+        )
+        if (
+            field_name in event.payload
+            and observed != expected_value
+            and not redacted_attested_authority
+        ):
+            raise RuntimeError(
+                "Targeted tool terminal conflicts with its durable invocation authority."
+            )
+    rebound = event.model_copy(update={"payload": {**event.payload, **expected}})
+    return _event_with_targeted_tool_invocation_authority(rebound, tool_call)
 
 
 def _require_matching_policy_round(
@@ -4785,6 +4824,11 @@ class ToolRoundExecutor:
                 tool_name=tool_call.name,
                 payload=payload,
             )
+            result_event = _restore_targeted_tool_invocation_event_authority(
+                result_event,
+                effective_tool_call,
+                redactor=publication_snapshot.redactor,
+            )
             if execution_outcome.publish_before_hooks and deferred_terminal_stager is None:
                 result_event, result = _prepare_tool_result_event(
                     event=result_event,
@@ -4812,6 +4856,11 @@ class ToolRoundExecutor:
                     ),
                     cancellation=post_tool_cancellation,
                     restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                )
+                result_event = _restore_targeted_tool_invocation_event_authority(
+                    result_event,
+                    effective_tool_call,
+                    redactor=publication_snapshot.redactor,
                 )
                 published_terminal_event = await _await_post_tool_operation(
                     self._event_writer.emit(result_event),
@@ -5776,8 +5825,12 @@ class ToolRoundExecutor:
             tool_call,
             arguments=resolved_argument_projection.transcript_arguments(),
         )
+        event = _restore_targeted_tool_invocation_event_authority(
+            event,
+            tool_call,
+            redactor=resolved_redactor,
+        )
         event_payload = dict(event.payload)
-        event_payload.update(_targeted_tool_invocation_payload(tool_call))
         event_payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
         event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
         if resolved_argument_projection.state == "unavailable":
@@ -5785,6 +5838,7 @@ class ToolRoundExecutor:
             event_payload[tool_argument_publication.ARGUMENTS_EXACT_FIELD] = False
         event_payload.update(resolved_argument_projection.payload_fields())
         event = event.model_copy(update={"payload": event_payload})
+        event = _event_with_targeted_tool_invocation_authority(event, tool_call)
         event = event_with_execution_profile_authority(event, execution_profile)
         hook_tool_call = _project_tool_call_for_hook(
             tool_call,
@@ -5823,16 +5877,11 @@ class ToolRoundExecutor:
                 result=result,
                 redactor=resolved_redactor,
             )
-        if tool_call.targeted_tool_invocation is not None:
-            event = event.model_copy(
-                update={
-                    "payload": {
-                        **event.payload,
-                        **_targeted_tool_invocation_payload(tool_call),
-                    }
-                }
-            )
-            event = _event_with_targeted_tool_invocation_authority(event, tool_call)
+        event = _restore_targeted_tool_invocation_event_authority(
+            event,
+            tool_call,
+            redactor=resolved_redactor,
+        )
         if deferred_terminal_stager is not None:
             await deferred_terminal_stager(
                 event,
@@ -5866,8 +5915,18 @@ class ToolRoundExecutor:
                 registered_environment=registered_environment,
                 tool_call=hook_tool_call,
             )
+            event = _restore_targeted_tool_invocation_event_authority(
+                event,
+                tool_call,
+                redactor=resolved_redactor,
+            )
             if deferred_terminal_projection_recorder is not None:
                 event = await deferred_terminal_projection_recorder(event)
+                event = _restore_targeted_tool_invocation_event_authority(
+                    event,
+                    tool_call,
+                    redactor=resolved_redactor,
+                )
                 stored_result = event.payload.get("result")
                 if type(stored_result) is not dict:
                     raise RuntimeError("Projected staged terminal lost its tool result.")
@@ -5948,8 +6007,18 @@ class ToolRoundExecutor:
             registered_environment=registered_environment,
             tool_call=tool_call,
         )
+        event = _restore_targeted_tool_invocation_event_authority(
+            event,
+            tool_call,
+            redactor=resolved_redactor,
+        )
         if deferred_terminal_finalizer is not None:
             event = await deferred_terminal_finalizer(event)
+            event = _restore_targeted_tool_invocation_event_authority(
+                event,
+                tool_call,
+                redactor=resolved_redactor,
+            )
             stored_result = event.payload.get("result")
             if type(stored_result) is not dict:
                 raise RuntimeError("Finalized staged terminal lost its tool result.")

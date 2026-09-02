@@ -112,6 +112,7 @@ from cayu.providers.operations import (
     ProviderOperationStatus,
     copy_provider_operation_state,
 )
+from cayu.vaults import REDACTED_SECRET
 
 if TYPE_CHECKING:
     import httpx
@@ -5183,6 +5184,8 @@ def _openai_provider_state_items(
             raise OpenAIProtocolError(
                 f"Unsupported OpenAI provider state item type: {item_type!r}."
             )
+        if item_type == "function_call":
+            state = _rematerialize_targeted_provider_history_call(state)
         items.append(state)
     return items
 
@@ -5405,14 +5408,49 @@ def _output_text_part(
     return {"type": "output_text", "text": part.text}
 
 
+_TARGETED_PROVIDER_HISTORY_REFERENCE_PREFIX = "cayu_provider_history_v1."
+
+
+def _rematerialize_targeted_provider_history_call(
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replace a non-executable transcript marker only on the OpenAI wire."""
+
+    copied = copy_json_value(item, "provider_history_function_call")
+    if copied.get("name") != _CAYU_CALL_TOOL_NAME:
+        return copied
+    raw_arguments = copied.get("arguments")
+    if type(raw_arguments) is not str:
+        return copied
+    try:
+        arguments = json.loads(raw_arguments)
+    except ValueError:
+        return copied
+    if type(arguments) is not dict or arguments.get("tool_ref") != REDACTED_SECRET:
+        return copied
+    call_id = require_clean_nonblank(copied.get("call_id"), "provider history call_id")
+    arguments["tool_ref"] = (
+        _TARGETED_PROVIDER_HISTORY_REFERENCE_PREFIX + sha256(call_id.encode("utf-8")).hexdigest()
+    )
+    copied["arguments"] = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return copied
+
+
 def _function_call_input_item(part: ToolCallPart) -> dict[str, Any]:
-    return {
-        "type": "function_call",
-        "call_id": part.tool_call_id,
-        "name": part.tool_name,
-        "arguments": _json_arguments(part.arguments),
-        "status": "completed",
-    }
+    return _rematerialize_targeted_provider_history_call(
+        {
+            "type": "function_call",
+            "call_id": part.tool_call_id,
+            "name": part.tool_name,
+            "arguments": _json_arguments(part.arguments),
+            "status": "completed",
+        }
+    )
 
 
 def _assistant_tool_call_input_item(

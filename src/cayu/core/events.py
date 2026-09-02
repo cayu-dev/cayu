@@ -510,6 +510,30 @@ def event_payload_authority_is_runtime_generated(
     )
 
 
+def event_retains_runtime_payload_authority(
+    event: Event,
+    *,
+    field_name: str,
+    value: str,
+) -> bool:
+    """Return private provenance retained across a redacted payload projection.
+
+    Unlike :func:`event_payload_authority_is_runtime_generated`, this helper does
+    not require the public payload to still expose ``value``. It is intended only
+    for runtime recovery code that already knows the exact expected authority and
+    separately verifies that the observed replacement is Cayu's fixed private
+    projection marker.
+    """
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    return (
+        type(field_name) is str
+        and type(value) is str
+        and (field_name, value) in event._runtime_payload_authority
+    )
+
+
 def event_nested_payload_authority_is_runtime_generated(
     event: Event,
     *,
