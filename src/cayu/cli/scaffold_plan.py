@@ -117,12 +117,23 @@ class CapabilitySpec:
 PRESETS: tuple[PresetSpec, ...] = (
     PresetSpec(
         name="agent",
-        summary="Complete Cayu application convention with one model-only agent.",
+        summary="Batteries-included local Cayu agent with explicit safe capability wiring.",
+        default_capabilities=(
+            "approvals",
+            "artifacts",
+            "evals",
+            "human-input",
+            "knowledge",
+            "memory",
+            "observability",
+            "recovery",
+            "tasks",
+        ),
     ),
     PresetSpec(
         name="service",
         summary="Maintained authenticated multi-user product-service shape.",
-        default_capabilities=("tasks", "approvals", "observability"),
+        default_capabilities=("tasks", "approvals", "observability", "evals"),
         supported_databases=("sqlite",),
         environment=("PRODUCT_AUTH_TOKENS_JSON", "CAYU_OPERATOR_BEARER_TOKEN"),
     ),
@@ -134,6 +145,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "tasks",
             "delegation",
             "human-input",
+            "evals",
         ),
         supported_executions=("none", "docker"),
     ),
@@ -207,16 +219,18 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="knowledge",
         summary="Reviewed durable knowledge, retrieval, curation, and maintenance.",
         status="preset-owned",
-        supported_presets=("coding",),
+        supported_presets=("agent", "coding"),
         files=("knowledge/", "configuration/storage.py"),
         verification=("uv run --no-sync cayu check --json",),
     ),
     CapabilitySpec(
         name="memory",
         summary="Context selection, recall, compaction, and memory attribution.",
-        status="extension-only",
+        status="preset-owned",
         supported_presets=("agent", "service", "coding"),
+        implied=("knowledge",),
         files=("memory/", "policies/context.py"),
+        verification=("uv run --no-sync pytest -q tests/test_memory.py",),
     ),
     CapabilitySpec(
         name="mcp",
@@ -229,7 +243,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="tasks",
         summary="Durable tasks and application-owned operation lifecycle wiring.",
         status="preset-owned",
-        supported_presets=("service", "coding"),
+        supported_presets=("agent", "service", "coding"),
         files=("operations/tasks.py",),
     ),
     CapabilitySpec(
@@ -251,15 +265,39 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         name="human-input",
         summary="Durable pause and application-owned human input resolution.",
         status="preset-owned",
-        supported_presets=("coding",),
+        supported_presets=("agent", "coding"),
         files=("operations/approvals.py",),
     ),
     CapabilitySpec(
         name="approvals",
         summary="Explicit approval policy and settlement boundaries.",
         status="preset-owned",
-        supported_presets=("service",),
+        supported_presets=("agent", "service", "coding"),
         files=("operations/approvals.py", "policies/tools.py"),
+    ),
+    CapabilitySpec(
+        name="artifacts",
+        summary="Durable local artifacts with bounded model-facing discovery.",
+        status="preset-owned",
+        supported_presets=("agent", "coding"),
+        files=("environments/local.py", "data/artifacts/"),
+        verification=("uv run --no-sync pytest -q tests/test_application.py",),
+    ),
+    CapabilitySpec(
+        name="recovery",
+        summary="Durable interruption inspection and explicit recovery entry points.",
+        status="preset-owned",
+        supported_presets=("agent", "service", "coding"),
+        files=("operations/recovery.py", "operations/workers.py"),
+        verification=("uv run --no-sync cayu inspect --json",),
+    ),
+    CapabilitySpec(
+        name="evals",
+        summary="Credential-free behavioral acceptance and durable eval evidence.",
+        status="preset-owned",
+        supported_presets=("agent", "service", "coding"),
+        files=("evals/",),
+        verification=("uv run --no-sync cayu eval run",),
     ),
     CapabilitySpec(
         name="observability",
@@ -344,19 +382,22 @@ class ApplicationPlan:
             if self.execution == "docker"
             else ("uv sync --extra dev",)
         )
-        return (
+        commands = (
             *setup,
             "uv run --no-sync cayu inspect --json",
             check,
             focused_test,
-            "uv run --no-sync cayu eval run",
         )
+        if "evals" in self.capabilities:
+            commands = (*commands, "uv run --no-sync cayu eval run")
+        return commands
 
     def as_dict(
         self,
         *,
         files: tuple[str, ...] = (),
         directories: tuple[str, ...] = (),
+        private_files: tuple[str, ...] = (),
     ) -> dict[str, object]:
         return {
             "schema_version": 1,
@@ -377,6 +418,7 @@ class ApplicationPlan:
             "minimal": self.minimal,
             "files": list(files),
             "directories": list(directories),
+            "private_files": list(private_files),
             "environment": list(_plan_environment(self)),
             "dependencies": list(_plan_dependencies(self)),
             "verification_commands": list(self.verification_commands()),
@@ -497,7 +539,7 @@ def normalize_application_plan(
     capabilities = set(() if minimal else selected_preset.default_capabilities)
     for name_value in requested:
         spec = capability_spec(name_value)
-        if spec.status != "selectable":
+        if name_value not in selected_preset.default_capabilities and spec.status != "selectable":
             raise ScaffoldPlanError(
                 "capability_not_selectable",
                 f"capability {name_value!r} is {spec.status}; use its documented "
@@ -522,13 +564,10 @@ def normalize_application_plan(
         capabilities.update(spec.implied)
 
     for name_value in excluded:
-        spec = capability_spec(name_value)
-        if name_value in selected_preset.default_capabilities and spec.status != "selectable":
-            raise ScaffoldPlanError(
-                "preset_capability_required",
-                f"preset {preset!r} requires capability {name_value!r}; choose another preset",
-            )
+        capability_spec(name_value)
         capabilities.discard(name_value)
+
+    for name_value in excluded:
         for selected in capabilities:
             if name_value in capability_spec(selected).implied:
                 raise ScaffoldPlanError(

@@ -124,10 +124,27 @@ def _verify_agent(
     app = (project / "app.py").read_text(encoding="utf-8")
     assert "class " not in app
     assert "def build_app(" in app
+    private_key = project / "data" / "memory-evidence.key"
+    assert len(private_key.read_text(encoding="utf-8").strip().encode("utf-8")) >= 32
+    for card in (
+        project / "knowledge" / "CAPABILITY.md",
+        project / "memory" / "CAPABILITY.md",
+        project / "environments" / "ARTIFACTS.md",
+        project / "operations" / "APPROVALS.md",
+    ):
+        assert "**Project state:** configured" in card.read_text(encoding="utf-8")
     check_environment = dict(environment)
     if postgres:
         check_environment["CAYU_DATABASE_URL"] = _POSTGRES_PLACEHOLDER
-    _run([str(cayu), "inspect", "--json"], cwd=project, environment=environment)
+    manifest = json.loads(
+        _run([str(cayu), "inspect", "--json"], cwd=project, environment=environment)
+    )
+    assert manifest["stores"]["knowledge"] in {
+        "SQLiteKnowledgeStore",
+        "PostgresKnowledgeStore",
+    }
+    assert manifest["agents"][0]["context_policy"] == "AutomaticRecallContextPolicy"
+    assert manifest["runtime"]["request_footprint"]["fingerprinting_enabled"] is True
     _run(
         [str(cayu), "check", "--fail-on", "warning", "--json"],
         cwd=project,
@@ -233,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "OPENROUTER_API_KEY",
+            "CAYU_MEMORY_EVIDENCE_KEY",
         }
     }
     environment["PYTHONNOUSERSITE"] = "1"
@@ -276,6 +294,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         assert dry["status"] == "planned"
+        assert dry["plan"]["capabilities"] == [
+            "approvals",
+            "artifacts",
+            "evals",
+            "human-input",
+            "knowledge",
+            "memory",
+            "observability",
+            "recovery",
+            "tasks",
+        ]
+        assert dry["plan"]["private_files"] == ["data/memory-evidence.key"]
         assert not (root / "planned").exists()
 
         agent = _create(cayu, root, "agent", environment=environment)

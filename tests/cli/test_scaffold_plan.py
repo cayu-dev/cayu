@@ -43,19 +43,214 @@ def test_dry_run_and_apply_use_the_same_normalized_plan(
     assert applied["status"] == "created"
     assert applied["plan"] == dry_run["plan"]
     assert applied["agent_context"] == dry_run["agent_context"]
-    assert "observability" in applied["plan"]["capabilities"]
+    assert applied["plan"]["capabilities"] == [
+        "approvals",
+        "artifacts",
+        "evals",
+        "human-input",
+        "knowledge",
+        "memory",
+        "observability",
+        "recovery",
+        "tasks",
+    ]
+    assert applied["plan"]["private_files"] == ["data/memory-evidence.key"]
     runtime = (tmp_path / "observed/configuration/runtime.py").read_text(encoding="utf-8")
     assert "enable_logging=True" in runtime
     instructions = (tmp_path / "observed/AGENTS.md").read_text(encoding="utf-8")
     expected_reference = (
         "uv run --no-sync cayu new observed_reference --preset agent --database sqlite "
-        "--provider neutral --execution none --with observability --json "
+        "--provider neutral --execution none --json "
         '--agent-name "observed" --dir "$reference_parent"'
     )
     assert f"{expected_reference} --dry-run" in instructions
     assert expected_reference in instructions
     assert "installed, exactly pinned Cayu version" in instructions
     assert "project-local uv cache" in instructions
+
+
+def test_default_agent_plan_is_the_complete_safe_local_profile() -> None:
+    plan = normalize_application_plan(name="standard", agent_name="standard")
+
+    assert plan.capabilities == (
+        "approvals",
+        "artifacts",
+        "evals",
+        "human-input",
+        "knowledge",
+        "memory",
+        "observability",
+        "recovery",
+        "tasks",
+    )
+    files = project_files("standard", application_plan=plan)
+    assert "AutomaticRecallContextPolicy" in files["memory/context.py"]
+    assert "SQLiteKnowledgeStore" in files["configuration/storage.py"]
+    assert "LocalArtifactStore" in files["environments/local.py"]
+    assert "StaticToolExposurePolicy" in files["policies/tools.py"]
+    assert "tests/test_memory.py" in files
+
+
+def test_without_memory_disables_recall_but_retains_its_truthful_home() -> None:
+    plan = normalize_application_plan(
+        name="no-memory",
+        agent_name="no-memory",
+        without_capabilities=("memory",),
+    )
+    files = project_files("no-memory", application_plan=plan)
+
+    assert "memory" not in plan.capabilities
+    assert "memory/context.py" in files
+    assert "if not False:" in files["memory/context.py"]
+    assert "tests/test_memory.py" not in files
+    assert "available but not configured" in files["memory/CAPABILITY.md"]
+
+
+def test_standard_capability_acceptance_is_emitted_only_for_its_complete_profile() -> None:
+    default_files = project_files("standard")
+    without_memory = project_files("standard", without_capabilities=("memory",))
+    without_observability = project_files(
+        "standard",
+        without_capabilities=("observability",),
+    )
+
+    assert "tests/test_standard_capabilities.py" in default_files
+    assert "tests/test_standard_capabilities.py" not in without_memory
+    assert "tests/test_standard_capabilities.py" not in without_observability
+
+
+def test_joint_dependency_exclusions_are_order_independent() -> None:
+    knowledge_first = normalize_application_plan(
+        name="reduced",
+        agent_name="reduced",
+        without_capabilities=("knowledge", "memory"),
+    )
+    memory_first = normalize_application_plan(
+        name="reduced",
+        agent_name="reduced",
+        without_capabilities=("memory", "knowledge"),
+    )
+
+    assert knowledge_first == memory_first
+    assert "knowledge" not in knowledge_first.capabilities
+    assert "memory" not in knowledge_first.capabilities
+
+
+def test_recovery_opt_out_changes_the_generated_runtime_profile() -> None:
+    selected = project_files("standard")
+    excluded = project_files("standard", without_capabilities=("recovery",))
+    changed = {
+        path for path in set(selected) | set(excluded) if selected.get(path) != excluded.get(path)
+    }
+
+    assert {
+        "environments/local.py",
+        "policies/tools.py",
+        "tools/registration.py",
+    } <= changed
+    for path in (
+        "environments/local.py",
+        "policies/tools.py",
+        "tools/registration.py",
+    ):
+        assert "if True" in selected[path]
+        assert "if False" in excluded[path]
+
+
+def test_user_names_cannot_collide_with_internal_capability_tokens() -> None:
+    name = "project__TASKS_ENABLED__"
+    files = project_files(name)
+
+    assert f'name="{name}"' in files["agents/agent.py"]
+    assert f'agent_name="{name}"' in files["tests/test_agent.py"]
+    assert "projectTrue" not in "\n".join(files.values())
+
+
+@pytest.mark.parametrize("execution", ("none", "docker"))
+def test_coding_knowledge_opt_out_reaches_the_overlay(execution: str) -> None:
+    files = project_files(
+        "coder",
+        preset="coding",
+        execution=execution,
+        without_capabilities=("knowledge",),
+    )
+
+    assert "_KNOWLEDGE_ENABLED = False" in files["operations/coding.py"]
+    assert '"list_knowledge"' not in files["tools/coding.py"]
+    assert "No knowledge store or knowledge tools are configured" in files["README.md"]
+
+
+def test_without_flags_disable_each_safe_default_deterministically(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    excluded = (
+        "approvals",
+        "artifacts",
+        "evals",
+        "human-input",
+        "memory",
+        "observability",
+        "recovery",
+        "tasks",
+    )
+    command = ["new", "reduced", "--dir", str(tmp_path), "--json"]
+    for capability in excluded:
+        command.extend(("--without", capability))
+
+    assert main(command) == 0
+    payload = _json_output(capsys)
+    project = tmp_path / "reduced"
+    assert payload["plan"]["capabilities"] == ["knowledge"]
+    assert not (project / "data" / "memory-evidence.key").exists()
+    assert not (project / "data" / "artifacts").exists()
+    assert not (project / "tests" / "test_memory.py").exists()
+    assert not (project / "evals" / "agent.py").exists()
+    pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
+    assert "eval_target" not in pyproject
+    assert "enable_logging=False" in (project / "configuration" / "runtime.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'SQLiteTaskStore("data/cayu.db") if False else None' in (
+        project / "configuration" / "storage.py"
+    ).read_text(encoding="utf-8")
+    assert "if not False:" in (project / "memory" / "context.py").read_text(encoding="utf-8")
+    for capability in excluded:
+        card_path = {
+            "approvals": "operations/APPROVALS.md",
+            "artifacts": "environments/ARTIFACTS.md",
+            "evals": "evals/CAPABILITY.md",
+            "human-input": "operations/HUMAN_INPUT.md",
+            "memory": "memory/CAPABILITY.md",
+            "observability": "observability/CAPABILITY.md",
+            "recovery": "operations/RECOVERY.md",
+            "tasks": "operations/TASKS.md",
+        }[capability]
+        assert "available but not configured" in (project / card_path).read_text(encoding="utf-8")
+
+
+def test_excluding_a_required_default_fails_before_writes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            [
+                "new",
+                "broken-scope",
+                "--without",
+                "knowledge",
+                "--dir",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+        == 1
+    )
+    payload = _json_output(capsys)
+    assert payload["error"]["code"] == "CAPABILITY_DEPENDENCY_CONFLICT"
+    assert "memory" in payload["error"]["message"]
+    assert not (tmp_path / "broken-scope").exists()
 
 
 def test_service_can_disable_selectable_observability_without_erasing_its_home() -> None:
@@ -176,10 +371,14 @@ def test_minimal_is_recorded_and_omits_the_complete_convention(
     project = tmp_path / "tiny"
 
     assert payload["plan"]["minimal"] is True
+    assert payload["plan"]["capabilities"] == []
+    assert payload["plan"]["private_files"] == []
     assert (project / "configuration.py").is_file()
     assert not (project / "configuration").exists()
     assert not (project / "workflows").exists()
     assert (project / "data").is_dir()
+    assert not (project / "data" / "memory-evidence.key").exists()
+    assert not (project / "data" / "artifacts").exists()
     assert "minimal = true" in (project / "pyproject.toml").read_text(encoding="utf-8")
 
 
@@ -260,7 +459,7 @@ def test_docker_coding_plan_records_explicit_toolchain_and_command_authority() -
     assert "--coding-command-authority structured" in instructions
 
 
-def test_extension_only_capability_fails_before_target_creation(
+def test_unconfigured_extension_only_capability_fails_before_target_creation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -270,7 +469,7 @@ def test_extension_only_capability_fails_before_target_creation(
                 "new",
                 "invalid",
                 "--with",
-                "memory",
+                "mcp",
                 "--dir",
                 str(tmp_path),
                 "--json",
@@ -291,7 +490,8 @@ def test_discovery_reports_truthful_capability_status_and_complete_metadata(
     by_name = {item["name"]: item for item in payload["capabilities"]}
 
     assert by_name["observability"]["status"] == "selectable"
-    assert by_name["memory"]["status"] == "extension-only"
+    assert by_name["memory"]["status"] == "preset-owned"
+    assert by_name["memory"]["requires"] == ["knowledge"]
     for field in (
         "files",
         "dependencies",

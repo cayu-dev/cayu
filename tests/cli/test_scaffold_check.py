@@ -44,6 +44,30 @@ def test_minimal_generated_project_passes_strict_scaffold_check(
     assert report["diagnostics"] == []
 
 
+@pytest.mark.parametrize(
+    "exclusions",
+    (
+        ("evals",),
+        ("memory", "knowledge"),
+    ),
+)
+def test_supported_capability_opt_outs_pass_strict_scaffold_check(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    exclusions: tuple[str, ...],
+) -> None:
+    command = ["new", "reduced", "--dir", str(tmp_path)]
+    for capability in exclusions:
+        command.extend(("--without", capability))
+    assert main(command) == 0
+    capsys.readouterr()
+    monkeypatch.chdir(tmp_path / "reduced")
+
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+
+
 def test_minimal_scaffold_still_requires_the_application_factory(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -70,6 +94,7 @@ def test_declared_layout_reports_missing_home_and_composition_collapse(
     assert main(["new", "project", "--dir", str(tmp_path)]) == 0
     capsys.readouterr()
     project = tmp_path / "project"
+    manifest = _generated_manifest(project)
     (project / "memory/context.py").unlink()
     app_path = project / "app.py"
     app_path.write_text(
@@ -77,7 +102,7 @@ def test_declared_layout_reports_missing_home_and_composition_collapse(
         encoding="utf-8",
     )
 
-    findings = check_declared_scaffold(project, _generated_manifest(project))
+    findings = check_declared_scaffold(project, manifest)
     by_code = {item.code: item for item in findings}
 
     assert by_code["SCAFFOLD_LAYOUT_PATH_MISSING"].path == "memory/context.py"
@@ -176,7 +201,7 @@ def test_cli_check_applies_tag_selection_before_source_only_gating(
     assert main(["new", "project", "--dir", str(tmp_path)]) == 0
     capsys.readouterr()
     project = tmp_path / "project"
-    (project / "knowledge/retrieval.py").unlink()
+    (project / "operations/watchers.py").unlink()
     monkeypatch.chdir(project)
 
     assert main(["check", "--tag", "security", "--json"]) == 0
@@ -833,15 +858,25 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
         ((('database = "sqlite"', 'database = "postgres"'),), "database"),
         ((('provider = "neutral"', 'provider = "openai"'),), "provider"),
         (
-            (("capabilities = []", 'capabilities = ["observability"]'),),
+            (
+                (
+                    'capabilities = ["approvals", "artifacts", "evals", '
+                    '"human-input", "knowledge", "memory", "observability", '
+                    '"recovery", "tasks"]',
+                    'capabilities = ["approvals", "artifacts", "evals", '
+                    '"human-input", "knowledge", "memory", "recovery", "tasks"]',
+                ),
+            ),
             "capabilities",
         ),
         (
             (
                 ('preset = "agent"', 'preset = "service"'),
                 (
-                    "capabilities = []",
-                    'capabilities = ["approvals", "observability", "tasks"]',
+                    'capabilities = ["approvals", "artifacts", "evals", '
+                    '"human-input", "knowledge", "memory", "observability", '
+                    '"recovery", "tasks"]',
+                    'capabilities = ["approvals", "evals", "observability", "tasks"]',
                 ),
             ),
             "preset",
@@ -851,8 +886,10 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
                 ('preset = "agent"', 'preset = "coding"'),
                 ('execution = "none"', 'execution = "docker"'),
                 (
-                    "capabilities = []",
-                    'capabilities = ["delegation", "human-input", "knowledge", "tasks"]',
+                    'capabilities = ["approvals", "artifacts", "evals", '
+                    '"human-input", "knowledge", "memory", "observability", '
+                    '"recovery", "tasks"]',
+                    'capabilities = ["delegation", "evals", "human-input", "knowledge", "tasks"]',
                 ),
             ),
             "execution",

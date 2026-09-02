@@ -224,7 +224,8 @@ def test_generate_tool_attaches_first_tracer_bullet_to_scaffold_starter(
     assert agent["name"] == "invoice-analyst"
     assert agent["workflow_tool_names"] == ["calculate_total"]
     assert agent["authoring_state"] == "unfinished_generated_tracer_bullet"
-    assert agent["tools"][0]["input_schema"]["required"] == ["input"]
+    generated_tool = next(tool for tool in agent["tools"] if tool["name"] == "calculate_total")
+    assert generated_tool["input_schema"]["required"] == ["input"]
     assert main(["check", "--json"]) == 0
     assert [item["code"] for item in json.loads(capsys.readouterr().out)["diagnostics"]] == [
         "AGENT_GENERATED_TRACER_BULLET_UNFINISHED"

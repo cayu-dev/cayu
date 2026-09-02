@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import sys
@@ -38,12 +39,6 @@ from cayu.cli.scaffold_plan import (
 from cayu.workspaces import LocalWorkspace
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
-_TEMPLATE_TOKEN_RE = re.compile(
-    r"__(?:PROJECT_NAME|AGENT_NAME|REVIEWER_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL|"
-    r"PROVIDER_GUIDE_POINTER|DATABASE_README_PROOF_GUIDANCE|DATABASE_AGENTS_PROOF_GUIDANCE|"
-    r"DATABASE_EVALS_STORAGE_GUIDANCE|CODING_DATABASE_SUMMARY|CODING_STATE_STORAGE)__"
-)
-
 _SCAFFOLD_COMMAND_TIMEOUT_S = 10.0
 _SCAFFOLD_COMMAND_OUTPUT_LIMIT_BYTES = 64 * 1024
 _SAFE_SCAFFOLD_ENV_KEYS = (
@@ -3612,9 +3607,13 @@ def project_files(
     coding_command_authority = plan.coding_command_authority
     reviewer_name = f"{resolved_agent_name}-reviewer"
 
-    def render(template: str) -> str:
+    def render(
+        template: str,
+        additional_replacements: dict[str, str] | None = None,
+    ) -> str:
         provider_display = provider or "no live provider"
         provider_literal = "None" if provider is None else json.dumps(provider)
+        knowledge_selected = "knowledge" in plan.capabilities
         if plan.database == "postgres":
             database_readme_proof_guidance = (
                 "Run setup and proof commands in the listed order. Do not parallelize "
@@ -3627,12 +3626,21 @@ def project_files(
                 "  constructing commands against the same configured Postgres database."
             )
             database_evals_storage_guidance = "the configured durable Postgres Evals store"
-            coding_database_summary = "durable Postgres knowledge"
+            coding_database_summary = (
+                "durable Postgres knowledge"
+                if knowledge_selected
+                else "no configured knowledge store or tools"
+            )
             coding_state_storage = (
-                "Artifact state is stored below that protected `.cayu` boundary; session, "
-                "task, and knowledge state lives in the configured Postgres stores. Use the "
-                "registered Git, artifact, and knowledge tools at their authenticated "
-                "boundaries instead."
+                "Artifact state is stored below that protected `.cayu` boundary; "
+                + (
+                    "session, task, and knowledge state lives in the configured Postgres "
+                    "stores. Use the registered Git, artifact, and knowledge tools at their "
+                    "authenticated boundaries instead."
+                    if knowledge_selected
+                    else "session and task state lives in the configured Postgres stores. "
+                    "No knowledge store or knowledge tools are configured."
+                )
             )
         else:
             database_readme_proof_guidance = (
@@ -3645,11 +3653,18 @@ def project_files(
                 "  constructing commands against the same local SQLite store."
             )
             database_evals_storage_guidance = "this project's durable `data/cayu.db` store"
-            coding_database_summary = "durable SQLite knowledge"
+            coding_database_summary = (
+                "durable SQLite knowledge"
+                if knowledge_selected
+                else "no configured knowledge store or tools"
+            )
             coding_state_storage = (
-                "Session, task, artifact, and knowledge state is stored below that protected "
-                "`.cayu` boundary; use the registered Git, artifact, and knowledge tools at "
-                "their authenticated boundaries instead."
+                "Session, task, artifact, and knowledge state is stored below that "
+                "protected `.cayu` boundary; use the registered Git, artifact, and "
+                "knowledge tools at their authenticated boundaries instead."
+                if knowledge_selected
+                else "Session, task, and artifact state is stored below that protected "
+                "`.cayu` boundary. No knowledge store or knowledge tools are configured."
             )
         replacements = {
             "__PROJECT_NAME__": name,
@@ -3665,7 +3680,12 @@ def project_files(
             "__CODING_DATABASE_SUMMARY__": coding_database_summary,
             "__CODING_STATE_STORAGE__": coding_state_storage,
         }
-        return _TEMPLATE_TOKEN_RE.sub(
+        if additional_replacements is not None:
+            replacements.update(additional_replacements)
+        token_re = re.compile(
+            "|".join(re.escape(token) for token in sorted(replacements, key=len, reverse=True))
+        )
+        return token_re.sub(
             lambda match: replacements[match.group(0)],
             template,
         )
@@ -3687,9 +3707,55 @@ def project_files(
     if not plan.minimal:
         files.pop("configuration.py")
         files.update(convention_files(plan, render=render))
+        if "knowledge" in plan.capabilities:
+            for relative in ("tests/test_agent.py", "evals/agent.py"):
+                files[relative] = (
+                    files[relative]
+                    .replace(
+                        "    InMemorySessionStore,\n",
+                        "    InMemoryKnowledgeStore,\n    InMemorySessionStore,\n",
+                    )
+                    .replace(
+                        "        task_store=InMemoryTaskStore(),\n",
+                        "        task_store=InMemoryTaskStore(),\n"
+                        "        knowledge_store=InMemoryKnowledgeStore(),\n",
+                    )
+                )
         files["pyproject.toml"] += scaffold_contract(plan)
         files["README.md"] += application_guidance(plan)
         files["AGENTS.md"] += application_guidance(plan)
+        if "evals" not in plan.capabilities:
+            files.pop("evals/agent.py", None)
+            files["pyproject.toml"] = files["pyproject.toml"].replace(
+                'eval_target = "evals.agent:build_eval"\n',
+                "",
+            )
+            for guidance_name in ("README.md", "AGENTS.md"):
+                files[guidance_name] = files[guidance_name].replace(
+                    "uv run --no-sync cayu eval run",
+                    "evals are not configured in this profile",
+                )
+        if plan.preset == "agent":
+            selected_capabilities = ", ".join(plan.capabilities)
+            files["README.md"] = files["README.md"].replace(
+                "A model-only Cayu agent scaffold. It starts with one agent, one deterministic\n"
+                "runtime test, and one output eval. Its registered agent identity is\n"
+                "`__AGENT_NAME__`. Add capabilities only when the job needs them.".replace(
+                    "__AGENT_NAME__", resolved_agent_name
+                ),
+                "A batteries-included local Cayu agent scaffold. Its registered agent identity "
+                f"is\n`{resolved_agent_name}`. The normalized profile explicitly configures: "
+                f"{selected_capabilities}.\nUse `--minimal` when a model-only application is "
+                "intentional.",
+            )
+            files["AGENTS.md"] = files["AGENTS.md"].replace(
+                "job. Do not retain the starter and add a second agent. Tools are optional: add\n"
+                "one only for a real capability outside the model, such as reading a repository\n"
+                "or calling an API. Do not create echo, pass-through, or placeholder tools.",
+                "job. Do not retain the starter and add a second agent. The safe local tools are\n"
+                "explicitly registered and exposed in `agents/registration.py`; change those\n"
+                "policies deliberately. Do not create echo, pass-through, or placeholder tools.",
+            )
     elif plan.minimal:
         files.update(convention_files(plan, render=render))
         files["pyproject.toml"] += scaffold_contract(plan)
@@ -3731,6 +3797,7 @@ def project_files(
                 toolchain=coding_toolchain,
                 command_authority=coding_command_authority,
                 database=plan.database,
+                capabilities=plan.capabilities,
             )
         )
         return files
@@ -4018,6 +4085,13 @@ def _publish_new_project(
         ) as raw_staging:
             staging = Path(raw_staging)
             (staging / "data").mkdir()
+            if "artifacts" in plan.capabilities:
+                (staging / "data" / "artifacts").mkdir()
+            if "memory" in plan.capabilities:
+                memory_key = staging / "data" / "memory-evidence.key"
+                memory_key.write_text(secrets.token_urlsafe(48) + "\n", encoding="utf-8")
+                if os.name != "nt":
+                    memory_key.chmod(0o600)
             for relative, content in files.items():
                 path = staging / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -4063,6 +4137,8 @@ def _render_new_receipt(
     )
     capabilities = ", ".join(plan.capabilities) if plan.capabilities else "none"
     print(f"  Capabilities: {capabilities}")
+    if "memory" in plan.capabilities:
+        print("  Private runtime state: data/memory-evidence.key (ignored; mode 0600 on POSIX)")
     print("  Agent instructions: AGENTS.md (CLAUDE.md imports the same contract)")
     print("  Scaffold contract: pyproject.toml [tool.cayu.scaffold]")
     print(f"  cd {target}")
@@ -4180,6 +4256,8 @@ def run_new(args: argparse.Namespace) -> int:
         code = exc.code.upper() if isinstance(exc, ScaffoldPlanError) else "PLAN_RENDER_FAILED"
         return _new_error(code=code, message=str(exc), as_json=args.json)
     directories = {"data"}
+    if "artifacts" in plan.capabilities:
+        directories.add("data/artifacts")
     directories.update(parent for path in files if (parent := str(Path(path).parent)) != ".")
     payload = {
         "status": "planned" if args.dry_run else "created",
@@ -4187,6 +4265,7 @@ def run_new(args: argparse.Namespace) -> int:
         "plan": plan.as_dict(
             files=tuple(sorted(files)),
             directories=tuple(sorted(directories)),
+            private_files=(("data/memory-evidence.key",) if "memory" in plan.capabilities else ()),
         ),
         "agent_context": _agent_context(plan),
     }
@@ -4201,6 +4280,8 @@ def run_new(args: argparse.Namespace) -> int:
             )
             for relative in sorted(files):
                 print(f"  create {relative}")
+            if "memory" in plan.capabilities:
+                print("  create private data/memory-evidence.key (content generated on apply)")
         return 0
 
     coding_git: str | None = None

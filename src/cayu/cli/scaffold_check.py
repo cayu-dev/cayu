@@ -189,7 +189,15 @@ def _source_diagnostics(
         return tuple(diagnostics), None
     minimal = plan.minimal
 
-    required = _MINIMAL_REQUIRED_PATHS if minimal else _COMPLETE_REQUIRED_PATHS
+    required = (
+        _MINIMAL_REQUIRED_PATHS
+        if minimal
+        else tuple(
+            relative
+            for relative in _COMPLETE_REQUIRED_PATHS
+            if relative != "evals/agent.py" or "evals" in plan.capabilities
+        )
+    )
     for relative in required:
         if not _required_path_is_present(root, relative):
             expected_kind = "directory" if relative in _REQUIRED_DIRECTORY_PATHS else "file"

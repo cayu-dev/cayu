@@ -327,6 +327,7 @@ _DENIED_PATH_PATTERNS = (
 _COMMAND_TIMEOUT_S = 10.0
 _COMMAND_OUTPUT_LIMIT_BYTES = 64 * 1024
 _GIT_AUTHORITY_OUTPUT_LIMIT_BYTES = 16 * 1024 * 1024
+_KNOWLEDGE_ENABLED = __CODING_KNOWLEDGE_ENABLED__
 _SAFE_LOCAL_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -348,12 +349,12 @@ _SAFE_LOCAL_ENV_KEYS = (
 _SUBAGENT_RESULT_TOOL_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="cayu.generated.coding.subagent_result",
     behavior_version="1",
-    implementation_version="1",
+    implementation_version="1-__CODING_PROFILE__",
 )
 _PRIMARY_TOOL_POLICY_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="cayu.generated.coding.primary_tool_policy",
     behavior_version="2",
-    implementation_version="1",
+    implementation_version="1-__CODING_PROFILE__",
 )
 
 
@@ -361,8 +362,8 @@ def _coding_environment_identity(
     *,
     root: Path,
     artifact_store: ArtifactStore,
-    knowledge_store: KnowledgeStore,
-    scope: KnowledgeAccessScope,
+    knowledge_store: KnowledgeStore | None,
+    scope: KnowledgeAccessScope | None,
     generated_stores: bool,
 ) -> ExecutionProfileBehaviorIdentity | None:
     """Declare the generated environment/store wiring version."""
@@ -371,13 +372,18 @@ def _coding_environment_identity(
         return None
     if type(artifact_store) is not LocalArtifactStore:
         return None
-    if type(knowledge_store) is not GENERATED_KNOWLEDGE_STORE_TYPE:
+    if (
+        knowledge_store is not None
+        and type(knowledge_store) is not GENERATED_KNOWLEDGE_STORE_TYPE
+    ):
         return None
     del root, scope
     return ExecutionProfileBehaviorIdentity(
         name="cayu.generated.coding.environment",
         behavior_version="2",
-        implementation_version=f"1-{GENERATED_STORE_PROFILE}",
+        implementation_version=(
+            f"1-{GENERATED_STORE_PROFILE}-__CODING_PROFILE__"
+        ),
     )
 
 
@@ -971,7 +977,9 @@ def _observe_coding_product_git_control(root: Path) -> tuple[str, str, str]:
     try:
         head_revision = head_result.output.decode("ascii").strip()
     except UnicodeDecodeError:
-        raise RuntimeError("coding source Git HEAD is not an ASCII object identity") from None
+        raise RuntimeError(
+            "coding source Git HEAD is not an ASCII object identity"
+        ) from None
     staged_entries = _execute_dependency_probe(
         _safe_git_probe_argv(git, "ls-files", "--stage", "-z", "--"),
         cwd=root,
@@ -1104,7 +1112,9 @@ def observe_clean_coding_product_git_baseline(root: Path) -> CodingGitBaselineAu
         staged_entries_sha256,
         tracked_flags_sha256,
     ):
-        raise RuntimeError("coding source Git authority changed during baseline admission")
+        raise RuntimeError(
+            "coding source Git authority changed during baseline admission"
+        )
     status_bytes = status.encode("utf-8")
     diff_bytes = staged.encode("utf-8") + b"\0" + unstaged.encode("utf-8")
     return CodingGitBaselineAuthority(
@@ -1136,7 +1146,10 @@ def require_coding_product_git_authority(
 def _source_path_is_excluded(path: str) -> bool:
     normalized = path.rstrip("/").replace("\\", "/")
     parts = tuple(part for part in normalized.split("/") if part)
-    if any(part.rstrip(" .").casefold() in _SOURCE_EXCLUDED_DIRECTORY_NAMES for part in parts):
+    if any(
+        part.rstrip(" .").casefold() in _SOURCE_EXCLUDED_DIRECTORY_NAMES
+        for part in parts
+    ):
         return True
     if not parts:
         return False
@@ -1147,8 +1160,8 @@ def _source_path_is_excluded(path: str) -> bool:
     )
 
 
-def _knowledge_scope() -> KnowledgeAccessScope:
-    return coding_knowledge_scope()
+def _knowledge_scope() -> KnowledgeAccessScope | None:
+    return coding_knowledge_scope() if _KNOWLEDGE_ENABLED else None
 
 
 def _path_rules(*, required: bool) -> tuple:
@@ -1160,24 +1173,26 @@ def _path_rules(*, required: bool) -> tuple:
 
 
 def _primary_tool_policy() -> ParameterConstrainedToolPolicy:
+    rules = {
+        "search_text": (
+            DenyPatternRule("path", patterns=_DENIED_PATH_PATTERNS),
+            DenyPatternRule("glob", patterns=_DENIED_PATH_PATTERNS),
+        ),
+        "read_file": _path_rules(required=False),
+        "apply_patch": (RequiredFieldRule("operations"),),
+        "write_file": _path_rules(required=True),
+        "edit_file": _path_rules(required=True),
+        "delete_file": _path_rules(required=True),
+        "subagent": (
+            RequiredAllowlistRule("agent", values=[_REVIEWER_ALIAS]),
+            RequiredFieldRule("task"),
+        ),
+        "ask_user": (RequiredFieldRule("question"),),
+    }
+    if _KNOWLEDGE_ENABLED:
+        rules["remember_knowledge"] = (RequiredFieldRule("text"),)
     return ParameterConstrainedToolPolicy(
-        {
-            "search_text": (
-                DenyPatternRule("path", patterns=_DENIED_PATH_PATTERNS),
-                DenyPatternRule("glob", patterns=_DENIED_PATH_PATTERNS),
-            ),
-            "read_file": _path_rules(required=False),
-            "apply_patch": (RequiredFieldRule("operations"),),
-            "write_file": _path_rules(required=True),
-            "edit_file": _path_rules(required=True),
-            "delete_file": _path_rules(required=True),
-            "remember_knowledge": (RequiredFieldRule("text"),),
-            "subagent": (
-                RequiredAllowlistRule("agent", values=[_REVIEWER_ALIAS]),
-                RequiredFieldRule("task"),
-            ),
-            "ask_user": (RequiredFieldRule("question"),),
-        },
+        rules,
         execution_profile_identity=_PRIMARY_TOOL_POLICY_IDENTITY,
     )
 
@@ -1257,10 +1272,16 @@ def build_coding_app(
     selected_session_store = stores.session_store
     selected_task_store = stores.task_store
     selected_knowledge_store = stores.knowledge_store
-    bound_scope = selected_knowledge_store.bound_access_scope()
-    selected_scope = _require_coding_knowledge_scope(
-        scope if bound_scope is None else bound_scope
-    )
+    selected_scope = None
+    if selected_knowledge_store is not None:
+        if scope is None:
+            raise RuntimeError(
+                "coding knowledge_store injection requires the knowledge capability"
+            )
+        bound_scope = selected_knowledge_store.bound_access_scope()
+        selected_scope = _require_coding_knowledge_scope(
+            scope if bound_scope is None else bound_scope
+        )
     selected_artifact_store = (
         artifact_store
         if artifact_store is not None
@@ -1271,7 +1292,10 @@ def build_coding_app(
         artifact_store=selected_artifact_store,
         knowledge_store=selected_knowledge_store,
         scope=selected_scope,
-        generated_stores=artifact_store is None and stores.generated_knowledge_store,
+        generated_stores=(
+            artifact_store is None
+            and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
+        ),
     )
 
     app = CayuApp(
@@ -1279,7 +1303,7 @@ def build_coding_app(
         task_store=selected_task_store,
         knowledge_store=selected_knowledge_store,
         knowledge_access_scope=selected_scope,
-        knowledge_review_namespace="default",
+        knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -1302,7 +1326,7 @@ def build_coding_app(
         default=True,
     )
     background_registry = BackgroundSubagentTaskRegistry()
-    tools = (
+    tools = [
         ListFilesTool(),
         SearchTextTool(
             exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
@@ -1315,47 +1339,56 @@ def build_coding_app(
         DeleteFileTool(),
         GitChangesTool(),
         ListArtifactsTool(),
-        ListKnowledgeTool(),
-        SearchKnowledgeTool(),
-        ReadKnowledgeTool(),
-        RememberKnowledgeTool(),
-        SubagentTool(
-            app,
-            agents={
-                _REVIEWER_ALIAS: SubagentSpec(
-                    agent_name=reviewer_agent.name,
-                    description="Review a bounded change and return concrete findings.",
-                    mode=SubagentExecutionMode.BACKGROUND,
-                    max_steps=REVIEWER_MAX_STEPS,
-                    result_max_chars=4_000,
-                    limits=RunLimits(
-                        max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
-                        max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
-                    ),
-                )
-            },
-            background_registry=background_registry,
-            execution_profile_identity=_subagent_tool_identity(
-                reviewer_agent,
-                reviewer_execution_profile_identity,
-                generated_session_store=generated_session_store,
+    ]
+    if _KNOWLEDGE_ENABLED:
+        tools.extend(
+            (
+                ListKnowledgeTool(),
+                SearchKnowledgeTool(),
+                ReadKnowledgeTool(),
+                RememberKnowledgeTool(),
+            )
+        )
+    tools.extend(
+        (
+            SubagentTool(
+                app,
+                agents={
+                    _REVIEWER_ALIAS: SubagentSpec(
+                        agent_name=reviewer_agent.name,
+                        description="Review a bounded change and return concrete findings.",
+                        mode=SubagentExecutionMode.BACKGROUND,
+                        max_steps=REVIEWER_MAX_STEPS,
+                        result_max_chars=4_000,
+                        limits=RunLimits(
+                            max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
+                            max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
+                        ),
+                    )
+                },
+                background_registry=background_registry,
+                execution_profile_identity=_subagent_tool_identity(
+                    reviewer_agent,
+                    reviewer_execution_profile_identity,
+                    generated_session_store=generated_session_store,
+                ),
             ),
-        ),
-        SubagentResultTool(
-            app.session_store,
-            background_registry=background_registry,
-            default_timeout_s=30,
-            execution_profile_identity=(
-                _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+            SubagentResultTool(
+                app.session_store,
+                background_registry=background_registry,
+                default_timeout_s=30,
+                execution_profile_identity=(
+                    _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+                ),
             ),
-        ),
-        UserInputTool(),
+            UserInputTool(),
+        )
     )
     register_coding_agents(
         app,
         primary_agent=primary_agent,
         reviewer_agent=reviewer_agent,
-        tools=require_coding_tool_inventory(tools, docker=False),
+        tools=require_coding_tool_inventory(tuple(tools), docker=False),
         tool_policy=require_coding_tool_policy(_primary_tool_policy()),
         provider_override=provider,
     )
@@ -1372,7 +1405,7 @@ changes inside the configured Git workspace, and use git_changes to review your
 work. Use edit_file for one small existing-file change, write_file or delete_file
 for one explicit file, and apply_patch for a coherent bounded multi-file change
 or move. Treat partial, ambiguous, or cancelled patch outcomes as a requirement
-to re-read current state. Durable knowledge writes are proposals pending review.
+to re-read current state.__CODING_KNOWLEDGE_PROMPT__
 Delegate focused review tasks to the reviewer alias in the background and recover
 their result with subagent_result. Use ask_user when a material choice cannot be
 inferred.
@@ -1550,16 +1583,25 @@ LOCAL_TOOL_NAMES = (
     "delete_file",
     "git_changes",
     "list_artifacts",
-    "list_knowledge",
-    "search_knowledge",
-    "read_knowledge",
-    "remember_knowledge",
-    "subagent",
+__CODING_KNOWLEDGE_TOOL_NAMES__    "subagent",
     "subagent_result",
     "ask_user",
 )
 DOCKER_TOOL_NAMES = (
-    LOCAL_TOOL_NAMES[:8] + ("run_check", "run_command") + LOCAL_TOOL_NAMES[8:]
+    "list_files",
+    "search_text",
+    "read_file",
+    "apply_patch",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "git_changes",
+    "run_check",
+    "run_command",
+    "list_artifacts",
+__CODING_KNOWLEDGE_TOOL_NAMES__    "subagent",
+    "subagent_result",
+    "ask_user",
 )
 
 
@@ -1662,14 +1704,14 @@ GENERATED_STORE_PROFILE = "sqlite"
 class CodingStores:
     session_store: SessionStore
     task_store: TaskStore
-    knowledge_store: KnowledgeStore
+    knowledge_store: KnowledgeStore | None
     generated_session_store: bool
     generated_knowledge_store: bool
 
 
 def build_coding_stores(
     state_root: Path,
-    scope: KnowledgeAccessScope,
+    scope: KnowledgeAccessScope | None,
     *,
     session_store: SessionStore | None = None,
     task_store: TaskStore | None = None,
@@ -1693,10 +1735,14 @@ def build_coding_stores(
         knowledge_store=(
             knowledge_store
             if knowledge_store is not None
-            else SQLiteKnowledgeStore(database, access_scope=scope)
+            else (
+                SQLiteKnowledgeStore(database, access_scope=scope)
+                if scope is not None
+                else None
+            )
         ),
         generated_session_store=session_store is None,
-        generated_knowledge_store=knowledge_store is None,
+        generated_knowledge_store=knowledge_store is None and scope is not None,
     )
 '''
 
@@ -1727,14 +1773,14 @@ _INSPECTION_DSN = "postgresql://cayu-unconfigured@127.0.0.1/cayu"
 class CodingStores:
     session_store: SessionStore
     task_store: TaskStore
-    knowledge_store: KnowledgeStore
+    knowledge_store: KnowledgeStore | None
     generated_session_store: bool
     generated_knowledge_store: bool
 
 
 def build_coding_stores(
     state_root: Path,
-    scope: KnowledgeAccessScope,
+    scope: KnowledgeAccessScope | None,
     *,
     session_store: SessionStore | None = None,
     task_store: TaskStore | None = None,
@@ -1759,10 +1805,14 @@ def build_coding_stores(
         knowledge_store=(
             knowledge_store
             if knowledge_store is not None
-            else PostgresKnowledgeStore(conninfo, access_scope=scope)
+            else (
+                PostgresKnowledgeStore(conninfo, access_scope=scope)
+                if scope is not None
+                else None
+            )
         ),
         generated_session_store=session_store is None,
-        generated_knowledge_store=knowledge_store is None,
+        generated_knowledge_store=knowledge_store is None and scope is not None,
     )
 '''
 
@@ -1827,8 +1877,7 @@ not inherit the full or arbitrary ambient environment; with `inherit_env=False`
 it forwards only Cayu's minimal operational allow-list
 (including command-resolution, home, locale, and temporary-directory variables).
 Path-addressed mutations are confined to the selected workspace by the workspace
-adapter and explicit parameter policy. Knowledge writes remain pending until a
-human reviews them.
+adapter and explicit parameter policy.__CODING_KNOWLEDGE_REVIEW_GUIDANCE__
 
 Completed reviewer sessions and their results are durable and can be retrieved
 after application reconstruction. Background reviewer execution itself belongs
@@ -1887,11 +1936,11 @@ compatibility import; do not move implementation back into it or replace the
 owning modules with an agent-type switch,
 plugin registry, implicit permission grant, or runtime mutation. Preserve the
 Git-root validation, `git`/`rg` compatibility preflight, minimal-environment local
-runner, parameter policy, pending knowledge review, bounded background reviewer,
+runner, parameter policy,__CODING_KNOWLEDGE_POLICY_PHRASE__ bounded background reviewer,
 result tool, and human-input pause/resume contract.
 Keep `.git` and runtime-private `.cayu` directories excluded at both the
 workspace and search boundaries. Do not replace artifact or knowledge tools
-with generic file access to their backing stores.
+with generic file access to their backing stores.__CODING_KNOWLEDGE_AGENT_GUIDANCE__
 Keep `environments/command_probe.py` project-owned and bounded; do not replace it with an
 import from Cayu's private modules or an unbounded subprocess helper.
 
@@ -2166,7 +2215,7 @@ _AUTHORING_STATE: str | None = None
 PRIMARY_EXECUTION_PROFILE_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_coding_primary",
     behavior_version="2",
-    implementation_version="1",
+    implementation_version="1-__CODING_PROFILE__",
 )
 
 AGENT = AgentSpec(
@@ -2845,7 +2894,7 @@ _CHECK_COMMAND_POLICY_IDENTITY = ExecutionProfileBehaviorIdentity(
 _DOCKER_ENVIRONMENT_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_coding.environment",
     behavior_version="9",
-    implementation_version="1",
+    implementation_version="1-__CODING_PROFILE__",
 )
 _DOCKER_BINDING_IDENTITY = ExecutionProfileBehaviorIdentity(
     name="__PROJECT_NAME__.docker_coding.binding",
@@ -3254,10 +3303,16 @@ def build_coding_composition(
     selected_session_store = stores.session_store
     selected_task_store = stores.task_store
     selected_knowledge_store = stores.knowledge_store
-    bound_scope = selected_knowledge_store.bound_access_scope()
-    selected_scope = _require_coding_knowledge_scope(
-        scope if bound_scope is None else bound_scope
-    )
+    selected_scope = None
+    if selected_knowledge_store is not None:
+        if scope is None:
+            raise RuntimeError(
+                "coding knowledge_store injection requires the knowledge capability"
+            )
+        bound_scope = selected_knowledge_store.bound_access_scope()
+        selected_scope = _require_coding_knowledge_scope(
+            scope if bound_scope is None else bound_scope
+        )
     selected_artifact_store = (
         artifact_store
         if artifact_store is not None
@@ -3268,7 +3323,10 @@ def build_coding_composition(
         artifact_store=selected_artifact_store,
         knowledge_store=selected_knowledge_store,
         scope=selected_scope,
-        generated_stores=artifact_store is None and stores.generated_knowledge_store,
+        generated_stores=(
+            artifact_store is None
+            and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
+        ),
     )
     checks = _named_checks(toolchain_profile)
     check_names = tuple(check.name for check in checks)
@@ -3312,7 +3370,7 @@ def build_coding_composition(
         task_store=selected_task_store,
         knowledge_store=selected_knowledge_store,
         knowledge_access_scope=selected_scope,
-        knowledge_review_namespace="default",
+        knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -3340,7 +3398,7 @@ def build_coding_composition(
         default=True,
     )
     background_registry = BackgroundSubagentTaskRegistry()
-    tools = (
+    tools = [
         ListFilesTool(),
         SearchTextTool(
             exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
@@ -3355,47 +3413,56 @@ def build_coding_composition(
         check_tool,
         command_tool,
         ListArtifactsTool(),
-        ListKnowledgeTool(),
-        SearchKnowledgeTool(),
-        ReadKnowledgeTool(),
-        RememberKnowledgeTool(),
-        SubagentTool(
-            app,
-            agents={
-                _REVIEWER_ALIAS: SubagentSpec(
-                    agent_name=reviewer_agent.name,
-                    description="Review a bounded change and return concrete findings.",
-                    mode=SubagentExecutionMode.BACKGROUND,
-                    max_steps=REVIEWER_MAX_STEPS,
-                    result_max_chars=4_000,
-                    limits=RunLimits(
-                        max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
-                        max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
-                    ),
-                )
-            },
-            background_registry=background_registry,
-            execution_profile_identity=_subagent_tool_identity(
-                reviewer_agent,
-                reviewer_execution_profile_identity,
-                generated_session_store=generated_session_store,
+    ]
+    if _KNOWLEDGE_ENABLED:
+        tools.extend(
+            (
+                ListKnowledgeTool(),
+                SearchKnowledgeTool(),
+                ReadKnowledgeTool(),
+                RememberKnowledgeTool(),
+            )
+        )
+    tools.extend(
+        (
+            SubagentTool(
+                app,
+                agents={
+                    _REVIEWER_ALIAS: SubagentSpec(
+                        agent_name=reviewer_agent.name,
+                        description="Review a bounded change and return concrete findings.",
+                        mode=SubagentExecutionMode.BACKGROUND,
+                        max_steps=REVIEWER_MAX_STEPS,
+                        result_max_chars=4_000,
+                        limits=RunLimits(
+                            max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
+                            max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
+                        ),
+                    )
+                },
+                background_registry=background_registry,
+                execution_profile_identity=_subagent_tool_identity(
+                    reviewer_agent,
+                    reviewer_execution_profile_identity,
+                    generated_session_store=generated_session_store,
+                ),
             ),
-        ),
-        SubagentResultTool(
-            app.session_store,
-            background_registry=background_registry,
-            default_timeout_s=30,
-            execution_profile_identity=(
-                _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+            SubagentResultTool(
+                app.session_store,
+                background_registry=background_registry,
+                default_timeout_s=30,
+                execution_profile_identity=(
+                    _SUBAGENT_RESULT_TOOL_IDENTITY if generated_session_store else None
+                ),
             ),
-        ),
-        UserInputTool(),
+            UserInputTool(),
+        )
     )
     register_coding_agents(
         app,
         primary_agent=primary_agent,
         reviewer_agent=reviewer_agent,
-        tools=require_coding_tool_inventory(tools, docker=True),
+        tools=require_coding_tool_inventory(tuple(tools), docker=True),
         tool_policy=require_coding_tool_policy(
             StructuredCommandToolPolicy(
                 toolchain_profile=toolchain_profile,
@@ -4524,6 +4591,100 @@ async def _collect(events):
 '''
 
 
+_REDUCED_SMOKE_TEST_PY = '''"""Credential-free proof for a reduced coding profile."""
+
+import asyncio
+import subprocess
+from pathlib import Path
+
+from cayu import (
+    InMemorySessionStore,
+    InMemoryTaskStore,
+    Message,
+    ModelStreamEvent,
+    RunRequest,
+    ScriptedModelProvider,
+    run_to_completion,
+)
+
+from app import build_app
+from operations import coding as composition
+
+_KNOWLEDGE_TOOL_NAMES = {
+    "list_knowledge",
+    "search_knowledge",
+    "read_knowledge",
+    "remember_knowledge",
+}
+
+
+def test_reduced_coding_profile_matches_the_declared_capabilities(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(composition, "_STATE_ROOT", tmp_path / "state")
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta("Reduced coding profile is runnable."),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = build_app(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+        workspace_root=workspace,
+    )
+
+    manifest = app.describe()
+    assert manifest.stores.knowledge is None
+    assert manifest.environments[0].knowledge_store is None
+    primary = next(
+        agent for agent in manifest.agents if agent.name == "__AGENT_NAME__"
+    )
+    assert _KNOWLEDGE_TOOL_NAMES.isdisjoint(tool.name for tool in primary.tools)
+
+    outcome = asyncio.run(
+        run_to_completion(
+            app,
+            RunRequest(
+                agent_name="__AGENT_NAME__",
+                messages=[Message.text("user", "Confirm the reduced profile.")],
+            ),
+        )
+    )
+    assert outcome.ok
+    assert outcome.final_text == "Reduced coding profile is runnable."
+'''
+
+
+_REDUCED_DOCKER_SMOKE_TEST_PY = '''"""Credential-free proof for a reduced Docker coding profile."""
+
+from operations import coding as composition
+from tools.coding import DOCKER_TOOL_NAMES
+
+_KNOWLEDGE_TOOL_NAMES = {
+    "list_knowledge",
+    "search_knowledge",
+    "read_knowledge",
+    "remember_knowledge",
+}
+
+
+def test_reduced_docker_profile_matches_the_declared_capabilities() -> None:
+    assert composition._KNOWLEDGE_ENABLED is False
+    assert _KNOWLEDGE_TOOL_NAMES.isdisjoint(DOCKER_TOOL_NAMES)
+'''
+
+
 _SMOKE_TEST_PY = r'''"""Credential-free smoke proof for the maintained coding composition."""
 
 from __future__ import annotations
@@ -5583,13 +5744,15 @@ def _docker_composition_source(source: str) -> str:
         1,
     )
     source = source.replace(
-        '            "remember_knowledge": (RequiredFieldRule("text"),),\n',
+        "    if _KNOWLEDGE_ENABLED:\n",
         (
-            '            "remember_knowledge": (RequiredFieldRule("text"),),\n'
-            '            "run_check": (RequiredAllowlistRule("check", values=list(check_names)),),\n'
-            '            "run_command": (\n'
-            '                RequiredAllowlistRule("selector", values=list(command_selectors)),\n'
-            "            ),\n"
+            '    rules["run_check"] = (\n'
+            '        RequiredAllowlistRule("check", values=list(check_names)),\n'
+            "    )\n"
+            '    rules["run_command"] = (\n'
+            '        RequiredAllowlistRule("selector", values=list(command_selectors)),\n'
+            "    )\n"
+            "    if _KNOWLEDGE_ENABLED:\n"
         ),
         1,
     )
@@ -5651,6 +5814,7 @@ def coding_project_files(
     toolchain: str | None = None,
     command_authority: str | None = None,
     database: str = "sqlite",
+    capabilities: tuple[str, ...] = (),
 ) -> dict[str, str]:
     """Return the explicit overlay for the opt-in coding composition."""
 
@@ -5666,6 +5830,67 @@ def coding_project_files(
         raise ValueError("coding command authority must be 'structured' or omitted.")
     if database not in {"sqlite", "postgres"}:
         raise ValueError("coding database must be 'sqlite' or 'postgres'.")
+
+    selected = frozenset(capabilities)
+    coding_profile = "-".join(sorted(selected)) or "minimal"
+
+    def coding_render(template: str) -> str:
+        configured = (
+            template.replace(
+                "__CODING_KNOWLEDGE_ENABLED__",
+                repr("knowledge" in selected),
+            )
+            .replace("__CODING_PROFILE__", coding_profile)
+            .replace(
+                "__CODING_KNOWLEDGE_PROMPT__",
+                (
+                    " Durable knowledge writes are proposals pending review."
+                    if "knowledge" in selected
+                    else ""
+                ),
+            )
+            .replace(
+                "__CODING_KNOWLEDGE_TOOL_NAMES__",
+                (
+                    '    "list_knowledge",\n'
+                    '    "search_knowledge",\n'
+                    '    "read_knowledge",\n'
+                    '    "remember_knowledge",\n'
+                    if "knowledge" in selected
+                    else ""
+                ),
+            )
+            .replace(
+                "__CODING_KNOWLEDGE_SUMMARY__",
+                (
+                    "reviewed durable knowledge"
+                    if "knowledge" in selected
+                    else "no configured knowledge store or tools"
+                ),
+            )
+            .replace(
+                "__CODING_KNOWLEDGE_REVIEW_GUIDANCE__",
+                (
+                    " Knowledge writes remain pending until a human reviews them."
+                    if "knowledge" in selected
+                    else "\nKnowledge is not configured in this profile."
+                ),
+            )
+            .replace(
+                "__CODING_KNOWLEDGE_POLICY_PHRASE__",
+                " pending knowledge review," if "knowledge" in selected else "",
+            )
+            .replace(
+                "__CODING_KNOWLEDGE_AGENT_GUIDANCE__",
+                (
+                    ""
+                    if "knowledge" in selected
+                    else "\nDo not assume knowledge storage or knowledge tools are configured."
+                ),
+            )
+        )
+        return render(configured)
+
     coding_storage = (
         _POSTGRES_CODING_STORAGE_PY if database == "postgres" else _SQLITE_CODING_STORAGE_PY
     )
@@ -5675,20 +5900,22 @@ def coding_project_files(
             "app.py": _coding_app_source(files["app.py"]),
             "composition.py": _CODING_COMPOSITION_COMPAT_PY,
             "configuration/coding_storage.py": coding_storage,
-            "environments/command_probe.py": render(_COMMAND_PROBE_PY),
+            "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
             "environments/coding.py": _CODING_ENVIRONMENT_PY,
-            "operations/coding.py": render(_COMPOSITION_PY),
+            "operations/coding.py": coding_render(_COMPOSITION_PY),
             "operations/delegation.py": _CODING_DELEGATION_PY,
             "knowledge/coding.py": _CODING_KNOWLEDGE_PY,
             "policies/coding.py": _CODING_POLICY_PY,
-            "tools/coding.py": _CODING_TOOLS_PY,
-            "prompts/coding.py": _CODING_PROMPTS_PY,
-            "agents/agent.py": render(_PRIMARY_AGENT_PY),
-            "agents/reviewer.py": render(_REVIEWER_AGENT_PY),
+            "tools/coding.py": coding_render(_CODING_TOOLS_PY),
+            "prompts/coding.py": coding_render(_CODING_PROMPTS_PY),
+            "agents/agent.py": coding_render(_PRIMARY_AGENT_PY),
+            "agents/reviewer.py": coding_render(_REVIEWER_AGENT_PY),
             "agents/registration.py": _CODING_AGENT_REGISTRATION_PY,
-            "tests/test_coding_composition.py": render(_SMOKE_TEST_PY),
-            "README.md": _coding_readme_source(files["README.md"]) + render(_README_APPEND),
-            "AGENTS.md": _coding_agents_source(files["AGENTS.md"]) + render(_AGENTS_APPEND),
+            "tests/test_coding_composition.py": coding_render(
+                _SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_SMOKE_TEST_PY
+            ),
+            "README.md": _coding_readme_source(files["README.md"]) + coding_render(_README_APPEND),
+            "AGENTS.md": _coding_agents_source(files["AGENTS.md"]) + coding_render(_AGENTS_APPEND),
         }
 
     pyproject = files["pyproject.toml"].replace(
@@ -5706,36 +5933,38 @@ def coding_project_files(
         ".gitignore": files[".gitignore"],
         ".dockerignore": _DOCKERIGNORE,
         "Dockerfile.coding": _DOCKERFILE,
-        "docker-coding-build.json": render(_DOCKER_BUILD_CONFIG),
-        "docker-coding-image.json": render(_DOCKER_IMAGE_CONFIG),
-        "build_coding_image.py": render(_DOCKER_BUILD_IMAGE_PY),
+        "docker-coding-build.json": coding_render(_DOCKER_BUILD_CONFIG),
+        "docker-coding-image.json": coding_render(_DOCKER_IMAGE_CONFIG),
+        "build_coding_image.py": coding_render(_DOCKER_BUILD_IMAGE_PY),
         "app.py": _docker_coding_app_source(files["app.py"]),
         "composition.py": _DOCKER_CODING_COMPOSITION_COMPAT_PY,
         "configuration/coding_storage.py": coding_storage,
-        "environments/command_probe.py": render(_COMMAND_PROBE_PY),
+        "environments/command_probe.py": coding_render(_COMMAND_PROBE_PY),
         "environments/coding.py": _CODING_ENVIRONMENT_PY,
-        "operations/coding.py": render(_docker_composition_source(_COMPOSITION_PY)),
+        "operations/coding.py": coding_render(_docker_composition_source(_COMPOSITION_PY)),
         "domain/coding_product.py": _CODING_PRODUCT_DOMAIN_PY,
         "workflows/coding_product.py": _CODING_PRODUCT_WORKFLOW_PY,
         "operations/delegation.py": _CODING_DELEGATION_PY,
         "knowledge/coding.py": _CODING_KNOWLEDGE_PY,
         "policies/coding.py": _CODING_POLICY_PY,
-        "tools/coding.py": _CODING_TOOLS_PY,
-        "prompts/coding.py": _DOCKER_CODING_PROMPTS_PY,
-        "agents/agent.py": render(_DOCKER_PRIMARY_AGENT_PY),
-        "agents/reviewer.py": render(_REVIEWER_AGENT_PY),
+        "tools/coding.py": coding_render(_CODING_TOOLS_PY),
+        "prompts/coding.py": coding_render(_DOCKER_CODING_PROMPTS_PY),
+        "agents/agent.py": coding_render(_DOCKER_PRIMARY_AGENT_PY),
+        "agents/reviewer.py": coding_render(_REVIEWER_AGENT_PY),
         "agents/registration.py": _CODING_AGENT_REGISTRATION_PY,
-        "tests/test_coding_composition.py": render(_DOCKER_SMOKE_TEST_PY),
+        "tests/test_coding_composition.py": coding_render(
+            _DOCKER_SMOKE_TEST_PY if "knowledge" in selected else _REDUCED_DOCKER_SMOKE_TEST_PY
+        ),
         "tests/test_project.py": _DOCKER_PROJECT_TEST_PY,
         "pyproject.toml": pyproject,
         "README.md": (
             _coding_readme_source(files["README.md"])
-            + render(_README_APPEND)
-            + render(_DOCKER_README_APPEND)
+            + coding_render(_README_APPEND)
+            + coding_render(_DOCKER_README_APPEND)
         ),
         "AGENTS.md": (
             _coding_agents_source(files["AGENTS.md"])
-            + render(_AGENTS_APPEND)
-            + render(_DOCKER_AGENTS_APPEND)
+            + coding_render(_AGENTS_APPEND)
+            + coding_render(_DOCKER_AGENTS_APPEND)
         ),
     }

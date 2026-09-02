@@ -21,6 +21,7 @@ from cayu import (
     DockerCodingEnvironmentFactory,
     DockerImageIdentity,
     EvalStatus,
+    InMemoryKnowledgeStore,
     InMemorySessionStore,
     InMemoryTaskStore,
     LocalWorkspace,
@@ -166,15 +167,45 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
         provider=ScriptedModelProvider([]),
         session_store=session_store,
         task_store=task_store,
+        knowledge_store=InMemoryKnowledgeStore(),
     )
     second_app = module.build_app(
         provider=ScriptedModelProvider([]),
         session_store=InMemorySessionStore(),
         task_store=InMemoryTaskStore(),
+        knowledge_store=InMemoryKnowledgeStore(),
     )
     assert first_app is not second_app
     assert first_app.session_store is session_store
     assert first_app.task_store is task_store
+    manifest = first_app.describe()
+    assert manifest.stores.knowledge == "InMemoryKnowledgeStore"
+    assert manifest.runtime.request_footprint.fingerprinting_enabled is True
+    assert manifest.runtime.request_footprint.fingerprint_key_id == "standard-local-v1"
+    agent = manifest.agents[0]
+    assert agent.context_policy == "AutomaticRecallContextPolicy"
+    assert agent.tool_policy == "ParameterConstrainedToolPolicy"
+    assert {tool.name for tool in agent.tools} == {
+        "ask_user",
+        "list_artifacts",
+        "list_knowledge",
+        "read_knowledge",
+        "remember_knowledge",
+        "search_knowledge",
+    }
+    assert next(
+        tool for tool in agent.tools if tool.name == "remember_knowledge"
+    ).policy_coverage == ("conditional")
+    environment = manifest.environments[0]
+    assert environment.artifact_store == "LocalArtifactStore"
+    assert environment.knowledge_store == "InMemoryKnowledgeStore"
+    assert environment.runner is None
+    assert environment.vault is None
+    assert environment.mcp_servers == ()
+    memory_key = proj / "data" / "memory-evidence.key"
+    assert len(memory_key.read_text(encoding="utf-8").strip().encode("utf-8")) >= 32
+    if os.name != "nt":
+        assert memory_key.stat().st_mode & 0o777 == 0o600
 
     app_source = (proj / "app.py").read_text(encoding="utf-8")
     configuration_source = (proj / "configuration/settings.py").read_text(encoding="utf-8")
@@ -1758,6 +1789,57 @@ def test_scaffolded_credential_free_proof_ignores_live_provider_selection(
     assert json.loads(eval_result.stdout)["status"] == "passed"
 
 
+def test_standard_scaffold_inspect_and_check_are_credential_free(
+    tmp_path: Path,
+) -> None:
+    assert main(["new", "standard", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "standard"
+    environment = os.environ.copy()
+    for name in (
+        "CAYU_PROVIDER",
+        "CAYU_MODEL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CAYU_MEMORY_EVIDENCE_KEY",
+    ):
+        environment.pop(name, None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+
+    inspected = subprocess.run(
+        [sys.executable, "-m", "cayu", "inspect", "--json"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert inspected.returncode == 0, inspected.stdout + inspected.stderr
+    manifest = json.loads(inspected.stdout)
+    assert manifest["stores"]["knowledge"] == "SQLiteKnowledgeStore"
+    assert manifest["runtime"]["request_footprint"]["fingerprinting_enabled"] is True
+    assert manifest["agents"][0]["context_policy"] == "AutomaticRecallContextPolicy"
+
+    checked = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cayu",
+            "check",
+            "--fail-on",
+            "warning",
+            "--json",
+        ],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert json.loads(checked.stdout)["diagnostics"] == []
+
+
 def test_python_m_cayu_routes_to_the_cli() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "cayu", "version"],
@@ -1878,6 +1960,28 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert (project / "evals" / "agent.py").is_file()
     assert (project / "workflows" / "__init__.py").is_file()
     assert (project / "memory" / "context.py").is_file()
+    capability_cards = (
+        "knowledge/CAPABILITY.md",
+        "memory/CAPABILITY.md",
+        "environments/ARTIFACTS.md",
+        "operations/TASKS.md",
+        "operations/HUMAN_INPUT.md",
+        "operations/APPROVALS.md",
+        "operations/RECOVERY.md",
+        "evals/CAPABILITY.md",
+        "observability/CAPABILITY.md",
+    )
+    for relative in capability_cards:
+        card = (project / relative).read_text(encoding="utf-8")
+        for heading in (
+            "**Behavior:**",
+            "**Use it when:**",
+            "**Project state:**",
+            "**Restricted/unavailable:**",
+            "**Explicit seam:**",
+            "**Verify:**",
+        ):
+            assert heading in card
 
     app_source = (project / "app.py").read_text(encoding="utf-8")
     assert "ExecCommandTool" not in app_source
@@ -1893,6 +1997,20 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "ToolCalled" not in eval_source
 
     instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    for capability in (
+        "approvals",
+        "artifacts",
+        "evals",
+        "human-input",
+        "knowledge",
+        "memory",
+        "observability",
+        "recovery",
+        "tasks",
+    ):
+        assert f"| `{capability}` | configured |" in readme
+        assert f"| `{capability}` | configured |" in instructions
     assert "uv run --no-sync cayu guide anatomy" in instructions
     assert "uv run --no-sync cayu inspect --json" in instructions
     assert "uv run --no-sync cayu check --fail-on warning --json" in instructions
@@ -1907,7 +2025,8 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "Client-IP and forwarded-header checks are not authentication" in instructions
     assert "cayu eval run evals.agent:build_eval" not in instructions
     assert "Edit the existing agent, test, and eval" in instructions
-    assert "Tools are optional" in instructions
+    assert "safe local tools are" in instructions
+    assert "explicitly registered and exposed" in instructions
     assert "uv run --no-sync cayu guide authoring#cayu-map" in instructions
     assert "uv run --no-sync cayu guide references" in instructions
     assert "github.com" not in instructions
