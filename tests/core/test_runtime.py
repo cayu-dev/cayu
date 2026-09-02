@@ -50,7 +50,13 @@ import cayu.runtime.context as runtime_context_module
 import cayu.runtime.execution_profiles as execution_profiles_module
 import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
-from cayu._exception_groups import iter_exception_tree
+from cayu._exception_groups import (
+    exception_cause,
+    exception_context,
+    exception_group_children,
+    exception_suppresses_context,
+    iter_exception_tree,
+)
 from cayu._validation import canonical_durable_json_bytes
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -228,6 +234,7 @@ from cayu.runtime import (
     StructuredOutputSpec,
     TaintAwareToolPolicy,
     TargetedToolGrant,
+    TaskClaimLost,
     TaskCreate,
     TaskStatus,
     TaskTerminalizationRequest,
@@ -804,8 +811,12 @@ class FailingOrdinaryToolResultCloseStore(InMemorySessionStore):
 class FailingAfterPendingToolRoundCheckpointStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        *,
+        ownership_clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        super().__init__(ownership_clock=ownership_clock)
         self.failed_pending_tool_round_once = False
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
@@ -1512,6 +1523,32 @@ def _without_request_evidence(events: list[Event]) -> list[Event]:
         EventType.TOOL_EXPOSURE_RECORDED,
     }
     return [event for event in events if event.type not in request_evidence_types]
+
+
+def _runtime_exception_graph(error: BaseException) -> list[BaseException]:
+    """Collect one runtime-owned exception graph, including explicit causes."""
+
+    pending = [error]
+    collected: list[BaseException] = []
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        collected.append(candidate)
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(children)
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+        elif not exception_suppresses_context(candidate):
+            context = exception_context(candidate)
+            if context is not None:
+                pending.append(context)
+    return collected
 
 
 def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
@@ -5585,6 +5622,7 @@ def test_cayu_app_environment_factory_failure_fails_worker_claimed_task(tmp_path
                 session_id="sess_factory_claim_failure",
                 task_id=task.id,
                 task_worker_id="worker_a",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "run")],
             ),
         )
@@ -17798,12 +17836,13 @@ def test_prompt_anatomy_fork_rejects_live_source_before_effects(
 
 
 def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
-    store = InMemorySessionStore()
-    now = datetime(2026, 1, 1, tzinfo=UTC)
+    store_now = datetime(2026, 1, 1, tzinfo=UTC)
+    worker_now = datetime(2100, 1, 1, tzinfo=UTC)
+    store = InMemorySessionStore(ownership_clock=lambda: store_now)
     app = CayuApp(
         session_store=store,
         enable_logging=False,
-        clock=lambda: now,
+        clock=lambda: worker_now,
         execution_profile_policy=_AllowForkProfileAdoption(),
     )
     app.register_provider(FakeProvider([]), default=True)
@@ -17829,8 +17868,8 @@ def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
             "incomplete_session_recovery_claim": {
                 "version": 1,
                 "claim_id": "active-recovery-owner",
-                "claimed_at": now.isoformat(),
-                "claim_expires_at": (now + timedelta(minutes=5)).isoformat(),
+                "claimed_at": store_now.isoformat(),
+                "claim_expires_at": (store_now + timedelta(minutes=5)).isoformat(),
             }
         }
         await store.checkpoint(source.id, checkpoint)
@@ -17849,6 +17888,69 @@ def test_prompt_anatomy_fork_rejects_active_recovery_before_effects() -> None:
             )
 
         assert await store.load("sess_prompt_active_recovery_child") is None
+        assert await store.load_checkpoint(source.id) == checkpoint
+
+    asyncio.run(scenario())
+
+
+def test_prompt_anatomy_fork_cannot_expire_session_operation_with_worker_clock() -> None:
+    store_now = datetime(2026, 1, 1, tzinfo=UTC)
+    worker_now = datetime(2100, 1, 1, tzinfo=UTC)
+    store = InMemorySessionStore(ownership_clock=lambda: store_now)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        clock=lambda: worker_now,
+        execution_profile_policy=_AllowForkProfileAdoption(),
+    )
+    app.register_provider(FakeProvider([]), default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="body")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model", system_prompt="current prompt")
+    )
+
+    async def scenario() -> None:
+        source = await store.create(
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                messages=[],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
+        )
+        await store.update_status(source.id, SessionStatus.COMPLETED)
+        checkpoint = {
+            "session_operations": {
+                "version": 1,
+                "active_operation_id": "active-fork-operation",
+                "records": {
+                    "active-fork-operation-key": {
+                        "operation_id": "active-fork-operation",
+                        "status": "running",
+                        "claim_expires_at": (store_now + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            }
+        }
+        await store.checkpoint(source.id, checkpoint)
+
+        with pytest.raises(RuntimeError, match="active durable operation"):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id=source.id,
+                    session_id="sess_prompt_active_operation_child",
+                    environment_name="body",
+                    copy_checkpoint=False,
+                    system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+                    **_current_fork_profile_selection("prompt-active-operation-child"),
+                ),
+            )
+
+        assert await store.load("sess_prompt_active_operation_child") is None
         assert await store.load_checkpoint(source.id) == checkpoint
 
     asyncio.run(scenario())
@@ -17951,7 +18053,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
         session_id = "sess_expired_recovery_claim_source"
         child_id = f"sess_expired_recovery_claim_child_{copy_checkpoint}"
         await store.checkpoint(session_id, {"custom_state": {"value": 1}})
-        completed = await store.update_status(session_id, SessionStatus.COMPLETED)
+        await store.update_status(session_id, SessionStatus.COMPLETED)
         stale_owner_ready = asyncio.Event()
         release_stale_owner = asyncio.Event()
 
@@ -17959,7 +18061,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
             fenced = await store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.COMPLETED},
-                inactive_before=completed.last_activity_at,
+                inactive_for_seconds=0,
             )
             assert fenced is not None
 
@@ -20231,8 +20333,19 @@ def test_pending_interruption_startup_waits_for_dead_claim_expiry(monkeypatch):
         monkeypatch.setattr(
             interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05
         )
+        monkeypatch.setattr(
+            interruption_coordinator_module,
+            "_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS",
+            0.005,
+        )
         store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            # The durable claim uses the store clock. A frozen worker clock
+            # must not prevent deferred takeover after store-owned expiry.
+            clock=lambda: datetime(2000, 1, 1, tzinfo=UTC),
+        )
         parent_id = "sess_startup_dead_claim"
         payload = {
             "reason": "operator stop",
@@ -20756,7 +20869,7 @@ def test_interruption_cascade_status_prefers_cleared_durable_marker_over_stale_d
         app._session_engine._defer_background_interruption_cascade(
             parent_session_id=parent_id,
             interrupt_payload=payload,
-            retry_at=datetime.now(UTC) + timedelta(seconds=30),
+            retry_after_seconds=30,
             drain_required=False,
             retry_request=None,
         )
@@ -20857,6 +20970,243 @@ def test_background_interruption_heartbeat_retries_transient_store_error(monkeyp
     assert drained is True
     assert renew_attempts >= 2
     assert "pending_interruption_cascade" not in checkpoint
+
+
+def test_background_interruption_does_not_start_after_claim_acknowledgement_expiry(
+    monkeypatch,
+):
+    async def run():
+        monkeypatch.setattr(
+            interruption_coordinator_module,
+            "_BACKGROUND_INTERRUPTION_LEASE_SECONDS",
+            0.05,
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module,
+            "_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS",
+            0.01,
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_delayed_interruption_claim_ack"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        coordinator = app._background_interruption_coordinator
+        original_claim = coordinator._claim_pending_interruption_cascade
+        claimed_run_started = False
+        deferred: list[dict[str, Any]] = []
+
+        async def delayed_claim(*args, **kwargs):
+            marker = await original_claim(*args, **kwargs)
+            await asyncio.sleep(0.06)
+            return marker
+
+        async def record_claimed_run(_state):
+            nonlocal claimed_run_started
+            claimed_run_started = True
+
+        monkeypatch.setattr(coordinator, "_claim_pending_interruption_cascade", delayed_claim)
+        monkeypatch.setattr(
+            coordinator,
+            "_run_claimed_background_interruption_cascade",
+            record_claimed_run,
+        )
+        monkeypatch.setattr(coordinator, "defer", lambda **kwargs: deferred.append(kwargs))
+
+        await coordinator.run_cascade(
+            parent_session_id=parent_id,
+            interrupt_payload=payload,
+        )
+        return claimed_run_started, deferred, await store.load_checkpoint(parent_id)
+
+    claimed_run_started, deferred, checkpoint = asyncio.run(run())
+
+    assert claimed_run_started is False
+    assert len(deferred) == 1
+    assert "pending_interruption_cascade" in checkpoint
+
+
+def test_background_interruption_heartbeat_loses_claim_with_frozen_worker_clock(
+    monkeypatch,
+):
+    async def run():
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS", 0.01
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module,
+            "_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS",
+            0.005,
+        )
+        store = InMemorySessionStore()
+        fixed_now = datetime(2000, 1, 1, tzinfo=UTC)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            clock=lambda: fixed_now,
+        )
+        parent_id = "sess_frozen_worker_heartbeat_parent"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+        renew_attempts = 0
+
+        async def unavailable_renew(*_args):
+            nonlocal renew_attempts
+            renew_attempts += 1
+            raise RuntimeError("store unavailable")
+
+        claim_lost = asyncio.Event()
+
+        async def wait_for_claim_loss(state):
+            await state.claim_lost.wait()
+            claim_lost.set()
+
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_renew_pending_interruption_cascade_claim",
+            unavailable_renew,
+        )
+        monkeypatch.setattr(
+            app._background_interruption_coordinator,
+            "_run_claimed_background_interruption_cascade",
+            wait_for_claim_loss,
+        )
+        await asyncio.wait_for(
+            app._background_interruption_coordinator.run_cascade(
+                parent_session_id=parent_id,
+                interrupt_payload=payload,
+            ),
+            timeout=1,
+        )
+        return claim_lost.is_set(), renew_attempts, await store.load_checkpoint(parent_id)
+
+    claim_lost, renew_attempts, checkpoint = asyncio.run(run())
+
+    assert claim_lost is True
+    assert renew_attempts >= 1
+    assert "pending_interruption_cascade" in checkpoint
+
+
+def test_background_interruption_claim_loss_cancels_dispatched_child_interruption(
+    monkeypatch,
+):
+    async def run():
+        monkeypatch.setattr(
+            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module,
+            "_BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS",
+            0.01,
+        )
+        monkeypatch.setattr(
+            interruption_coordinator_module,
+            "_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS",
+            0.005,
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        parent_id = "sess_interruption_claim_loss_parent"
+        child_id = "sess_interruption_claim_loss_child"
+        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=parent_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="reviewer",
+                session_id=child_id,
+                parent_session_id=parent_id,
+                messages=[Message.text("user", "background task")],
+                metadata={"subagent": {"mode": "background"}},
+            ),
+            identity=identity,
+        )
+
+        interruption_started = asyncio.Event()
+        interruption_cancelled = asyncio.Event()
+        late_release = asyncio.Event()
+        late_effects: list[str] = []
+
+        async def blocked_interruption(request):
+            interruption_started.set()
+            try:
+                await late_release.wait()
+                late_effects.append(request.session_id)
+                yield Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=request.session_id,
+                    agent_name="reviewer",
+                )
+            except asyncio.CancelledError:
+                interruption_cancelled.set()
+                raise
+
+        async def unavailable_renew(*_args):
+            raise RuntimeError("store unavailable")
+
+        coordinator = app._background_interruption_coordinator
+        monkeypatch.setattr(coordinator, "_interrupt_session", blocked_interruption)
+        monkeypatch.setattr(
+            coordinator,
+            "_renew_pending_interruption_cascade_claim",
+            unavailable_renew,
+        )
+        cascade = asyncio.create_task(
+            coordinator.run_cascade(
+                parent_session_id=parent_id,
+                interrupt_payload={
+                    "reason": "operator stop",
+                    "metadata": {},
+                    "requested_by": None,
+                    "interruption_type": "operator_requested",
+                },
+            )
+        )
+        await asyncio.wait_for(interruption_started.wait(), timeout=1)
+        await asyncio.wait_for(interruption_cancelled.wait(), timeout=1)
+        await asyncio.wait_for(cascade, timeout=1)
+        late_release.set()
+        await asyncio.sleep(0)
+        return late_effects, await store.load_checkpoint(parent_id)
+
+    late_effects, checkpoint = asyncio.run(run())
+
+    assert late_effects == []
+    assert "pending_interruption_cascade" in checkpoint
 
 
 def test_background_interruption_concurrency_is_app_wide_across_nested_trees(monkeypatch):
@@ -21311,7 +21661,7 @@ def test_pending_interruption_cascade_resumes_from_durable_checkpoint():
         )
 
         scheduled = await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=datetime.now(UTC)
+            interrupting_inactive_for_seconds=0
         )
         drained = await app.drain_background_interruptions(timeout_s=1)
         return (
@@ -21402,9 +21752,8 @@ def test_pending_interruption_recovery_discovers_only_indexed_markers(monkeypatc
             "_schedule_background_interruption_cascade",
             record_schedule,
         )
-        cutoff = datetime.now(UTC) - timedelta(minutes=5)
         scheduled = await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=cutoff
+            interrupting_inactive_for_seconds=300
         )
         return (
             scheduled,
@@ -21421,8 +21770,8 @@ def test_pending_interruption_recovery_discovers_only_indexed_markers(monkeypatc
         SessionStatus.INTERRUPTING,
         SessionStatus.INTERRUPTED,
     ]
-    assert discovery_queries[0].last_activity_before is not None
-    assert discovery_queries[1].last_activity_before is None
+    assert discovery_queries[0].inactive_for_seconds == 300
+    assert discovery_queries[1].inactive_for_seconds is None
     assert loaded_checkpoint_ids == ["sess_indexed_interruption_cascade"]
 
 
@@ -21473,7 +21822,7 @@ def test_pending_interruption_cascade_finalizes_interrupting_parent_after_restar
         )
 
         scheduled = await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=datetime.now(UTC)
+            interrupting_inactive_for_seconds=0
         )
         drained = await app.drain_background_interruptions(timeout_s=1)
         return (
@@ -21539,7 +21888,7 @@ def test_pending_interruption_restart_admits_parent_once_across_status_scans(mon
 
         monkeypatch.setattr(app._background_interruption_coordinator, "run_cascade", record_attempt)
         scheduled = await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=datetime.now(UTC)
+            interrupting_inactive_for_seconds=0
         )
         assert await app.drain_background_interruptions(timeout_s=1) is True
         return scheduled, attempts
@@ -21563,7 +21912,7 @@ def test_pending_interruption_restart_does_not_fence_fresh_remote_owner():
             "requested_by": None,
             "interruption_type": "operator_requested",
         }
-        created = await store.create(
+        await store.create(
             RunRequest(
                 agent_name="parent",
                 session_id=parent_id,
@@ -21584,7 +21933,7 @@ def test_pending_interruption_restart_does_not_fence_fresh_remote_owner():
         )
 
         scheduled = await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=created.last_activity_at - timedelta(seconds=1)
+            interrupting_inactive_for_seconds=1
         )
         return (
             scheduled,
@@ -21655,8 +22004,8 @@ def test_background_interruption_does_not_cross_fork_lineage():
 
 def test_interruption_cascade_generation_rejects_stale_worker_results():
     async def run():
-        store = InMemorySessionStore()
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        store = InMemorySessionStore(ownership_clock=lambda: now[0])
         app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now[0])
         session_id = "sess_cascade_generation_claim"
         payload = {
@@ -21699,6 +22048,30 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
             payload,
         )
         now[0] += timedelta(seconds=16)
+        expired_renewal = await app._renew_pending_interruption_cascade_claim(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
+        expired_failure_recorded = await app._mark_pending_interruption_cascade_failed(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
+        expired_completion = await app._complete_pending_interruption_cascade(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
+        await app._release_pending_interruption_cascade_claim(
+            session_id,
+            first["attempt_id"],
+            first["generation"],
+            first["claim_id"],
+        )
         second = await app._claim_pending_interruption_cascade(session_id, payload)
         stale_failure_recorded = await app._mark_pending_interruption_cascade_failed(
             session_id,
@@ -21739,6 +22112,9 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
             overlapping,
             renewed,
             protected_by_heartbeat,
+            expired_renewal,
+            expired_failure_recorded,
+            expired_completion,
             second,
             third,
             retry_status,
@@ -21757,6 +22133,9 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
         overlapping,
         renewed,
         protected_by_heartbeat,
+        expired_renewal,
+        expired_failure_recorded,
+        expired_completion,
         second,
         third,
         retry_status,
@@ -21774,6 +22153,9 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
     assert overlapping is None
     assert renewed is True
     assert protected_by_heartbeat is None
+    assert expired_renewal is False
+    assert expired_failure_recorded is False
+    assert expired_completion == (False, False)
     assert second["generation"] == 2
     assert third["generation"] == 3
     assert failed_status == "failed"
@@ -21784,6 +22166,59 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
     assert failed_generation_completion == (False, False)
     assert current_completion == (True, True)
     assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
+
+
+def test_interruption_cascade_lease_uses_session_store_time() -> None:
+    async def run() -> None:
+        store_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        worker_now = [datetime(2100, 1, 1, tzinfo=UTC)]
+        store = InMemorySessionStore(ownership_clock=lambda: store_now[0])
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            clock=lambda: worker_now[0],
+        )
+        session_id = "sess_cascade_store_time_claim"
+        payload = {
+            "reason": "operator stop",
+            "metadata": {},
+            "requested_by": None,
+            "interruption_type": "operator_requested",
+        }
+        await store.create(
+            RunRequest(
+                agent_name="parent",
+                session_id=session_id,
+                messages=[Message.text("user", "parent")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.checkpoint(
+            session_id,
+            {
+                "pending_interruption_cascade": {
+                    "attempt_id": "cascade-store-time-attempt",
+                    "interrupt_payload": payload,
+                }
+            },
+        )
+
+        first = await app._claim_pending_interruption_cascade(session_id, payload)
+        assert first is not None
+        assert first["created_at"] == store_now[0].isoformat()
+        assert await app.interruption_cascade_status(session_id) == "pending"
+
+        worker_now[0] += timedelta(days=3650)
+        assert await app._claim_pending_interruption_cascade(session_id, payload) is None
+        assert await app.interruption_cascade_status(session_id) == "pending"
+
+        store_now[0] += timedelta(minutes=5)
+        replacement = await app._claim_pending_interruption_cascade(session_id, payload)
+        assert replacement is not None
+        assert replacement["generation"] == first["generation"] + 1
+        assert datetime.fromisoformat(replacement["claim_expires_at"]) > store_now[0]
+
+    asyncio.run(run())
 
 
 def test_interruption_cascade_completion_publish_failure_keeps_retryable_marker(monkeypatch):
@@ -21989,7 +22424,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         )
         await store._publish_completion_result_event_publication(
             session_id,
-            checkpoint_transform=lambda _session, checkpoint: (
+            checkpoint_transform=lambda _session, checkpoint, store_now: (
                 _reserve_completion_result_event_publication(
                     checkpoint,
                     publication_id=(
@@ -21998,7 +22433,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
                     authority_sha256=current_publication_digest,
                     owner_id=current_owner_id,
                     owner_expires_at=owner_expiry,
-                    now=datetime.now(UTC),
+                    now=store_now,
                 )
             ),
             events=[],
@@ -22023,7 +22458,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         await app._session_engine._clear_pending_interruption_cascade(session_id)
         await store._publish_completion_result_event_publication(
             session_id,
-            checkpoint_transform=lambda _session, checkpoint: {
+            checkpoint_transform=lambda _session, checkpoint, _store_now: {
                 key: value
                 for key, value in (checkpoint or {}).items()
                 if key
@@ -22154,14 +22589,14 @@ def test_fork_does_not_inherit_source_result_event_publication_reservation() -> 
         )
         await store._publish_completion_result_event_publication(
             source_session_id,
-            checkpoint_transform=lambda _session, checkpoint: (
+            checkpoint_transform=lambda _session, checkpoint, store_now: (
                 _reserve_completion_result_event_publication(
                     checkpoint,
                     publication_id=publication_id,
                     authority_sha256=authority_sha256,
                     owner_id=owner_id,
                     owner_expires_at=owner_expiry,
-                    now=datetime.now(UTC),
+                    now=store_now,
                 )
             ),
             events=[],
@@ -22761,7 +23196,8 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             **kwargs,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
@@ -22769,6 +23205,7 @@ def test_subagent_tool_interrupts_child_session_during_startup_window():
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 **kwargs,
             )
             if (
@@ -26040,6 +26477,7 @@ def test_cayu_app_links_claimed_task_to_successful_run():
                 session_id="sess_task_claimed_success",
                 task_id="task_runtime_claimed_success",
                 task_worker_id="worker_a",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "hi")],
             ),
         )
@@ -26066,6 +26504,49 @@ def test_cayu_app_links_claimed_task_to_successful_run():
     assert events[1].payload["task_id"] == PRIVATE_EVENT_AUTHORITY
 
 
+def test_cayu_app_rejects_stale_same_worker_lease_before_provider_dispatch() -> None:
+    ownership_time = [datetime(2026, 1, 1, tzinfo=UTC)]
+    session_store = InMemorySessionStore()
+    task_store = InMemoryTaskStore(ownership_clock=lambda: ownership_time[0])
+    provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+
+    async def run_task_session() -> None:
+        await task_store.create_task(
+            TaskCreate(task_id="task_runtime_stale_same_worker", type="respond")
+        )
+        stale = await task_store.claim_task("shared-worker", lease_seconds=10)
+        assert stale is not None
+        assert stale.lease_expires_at is not None
+        ownership_time[0] += timedelta(seconds=10)
+        assert [task.id for task in await task_store.reclaim_expired()] == [stale.id]
+        successor = await task_store.claim_task("shared-worker", lease_seconds=300)
+        assert successor is not None
+        assert successor.lease_expires_at != stale.lease_expires_at
+
+        app = CayuApp(session_store=session_store, task_store=task_store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_task_stale_same_worker",
+                task_id=stale.id,
+                task_worker_id="shared-worker",
+                task_lease_expires_at=stale.lease_expires_at,
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        assert EventType.TASK_STARTED not in {event.type for event in events}
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].payload["error_type"] == TaskClaimLost.__name__
+        assert provider.requests == []
+        assert await task_store.load_task(stale.id) == successor
+
+    asyncio.run(run_task_session())
+
+
 def test_cayu_app_reconciles_claimed_task_completion_acknowledgement_loss():
     class CommitThenRaiseTaskStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
@@ -26090,7 +26571,8 @@ def test_cayu_app_reconciles_claimed_task_completion_acknowledgement_loss():
 
     async def run_task_session() -> tuple[list[Event], object]:
         await task_store.create_task(TaskCreate(task_id="task_ack_loss", type="respond"))
-        assert await task_store.claim_task("worker_a", lease_seconds=300) is not None
+        claimed = await task_store.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
         app = CayuApp(session_store=session_store, task_store=task_store)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -26102,6 +26584,7 @@ def test_cayu_app_reconciles_claimed_task_completion_acknowledgement_loss():
                 session_id="sess_task_ack_loss",
                 task_id="task_ack_loss",
                 task_worker_id="worker_a",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "hi")],
             ),
         )
@@ -26197,7 +26680,8 @@ def test_cayu_app_reconciles_claimed_task_failure_acknowledgement_loss():
 
     async def run_task_session() -> tuple[list[Event], object]:
         await task_store.create_task(TaskCreate(task_id="task_failure_ack", type="respond"))
-        assert await task_store.claim_task("worker_a", lease_seconds=300) is not None
+        claimed = await task_store.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
         app = CayuApp(session_store=session_store, task_store=task_store)
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -26209,6 +26693,7 @@ def test_cayu_app_reconciles_claimed_task_failure_acknowledgement_loss():
                 session_id="sess_task_failure_ack",
                 task_id="task_failure_ack",
                 task_worker_id="worker_a",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "hi")],
             ),
         )
@@ -29370,7 +29855,8 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt(
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
@@ -29378,6 +29864,7 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt(
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             if (
@@ -30353,7 +30840,15 @@ def test_cayu_app_recover_tool_round_athrow_preserves_cleanup_failure() -> None:
     asyncio.run(scenario())
 
 
-def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fence():
+@pytest.mark.parametrize(
+    "expire_acknowledgement",
+    [False, True],
+    ids=["live-claim", "expired-claim"],
+)
+def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_preserves_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    expire_acknowledgement: bool,
+):
     class BlockingRecoveryTransitionStore(FailingTerminalToolEventStore):
         invocation_lifecycle_command_version = 1
 
@@ -30368,7 +30863,8 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
@@ -30376,6 +30872,7 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             if to_status == SessionStatus.RUNNING and SessionStatus.FAILED in from_statuses:
@@ -30420,6 +30917,26 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
         assert checkpoint is not None
         round_id = checkpoint["pending_tool_round"]["tool_round_id"]
         releases_before_recovery = store.release_calls
+        if expire_acknowledgement:
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
+                timedelta(seconds=1),
+            )
+            cleanup_failure = RuntimeError("expired recovery claim cleanup failed")
+            original_release = app._recovery_coordinator._release_incomplete_recovery_claim
+
+            async def release_then_fail(session_id: str, claim_id: str) -> None:
+                await original_release(session_id, claim_id)
+                raise cleanup_failure
+
+            monkeypatch.setattr(
+                app._recovery_coordinator,
+                "_release_incomplete_recovery_claim",
+                release_then_fail,
+            )
+        else:
+            cleanup_failure = None
 
         recovery_task = asyncio.create_task(
             collect_tool_round_recovery_events(
@@ -30435,21 +30952,42 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_releases_fe
         )
         await asyncio.wait_for(store.recovery_transition_committed.wait(), timeout=5)
         recovery_task.cancel("cancel committed manual recovery claim")
+        assert recovery_task.cancelling() == 1
+        if expire_acknowledgement:
+            await asyncio.sleep(1.05)
         store.allow_recovery_transition_return.set()
         with pytest.raises(asyncio.CancelledError) as cancellation:
             await recovery_task
         assert cancellation.value.args == ("cancel committed manual recovery claim",)
+        assert recovery_task.cancelled() is True
+        if expire_acknowledgement:
+            failure_graph = _runtime_exception_graph(cancellation.value)
+            assert cleanup_failure is not None
+            assert sum(candidate is cleanup_failure for candidate in failure_graph) == 1
+            assert (
+                sum(
+                    isinstance(candidate, RuntimeError) and "consumed its lease" in str(candidate)
+                    for candidate in failure_graph
+                )
+                == 1
+            )
 
         session = await store.load(session_id)
         assert session is not None
-        assert session.status == SessionStatus.INTERRUPTED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
         assert checkpoint["pending_tool_round"]["tool_round_id"] == round_id
+        assert "incomplete_session_recovery_claim" not in checkpoint
         events = await store.load_events(session_id)
-        assert events[-1].type == EventType.SESSION_INTERRUPTED
-        assert events[-1].payload["abandoned"] is True
-        assert store.release_calls - releases_before_recovery == 1
+        if expire_acknowledgement:
+            assert session.status == SessionStatus.RUNNING
+            assert not any(event.payload.get("manual_recovery") is True for event in events)
+            assert store.release_calls == releases_before_recovery
+        else:
+            assert session.status == SessionStatus.INTERRUPTED
+            assert events[-1].type == EventType.SESSION_INTERRUPTED
+            assert events[-1].payload["abandoned"] is True
+            assert store.release_calls - releases_before_recovery == 1
         assert tool.calls == [{}]
         assert app._session_control.has_active_tasks(session_id) is False
 
@@ -30519,7 +31057,8 @@ def test_cayu_app_recover_tool_round_reconciles_ambiguous_claim_commit() -> None
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             transitioned = await super().transition_status_and_checkpoint(
@@ -30527,6 +31066,7 @@ def test_cayu_app_recover_tool_round_reconciles_ambiguous_claim_commit() -> None
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             checkpoint = await self.load_checkpoint(session_id)
@@ -30578,7 +31118,8 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             transitioned = await super().transition_status_and_checkpoint(
@@ -30586,6 +31127,7 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             checkpoint = await super().load_checkpoint(session_id)
@@ -30645,6 +31187,200 @@ def test_cayu_app_recover_tool_round_preserves_cancellation_during_claim_reconci
         assert tool.calls == [{}]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("delayed_boundary", "expected_expired_fence_failures"),
+    [
+        ("initial_claim", 0),
+        ("interruption_fence", 1),
+    ],
+)
+def test_manual_recovery_interruption_fence_uses_its_own_lease_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    delayed_boundary: str,
+    expected_expired_fence_failures: int,
+) -> None:
+    class DelayedInterruptionFenceStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.pause_manual_claim = False
+            self.manual_claim_started = asyncio.Event()
+            self.allow_manual_claim = asyncio.Event()
+            self.operator_interrupt_committed = asyncio.Event()
+            self.interruption_fence_committed = asyncio.Event()
+            self.allow_interruption_fence_return = asyncio.Event()
+
+        async def transition_status_and_checkpoint(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
+            result_checkpoint_transform=None,
+        ) -> Session:
+            if self.pause_manual_claim and to_status == SessionStatus.RUNNING:
+                self.manual_claim_started.set()
+                await self.allow_manual_claim.wait()
+            session = await super().transition_status_and_checkpoint(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+                checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
+                result_checkpoint_transform=result_checkpoint_transform,
+            )
+            if to_status == SessionStatus.INTERRUPTING:
+                self.operator_interrupt_committed.set()
+            return session
+
+        async def fence_run_and_transform_checkpoint(self, *args, **kwargs) -> Session:
+            fenced = await super().fence_run_and_transform_checkpoint(*args, **kwargs)
+            checkpoint = await super().load_checkpoint(fenced.id)
+            marker = (
+                None if checkpoint is None else checkpoint.get("incomplete_session_recovery_claim")
+            )
+            if (
+                type(marker) is dict
+                and marker.get("operation") == "manual_tool_round_interruption_fence"
+            ):
+                self.interruption_fence_committed.set()
+                await self.allow_interruption_fence_return.wait()
+            return fenced
+
+    session_id = f"sess_tool_round_interruption_fence_{delayed_boundary}_cancelled"
+    store = DelayedInterruptionFenceStore()
+    app, store, tool, checkpoint = _crashed_tool_round_app(session_id, store=store)
+    operator_app = CayuApp(session_store=store, enable_logging=False)
+    operator_app.register_provider(FakeProvider([]), default=True)
+    operator_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    request = ToolRoundRecoveryRequest(
+        session_id=session_id,
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
+        tool_call_id="call_1",
+        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+        message="side effect verified externally",
+    )
+    real_monotonic = recovery_coordinator_module.time.monotonic
+    monotonic_offset = 0.0
+
+    class RecoveryMonotonicClock:
+        @staticmethod
+        def monotonic() -> float:
+            return real_monotonic() + monotonic_offset
+
+    monkeypatch.setattr(
+        recovery_coordinator_module,
+        "time",
+        RecoveryMonotonicClock,
+    )
+    monkeypatch.setattr(
+        recovery_coordinator_module,
+        "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
+        timedelta(seconds=30),
+    )
+
+    async def scenario() -> None:
+        nonlocal monotonic_offset
+        current = await store.load(session_id)
+        assert current is not None
+        await rebind_test_invocation(
+            store,
+            session_id,
+            target_status=SessionStatus.RUNNING,
+            checkpoint_transform=lambda session, current_checkpoint: (
+                execution_profiles_module.checkpoint_with_active_invocation_execution_profile(
+                    current_checkpoint,
+                    session_id=session.id,
+                    interaction_id=active_profile.interaction_id,
+                    run_epoch=session.run_epoch + 1,
+                    profile=active_profile.profile,
+                    expected=active_profile,
+                )
+            ),
+        )
+        await store.release_run_fence(session_id)
+        store.pause_manual_claim = True
+        recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
+        await asyncio.wait_for(store.manual_claim_started.wait(), timeout=5)
+
+        interruption_task = asyncio.create_task(
+            collect_interrupt_events(
+                operator_app,
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="operator superseded manual recovery",
+                ),
+            )
+        )
+        await asyncio.wait_for(store.operator_interrupt_committed.wait(), timeout=5)
+        recovery_task.cancel("cancel superseded manual recovery")
+        assert recovery_task.cancelling() == 1
+        if delayed_boundary == "initial_claim":
+            monotonic_offset += 31
+        store.allow_manual_claim.set()
+        await asyncio.wait_for(store.interruption_fence_committed.wait(), timeout=5)
+        if delayed_boundary == "interruption_fence":
+            monotonic_offset += 31
+        store.allow_interruption_fence_return.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await recovery_task
+        assert cancellation.value.args == ("cancel superseded manual recovery",)
+        assert recovery_task.cancelled() is True
+        failure_graph = _runtime_exception_graph(cancellation.value)
+        assert (
+            sum(
+                isinstance(candidate, RuntimeError) and "consumed its lease" in str(candidate)
+                for candidate in failure_graph
+            )
+            == expected_expired_fence_failures
+        ), [f"{type(candidate).__name__}: {candidate}" for candidate in failure_graph]
+
+        await operator_app._recovery_coordinator.finalize_abandoned_session_by_id(session_id)
+        interruption_events = await asyncio.wait_for(interruption_task, timeout=5)
+        assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
+        interrupted = await store.load(session_id)
+        assert interrupted is not None and interrupted.status == SessionStatus.INTERRUPTED
+        checkpoint_after_cancel = await store.load_checkpoint(session_id)
+        assert checkpoint_after_cancel is not None
+        assert "incomplete_session_recovery_claim" not in checkpoint_after_cancel
+        assert tool.calls == [{}]
+        assert await operator_app.drain_background_interruptions(timeout_s=1) is True
+        assert await app.drain_background_interruptions(timeout_s=1) is True
+
+    asyncio.run(scenario())
+
+
+def test_expired_recovery_claim_preserves_fatal_signal_and_existing_graph() -> None:
+    fatal_leaf = GeneratorExit("manual recovery fence aborted")
+    prior_failure = RuntimeError("fence commit acknowledgement failed")
+    fatal_signal = BaseExceptionGroup(
+        "manual recovery fence aborted",
+        [fatal_leaf, prior_failure],
+    )
+    lease_failure = recovery_coordinator_module._IncompleteRecoveryClaimLost(
+        "Incomplete-session recovery claim acknowledgement consumed its lease."
+    )
+
+    authoritative = recovery_coordinator_module._authoritative_expired_recovery_claim_failure(
+        fatal_signal,
+        lease_failure,
+    )
+    failure_graph = _runtime_exception_graph(authoritative)
+
+    assert authoritative is fatal_signal
+    assert sum(candidate is fatal_leaf for candidate in failure_graph) == 1
+    assert sum(candidate is prior_failure for candidate in failure_graph) == 1
+    assert sum(candidate is lease_failure for candidate in failure_graph) == 1
 
 
 def test_cayu_app_recover_tool_round_failed_outcome_resumes():
@@ -30926,7 +31662,8 @@ def test_cayu_app_recover_tool_round_claims_before_status_transition():
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             if self.pause_recovery_transition and to_status == SessionStatus.RUNNING:
@@ -30939,6 +31676,7 @@ def test_cayu_app_recover_tool_round_claims_before_status_transition():
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
 
@@ -31023,7 +31761,8 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             if self.pause_manual_claim and to_status == SessionStatus.RUNNING:
@@ -31034,6 +31773,7 @@ def test_operator_interrupt_wins_race_with_manual_tool_round_recovery_claim(
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             if to_status == SessionStatus.INTERRUPTING:
@@ -32433,6 +33173,164 @@ def test_cayu_app_resume_repairs_missing_initial_run_terminal_evidence() -> None
         assert lifecycle[1].event.payload["terminal_evidence_repaired"] is True
         assert "session_run_operation_id" not in lifecycle[1].event.payload
         assert "session_run_operation_id" in lifecycle[-1].event.payload
+
+    asyncio.run(scenario())
+
+
+def test_cayu_app_resume_cannot_expire_recovery_owner_with_worker_clock() -> None:
+    async def scenario() -> None:
+        store_now = datetime(2026, 1, 1, tzinfo=UTC)
+        worker_now = datetime(2100, 1, 1, tzinfo=UTC)
+        store = InMemorySessionStore(ownership_clock=lambda: store_now)
+        provider = FakeProvider([])
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            clock=lambda: worker_now,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "sess_resume_store_time_recovery_owner"
+        await store.create(
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "start")],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+                app=app,
+            ),
+        )
+        await store.append_transcript_messages(session_id, [Message.text("user", "start")])
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+            ),
+        )
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+
+        def install_live_recovery_claim(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            updated = {} if checkpoint is None else dict(checkpoint)
+            updated["incomplete_session_recovery_claim"] = {
+                "version": 1,
+                "claim_id": "store-time-owner",
+                "claimed_at": store_now.isoformat(),
+                "claim_expires_at": (store_now + timedelta(minutes=5)).isoformat(),
+            }
+            return updated
+
+        await store.transform_checkpoint(session_id, install_live_recovery_claim)
+        before = await store.load(session_id)
+        before_events = await store.load_events(session_id)
+
+        with pytest.raises(
+            RuntimeError,
+            match="active incomplete-session recovery operation",
+        ):
+            await collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "must remain fenced")],
+                ),
+            )
+
+        assert await store.load(session_id) == before
+        assert await store.load_events(session_id) == before_events
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        assert checkpoint["incomplete_session_recovery_claim"]["claim_id"] == ("store-time-owner")
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_cayu_app_resume_cannot_expire_session_operation_with_worker_clock() -> None:
+    async def scenario() -> None:
+        store_now = datetime(2026, 1, 1, tzinfo=UTC)
+        worker_now = datetime(2100, 1, 1, tzinfo=UTC)
+        store = InMemorySessionStore(ownership_clock=lambda: store_now)
+        provider = FakeProvider([])
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            clock=lambda: worker_now,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "sess_resume_store_time_session_operation"
+        await store.create(
+            run_request_with_registered_tool_ceiling(
+                app,
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "start")],
+            ),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+                app=app,
+            ),
+        )
+        await store.append_transcript_messages(session_id, [Message.text("user", "start")])
+        await store.append_event(
+            session_id,
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id=session_id,
+                agent_name="assistant",
+            ),
+        )
+        await store.update_status(session_id, SessionStatus.COMPLETED)
+
+        def install_live_operation(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            updated = {} if checkpoint is None else dict(checkpoint)
+            updated["session_operations"] = {
+                "version": 1,
+                "active_operation_id": "live-store-time-operation",
+                "records": {
+                    "live-store-time-operation-key": {
+                        "operation_id": "live-store-time-operation",
+                        "status": "running",
+                        "claim_expires_at": (store_now + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+            }
+            return updated
+
+        await store.transform_checkpoint(session_id, install_live_operation)
+        before = await store.load(session_id)
+        before_events = await store.load_events(session_id)
+
+        with pytest.raises(RuntimeError, match="active durable operation"):
+            await collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "must remain fenced")],
+                ),
+            )
+
+        assert await store.load(session_id) == before
+        assert await store.load_events(session_id) == before_events
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        operations = checkpoint["session_operations"]
+        assert operations["active_operation_id"] == "live-store-time-operation"
+        assert operations["records"]["live-store-time-operation-key"]["status"] == "running"
+        assert provider.requests == []
 
     asyncio.run(scenario())
 
@@ -33989,11 +34887,11 @@ def test_concurrent_incomplete_recovery_claims_tool_round_once() -> None:
             self.claim_fenced = asyncio.Event()
             self.allow_claim = asyncio.Event()
 
-        async def fence_run_and_transform_checkpoint(self, *args, **kwargs):
-            fenced = await super().fence_run_and_transform_checkpoint(*args, **kwargs)
+        async def reserve_stalled_run_recovery(self, *args, **kwargs):
+            reserved = await super().reserve_stalled_run_recovery(*args, **kwargs)
             self.claim_fenced.set()
             await self.allow_claim.wait()
-            return fenced
+            return reserved
 
     class RecoveryHook(RuntimeHook):
         def __init__(self) -> None:
@@ -34129,15 +35027,26 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
     class TransientHeartbeatFailureStore(FailingAfterPendingToolRoundCheckpointStore):
         invocation_lifecycle_command_version = 1
 
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(
+            self,
+            *,
+            ownership_clock: Callable[[], datetime] | None = None,
+        ) -> None:
+            super().__init__(ownership_clock=ownership_clock)
             self.fail_next_transform = False
 
-        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+        async def transform_checkpoint_with_store_time(
+            self,
+            session_id,
+            checkpoint_transform,
+        ) -> None:
             if self.fail_next_transform:
                 self.fail_next_transform = False
                 raise RuntimeError("transient recovery heartbeat failure")
-            await super().transform_checkpoint(session_id, checkpoint_transform)
+            await super().transform_checkpoint_with_store_time(
+                session_id,
+                checkpoint_transform,
+            )
 
     class BlockingRecoveryHook(RuntimeHook):
         def __init__(self) -> None:
@@ -34168,7 +35077,7 @@ def test_incomplete_recovery_renews_claim_while_hook_is_running(monkeypatch) -> 
         def clock() -> datetime:
             return current_time["value"]
 
-        store = TransientHeartbeatFailureStore()
+        store = TransientHeartbeatFailureStore(ownership_clock=clock)
         hook = BlockingRecoveryHook()
         app = CayuApp(session_store=store, enable_logging=False, clock=clock)
         app.register_provider(
@@ -34485,7 +35394,7 @@ def test_inactive_recovery_does_not_fence_local_active_work() -> None:
             result = await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id="sess_active_recovery",
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
             session = await store.load("sess_active_recovery")
@@ -34581,8 +35490,10 @@ def test_cayu_app_recover_incomplete_sessions_fetches_only_requested_limit():
 
 
 def test_cayu_app_recover_incomplete_sessions_filters_activity_before_limiting():
-    store = InMemorySessionStore()
-    app = CayuApp(session_store=store)
+    now = [datetime(2026, 1, 1, tzinfo=UTC)]
+    worker_now = [now[0] + timedelta(days=3650)]
+    store = InMemorySessionStore(ownership_clock=lambda: now[0])
+    app = CayuApp(session_store=store, clock=lambda: worker_now[0])
     app.register_provider(FakeProvider([]), default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -34595,7 +35506,16 @@ def test_cayu_app_recover_incomplete_sessions_filters_activity_before_limiting()
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
-        inactive_before = datetime.now(UTC)
+        early = await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(
+                statuses={SessionStatus.PENDING},
+                limit=1,
+                inactive_for_seconds=1,
+            )
+        )
+        assert early.results == ()
+        worker_now[0] = now[0] - timedelta(days=3650)
+        now[0] += timedelta(seconds=1)
         for index in range(1000):
             await store.create(
                 RunRequest(
@@ -34609,7 +35529,7 @@ def test_cayu_app_recover_incomplete_sessions_filters_activity_before_limiting()
             IncompleteSessionsRecoveryRequest(
                 statuses={SessionStatus.PENDING},
                 limit=1,
-                inactive_before=inactive_before,
+                inactive_for_seconds=1,
             )
         )
 
@@ -34694,7 +35614,7 @@ def test_cayu_app_recover_incomplete_sessions_skips_unregistered_agent_and_conti
         return await app.recover_incomplete_sessions(
             IncompleteSessionsRecoveryRequest(
                 statuses={SessionStatus.RUNNING, SessionStatus.PENDING},
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -37368,7 +38288,8 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             if self.block_manual_recovery_claim and to_status is SessionStatus.RUNNING:
@@ -37379,6 +38300,7 @@ def test_ordinary_tool_round_recovery_rejects_approval_owned_round_without_mutat
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
 
@@ -57714,7 +58636,8 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
@@ -57722,6 +58645,7 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             if (
@@ -58075,7 +58999,8 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             session = await super().transition_status_and_checkpoint(
@@ -58083,6 +59008,7 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             if (
@@ -58457,7 +59383,8 @@ def test_interrupt_session_persists_payload_atomically_with_interrupting_status(
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ):
             session = await super().transition_status_and_checkpoint(
@@ -58465,6 +59392,7 @@ def test_interrupt_session_persists_payload_atomically_with_interrupting_status(
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
             checkpoint = await self.load_checkpoint(session_id)
@@ -58512,7 +59440,8 @@ def test_interrupt_session_checkpoint_failure_does_not_transition_status():
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ):
             raise RuntimeError("checkpoint unavailable")
@@ -58738,7 +59667,8 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             if session_id == "sess_interrupt_transition_loser_finalizing":
@@ -58747,6 +59677,7 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
                     from_statuses=from_statuses,
                     to_status=SessionStatus.INTERRUPTING,
                     checkpoint_transform=checkpoint_transform,
+                    store_time_checkpoint_transform=store_time_checkpoint_transform,
                     result_checkpoint_transform=result_checkpoint_transform,
                 )
                 raise ValueError("lost transition")
@@ -58755,6 +59686,7 @@ def test_interrupt_session_transition_loser_reports_finalizing(monkeypatch):
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
 
@@ -59674,7 +60606,8 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event(
             *,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-            checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=None,
             result_checkpoint_transform=None,
         ) -> Session:
             if (
@@ -59719,6 +60652,7 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event(
                 from_statuses=from_statuses,
                 to_status=to_status,
                 checkpoint_transform=checkpoint_transform,
+                store_time_checkpoint_transform=store_time_checkpoint_transform,
                 result_checkpoint_transform=result_checkpoint_transform,
             )
 

@@ -58,6 +58,13 @@ _INTERRUPTED_TASK_HANDOFF_READS = (
     "load_interrupted_task_handoff_receipt",
     "list_expired_interrupted_task_handoff_candidates",
 )
+_TASK_CANCELLATION_RECONCILIATION_METHODS = (
+    "mark_claimed_task_execution_started",
+    "request_claimed_task_cancellation",
+    "reconcile_task_cancellation",
+    "terminalize_task",
+    "load_task_terminalization_receipt",
+)
 
 
 class _TaskStoreOperationCancellationMarker:
@@ -244,6 +251,30 @@ def task_store_interrupted_handoff_capability_is_complete(
     return all(
         task_store_mutation_is_cancellation_quiescent(task_store, method_name)
         for method_name in _INTERRUPTED_TASK_HANDOFF_MUTATIONS
+    )
+
+
+def task_store_cancellation_reconciliation_capability_is_complete(
+    task_store: TaskStore,
+) -> bool:
+    """Return positive proof for owner-lost ordinary-task settlement."""
+
+    try:
+        cancellation_supported = object.__getattribute__(
+            task_store,
+            "supports_task_cancellation_reconciliation",
+        )
+        terminalization_supported = object.__getattribute__(
+            task_store,
+            "supports_idempotent_terminalization",
+        )
+    except BaseException:
+        return False
+    if cancellation_supported is not True or terminalization_supported is not True:
+        return False
+    return all(
+        _task_store_method_has_stable_concrete_implementation(task_store, method_name)
+        for method_name in _TASK_CANCELLATION_RECONCILIATION_METHODS
     )
 
 
@@ -1009,6 +1040,7 @@ __all__ = [
     "capture_sensitive_validation",
     "capture_task_store_operation",
     "raise_task_store_operation_failure",
+    "task_store_cancellation_reconciliation_capability_is_complete",
     "task_store_mutation_is_cancellation_quiescent",
     "task_store_work_attempt_admission_capability_is_complete",
 ]

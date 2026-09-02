@@ -273,7 +273,8 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform,
+        checkpoint_transform=None,
+        store_time_checkpoint_transform=None,
         **kwargs,
     ) -> Session:
         session = await super().transition_status_and_checkpoint(
@@ -281,6 +282,7 @@ class _BlockingCommittedRunningTransitionStore(_RecordingReleaseStore):
             from_statuses=from_statuses,
             to_status=to_status,
             checkpoint_transform=checkpoint_transform,
+            store_time_checkpoint_transform=store_time_checkpoint_transform,
             **kwargs,
         )
         if self.block_next_running_transition and to_status == SessionStatus.RUNNING:
@@ -358,7 +360,6 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock=None,
     ):
         if self.block_next_interrupted_transition and to_status == SessionStatus.INTERRUPTED:
             self.block_next_interrupted_transition = False
@@ -377,7 +378,6 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
             expected_recovery_claim_id=expected_recovery_claim_id,
-            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
 
 

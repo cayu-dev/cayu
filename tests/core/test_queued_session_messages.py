@@ -216,7 +216,8 @@ class InterruptTrackingStore(InMemorySessionStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform,
+        checkpoint_transform=None,
+        store_time_checkpoint_transform=None,
         **kwargs,
     ):
         result = await super().transition_status_and_checkpoint(
@@ -224,6 +225,7 @@ class InterruptTrackingStore(InMemorySessionStore):
             from_statuses=from_statuses,
             to_status=to_status,
             checkpoint_transform=checkpoint_transform,
+            store_time_checkpoint_transform=store_time_checkpoint_transform,
             **kwargs,
         )
         if to_status is SessionStatus.INTERRUPTING:
@@ -252,7 +254,6 @@ class CompletionFenceStore(InterruptTrackingStore):
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock=None,
     ):
         if only_if_no_queued_messages:
             self.completion_started.set()
@@ -268,7 +269,6 @@ class CompletionFenceStore(InterruptTrackingStore):
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
             expected_recovery_claim_id=expected_recovery_claim_id,
-            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
 
 

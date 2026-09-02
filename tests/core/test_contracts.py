@@ -8,6 +8,7 @@ import pickle
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
@@ -2607,6 +2608,23 @@ def test_run_request_requires_task_id_for_task_worker_id():
         RunRequest(
             agent_name="assistant",
             task_worker_id="worker_1",
+            messages=[Message.text("user", "start")],
+        )
+
+
+def test_run_request_requires_exact_task_lease_with_worker_identity() -> None:
+    with pytest.raises(ValidationError, match="must be supplied together"):
+        RunRequest(
+            agent_name="assistant",
+            task_id="task_1",
+            task_worker_id="worker_1",
+            messages=[Message.text("user", "start")],
+        )
+    with pytest.raises(ValidationError, match="must be supplied together"):
+        RunRequest(
+            agent_name="assistant",
+            task_id="task_1",
+            task_lease_expires_at=datetime.now(UTC),
             messages=[Message.text("user", "start")],
         )
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -1181,7 +1180,7 @@ def test_incomplete_recovery_abandons_prepared_stage_before_provider_dispatch() 
         recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=running.id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert provider.requests == []
@@ -1347,7 +1346,7 @@ def test_manual_model_recovery_settles_budget_before_clearing_stage(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=running.id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         recovered_owner = await store.load(running.id)
@@ -1408,7 +1407,7 @@ def test_manual_model_recovery_settles_budget_before_clearing_stage(
         recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=running.id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         resumed = [

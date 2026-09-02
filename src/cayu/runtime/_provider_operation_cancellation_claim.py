@@ -91,18 +91,20 @@ def active_provider_operation_cancellation_claim_from_checkpoint(
 def checkpoint_with_provider_operation_cancellation_claim(
     checkpoint: dict[str, Any] | None,
     claim: ProviderOperationCancellationClaim,
+    *,
+    now: datetime,
 ) -> dict[str, Any]:
     """Acquire or exactly replay one active cancellation claim."""
 
     claim = ProviderOperationCancellationClaim.model_validate(claim)
     copied = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
     existing = provider_operation_cancellation_claim_from_checkpoint(copied)
-    if (
-        existing is not None
-        and not existing.same_owner(claim)
-        and existing.active_at(datetime.now(UTC))
-    ):
-        raise RuntimeError("A different provider-operation cancellation claim is active.")
+    if existing is not None:
+        same_owner = existing.same_owner(claim)
+        if (same_owner and not existing.active_at(now)) or (
+            not same_owner and existing.active_at(now)
+        ):
+            raise RuntimeError("Provider-operation cancellation claim is no longer acquirable.")
     copied[PROVIDER_OPERATION_CANCELLATION_CLAIM_CHECKPOINT_KEY] = claim.model_dump(mode="json")
     return copied
 
@@ -110,13 +112,15 @@ def checkpoint_with_provider_operation_cancellation_claim(
 def checkpoint_without_provider_operation_cancellation_claim(
     checkpoint: dict[str, Any] | None,
     claim: ProviderOperationCancellationClaim,
+    *,
+    now: datetime,
 ) -> dict[str, Any]:
     """Release only the exact active cancellation claim."""
 
     claim = ProviderOperationCancellationClaim.model_validate(claim)
     copied = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
     existing = provider_operation_cancellation_claim_from_checkpoint(copied)
-    if existing is None or not existing.same_owner(claim):
+    if existing is None or not existing.same_owner(claim) or not existing.active_at(now):
         raise RuntimeError("Provider-operation cancellation ownership changed before release.")
     copied.pop(PROVIDER_OPERATION_CANCELLATION_CLAIM_CHECKPOINT_KEY, None)
     return copied

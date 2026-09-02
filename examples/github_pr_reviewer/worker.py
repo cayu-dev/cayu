@@ -60,6 +60,7 @@ async def _handle_pr_review_task(app: CayuApp, task: Task, worker_id: str) -> No
         session_id=f"pr-review-{owner}-{repo}-{pr_number}-{short_head_sha}",
         task_id=task.id,
         task_worker_id=worker_id,
+        task_lease_expires_at=task.lease_expires_at,
         environment_name="pr-workspace",
         metadata={
             "repo_owner": owner,

@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from cayu._clock import utc_clock
+from cayu._clock import normalize_utc_datetime, utc_clock, utc_duration_cutoff
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
@@ -65,6 +65,7 @@ from cayu.memory_evidence import (
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
+from cayu.runtime._task_lease_authority import managed_task_lease_mutation
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.completion_verifier_profiles import (
@@ -214,6 +215,8 @@ from cayu.runtime.sessions import (
     SessionTopologyNode,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
+    StoreTimeCheckpointTransform,
+    StoreTimeSessionOperationTransform,
     TerminalPublicationMarker,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
@@ -263,10 +266,10 @@ from cayu.runtime.sessions import (
     _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
+    _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_checkpoint,
     _initial_transcript_prefix_count,
     _interaction_transition_receipt_record,
-    _interaction_transition_recovery_claim_observed_at,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
     _invocation_terminal_event_receipt_record,
@@ -316,6 +319,7 @@ from cayu.runtime.sessions import (
     _require_invocation_release_recovery_claim,
     _require_invocation_release_settlement_record,
     _require_invocation_release_terminal_session_event,
+    _require_live_incomplete_recovery_claim_for_run_epoch_transfer,
     _runtime_publication_json_equal,
     _runtime_publication_receipt_record,
     _runtime_publication_referenced_event_ids,
@@ -331,11 +335,12 @@ from cayu.runtime.sessions import (
     _validate_equivalent_queued_session_message,
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
+    _validate_inactive_for_seconds,
     _validate_interaction_page,
     _validate_interaction_transition_invocation_authority_parameters,
     _validate_interaction_transition_receipt_authority,
     _validate_interaction_transition_receipt_recovery_authority,
-    _validate_interaction_transition_recovery_claim_parameters,
+    _validate_interaction_transition_recovery_claim_id,
     _validate_invocation_release_settlement_receipt_authority,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
@@ -465,9 +470,12 @@ from cayu.runtime.tasks import (
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
+    _ensure_exact_owned_active_task_lease,
     _ensure_owned_active_task_lease,
     _ensure_retry_series_queue_attempt,
     _ensure_task_handoff_authority,
+    _ensure_task_terminalization_lease_authority,
+    _expired_dispatched_task_cancellation,
     _expired_task_retry_settlement,
     _interrupted_task_continuation_handoff_id_sha256,
     _raise_task_claim_attach_error,
@@ -575,6 +583,7 @@ from cayu.runtime.work_attempt_admission import (
     copy_work_attempt_admission_prepare,
     copy_work_attempt_execution_claim_request,
     copy_work_attempt_recovery_activate,
+    work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
@@ -1671,6 +1680,7 @@ class SQLiteSessionStore(SessionStore):
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
         read_only: bool = False,
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+        ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -1703,6 +1713,7 @@ class SQLiteSessionStore(SessionStore):
         self._schema_mode = schema_mode
         self._read_only = read_only
         self._public_authority_alias_codec = public_authority_alias_codec
+        self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._detached_read_tasks: set[asyncio.Task[object]] = set()
         self._connection = self._connect_read_only(db_path) if read_only else self._connect(db_path)
@@ -2460,7 +2471,7 @@ class SQLiteSessionStore(SessionStore):
                     connection,
                     session_id,
                     new_events,
-                    activity_at=datetime.now(UTC),
+                    activity_at=self._ownership_clock(),
                 )
                 return tuple(resolved), tuple(outcomes), tuple(resolved_events)
 
@@ -3260,6 +3271,7 @@ class SQLiteSessionStore(SessionStore):
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 with self._connection:
+                    created_at = self._ownership_clock()
                     parent_session = (
                         None
                         if request.parent_session_id is None
@@ -3271,6 +3283,7 @@ class SQLiteSessionStore(SessionStore):
                         request,
                         identity=identity,
                         parent_session=parent_session,
+                        created_at=created_at,
                     )
                     admission = _copy_optional_interaction_admission(
                         session.id,
@@ -3856,7 +3869,7 @@ class SQLiteSessionStore(SessionStore):
                 if events:
                     from cayu.runtime.pending_actions import pending_action_event_storage_values
 
-                    _touch_session_activity(self._connection, fork.id, datetime.now(UTC))
+                    _touch_session_activity(self._connection, fork.id, self._ownership_clock())
                     rows = []
                     for event in events:
                         lookup_key, projection, projection_bytes = (
@@ -4563,7 +4576,7 @@ class SQLiteSessionStore(SessionStore):
                         _durable_subagent_parent_delete_block_reason(durable_child["id"])
                     )
                 checkpoint = self._load_checkpoint_unlocked(session_id)
-                deletion_now = datetime.now(UTC)
+                deletion_now = self._ownership_clock()
                 active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
                     checkpoint,
                     now=deletion_now,
@@ -4617,7 +4630,10 @@ class SQLiteSessionStore(SessionStore):
                         f"{active_operation_id} is active: {session_id}"
                     )
                 completion_result_publication_block = (
-                    _completion_result_event_publication_delete_block_reason(checkpoint)
+                    _completion_result_event_publication_delete_block_reason(
+                        checkpoint,
+                        now=deletion_now,
+                    )
                 )
                 if completion_result_publication_block is not None:
                     raise ValueError(
@@ -4681,7 +4697,7 @@ class SQLiteSessionStore(SessionStore):
     async def update_labels(self, session_id: str, labels: dict[str, str]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
-        updated_at = datetime.now(UTC)
+        updated_at = self._ownership_clock()
         expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._lock:
             with self._connection:
@@ -4730,10 +4746,10 @@ class SQLiteSessionStore(SessionStore):
     async def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         user_metadata = copy_session_user_metadata(metadata)
-        updated_at = datetime.now(UTC)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 row = self._connection.execute(
                     "SELECT run_epoch, metadata_json FROM cayu_sessions WHERE id = ?",
                     (session_id,),
@@ -4782,23 +4798,24 @@ class SQLiteSessionStore(SessionStore):
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
 
-        updated_at = datetime.now(UTC)
         async with self._lock:
-            expected_run_epoch = _current_session_run_epoch(session_id)
-            placeholders = ", ".join("?" for _ in allowed_statuses)
-            params: list[object] = [
-                str(to_status),
-                sqlite_support.format_datetime(updated_at),
-                sqlite_support.format_datetime(updated_at),
-                1 if to_status == SessionStatus.RUNNING else 0,
-                session_id,
-                *[str(status) for status in allowed_statuses],
-            ]
-            epoch_clause = ""
-            if expected_run_epoch is not None:
-                epoch_clause = " AND run_epoch = ?"
-                params.append(expected_run_epoch)
-            with self._connection:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
+                expected_run_epoch = _current_session_run_epoch(session_id)
+                placeholders = ", ".join("?" for _ in allowed_statuses)
+                params: list[object] = [
+                    str(to_status),
+                    sqlite_support.format_datetime(updated_at),
+                    sqlite_support.format_datetime(updated_at),
+                    1 if to_status == SessionStatus.RUNNING else 0,
+                    session_id,
+                    *[str(status) for status in allowed_statuses],
+                ]
+                epoch_clause = ""
+                if expected_run_epoch is not None:
+                    epoch_clause = " AND run_epoch = ?"
+                    params.append(expected_run_epoch)
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_sessions
@@ -4808,22 +4825,31 @@ class SQLiteSessionStore(SessionStore):
                     """,
                     params,
                 )
-            if cursor.rowcount != 1:
+                if cursor.rowcount != 1:
+                    loaded = self._load_unlocked(session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
+                        raise SessionRunFenced(
+                            f"Session run epoch no longer owns {session_id}: expected "
+                            f"{expected_run_epoch}, current {loaded.run_epoch}."
+                        )
+                    raise SessionStatusConflict(
+                        f"Session status transition not allowed: {loaded.status} -> {to_status}"
+                    )
+                if to_status is SessionStatus.RUNNING:
+                    _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                        self._load_checkpoint_unlocked(session_id),
+                        now=updated_at,
+                    )
+
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
-                if expected_run_epoch is not None and loaded.run_epoch != expected_run_epoch:
-                    raise SessionRunFenced(
-                        f"Session run epoch no longer owns {session_id}: expected "
-                        f"{expected_run_epoch}, current {loaded.run_epoch}."
-                    )
-                raise SessionStatusConflict(
-                    f"Session status transition not allowed: {loaded.status} -> {to_status}"
-                )
-
-            loaded = self._load_unlocked(session_id)
-            if loaded is None:
-                raise KeyError(f"Session not found: {session_id}")
+                self._connection.commit()
+            except BaseException:
+                self._connection.rollback()
+                raise
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(loaded)
             return loaded
@@ -4834,7 +4860,8 @@ class SQLiteSessionStore(SessionStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
@@ -4852,8 +4879,8 @@ class SQLiteSessionStore(SessionStore):
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
-        if checkpoint_transform is None:
-            raise TypeError("checkpoint_transform is required.")
+        if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
+            raise TypeError("Exactly one checkpoint transform is required.")
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
         admission = _copy_transition_interaction_admission(
@@ -4886,10 +4913,10 @@ class SQLiteSessionStore(SessionStore):
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
 
-        updated_at = datetime.now(UTC)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -4939,13 +4966,27 @@ class SQLiteSessionStore(SessionStore):
                 )
 
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
-                transformed_checkpoint = checkpoint_transform(
-                    loaded,
-                    _copy_checkpoint_for_transform(
+                if to_status is SessionStatus.RUNNING:
+                    _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                         current_checkpoint,
-                        session_id=session_id,
-                    ),
+                        now=updated_at,
+                    )
+                checkpoint_copy = _copy_checkpoint_for_transform(
+                    current_checkpoint,
+                    session_id=session_id,
                 )
+                if store_time_checkpoint_transform is not None:
+                    transformed_checkpoint = store_time_checkpoint_transform(
+                        loaded,
+                        checkpoint_copy,
+                        updated_at,
+                    )
+                else:
+                    assert checkpoint_transform is not None
+                    transformed_checkpoint = checkpoint_transform(
+                        loaded,
+                        checkpoint_copy,
+                    )
                 if transformed_checkpoint is not None:
                     transformed_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
                         current_checkpoint,
@@ -5306,7 +5347,7 @@ class SQLiteSessionStore(SessionStore):
                 lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                     copied_event
                 )
-                _touch_session_activity(self._connection, session_id, datetime.now(UTC))
+                _touch_session_activity(self._connection, session_id, self._ownership_clock())
                 self._connection.execute(
                     """
                     INSERT INTO cayu_events (
@@ -5348,27 +5389,36 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         *,
         statuses: set[SessionStatus],
-        inactive_before: datetime,
+        inactive_for_seconds: int,
     ) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(statuses, "statuses")
-        if inactive_before.tzinfo is None or inactive_before.utcoffset() is None:
-            raise ValueError("inactive_before must be timezone-aware.")
-        now = datetime.now(UTC)
+        validated_inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
+        assert validated_inactive_for_seconds is not None
         placeholders = ", ".join("?" for _ in allowed_statuses)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                now = self._ownership_clock()
+                inactive_before = utc_duration_cutoff(
+                    now,
+                    validated_inactive_for_seconds,
+                )
                 if not self._session_exists_unlocked(session_id):
                     raise KeyError(f"Session not found: {session_id}")
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 if (
                     active_provider_operation_cancellation_claim_from_checkpoint(
-                        self._load_checkpoint_unlocked(session_id),
+                        current_checkpoint,
                         now=now,
                     )
                     is not None
+                    or _incomplete_recovery_claim_from_checkpoint(current_checkpoint) is not None
                 ):
                     self._connection.rollback()
+                    return None
+                if inactive_before is None:
+                    self._connection.commit()
                     return None
                 cursor = self._connection.execute(
                     f"""
@@ -5395,6 +5445,87 @@ class SQLiteSessionStore(SessionStore):
             _activate_session_run_fence(loaded)
             return loaded
 
+    async def reserve_stalled_run_recovery(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_for_seconds: int | None,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> Session | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                now = self._ownership_clock()
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                current = self._load_checkpoint_unlocked(session_id)
+                inactive_before = (
+                    None
+                    if inactive_for_seconds is None
+                    else utc_duration_cutoff(now, inactive_for_seconds)
+                )
+                if (
+                    loaded.status not in allowed_statuses
+                    or (
+                        inactive_for_seconds is not None
+                        and (inactive_before is None or loaded.last_activity_at > inactive_before)
+                    )
+                    or active_provider_operation_cancellation_claim_from_checkpoint(
+                        current,
+                        now=now,
+                    )
+                    is not None
+                ):
+                    self._connection.commit()
+                    return None
+                transformed = checkpoint_transform(
+                    loaded,
+                    _copy_checkpoint_for_transform(current, session_id=session_id),
+                    now,
+                )
+                if transformed is None:
+                    self._connection.commit()
+                    return None
+                transformed = (
+                    _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current,
+                        transformed,
+                        session_id=session_id,
+                    )
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO cayu_checkpoints (
+                        session_id, state_json, updated_at,
+                        pending_action_source_bytes,
+                        pending_action_tool_call_count,
+                        pending_action_flags,
+                        pending_action_metrics_ready
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        state_json = excluded.state_json,
+                        updated_at = excluded.updated_at,
+                        pending_action_source_bytes = excluded.pending_action_source_bytes,
+                        pending_action_tool_call_count = excluded.pending_action_tool_call_count,
+                        pending_action_flags = excluded.pending_action_flags,
+                        pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                    """,
+                    sqlite_support.checkpoint_row_values(session_id, transformed, now),
+                )
+                self._connection.commit()
+                return loaded
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     async def fence_run_and_transform_checkpoint(
         self,
         session_id: str,
@@ -5409,16 +5540,20 @@ class SQLiteSessionStore(SessionStore):
             raise TypeError("checkpoint_transform is required.")
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
-        updated_at = datetime.now(UTC)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(f"Session status cannot be fenced: {loaded.status}")
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
+                _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                    current_checkpoint,
+                    now=updated_at,
+                )
                 if (
                     active_provider_operation_cancellation_claim_from_checkpoint(
                         current_checkpoint,
@@ -5513,10 +5648,10 @@ class SQLiteSessionStore(SessionStore):
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
-        updated_at = datetime.now(UTC)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -5576,7 +5711,6 @@ class SQLiteSessionStore(SessionStore):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -5587,11 +5721,8 @@ class SQLiteSessionStore(SessionStore):
                 expected_invocation_authority_state=expected_invocation_authority_state,
             )
         )
-        expected_recovery_claim_id, expected_recovery_claim_clock = (
-            _validate_interaction_transition_recovery_claim_parameters(
-                expected_recovery_claim_id=expected_recovery_claim_id,
-                expected_recovery_claim_clock=expected_recovery_claim_clock,
-            )
+        expected_recovery_claim_id = _validate_interaction_transition_recovery_claim_id(
+            expected_recovery_claim_id
         )
 
         session_id, transition = _prepare_interaction_transition(
@@ -5659,18 +5790,19 @@ class SQLiteSessionStore(SessionStore):
                     raise RuntimeError(
                         "Interaction transition event exists without its immutable receipt."
                     )
-                if expected_recovery_claim_id is not None:
-                    assert expected_recovery_claim_clock is not None
-                    active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                        _load_checkpoint_state(connection, session_id),
-                        now=_interaction_transition_recovery_claim_observed_at(
-                            expected_recovery_claim_clock
-                        ),
-                    )
-                    if active_recovery_claim_id != expected_recovery_claim_id:
+                active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+                    _load_checkpoint_state(connection, session_id),
+                    now=self._ownership_clock(),
+                )
+                if expected_recovery_claim_id is None:
+                    if active_recovery_claim_id is not None:
                         raise SessionRunFenced(
-                            "Interaction transition lost its exact terminal recovery claim."
+                            "Interaction transition is owned by another terminal recovery claim."
                         )
+                elif active_recovery_claim_id != expected_recovery_claim_id:
+                    raise SessionRunFenced(
+                        "Interaction transition lost its exact terminal recovery claim."
+                    )
                 if expected_active_invocation_profile is not None:
                     from cayu.runtime._invocation_lifecycle import (
                         require_invocation_command_authority,
@@ -5712,7 +5844,7 @@ class SQLiteSessionStore(SessionStore):
                         ).fetchone()
                         is not None
                     )
-                updated_at = datetime.now(UTC)
+                updated_at = self._ownership_clock()
                 formatted_updated_at = sqlite_support.format_datetime(updated_at)
                 settlement_record = None
                 settlement_storage_key = None
@@ -6288,20 +6420,25 @@ class SQLiteSessionStore(SessionStore):
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         def statement(connection: sqlite3.Connection) -> None:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
             if not copied_events:
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
                 return
 
             try:
-                with connection:
-                    _append_events_in_transaction(
-                        connection,
-                        session_id,
-                        copied_events,
-                        activity_at=datetime.now(UTC),
-                    )
+                connection.execute("BEGIN IMMEDIATE")
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                activity_at = self._ownership_clock()
+                _append_events_in_transaction(
+                    connection,
+                    session_id,
+                    copied_events,
+                    activity_at=activity_at,
+                )
+                connection.commit()
             except sqlite3.IntegrityError as exc:
+                connection.rollback()
                 existing_event_id = _first_existing_event_id(
                     connection,
                     session_id,
@@ -6315,6 +6452,9 @@ class SQLiteSessionStore(SessionStore):
                     raise BudgetReservationIdentityConflict(
                         "Budget ledger reused a reservation identity."
                     ) from exc
+                raise
+            except BaseException:
+                connection.rollback()
                 raise
 
         await self._run_write(statement)
@@ -6360,7 +6500,7 @@ class SQLiteSessionStore(SessionStore):
                     connection.rollback()
                     return False
 
-                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                _touch_session_activity(connection, session_id, self._ownership_clock())
                 lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                     copied_event
                 )
@@ -6501,7 +6641,7 @@ class SQLiteSessionStore(SessionStore):
                     baseline_updates=updates,
                     events=copied_events,
                 )
-                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                _touch_session_activity(connection, session_id, self._ownership_clock())
                 event_rows = []
                 for event in copied_events:
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
@@ -6541,7 +6681,7 @@ class SQLiteSessionStore(SessionStore):
                     session_id,
                     copied_events,
                 )
-                updated_at = sqlite_support.format_datetime(datetime.now(UTC))
+                updated_at = sqlite_support.format_datetime(self._ownership_clock())
                 for key, baseline in updates.items():
                     connection.execute(
                         """
@@ -6604,7 +6744,7 @@ class SQLiteSessionStore(SessionStore):
         def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectClaim | None:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 lease_expires_at = now + timedelta(seconds=float(lease_seconds))
                 formatted_now = sqlite_support.format_datetime(now)
                 filters = [
@@ -6738,7 +6878,7 @@ class SQLiteSessionStore(SessionStore):
         def statement(connection: sqlite3.Connection) -> PersistedEventSideEffectDelivery:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 next_attempt_at = (
                     None
                     if retry_delay_seconds is None
@@ -6831,7 +6971,7 @@ class SQLiteSessionStore(SessionStore):
                     "(next_attempt_at IS NULL OR next_attempt_at <= ?)) "
                     "OR (status = 'leased' AND lease_expires_at <= ?))"
                 )
-                formatted_now = sqlite_support.format_datetime(datetime.now(UTC))
+                formatted_now = sqlite_support.format_datetime(self._ownership_clock())
                 params.extend([formatted_now, formatted_now])
             where = "" if not clauses else "WHERE " + " AND ".join(clauses)
             params.append(limit)
@@ -6886,7 +7026,7 @@ class SQLiteSessionStore(SessionStore):
                         "Session messages may be enqueued only while a session is pending or running."
                     )
                 transcript_cursor = _transcript_cursor(connection, request.session_id)
-                accepted_at = datetime.now(UTC)
+                accepted_at = self._ownership_clock()
                 queue_id = str(uuid4())
                 accepted_event_id = str(uuid4())
                 cursor = connection.execute(
@@ -7151,7 +7291,7 @@ class SQLiteSessionStore(SessionStore):
                                     interaction_started_event.model_dump(mode="json")
                                 )
                             ),
-                            sqlite_support.format_datetime(datetime.now(UTC)),
+                            sqlite_support.format_datetime(self._ownership_clock()),
                         ),
                     )
                     connection.commit()
@@ -7162,7 +7302,7 @@ class SQLiteSessionStore(SessionStore):
                         has_more=False,
                     )
                 transcript_cursor = _transcript_cursor(connection, session_id)
-                delivered_at = datetime.now(UTC)
+                delivered_at = self._ownership_clock()
                 updated_messages: list[SessionQueuedMessage] = []
                 delivery_events: list[Event] = []
                 transcript_messages: list[Message] = []
@@ -7362,7 +7502,9 @@ class SQLiteSessionStore(SessionStore):
             checkpoint_transform=checkpoint_transform,
             operation_idempotency_key=None,
             operation_transform=None,
+            store_time_operation_transform=None,
             operation_commit_guard=None,
+            operation_commit_time_guard=None,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -7374,15 +7516,18 @@ class SQLiteSessionStore(SessionStore):
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: StoreTimeCheckpointTransform,
         events: list[Event],
     ) -> Session:
         return await self._publish_checkpoint_and_events(
             session_id,
-            checkpoint_transform=checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=checkpoint_transform,
             operation_idempotency_key=None,
             operation_transform=None,
+            store_time_operation_transform=None,
             operation_commit_guard=None,
+            operation_commit_time_guard=None,
             events=events,
             expected_statuses=None,
             expected_run_epoch=None,
@@ -8891,7 +9036,9 @@ class SQLiteSessionStore(SessionStore):
                 "idempotency_key",
             ),
             operation_transform=operation_transform,
+            store_time_operation_transform=None,
             operation_commit_guard=None,
+            operation_commit_time_guard=None,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -8919,7 +9066,40 @@ class SQLiteSessionStore(SessionStore):
                 "idempotency_key",
             ),
             operation_transform=operation_transform,
+            store_time_operation_transform=None,
             operation_commit_guard=commit_guard,
+            operation_commit_time_guard=None,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
+        )
+
+    async def publish_session_operation_guarded_with_store_time(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: StoreTimeSessionOperationTransform,
+        commit_guard: Callable[[], None],
+        commit_time_guard: Callable[[datetime], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=None,
+            operation_idempotency_key=require_clean_nonblank(
+                idempotency_key,
+                "idempotency_key",
+            ),
+            operation_transform=None,
+            store_time_operation_transform=operation_transform,
+            operation_commit_guard=commit_guard,
+            operation_commit_time_guard=commit_time_guard,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -8932,9 +9112,12 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         *,
         checkpoint_transform: CheckpointTransform | None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         operation_idempotency_key: str | None,
         operation_transform: SessionOperationTransform | None,
+        store_time_operation_transform: StoreTimeSessionOperationTransform | None,
         operation_commit_guard: Callable[[], None] | None,
+        operation_commit_time_guard: Callable[[datetime], None] | None,
         events: list[Event],
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
@@ -8944,20 +9127,31 @@ class SQLiteSessionStore(SessionStore):
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
         session_id, copied_events = _copy_session_event_batch(session_id, events)
-        if (checkpoint_transform is None) == (operation_transform is None):
+        transform_count = sum(
+            transform is not None
+            for transform in (
+                checkpoint_transform,
+                store_time_checkpoint_transform,
+                operation_transform,
+                store_time_operation_transform,
+            )
+        )
+        if transform_count != 1:
             raise TypeError("Exactly one checkpoint publication transform is required.")
-        if operation_transform is not None and operation_idempotency_key is None:
+        if (
+            operation_transform is not None or store_time_operation_transform is not None
+        ) and operation_idempotency_key is None:
             raise TypeError("operation_idempotency_key is required.")
         allowed_statuses = (
             None
             if expected_statuses is None
             else _validate_status_set(expected_statuses, "expected_statuses")
         )
-        updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> Session:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -8988,7 +9182,7 @@ class SQLiteSessionStore(SessionStore):
                 )
                 operation_records: dict[str, dict[str, Any]] = {}
                 model_completion_stage_release = None
-                if operation_transform is not None:
+                if operation_transform is not None or store_time_operation_transform is not None:
                     operation_row = connection.execute(
                         "SELECT record_json FROM cayu_session_operations "
                         "WHERE session_id = ? AND idempotency_key = ?",
@@ -8997,11 +9191,20 @@ class SQLiteSessionStore(SessionStore):
                     current_operation = (
                         None if operation_row is None else json.loads(operation_row["record_json"])
                     )
-                    publication = operation_transform(
-                        loaded,
-                        callback_checkpoint,
-                        current_operation,
-                    )
+                    if operation_transform is not None:
+                        publication = operation_transform(
+                            loaded,
+                            callback_checkpoint,
+                            current_operation,
+                        )
+                    else:
+                        assert store_time_operation_transform is not None
+                        publication = store_time_operation_transform(
+                            loaded,
+                            callback_checkpoint,
+                            current_operation,
+                            updated_at,
+                        )
                     if type(publication) is not SessionOperationPublication:
                         raise TypeError(
                             "Session operation transform must return a SessionOperationPublication."
@@ -9022,8 +9225,15 @@ class SQLiteSessionStore(SessionStore):
                     model_completion_stage_release = publication.model_completion_stage_release
                     _validate_session_operation_record_keys(operation_records)
                 else:
-                    assert checkpoint_transform is not None
-                    transformed = checkpoint_transform(loaded, callback_checkpoint)
+                    if checkpoint_transform is not None:
+                        transformed = checkpoint_transform(loaded, callback_checkpoint)
+                    else:
+                        assert store_time_checkpoint_transform is not None
+                        transformed = store_time_checkpoint_transform(
+                            loaded,
+                            callback_checkpoint,
+                            updated_at,
+                        )
                     if transformed is None:
                         raise ValueError("Checkpoint transform must return a checkpoint.")
                     transformed = copy_durable_json_object(transformed, "checkpoint")
@@ -9060,7 +9270,6 @@ class SQLiteSessionStore(SessionStore):
                         )
                     )
                 _publish_budget_reservation_identities(connection, copied_events)
-                _touch_session_activity(connection, session_id, updated_at)
                 connection.execute(
                     """
                     INSERT INTO cayu_checkpoints (
@@ -9159,6 +9368,13 @@ class SQLiteSessionStore(SessionStore):
                     )
                 if operation_commit_guard is not None:
                     operation_commit_guard()
+                activity_at = (
+                    self._ownership_clock() if operation_commit_guard is not None else updated_at
+                )
+                if operation_commit_time_guard is not None:
+                    activity_at = self._ownership_clock()
+                    operation_commit_time_guard(activity_at)
+                _touch_session_activity(connection, session_id, activity_at)
                 connection.commit()
             except sqlite3.IntegrityError as exc:
                 connection.rollback()
@@ -9176,7 +9392,7 @@ class SQLiteSessionStore(SessionStore):
                 connection.rollback()
                 raise
             return loaded.model_copy(
-                update={"updated_at": updated_at, "last_activity_at": updated_at}
+                update={"updated_at": updated_at, "last_activity_at": activity_at}
             )
 
         return await self._run_write(statement)
@@ -11827,9 +12043,32 @@ class SQLiteSessionStore(SessionStore):
             if pending_interruption_cascade_only
             else "cayu_sessions"
         )
-        plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
 
         def run_query(connection: sqlite3.Connection) -> SessionListResult:
+            inactive_before = (
+                query.last_activity_before
+                if query.inactive_for_seconds is None
+                else utc_duration_cutoff(
+                    self._ownership_clock(),
+                    query.inactive_for_seconds,
+                )
+            )
+            if query.inactive_for_seconds is not None and inactive_before is None:
+                return SessionListResult(
+                    sessions=[],
+                    next_cursor=None,
+                    total_count=0 if query.include_total_count else None,
+                )
+            resolved_query = query.model_copy(
+                update={
+                    "last_activity_before": inactive_before,
+                    "inactive_for_seconds": None,
+                }
+            )
+            plan = session_store_sql.build_session_query_sql(
+                resolved_query,
+                dialect=_SQL_DIALECT,
+            )
             total_count: int | None = None
             if query.include_total_count:
                 total_count = connection.execute(
@@ -11883,12 +12122,16 @@ class SQLiteSessionStore(SessionStore):
         copied_messages = copy_transcript_messages(messages)
 
         def statement(connection: sqlite3.Connection) -> None:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
             if not copied_messages:
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
                 return
-            with connection:
-                _touch_session_activity(connection, session_id, datetime.now(UTC))
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                activity_at = self._ownership_clock()
+                _touch_session_activity(connection, session_id, activity_at)
                 connection.executemany(
                     """
                     INSERT INTO cayu_transcript_messages (
@@ -11911,6 +12154,10 @@ class SQLiteSessionStore(SessionStore):
                         for message in copied_messages
                     ],
                 )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
         await self._run_write(statement)
 
@@ -11930,11 +12177,11 @@ class SQLiteSessionStore(SessionStore):
             raise ValueError("Initial transcript publication requires an interaction identity.")
         expected = copy_transcript_messages(expected_messages)
         replacement = copy_transcript_messages(replacement_messages)
-        updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 session = self._load_unlocked(session_id)
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -12094,7 +12341,7 @@ class SQLiteSessionStore(SessionStore):
                     "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
                     (session_id,),
                 )
-                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                _touch_session_activity(connection, session_id, self._ownership_clock())
                 connection.commit()
                 return True
             except Exception:
@@ -12145,11 +12392,11 @@ class SQLiteSessionStore(SessionStore):
         copied_messages = copy_transcript_messages(messages)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
-        updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 session = self._load_unlocked(session_id)
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -12538,11 +12785,11 @@ class SQLiteSessionStore(SessionStore):
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         checkpoint = copy_durable_json_object(state, "checkpoint")
-        updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 if not _session_exists(connection, session_id):
                     raise KeyError(f"Session not found: {session_id}")
                 replacement = _replace_checkpoint_preserving_completion_result_event_publications(
@@ -12586,11 +12833,11 @@ class SQLiteSessionStore(SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
-        updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                updated_at = self._ownership_clock()
                 session = self._load_unlocked(session_id)
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
@@ -12637,6 +12884,65 @@ class SQLiteSessionStore(SessionStore):
                 )
                 if transaction_failure is not primary:
                     raise transaction_failure from None
+                raise
+
+        await self._run_write(statement)
+
+    async def transform_checkpoint_with_store_time(
+        self,
+        session_id: str,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+
+        def statement(connection: sqlite3.Connection) -> None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = self._ownership_clock()
+                session = self._load_unlocked(session_id)
+                if session is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, session)
+                current = self._load_checkpoint_unlocked(session_id)
+                transformed = checkpoint_transform(
+                    session,
+                    _copy_checkpoint_for_transform(current, session_id=session_id),
+                    now,
+                )
+                if transformed is not None:
+                    transformed = (
+                        _replace_checkpoint_preserving_completion_result_event_publications(
+                            current,
+                            copy_durable_json_object(transformed, "checkpoint"),
+                            session_id=session_id,
+                        )
+                    )
+                    _touch_session_activity(connection, session_id, now)
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_checkpoints (
+                            session_id, state_json, updated_at,
+                            pending_action_source_bytes,
+                            pending_action_tool_call_count,
+                            pending_action_flags,
+                            pending_action_metrics_ready
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at,
+                            pending_action_source_bytes = excluded.pending_action_source_bytes,
+                            pending_action_tool_call_count = excluded.pending_action_tool_call_count,
+                            pending_action_flags = excluded.pending_action_flags,
+                            pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                        """,
+                        sqlite_support.checkpoint_row_values(session_id, transformed, now),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
                 raise
 
         await self._run_write(statement)
@@ -12754,6 +13060,7 @@ class SQLiteTaskStore(TaskStore):
         path: str | Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        ownership_clock: Callable[[], datetime] | None = None,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
     ) -> None:
         if isinstance(path, Path):
@@ -12774,6 +13081,7 @@ class SQLiteTaskStore(TaskStore):
         self._schema_mode = schema_mode
         self._clock = utc_clock(clock)
         self._enable_task_admission_wakeups()
+        self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._connection = self._connect(db_path)
         self._initialize_schema()
@@ -12903,7 +13211,7 @@ class SQLiteTaskStore(TaskStore):
                 )
                 prior = self._latest_local_execution_attempt_unlocked(authority)
                 evidence_now = self._clock()
-                lease_now = datetime.now(UTC)
+                lease_now = self._ownership_clock()
                 record = prepare_local_execution_attempt_record(
                     authority=authority,
                     task=task,
@@ -12934,7 +13242,7 @@ class SQLiteTaskStore(TaskStore):
                         "Local execution start has no prepared attempt."
                     )
                 evidence_now = self._clock()
-                lease_now = datetime.now(UTC)
+                lease_now = self._ownership_clock()
                 if record.start is None:
                     require_local_execution_task_authority(
                         self._require_task_unlocked(record.authority.task_id),
@@ -12972,7 +13280,7 @@ class SQLiteTaskStore(TaskStore):
                     record,
                     settlement,
                     evidence_now=self._clock(),
-                    lease_now=datetime.now(UTC),
+                    lease_now=self._ownership_clock(),
                 )
                 if updated != record:
                     self._store_local_execution_attempt_unlocked(updated, insert=False)
@@ -13042,7 +13350,7 @@ class SQLiteTaskStore(TaskStore):
                         "Local execution recovery attempt was not found."
                     )
                 evidence_now = self._clock()
-                lease_now = datetime.now(UTC)
+                lease_now = self._ownership_clock()
                 task = self._require_task_unlocked(record.authority.task_id)
                 require_local_execution_recovery_eligible(
                     task,
@@ -13459,7 +13767,7 @@ class SQLiteTaskStore(TaskStore):
         session_id: str,
         authority_kind: Literal["ordinary", "contracted"],
     ) -> None:
-        now = datetime.now(UTC)
+        now = self._ownership_clock()
         self._connection.execute(
             "INSERT OR IGNORE INTO cayu_task_session_execution_authority "
             "(session_id, authority_kind, committed_at) VALUES (?, ?, ?)",
@@ -13605,18 +13913,31 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         *,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
         contract: WorkContractRef,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         copied_contract = copy_work_contract_ref(contract)
         if copied_contract is None:
             raise TypeError("contract must be a WorkContractRef.")
         async with self._lock:
             with self._verified_transaction_unlocked():
                 task = self._require_task_unlocked(task_id)
-                now = datetime.now(UTC)
-                _ensure_owned_active_task_lease(task, worker_id, now=now)
+                now = self._ownership_clock()
+                if expected_lease is None:
+                    raise TaskClaimLost("Contracted task parking requires its exact worker lease.")
+                _ensure_exact_owned_active_task_lease(
+                    task,
+                    worker_id,
+                    expected_lease,
+                    now=now,
+                )
                 if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
                     raise TaskClaimLost(
                         "Only the current worker may park its unattached claimed task."
@@ -13722,7 +14043,10 @@ class SQLiteTaskStore(TaskStore):
             with self._verified_transaction_unlocked():
                 existing = self._load_work_attempt_admission_unlocked(request.admission_id)
                 if existing is not None:
-                    if existing.prepare_request_sha256 != request_sha256:
+                    if not work_attempt_admission_prepare_matches_sha256(
+                        request,
+                        existing.prepare_request_sha256,
+                    ):
                         raise WorkAttemptAdmissionConflict(
                             "Work-attempt admission identity is bound to another request."
                         )
@@ -13777,8 +14101,8 @@ class SQLiteTaskStore(TaskStore):
                         "Task already has an unreleased work-attempt admission."
                     )
                 contract = self._require_task_contract_unlocked(task, request.contract)
-                queue_now = datetime.now(UTC)
-                now = self._clock()
+                lease_now = self._ownership_clock()
+                availability_now = self._clock()
                 continuation = self._work_attempt_continuation_context_unlocked(
                     task,
                     contract,
@@ -13792,25 +14116,38 @@ class SQLiteTaskStore(TaskStore):
                         raise WorkAttemptAdmissionConflict(
                             "Initial admission requires a pending or claimed contracted task."
                         )
-                    if task.available_at is not None and task.available_at > now:
+                    if task.available_at is not None and task.available_at > availability_now:
                         raise WorkAttemptAdmissionConflict(
                             "Contracted task is not yet available for admission."
                         )
                     if task.status is TaskStatus.CLAIMED:
-                        _ensure_owned_active_task_lease(
+                        if request.task_lease_expires_at is None:
+                            raise TaskClaimLost(
+                                "Work-attempt admission requires the claimed task's exact lease."
+                            )
+                        _ensure_exact_owned_active_task_lease(
                             task,
                             request.worker_id,
-                            now=queue_now,
+                            request.task_lease_expires_at,
+                            now=lease_now,
                         )
                     elif task.worker_id is not None or task.lease_expires_at is not None:
                         raise WorkAttemptAdmissionConflict(
                             "Pending contracted task has conflicting worker ownership."
+                        )
+                    elif request.task_lease_expires_at is not None:
+                        raise WorkAttemptAdmissionConflict(
+                            "Pending work-attempt admission cannot consume worker lease authority."
                         )
                     if task.session_id not in {None, request.session_id}:
                         raise WorkAttemptAdmissionConflict(
                             "Initial admission conflicts with the task's session."
                         )
                 else:
+                    if request.task_lease_expires_at is not None:
+                        raise WorkAttemptAdmissionConflict(
+                            "Continuation admission cannot consume prior worker lease authority."
+                        )
                     if request.kind != "continuation":
                         raise WorkAttemptAdmissionConflict(
                             "Initial admission cannot consume continuation authority."
@@ -13865,8 +14202,8 @@ class SQLiteTaskStore(TaskStore):
                     execution_owner_id=request.execution_owner_id,
                     generation=request.generation,
                     request_sha256=work_attempt_execution_claim_request_sha256(claim_request),
-                    claimed_at=now,
-                    lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+                    claimed_at=lease_now,
+                    lease_expires_at=lease_now + timedelta(seconds=request.lease_seconds),
                 )
                 admission = WorkAttemptAdmission(
                     admission_id=request.admission_id,
@@ -13885,7 +14222,7 @@ class SQLiteTaskStore(TaskStore):
                     ),
                     claim=claim,
                     continuation=continuation,
-                    prepared_at=now,
+                    prepared_at=lease_now,
                 )
                 updated_task = task.model_copy(
                     update={
@@ -13894,8 +14231,8 @@ class SQLiteTaskStore(TaskStore):
                         "session_instance_id": session_instance_id,
                         "worker_id": request.worker_id,
                         "lease_expires_at": claim.lease_expires_at,
-                        "started_at": task.started_at or now,
-                        "updated_at": now,
+                        "started_at": task.started_at or lease_now,
+                        "updated_at": lease_now,
                     }
                 )
                 self._update_task_snapshot_unlocked(updated_task)
@@ -13959,8 +14296,8 @@ class SQLiteTaskStore(TaskStore):
                     raise WorkAttemptAdmissionConflict(
                         "Only a prepared admission can publish its work attempt."
                     )
-                now = self._clock()
-                self._ensure_live_work_attempt_admission_claim(admission, now=now)
+                lease_now = self._ownership_clock()
+                self._ensure_live_work_attempt_admission_claim(admission, now=lease_now)
                 if (
                     task.status is not TaskStatus.RUNNING
                     or task.worker_id != admission.claim.worker_id
@@ -13989,7 +14326,7 @@ class SQLiteTaskStore(TaskStore):
                     **attempt_request.model_dump(mode="python"),
                     ordinal=ordinal,
                     request_sha256=work_attempt_request_sha256(attempt_request),
-                    started_at=now,
+                    started_at=(evidence_now := self._clock()),
                 )
                 activated = WorkAttemptAdmission.model_validate(
                     admission.model_copy(
@@ -13997,7 +14334,7 @@ class SQLiteTaskStore(TaskStore):
                             "state": WorkAttemptAdmissionState.ACTIVE,
                             "attempt": attempt,
                             "session_evidence_sha256": request.session_evidence_sha256,
-                            "activated_at": now,
+                            "activated_at": evidence_now,
                         }
                     ).model_dump(mode="python", warnings=False)
                 )
@@ -14056,7 +14393,7 @@ class SQLiteTaskStore(TaskStore):
                     raise WorkAttemptExecutionClaimLost(
                         "Execution-claim renewal conflicts with current authority."
                     )
-                now = self._clock()
+                now = self._ownership_clock()
                 self._ensure_live_work_attempt_admission_claim(admission, now=now)
                 if (
                     self._connection.execute(
@@ -14141,7 +14478,7 @@ class SQLiteTaskStore(TaskStore):
                         "Only a prepared or published admission can enter recovery."
                     )
                 current = admission.claim
-                now = self._clock()
+                now = self._ownership_clock()
                 exact_current_request = (
                     current.claim_id == request.claim_id
                     and current.worker_id == request.worker_id
@@ -14291,7 +14628,7 @@ class SQLiteTaskStore(TaskStore):
                     )
                 if admission.state is WorkAttemptAdmissionState.ACTIVE:
                     return admission.model_copy(deep=True)
-                now = self._clock()
+                now = self._ownership_clock()
                 self._ensure_live_work_attempt_admission_claim(admission, now=now)
                 if (
                     task.status is not TaskStatus.RUNNING
@@ -14361,7 +14698,7 @@ class SQLiteTaskStore(TaskStore):
                 verified_work_support.require_attempt_worker(
                     task,
                     request.worker_id,
-                    now=datetime.now(UTC),
+                    now=self._ownership_clock(),
                 )
                 prior_id = self._latest_work_attempt_id_unlocked(task.id)
                 prior = None if prior_id is None else self._load_work_attempt_unlocked(prior_id)
@@ -14461,7 +14798,7 @@ class SQLiteTaskStore(TaskStore):
                     attempt,
                     latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
                     contract=contract,
-                    now=datetime.now(UTC),
+                    now=self._ownership_clock(),
                 )
                 proposal = CompletionProposal(
                     proposal_id=request.proposal_id,
@@ -14533,8 +14870,8 @@ class SQLiteTaskStore(TaskStore):
                     raise WorkAttemptExecutionClaimLost(
                         "Completion proposal no longer owns the exact active admission."
                     )
-                now = self._clock()
-                self._ensure_live_work_attempt_admission_claim(admission, now=now)
+                lease_now = self._ownership_clock()
+                self._ensure_live_work_attempt_admission_claim(admission, now=lease_now)
                 if existing is not None:
                     if existing.request_sha256 != proposal_sha256:
                         raise WorkCompletionConflict(
@@ -14575,7 +14912,7 @@ class SQLiteTaskStore(TaskStore):
                     task_id=admission.task_id,
                     contract=admission.contract,
                     request_sha256=proposal_sha256,
-                    proposed_at=now,
+                    proposed_at=self._clock(),
                 )
                 released = WorkAttemptAdmission.model_validate(
                     admission.model_copy(
@@ -14601,7 +14938,7 @@ class SQLiteTaskStore(TaskStore):
                         update={
                             "worker_id": None,
                             "lease_expires_at": None,
-                            "updated_at": now,
+                            "updated_at": lease_now,
                         }
                     )
                 )
@@ -14768,7 +15105,7 @@ class SQLiteTaskStore(TaskStore):
                     raise WorkCompletionConflict(
                         "Verification claim requires the exact prepared verifier profile."
                     )
-                now = self._clock()
+                now = self._ownership_clock()
                 current = self._load_completion_claim_unlocked(request.proposal_id)
                 decision = self._load_completion_decision_for_proposal_unlocked(request.proposal_id)
                 if (
@@ -14861,7 +15198,7 @@ class SQLiteTaskStore(TaskStore):
                 if proposal is None:
                     raise KeyError(f"Completion proposal not found: {request.proposal_id}")
                 current = self._load_completion_claim_unlocked(request.proposal_id)
-                now = self._clock()
+                now = self._ownership_clock()
                 if (
                     current is None
                     or current.claim_id != request.claim_id
@@ -14935,7 +15272,8 @@ class SQLiteTaskStore(TaskStore):
                     raise KeyError(f"Completion proposal not found: {request.proposal_id}")
                 claim = self._load_completion_claim_unlocked(proposal.proposal_id)
                 profile = self._load_completion_verifier_profile_unlocked(proposal.proposal_id)
-                now = self._clock()
+                lease_now = self._ownership_clock()
+                evidence_now = self._clock()
                 if (
                     claim is None
                     or claim.claim_id != request.claim_id
@@ -14944,7 +15282,7 @@ class SQLiteTaskStore(TaskStore):
                     or claim.verifier_profile_fingerprint != request.verifier_profile_fingerprint
                     or profile is None
                     or profile.profile.fingerprint != request.verifier_profile_fingerprint
-                    or claim.lease_expires_at <= now
+                    or claim.lease_expires_at <= lease_now
                 ):
                     raise CompletionVerificationClaimLost(
                         "Completion decision requires the current live verifier claim."
@@ -14981,7 +15319,7 @@ class SQLiteTaskStore(TaskStore):
                     claim_authority_sha256=completion_verification_claim_authority_sha256(claim),
                     request_sha256=request_sha256,
                     gap_fingerprint=completion_gap_fingerprint(request),
-                    decided_at=now,
+                    decided_at=evidence_now,
                 )
                 self._connection.execute(
                     "INSERT INTO cayu_completion_decisions "
@@ -15098,7 +15436,7 @@ class SQLiteTaskStore(TaskStore):
                     attempt=attempt,
                     contract=contract,
                     matching_gap_count=matching_gap_count,
-                    now=datetime.now(UTC),
+                    now=self._ownership_clock(),
                 )
                 if updated != task:
                     self._update_task_snapshot_unlocked(updated)
@@ -15262,7 +15600,7 @@ class SQLiteTaskStore(TaskStore):
                 worker_id=worker_id,
                 session_id=session_id,
                 session_instance_id=session_instance_id,
-                now=datetime.now(UTC),
+                now=self._ownership_clock(),
             )
 
     async def load_direct_attached_task_resume(
@@ -15669,7 +16007,7 @@ class SQLiteTaskStore(TaskStore):
                     session_id=effective_session_id,
                     session_binding=session_binding,
                 )
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 updated = task.model_copy(
                     update={
                         "status": TaskStatus.RUNNING,
@@ -15689,17 +16027,23 @@ class SQLiteTaskStore(TaskStore):
         session_id: str,
         session_invocation: SessionInvocationBinding,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
             with self._verified_transaction_unlocked():
                 # Lease authority must be sampled only after BEGIN IMMEDIATE
                 # has acquired SQLite's cross-process writer lock. A timestamp
                 # captured before that wait could outlive the worker lease.
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 task = self._require_task_unlocked(task_id)
                 _ensure_retry_series_queue_attempt(task.retry_series)
                 if not _can_attach_claimed_task_state(
@@ -15710,7 +16054,15 @@ class SQLiteTaskStore(TaskStore):
                     expected_worker_id=worker_id,
                     now=now,
                 ):
-                    self._raise_task_claim_attach_error(task_id, worker_id)
+                    self._raise_task_claim_attach_error(task_id, worker_id, now=now)
+                if expected_lease is None:
+                    raise TaskClaimLost("Task attachment requires its exact worker lease.")
+                _ensure_exact_owned_active_task_lease(
+                    task,
+                    worker_id,
+                    expected_lease,
+                    now=now,
+                )
                 if task.work_contract is not None:
                     self._require_task_contract_unlocked(task, task.work_contract)
                     self._ensure_session_execution_authority_unlocked(
@@ -15745,17 +16097,31 @@ class SQLiteTaskStore(TaskStore):
         result: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
-        async with self._lock:
+        if worker_id is not None and lease_expires_at is None:
+            raise TaskClaimLost(
+                "Worker-owned task terminalization requires its exact lease generation."
+            )
+        async with (
+            managed_task_lease_mutation(
+                task_id=task_id,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                presented_lease_expires_at=lease_expires_at,
+            ) as effective_lease,
+            self._lock,
+        ):
             return self._finish_task_unlocked(
                 task_id,
                 TaskStatus.COMPLETED,
                 result=result,
                 error=None,
                 worker_id=worker_id,
+                expected_lease_expires_at=effective_lease,
                 handoff_id=handoff_id,
             )
 
@@ -15765,17 +16131,31 @@ class SQLiteTaskStore(TaskStore):
         error: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
-        async with self._lock:
+        if worker_id is not None and lease_expires_at is None:
+            raise TaskClaimLost(
+                "Worker-owned task terminalization requires its exact lease generation."
+            )
+        async with (
+            managed_task_lease_mutation(
+                task_id=task_id,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                presented_lease_expires_at=lease_expires_at,
+            ) as effective_lease,
+            self._lock,
+        ):
             return self._finish_task_unlocked(
                 task_id,
                 TaskStatus.FAILED,
                 result=None,
                 error=error,
                 worker_id=worker_id,
+                expected_lease_expires_at=effective_lease,
                 handoff_id=handoff_id,
             )
 
@@ -15797,6 +16177,7 @@ class SQLiteTaskStore(TaskStore):
                         row=receipt_row,
                     )
                     replayed = _replay_task_terminalization_receipt(
+                        request=request,
                         request_sha256=request_sha256,
                         receipt=receipt,
                         current_task=self._load_task_unlocked(request.task_id),
@@ -15822,8 +16203,8 @@ class SQLiteTaskStore(TaskStore):
                     raise TaskTerminalizationConflict(
                         "Task is terminal without the matching terminalization receipt."
                     )
-                now = datetime.now(UTC)
-                _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                now = self._ownership_clock()
+                _ensure_task_terminalization_lease_authority(task, request, now=now)
                 _ensure_task_handoff_authority(task, request.handoff_id)
 
                 _validate_ordinary_task_terminalization_against_cancellation(task, request)
@@ -15877,7 +16258,11 @@ class SQLiteTaskStore(TaskStore):
                     ),
                 )
                 if cursor.rowcount != 1:
-                    self._raise_task_active_lease_error(request.task_id, request.worker_id)
+                    self._raise_task_active_lease_error(
+                        request.task_id,
+                        request.worker_id,
+                        now=now,
+                    )
                 terminal_task = self._require_task_unlocked(request.task_id)
                 self._connection.execute(
                     "INSERT INTO cayu_task_terminalization_receipts "
@@ -15977,7 +16362,7 @@ class SQLiteTaskStore(TaskStore):
                     request.task_id,
                     "Admitted work attempts do not use interrupted-task handoff release.",
                 )
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 _require_interrupted_task_handoff_authority(
                     task,
                     request,
@@ -16096,7 +16481,7 @@ class SQLiteTaskStore(TaskStore):
                 "ORDER BY lease_expires_at ASC, id ASC LIMIT ?",
                 (
                     str(TaskStatus.RUNNING),
-                    sqlite_support.format_datetime(datetime.now(UTC)),
+                    sqlite_support.format_datetime(self._ownership_clock()),
                     *after_params,
                     limit,
                 ),
@@ -16126,7 +16511,7 @@ class SQLiteTaskStore(TaskStore):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 lease_expires_at = now + timedelta(seconds=lease_seconds)
                 prior_claim_row = self._connection.execute(
                     "SELECT task_id, worker_id "
@@ -16313,7 +16698,7 @@ class SQLiteTaskStore(TaskStore):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 rejection_row = self._connection.execute(
                     "SELECT request_sha256, record_json "
                     "FROM cayu_task_retry_reconciliation_rejections "
@@ -16483,6 +16868,7 @@ class SQLiteTaskStore(TaskStore):
                         json.loads(row["receipt_json"])
                     )
                     replayed = _replay_task_retry_settlement(
+                        request=request,
                         request_sha256=request_sha256,
                         receipt=receipt,
                         current_task=self._load_task_unlocked(request.task_id),
@@ -16491,8 +16877,15 @@ class SQLiteTaskStore(TaskStore):
                     return replayed
 
                 task = self._require_task_unlocked(request.task_id)
-                now = datetime.now(UTC)
-                _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                now = self._ownership_clock()
+                if request.lease_expires_at is None:
+                    raise TaskClaimLost("Task retry settlement requires its exact worker lease.")
+                _ensure_exact_owned_active_task_lease(
+                    task,
+                    request.worker_id,
+                    request.lease_expires_at,
+                    now=now,
+                )
                 series_now = self._clock()
                 settled, successor = _settled_task_retry_attempt(
                     task,
@@ -16537,7 +16930,11 @@ class SQLiteTaskStore(TaskStore):
                     ),
                 )
                 if cursor.rowcount != 1:
-                    self._raise_task_active_lease_error(request.task_id, request.worker_id)
+                    self._raise_task_active_lease_error(
+                        request.task_id,
+                        request.worker_id,
+                        now=now,
+                    )
                 if successor is not None:
                     self._connection.execute(
                         """
@@ -16610,7 +17007,7 @@ class SQLiteTaskStore(TaskStore):
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                now = datetime.now(UTC)
+                now = self._ownership_clock()
                 rejection_row = self._connection.execute(
                     "SELECT request_sha256, record_json "
                     "FROM cayu_task_retry_reconciliation_rejections "
@@ -16747,11 +17144,13 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         token_count, estimated_cost = _validated_task_retry_terminal_accounting(
             token_count=token_count,
             estimated_cost=estimated_cost,
@@ -16760,8 +17159,13 @@ class SQLiteTaskStore(TaskStore):
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 task = self._require_task_unlocked(task_id)
-                lease_now = datetime.now(UTC)
-                _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+                lease_now = self._ownership_clock()
+                _ensure_exact_owned_active_task_lease(
+                    task,
+                    worker_id,
+                    expected_lease,
+                    now=lease_now,
+                )
                 if not _claimed_task_retry_attempt_elapsed(task, series_now=self._clock()):
                     self._connection.commit()
                     return None
@@ -16781,7 +17185,7 @@ class SQLiteTaskStore(TaskStore):
                         lease_expires_at = NULL, started_at = ?, completed_at = ?,
                         updated_at = ?, retry_series_json = ?
                     WHERE id = ? AND status IN (?, ?) AND worker_id = ?
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                      AND lease_expires_at = ? AND lease_expires_at > ?
                     """,
                     (
                         str(settled.status),
@@ -16796,11 +17200,12 @@ class SQLiteTaskStore(TaskStore):
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         worker_id,
+                        sqlite_support.format_datetime(expected_lease),
                         sqlite_support.format_datetime(lease_now),
                     ),
                 )
                 if cursor.rowcount != 1:
-                    self._raise_task_active_lease_error(task_id, worker_id)
+                    self._raise_task_active_lease_error(task_id, worker_id, now=lease_now)
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -16823,14 +17228,22 @@ class SQLiteTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
+        *,
+        lease_expires_at: datetime,
     ) -> bool:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 task = self._require_task_unlocked(task_id)
-                _ensure_owned_active_task_lease(task, worker_id, now=datetime.now(UTC))
+                _ensure_exact_owned_active_task_lease(
+                    task,
+                    worker_id,
+                    expected_lease,
+                    now=self._ownership_clock(),
+                )
                 elapsed = _claimed_task_retry_attempt_elapsed(
                     task,
                     series_now=self._clock(),
@@ -16855,6 +17268,79 @@ class SQLiteTaskStore(TaskStore):
                 result=None,
                 error=copied_error,
             )
+
+    async def request_claimed_task_cancellation(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+        error: dict[str, Any] | None = None,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        copied_error = None if error is None else copy_durable_json_object(error, "error")
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                current = self._require_task_unlocked(task_id)
+                if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                    raise TaskClaimLost(
+                        "Claimed-task cancellation no longer owns the expected worker lease."
+                    )
+                if _task_cancellation_requested(current) or (
+                    current.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+                ):
+                    return current.model_copy(deep=True)
+                if current.started_at is not None:
+                    requested = _expired_dispatched_task_cancellation(
+                        current,
+                        updated_at=self._ownership_clock(),
+                        error=copied_error,
+                    )
+                    self._update_task_snapshot_unlocked(requested)
+                    return requested.model_copy(deep=True)
+                return self._finish_task_in_transaction_unlocked(
+                    task_id,
+                    TaskStatus.CANCELLED,
+                    result=None,
+                    error=copied_error,
+                    worker_id=worker_id,
+                    handoff_id=current.interrupted_handoff_id,
+                    expected_lease_expires_at=expected_lease,
+                )
+
+    async def mark_claimed_task_execution_started(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                now = self._ownership_clock()
+                current = self._require_task_unlocked(task_id)
+                if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                    raise TaskClaimLost(
+                        "Claimed-task execution no longer owns the expected worker lease."
+                    )
+                _ensure_owned_active_task_lease(current, worker_id, now=now)
+                if (
+                    current.status is not TaskStatus.CLAIMED
+                    or current.session_id is not None
+                    or _task_cancellation_requested(current)
+                    or current.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+                ):
+                    raise TaskTerminalizationConflict(
+                        "Claimed task cannot begin ordinary worker execution."
+                    )
+                if current.started_at is not None:
+                    return current.model_copy(deep=True)
+                started = current.model_copy(update={"started_at": now, "updated_at": now})
+                self._update_task_snapshot_unlocked(started)
+                return started.model_copy(deep=True)
 
     async def pause_task(
         self,
@@ -16900,9 +17386,9 @@ class SQLiteTaskStore(TaskStore):
 
     async def resume_task(self, task_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
-        now = datetime.now(UTC)
         async with self._lock:
-            with self._connection:
+            with self._verified_transaction_unlocked():
+                now = self._ownership_clock()
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -17000,11 +17486,11 @@ class SQLiteTaskStore(TaskStore):
         # display ordering, so the oldest pending task is dispatched first.
         order_sql = sqlite_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
         async with self._lock:
-            availability_now = self._clock()
-            now = datetime.now(UTC)
-            lease_expires_at = now + timedelta(seconds=lease_seconds)
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                availability_now = self._clock()
+                now = self._ownership_clock()
+                lease_expires_at = now + timedelta(seconds=lease_seconds)
                 expired_rows = self._connection.execute(
                     """
                     SELECT id
@@ -17138,18 +17624,22 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
-        now = datetime.now(UTC)
-        lease_expires_at = now + timedelta(seconds=extend_seconds)
         async with self._lock:
-            with self._connection:
+            with self._verified_transaction_unlocked():
+                now = self._ownership_clock()
+                lease_expires_at = now + timedelta(seconds=extend_seconds)
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
                 _ensure_task_handoff_authority(task, handoff_id)
                 if (
                     self._connection.execute(
@@ -17168,7 +17658,7 @@ class SQLiteTaskStore(TaskStore):
                         updated_at = ?
                     WHERE id = ? AND worker_id = ? AND interrupted_handoff_id IS ?
                       AND status IN (?, ?)
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                      AND lease_expires_at = ? AND lease_expires_at > ?
                       AND NOT EXISTS (
                           SELECT 1 FROM cayu_work_attempt_admissions
                           WHERE task_id = ?
@@ -17182,27 +17672,37 @@ class SQLiteTaskStore(TaskStore):
                         handoff_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
+                        sqlite_support.format_datetime(expected_lease),
                         sqlite_support.format_datetime(now),
                         task_id,
                     ),
                 )
-            if cursor.rowcount != 1:
-                self._raise_if_governed_work_attempt_admission(
-                    task_id,
-                    "Admitted work attempts require claim-fenced lease renewal.",
-                )
-                self._raise_task_active_lease_error(task_id, worker_id)
-            updated = self._require_task_unlocked(task_id)
-            return updated.model_copy(deep=True)
+                if cursor.rowcount != 1:
+                    self._raise_if_governed_work_attempt_admission(
+                        task_id,
+                        "Admitted work attempts require claim-fenced lease renewal.",
+                    )
+                    self._raise_task_active_lease_error(task_id, worker_id, now=now)
+                updated = self._require_task_unlocked(task_id)
+                return updated.model_copy(deep=True)
 
-    async def release_task(self, task_id: str, worker_id: str) -> Task:
+    async def release_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        now = datetime.now(UTC)
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         async with self._lock:
-            with self._connection:
+            with self._verified_transaction_unlocked():
+                now = self._ownership_clock()
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost("Task release no longer owns the expected worker lease.")
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -17219,11 +17719,12 @@ class SQLiteTaskStore(TaskStore):
                     SET status = ?,
                         worker_id = NULL,
                         lease_expires_at = NULL,
+                        started_at = NULL,
                         updated_at = ?
                     WHERE id = ? AND worker_id = ? AND status = ?
                       AND session_id IS NULL
                       AND (status_reason IS NULL OR status_reason NOT IN (?, ?))
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                      AND lease_expires_at = ? AND lease_expires_at > ?
                       AND NOT EXISTS (
                           SELECT 1 FROM cayu_work_attempt_admissions
                           WHERE task_id = ?
@@ -17237,27 +17738,39 @@ class SQLiteTaskStore(TaskStore):
                         str(TaskStatus.CLAIMED),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         _TASK_CANCELLATION_REQUESTED_REASON,
+                        sqlite_support.format_datetime(expected_lease),
                         sqlite_support.format_datetime(now),
                         task_id,
                     ),
                 )
-            if cursor.rowcount != 1:
-                self._raise_if_governed_work_attempt_admission(
-                    task_id,
-                    "Admitted work attempts release ownership through proposal publication.",
-                )
-                self._raise_task_release_error(task_id, worker_id)
-            updated = self._require_task_unlocked(task_id)
-            return updated.model_copy(deep=True)
+                if cursor.rowcount != 1:
+                    self._raise_if_governed_work_attempt_admission(
+                        task_id,
+                        "Admitted work attempts release ownership through proposal publication.",
+                    )
+                    self._raise_task_release_error(task_id, worker_id, now=now)
+                updated = self._require_task_unlocked(task_id)
+                return updated.model_copy(deep=True)
 
-    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+    async def release_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        now = datetime.now(UTC)
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         async with self._lock:
-            with self._connection:
+            with self._verified_transaction_unlocked():
+                now = self._ownership_clock()
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost(
+                        "Attached-task release no longer owns the expected worker lease."
+                    )
                 if task.interrupted_handoff_id is not None:
                     raise TaskInterruptedHandoffConflict(
                         "Recovery-owned attached tasks must publish an interrupted handoff."
@@ -17281,7 +17794,7 @@ class SQLiteTaskStore(TaskStore):
                     WHERE id = ? AND worker_id = ? AND status = ?
                       AND session_id IS NOT NULL
                       AND (status_reason IS NULL OR status_reason != ?)
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                      AND lease_expires_at = ? AND lease_expires_at > ?
                       AND NOT EXISTS (
                           SELECT 1 FROM cayu_work_attempt_admissions
                           WHERE task_id = ?
@@ -17293,18 +17806,23 @@ class SQLiteTaskStore(TaskStore):
                         worker_id,
                         str(TaskStatus.RUNNING),
                         _TASK_CANCELLATION_REQUESTED_REASON,
+                        sqlite_support.format_datetime(expected_lease),
                         sqlite_support.format_datetime(now),
                         task_id,
                     ),
                 )
-            if cursor.rowcount != 1:
-                self._raise_if_governed_work_attempt_admission(
-                    task_id,
-                    "Admitted work attempts release ownership through proposal publication.",
-                )
-                self._raise_attached_task_worker_release_error(task_id, worker_id)
-            updated = self._require_task_unlocked(task_id)
-            return updated.model_copy(deep=True)
+                if cursor.rowcount != 1:
+                    self._raise_if_governed_work_attempt_admission(
+                        task_id,
+                        "Admitted work attempts release ownership through proposal publication.",
+                    )
+                    self._raise_attached_task_worker_release_error(
+                        task_id,
+                        worker_id,
+                        now=now,
+                    )
+                updated = self._require_task_unlocked(task_id)
+                return updated.model_copy(deep=True)
 
     async def reclaim_expired(
         self,
@@ -17334,10 +17852,10 @@ class SQLiteTaskStore(TaskStore):
                 *clauses,
             ]
         )
-        now = datetime.now(UTC)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                now = self._ownership_clock()
                 rows = self._connection.execute(
                     f"""
                     SELECT id
@@ -17356,27 +17874,26 @@ class SQLiteTaskStore(TaskStore):
                     ],
                 ).fetchall()
                 task_ids = [row["id"] for row in rows]
-                if task_ids:
-                    self._connection.executemany(
-                        """
-                        UPDATE cayu_tasks
-                        SET status = ?,
-                            worker_id = NULL,
-                            lease_expires_at = NULL,
-                            updated_at = ?
-                        WHERE id = ? AND status = ? AND session_id IS NULL
-                        """,
-                        [
-                            (
-                                str(TaskStatus.PENDING),
-                                sqlite_support.format_datetime(now),
-                                task_id,
-                                str(TaskStatus.CLAIMED),
-                            )
-                            for task_id in task_ids
-                        ],
+                reclaimed: list[Task] = []
+                for task_id in task_ids:
+                    task = self._require_task_unlocked(task_id)
+                    if task.started_at is not None:
+                        requested = _expired_dispatched_task_cancellation(
+                            task,
+                            updated_at=now,
+                        )
+                        self._update_task_snapshot_unlocked(requested)
+                        continue
+                    updated = task.model_copy(
+                        update={
+                            "status": TaskStatus.PENDING,
+                            "worker_id": None,
+                            "lease_expires_at": None,
+                            "updated_at": now,
+                        }
                     )
-                reclaimed = [self._require_task_unlocked(task_id) for task_id in task_ids]
+                    self._update_task_snapshot_unlocked(updated)
+                    reclaimed.append(updated)
                 self._connection.commit()
                 return [task.model_copy(deep=True) for task in reclaimed]
             except Exception:
@@ -17467,12 +17984,57 @@ class SQLiteTaskStore(TaskStore):
         error: dict[str, Any] | None,
         worker_id: str | None = None,
         handoff_id: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
     ) -> Task:
-        now = datetime.now(UTC)
+        with self._verified_transaction_unlocked():
+            return self._finish_task_in_transaction_unlocked(
+                task_id,
+                status,
+                result=result,
+                error=error,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                expected_lease_expires_at=expected_lease_expires_at,
+            )
+
+    def _finish_task_in_transaction_unlocked(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        result: dict[str, Any] | None,
+        error: dict[str, Any] | None,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
+    ) -> Task:
+        now = self._ownership_clock()
         task = self._require_task_unlocked(task_id)
         if worker_id is not None:
+            if expected_lease_expires_at is not None:
+                expected_lease_expires_at = normalize_utc_datetime(
+                    expected_lease_expires_at,
+                    "lease_expires_at",
+                )
+                if task.lease_expires_at != expected_lease_expires_at:
+                    raise TaskClaimLost(
+                        "Task terminalization no longer owns the expected worker lease."
+                    )
             _ensure_owned_active_task_lease(task, worker_id, now=now)
             _ensure_task_handoff_authority(task, handoff_id)
+        cancellation_owner_clause = ""
+        cancellation_owner_params: list[str | None] = []
+        if worker_id is not None and expected_lease_expires_at is not None:
+            cancellation_owner_clause = (
+                "\n                          AND worker_id = ?"
+                "\n                          AND lease_expires_at = ?"
+                "\n                          AND interrupted_handoff_id IS ?"
+            )
+            cancellation_owner_params = [
+                worker_id,
+                sqlite_support.format_datetime(expected_lease_expires_at),
+                handoff_id,
+            ]
         if (
             self._connection.execute(
                 "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -17497,27 +18059,27 @@ class SQLiteTaskStore(TaskStore):
                     error=error,
                     updated_at=now,
                 )
-                with self._connection:
-                    cursor = self._connection.execute(
-                        """
-                        UPDATE cayu_tasks
-                        SET status_reason = ?, status_payload_json = ?, updated_at = ?
-                        WHERE id = ? AND status IN (?, ?)
-                          AND NOT EXISTS (
-                              SELECT 1 FROM cayu_work_attempt_admissions
-                              WHERE task_id = ?
-                          )
-                        """,
-                        (
-                            cancellation_requested.status_reason,
-                            sqlite_support.json_dumps(cancellation_requested.status_payload),
-                            sqlite_support.format_datetime(cancellation_requested.updated_at),
-                            task_id,
-                            str(TaskStatus.CLAIMED),
-                            str(TaskStatus.RUNNING),
-                            task_id,
-                        ),
-                    )
+                cursor = self._connection.execute(
+                    f"""
+                    UPDATE cayu_tasks
+                    SET status_reason = ?, status_payload_json = ?, updated_at = ?
+                    WHERE id = ? AND status IN (?, ?){cancellation_owner_clause}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cayu_work_attempt_admissions
+                          WHERE task_id = ?
+                      )
+                    """,
+                    (
+                        cancellation_requested.status_reason,
+                        sqlite_support.json_dumps(cancellation_requested.status_payload),
+                        sqlite_support.format_datetime(cancellation_requested.updated_at),
+                        task_id,
+                        str(TaskStatus.CLAIMED),
+                        str(TaskStatus.RUNNING),
+                        *cancellation_owner_params,
+                        task_id,
+                    ),
+                )
                 if cursor.rowcount != 1:
                     self._raise_if_governed_work_attempt_admission(
                         task_id,
@@ -17538,33 +18100,34 @@ class SQLiteTaskStore(TaskStore):
             and status is TaskStatus.CANCELLED
             and task.worker_id is not None
             and task.lease_expires_at is not None
+            and not _task_cancellation_requested(task)
         ):
             cancellation_requested = _task_cancellation_requested_task(
                 task,
                 error=error,
                 updated_at=now,
             )
-            with self._connection:
-                cursor = self._connection.execute(
-                    """
-                    UPDATE cayu_tasks
-                    SET status_reason = ?, status_payload_json = ?, updated_at = ?
-                    WHERE id = ? AND status IN (?, ?)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM cayu_work_attempt_admissions
-                          WHERE task_id = ?
-                      )
-                    """,
-                    (
-                        cancellation_requested.status_reason,
-                        sqlite_support.json_dumps(cancellation_requested.status_payload),
-                        sqlite_support.format_datetime(cancellation_requested.updated_at),
-                        task_id,
-                        str(TaskStatus.CLAIMED),
-                        str(TaskStatus.RUNNING),
-                        task_id,
-                    ),
-                )
+            cursor = self._connection.execute(
+                f"""
+                UPDATE cayu_tasks
+                SET status_reason = ?, status_payload_json = ?, updated_at = ?
+                WHERE id = ? AND status IN (?, ?){cancellation_owner_clause}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cayu_work_attempt_admissions
+                      WHERE task_id = ?
+                  )
+                """,
+                (
+                    cancellation_requested.status_reason,
+                    sqlite_support.json_dumps(cancellation_requested.status_payload),
+                    sqlite_support.format_datetime(cancellation_requested.updated_at),
+                    task_id,
+                    str(TaskStatus.CLAIMED),
+                    str(TaskStatus.RUNNING),
+                    *cancellation_owner_params,
+                    task_id,
+                ),
+            )
             if cursor.rowcount != 1:
                 self._raise_if_governed_work_attempt_admission(
                     task_id,
@@ -17601,78 +18164,77 @@ class SQLiteTaskStore(TaskStore):
                 "\n                  AND interrupted_handoff_id IS ?"
             )
             owner_params = [worker_id, sqlite_support.format_datetime(now), handoff_id]
-        with self._connection:
-            cursor = self._connection.execute(
-                f"""
-                UPDATE cayu_tasks
-                SET status = ?,
-                    status_reason = ?,
-                    status_payload_json = ?,
-                    result_json = ?,
-                    error_json = ?,
-                    worker_id = NULL,
-                    lease_expires_at = NULL,
-                    interrupted_handoff_id = NULL,
-                    started_at = COALESCE(started_at, ?),
-                    completed_at = ?,
-                    updated_at = ?,
-                    retry_series_json = ?
-                WHERE id = ?
-                  AND status NOT IN (?, ?, ?)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM cayu_work_attempt_admissions
-                      WHERE task_id = ?
-                  ){owner_clause}
-                """,
+        cursor = self._connection.execute(
+            f"""
+            UPDATE cayu_tasks
+            SET status = ?,
+                status_reason = ?,
+                status_payload_json = ?,
+                result_json = ?,
+                error_json = ?,
+                worker_id = NULL,
+                lease_expires_at = NULL,
+                interrupted_handoff_id = NULL,
+                started_at = COALESCE(started_at, ?),
+                completed_at = ?,
+                updated_at = ?,
+                retry_series_json = ?
+            WHERE id = ?
+              AND status NOT IN (?, ?, ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM cayu_work_attempt_admissions
+                  WHERE task_id = ?
+              ){owner_clause}
+            """,
+            (
+                str(status),
+                terminal_task.status_reason,
                 (
-                    str(status),
-                    terminal_task.status_reason,
-                    (
-                        None
-                        if terminal_task.status_payload is None
-                        else sqlite_support.json_dumps(terminal_task.status_payload)
-                    ),
-                    (
-                        None
-                        if terminal_task.result is None
-                        else sqlite_support.json_dumps(terminal_task.result)
-                    ),
-                    (
-                        None
-                        if terminal_task.error is None
-                        else sqlite_support.json_dumps(terminal_task.error)
-                    ),
-                    sqlite_support.format_optional_datetime(terminal_task.started_at),
-                    sqlite_support.format_optional_datetime(terminal_task.completed_at),
-                    sqlite_support.format_datetime(terminal_task.updated_at),
-                    (
-                        None
-                        if terminal_task.retry_series is None
-                        else sqlite_support.json_dumps(
-                            terminal_task.retry_series.model_dump(mode="json")
-                        )
-                    ),
-                    task_id,
-                    str(TaskStatus.COMPLETED),
-                    str(TaskStatus.FAILED),
-                    str(TaskStatus.CANCELLED),
-                    task_id,
-                    *owner_params,
+                    None
+                    if terminal_task.status_payload is None
+                    else sqlite_support.json_dumps(terminal_task.status_payload)
+                ),
+                (
+                    None
+                    if terminal_task.result is None
+                    else sqlite_support.json_dumps(terminal_task.result)
+                ),
+                (
+                    None
+                    if terminal_task.error is None
+                    else sqlite_support.json_dumps(terminal_task.error)
+                ),
+                sqlite_support.format_optional_datetime(terminal_task.started_at),
+                sqlite_support.format_optional_datetime(terminal_task.completed_at),
+                sqlite_support.format_datetime(terminal_task.updated_at),
+                (
+                    None
+                    if terminal_task.retry_series is None
+                    else sqlite_support.json_dumps(
+                        terminal_task.retry_series.model_dump(mode="json")
+                    )
+                ),
+                task_id,
+                str(TaskStatus.COMPLETED),
+                str(TaskStatus.FAILED),
+                str(TaskStatus.CANCELLED),
+                task_id,
+                *owner_params,
+            ),
+        )
+        if cursor.rowcount == 1 and cancellation is not None:
+            self._connection.execute(
+                "INSERT INTO cayu_task_retry_settlements "
+                "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    cancellation.task_id,
+                    cancellation.idempotency_key,
+                    cancellation.request_sha256,
+                    sqlite_support.json_dumps(cancellation.model_dump(mode="json")),
+                    sqlite_support.format_datetime(cancellation.committed_at),
                 ),
             )
-            if cursor.rowcount == 1 and cancellation is not None:
-                self._connection.execute(
-                    "INSERT INTO cayu_task_retry_settlements "
-                    "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        cancellation.task_id,
-                        cancellation.idempotency_key,
-                        cancellation.request_sha256,
-                        sqlite_support.json_dumps(cancellation.model_dump(mode="json")),
-                        sqlite_support.format_datetime(cancellation.committed_at),
-                    ),
-                )
         if cursor.rowcount != 1:
             if worker_id is not None:
                 current = self._require_task_unlocked(task_id)
@@ -17701,9 +18263,9 @@ class SQLiteTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         reason = _copy_optional_status_reason(reason)
         payload = _copy_optional_status_payload(payload)
-        now = datetime.now(UTC)
         async with self._lock:
-            with self._connection:
+            with self._verified_transaction_unlocked():
+                now = self._ownership_clock()
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -17755,22 +18317,22 @@ class SQLiteTaskStore(TaskStore):
                         task_id,
                     ),
                 )
-            if cursor.rowcount != 1:
-                if (
-                    self._connection.execute(
-                        "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
-                        (task_id,),
-                    ).fetchone()
-                    is not None
-                ):
-                    raise WorkAttemptExecutionClaimLost(
-                        "Admitted work attempts cannot use ordinary task holds."
-                    )
-                task = self._require_task_unlocked(task_id)
-                _ensure_can_hold_task(task, status)
-                raise ValueError(f"Task {task.id} cannot transition to {status}")
-            updated = self._require_task_unlocked(task_id)
-            return updated.model_copy(deep=True)
+                if cursor.rowcount != 1:
+                    if (
+                        self._connection.execute(
+                            "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
+                            (task_id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise WorkAttemptExecutionClaimLost(
+                            "Admitted work attempts cannot use ordinary task holds."
+                        )
+                    task = self._require_task_unlocked(task_id)
+                    _ensure_can_hold_task(task, status)
+                    raise ValueError(f"Task {task.id} cannot transition to {status}")
+                updated = self._require_task_unlocked(task_id)
+                return updated.model_copy(deep=True)
 
     def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]:
         clauses: list[str] = []
@@ -17789,14 +18351,26 @@ class SQLiteTaskStore(TaskStore):
             params.append(query.assigned_agent_name)
         return clauses, params
 
-    def _raise_task_active_lease_error(self, task_id: str, worker_id: str) -> None:
+    def _raise_task_active_lease_error(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        now: datetime,
+    ) -> None:
         task = self._require_task_unlocked(task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         raise RuntimeError(f"Task {task.id} active-lease mutation did not update a row.")
 
-    def _raise_task_release_error(self, task_id: str, worker_id: str) -> None:
+    def _raise_task_release_error(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        now: datetime,
+    ) -> None:
         task = self._require_task_unlocked(task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
@@ -17814,9 +18388,11 @@ class SQLiteTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
+        *,
+        now: datetime,
     ) -> None:
         task = self._require_task_unlocked(task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         if task.status is not TaskStatus.RUNNING:
             raise ValueError(f"Task {task.id} is not running.")
         if task.session_id is None:
@@ -17827,9 +18403,15 @@ class SQLiteTaskStore(TaskStore):
             )
         raise RuntimeError(f"Task {task.id} active attached claim could not be released.")
 
-    def _raise_task_claim_attach_error(self, task_id: str, worker_id: str) -> None:
+    def _raise_task_claim_attach_error(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        now: datetime,
+    ) -> None:
         task = self._require_task_unlocked(task_id)
-        _raise_task_claim_attach_error(task, worker_id)
+        _raise_task_claim_attach_error(task, worker_id, now=now)
 
 
 def _sqlite_task_terminalization_receipt(

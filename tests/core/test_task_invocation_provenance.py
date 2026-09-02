@@ -80,12 +80,14 @@ def test_task_root_and_child_provenance_is_immutable(store_factory, tmp_path) ->
                 ),
             ),
             worker_id="worker-a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         assert attached.invocation == root.invocation
         completed = await store.complete_task(
             attached.id,
             {"ok": True},
             worker_id="worker-a",
+            lease_expires_at=attached.lease_expires_at,
         )
         assert completed.invocation == root.invocation
 

@@ -196,6 +196,74 @@ def _create_command(
     )
 
 
+def test_rebind_rejects_recovery_claim_that_expires_after_command_preparation() -> None:
+    async def scenario() -> None:
+        current_time = {"value": datetime(2026, 9, 1, tzinfo=UTC)}
+
+        def clock() -> datetime:
+            return current_time["value"]
+
+        store = InMemorySessionStore(ownership_clock=clock)
+        session_id = "expired-rebind-recovery-claim"
+        interaction_id = "interaction-expired-rebind-recovery-claim"
+        profile = _profile()
+        created = await store.apply_invocation_lifecycle_command(
+            _create_command(
+                session_id=session_id,
+                session_instance_id=str(uuid4()),
+                interaction_id=interaction_id,
+                profile=profile,
+            )
+        )
+        assert type(created) is InvocationMutationResult
+        await store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+        def add_claim(_session, checkpoint):
+            assert checkpoint is not None
+            updated = dict(checkpoint)
+            updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
+                "version": 1,
+                "claim_id": "claim-expired-before-rebind",
+                "claimed_at": current_time["value"].isoformat(),
+                "claim_expires_at": (current_time["value"] + timedelta(minutes=5)).isoformat(),
+            }
+            return updated
+
+        await store.transform_checkpoint(session_id, add_claim)
+        source_session = await store.load(session_id)
+        source_checkpoint = await store.load_checkpoint(session_id)
+        assert source_session is not None
+        assert source_checkpoint is not None
+
+        def rebind_checkpoint(current_session, checkpoint):
+            assert checkpoint is not None
+            return checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=interaction_id,
+                run_epoch=current_session.run_epoch + 1,
+                profile=profile,
+                expected=created.active_profile,
+            )
+
+        command = prepare_rebind_invocation_command(
+            source_session,
+            source_checkpoint,
+            expected_statuses={SessionStatus.INTERRUPTED},
+            checkpoint_transform=rebind_checkpoint,
+        )
+        current_time["value"] += timedelta(minutes=6)
+
+        with pytest.raises(SessionRunFenced, match="expired before run ownership transfer"):
+            await store.apply_invocation_lifecycle_command(command)
+        unchanged = await store.load(session_id)
+        assert unchanged is not None
+        assert unchanged.run_epoch == source_session.run_epoch
+        assert unchanged.status is SessionStatus.INTERRUPTED
+
+    asyncio.run(scenario())
+
+
 def _transition_event(
     *,
     session_id: str,
@@ -2593,6 +2661,73 @@ def test_runtime_checkpoint_adapter_owns_command_codec_and_rejects_v4_collision(
         )
         with pytest.raises(ValueError, match="Session already exists"):
             await store.apply_invocation_lifecycle_command(collision)
+
+    asyncio.run(run())
+
+
+def test_runtime_checkpoint_adapter_wraps_store_time_event_publication() -> None:
+    async def run() -> None:
+        raw_store = InMemorySessionStore()
+        store = runtime_checkpoint_session_store(raw_store)
+        session_id = f"store-time-checkpoint-adapter-{uuid4().hex}"
+        await raw_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "checkpoint")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+        await raw_store.checkpoint(
+            session_id,
+            {
+                CHECKPOINT_SCHEMA_VERSION_KEY: 4,
+                "ordinary": "preserved",
+            },
+        )
+        observed_versions: list[int] = []
+
+        def migrate_and_publish(_session, checkpoint, _store_now):
+            assert checkpoint is not None
+            observed_versions.append(checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY])
+            return {**checkpoint, "store-time-publication": True}
+
+        await store.publish_checkpoint_and_events_with_store_time(
+            session_id,
+            idempotency_key=f"store-time-publication-{uuid4().hex}",
+            checkpoint_transform=migrate_and_publish,
+            commit_time_guard=lambda _store_now: None,
+            events=[],
+        )
+        migrated = await raw_store.load_checkpoint(session_id)
+        assert migrated is not None
+        assert observed_versions == [CURRENT_CHECKPOINT_SCHEMA_VERSION]
+        assert migrated[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
+        assert migrated["ordinary"] == "preserved"
+        assert migrated["store-time-publication"] is True
+
+        future = dict(migrated)
+        future[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
+        with sessions_module._invocation_lifecycle_authority_mutation_scope():
+            await raw_store.checkpoint(session_id, future)
+        callback_called = False
+
+        def reject_future(_session, checkpoint, _store_now):
+            nonlocal callback_called
+            callback_called = True
+            return checkpoint
+
+        with pytest.raises(CheckpointCompatibilityError):
+            await store.publish_checkpoint_and_events_with_store_time(
+                session_id,
+                idempotency_key=f"future-store-time-publication-{uuid4().hex}",
+                checkpoint_transform=reject_future,
+                commit_time_guard=lambda _store_now: None,
+                events=[],
+            )
+        assert callback_called is False
+        assert await raw_store.load_checkpoint(session_id) == future
 
     asyncio.run(run())
 

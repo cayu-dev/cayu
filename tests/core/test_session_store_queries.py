@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import sqlite3
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -11,6 +12,9 @@ import pytest
 from pydantic import ValidationError
 from tests._session_provenance import fixture_session_invocation
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
+from tests.core.session_store_time_conformance import (
+    assert_session_store_time_conformance,
+)
 
 from cayu import (
     EventOrder,
@@ -150,7 +154,119 @@ def test_session_store_requires_run_fencing_implementation() -> None:
         "fence_stalled_run",
         "query_pending_actions",
         "release_run_fence",
+        "reserve_stalled_run_recovery",
+        "transform_checkpoint_with_store_time",
     } <= SessionStore.__abstractmethods__
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_store_authoritative_time_conformance(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    initial_time = datetime(2026, 1, 1, tzinfo=UTC)
+    now = [initial_time]
+    if store_factory is SQLiteSessionStore:
+        path = tmp_path / "session-store-time.sqlite"
+        store: SessionStore = SQLiteSessionStore(
+            path,
+            ownership_clock=lambda: now[0],
+        )
+        contender_store: SessionStore | None = SQLiteSessionStore(
+            path,
+            ownership_clock=lambda: now[0],
+        )
+    else:
+        store = InMemorySessionStore(ownership_clock=lambda: now[0])
+        contender_store = None
+
+    async def run() -> None:
+        try:
+            await assert_session_store_time_conformance(
+                store,
+                initial_time=initial_time,
+                set_store_time=lambda value: now.__setitem__(0, value),
+                contender_store=contender_store,
+            )
+        finally:
+            if contender_store is not None:
+                await _close_store(contender_store)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["checkpoint", "event", "transcript"])
+def test_sqlite_session_activity_samples_time_after_writer_lock(
+    tmp_path,
+    operation: str,
+) -> None:
+    async def run() -> None:
+        boundary = datetime(2026, 1, 1, tzinfo=UTC)
+        now = [boundary]
+        path = tmp_path / f"session-activity-lock-clock-{operation}.sqlite"
+        store = SQLiteSessionStore(path, ownership_clock=lambda: now[0])
+        blocker: sqlite3.Connection | None = None
+        release_timer: threading.Timer | None = None
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="session-activity-lock-clock",
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+            )
+            assert session.last_activity_at == boundary
+
+            blocker = sqlite3.connect(path, timeout=5, check_same_thread=False)
+            blocker.execute("PRAGMA busy_timeout = 5000")
+            blocker.execute("BEGIN IMMEDIATE")
+
+            def release_writer() -> None:
+                now[0] = boundary + timedelta(minutes=1)
+                assert blocker is not None
+                blocker.commit()
+
+            release_timer = threading.Timer(0.05, release_writer)
+            release_timer.start()
+            if operation == "checkpoint":
+                await store.checkpoint(session.id, {"progress": "durable"})
+            elif operation == "event":
+                await store.append_event(
+                    session.id,
+                    Event(
+                        id="event-after-writer-lock",
+                        type=EventType.SESSION_STARTED,
+                        session_id=session.id,
+                    ),
+                )
+            else:
+                await store.append_transcript_messages(
+                    session.id,
+                    [Message.text("assistant", "after writer lock")],
+                )
+
+            updated = await store.load(session.id)
+            assert updated is not None
+            assert updated.last_activity_at == now[0]
+            assert (
+                await store.reserve_stalled_run_recovery(
+                    session.id,
+                    statuses={SessionStatus.PENDING},
+                    inactive_for_seconds=60,
+                    checkpoint_transform=lambda _session, checkpoint, _store_now: checkpoint,
+                )
+                is None
+            )
+        finally:
+            if release_timer is not None:
+                release_timer.join(timeout=5)
+            if blocker is not None:
+                blocker.close()
+            await store.close()
+
+    asyncio.run(run())
 
 
 def test_event_query_requires_session_id_for_event_id() -> None:
@@ -931,7 +1047,15 @@ def test_session_stores_filter_sessions_by_last_activity(
     store_factory: StoreFactory,
     tmp_path,
 ):
-    store = _make_store(store_factory, tmp_path)
+    now = [datetime(2026, 1, 1, tzinfo=UTC)]
+    store = (
+        SQLiteSessionStore(
+            tmp_path / "sessions.sqlite",
+            ownership_clock=lambda: now[0],
+        )
+        if store_factory is SQLiteSessionStore
+        else InMemorySessionStore(ownership_clock=lambda: now[0])
+    )
 
     async def run_store_operations() -> None:
         for session_id in ("sess_activity_stale", "sess_activity_recent"):
@@ -943,8 +1067,8 @@ def test_session_stores_filter_sessions_by_last_activity(
                 ),
                 identity=_identity(),
             )
-        inactive_before = datetime.now(UTC)
-        await asyncio.sleep(0.001)
+        inactive_before = now[0]
+        now[0] += timedelta(seconds=1)
         await store.append_event(
             "sess_activity_recent",
             Event(
@@ -2653,7 +2777,7 @@ def test_session_stores_fence_writes_from_stalled_run(
         fenced = await store.fence_stalled_run(
             "sess_fenced",
             statuses={SessionStatus.RUNNING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is not None
         assert fenced.run_epoch == 2

@@ -8,6 +8,7 @@ import traceback as traceback_module
 import warnings
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from threading import Event as ThreadEvent
 from threading import Thread
 from typing import Any
@@ -16,6 +17,7 @@ import pytest
 from tests.core.task_invocation_fixtures import (
     stored_session_invocation,
     task_backed_session_invocation,
+    unattributed_session_invocation_binding,
 )
 from tests.core.test_verified_work_contracts import (
     _accepted_decision,
@@ -109,6 +111,8 @@ from cayu.runtime.work_attempt_admission import (
     WorkAttemptExecutionClaimRequest,
     WorkAttemptRecoveryActivate,
     WorkAttemptRecoveryRequired,
+    work_attempt_admission_prepare_matches_sha256,
+    work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
 from cayu.runtime.work_contracts import (
@@ -123,8 +127,8 @@ from cayu.storage.migrations import SchemaMode
 class _LoseFirstAdmissionPreparationAcknowledgement(InMemoryTaskStore):
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self._lose_prepare_ack = True
 
     async def prepare_work_attempt_admission(
@@ -150,8 +154,13 @@ class _AdmissionResultResolver(CompletionResultResolver):
 class _LoseFirstAdmissionActivationAcknowledgement(InMemoryTaskStore):
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
-        super().__init__(clock=clock)
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        ownership_clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self._lose_activation_ack = True
 
     async def activate_work_attempt_admission(
@@ -168,8 +177,8 @@ class _LoseFirstAdmissionActivationAcknowledgement(InMemoryTaskStore):
 class _LoseFirstRecoveryActivationAcknowledgement(InMemoryTaskStore):
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self._lose_recovery_ack = True
 
     async def activate_work_attempt_recovery(
@@ -186,8 +195,8 @@ class _LoseFirstRecoveryActivationAcknowledgement(InMemoryTaskStore):
 class _FailFirstRecoveryActivationBeforeMutation(InMemoryTaskStore):
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self._fail_recovery_activation = True
 
     async def activate_work_attempt_recovery(
@@ -205,8 +214,8 @@ class _SecretBearingHistoricalClaimStore(_FailFirstRecoveryActivationBeforeMutat
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, secret: str, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, secret: str, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self._secret = secret
         self.forge_historical_claim = False
 
@@ -223,8 +232,8 @@ class _SecretBearingHistoricalClaimStore(_FailFirstRecoveryActivationBeforeMutat
 class _FailFirstSQLiteRecoveryActivationBeforeMutation(SQLiteTaskStore):
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, path, *, clock) -> None:
-        super().__init__(path, clock=clock)
+    def __init__(self, path, *, clock, ownership_clock=None) -> None:
+        super().__init__(path, clock=clock, ownership_clock=ownership_clock)
         self._fail_recovery_activation = True
 
     async def activate_work_attempt_recovery(
@@ -242,8 +251,13 @@ class _ConflictingWorkAttemptResultStore(InMemoryTaskStore):
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
-        super().__init__(clock=clock)
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        ownership_clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self.forge_prepare = False
         self.forge_prepare_sha256: str | None = None
         self.forge_activation = False
@@ -360,8 +374,8 @@ class _SecretBearingTaskResultStore(InMemoryTaskStore):
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, secret: str, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, secret: str, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self._secret = secret
         self.forge_task_result = False
 
@@ -518,8 +532,8 @@ class _RacingWorkAttemptClaimStore(InMemoryTaskStore):
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self.lose_next_prepare_ack = False
         self.block_next_claim = False
         self.claim_started = asyncio.Event()
@@ -551,8 +565,8 @@ class _RacingWorkAttemptRenewalStore(InMemoryTaskStore):
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self.block_next_renewal = False
         self.renewal_started = asyncio.Event()
         self.release_renewal = asyncio.Event()
@@ -573,8 +587,8 @@ class _RacingWorkAttemptProposalStore(InMemoryTaskStore):
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self.block_next_proposal = False
         self.proposal_started = asyncio.Event()
         self.release_proposal = asyncio.Event()
@@ -595,8 +609,8 @@ class _IneligibleWorkAttemptTransitionStore(InMemoryTaskStore):
 
     verified_work_mutations_are_cancellation_quiescent = True
 
-    def __init__(self, *, clock) -> None:
-        super().__init__(clock=clock)
+    def __init__(self, *, clock, ownership_clock=None) -> None:
+        super().__init__(clock=clock, ownership_clock=ownership_clock)
         self.forge_ineligible_renewal = False
         self.forge_ineligible_recovery = False
 
@@ -618,7 +632,7 @@ class _IneligibleWorkAttemptTransitionStore(InMemoryTaskStore):
             return await super().claim_work_attempt_recovery(request)
         admission = await self.load_work_attempt_admission(request.admission_id)
         assert admission is not None
-        claimed_at = max(self._clock(), admission.claim.lease_expires_at)
+        claimed_at = max(self._ownership_clock(), admission.claim.lease_expires_at)
         claim = admission.claim.model_copy(
             update={
                 "claim_id": request.claim_id,
@@ -946,6 +960,7 @@ def _prepare_request(
     attempt_id: str = "attempt-1",
     claim_id: str = "execution-claim-1",
     worker_id: str = "worker-1",
+    task_lease_expires_at: datetime | None = None,
     execution_owner_id: str = "runtime-owner-1",
 ) -> WorkAttemptAdmissionPrepare:
     return WorkAttemptAdmissionPrepare(
@@ -956,6 +971,7 @@ def _prepare_request(
         session_id=session_id,
         interaction_id=f"interaction:{attempt_id}",
         worker_id=worker_id,
+        task_lease_expires_at=task_lease_expires_at,
         execution_owner_id=execution_owner_id,
         generation=1,
         lease_seconds=300,
@@ -965,6 +981,29 @@ def _prepare_request(
         session_invocation=session_invocation,
         source_execution_profile_fingerprint=_digest("worker-profile"),
     )
+
+
+def test_work_attempt_admission_digest_accepts_pre_lease_receipt() -> None:
+    request = _prepare_request(
+        task_id="task-1",
+        session_id="session-1",
+        session_invocation=unattributed_session_invocation_binding("session-1"),
+        task_lease_expires_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
+    )
+    current_sha256 = work_attempt_admission_prepare_sha256(request)
+    legacy_sha256 = sha256(
+        canonical_durable_json_bytes(
+            request.model_dump(
+                mode="json",
+                warnings=False,
+                exclude={"task_lease_expires_at"},
+            ),
+            "work_attempt_admission",
+        )
+    ).hexdigest()
+
+    assert current_sha256 != legacy_sha256
+    assert work_attempt_admission_prepare_matches_sha256(request, legacy_sha256)
 
 
 async def _configured_public_initial_admission(
@@ -1216,12 +1255,17 @@ def test_admission_keeps_queue_lease_time_separate_from_verified_work_clock(
 ) -> None:
     async def scenario() -> None:
         verified_now = datetime(2100, 1, 1, tzinfo=UTC)
+        ownership_now = [datetime(2026, 8, 31, tzinfo=UTC)]
         store = (
-            InMemoryTaskStore(clock=lambda: verified_now)
+            InMemoryTaskStore(
+                clock=lambda: verified_now,
+                ownership_clock=lambda: ownership_now[0],
+            )
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "admission-queue-clock.db",
                 clock=lambda: verified_now,
+                ownership_clock=lambda: ownership_now[0],
             )
         )
         contract = _contract(contract_id=f"admission-queue-clock-{backend}")
@@ -1250,10 +1294,90 @@ def test_admission_keeps_queue_lease_time_separate_from_verified_work_clock(
             attempt_id=f"admission-queue-clock-attempt-{backend}",
             claim_id=f"admission-queue-clock-claim-{backend}",
             worker_id=worker_id,
+            task_lease_expires_at=claimed.lease_expires_at,
         ).model_copy(update={"contract": contract.reference()})
         prepared = await store.prepare_work_attempt_admission(request)
-        assert prepared.claim.claimed_at == verified_now
-        assert prepared.claim.lease_expires_at > prepared.claim.claimed_at
+        assert prepared.claim.claimed_at == ownership_now[0]
+        assert prepared.claim.lease_expires_at == ownership_now[0] + timedelta(minutes=5)
+        assert prepared.prepared_at == ownership_now[0]
+
+        active = await store.activate_work_attempt_admission(
+            WorkAttemptAdmissionActivate(
+                admission_id=prepared.admission_id,
+                claim_id=prepared.claim.claim_id,
+                prepare_request_sha256=prepared.prepare_request_sha256,
+                session_evidence_sha256=_digest("store-time-admission-evidence"),
+            )
+        )
+        assert active.attempt is not None
+        assert active.attempt.started_at == verified_now
+
+        renewal = WorkAttemptExecutionClaimRequest(
+            admission_id=active.admission_id,
+            claim_id=active.claim.claim_id,
+            worker_id=active.claim.worker_id,
+            execution_owner_id=active.claim.execution_owner_id,
+            generation=active.claim.generation,
+            lease_seconds=300,
+        )
+        assert await store.renew_work_attempt_execution_claim(renewal) == active
+
+        ownership_now[0] += timedelta(minutes=5, seconds=1)
+        expired_proposal_request = AdmittedCompletionProposalRequest(
+            admission_id=active.admission_id,
+            claim_id=active.claim.claim_id,
+            execution_owner_id=active.claim.execution_owner_id,
+            generation=active.claim.generation,
+            proposal=CompletionProposalCreate(
+                proposal_id=f"admission-queue-clock-expired-proposal-{backend}",
+                attempt_id=active.attempt_id,
+                result=_result_reference(),
+                evidence_references=(_artifact_evidence(),),
+            ),
+        )
+        with pytest.raises(WorkAttemptExecutionClaimLost, match="expired"):
+            await store.submit_admitted_completion_proposal(expired_proposal_request)
+        assert (
+            await store.load_completion_proposal(expired_proposal_request.proposal.proposal_id)
+            is None
+        )
+
+        recovered = await store.claim_work_attempt_recovery(
+            renewal.model_copy(
+                update={
+                    "claim_id": f"admission-queue-clock-recovery-{backend}",
+                    "worker_id": f"admission-queue-clock-recovery-worker-{backend}",
+                    "execution_owner_id": f"admission-queue-clock-recovery-owner-{backend}",
+                    "generation": 2,
+                }
+            )
+        )
+        assert recovered.state is WorkAttemptAdmissionState.RECOVERING
+        assert recovered.claim.claimed_at == ownership_now[0]
+        assert recovered.claim.generation == 2
+        recovered = await store.activate_work_attempt_recovery(
+            WorkAttemptRecoveryActivate(
+                admission_id=recovered.admission_id,
+                claim_id=recovered.claim.claim_id,
+                generation=recovered.claim.generation,
+                recovery_evidence_sha256=_digest(f"admission-queue-clock-recovery-{backend}"),
+            )
+        )
+        proposal = await store.submit_admitted_completion_proposal(
+            AdmittedCompletionProposalRequest(
+                admission_id=recovered.admission_id,
+                claim_id=recovered.claim.claim_id,
+                execution_owner_id=recovered.claim.execution_owner_id,
+                generation=recovered.claim.generation,
+                proposal=CompletionProposalCreate(
+                    proposal_id=f"admission-queue-clock-proposal-{backend}",
+                    attempt_id=recovered.attempt_id,
+                    result=_result_reference(),
+                    evidence_references=(_artifact_evidence(),),
+                ),
+            )
+        )
+        assert proposal.proposed_at == verified_now
         if isinstance(store, SQLiteTaskStore):
             await store.close()
 
@@ -1312,6 +1436,7 @@ def test_admission_rejects_expired_queue_lease_despite_behind_verified_work_cloc
             attempt_id=f"expired-admission-queue-clock-attempt-{backend}",
             claim_id=f"expired-admission-queue-clock-claim-{backend}",
             worker_id=worker_id,
+            task_lease_expires_at=expired_at,
         ).model_copy(update={"contract": contract.reference()})
         with pytest.raises(TaskClaimLost, match="expired"):
             await store.prepare_work_attempt_admission(request)
@@ -1319,6 +1444,65 @@ def test_admission_rejects_expired_queue_lease_despite_behind_verified_work_cloc
         assert untouched is not None
         assert untouched.worker_id == worker_id
         assert await store.load_work_attempt_admission(request.admission_id) is None
+        if isinstance(store, SQLiteTaskStore):
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_admission_rejects_prior_lease_after_same_worker_reclaims_task(
+    backend: str,
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        ownership_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+        store = (
+            InMemoryTaskStore(ownership_clock=lambda: ownership_now[0])
+            if backend == "memory"
+            else SQLiteTaskStore(
+                tmp_path / "admission-same-worker-reclaim.db",
+                ownership_clock=lambda: ownership_now[0],
+            )
+        )
+        contract = _contract(contract_id=f"same-worker-reclaim-{backend}")
+        await store.publish_work_contract(contract)
+        task = await store.create_task(
+            TaskCreate(
+                task_id=f"same-worker-reclaim-task-{backend}",
+                type="verified-work",
+                work_contract=contract.reference(),
+            )
+        )
+        worker_id = f"same-worker-reclaim-worker-{backend}"
+        first_claim = await store.claim_task(worker_id, lease_seconds=1)
+        assert first_claim is not None
+        session_id = f"same-worker-reclaim-session-{backend}"
+        stale_request = _prepare_request(
+            task_id=task.id,
+            session_id=session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task.id,
+                session_id,
+            ),
+            admission_id=f"same-worker-reclaim-admission-{backend}",
+            attempt_id=f"same-worker-reclaim-attempt-{backend}",
+            claim_id=f"same-worker-reclaim-claim-{backend}",
+            worker_id=worker_id,
+            task_lease_expires_at=first_claim.lease_expires_at,
+        ).model_copy(update={"contract": contract.reference()})
+
+        ownership_now[0] += timedelta(seconds=2)
+        assert [reclaimed.id for reclaimed in await store.reclaim_expired()] == [task.id]
+        successor_claim = await store.claim_task(worker_id, lease_seconds=30)
+        assert successor_claim is not None
+        assert successor_claim.lease_expires_at != first_claim.lease_expires_at
+
+        with pytest.raises(TaskClaimLost, match="lease"):
+            await store.prepare_work_attempt_admission(stale_request)
+        assert await store.load_task(task.id) == successor_claim
+        assert await store.load_work_attempt_admission(stale_request.admission_id) is None
         if isinstance(store, SQLiteTaskStore):
             await store.close()
 
@@ -1410,9 +1594,17 @@ def test_work_attempt_admission_is_exact_and_claim_fenced(
         assert await store.activate_work_attempt_admission(activation) == admitted
 
         with pytest.raises(WorkAttemptExecutionClaimLost):
-            await store.heartbeat(task.id, request.worker_id)
+            await store.heartbeat(
+                task.id,
+                request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         with pytest.raises(WorkAttemptExecutionClaimLost):
-            await store.release_attached_task_worker(task.id, request.worker_id)
+            await store.release_attached_task_worker(
+                task.id,
+                request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         with pytest.raises(WorkAttemptExecutionClaimLost):
             await store.pause_task(task.id, reason="ordinary-pause")
         with pytest.raises(WorkAttemptExecutionClaimLost):
@@ -1424,12 +1616,18 @@ def test_work_attempt_admission_is_exact_and_claim_fenced(
         with pytest.raises(WorkAttemptExecutionClaimLost):
             await store.cancel_task(task.id)
         with pytest.raises(WorkAttemptExecutionClaimLost):
-            await store.complete_task(task.id, _task_result(), worker_id=request.worker_id)
+            await store.complete_task(
+                task.id,
+                _task_result(),
+                worker_id=request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         with pytest.raises(WorkAttemptExecutionClaimLost):
             await store.fail_task(
                 task.id,
                 {"message": "ordinary worker failure"},
                 worker_id=request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
             )
         with pytest.raises(WorkAttemptExecutionClaimLost):
             await store.terminalize_task(
@@ -1519,12 +1717,18 @@ def test_work_attempt_admission_is_exact_and_claim_fenced(
         with pytest.raises(WorkAttemptExecutionClaimLost):
             await store.resume_task(task.id)
         with pytest.raises(TaskClaimLost):
-            await store.complete_task(task.id, _task_result(), worker_id=request.worker_id)
+            await store.complete_task(
+                task.id,
+                _task_result(),
+                worker_id=request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         with pytest.raises(TaskClaimLost):
             await store.fail_task(
                 task.id,
                 {"message": "stale worker failure"},
                 worker_id=request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
             )
         with pytest.raises(WorkAttemptExecutionClaimLost):
             await store.terminalize_task(
@@ -1537,11 +1741,23 @@ def test_work_attempt_admission_is_exact_and_claim_fenced(
                 )
             )
         with pytest.raises(TaskClaimLost):
-            await store.heartbeat(task.id, request.worker_id)
+            await store.heartbeat(
+                task.id,
+                request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         with pytest.raises(TaskClaimLost):
-            await store.release_task(task.id, request.worker_id)
+            await store.release_task(
+                task.id,
+                request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         with pytest.raises(TaskClaimLost):
-            await store.release_attached_task_worker(task.id, request.worker_id)
+            await store.release_attached_task_worker(
+                task.id,
+                request.worker_id,
+                lease_expires_at=reserved.lease_expires_at,
+            )
         assert await store.load_task(task.id) == released_task
         assert await store.submit_admitted_completion_proposal(proposal_request) == proposal
 
@@ -1761,11 +1977,12 @@ def test_expired_preparation_owner_is_replaced_before_publication(
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         store = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "prepared-replacement.db",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         contract = _contract(contract_id=f"prepared-replacement-{backend}")
@@ -1881,6 +2098,7 @@ def test_sqlite_ordinary_task_mutation_cannot_cross_admission_publication(
             attempt_id=f"sqlite-race-attempt-{ordinary_operation}",
             claim_id=f"sqlite-race-claim-{ordinary_operation}",
             worker_id=worker_id,
+            task_lease_expires_at=claimed.lease_expires_at,
             execution_owner_id=f"sqlite-race-owner-{ordinary_operation}",
         ).model_copy(update={"contract": contract.reference()})
 
@@ -1921,32 +2139,50 @@ def test_sqlite_ordinary_task_mutation_cannot_cross_admission_publication(
             publication_started = True
             publication_thread = Thread(target=publish_admission, daemon=True)
             publication_thread.start()
-            if not publication_done.wait(timeout=10):
-                raise RuntimeError("Competing admission publication did not settle.")
 
-        store._connection.set_trace_callback(interleave_after_ordinary_preflight)
-        try:
+        if ordinary_operation == "heartbeat":
+            store._connection.set_trace_callback(interleave_after_ordinary_preflight)
+            try:
+                renewed = await store.heartbeat(
+                    task.id,
+                    worker_id,
+                    lease_expires_at=claimed.lease_expires_at,
+                )
+                assert renewed.worker_id == worker_id
+            finally:
+                store._connection.set_trace_callback(None)
+                if publication_thread is not None:
+                    publication_thread.join(timeout=10)
+        else:
+            publication_started = True
+            publication_thread = Thread(target=publish_admission, daemon=True)
+            publication_thread.start()
+            assert await asyncio.to_thread(publication_done.wait, 10)
             with pytest.raises(WorkAttemptExecutionClaimLost):
-                if ordinary_operation == "heartbeat":
-                    await store.heartbeat(task.id, worker_id)
-                else:
-                    await store.cancel_task(task.id)
-        finally:
-            store._connection.set_trace_callback(None)
+                await store.cancel_task(task.id)
             if publication_thread is not None:
                 publication_thread.join(timeout=10)
 
         assert publication_started
-        assert publication_errors == []
-        assert len(published) == 1
-        admission = published[0]
-        assert admission.state is WorkAttemptAdmissionState.PREPARING
         durable_task = await store.load_task(task.id)
         assert durable_task is not None
-        assert durable_task.status is TaskStatus.RUNNING
-        assert durable_task.session_id == admission.session_id
-        assert durable_task.worker_id == admission.claim.worker_id
-        assert durable_task.lease_expires_at == admission.claim.lease_expires_at
+        if ordinary_operation == "heartbeat":
+            assert len(publication_errors) == 1
+            assert isinstance(publication_errors[0], TaskClaimLost)
+            assert published == []
+            assert durable_task.status is TaskStatus.CLAIMED
+            assert durable_task.session_id is None
+            assert durable_task.worker_id == worker_id
+            assert durable_task.lease_expires_at != claimed.lease_expires_at
+        else:
+            assert publication_errors == []
+            assert len(published) == 1
+            admission = published[0]
+            assert admission.state is WorkAttemptAdmissionState.PREPARING
+            assert durable_task.status is TaskStatus.RUNNING
+            assert durable_task.session_id == admission.session_id
+            assert durable_task.worker_id == admission.claim.worker_id
+            assert durable_task.lease_expires_at == admission.claim.lease_expires_at
         await store.close()
 
     asyncio.run(scenario())
@@ -1960,11 +2196,12 @@ def test_work_attempt_recovery_requires_expiry_and_positive_activation(
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         store = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "recovery-admission.db",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         contract = _contract()
@@ -2102,7 +2339,7 @@ def test_public_admission_rejects_conflicting_extension_receipts(fault: str) -> 
     async def scenario() -> None:
         now = datetime(2026, 1, 1, tzinfo=UTC)
         sessions = InMemorySessionStore()
-        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now)
+        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now, ownership_clock=lambda: now)
         setattr(tasks, f"forge_{fault}", True)
         sink = InMemoryEventSink()
         app = CayuApp(
@@ -2165,7 +2402,7 @@ def test_public_renewal_and_proposal_reject_conflicting_extension_receipts() -> 
     async def scenario() -> None:
         now = datetime(2026, 1, 1, tzinfo=UTC)
         sessions = InMemorySessionStore()
-        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now)
+        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now, ownership_clock=lambda: now)
         app = CayuApp(
             session_store=sessions,
             task_store=tasks,
@@ -2245,7 +2482,7 @@ def test_public_renewal_accepts_a_concurrent_extension_past_its_stale_snapshot()
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _RacingWorkAttemptRenewalStore(clock=lambda: now[0])
+        tasks = _RacingWorkAttemptRenewalStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         app, run, execution = await _configured_public_initial_admission(
             prefix="concurrent-renewal",
             sessions=sessions,
@@ -2283,7 +2520,7 @@ def test_restarted_proposal_retry_replays_when_release_wins_after_lookup() -> No
     async def scenario() -> None:
         now = datetime(2026, 1, 1, tzinfo=UTC)
         sessions = InMemorySessionStore()
-        tasks = _RacingWorkAttemptProposalStore(clock=lambda: now)
+        tasks = _RacingWorkAttemptProposalStore(clock=lambda: now, ownership_clock=lambda: now)
         owner_app, run, execution = await _configured_public_initial_admission(
             prefix="concurrent-proposal-replay",
             sessions=sessions,
@@ -2437,9 +2674,9 @@ def test_secret_bearing_work_attempt_store_results_are_diagnostic_safe(
             )
         )
         tasks = (
-            _SecretBearingTaskResultStore(secret, clock=lambda: now)
+            _SecretBearingTaskResultStore(secret, clock=lambda: now, ownership_clock=lambda: now)
             if result_kind == "task"
-            else InMemoryTaskStore(clock=lambda: now)
+            else InMemoryTaskStore(clock=lambda: now, ownership_clock=lambda: now)
         )
         app, run, execution = await _configured_public_initial_admission(
             prefix=f"secret-bearing-{result_kind}",
@@ -2522,7 +2759,9 @@ def test_secret_bearing_historical_claim_is_diagnostic_safe_through_recovery(
     async def scenario() -> BaseException:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _SecretBearingHistoricalClaimStore(secret, clock=lambda: now[0])
+        tasks = _SecretBearingHistoricalClaimStore(
+            secret, clock=lambda: now[0], ownership_clock=lambda: now[0]
+        )
         app, run, execution = await _configured_public_initial_admission(
             prefix="secret-bearing-historical-claim",
             sessions=sessions,
@@ -2581,7 +2820,7 @@ def test_public_admission_exact_retry_accepts_concurrent_activation() -> None:
     async def scenario() -> None:
         now = datetime(2026, 1, 1, tzinfo=UTC)
         sessions = InMemorySessionStore()
-        tasks = _RacingWorkAttemptClaimStore(clock=lambda: now)
+        tasks = _RacingWorkAttemptClaimStore(clock=lambda: now, ownership_clock=lambda: now)
         app, run, execution = await _configured_public_initial_admission(
             prefix="concurrent-admission-replay",
             sessions=sessions,
@@ -2612,7 +2851,7 @@ def test_public_recovery_exact_retry_accepts_concurrent_activation() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _RacingWorkAttemptClaimStore(clock=lambda: now[0])
+        tasks = _RacingWorkAttemptClaimStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         app, run, execution = await _configured_public_initial_admission(
             prefix="concurrent-recovery-replay",
             sessions=sessions,
@@ -2652,7 +2891,9 @@ def test_public_claim_mutations_reject_released_extension_authority() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _IneligibleWorkAttemptTransitionStore(clock=lambda: now[0])
+        tasks = _IneligibleWorkAttemptTransitionStore(
+            clock=lambda: now[0], ownership_clock=lambda: now[0]
+        )
         app, run, execution = await _configured_public_initial_admission(
             prefix="released-extension-authority",
             sessions=sessions,
@@ -2724,7 +2965,7 @@ def test_conflicting_extension_result_is_secret_safe_across_diagnostics(
     async def scenario() -> BaseException:
         now = datetime(2026, 1, 1, tzinfo=UTC)
         sessions = InMemorySessionStore()
-        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now)
+        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now, ownership_clock=lambda: now)
         tasks.forge_prepare_sha256 = secret
         app, run, execution = await _configured_public_initial_admission(
             prefix="secret-extension-result",
@@ -2894,7 +3135,7 @@ def test_public_handoff_keeps_initial_replay_and_recovery_claims_live() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _LeaseAdvancingWorkAttemptSessionStore(now)
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         sink = InMemoryEventSink()
         app = CayuApp(
             session_store=sessions,
@@ -3130,7 +3371,9 @@ def test_public_recovery_rejects_conflicting_extension_claim_authority(
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _ConflictingWorkAttemptResultStore(clock=lambda: now[0])
+        tasks = _ConflictingWorkAttemptResultStore(
+            clock=lambda: now[0], ownership_clock=lambda: now[0]
+        )
         app, run, execution = await _configured_public_initial_admission(
             prefix=f"conflicting-recovery-{fault}",
             sessions=sessions,
@@ -3181,11 +3424,12 @@ def test_public_first_crash_recovery_needs_no_direct_store_mutation(
             else SQLiteSessionStore(tmp_path / "first-crash-sessions.sqlite")
         )
         tasks: TaskStore = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "first-crash-tasks.sqlite",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         app, run, execution = await _configured_public_initial_admission(
@@ -3302,11 +3546,12 @@ def test_public_work_attempt_recovery_rejects_deleted_v4_lifecycle_authority_bef
             else SQLiteSessionStore(tmp_path / "v4-work-recovery-sessions.sqlite")
         )
         tasks: TaskStore = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "v4-work-recovery-tasks.sqlite",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         app, run, execution = await _configured_public_initial_admission(
@@ -3377,7 +3622,7 @@ def test_migrated_source_only_initial_input_keeps_recovery_fenced(tmp_path) -> N
         session_path = tmp_path / "migrated-source-only-session.sqlite"
         task_path = tmp_path / "migrated-source-only-task.sqlite"
         sessions = SQLiteSessionStore(session_path)
-        tasks = SQLiteTaskStore(task_path, clock=lambda: now[0])
+        tasks = SQLiteTaskStore(task_path, clock=lambda: now[0], ownership_clock=lambda: now[0])
         source, run, execution = await _configured_public_initial_admission(
             prefix="migrated-source-only",
             sessions=sessions,
@@ -3430,6 +3675,7 @@ def test_migrated_source_only_initial_input_keeps_recovery_fenced(tmp_path) -> N
         migrated_tasks = SQLiteTaskStore(
             task_path,
             clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
             schema_mode=SchemaMode.MIGRATE,
         )
         try:
@@ -3488,11 +3734,12 @@ def test_first_crash_settlement_rejects_a_claim_that_expires_before_handoff(
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _BlockNextWorkAttemptCheckpointLoad()
         tasks: TaskStore = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "expired-settlement-claim.sqlite",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         source_app, run, execution = await _configured_public_initial_admission(
@@ -3558,7 +3805,7 @@ def test_first_crash_settlement_cleanup_failure_is_exactly_retryable() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _FailOnceWorkAttemptRunFenceRelease()
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         source_app, run, execution = await _configured_public_initial_admission(
             prefix="retry-first-crash-cleanup",
             sessions=sessions,
@@ -3607,7 +3854,7 @@ def test_concurrent_exact_first_crash_retry_is_bounded_until_cleanup_settles() -
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _BlockFirstWorkAttemptRunFenceRelease()
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         source_app, run, execution = await _configured_public_initial_admission(
             prefix="concurrent-first-crash-retry",
             sessions=sessions,
@@ -3660,7 +3907,7 @@ def test_first_crash_settlement_extension_failure_is_diagnostic_safe(
     async def scenario() -> BaseException:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _FailWorkAttemptSettlementFence(secret)
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         source_app, run, execution = await _configured_public_initial_admission(
             prefix="secret-settlement-failure",
             sessions=sessions,
@@ -3706,7 +3953,7 @@ def test_cancelled_first_crash_settlement_is_quiescent_and_exactly_retryable() -
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _BlockFirstWorkAttemptSettlementFence()
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         source_app, run, execution = await _configured_public_initial_admission(
             prefix="cancelled-first-crash",
             sessions=sessions,
@@ -3770,7 +4017,9 @@ def test_public_recovery_fences_stale_generation_and_replays_exact_receipt() -> 
         # session-store clock. Recovery authority must not compare these clocks.
         now = [datetime(2020, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _LoseFirstRecoveryActivationAcknowledgement(clock=lambda: now[0])
+        tasks = _LoseFirstRecoveryActivationAcknowledgement(
+            clock=lambda: now[0], ownership_clock=lambda: now[0]
+        )
         app = CayuApp(
             session_store=sessions,
             task_store=tasks,
@@ -3881,11 +4130,14 @@ def test_recovery_reconciles_predecessor_session_transition_after_activation_cra
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
         tasks = (
-            _FailFirstRecoveryActivationBeforeMutation(clock=lambda: now[0])
+            _FailFirstRecoveryActivationBeforeMutation(
+                clock=lambda: now[0], ownership_clock=lambda: now[0]
+            )
             if backend == "memory"
             else _FailFirstSQLiteRecoveryActivationBeforeMutation(
                 tmp_path / "predecessor-recovery.db",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         first_app = CayuApp(
@@ -3996,7 +4248,7 @@ def test_public_recovery_rejects_session_mutation_after_claim_under_reverse_cloc
         # last_activity_at > claimed_at comparison.
         now = [datetime(2100, 1, 1, tzinfo=UTC)]
         sessions = _BlockFirstWorkAttemptRecoveryTransition()
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         app = CayuApp(
             session_store=sessions,
             task_store=tasks,
@@ -4071,7 +4323,7 @@ def test_cancelled_recovery_waits_for_dispatched_session_mutation_and_reconciles
     async def scenario() -> None:
         now = [datetime.now(UTC)]
         sessions = _BlockFirstWorkAttemptRecoveryTransition()
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         app = CayuApp(
             session_store=sessions,
             task_store=tasks,
@@ -4208,7 +4460,9 @@ def test_recovery_completes_interaction_fanout_after_activation_acknowledgement_
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = InMemorySessionStore()
-        tasks = _LoseFirstAdmissionActivationAcknowledgement(clock=lambda: now[0])
+        tasks = _LoseFirstAdmissionActivationAcknowledgement(
+            clock=lambda: now[0], ownership_clock=lambda: now[0]
+        )
         sink = InMemoryEventSink()
         contract = _contract(contract_id="recovery-fanout-contract")
         await tasks.publish_work_contract(contract)
@@ -4283,7 +4537,9 @@ def test_prepared_admission_is_reclaimed_after_process_acknowledgement_loss() ->
     async def scenario() -> None:
         now = [datetime.now(UTC)]
         sessions = InMemorySessionStore()
-        tasks = _LoseFirstAdmissionPreparationAcknowledgement(clock=lambda: now[0])
+        tasks = _LoseFirstAdmissionPreparationAcknowledgement(
+            clock=lambda: now[0], ownership_clock=lambda: now[0]
+        )
         contract = _contract(contract_id="prepared-recovery-contract")
         await tasks.publish_work_contract(contract)
         task = await tasks.create_task(
@@ -4555,7 +4811,7 @@ def test_cancelled_public_preparation_is_quiescent_and_reclaimable() -> None:
     async def scenario() -> None:
         now = [datetime.now(UTC)]
         sessions = _BlockFirstWorkAttemptSessionCreation()
-        tasks = InMemoryTaskStore(clock=lambda: now[0])
+        tasks = InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
         contract = _contract(contract_id="cancelled-preparation-contract")
         await tasks.publish_work_contract(contract)
         task = await tasks.create_task(
@@ -4650,11 +4906,12 @@ def test_public_rejected_continue_admission_preserves_contract_and_adds_interact
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sessions = _BlockFirstWorkAttemptContinuationAdmission()
         tasks = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(clock=lambda: now[0], ownership_clock=lambda: now[0])
             if backend == "memory"
             else SQLiteTaskStore(
                 tmp_path / "continuation-admission.db",
                 clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
             )
         )
         provider = _RecordingProvider()

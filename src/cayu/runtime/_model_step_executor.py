@@ -13,11 +13,12 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, Never, cast
 from uuid import uuid4
@@ -2664,6 +2665,7 @@ class _ProviderOperationCancellationClaimReleaseObserved(RuntimeError):
 class _ProviderOperationCancellationHeartbeat:
     stop: asyncio.Event
     release_intended: asyncio.Event
+    claim_deadline_monotonic: float
     task: asyncio.Task[None] | None = None
 
 
@@ -2725,10 +2727,12 @@ class ModelStepExecutor:
         session: Session,
         claim: ProviderOperationCancellationClaim,
         ownership_lost: asyncio.Event,
-    ) -> None:
+        claim_deadline_monotonic: float,
+    ) -> _ProviderOperationCancellationHeartbeat:
         control = _ProviderOperationCancellationHeartbeat(
             stop=asyncio.Event(),
             release_intended=asyncio.Event(),
+            claim_deadline_monotonic=claim_deadline_monotonic,
         )
         task = asyncio.create_task(
             self._heartbeat_provider_operation_cancellation_claim(
@@ -2738,6 +2742,7 @@ class ModelStepExecutor:
                 ownership_lost=ownership_lost,
                 stop=control.stop,
                 release_intended=control.release_intended,
+                control=control,
             )
         )
         control.task = task
@@ -2749,6 +2754,7 @@ class ModelStepExecutor:
             _consume_detached_task_outcome(completed)
 
         task.add_done_callback(settled)
+        return control
 
     def _mark_provider_operation_cancellation_claim_release(
         self,
@@ -2788,7 +2794,7 @@ class ModelStepExecutor:
         error_type: str | None = None,
         cancellation_claim: ProviderOperationCancellationClaim | None = None,
         release_cancellation_claim: bool = False,
-    ) -> Event:
+    ) -> ProviderOperationCancellationClaim | None:
         identity_material = canonical_durable_json_bytes(
             {
                 "schema_version": 1,
@@ -2847,30 +2853,60 @@ class ModelStepExecutor:
                 raise ValueError("Cancellation-claim release requires the exact claim.")
             persisted = await self._event_writer.persist_exact_replay(prepared)
         else:
+            persisted_claim: ProviderOperationCancellationClaim | None = None
 
             def checkpoint_transform(
                 current_session: Session,
                 checkpoint: dict[str, Any] | None,
+                store_now: datetime,
             ) -> dict[str, Any]:
+                nonlocal persisted_claim
                 if current_session.run_epoch != session.run_epoch:
                     raise SessionRunFenced(
                         "Provider-operation cancellation ownership changed at publication."
                     )
                 if release_cancellation_claim:
+                    existing = provider_operation_cancellation_claim_from_checkpoint(checkpoint)
+                    if (
+                        existing is None
+                        or not existing.same_owner(cancellation_claim)
+                        or not existing.active_at(store_now)
+                    ):
+                        raise RuntimeError(
+                            "Provider-operation cancellation ownership changed before release."
+                        )
+                    persisted_claim = existing
                     return checkpoint_without_provider_operation_cancellation_claim(
                         checkpoint,
                         cancellation_claim,
+                        now=store_now,
                     )
+                persisted_claim = cancellation_claim.model_copy(
+                    update={
+                        "expires_at": (store_now + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE)
+                    }
+                )
                 return checkpoint_with_provider_operation_cancellation_claim(
                     checkpoint,
-                    cancellation_claim,
+                    persisted_claim,
+                    now=store_now,
                 )
+
+            def commit_time_guard(commit_now: datetime) -> None:
+                if persisted_claim is None or not persisted_claim.active_at(commit_now):
+                    raise RuntimeError(
+                        "Provider-operation cancellation claim expired before publication."
+                    )
 
             if release_cancellation_claim:
                 self._mark_provider_operation_cancellation_claim_release(cancellation_claim)
-            await self._session_store.publish_checkpoint_and_events(
+            await self._session_store.publish_checkpoint_and_events_with_store_time(
                 session.id,
+                idempotency_key=(
+                    f"provider-operation-cancellation-lease:{cancellation_claim.claim_id}"
+                ),
                 checkpoint_transform=checkpoint_transform,
+                commit_time_guard=commit_time_guard,
                 events=[prepared],
                 expected_run_epoch=session.run_epoch,
             )
@@ -2878,7 +2914,11 @@ class ModelStepExecutor:
                 await self._stop_provider_operation_cancellation_heartbeat(cancellation_claim)
             persisted = prepared
         [emitted] = await self._event_writer.fan_out_persisted([persisted])
-        return emitted
+        del emitted
+        if cancellation_claim is None or release_cancellation_claim:
+            return None
+        assert persisted_claim is not None
+        return persisted_claim
 
     async def _release_provider_operation_cancellation_claim(
         self,
@@ -2886,23 +2926,44 @@ class ModelStepExecutor:
         session: Session,
         claim: ProviderOperationCancellationClaim,
     ) -> None:
+        persisted_claim: ProviderOperationCancellationClaim | None = None
+
         def release_claim(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            store_now: datetime,
         ) -> dict[str, Any]:
+            nonlocal persisted_claim
             if current_session.run_epoch != session.run_epoch:
                 raise SessionRunFenced(
                     "Provider-operation cancellation ownership changed before claim release."
                 )
+            existing = provider_operation_cancellation_claim_from_checkpoint(checkpoint)
+            if (
+                existing is None
+                or not existing.same_owner(claim)
+                or not existing.active_at(store_now)
+            ):
+                raise RuntimeError(
+                    "Provider-operation cancellation ownership changed before release."
+                )
+            persisted_claim = existing
             return checkpoint_without_provider_operation_cancellation_claim(
                 checkpoint,
                 claim,
+                now=store_now,
             )
 
+        def commit_time_guard(commit_now: datetime) -> None:
+            if persisted_claim is None or not persisted_claim.active_at(commit_now):
+                raise RuntimeError("Provider-operation cancellation claim expired before release.")
+
         self._mark_provider_operation_cancellation_claim_release(claim)
-        await self._session_store.publish_checkpoint_and_events(
+        await self._session_store.publish_checkpoint_and_events_with_store_time(
             session.id,
+            idempotency_key=f"provider-operation-cancellation-lease:{claim.claim_id}",
             checkpoint_transform=release_claim,
+            commit_time_guard=commit_time_guard,
             events=[],
             expected_run_epoch=session.run_epoch,
         )
@@ -2917,30 +2978,43 @@ class ModelStepExecutor:
         ownership_lost: asyncio.Event,
         stop: asyncio.Event,
         release_intended: asyncio.Event,
+        control: _ProviderOperationCancellationHeartbeat,
     ) -> None:
         """Renew one cancellation lease until its owner releases or loses it."""
 
         while not stop.is_set():
+            remaining = control.claim_deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                ownership_lost.set()
+                if owner_task is not None and not owner_task.done():
+                    owner_task.cancel("Provider-operation cancellation ownership lease expired.")
+                return
             try:
+                wait_seconds = (
+                    _PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS
+                    if remaining > _PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS
+                    else 0.0
+                )
                 await asyncio.wait_for(
                     stop.wait(),
-                    timeout=_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS,
+                    timeout=wait_seconds,
                 )
                 return
             except TimeoutError:
                 pass
             if owner_task is not None and owner_task.done():
                 return
-            renewed = claim.model_copy(
-                update={
-                    "expires_at": datetime.now(UTC) + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE
-                }
-            )
+            renewal_started_monotonic = time.monotonic()
+            renewed_claim_ref: dict[str, ProviderOperationCancellationClaim] = {}
 
             def renew_claim(
                 current_session: Session,
                 checkpoint: dict[str, Any] | None,
-                renewed_claim: ProviderOperationCancellationClaim = renewed,
+                store_now: datetime,
+                claim_ref: dict[
+                    str,
+                    ProviderOperationCancellationClaim,
+                ] = renewed_claim_ref,
             ) -> dict[str, Any]:
                 if current_session.run_epoch != session.run_epoch:
                     raise SessionRunFenced(
@@ -2949,29 +3023,92 @@ class ModelStepExecutor:
                 existing = provider_operation_cancellation_claim_from_checkpoint(checkpoint)
                 if existing is None and release_intended.is_set():
                     raise _ProviderOperationCancellationClaimReleaseObserved
-                if existing is None or not existing.same_owner(claim):
+                if (
+                    existing is None
+                    or not existing.same_owner(claim)
+                    or not existing.active_at(store_now)
+                ):
                     raise RuntimeError("Provider-operation cancellation claim is no longer active.")
+                renewed = existing.model_copy(
+                    update={
+                        "expires_at": (store_now + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE)
+                    }
+                )
+                claim_ref["claim"] = renewed
                 return checkpoint_with_provider_operation_cancellation_claim(
                     checkpoint,
-                    renewed_claim,
+                    renewed,
+                    now=store_now,
                 )
 
-            try:
-                await self._session_store.publish_checkpoint_and_events(
+            def commit_time_guard(
+                commit_now: datetime,
+                claim_ref: dict[
+                    str,
+                    ProviderOperationCancellationClaim,
+                ] = renewed_claim_ref,
+            ) -> None:
+                renewed = claim_ref.get("claim")
+                if renewed is None or not renewed.active_at(commit_now):
+                    raise RuntimeError(
+                        "Provider-operation cancellation claim expired before renewal."
+                    )
+
+            renewal_task = asyncio.create_task(
+                self._session_store.publish_checkpoint_and_events_with_store_time(
                     session.id,
+                    idempotency_key=(f"provider-operation-cancellation-lease:{claim.claim_id}"),
                     checkpoint_transform=renew_claim,
+                    commit_time_guard=commit_time_guard,
                     events=[],
                     expected_run_epoch=session.run_epoch,
+                )
+            )
+            try:
+                outcome = await await_shielded_task_outcome(
+                    renewal_task,
+                    timeout_s=max(
+                        0.0,
+                        control.claim_deadline_monotonic - time.monotonic(),
+                    ),
                 )
             except _ProviderOperationCancellationClaimReleaseObserved:
                 return
             except asyncio.CancelledError:
+                renewal_task.add_done_callback(_consume_detached_task_outcome)
                 raise
-            except BaseException:
+            if outcome.cancellation is not None:
+                renewal_task.add_done_callback(_consume_detached_task_outcome)
+                raise outcome.cancellation
+            if outcome.timed_out:
+                renewal_task.add_done_callback(_consume_detached_task_outcome)
+                ownership_lost.set()
+                if owner_task is not None and not owner_task.done():
+                    owner_task.cancel(
+                        "Provider-operation cancellation ownership renewal was not acknowledged."
+                    )
+                return
+            if outcome.error is not None:
+                if isinstance(
+                    outcome.error,
+                    _ProviderOperationCancellationClaimReleaseObserved,
+                ):
+                    return
                 ownership_lost.set()
                 if owner_task is not None and not owner_task.done():
                     owner_task.cancel("Provider-operation cancellation ownership heartbeat failed.")
-                raise
+                raise outcome.error
+            control.claim_deadline_monotonic = (
+                renewal_started_monotonic
+                + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE.total_seconds()
+            )
+            if time.monotonic() >= control.claim_deadline_monotonic:
+                ownership_lost.set()
+                if owner_task is not None and not owner_task.done():
+                    owner_task.cancel(
+                        "Provider-operation cancellation ownership acknowledgement expired."
+                    )
+                return
 
     async def _cancel_started_provider_operation(
         self,
@@ -2991,7 +3128,16 @@ class ModelStepExecutor:
         model_attempt_identity: ModelAttemptIdentity,
         settle_budget: bool = False,
     ) -> ProviderOperationSnapshot | None:
+        heartbeat_control: _ProviderOperationCancellationHeartbeat | None = None
+        cancellation_ownership_lost: asyncio.Event | None = None
+
         async def require_cancellation_owner() -> None:
+            if heartbeat_control is not None and (
+                cancellation_ownership_lost is None
+                or cancellation_ownership_lost.is_set()
+                or time.monotonic() >= heartbeat_control.claim_deadline_monotonic
+            ):
+                raise RuntimeError("Provider-operation cancellation claim is no longer active.")
             current = await self._session_store.load(session.id)
             if current is None:
                 raise KeyError(f"Session not found: {session.id}")
@@ -3000,6 +3146,37 @@ class ModelStepExecutor:
                     "Provider-operation cancellation run epoch is stale: expected "
                     f"{session.run_epoch}, current {current.run_epoch}."
                 )
+            if heartbeat_control is not None:
+
+                def inspect_claim(
+                    current_session: Session,
+                    checkpoint: dict[str, Any] | None,
+                    store_now: datetime,
+                ) -> None:
+                    if current_session.run_epoch != session.run_epoch:
+                        raise SessionRunFenced("Provider-operation cancellation run epoch changed.")
+                    existing = provider_operation_cancellation_claim_from_checkpoint(checkpoint)
+                    if (
+                        existing is None
+                        or not existing.same_owner(cancellation_claim)
+                        or not existing.active_at(store_now)
+                    ):
+                        raise RuntimeError(
+                            "Provider-operation cancellation claim is no longer active."
+                        )
+
+                await self._session_store.transform_checkpoint_with_store_time(
+                    session.id,
+                    inspect_claim,
+                )
+                if (
+                    cancellation_ownership_lost is None
+                    or cancellation_ownership_lost.is_set()
+                    or time.monotonic() >= heartbeat_control.claim_deadline_monotonic
+                ):
+                    raise RuntimeError(
+                        "Provider-operation cancellation claim expired during validation."
+                    )
 
         await require_cancellation_owner()
         cancellation_claim = ProviderOperationCancellationClaim(
@@ -3011,7 +3188,7 @@ class ModelStepExecutor:
             run_epoch=session.run_epoch,
             operation_id=state.operation_id,
             stream_protocol=state.stream_protocol,
-            expires_at=datetime.now(UTC) + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE,
+            expires_at=session.updated_at,
         )
         support = adapter.cancellation_support
         if type(support) is not ProviderOperationCancellationSupport:
@@ -3019,7 +3196,8 @@ class ModelStepExecutor:
                 "ProviderOperationAdapter.cancellation_support must return "
                 "ProviderOperationCancellationSupport."
             )
-        await self._persist_provider_operation_cancellation_event(
+        claim_started_monotonic = time.monotonic()
+        persisted_cancellation_claim = await self._persist_provider_operation_cancellation_event(
             event_type=EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
             cancellation_status="requested",
             session=session,
@@ -3035,11 +3213,22 @@ class ModelStepExecutor:
             model_attempt_identity=model_attempt_identity,
             cancellation_claim=cancellation_claim,
         )
+        if persisted_cancellation_claim is None:
+            raise RuntimeError("Provider-operation cancellation claim was not persisted.")
+        cancellation_claim = persisted_cancellation_claim
+        claim_deadline_monotonic = (
+            claim_started_monotonic + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE.total_seconds()
+        )
+        if claim_deadline_monotonic <= time.monotonic():
+            raise RuntimeError(
+                "Provider-operation cancellation claim acknowledgement consumed its lease."
+            )
         cancellation_ownership_lost = asyncio.Event()
-        self._start_provider_operation_cancellation_heartbeat(
+        heartbeat_control = self._start_provider_operation_cancellation_heartbeat(
             session=session,
             claim=cancellation_claim,
             ownership_lost=cancellation_ownership_lost,
+            claim_deadline_monotonic=claim_deadline_monotonic,
         )
         await require_cancellation_owner()
         if support is ProviderOperationCancellationSupport.UNSUPPORTED:
@@ -3855,7 +4044,7 @@ class ModelStepExecutor:
             run_epoch=session.run_epoch,
             operation_id=operation.state.operation_id,
             stream_protocol=operation.state.stream_protocol,
-            expires_at=datetime.now(UTC) + _PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE,
+            expires_at=session.updated_at,
         )
         recovery_under_cancellation_claim = False
 

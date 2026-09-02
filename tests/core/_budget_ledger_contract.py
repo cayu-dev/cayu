@@ -11,7 +11,7 @@ from uuid import UUID
 import pytest
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
-from cayu._validation import DurableValueError
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.core import AgentSpec, EventType, Message
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -792,7 +792,7 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     assert await ledger.list_pending_settlements() == pending_releases
     assert pending_releases[0].settlement_kind == "released"
     assert pending_releases[0].reconciliation.reason == expiration_fallback.expiration_reason
-    assert pending_releases[0].reconciliation.settled_at == expiration_fallback.settled_at
+    assert pending_releases[0].reconciliation.settled_at == clock.value
 
     audit_limit = limit.model_copy(
         update={"max_estimated_cost": Decimal("2")},
@@ -1035,3 +1035,153 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     )
     assert len(second_releases) == 1
     assert second_releases[0].reservation_id == second.record.reservation_id
+
+
+async def assert_budget_reservation_store_time_conformance(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+    *,
+    clock: MutableClock,
+    ttl_seconds: int,
+    contender_ledger: BudgetLedger | None = None,
+) -> None:
+    """Exercise expiry, dispatch, heartbeat, reaping, and exact replay at store time."""
+
+    expiring = await ledger.reserve(
+        limit=limit,
+        session_id="sess_store_time_expiring",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert expiring.record is not None
+
+    replay_limit = limit.model_copy(
+        update={"max_estimated_cost": Decimal("1")},
+        deep=True,
+    )
+    replayable = await ledger.reserve(
+        limit=replay_limit,
+        session_id="sess_store_time_replay",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert replayable.record is not None
+    dispatched = await ledger.mark_dispatched(
+        reservation_ids=(replayable.record.reservation_id,),
+        dispatch_id="dispatch:store-time-replay",
+    )
+
+    clock.value += timedelta(seconds=ttl_seconds)
+    assert await ledger.heartbeat(reservation_id=expiring.record.reservation_id) is False
+    with pytest.raises(ValueError, match="expired"):
+        await ledger.mark_dispatched(
+            reservation_ids=(expiring.record.reservation_id,),
+            dispatch_id="dispatch:too-late",
+        )
+    assert (
+        await ledger.mark_dispatched(
+            reservation_ids=(replayable.record.reservation_id,),
+            dispatch_id="dispatch:store-time-replay",
+        )
+        == dispatched
+    )
+
+    replacement = await ledger.reserve(
+        limit=limit,
+        session_id="sess_store_time_replacement",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert replacement.accepted is True
+    settlements = await ledger.list_pending_settlements(
+        session_id=expiring.record.session_id,
+    )
+    assert len(settlements) == 1
+    assert settlements[0].reconciliation.settled_at == clock.value
+
+    race_limit = limit.model_copy(
+        update={"scope": "agent", "key": "store-time-race"},
+        deep=True,
+    )
+    race_owner = await ledger.reserve(
+        limit=race_limit,
+        session_id="sess_store_time_race_owner",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert race_owner.record is not None
+
+    clock.value += timedelta(seconds=ttl_seconds - 1)
+    competing_ledger = contender_ledger or ledger
+    live_heartbeat, live_competitor = await asyncio.gather(
+        ledger.heartbeat(reservation_id=race_owner.record.reservation_id),
+        competing_ledger.reserve(
+            limit=race_limit,
+            session_id="sess_store_time_race_live_competitor",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
+        ),
+    )
+    assert live_heartbeat is True
+    assert live_competitor.accepted is False
+
+    clock.value += timedelta(seconds=ttl_seconds)
+    expired_heartbeat, replacement_race = await asyncio.gather(
+        ledger.heartbeat(reservation_id=race_owner.record.reservation_id),
+        competing_ledger.reserve(
+            limit=race_limit,
+            session_id="sess_store_time_race_replacement",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=model_attempt_identity(),
+        ),
+    )
+    assert expired_heartbeat is False
+    assert replacement_race.accepted is True
+    race_settlements = await ledger.list_pending_settlements(
+        session_id=race_owner.record.session_id,
+    )
+    assert len(race_settlements) == 1
+    assert race_settlements[0].reservation_id == race_owner.record.reservation_id
+
+
+async def assert_maximum_reservation_ttl_preserves_minimum_timestamp(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+) -> None:
+    """A maximum TTL must not expire a record stamped at ``datetime.min``."""
+
+    assert ledger.reservation_ttl_seconds == MAX_DURABLE_JSON_INTEGER
+    owner = await ledger.reserve(
+        limit=limit,
+        session_id="sess_minimum_timestamp_owner",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert owner.record is not None
+    assert owner.record.updated_at == datetime.min.replace(tzinfo=owner.record.updated_at.tzinfo)
+    assert await ledger.heartbeat(reservation_id=owner.record.reservation_id) is True
+
+    contender = await ledger.reserve(
+        limit=limit,
+        session_id="sess_minimum_timestamp_contender",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert contender.accepted is False
+    assert await ledger.list_pending_settlements(session_id=owner.record.session_id) == []

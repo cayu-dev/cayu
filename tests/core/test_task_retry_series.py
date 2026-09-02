@@ -39,7 +39,13 @@ from cayu import (
     run_task_worker,
     settle_task_retry_attempt_with_retry,
 )
+from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu.runtime.tasks import (
+    _legacy_task_retry_settlement_request_sha256,
+    _task_retry_settlement_request_matches_sha256,
+    prepare_task_retry_settlement,
+)
 from cayu.storage import migrations as schema_migrations
 
 
@@ -345,6 +351,7 @@ def test_task_retry_maximum_attempt_reports_remain_durably_representable() -> No
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key=f"maximum-token-report-{attempt}",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=(
@@ -393,6 +400,7 @@ def test_task_retry_series_expires_queued_attempt_before_late_claim(
                 TaskRetrySettlementRequest(
                     task_id="task-elapsed-claim",
                     worker_id="first-worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="first-elapsed-report",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -462,6 +470,7 @@ def test_task_retry_series_succeeds_after_one_delayed_retry(
             TaskRetrySettlementRequest(
                 task_id=claimed.id,
                 worker_id="worker-a",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="first-failure",
                 causal_budget_id=_retry_causal_budget_id(claimed),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -501,6 +510,7 @@ def test_task_retry_series_succeeds_after_one_delayed_retry(
             TaskRetrySettlementRequest(
                 task_id=second.id,
                 worker_id="worker-b",
+                lease_expires_at=second.lease_expires_at,
                 idempotency_key="second-success",
                 causal_budget_id=_retry_causal_budget_id(second),
                 disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -566,6 +576,7 @@ def test_task_retry_receipt_rejects_changed_successor_authority(
             TaskRetrySettlementRequest(
                 task_id=claimed.id,
                 worker_id="worker",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="authority-report",
                 causal_budget_id=_retry_causal_budget_id(claimed),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -622,6 +633,7 @@ def test_task_retry_settlement_boundary_revalidates_mutated_custom_store_receipt
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="mutated-receipt-report",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -668,6 +680,7 @@ def test_task_retry_settlement_rejects_immediate_receipt_for_another_operation(
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="expected-settlement-operation",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -704,6 +717,7 @@ def test_task_retry_settlement_rejects_immediate_receipt_for_another_task() -> N
             TaskRetrySettlementRequest(
                 task_id=source.id,
                 worker_id="source-worker",
+                lease_expires_at=source.lease_expires_at,
                 idempotency_key="source-settlement",
                 causal_budget_id=_retry_causal_budget_id(source),
                 disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -727,6 +741,7 @@ def test_task_retry_settlement_rejects_immediate_receipt_for_another_task() -> N
                 TaskRetrySettlementRequest(
                     task_id=target.id,
                     worker_id="target-worker",
+                    lease_expires_at=target.lease_expires_at,
                     idempotency_key="target-settlement",
                     causal_budget_id=_retry_causal_budget_id(target),
                     disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -778,6 +793,7 @@ def test_task_retry_settlement_terminalizes_overspend_without_replay(
                 TaskRetrySettlementRequest(
                     task_id=created.id,
                     worker_id="worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key=f"overspend-{expected}",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -841,6 +857,7 @@ def test_task_retry_late_active_attempt_cannot_succeed(
                 TaskRetrySettlementRequest(
                     task_id=created.id,
                     worker_id="worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="late-success",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -888,6 +905,7 @@ def test_task_retry_settlement_authenticates_causal_budget_identity(
                     TaskRetrySettlementRequest(
                         task_id=created.id,
                         worker_id="worker",
+                        lease_expires_at=claimed.lease_expires_at,
                         idempotency_key="wrong-causal-budget",
                         causal_budget_id="another-budget",
                         disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -968,23 +986,18 @@ def test_task_retry_active_cancellation_retains_claim_until_handler_quiesces(
             )
         )
         started = asyncio.Event()
-        cancellation_delivered = asyncio.Event()
         release = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
             started.set()
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                await release.wait()
-                return TaskRetryAttemptReport(
-                    idempotency_key="cancelled-handler-accounting",
-                    disposition=TaskRetryAttemptDisposition.CANCELLED,
-                    error={"code": "handler_quiesced"},
-                    token_count=7,
-                    estimated_cost=Decimal("1.50"),
-                )
+            await release.wait()
+            return TaskRetryAttemptReport(
+                idempotency_key="cancelled-handler-accounting",
+                disposition=TaskRetryAttemptDisposition.CANCELLED,
+                error={"code": "handler_quiesced"},
+                token_count=7,
+                estimated_cost=Decimal("1.50"),
+            )
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -1007,7 +1020,6 @@ def test_task_retry_active_cancellation_retains_claim_until_handler_quiesces(
             assert requested.worker_id == "cancellation-owner"
             assert requested.status_reason == "retry_cancellation_requested"
 
-            await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
             await asyncio.sleep(1.1)
             draining = await store.load_task("active-cancellation-drain")
             assert draining is not None
@@ -1473,6 +1485,7 @@ def test_task_retry_late_worker_cannot_settle_after_reconciler_wins(
             worker_settlement = TaskRetrySettlementRequest(
                 task_id=claimed.id,
                 worker_id="lost-worker",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key=reconciliation.cancellation_idempotency_key,
                 causal_budget_id=reconciliation.causal_budget_id,
                 disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -1529,6 +1542,7 @@ def test_task_retry_reconciler_cannot_replace_worker_cancellation_receipt(
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="live-worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key=reconciliation.cancellation_idempotency_key,
                     causal_budget_id=reconciliation.causal_budget_id,
                     disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -1579,22 +1593,17 @@ def test_task_retry_deadline_drain_honors_late_operator_cancellation(
                 retry_policy=TaskRetryPolicy(max_attempts=2, max_elapsed_seconds=0.1),
             )
         )
-        cancellation_delivered = asyncio.Event()
         release = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                await release.wait()
-                return TaskRetryAttemptReport(
-                    idempotency_key="deadline-cancellation-accounting",
-                    disposition=TaskRetryAttemptDisposition.CANCELLED,
-                    error={"code": "handler_quiesced"},
-                    token_count=9,
-                    estimated_cost=Decimal("2.25"),
-                )
+            await release.wait()
+            return TaskRetryAttemptReport(
+                idempotency_key="deadline-cancellation-accounting",
+                disposition=TaskRetryAttemptDisposition.CANCELLED,
+                error={"code": "handler_quiesced"},
+                token_count=9,
+                estimated_cost=Decimal("2.25"),
+            )
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -1608,7 +1617,7 @@ def test_task_retry_deadline_drain_honors_late_operator_cancellation(
             )
         )
         try:
-            await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
+            await asyncio.sleep(0.2)
             requested = await store.cancel_task(
                 "deadline-cancellation-race",
                 {"code": "operator"},
@@ -1656,10 +1665,11 @@ def test_task_retry_worker_shutdown_releases_quiescent_unreported_attempt(
             )
         )
         started = asyncio.Event()
+        release = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
             started.set()
-            await asyncio.sleep(30)
+            await release.wait()
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -1675,6 +1685,9 @@ def test_task_retry_worker_shutdown_releases_quiescent_unreported_attempt(
         try:
             await asyncio.wait_for(started.wait(), timeout=3)
             worker.cancel("shutdown worker")
+            await asyncio.sleep(0)
+            assert worker.done() is False
+            release.set()
             with pytest.raises(asyncio.CancelledError, match="shutdown worker"):
                 await asyncio.wait_for(worker, timeout=3)
             assert worker.cancelled()
@@ -1686,6 +1699,7 @@ def test_task_retry_worker_shutdown_releases_quiescent_unreported_attempt(
             assert released.lease_expires_at is None
             assert await store.claim_task("replacement-owner") is not None
         finally:
+            release.set()
             if not worker.done():
                 worker.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -1715,22 +1729,19 @@ def test_task_retry_worker_shutdown_settles_quiescent_handler_report(
             )
         )
         started = asyncio.Event()
-        cancellation_delivered = asyncio.Event()
+        release = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
             started.set()
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                return TaskRetryAttemptReport(
-                    idempotency_key="shutdown-report-settlement",
-                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
-                    error={"code": "worker_shutdown"},
-                    token_count=5,
-                    estimated_cost=Decimal("1.25"),
-                    retry_after_seconds=0,
-                )
+            await release.wait()
+            return TaskRetryAttemptReport(
+                idempotency_key="shutdown-report-settlement",
+                disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                error={"code": "worker_shutdown"},
+                token_count=5,
+                estimated_cost=Decimal("1.25"),
+                retry_after_seconds=0,
+            )
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -1746,7 +1757,9 @@ def test_task_retry_worker_shutdown_settles_quiescent_handler_report(
         try:
             await asyncio.wait_for(started.wait(), timeout=3)
             worker.cancel("shutdown worker")
-            await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
+            await asyncio.sleep(0)
+            assert worker.done() is False
+            release.set()
 
             with pytest.raises(asyncio.CancelledError, match="shutdown worker"):
                 await asyncio.wait_for(worker, timeout=3)
@@ -1763,6 +1776,7 @@ def test_task_retry_worker_shutdown_settles_quiescent_handler_report(
             assert successor is not None
             assert successor.status is TaskStatus.PENDING
         finally:
+            release.set()
             if not worker.done():
                 worker.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -1792,23 +1806,18 @@ def test_task_retry_worker_shutdown_reconciles_cancellation_requested_while_drai
             )
         )
         started = asyncio.Event()
-        cancellation_delivered = asyncio.Event()
         release = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
             started.set()
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                await release.wait()
-                return TaskRetryAttemptReport(
-                    idempotency_key="shutdown-late-accounting",
-                    disposition=TaskRetryAttemptDisposition.CANCELLED,
-                    error={"code": "handler_quiesced"},
-                    token_count=11,
-                    estimated_cost=Decimal("2.75"),
-                )
+            await release.wait()
+            return TaskRetryAttemptReport(
+                idempotency_key="shutdown-late-accounting",
+                disposition=TaskRetryAttemptDisposition.CANCELLED,
+                error={"code": "handler_quiesced"},
+                token_count=11,
+                estimated_cost=Decimal("2.75"),
+            )
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -1824,14 +1833,19 @@ def test_task_retry_worker_shutdown_reconciles_cancellation_requested_while_drai
         try:
             await asyncio.wait_for(started.wait(), timeout=3)
             worker.cancel("shutdown worker")
-            await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
+            await asyncio.sleep(0)
+            assert worker.done() is False
             requested = await store.cancel_task(
                 "shutdown-late-cancellation",
                 {"code": "operator"},
             )
             assert requested.status_reason == "retry_cancellation_requested"
             with pytest.raises(TaskTerminalizationConflict, match="still draining"):
-                await store.release_task(requested.id, "shutdown-owner")
+                await store.release_task(
+                    requested.id,
+                    "shutdown-owner",
+                    lease_expires_at=requested.lease_expires_at,
+                )
             release.set()
 
             with pytest.raises(asyncio.CancelledError, match="shutdown worker"):
@@ -1876,16 +1890,11 @@ def test_task_retry_owner_shutdown_settles_existing_cancellation_request(
             )
         )
         started = asyncio.Event()
-        cancellation_delivered = asyncio.Event()
         release = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
             started.set()
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                await release.wait()
+            await release.wait()
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -1907,7 +1916,6 @@ def test_task_retry_owner_shutdown_settles_existing_cancellation_request(
             assert requested.status_reason == "retry_cancellation_requested"
 
             worker.cancel("shutdown worker")
-            await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
             await asyncio.sleep(1.1)
 
             draining = await store.load_task("shutdown-cancellation")
@@ -1976,11 +1984,19 @@ def test_task_retry_durable_cancellation_wins_over_later_deadline(
             assert isinstance(settlement_key, str)
 
             clock.value = started_at + timedelta(seconds=11)
-            assert await store.enforce_task_retry_deadline(claimed.id, "cancellation-owner") is None
+            assert (
+                await store.enforce_task_retry_deadline(
+                    claimed.id,
+                    "cancellation-owner",
+                    lease_expires_at=claimed.lease_expires_at,
+                )
+                is None
+            )
             receipt = await store.settle_task_retry_attempt(
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="cancellation-owner",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key=settlement_key,
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -2107,6 +2123,7 @@ def test_task_retry_series_cumulative_ceiling_prevents_successor(
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="worker",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key=f"settle-{expected}",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2153,6 +2170,7 @@ def test_task_retry_settlement_replays_exact_intent_and_rejects_changed_intent(
             request = TaskRetrySettlementRequest(
                 task_id="task-replay",
                 worker_id="worker",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="retry-report",
                 causal_budget_id=_retry_causal_budget_id(claimed),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2170,6 +2188,27 @@ def test_task_retry_settlement_replays_exact_intent_and_rejects_changed_intent(
             await _close(store)
 
     asyncio.run(run())
+
+
+def test_task_retry_settlement_digest_accepts_pre_lease_receipt() -> None:
+    request = TaskRetrySettlementRequest(
+        task_id="task-replay",
+        worker_id="worker",
+        lease_expires_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
+        idempotency_key="retry-report",
+        causal_budget_id="causal-budget",
+        disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+        error={"code": "temporary"},
+    )
+    request, request_sha256 = prepare_task_retry_settlement(request)
+    legacy_sha256 = _legacy_task_retry_settlement_request_sha256(request)
+
+    assert request_sha256 != legacy_sha256
+    assert _task_retry_settlement_request_matches_sha256(
+        request,
+        request_sha256=request_sha256,
+        candidate_sha256=legacy_sha256,
+    )
 
 
 def test_sqlite_task_retry_settlement_converges_across_connections(tmp_path: Path) -> None:
@@ -2194,6 +2233,7 @@ def test_sqlite_task_retry_settlement_converges_across_connections(tmp_path: Pat
             request = TaskRetrySettlementRequest(
                 task_id="task-race",
                 worker_id="worker",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="same-report",
                 causal_budget_id=_retry_causal_budget_id(claimed),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2236,6 +2276,7 @@ def test_sqlite_task_retry_backoff_survives_restart_and_cancellation(tmp_path: P
             TaskRetrySettlementRequest(
                 task_id="task-restart",
                 worker_id="worker",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="restart-report",
                 causal_budget_id=_retry_causal_budget_id(claimed),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2291,6 +2332,7 @@ def test_task_retry_series_lease_loss_and_legacy_terminalization_fail_closed(
                     TaskRetrySettlementRequest(
                         task_id="task-lease",
                         worker_id="worker",
+                        lease_expires_at=claimed.lease_expires_at,
                         idempotency_key="expired-report",
                         causal_budget_id=_retry_causal_budget_id(claimed),
                         disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2301,6 +2343,75 @@ def test_task_retry_series_lease_loss_and_legacy_terminalization_fail_closed(
             assert loaded is not None
             assert loaded.status is TaskStatus.CLAIMED
             assert await store.load_task_retry_settlement("task-lease", "expired-report") is None
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("operation", ["settle", "deadline"])
+def test_task_retry_mutation_rejects_prior_lease_after_same_worker_reclaim(
+    store_kind: str,
+    operation: str,
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        ownership_now = [datetime(2026, 9, 3, tzinfo=UTC)]
+        store = (
+            InMemoryTaskStore(ownership_clock=lambda: ownership_now[0])
+            if store_kind == "memory"
+            else SQLiteTaskStore(
+                tmp_path / f"same-worker-{operation}.sqlite",
+                ownership_clock=lambda: ownership_now[0],
+            )
+        )
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id=f"same-worker-{operation}",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        max_elapsed_seconds=300,
+                    ),
+                )
+            )
+            first_claim = await store.claim_task("same-worker", lease_seconds=1)
+            assert first_claim is not None
+            stale_request = TaskRetrySettlementRequest(
+                task_id=first_claim.id,
+                worker_id="same-worker",
+                lease_expires_at=first_claim.lease_expires_at,
+                idempotency_key=f"same-worker-{operation}-settlement",
+                causal_budget_id=_retry_causal_budget_id(first_claim),
+                disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                error={"code": "temporary"},
+            )
+
+            ownership_now[0] += timedelta(seconds=2)
+            assert [task.id for task in await store.reclaim_expired()] == [first_claim.id]
+            successor_claim = await store.claim_task("same-worker", lease_seconds=30)
+            assert successor_claim is not None
+            assert successor_claim.lease_expires_at != first_claim.lease_expires_at
+
+            with pytest.raises(TaskClaimLost, match="lease"):
+                if operation == "settle":
+                    await store.settle_task_retry_attempt(stale_request)
+                else:
+                    await store.task_retry_deadline_elapsed(
+                        first_claim.id,
+                        "same-worker",
+                        lease_expires_at=first_claim.lease_expires_at,
+                    )
+            assert await store.load_task(first_claim.id) == successor_claim
+            assert (
+                await store.load_task_retry_settlement(
+                    first_claim.id,
+                    stale_request.idempotency_key,
+                )
+                is None
+            )
         finally:
             await _close(store)
 
@@ -2442,10 +2553,18 @@ def test_task_retry_deadline_probe_retains_live_claim(
             )
             claimed = await store.claim_task("worker")
             assert claimed is not None
-            assert not await store.task_retry_deadline_elapsed(claimed.id, "worker")
+            assert not await store.task_retry_deadline_elapsed(
+                claimed.id,
+                "worker",
+                lease_expires_at=claimed.lease_expires_at,
+            )
 
             clock.value += timedelta(seconds=11)
-            assert await store.task_retry_deadline_elapsed(claimed.id, "worker")
+            assert await store.task_retry_deadline_elapsed(
+                claimed.id,
+                "worker",
+                lease_expires_at=claimed.lease_expires_at,
+            )
             still_owned = await store.load_task(claimed.id)
             assert still_owned is not None
             assert still_owned.status is TaskStatus.CLAIMED
@@ -2458,7 +2577,7 @@ def test_task_retry_deadline_probe_retains_live_claim(
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
-def test_task_worker_cancels_active_handler_at_series_deadline(
+def test_task_worker_retains_active_handler_at_series_deadline_until_quiescent(
     store_kind: str,
     tmp_path: Path,
 ) -> None:
@@ -2481,17 +2600,19 @@ def test_task_worker_cancels_active_handler_at_series_deadline(
                     ),
                 )
             )
-            cancelled = asyncio.Event()
+            handler_started = asyncio.Event()
+            handler_stopped = asyncio.Event()
+            release_handler = asyncio.Event()
 
             async def handler(_app, _task, _worker_id):
+                handler_started.set()
                 try:
-                    await asyncio.sleep(30)
-                except asyncio.CancelledError:
-                    cancelled.set()
-                    raise
+                    await release_handler.wait()
+                finally:
+                    handler_stopped.set()
 
-            assert (
-                await run_task_worker(
+            worker = asyncio.create_task(
+                run_task_worker(
                     app,
                     store,
                     handler,
@@ -2500,9 +2621,20 @@ def test_task_worker_cancels_active_handler_at_series_deadline(
                     max_tasks=1,
                     poll_interval_s=0.01,
                 )
-                == 1
             )
-            assert cancelled.is_set()
+            await asyncio.wait_for(handler_started.wait(), timeout=1)
+            await asyncio.sleep(0.75)
+            assert worker.done() is False
+            assert handler_stopped.is_set() is False
+            draining = await store.load_task(created.id)
+            assert draining is not None
+            assert draining.worker_id == "deadline-worker"
+            assert draining.lease_expires_at is not None
+            assert await store.reclaim_expired() == []
+
+            release_handler.set()
+            assert await asyncio.wait_for(worker, timeout=2) == 1
+            assert handler_stopped.is_set()
             terminal = await store.load_task(created.id)
             assert terminal is not None
             assert terminal.status is TaskStatus.FAILED
@@ -2566,6 +2698,79 @@ def test_task_worker_never_uses_its_wall_clock_as_retry_deadline_authority() -> 
     asyncio.run(run())
 
 
+def test_task_worker_does_not_dispatch_after_delayed_claim_crosses_retry_deadline() -> None:
+    async def run() -> None:
+        series_clock = _MutableClock(datetime(2026, 9, 1, tzinfo=UTC))
+        ownership_clock = _MutableClock(datetime(2026, 9, 1, tzinfo=UTC))
+
+        class DelayedClaimAcknowledgementStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__(clock=series_clock, ownership_clock=ownership_clock)
+                self.claim_committed = asyncio.Event()
+                self.release_claim_acknowledgement = asyncio.Event()
+
+            async def claim_task(self, worker_id, query=None, *, lease_seconds=300):
+                claimed = await super().claim_task(
+                    worker_id,
+                    query,
+                    lease_seconds=lease_seconds,
+                )
+                if claimed is not None:
+                    self.claim_committed.set()
+                    await self.release_claim_acknowledgement.wait()
+                return claimed
+
+        store = DelayedClaimAcknowledgementStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(
+            TaskCreate(
+                task_id="delayed-claim-retry-deadline",
+                type="job",
+                retry_policy=TaskRetryPolicy(
+                    max_attempts=2,
+                    max_elapsed_seconds=10,
+                ),
+            )
+        )
+        handler_called = False
+
+        async def handler(_app, _task, _worker_id):
+            nonlocal handler_called
+            handler_called = True
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="deadline-worker",
+                lease_seconds=60,
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await store.claim_committed.wait()
+        series_clock.value += timedelta(seconds=11)
+        store.release_claim_acknowledgement.set()
+
+        assert await worker == 1
+        assert handler_called is False
+        terminal = await store.load_task("delayed-claim-retry-deadline")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.FAILED
+        assert terminal.retry_series is not None
+        assert terminal.retry_series.disposition is TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
+        assert terminal.status_payload is not None
+        receipt_key = terminal.status_payload["settlement_idempotency_key"]
+        assert isinstance(receipt_key, str)
+        assert await store.load_task_retry_settlement(terminal.id, receipt_key) is not None
+
+    asyncio.run(run())
+
+
 def test_task_worker_bounds_noncooperative_deadline_cancellation() -> None:
     async def run() -> None:
         store = InMemoryTaskStore()
@@ -2583,21 +2788,16 @@ def test_task_worker_bounds_noncooperative_deadline_cancellation() -> None:
             )
         )
         release = asyncio.Event()
-        cancellation_delivered = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                await release.wait()
-                return TaskRetryAttemptReport(
-                    idempotency_key="deadline-handler-accounting",
-                    disposition=TaskRetryAttemptDisposition.CANCELLED,
-                    error={"code": "handler_quiesced"},
-                    token_count=13,
-                    estimated_cost=Decimal("3.25"),
-                )
+            await release.wait()
+            return TaskRetryAttemptReport(
+                idempotency_key="deadline-handler-accounting",
+                disposition=TaskRetryAttemptDisposition.CANCELLED,
+                error={"code": "handler_quiesced"},
+                token_count=13,
+                estimated_cost=Decimal("3.25"),
+            )
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -2611,7 +2811,7 @@ def test_task_worker_bounds_noncooperative_deadline_cancellation() -> None:
             )
         )
         try:
-            await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
+            await asyncio.sleep(0.2)
             await asyncio.sleep(1.1)
             assert not worker.done()
             draining = await store.load_task("noncooperative-deadline-handler")
@@ -2657,14 +2857,9 @@ def test_task_worker_cancellation_during_deadline_drain_preserves_claim_until_qu
             )
         )
         release = asyncio.Event()
-        cancellation_delivered = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancellation_delivered.set()
-                await release.wait()
+            await release.wait()
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -2677,7 +2872,7 @@ def test_task_worker_cancellation_during_deadline_drain_preserves_claim_until_qu
                 poll_interval_s=0.01,
             )
         )
-        await asyncio.wait_for(cancellation_delivered.wait(), timeout=3)
+        await asyncio.sleep(0.2)
         worker.cancel()
         await asyncio.sleep(1.1)
 
@@ -2686,6 +2881,7 @@ def test_task_worker_cancellation_during_deadline_drain_preserves_claim_until_qu
         assert draining is not None
         assert draining.status is TaskStatus.CLAIMED
         assert draining.worker_id == "deadline-owner"
+        assert await store.reclaim_expired(query=None) == []
         assert await store.claim_task("competing-worker") is None
 
         release.set()
@@ -2728,9 +2924,10 @@ def test_task_worker_defers_cancellation_during_deadline_terminalization() -> No
                 ),
             )
         )
+        release_handler = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
-            await asyncio.sleep(30)
+            await release_handler.wait()
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -2743,6 +2940,9 @@ def test_task_worker_defers_cancellation_during_deadline_terminalization() -> No
                 poll_interval_s=0.01,
             )
         )
+        await asyncio.sleep(0.75)
+        assert store.terminalization_started.is_set() is False
+        release_handler.set()
         await asyncio.wait_for(store.terminalization_started.wait(), timeout=3)
         worker.cancel()
         await asyncio.sleep(0)
@@ -2795,20 +2995,18 @@ def test_task_worker_reconciles_lost_deadline_enforcement_acknowledgement() -> N
                 ),
             )
         )
-        cancelled = asyncio.Event()
+        naturally_settled = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancelled.set()
-                return TaskRetryAttemptReport(
-                    idempotency_key="deadline-ack-lost-accounting",
-                    disposition=TaskRetryAttemptDisposition.CANCELLED,
-                    error={"code": "handler_quiesced"},
-                    token_count=19,
-                    estimated_cost=Decimal("4.75"),
-                )
+            await asyncio.sleep(0.5)
+            naturally_settled.set()
+            return TaskRetryAttemptReport(
+                idempotency_key="deadline-ack-lost-accounting",
+                disposition=TaskRetryAttemptDisposition.CANCELLED,
+                error={"code": "handler_quiesced"},
+                token_count=19,
+                estimated_cost=Decimal("4.75"),
+            )
 
         assert (
             await run_task_worker(
@@ -2823,7 +3021,7 @@ def test_task_worker_reconciles_lost_deadline_enforcement_acknowledgement() -> N
             == 1
         )
         assert store.lost
-        assert cancelled.is_set()
+        assert naturally_settled.is_set()
         terminal = await store.load_task("deadline-ack-lost")
         assert terminal is not None
         assert terminal.status is TaskStatus.FAILED
@@ -2862,14 +3060,11 @@ def test_task_worker_retries_indeterminate_deadline_enforcement() -> None:
                 ),
             )
         )
-        cancelled = asyncio.Event()
+        naturally_settled = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+            await asyncio.sleep(0.5)
+            naturally_settled.set()
 
         assert (
             await run_task_worker(
@@ -2884,7 +3079,7 @@ def test_task_worker_retries_indeterminate_deadline_enforcement() -> None:
             == 1
         )
         assert store.enforcement_calls == 2
-        assert cancelled.is_set()
+        assert naturally_settled.is_set()
         terminal = await store.load_task("deadline-transient-failure")
         assert terminal is not None
         assert terminal.status is TaskStatus.FAILED
@@ -3023,6 +3218,148 @@ def test_task_retry_worker_retains_lease_and_settles_before_redelivering_cancell
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("handler_raises", "cancel_during_drain"),
+    [
+        pytest.param(False, False, id="returns"),
+        pytest.param(True, False, id="raises"),
+        pytest.param(False, True, id="cancelled-then-returns"),
+        pytest.param(True, True, id="cancelled-then-raises"),
+    ],
+)
+def test_retry_worker_fences_replacement_while_lost_lease_handler_drains(
+    handler_raises: bool,
+    cancel_during_drain: bool,
+) -> None:
+    class BlockingHeartbeatStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.heartbeat_calls = 0
+            self.periodic_heartbeat_started = asyncio.Event()
+            self.release_heartbeat = asyncio.Event()
+
+        async def heartbeat(
+            self,
+            task_id,
+            worker_id,
+            *,
+            lease_expires_at,
+            handoff_id=None,
+            extend_seconds=300,
+        ):
+            self.heartbeat_calls += 1
+            if worker_id == "stale-retry-worker" and self.heartbeat_calls == 3:
+                self.periodic_heartbeat_started.set()
+                await self.release_heartbeat.wait()
+            return await super().heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_expires_at,
+                handoff_id=handoff_id,
+                extend_seconds=extend_seconds,
+            )
+
+    async def run() -> None:
+        store = BlockingHeartbeatStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(
+            TaskCreate(
+                task_id="retry-heartbeat-drain-fence",
+                type="job",
+                retry_policy=TaskRetryPolicy(max_attempts=2),
+            )
+        )
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+        handler_failure = RuntimeError("retry handler failed after lease loss")
+
+        async def handler(_app, _task, _worker_id):
+            handler_started.set()
+            await release_handler.wait()
+            if handler_raises:
+                raise handler_failure
+            return TaskRetryAttemptReport(
+                idempotency_key="retry-heartbeat-drain-report",
+                disposition=TaskRetryAttemptDisposition.SUCCEEDED,
+                result={"ok": True},
+            )
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="stale-retry-worker",
+                lease_seconds=1,
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=2)
+        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=2)
+        await asyncio.sleep(1.05)
+        draining = await store.load_task("retry-heartbeat-drain-fence")
+        assert draining is not None
+        assert draining.status_reason == "retry_cancellation_requested"
+        assert await store.reclaim_expired(query=None) == []
+        assert await store.claim_task("replacement-retry-worker") is None
+
+        if cancel_during_drain:
+            worker.cancel("shutdown during retry drain")
+            await asyncio.sleep(0)
+            assert worker.done() is False
+        release_handler.set()
+        if cancel_during_drain:
+            with pytest.raises(
+                asyncio.CancelledError,
+                match="shutdown during retry drain",
+            ) as cancelled:
+                await worker
+            cause = exception_cause(cancelled.value)
+            assert cause is not None
+            failures: list[BaseException] = []
+            pending_failures = [cause]
+            visited_failures: set[int] = set()
+            while pending_failures:
+                current_failure = pending_failures.pop()
+                for candidate in iter_exception_tree(current_failure):
+                    if id(candidate) in visited_failures:
+                        continue
+                    visited_failures.add(id(candidate))
+                    failures.append(candidate)
+                    nested_cause = exception_cause(candidate)
+                    if nested_cause is not None:
+                        pending_failures.append(nested_cause)
+            assert sum(isinstance(candidate, TaskClaimLost) for candidate in failures) == 1
+            assert sum(candidate is handler_failure for candidate in failures) == int(
+                handler_raises
+            )
+            assert worker.cancelling() == 1
+            assert worker.cancelled()
+        elif handler_raises:
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await worker
+            failures = list(iter_exception_tree(raised.value))
+            assert sum(candidate is handler_failure for candidate in failures) == 1
+            assert sum(isinstance(candidate, TaskClaimLost) for candidate in failures) == 1
+        else:
+            with pytest.raises(TaskClaimLost):
+                await worker
+        terminal = await store.load_task("retry-heartbeat-drain-fence")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.retry_series is not None
+        assert terminal.retry_series.disposition is TaskRetrySeriesDisposition.CANCELLED
+
+        store.release_heartbeat.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
 def test_task_retry_worker_classifies_child_cancellation_as_handler_failure() -> None:
     async def run() -> None:
         store = InMemoryTaskStore()
@@ -3081,16 +3418,26 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_failed = asyncio.Event()
+            self.heartbeat_calls = 0
 
         async def heartbeat(
             self,
             task_id,
             worker_id,
             *,
+            lease_expires_at,
             handoff_id=None,
             extend_seconds=300,
         ):
-            del handoff_id
+            self.heartbeat_calls += 1
+            if self.heartbeat_calls == 1:
+                return await super().heartbeat(
+                    task_id,
+                    worker_id,
+                    lease_expires_at=lease_expires_at,
+                    handoff_id=handoff_id,
+                    extend_seconds=extend_seconds,
+                )
             self.heartbeat_failed.set()
             raise ConnectionError("transient task heartbeat failure")
 
@@ -3105,16 +3452,24 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
             )
         )
         handler_cancelled = asyncio.Event()
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
+            handler_started.set()
             try:
-                await asyncio.Event().wait()
+                await release_handler.wait()
             except asyncio.CancelledError:
                 handler_cancelled.set()
                 raise
+            return TaskRetryAttemptReport(
+                idempotency_key="retry-heartbeat-failure-report",
+                disposition=TaskRetryAttemptDisposition.SUCCEEDED,
+                result={"ok": True},
+            )
 
-        with pytest.raises(ConnectionError, match="transient task heartbeat failure"):
-            await run_task_worker(
+        worker = asyncio.create_task(
+            run_task_worker(
                 app,
                 store,
                 handler,
@@ -3123,16 +3478,33 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
                 max_tasks=1,
                 poll_interval_s=0.01,
             )
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=2)
+        await asyncio.wait_for(store.heartbeat_failed.wait(), timeout=2)
+        for _attempt in range(100):
+            draining = await store.load_task("retry-heartbeat-failure")
+            if draining is not None and draining.status_reason == "retry_cancellation_requested":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("Retry heartbeat loss did not establish a durable fence.")
+
+        assert worker.done() is False
+        assert handler_cancelled.is_set() is False
+        assert await store.claim_task("replacement-worker") is None
+        release_handler.set()
+        with pytest.raises(ConnectionError, match="transient task heartbeat failure"):
+            await worker
 
         assert store.heartbeat_failed.is_set()
-        assert handler_cancelled.is_set()
+        assert handler_cancelled.is_set() is False
         retained = await store.load_task("retry-heartbeat-failure")
         assert retained is not None
-        assert retained.status is TaskStatus.CLAIMED
-        assert retained.worker_id == "heartbeat-owner"
-        assert retained.error is None
+        assert retained.status is TaskStatus.CANCELLED
+        assert retained.worker_id is None
+        assert retained.error == {"code": "task_worker_lease_authority_lost"}
         assert retained.retry_series is not None
-        assert retained.retry_series.disposition is TaskRetrySeriesDisposition.ACTIVE
+        assert retained.retry_series.disposition is TaskRetrySeriesDisposition.CANCELLED
         assert retained.retry_series.successor_task_id is None
 
     asyncio.run(run())
@@ -3147,12 +3519,14 @@ def test_task_retry_worker_preserves_cancellation_when_heartbeat_fails_during_se
             self.settlement_started = asyncio.Event()
             self.heartbeat_failed = asyncio.Event()
             self.allow_settlement = asyncio.Event()
+            self.heartbeat_reconciliation_failed = False
 
         async def heartbeat(
             self,
             task_id,
             worker_id,
             *,
+            lease_expires_at,
             handoff_id=None,
             extend_seconds=300,
         ):
@@ -3162,9 +3536,16 @@ def test_task_retry_worker_preserves_cancellation_when_heartbeat_fails_during_se
             return await super().heartbeat(
                 task_id,
                 worker_id,
+                lease_expires_at=lease_expires_at,
                 handoff_id=handoff_id,
                 extend_seconds=extend_seconds,
             )
+
+        async def load_task(self, task_id):
+            if self.heartbeat_failed.is_set() and not self.heartbeat_reconciliation_failed:
+                self.heartbeat_reconciliation_failed = True
+                raise ConnectionError("heartbeat reconciliation failure")
+            return await super().load_task(task_id)
 
         async def settle_task_retry_attempt(self, request):
             self.settlement_started.set()
@@ -3295,16 +3676,12 @@ def test_task_retry_worker_preserves_owner_cancellation_when_handler_cleanup_gro
             )
         )
         handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
 
         async def handler(_app, _task, _worker_id):
             handler_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError as cancellation:
-                raise BaseExceptionGroup(
-                    "handler cancellation cleanup",
-                    [cancellation, RuntimeError("handler cleanup failed")],
-                ) from None
+            await release_handler.wait()
+            raise RuntimeError("handler cleanup failed")
 
         worker = asyncio.create_task(
             run_task_worker(
@@ -3319,6 +3696,9 @@ def test_task_retry_worker_preserves_owner_cancellation_when_handler_cleanup_gro
         )
         await asyncio.wait_for(handler_started.wait(), timeout=3)
         worker.cancel("shutdown grouped handler")
+        await asyncio.sleep(0)
+        assert worker.done() is False
+        release_handler.set()
         with pytest.raises(asyncio.CancelledError, match="shutdown grouped handler") as exc_info:
             await asyncio.wait_for(worker, timeout=3)
 

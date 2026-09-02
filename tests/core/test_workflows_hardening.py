@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -2388,6 +2389,7 @@ def test_step_forwards_run_options_and_preserves_owned_lineage():
                 thinking=thinking,
                 task_id="task-1",
                 task_worker_id="worker-1",
+                task_lease_expires_at=datetime(2026, 1, 1, tzinfo=UTC),
             ),
         )
     )
@@ -2409,6 +2411,7 @@ def test_step_forwards_run_options_and_preserves_owned_lineage():
     assert request.thinking is thinking
     assert request.task_id == "task-1"
     assert request.task_worker_id == "worker-1"
+    assert request.task_lease_expires_at == datetime(2026, 1, 1, tzinfo=UTC)
     assert request.parent_session_id == "wf-options"
     assert request.causal_budget_id == "wf-options"
 

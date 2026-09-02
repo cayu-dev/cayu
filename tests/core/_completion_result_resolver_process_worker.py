@@ -17,7 +17,7 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
 )
-from cayu.runtime.sessions import CheckpointTransform, Session
+from cayu.runtime.sessions import Session, StoreTimeCheckpointTransform
 
 _PROCESS_LOSS_EXIT_CODE = 86
 
@@ -30,7 +30,7 @@ class _CrashBeforeResultEventStore(SQLiteSessionStore):
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: StoreTimeCheckpointTransform,
         events: list[Event],
     ) -> Session:
         if any(event.type is EventType.TASK_COMPLETION_RESULT_RESOLVED for event in events):

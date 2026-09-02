@@ -404,6 +404,7 @@ def test_every_contracted_session_binding_path_publishes_authority(binding_path:
                     session_id=session_id,
                     session_invocation=session_invocation,
                     worker_id="index-worker",
+                    lease_expires_at=pending.lease_expires_at,
                 )
 
         assert task.session_id == session_id
@@ -446,6 +447,7 @@ def test_claimed_contract_attachment_and_ordinary_admission_are_atomic(
                 session_id=session_id,
                 session_invocation=session_invocation,
                 worker_id=worker_id,
+                lease_expires_at=claimed.lease_expires_at,
             )
 
         # Queue both production entrances behind the real store lock so the
@@ -496,6 +498,7 @@ def test_claimed_contract_attachment_and_ordinary_admission_are_atomic(
                     session_id=session_id,
                     session_invocation=session_invocation,
                     worker_id=worker_id,
+                    lease_expires_at=claimed.lease_expires_at,
                 )
         else:
             assert isinstance(admission_result, TaskCompletionDecisionRequired)

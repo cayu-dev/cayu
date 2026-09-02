@@ -2206,9 +2206,11 @@ def test_server_task_status_omits_private_work_contract_fingerprint() -> None:
         claimed = await task_store.claim_task("ordinary-worker")
         assert claimed is not None
         assert claimed.id == task.id
+        assert claimed.lease_expires_at is not None
         await task_store.hold_claimed_work_contract_task(
             task.id,
             worker_id="ordinary-worker",
+            lease_expires_at=claimed.lease_expires_at,
             contract=contract.reference(),
         )
 
@@ -2401,6 +2403,7 @@ def test_server_task_retry_series_redacts_caller_controlled_currency(
             TaskRetrySettlementRequest(
                 task_id=claimed.id,
                 worker_id="currency-worker",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="currency-settlement",
                 causal_budget_id=claimed.retry_series.causal_budget_id,
                 disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -5605,11 +5608,13 @@ def test_control_plane_preserves_runtime_timestamps_for_short_secret() -> None:
                 type="review",
             )
         )
-        await task_store.claim_task("safe-worker")
+        claimed = await task_store.claim_task("safe-worker")
+        assert claimed is not None
         await task_store.complete_task(
             task.id,
             {"status": "done"},
             worker_id="safe-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
     asyncio.run(seed())
@@ -8593,8 +8598,8 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     knowledge_seals = 0
     resume_calls = []
 
-    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
-        resume_calls.append(interrupting_inactive_before)
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
+        resume_calls.append(interrupting_inactive_for_seconds)
         return 0
 
     async def drain_background_interruptions(*, timeout_s):
@@ -8642,7 +8647,8 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     assert knowledge_seals == 1
     assert knowledge_drain_timeouts == [1.5]
     assert len(resume_calls) == 1
-    assert resume_calls[0] < datetime.now(UTC)
+    assert type(resume_calls[0]) is int
+    assert resume_calls[0] >= 0
 
 
 def test_mount_cayu_drains_cascades_when_startup_recovery_fails() -> None:
@@ -8650,8 +8656,9 @@ def test_mount_cayu_drains_cascades_when_startup_recovery_fails() -> None:
     cayu_app = CayuApp()
     calls: list[str] = []
 
-    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
-        assert interrupting_inactive_before < datetime.now(UTC)
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
+        assert type(interrupting_inactive_for_seconds) is int
+        assert interrupting_inactive_for_seconds >= 0
         calls.append("recover")
         raise RuntimeError("mounted recovery failed")
 
@@ -13454,9 +13461,9 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         assert timeout_s == 10.0
         return True
 
-    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
         calls.append("resume_cascades")
-        assert interrupting_inactive_before < datetime.now(UTC)
+        assert interrupting_inactive_for_seconds == 60
         return 0
 
     app.recover_incomplete_sessions = recover
@@ -13509,8 +13516,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     }
     assert request.reason == "server_startup_recovery"
     assert request.metadata == {"source": "create_server"}
-    assert request.inactive_before is not None
-    assert request.inactive_before < datetime.now(UTC)
+    assert request.inactive_for_seconds == 60
 
 
 def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
@@ -13561,7 +13567,7 @@ def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
     assert all(request.statuses == {SessionStatus.INTERRUPTED} for request in requests)
     assert all(request.reason == "server_startup_recovery" for request in requests)
     assert all(request.metadata == {"source": "create_server"} for request in requests)
-    assert len({request.inactive_before for request in requests}) == 1
+    assert len({request.inactive_for_seconds for request in requests}) == 1
 
 
 def test_create_server_stops_incomplete_recovery_continuation_on_shutdown() -> None:
@@ -13840,8 +13846,9 @@ def test_create_server_drains_cascades_when_startup_recovery_fails() -> None:
     app = CayuApp()
     calls: list[str] = []
 
-    async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
-        assert interrupting_inactive_before < datetime.now(UTC)
+    async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
+        assert type(interrupting_inactive_for_seconds) is int
+        assert interrupting_inactive_for_seconds >= 0
         calls.append("recover")
         raise RuntimeError("recovery failed after scheduling work")
 

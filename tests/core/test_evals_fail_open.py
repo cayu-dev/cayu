@@ -87,6 +87,7 @@ def test_eval_case_rejects_task_linked_request():
                 messages=[Message.text("user", "go")],
                 task_id="task-1",
                 task_worker_id="worker-1",
+                task_lease_expires_at=datetime.now(UTC),
             ),
         )
 

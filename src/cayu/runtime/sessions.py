@@ -57,6 +57,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
+from cayu._clock import normalize_utc_datetime, utc_clock, utc_duration_cutoff
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     FrozenJsonDict,
@@ -1477,6 +1478,9 @@ class RunRequest(BaseModel):
     causal_budget_id: str | None = None
     task_id: str | None = None
     task_worker_id: str | None = None
+    # Exact claim generation for worker-owned fresh task attachment. Worker
+    # identifiers are reusable after lease expiry and are not authority alone.
+    task_lease_expires_at: datetime | None = None
     # Exact per-run execution target. When omitted, the agent model and provider
     # routing/defaults select the initial target.
     target: ModelTarget | None = None
@@ -1626,7 +1630,18 @@ class RunRequest(BaseModel):
     def validate_task_worker_handoff(self) -> RunRequest:
         if self.task_worker_id is not None and self.task_id is None:
             raise ValueError("RunRequest.task_worker_id requires task_id.")
+        if (self.task_worker_id is None) != (self.task_lease_expires_at is None):
+            raise ValueError(
+                "RunRequest.task_worker_id and task_lease_expires_at must be supplied together."
+            )
         return self
+
+    @field_validator("task_lease_expires_at")
+    @classmethod
+    def normalize_task_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "task_lease_expires_at")
 
 
 def session_input_messages_sha256(messages: Sequence[Message]) -> str:
@@ -3896,6 +3911,22 @@ CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any] | None,
 ]
+StoreTimeCheckpointTransform = Callable[
+    [Session, dict[str, Any] | None, datetime],
+    dict[str, Any] | None,
+]
+
+
+def _validate_inactive_for_seconds(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError("inactive_for_seconds must be an integer.")
+    if value < 0 or value > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError(f"inactive_for_seconds must be between 0 and {MAX_DURABLE_JSON_INTEGER}.")
+    return value
+
+
 SessionOperationInitializer = Callable[
     [Session],
     Mapping[str, dict[str, Any]],
@@ -4184,11 +4215,13 @@ def _complete_completion_result_event_publication(
     authority_sha256: str,
     owner_id: str,
     require_present: bool,
+    now: datetime,
 ) -> dict[str, Any]:
     if type(require_present) is not bool:
         raise TypeError("require_present must be a boolean.")
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
     reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
     existing = reservations.get(publication_id)
     if existing is None:
         if require_present:
@@ -4217,12 +4250,12 @@ def _complete_completion_result_event_publication(
 def _completion_result_event_publication_delete_block_reason(
     checkpoint: dict[str, Any] | None,
     *,
-    now: datetime | None = None,
+    now: datetime,
 ) -> str | None:
     reservations = _completion_result_event_publication_reservations(checkpoint)
     _prune_expired_completion_result_event_publication_owners(
         reservations,
-        now=datetime.now(UTC) if now is None else now,
+        now=now,
     )
     if not reservations:
         return None
@@ -5893,6 +5926,10 @@ SessionOperationTransform = Callable[
     [Session, dict[str, Any] | None, dict[str, Any] | None],
     SessionOperationPublication,
 ]
+StoreTimeSessionOperationTransform = Callable[
+    [Session, dict[str, Any] | None, dict[str, Any] | None, datetime],
+    SessionOperationPublication,
+]
 
 
 _MCP_MANIFEST_BASELINE_MAX_TOOLS = 10_000
@@ -6300,6 +6337,11 @@ class SessionQuery(BaseModel):
     parent_session_id: str | None = None
     causal_budget_id: str | None = None
     last_activity_before: datetime | None = None
+    inactive_for_seconds: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     labels: dict[str, str] = Field(default_factory=dict)
     label_selectors: tuple[LabelSelectorRequirement, ...] = Field(default_factory=tuple)
     limit: StrictInt = Field(default=100, ge=1, le=1000)
@@ -6321,6 +6363,8 @@ class SessionQuery(BaseModel):
         # would silently ignore the offset, so reject it explicitly.
         if self.cursor is not None and self.offset:
             raise ValueError("cursor and a non-zero offset cannot be combined.")
+        if self.last_activity_before is not None and self.inactive_for_seconds is not None:
+            raise ValueError("last_activity_before and inactive_for_seconds cannot be combined.")
         return self
 
     @field_validator(
@@ -7156,7 +7200,11 @@ class IncompleteSessionRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
-    inactive_before: datetime | None = None
+    inactive_for_seconds: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     reason: str = "worker_recovered_incomplete_session"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -7164,15 +7212,6 @@ class IncompleteSessionRecoveryRequest(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
-
-    @field_validator("inactive_before")
-    @classmethod
-    def validate_inactive_before(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("inactive_before must be timezone-aware.")
-        return value.astimezone(UTC)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -7189,7 +7228,11 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     inspection_limit: StrictInt = Field(default=1000, ge=1, le=10_000)
     cursor: str | None = None
-    inactive_before: datetime | None = None
+    inactive_for_seconds: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     reason: str = "worker_recovered_incomplete_session"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -7241,15 +7284,6 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
                 f"cursor exceeds its {MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES}-byte limit."
             )
         return value
-
-    @field_validator("inactive_before")
-    @classmethod
-    def validate_inactive_before(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("inactive_before must be timezone-aware.")
-        return value.astimezone(UTC)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -9017,6 +9051,11 @@ class SessionStore(ABC):
     progress writes made by that context must reject a stale epoch with
     ``SessionRunFenced``. Releasing the claim revokes the durable epoch before
     clearing task-local ownership so inherited child contexts cannot write late.
+
+    Implementations also own the clock used for inactivity, recovery-claim,
+    epoch-takeover, and activity-stamp decisions. Callers pass durations. The
+    store samples, compares, and stamps time inside one atomic boundary; a
+    caller or worker clock is never durable ownership authority.
     """
 
     # Custom stores must opt into optional capabilities explicitly. Conservative
@@ -9319,7 +9358,11 @@ class SessionStore(ABC):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
     ) -> Session:
-        """Atomically transition status, claiming a new epoch when entering RUNNING."""
+        """Atomically transition status, claiming a new epoch when entering RUNNING.
+
+        Entering ``RUNNING`` must reject an incomplete-recovery claim whose
+        lease has expired at the store's authoritative transaction time.
+        """
 
     @abstractmethod
     async def transition_status_and_checkpoint(
@@ -9328,7 +9371,8 @@ class SessionStore(ABC):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
@@ -9340,7 +9384,11 @@ class SessionStore(ABC):
         adopted_runtime_identity: SessionRuntimeIdentity | None = None,
         tool_capability_ceiling: ToolCapabilityCeiling | None = None,
     ) -> Session:
-        """Atomically persist status, checkpoint, interaction, target, and profile admission."""
+        """Atomically persist status, checkpoint, interaction, target, and profile admission.
+
+        Entering ``RUNNING`` must reject an incomplete-recovery claim whose
+        lease has expired at the store's authoritative transaction time.
+        """
 
     async def admit_execution_profile_resume(
         self,
@@ -9706,7 +9754,6 @@ class SessionStore(ABC):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
         """Atomically publish one interaction state and its session transition.
 
@@ -9715,10 +9762,11 @@ class SessionStore(ABC):
         queued input remains. Repeating the exact complete transition
         reconstructs the committed result without re-evaluating that queue
         boundary. Reusing its event identity with different transition data
-        fails closed. A runtime-supplied recovery claim must include the same
-        authoritative clock that issued its lease; implementations sample that
-        clock after acquiring the mutation lock and before first publication.
-        Exact receipt replay remains valid after the lease has settled.
+        fails closed. Implementations validate a runtime-supplied recovery claim
+        against store-owned time after acquiring the mutation lock and before
+        first publication, and reject an unclaimed first publication while a
+        store-time-live recovery claim exists. Exact receipt replay remains
+        valid after the lease has settled.
         """
 
     async def load_interaction_transition_receipt(
@@ -9836,12 +9884,31 @@ class SessionStore(ABC):
         session_id: str,
         *,
         statuses: set[SessionStatus],
-        inactive_before: datetime,
+        inactive_for_seconds: int,
     ) -> Session | None:
         """Atomically evict a stale run and claim its newly incremented epoch.
 
         Returns ``None`` when the session is no longer in one of ``statuses`` or
-        has activity newer than ``inactive_before``.
+        has not been inactive for ``inactive_for_seconds`` at store time. An
+        existing incomplete-recovery claim must be reconciled through the exact
+        checkpoint-authorized takeover path instead.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def reserve_stalled_run_recovery(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_for_seconds: int | None,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> Session | None:
+        """Reserve recovery at store time without yet advancing the run epoch.
+
+        The reservation transform and eligibility check are atomic. The method
+        intentionally leaves session activity unchanged so a subsequent typed
+        invocation rebind can authenticate and fence the exact reserved state.
         """
         raise NotImplementedError
 
@@ -9861,6 +9928,8 @@ class SessionStore(ABC):
         This operation is for ownership that must persist a checkpoint lease
         and fence the prior run as one transaction. Recovery that needs only an
         inactivity predicate should continue to use :meth:`fence_stalled_run`.
+        An incomplete-recovery claim present in the source checkpoint must
+        still be live at the store's authoritative transaction time.
         """
         raise NotImplementedError
 
@@ -10034,14 +10103,56 @@ class SessionStore(ABC):
     ) -> Session:
         """Atomically transform a checkpoint and append its causal event batch."""
 
+    async def publish_checkpoint_and_events_with_store_time(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+        commit_time_guard: Callable[[datetime], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        """Publish checkpoint state using the backend's transactional clock."""
+
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        if commit_time_guard is None:
+            raise TypeError("commit_time_guard is required.")
+
+        def operation_transform(
+            session: Session,
+            checkpoint: dict[str, Any] | None,
+            _record: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> SessionOperationPublication:
+            transformed = checkpoint_transform(session, checkpoint, store_now)
+            if transformed is None:
+                raise ValueError("Checkpoint transform must return a checkpoint.")
+            return SessionOperationPublication(checkpoint=transformed)
+
+        return await self.publish_session_operation_guarded_with_store_time(
+            session_id,
+            idempotency_key=idempotency_key,
+            operation_transform=operation_transform,
+            commit_guard=lambda: None,
+            commit_time_guard=commit_time_guard,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
     async def _publish_completion_result_event_publication(
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: StoreTimeCheckpointTransform,
         events: list[Event],
     ) -> Session:
-        """Mutate the private completion-result publication root atomically."""
+        """Mutate the private publication root with authoritative store time."""
 
         raise NotImplementedError(
             "This SessionStore does not own completion-result event publication."
@@ -10162,6 +10273,25 @@ class SessionStore(ABC):
 
         raise NotImplementedError(
             f"{type(self).__name__} must implement atomic guarded operation publication."
+        )
+
+    async def publish_session_operation_guarded_with_store_time(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: StoreTimeSessionOperationTransform,
+        commit_guard: Callable[[], None],
+        commit_time_guard: Callable[[datetime], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        """Publish an operation using time sampled at the commit transaction."""
+
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement store-time guarded operation publication."
         )
 
     async def load_runtime_publication_receipt(
@@ -11297,6 +11427,18 @@ class SessionStore(ABC):
         """
 
     @abstractmethod
+    async def transform_checkpoint_with_store_time(
+        self,
+        session_id: str,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> None:
+        """Transform a checkpoint with time sampled by the store transaction.
+
+        The same sampled value must govern any lease comparison made by the
+        transform and the resulting checkpoint/activity timestamps.
+        """
+
+    @abstractmethod
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         """Load the latest checkpoint for a session."""
 
@@ -11380,6 +11522,7 @@ class InMemorySessionStore(SessionStore):
         self,
         *,
         public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+        ownership_clock: Callable[[], datetime] | None = None,
     ) -> None:
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
@@ -11400,6 +11543,7 @@ class InMemorySessionStore(SessionStore):
                 )
             )
         self._public_authority_alias_codec = public_authority_alias_codec
+        self._ownership_clock = utc_clock(ownership_clock)
         self._lock = asyncio.Lock()
         self._sessions: dict[str, Session] = {}
         self._public_authority_aliases: dict[tuple[str, str, str], str] = {}
@@ -12827,7 +12971,7 @@ class InMemorySessionStore(SessionStore):
                 if request.parent_session_id is None
                 else self._sessions[request.parent_session_id]
             )
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             session = Session(
                 id=session_id,
                 instance_id=session_instance_id_for_run_request(
@@ -13346,7 +13490,7 @@ class InMemorySessionStore(SessionStore):
                 if _is_durable_subagent_child(child):
                     raise ValueError(_durable_subagent_parent_delete_block_reason(child.id))
             checkpoint = self._checkpoints.get(session_id)
-            deletion_now = datetime.now(UTC)
+            deletion_now = self._ownership_clock()
             active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
                 checkpoint,
                 now=deletion_now,
@@ -13396,7 +13540,10 @@ class InMemorySessionStore(SessionStore):
                     f"{active_operation_id} is active: {session_id}"
                 )
             completion_result_publication_block = (
-                _completion_result_event_publication_delete_block_reason(checkpoint)
+                _completion_result_event_publication_delete_block_reason(
+                    checkpoint,
+                    now=deletion_now,
+                )
             )
             if completion_result_publication_block is not None:
                 raise ValueError(
@@ -13615,7 +13762,7 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             updated = session.model_copy(update={"labels": new_labels, "updated_at": now})
             from cayu.runtime._invocation_lifecycle import (
                 require_invocation_lifecycle_release_capacity,
@@ -13637,7 +13784,7 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             new_metadata = replace_session_user_metadata(session.metadata, user_metadata)
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             updated = session.model_copy(update={"metadata": new_metadata, "updated_at": now})
             from cayu.runtime._invocation_lifecycle import (
                 require_invocation_lifecycle_release_capacity,
@@ -13671,7 +13818,12 @@ class InMemorySessionStore(SessionStore):
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
 
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
+            if to_status is SessionStatus.RUNNING:
+                _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                    self._checkpoints.get(session_id),
+                    now=now,
+                )
             updated = session.model_copy(
                 update={
                     "status": to_status,
@@ -13754,7 +13906,8 @@ class InMemorySessionStore(SessionStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
@@ -13770,8 +13923,8 @@ class InMemorySessionStore(SessionStore):
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
-        if checkpoint_transform is None:
-            raise TypeError("checkpoint_transform is required.")
+        if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
+            raise TypeError("Exactly one checkpoint transform is required.")
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
         admission = _copy_transition_interaction_admission(
@@ -13827,7 +13980,12 @@ class InMemorySessionStore(SessionStore):
                     prepared_model_transition,
                 )
 
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
+            if to_status is SessionStatus.RUNNING:
+                _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                    self._checkpoints.get(session_id),
+                    now=now,
+                )
             session_updates: dict[str, Any] = {
                 "status": to_status,
                 "updated_at": now,
@@ -13864,13 +14022,22 @@ class InMemorySessionStore(SessionStore):
             )
 
             current_checkpoint = self._checkpoints.get(session_id)
-            transformed_checkpoint = checkpoint_transform(
-                session.model_copy(deep=True),
-                _copy_checkpoint_for_transform(
-                    current_checkpoint,
-                    session_id=session_id,
-                ),
+            checkpoint_copy = _copy_checkpoint_for_transform(
+                current_checkpoint,
+                session_id=session_id,
             )
+            if store_time_checkpoint_transform is not None:
+                transformed_checkpoint = store_time_checkpoint_transform(
+                    session.model_copy(deep=True),
+                    checkpoint_copy,
+                    now,
+                )
+            else:
+                assert checkpoint_transform is not None
+                transformed_checkpoint = checkpoint_transform(
+                    session.model_copy(deep=True),
+                    checkpoint_copy,
+                )
             if transformed_checkpoint is not None:
                 transformed_checkpoint = (
                     _checkpoint_transform_result_preserving_completion_result_event_publications(
@@ -13989,7 +14156,7 @@ class InMemorySessionStore(SessionStore):
                 raise SessionQueuedMessagesPending(
                     f"Session has durable queued messages: {session_id}"
                 )
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             updated = session.model_copy(
                 update={
                     "status": to_status,
@@ -14017,13 +14184,9 @@ class InMemorySessionStore(SessionStore):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
-        expected_recovery_claim_id, expected_recovery_claim_clock = (
-            _validate_interaction_transition_recovery_claim_parameters(
-                expected_recovery_claim_id=expected_recovery_claim_id,
-                expected_recovery_claim_clock=expected_recovery_claim_clock,
-            )
+        expected_recovery_claim_id = _validate_interaction_transition_recovery_claim_id(
+            expected_recovery_claim_id
         )
         expected_invocation_authority_state = (
             _validate_interaction_transition_invocation_authority_parameters(
@@ -14083,18 +14246,19 @@ class InMemorySessionStore(SessionStore):
                 raise RuntimeError(
                     "Interaction transition event exists without its immutable receipt."
                 )
-            if expected_recovery_claim_id is not None:
-                assert expected_recovery_claim_clock is not None
-                active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                    self._checkpoints.get(session_id),
-                    now=_interaction_transition_recovery_claim_observed_at(
-                        expected_recovery_claim_clock
-                    ),
-                )
-                if active_recovery_claim_id != expected_recovery_claim_id:
+            active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+                self._checkpoints.get(session_id),
+                now=self._ownership_clock(),
+            )
+            if expected_recovery_claim_id is None:
+                if active_recovery_claim_id is not None:
                     raise SessionRunFenced(
-                        "Interaction transition lost its exact terminal recovery claim."
+                        "Interaction transition is owned by another terminal recovery claim."
                     )
+            elif active_recovery_claim_id != expected_recovery_claim_id:
+                raise SessionRunFenced(
+                    "Interaction transition lost its exact terminal recovery claim."
+                )
             if expected_active_invocation_profile is not None:
                 from cayu.runtime._invocation_lifecycle import (
                     require_invocation_command_authority,
@@ -14129,7 +14293,7 @@ class InMemorySessionStore(SessionStore):
                 (session_id, delivery_mode) in self._pending_session_messages
                 for delivery_mode in SessionMessageDeliveryMode
             )
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             settlement_record = None
             settlement_storage_key = None
             if settlement_request is not None:
@@ -14335,36 +14499,98 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         *,
         statuses: set[SessionStatus],
-        inactive_before: datetime,
+        inactive_for_seconds: int,
     ) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(statuses, "statuses")
-        if inactive_before.tzinfo is None or inactive_before.utcoffset() is None:
-            raise ValueError("inactive_before must be timezone-aware.")
+        validated_inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
+        assert validated_inactive_for_seconds is not None
         async with self._lock:
+            now = self._ownership_clock()
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            current_checkpoint = self._checkpoints.get(session_id)
             if (
                 active_provider_operation_cancellation_claim_from_checkpoint(
-                    self._checkpoints.get(session_id),
-                    now=datetime.now(UTC),
+                    current_checkpoint,
+                    now=now,
                 )
                 is not None
+                or _incomplete_recovery_claim_from_checkpoint(current_checkpoint) is not None
             ):
                 return None
-            if session.status not in allowed_statuses or session.last_activity_at > inactive_before:
+            inactive_before = utc_duration_cutoff(now, validated_inactive_for_seconds)
+            if (
+                inactive_before is None
+                or session.status not in allowed_statuses
+                or session.last_activity_at > inactive_before
+            ):
                 return None
             fenced = session.model_copy(
                 update={
                     "run_epoch": session.run_epoch + 1,
-                    "last_activity_at": datetime.now(UTC),
+                    "last_activity_at": now,
                 }
             )
             self._sessions[session_id] = fenced
             result = fenced.model_copy(deep=True)
             _activate_session_run_fence(result)
             return result
+
+    async def reserve_stalled_run_recovery(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_for_seconds: int | None,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> Session | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        async with self._lock:
+            now = self._ownership_clock()
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            current = self._checkpoints.get(session_id)
+            inactive_before = (
+                None
+                if inactive_for_seconds is None
+                else utc_duration_cutoff(now, inactive_for_seconds)
+            )
+            if (
+                session.status not in allowed_statuses
+                or (
+                    inactive_for_seconds is not None
+                    and (inactive_before is None or session.last_activity_at > inactive_before)
+                )
+                or active_provider_operation_cancellation_claim_from_checkpoint(
+                    current,
+                    now=now,
+                )
+                is not None
+            ):
+                return None
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                _copy_checkpoint_for_transform(current, session_id=session_id),
+                now,
+            )
+            if transformed is None:
+                return None
+            self._store_checkpoint_unlocked(
+                session_id,
+                _checkpoint_transform_result_preserving_completion_result_event_publications(
+                    current,
+                    transformed,
+                    session_id=session_id,
+                ),
+            )
+            return session.model_copy(deep=True)
 
     async def fence_run_and_transform_checkpoint(
         self,
@@ -14381,16 +14607,21 @@ class InMemorySessionStore(SessionStore):
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
         async with self._lock:
+            now = self._ownership_clock()
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(f"Session status cannot be fenced: {session.status}")
             current = self._checkpoints.get(session_id)
+            _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                current,
+                now=now,
+            )
             if (
                 active_provider_operation_cancellation_claim_from_checkpoint(
                     current,
-                    now=datetime.now(UTC),
+                    now=now,
                 )
                 is not None
             ):
@@ -14413,7 +14644,7 @@ class InMemorySessionStore(SessionStore):
             fenced = session.model_copy(
                 update={
                     "run_epoch": session.run_epoch + 1,
-                    "last_activity_at": datetime.now(UTC),
+                    "last_activity_at": now,
                 }
             )
             if result_checkpoint_transform is not None:
@@ -14911,7 +15142,9 @@ class InMemorySessionStore(SessionStore):
         )
         if not prepared.events:
             return session
-        return session.model_copy(update={"last_activity_at": activity_at or datetime.now(UTC)})
+        return session.model_copy(
+            update={"last_activity_at": activity_at or self._ownership_clock()}
+        )
 
     def _append_events_unlocked(
         self,
@@ -15046,7 +15279,7 @@ class InMemorySessionStore(SessionStore):
         if type(lease_seconds) not in {int, float} or lease_seconds <= 0:
             raise ValueError("lease_seconds must be greater than 0.")
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             deliveries = sorted(
                 self._persisted_event_side_effect_deliveries.values(),
                 key=lambda delivery: delivery.event_sequence,
@@ -15127,7 +15360,7 @@ class InMemorySessionStore(SessionStore):
                     "lease_expires_at": None,
                     "next_attempt_at": None,
                     "last_error": None,
-                    "updated_at": datetime.now(UTC),
+                    "updated_at": self._ownership_clock(),
                 },
                 deep=True,
             )
@@ -15156,7 +15389,7 @@ class InMemorySessionStore(SessionStore):
             raise ValueError("retry_delay_seconds must be a finite non-negative number.")
         dead_lettered = claim.attempt >= max_attempts
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             delivery = self._matching_persisted_event_side_effect_claim_unlocked(claim)
             updated = delivery.model_copy(
                 update={
@@ -15202,7 +15435,7 @@ class InMemorySessionStore(SessionStore):
             else {PersistedEventSideEffectStatus(status) for status in statuses}
         )
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             deliveries = sorted(
                 self._persisted_event_side_effect_deliveries.values(),
                 key=lambda delivery: delivery.event_sequence,
@@ -15286,7 +15519,7 @@ class InMemorySessionStore(SessionStore):
                 raise SessionStatusConflict(
                     "Session messages may be enqueued only while a session is pending or running."
                 )
-            accepted_at = datetime.now(UTC)
+            accepted_at = self._ownership_clock()
             queue_id = str(uuid4())
             ordering_key = self._next_session_message_ordering_key
             accepted_transcript_cursor = len(self._transcripts.get(session.id, []))
@@ -15449,7 +15682,7 @@ class InMemorySessionStore(SessionStore):
                 raise RuntimeError("Queued message selection lost its pending index.")
 
             transcript_cursor = len(self._transcripts.get(session_id, []))
-            delivered_at = datetime.now(UTC)
+            delivered_at = self._ownership_clock()
             updated_messages: list[SessionQueuedMessage] = []
             delivery_events: list[Event] = []
             transcript_messages: list[Message] = []
@@ -15575,12 +15808,13 @@ class InMemorySessionStore(SessionStore):
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: StoreTimeCheckpointTransform,
         events: list[Event],
     ) -> Session:
         return await self._publish_checkpoint_and_events(
             session_id,
-            checkpoint_transform=checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=checkpoint_transform,
             events=events,
             expected_statuses=None,
             expected_run_epoch=None,
@@ -15592,7 +15826,8 @@ class InMemorySessionStore(SessionStore):
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         events: list[Event],
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
@@ -15600,14 +15835,15 @@ class InMemorySessionStore(SessionStore):
         preserve_completion_result_publications: bool,
     ) -> Session:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
-        if checkpoint_transform is None:
-            raise TypeError("checkpoint_transform is required.")
+        if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
+            raise TypeError("Exactly one checkpoint transform is required.")
         allowed_statuses = (
             None
             if expected_statuses is None
             else _validate_status_set(expected_statuses, "expected_statuses")
         )
         async with self._lock:
+            store_now = self._ownership_clock()
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -15631,10 +15867,23 @@ class InMemorySessionStore(SessionStore):
                     f"{expected_transcript_cursor}, current {current_cursor}."
                 )
             current = self._checkpoints.get(session_id)
-            transformed = checkpoint_transform(
-                session.model_copy(deep=True),
-                _copy_checkpoint_for_transform(current, session_id=session_id),
+            callback_session = session.model_copy(deep=True)
+            callback_checkpoint = _copy_checkpoint_for_transform(
+                current,
+                session_id=session_id,
             )
+            if checkpoint_transform is not None:
+                transformed = checkpoint_transform(
+                    callback_session,
+                    callback_checkpoint,
+                )
+            else:
+                assert store_time_checkpoint_transform is not None
+                transformed = store_time_checkpoint_transform(
+                    callback_session,
+                    callback_checkpoint,
+                    store_now,
+                )
             if transformed is None:
                 raise ValueError("Checkpoint transform must return a checkpoint.")
             copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
@@ -15645,6 +15894,8 @@ class InMemorySessionStore(SessionStore):
                 session_id=session_id,
             )
             updated = self._append_events_unlocked(session, copied_events)
+            if not copied_events:
+                updated = updated.model_copy(update={"last_activity_at": store_now})
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = updated
             return updated.model_copy(deep=True)
@@ -15747,7 +15998,9 @@ class InMemorySessionStore(SessionStore):
             session_id,
             idempotency_key=idempotency_key,
             operation_transform=operation_transform,
+            store_time_operation_transform=None,
             commit_guard=None,
+            commit_time_guard=None,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -15770,7 +16023,35 @@ class InMemorySessionStore(SessionStore):
             session_id,
             idempotency_key=idempotency_key,
             operation_transform=operation_transform,
+            store_time_operation_transform=None,
             commit_guard=commit_guard,
+            commit_time_guard=None,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def publish_session_operation_guarded_with_store_time(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: StoreTimeSessionOperationTransform,
+        commit_guard: Callable[[], None],
+        commit_time_guard: Callable[[datetime], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_session_operation(
+            session_id,
+            idempotency_key=idempotency_key,
+            operation_transform=None,
+            store_time_operation_transform=operation_transform,
+            commit_guard=commit_guard,
+            commit_time_guard=commit_time_guard,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -15782,8 +16063,10 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         *,
         idempotency_key: str,
-        operation_transform: SessionOperationTransform,
+        operation_transform: SessionOperationTransform | None,
+        store_time_operation_transform: StoreTimeSessionOperationTransform | None,
         commit_guard: Callable[[], None] | None,
+        commit_time_guard: Callable[[datetime], None] | None,
         events: list[Event],
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
@@ -15794,14 +16077,15 @@ class InMemorySessionStore(SessionStore):
             idempotency_key,
             "idempotency_key",
         )
-        if operation_transform is None:
-            raise TypeError("operation_transform is required.")
+        if (operation_transform is None) == (store_time_operation_transform is None):
+            raise TypeError("Exactly one session operation transform is required.")
         allowed_statuses = (
             None
             if expected_statuses is None
             else _validate_status_set(expected_statuses, "expected_statuses")
         )
         async with self._lock:
+            store_now = self._ownership_clock()
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -15828,13 +16112,29 @@ class InMemorySessionStore(SessionStore):
             current_record = self._session_operation_records.get(session_id, {}).get(
                 idempotency_key
             )
-            publication = operation_transform(
-                session.model_copy(deep=True),
-                None if current_checkpoint is None else deepcopy(current_checkpoint),
+            callback_session = session.model_copy(deep=True)
+            callback_checkpoint = (
+                None if current_checkpoint is None else deepcopy(current_checkpoint)
+            )
+            callback_record = (
                 None
                 if current_record is None
-                else copy_durable_json_object(current_record, "session_operation"),
+                else copy_durable_json_object(current_record, "session_operation")
             )
+            if operation_transform is not None:
+                publication = operation_transform(
+                    callback_session,
+                    callback_checkpoint,
+                    callback_record,
+                )
+            else:
+                assert store_time_operation_transform is not None
+                publication = store_time_operation_transform(
+                    callback_session,
+                    callback_checkpoint,
+                    callback_record,
+                    store_now,
+                )
             if type(publication) is not SessionOperationPublication:
                 raise TypeError(
                     "Session operation transform must return a SessionOperationPublication."
@@ -15873,7 +16173,12 @@ class InMemorySessionStore(SessionStore):
                 if commit_guard is None
                 else await _run_session_commit_guard_owned(commit_guard)
             )
+            commit_at = self._ownership_clock()
+            if commit_time_guard is not None:
+                commit_time_guard(commit_at)
             updated = self._append_events_unlocked(session, copied_events)
+            if not copied_events:
+                updated = updated.model_copy(update={"last_activity_at": commit_at})
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             operation_records = self._session_operation_records.setdefault(session_id, {})
             operation_records.update(copied_records)
@@ -17214,7 +17519,7 @@ class InMemorySessionStore(SessionStore):
         filters = copy_session_aggregate_filter(filters)
         session_query = session_query_from_aggregate_filter(filters)
         async with self._lock:
-            as_of = datetime.now(UTC)
+            as_of = self._ownership_clock()
             counts = {status: 0 for status in SessionStatus}
             total_count = 0
             for session in self._sessions.values():
@@ -17232,7 +17537,7 @@ class InMemorySessionStore(SessionStore):
         query = copy_usage_rollup_query(query)
         session_query = session_query_from_aggregate_filter(query.sessions)
         async with self._lock:
-            as_of = datetime.now(UTC)
+            as_of = self._ownership_clock()
             matching_session_count = 0
             active_session_count = 0
             for session in self._sessions.values():
@@ -17520,8 +17825,25 @@ class InMemorySessionStore(SessionStore):
         pending_interruption_cascade_only: bool,
     ) -> SessionListResult:
         query = copy_session_query(query)
-        base_query = query.model_copy(update={"debug_state": None})
         async with self._lock:
+            inactive_before = (
+                query.last_activity_before
+                if query.inactive_for_seconds is None
+                else utc_duration_cutoff(
+                    self._ownership_clock(),
+                    query.inactive_for_seconds,
+                )
+            )
+            duration_matches_no_timestamp = (
+                query.inactive_for_seconds is not None and inactive_before is None
+            )
+            base_query = query.model_copy(
+                update={
+                    "debug_state": None,
+                    "last_activity_before": inactive_before,
+                    "inactive_for_seconds": None,
+                }
+            )
             candidates = (
                 (
                     self._sessions[session_id]
@@ -17531,16 +17853,20 @@ class InMemorySessionStore(SessionStore):
                 if pending_interruption_cascade_only
                 else self._sessions.values()
             )
-            matching = [
-                session
-                for session in candidates
-                if _session_matches(session, base_query)
-                and _session_matches_debug_state(
-                    session,
-                    self._session_event_records.get(session.id, []),
-                    query.debug_state,
-                )
-            ]
+            matching = (
+                []
+                if duration_matches_no_timestamp
+                else [
+                    session
+                    for session in candidates
+                    if _session_matches(session, base_query)
+                    and _session_matches_debug_state(
+                        session,
+                        self._session_event_records.get(session.id, []),
+                        query.debug_state,
+                    )
+                ]
+            )
             total = len(matching) if query.include_total_count else None
             ordered = _sort_sessions(matching, query.order_by)
             if query.cursor is not None:
@@ -17590,8 +17916,40 @@ class InMemorySessionStore(SessionStore):
                 session_id, [interaction_id] * len(copied_messages)
             )
             self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
+                update={"last_activity_at": self._ownership_clock()}
             )
+
+    async def transform_checkpoint_with_store_time(
+        self,
+        session_id: str,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        async with self._lock:
+            now = self._ownership_clock()
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            current = self._checkpoints.get(session_id)
+            transformed = checkpoint_transform(
+                session.model_copy(deep=True),
+                _copy_checkpoint_for_transform(current, session_id=session_id),
+                now,
+            )
+            if transformed is None:
+                return
+            self._store_checkpoint_unlocked(
+                session_id,
+                _replace_checkpoint_preserving_completion_result_event_publications(
+                    current,
+                    copy_durable_json_object(transformed, "checkpoint"),
+                    session_id=session_id,
+                ),
+            )
+            self._sessions[session_id] = session.model_copy(update={"last_activity_at": now})
 
     async def replace_initial_transcript_messages(
         self,
@@ -17666,7 +18024,7 @@ class InMemorySessionStore(SessionStore):
             else:
                 self._store_checkpoint_unlocked(session_id, checkpoint)
             self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
+                update={"last_activity_at": self._ownership_clock()}
             )
 
     async def materialize_deferred_interaction_input(
@@ -17696,7 +18054,7 @@ class InMemorySessionStore(SessionStore):
             )
             self._deferred_interaction_inputs.pop(session_id, None)
             self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
+                update={"last_activity_at": self._ownership_clock()}
             )
             return True
 
@@ -17761,7 +18119,7 @@ class InMemorySessionStore(SessionStore):
                 )
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
+                update={"last_activity_at": self._ownership_clock()}
             )
 
     async def load_transcript(self, session_id: str) -> list[Message]:
@@ -18378,7 +18736,7 @@ class InMemorySessionStore(SessionStore):
                 ),
             )
             self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
+                update={"last_activity_at": self._ownership_clock()}
             )
 
     async def transform_checkpoint(
@@ -18410,7 +18768,7 @@ class InMemorySessionStore(SessionStore):
                 ),
             )
             self._sessions[session_id] = session.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
+                update={"last_activity_at": self._ownership_clock()}
             )
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
@@ -18693,6 +19051,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         causal_budget_id=request.causal_budget_id,
         task_id=request.task_id,
         task_worker_id=request.task_worker_id,
+        task_lease_expires_at=request.task_lease_expires_at,
         target=(
             None
             if request.target is None
@@ -19847,7 +20206,7 @@ def copy_incomplete_session_recovery_request(
         raise TypeError("Incomplete session recovery requires an IncompleteSessionRecoveryRequest.")
     return IncompleteSessionRecoveryRequest(
         session_id=request.session_id,
-        inactive_before=request.inactive_before,
+        inactive_for_seconds=request.inactive_for_seconds,
         reason=request.reason,
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
@@ -19865,7 +20224,7 @@ def copy_incomplete_sessions_recovery_request(
         limit=request.limit,
         inspection_limit=request.inspection_limit,
         cursor=request.cursor,
-        inactive_before=request.inactive_before,
+        inactive_for_seconds=request.inactive_for_seconds,
         reason=request.reason,
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
@@ -20888,39 +21247,17 @@ def _validate_interaction_transition_invocation_authority_parameters(
     return cast('Literal["active", "released"]', expected_invocation_authority_state)
 
 
-def _validate_interaction_transition_recovery_claim_parameters(
-    *,
+def _validate_interaction_transition_recovery_claim_id(
     expected_recovery_claim_id: str | None,
-    expected_recovery_claim_clock: Callable[[], datetime] | None,
-) -> tuple[str | None, Callable[[], datetime] | None]:
-    """Require one clock domain for an exact recovery-claim mutation fence."""
+) -> str | None:
+    """Validate the identity used for a store-time recovery-claim fence."""
 
     if expected_recovery_claim_id is None:
-        if expected_recovery_claim_clock is not None:
-            raise TypeError("A recovery-claim clock requires an expected recovery claim.")
-        return None, None
-    claim_id = require_clean_nonblank(
+        return None
+    return require_clean_nonblank(
         expected_recovery_claim_id,
         "expected_recovery_claim_id",
     )
-    if expected_recovery_claim_clock is None or not callable(expected_recovery_claim_clock):
-        raise TypeError("An expected recovery claim requires its authoritative clock.")
-    return claim_id, expected_recovery_claim_clock
-
-
-def _interaction_transition_recovery_claim_observed_at(
-    clock: Callable[[], datetime],
-) -> datetime:
-    """Sample and normalize the clock that issued the fenced recovery lease."""
-
-    observed_at = clock()
-    if (
-        not isinstance(observed_at, datetime)
-        or observed_at.tzinfo is None
-        or observed_at.utcoffset() is None
-    ):
-        raise ValueError("expected_recovery_claim_clock must return an aware datetime.")
-    return observed_at.astimezone(UTC)
 
 
 def _interaction_transition_receipt_record(
@@ -26555,6 +26892,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         parent_session_id=query.parent_session_id,
         causal_budget_id=query.causal_budget_id,
         last_activity_before=query.last_activity_before,
+        inactive_for_seconds=query.inactive_for_seconds,
         labels=copy_label_map(query.labels, "labels"),
         label_selectors=copy_label_selector_requirements(query.label_selectors),
         limit=query.limit,
@@ -26951,6 +27289,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
         and session.last_activity_at > query.last_activity_before
     ):
         return False
+    if query.inactive_for_seconds is not None:
+        raise ValueError("SessionQuery inactive_for_seconds must be resolved by the SessionStore.")
     for key, value in query.labels.items():
         if session.labels.get(key) != value:
             return False
@@ -28792,6 +29132,25 @@ def _active_unexpired_incomplete_recovery_claim_id(
         return None
     claim_id, expires_at = claim
     return claim_id if expires_at.astimezone(UTC) > now.astimezone(UTC) else None
+
+
+def _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+    checkpoint: Mapping[str, Any] | None,
+    *,
+    now: datetime,
+) -> None:
+    """Reject a run-epoch transfer authorized by an expired recovery lease."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+    if claim is None:
+        return
+    _claim_id, expires_at = claim
+    if expires_at.astimezone(UTC) <= now.astimezone(UTC):
+        raise SessionRunFenced(
+            "Incomplete-session recovery claim expired before run ownership transfer."
+        )
 
 
 def _active_unexpired_session_operation_id(

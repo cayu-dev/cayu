@@ -1805,7 +1805,8 @@ def test_revision_seventy_six_backfills_live_handoff_authority(
             async def release(task_id: str, task_type: str, session_id: str):
                 await creator.create_task(TaskCreate(task_id=task_id, type=task_type))
                 worker_id = f"prior-{task_id}"
-                assert await creator.claim_task(worker_id, TaskQuery(type=task_type)) is not None
+                claimed = await creator.claim_task(worker_id, TaskQuery(type=task_type))
+                assert claimed is not None
                 attached = await creator.attach_task(
                     task_id,
                     session_id=session_id,
@@ -1815,6 +1816,7 @@ def test_revision_seventy_six_backfills_live_handoff_authority(
                         session_id,
                     ),
                     worker_id=worker_id,
+                    lease_expires_at=claimed.lease_expires_at,
                 )
                 request = interrupted_task_handoff_request(attached, session_run_epoch=1)
                 await creator.release_interrupted_task_worker(request)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -673,7 +672,7 @@ def test_partial_provider_stream_reconnects_after_cursor_without_duplicate_outpu
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -719,7 +718,7 @@ def test_pending_cursor_reconnect_returns_to_scheduled_inspection_state() -> Non
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -765,7 +764,7 @@ def test_retrieved_post_terminal_output_preserves_non_turn_completion_and_usage(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -814,7 +813,7 @@ def test_partial_tool_call_replay_materializes_one_pending_call() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -867,7 +866,7 @@ def test_partial_thinking_replay_preserves_state_without_duplicate_public_delta(
         result = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -919,7 +918,7 @@ def test_competing_partial_cursor_recovery_workers_publish_once() -> None:
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         request = IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC),
+            inactive_for_seconds=0,
         )
 
         outcomes = await asyncio.gather(
@@ -967,7 +966,7 @@ def test_cursor_validation_failure_closes_stream_and_requires_resolution() -> No
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -999,7 +998,7 @@ def test_reconnect_stops_and_closes_stream_after_terminal_event() -> None:
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             ),
             timeout=1.0,
@@ -1031,7 +1030,7 @@ def test_reconnect_cleanup_failure_preserves_non_turn_completion_and_usage() -> 
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1074,7 +1073,7 @@ def test_invalid_recovered_completion_preserves_non_turn_usage_evidence() -> Non
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1115,7 +1114,7 @@ def test_cancellation_during_reconnect_close_preserves_completion_then_propagate
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -1162,7 +1161,7 @@ def test_reconnect_adapter_cannot_mutate_runtime_owned_operation_state() -> None
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -1210,7 +1209,7 @@ def test_reconnect_rejects_secret_bearing_opaque_state_before_progress_commit(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -1259,7 +1258,7 @@ def test_reconnect_revalidates_stored_opaque_state_against_current_secrets(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1287,7 +1286,7 @@ def test_reconnect_rejects_malformed_output_before_cursor_commit(event_kind: str
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -1333,7 +1332,7 @@ def test_recovery_rejects_operation_identity_that_conflicts_with_model_started(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1621,7 +1620,7 @@ def test_recovery_rejects_ambiguous_output_after_valid_cursor_progress(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1887,7 +1886,7 @@ def test_provider_progress_commit_is_atomic_monotonic_and_replay_safe(
         fenced = await store.fence_stalled_run(
             session_id,
             statuses={SessionStatus.RUNNING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is not None
         stale = ModelStreamEvent.text_delta(

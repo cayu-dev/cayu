@@ -68,7 +68,8 @@ Both claim durable work with leases, but they cover different shapes:
 - **`run_task_worker(app, task_store, handler, *, worker_id, query=..., ...)`** —
   claims *arbitrary* `Task`s and starts a *new* session for each. The handler
   turns a claimed task into an `app.run(RunRequest(task_id=task.id,
-  task_worker_id=worker_id, ...))`. Use it when an external event (a webhook, a
+  task_worker_id=worker_id, task_lease_expires_at=task.lease_expires_at, ...))`.
+  Use it when an external event (a webhook, a
   cron tick) enqueues a job. This is what the
   [PR-reviewer recipe](recipes/pr-reviewer.md) uses.
 
@@ -88,6 +89,7 @@ async def handle(app, task, worker_id):
         session_id=f"job-{task.id}",
         task_id=task.id,
         task_worker_id=worker_id,
+        task_lease_expires_at=task.lease_expires_at,
         messages=[Message.text("user", task.input["prompt"])],
     )):
         if _event.type == EventType.SESSION_INTERRUPTED:
@@ -104,6 +106,16 @@ The loop owns claim → heartbeat → handle → reclaim-expired-leases, and kee
 going if one task's handler raises or returns without terminalizing its task (it
 marks that task failed). Pass a `stop: asyncio.Event` for graceful shutdown and
 `max_tasks=N` to bound it.
+
+The handler passes the claim snapshot it received. The worker loop privately
+serializes later heartbeat generations with session attachment and terminal
+mutation, so the handler must not reload or guess a replacement lease while
+`run_task_worker(...)` is supervising it. If the handler itself completes or
+fails the task, use `complete_managed_task(task_store, task, worker_id, result)`
+or `fail_managed_task(task_store, task, worker_id, error)` with the original
+claimed `task`; those boundaries present the latest acknowledged private lease
+to the store without allowing a same-ID successor claim to be mistaken for the
+original owner.
 
 The explicit `SESSION_INTERRUPTED` outcome is the exception to terminal handler
 completion. The helper verifies that the task is attached and its durable

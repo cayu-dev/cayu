@@ -12,6 +12,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from math import isfinite
+from time import monotonic
 from typing import TypeVar
 
 _HeartbeatUpdateT = TypeVar("_HeartbeatUpdateT")
@@ -198,6 +199,9 @@ async def run_durable_lease_heartbeat(
     | None = None,
     on_failure: Callable[[Exception], Awaitable[_HeartbeatOutcomeT | None]] | None = None,
     wait: WorkerWait = wait_or_stop,
+    lease_deadline: Callable[[], float] | None = None,
+    deadline_failure: Callable[[], BaseException] | None = None,
+    clock: Callable[[], float] = monotonic,
 ) -> _HeartbeatOutcomeT:
     """Maintain one lease until stopped or an adapter returns an outcome.
 
@@ -206,12 +210,23 @@ async def run_durable_lease_heartbeat(
     preserves the adapter failure and traceback.
     """
 
+    if (lease_deadline is None) != (deadline_failure is None):
+        raise ValueError("lease_deadline and deadline_failure must be provided together.")
     interval = lease_heartbeat_interval(
         lease_seconds,
         maximum_s=maximum_interval_s,
     )
     while not stop.is_set():
-        if await wait(interval, stop):
+        wait_seconds = interval
+        if lease_deadline is not None:
+            remaining = lease_deadline() - clock()
+            if remaining <= 0:
+                assert deadline_failure is not None
+                raise deadline_failure()
+            half_remaining = remaining / 2
+            if half_remaining + 1e-5 < wait_seconds:
+                wait_seconds = half_remaining
+        if await wait(wait_seconds, stop):
             return stopped_outcome
         try:
             update = await heartbeat()

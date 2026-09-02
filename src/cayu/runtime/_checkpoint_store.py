@@ -45,6 +45,7 @@ from cayu.runtime.sessions import (
     SessionOperationInitializer,
     SessionOperationPublication,
     SessionStore,
+    StoreTimeCheckpointTransform,
     _apply_runtime_publication_checkpoint_mutation,
     _copy_checkpoint_for_transform,
     _invocation_lifecycle_authority_read_scope,
@@ -130,6 +131,40 @@ def _optional_versioned_checkpoint_transform(
     return _versioned_checkpoint_transform(session_id, checkpoint_transform)
 
 
+def _versioned_store_time_checkpoint_transform(
+    session_id: str,
+    checkpoint_transform: StoreTimeCheckpointTransform,
+    *,
+    preserve_completion_result_publications: bool = False,
+) -> StoreTimeCheckpointTransform:
+    if checkpoint_transform is None:
+        raise TypeError("checkpoint_transform is required.")
+
+    @wraps(checkpoint_transform)
+    def transform(
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        store_now: Any,
+    ) -> dict[str, Any] | None:
+        def apply_store_time(
+            callback_session: Session,
+            callback_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return checkpoint_transform(
+                callback_session,
+                callback_checkpoint,
+                store_now,
+            )
+
+        return _versioned_checkpoint_transform(
+            session_id,
+            apply_store_time,
+            preserve_completion_result_publications=(preserve_completion_result_publications),
+        )(session, checkpoint)
+
+    return transform
+
+
 def _versioned_operation_transform(
     session_id: str,
     operation_transform: Any,
@@ -187,6 +222,40 @@ def _versioned_operation_transform(
             if versioned is not None:
                 versioned.clear()
             raise
+
+    return transform
+
+
+def _versioned_store_time_operation_transform(
+    session_id: str,
+    operation_transform: Any,
+) -> Any:
+    if operation_transform is None:
+        raise TypeError("operation_transform is required.")
+
+    def transform(
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        operation_record: dict[str, Any] | None,
+        store_now: Any,
+    ) -> SessionOperationPublication:
+        def apply_store_time(
+            callback_session: Session,
+            callback_checkpoint: dict[str, Any] | None,
+            callback_operation_record: dict[str, Any] | None,
+        ) -> SessionOperationPublication:
+            return operation_transform(
+                callback_session,
+                callback_checkpoint,
+                callback_operation_record,
+                store_now,
+            )
+
+        return _versioned_operation_transform(session_id, apply_store_time)(
+            session,
+            checkpoint,
+            operation_record,
+        )
 
     return transform
 
@@ -459,21 +528,53 @@ class _RuntimeCheckpointSessionStore:
             ),
         )
 
-    async def transition_status_and_checkpoint(
+    async def transform_checkpoint_with_store_time(
         self,
         session_id: str,
-        *,
-        checkpoint_transform: CheckpointTransform,
-        result_checkpoint_transform: CheckpointTransform | None = None,
-        **kwargs: Any,
-    ) -> Session:
-        return await self._store.transition_status_and_checkpoint(
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> None:
+        await self._store.transform_checkpoint_with_store_time(
             session_id,
-            checkpoint_transform=_versioned_checkpoint_transform(
+            _versioned_store_time_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
                 preserve_completion_result_publications=True,
             ),
+        )
+
+    async def transition_status_and_checkpoint(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
+        result_checkpoint_transform: CheckpointTransform | None = None,
+        **kwargs: Any,
+    ) -> Session:
+        if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
+            raise TypeError("Exactly one checkpoint transform is required.")
+        versioned_checkpoint_transform = (
+            None
+            if checkpoint_transform is None
+            else _versioned_checkpoint_transform(
+                session_id,
+                checkpoint_transform,
+                preserve_completion_result_publications=True,
+            )
+        )
+        versioned_store_time_transform = (
+            None
+            if store_time_checkpoint_transform is None
+            else _versioned_store_time_checkpoint_transform(
+                session_id,
+                store_time_checkpoint_transform,
+                preserve_completion_result_publications=True,
+            )
+        )
+        return await self._store.transition_status_and_checkpoint(
+            session_id,
+            checkpoint_transform=versioned_checkpoint_transform,
+            store_time_checkpoint_transform=versioned_store_time_transform,
             result_checkpoint_transform=_optional_versioned_checkpoint_transform(
                 session_id,
                 result_checkpoint_transform,
@@ -632,6 +733,23 @@ class _RuntimeCheckpointSessionStore:
             **kwargs,
         )
 
+    async def reserve_stalled_run_recovery(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+        **kwargs: Any,
+    ) -> Session | None:
+        return await self._store.reserve_stalled_run_recovery(
+            session_id,
+            checkpoint_transform=_versioned_store_time_checkpoint_transform(
+                session_id,
+                checkpoint_transform,
+                preserve_completion_result_publications=True,
+            ),
+            **kwargs,
+        )
+
     async def publish_checkpoint_and_events(
         self,
         session_id: str,
@@ -649,16 +767,33 @@ class _RuntimeCheckpointSessionStore:
             **kwargs,
         )
 
+    async def publish_checkpoint_and_events_with_store_time(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+        **kwargs: Any,
+    ) -> Session:
+        return await self._store.publish_checkpoint_and_events_with_store_time(
+            session_id,
+            checkpoint_transform=_versioned_store_time_checkpoint_transform(
+                session_id,
+                checkpoint_transform,
+                preserve_completion_result_publications=True,
+            ),
+            **kwargs,
+        )
+
     async def _publish_completion_result_event_publication(
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: StoreTimeCheckpointTransform,
         events: list[Any],
     ) -> Session:
         return await self._store._publish_completion_result_event_publication(
             session_id,
-            checkpoint_transform=_versioned_checkpoint_transform(
+            checkpoint_transform=_versioned_store_time_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
             ),
@@ -691,6 +826,22 @@ class _RuntimeCheckpointSessionStore:
         return await self._store.publish_session_operation_guarded(
             session_id,
             operation_transform=_versioned_operation_transform(
+                session_id,
+                operation_transform,
+            ),
+            **kwargs,
+        )
+
+    async def publish_session_operation_guarded_with_store_time(
+        self,
+        session_id: str,
+        *,
+        operation_transform: Any,
+        **kwargs: Any,
+    ) -> Session:
+        return await self._store.publish_session_operation_guarded_with_store_time(
+            session_id,
+            operation_transform=_versioned_store_time_operation_transform(
                 session_id,
                 operation_transform,
             ),

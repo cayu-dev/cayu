@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,7 @@ class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
         result: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         if self._terminal_status is TaskStatus.COMPLETED:
@@ -86,6 +87,7 @@ class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
             task_id,
             result,
             worker_id=worker_id,
+            lease_expires_at=lease_expires_at,
             handoff_id=handoff_id,
         )
 
@@ -95,6 +97,7 @@ class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
         error: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         if self._terminal_status is TaskStatus.FAILED:
@@ -103,6 +106,7 @@ class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
             task_id,
             error,
             worker_id=worker_id,
+            lease_expires_at=lease_expires_at,
             handoff_id=handoff_id,
         )
 
@@ -489,6 +493,7 @@ def test_daily_recipe_does_not_recover_expired_attached_task_from_stale_evidence
                 session_id=f"session_{created.id}",
                 task_id=created.id,
                 task_worker_id="daily-worker-a",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "Begin the daily page check.")],
             )
         )
@@ -508,6 +513,7 @@ def test_daily_recipe_does_not_recover_expired_attached_task_from_stale_evidence
                 invocation=admitted.session.invocation,
             ),
             worker_id="daily-worker-a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         assert attached.status is TaskStatus.RUNNING
         assert attached.session_id == admitted.session.id
@@ -626,6 +632,7 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
                 session_id=f"session_{created.id}",
                 task_id=created.id,
                 task_worker_id="daily-worker-a",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "Begin the daily page check.")],
             )
         )
@@ -636,7 +643,7 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
             model=prepared.registered_agent.spec.model,
             execution_profile=prepared.execution_profile,
         )
-        await first_tasks.attach_task(
+        attached = await first_tasks.attach_task(
             created.id,
             session_id=admitted.session.id,
             session_invocation=SessionInvocationBinding(
@@ -645,6 +652,7 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
                 invocation=admitted.session.invocation,
             ),
             worker_id="daily-worker-a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         await interrupt_and_release_test_invocation(
             first_sessions,
@@ -653,6 +661,7 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
         released = await first_tasks.release_attached_task_worker(
             created.id,
             "daily-worker-a",
+            lease_expires_at=attached.lease_expires_at,
         )
         assert released.status is TaskStatus.RUNNING
         assert released.worker_id is None
@@ -795,7 +804,7 @@ def test_daily_recipe_concurrently_settles_the_same_ownerless_terminal_task(
                 session_id=session_id,
             ),
         )
-        await task_store.attach_task(
+        attached = await task_store.attach_task(
             created.id,
             session_id=session_id,
             session_invocation=SessionInvocationBinding(
@@ -804,8 +813,13 @@ def test_daily_recipe_concurrently_settles_the_same_ownerless_terminal_task(
                 invocation=session.invocation,
             ),
             worker_id="daily-worker-a",
+            lease_expires_at=claimed.lease_expires_at,
         )
-        await task_store.release_attached_task_worker(created.id, "daily-worker-a")
+        await task_store.release_attached_task_worker(
+            created.id,
+            "daily-worker-a",
+            lease_expires_at=attached.lease_expires_at,
+        )
         first_snapshot = await task_store.load_task(created.id)
         second_snapshot = await task_store.load_task(created.id)
         assert first_snapshot is not None
@@ -890,6 +904,7 @@ def test_daily_recipe_reconciles_a_terminal_session_before_recreating_it() -> No
                 session_id=f"session_{created.id}",
                 task_id=created.id,
                 task_worker_id="daily-worker",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "Begin the daily page check.")],
             )
         )

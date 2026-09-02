@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -55,6 +56,7 @@ from cayu import (
     TaskInterruptedHandoffRequest,
     TaskInvocationSnapshot,
     TaskQuery,
+    TaskRetryPolicy,
     TaskStatus,
     TaskStore,
     TaskTerminalizationConflict,
@@ -74,6 +76,8 @@ from cayu import (
     ToolSpec,
     UserInputRecoveryRequest,
     UserInputResponse,
+    complete_managed_task,
+    fail_managed_task,
     interrupted_task_handoff_request,
     run_task_worker,
 )
@@ -165,6 +169,7 @@ async def _seed_receipt_backed_continuation(
             session_id,
         ),
         worker_id=worker_id,
+        lease_expires_at=claimed.lease_expires_at,
     )
     session = await app.session_store.load(session_id)
     assert session is not None
@@ -222,28 +227,737 @@ def test_run_task_worker_rejects_incomplete_interrupted_handoff_capability() -> 
     asyncio.run(scenario())
 
 
+def test_task_worker_revalidates_before_dispatch_after_delayed_claim_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store_time = [datetime(2026, 9, 1, tzinfo=UTC)]
+        monotonic_time = [0.0]
+
+        class DelayedClaimAcknowledgementStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__(ownership_clock=lambda: store_time[0])
+                self.claim_committed = asyncio.Event()
+                self.release_claim_acknowledgement = asyncio.Event()
+
+            async def claim_task(self, worker_id, query=None, *, lease_seconds=300):
+                claimed = await super().claim_task(
+                    worker_id,
+                    query,
+                    lease_seconds=lease_seconds,
+                )
+                if worker_id == "stale-worker" and claimed is not None:
+                    self.claim_committed.set()
+                    await self.release_claim_acknowledgement.wait()
+                return claimed
+
+        monkeypatch.setattr(task_worker_module, "monotonic", lambda: monotonic_time[0])
+        store = DelayedClaimAcknowledgementStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="delayed-claim-ack", type="job"))
+        handler_workers: list[str] = []
+
+        async def handler(_app: CayuApp, _task: Task, worker_id: str) -> None:
+            handler_workers.append(worker_id)
+
+        stale_worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="stale-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        await store.claim_committed.wait()
+        store_time[0] += timedelta(seconds=2)
+        monotonic_time[0] += 2
+        try:
+            assert (
+                await run_task_worker(
+                    app,
+                    store,
+                    handler,
+                    worker_id="replacement-worker",
+                    lease_seconds=1,
+                    poll_interval_s=0.001,
+                    max_tasks=1,
+                )
+                == 1
+            )
+        finally:
+            store.release_claim_acknowledgement.set()
+        with pytest.raises(TaskClaimLost):
+            await stale_worker
+        assert handler_workers == ["replacement-worker"]
+
+    asyncio.run(scenario())
+
+
+def test_task_worker_rejects_heartbeat_acknowledged_after_its_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        store_time = [datetime(2026, 9, 1, tzinfo=UTC)]
+        monotonic_time = [0.0]
+
+        class DelayedHeartbeatAcknowledgementStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__(ownership_clock=lambda: store_time[0])
+                self.heartbeat_committed = asyncio.Event()
+                self.release_heartbeat_acknowledgement = asyncio.Event()
+
+            async def heartbeat(
+                self,
+                task_id,
+                worker_id,
+                *,
+                lease_expires_at,
+                handoff_id=None,
+                extend_seconds=300,
+            ):
+                renewed = await super().heartbeat(
+                    task_id,
+                    worker_id,
+                    lease_expires_at=lease_expires_at,
+                    handoff_id=handoff_id,
+                    extend_seconds=extend_seconds,
+                )
+                if not self.heartbeat_committed.is_set():
+                    self.heartbeat_committed.set()
+                    await self.release_heartbeat_acknowledgement.wait()
+                return renewed
+
+        monkeypatch.setattr(task_worker_module, "monotonic", lambda: monotonic_time[0])
+        store = DelayedHeartbeatAcknowledgementStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="delayed-heartbeat-ack", type="job"))
+        handler_called = False
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        await store.heartbeat_committed.wait()
+        store_time[0] += timedelta(seconds=2)
+        monotonic_time[0] += 2
+        store.release_heartbeat_acknowledgement.set()
+        with pytest.raises(TaskClaimLost, match="acknowledgement consumed"):
+            await worker
+        assert handler_called is False
+
+    asyncio.run(scenario())
+
+
+def test_task_worker_stops_handler_when_heartbeat_stalls_past_lease() -> None:
+    async def scenario() -> None:
+        class BlockingPeriodicHeartbeatStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.heartbeat_calls = 0
+                self.periodic_heartbeat_started = asyncio.Event()
+                self.release_periodic_heartbeat = asyncio.Event()
+
+            async def heartbeat(
+                self,
+                task_id,
+                worker_id,
+                *,
+                lease_expires_at,
+                handoff_id=None,
+                extend_seconds=300,
+            ):
+                self.heartbeat_calls += 1
+                if worker_id == "stale-worker" and self.heartbeat_calls == 2:
+                    self.periodic_heartbeat_started.set()
+                    await self.release_periodic_heartbeat.wait()
+                return await super().heartbeat(
+                    task_id,
+                    worker_id,
+                    lease_expires_at=lease_expires_at,
+                    handoff_id=handoff_id,
+                    extend_seconds=extend_seconds,
+                )
+
+        store = BlockingPeriodicHeartbeatStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="stalled-periodic-heartbeat", type="job"))
+        stale_handler_started = asyncio.Event()
+        stale_handler_stopped = asyncio.Event()
+        release_stale_handler = threading.Event()
+
+        async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
+            if worker_id == "stale-worker":
+                stale_handler_started.set()
+                try:
+                    await asyncio.to_thread(release_stale_handler.wait)
+                finally:
+                    stale_handler_stopped.set()
+                return
+            raise AssertionError("A replacement must not run while stale work drains.")
+
+        stale_worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="stale-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        await asyncio.wait_for(stale_handler_started.wait(), timeout=1)
+        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=1)
+        await asyncio.sleep(1.05)
+        assert stale_worker.done() is False
+        assert stale_handler_stopped.is_set() is False
+        for _attempt in range(100):
+            draining = await store.load_task("stalled-periodic-heartbeat")
+            if draining is not None and draining.status_reason == "cancellation_requested":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("Task worker did not durably fence its draining handler.")
+        assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+        assert (
+            await store.claim_task(
+                "replacement-worker",
+                TaskQuery(type="job"),
+                lease_seconds=1,
+            )
+            is None
+        )
+        release_stale_handler.set()
+        await asyncio.wait_for(stale_handler_stopped.wait(), timeout=2)
+        with pytest.raises(TaskClaimLost, match="positively known lease deadline"):
+            await stale_worker
+        terminal = await store.load_task("stalled-periodic-heartbeat")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.worker_id is None
+        assert terminal.lease_expires_at is None
+
+        store.release_periodic_heartbeat.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_task_worker_cancellation_fences_opaque_handler_until_natural_settlement() -> None:
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        class CancellationAcknowledgementLossStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancel_calls = 0
+
+            async def request_claimed_task_cancellation(
+                self,
+                task_id,
+                worker_id,
+                lease_expires_at,
+                error=None,
+            ):
+                self.cancel_calls += 1
+                cancelled = await super().request_claimed_task_cancellation(
+                    task_id,
+                    worker_id,
+                    lease_expires_at,
+                    error,
+                )
+                if self.cancel_calls == 1:
+                    raise ConnectionError("cancellation acknowledgement lost")
+                return cancelled
+
+        store = CancellationAcknowledgementLossStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="opaque-cancelled-handler", type="job"))
+        handler_started = asyncio.Event()
+        handler_stopped = asyncio.Event()
+        release_handler = threading.Event()
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            handler_started.set()
+            try:
+                await asyncio.to_thread(release_handler.wait)
+            finally:
+                handler_stopped.set()
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="cancelled-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        worker.cancel("stop opaque worker")
+        cancelling = worker.cancelling()
+        for _attempt in range(100):
+            draining = await store.load_task("opaque-cancelled-handler")
+            if draining is not None and draining.status_reason == "cancellation_requested":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("Cancelled worker did not publish its durable drain fence.")
+        await asyncio.sleep(1.05)
+        assert worker.done() is False
+        assert handler_stopped.is_set() is False
+        assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+        assert (
+            await store.claim_task(
+                "replacement-worker",
+                TaskQuery(type="job"),
+                lease_seconds=1,
+            )
+            is None
+        )
+
+        release_handler.set()
+        await asyncio.wait_for(handler_stopped.wait(), timeout=2)
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await worker
+        terminal = await store.load_task("opaque-cancelled-handler")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.worker_id is None
+        assert terminal.lease_expires_at is None
+        assert store.cancel_calls == 1
+        return raised.value, cancelling, worker.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancellation.args == ("stop opaque worker",)
+    assert cancelling == 1
+    assert cancelled is True
+
+
+def test_expired_dispatched_task_cannot_be_reclaimed_while_fence_publication_waits() -> None:
+    async def scenario() -> None:
+        now = {"value": datetime.now(UTC)}
+
+        class DelayedCancellationStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__(ownership_clock=lambda: now["value"])
+                self.fence_started = asyncio.Event()
+                self.release_fence = asyncio.Event()
+
+            async def request_claimed_task_cancellation(
+                self,
+                task_id,
+                worker_id,
+                lease_expires_at,
+                error=None,
+            ):
+                self.fence_started.set()
+                await self.release_fence.wait()
+                return await super().request_claimed_task_cancellation(
+                    task_id,
+                    worker_id,
+                    lease_expires_at,
+                    error,
+                )
+
+        store = DelayedCancellationStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="stale-cancellation", type="job"))
+        handler_started = asyncio.Event()
+        handler_stopped = asyncio.Event()
+        release_handler = threading.Event()
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            handler_started.set()
+            try:
+                await asyncio.to_thread(release_handler.wait)
+            finally:
+                handler_stopped.set()
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="stale-worker",
+                lease_seconds=60,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        try:
+            await asyncio.wait_for(handler_started.wait(), timeout=1)
+            claimed = await store.load_task("stale-cancellation")
+            assert claimed is not None
+            assert claimed.lease_expires_at is not None
+
+            worker.cancel("stop stale worker")
+            await asyncio.wait_for(store.fence_started.wait(), timeout=1)
+            now["value"] = claimed.lease_expires_at + timedelta(seconds=1)
+            reclaimed = await store.reclaim_expired(query=TaskQuery(type="job"))
+            assert reclaimed == []
+            replacement = await store.claim_task(
+                "replacement-worker",
+                TaskQuery(type="job"),
+                lease_seconds=300,
+            )
+            assert replacement is None
+
+            draining = await store.load_task(claimed.id)
+            assert draining is not None
+            assert draining.worker_id == "stale-worker"
+            assert draining.lease_expires_at == claimed.lease_expires_at
+            assert draining.status_reason == "cancellation_requested"
+            assert handler_stopped.is_set() is False
+
+            store.release_fence.set()
+            await asyncio.sleep(0)
+            assert worker.done() is False
+            assert handler_stopped.is_set() is False
+            assert (
+                await store.claim_task(
+                    "replacement-worker",
+                    TaskQuery(type="job"),
+                    lease_seconds=300,
+                )
+                is None
+            )
+
+            release_handler.set()
+            await asyncio.wait_for(handler_stopped.wait(), timeout=2)
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+            terminal = await store.load_task(claimed.id)
+            assert terminal is not None
+            assert terminal.status is TaskStatus.CANCELLED
+            assert terminal.worker_id is None
+            assert terminal.lease_expires_at is None
+        finally:
+            store.release_fence.set()
+            release_handler.set()
+            if not worker.done():
+                worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_task_retry_worker_cancellation_fences_opaque_handler_until_natural_settlement() -> None:
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        store = InMemoryTaskStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(
+            TaskCreate(
+                task_id="opaque-cancelled-retry-handler",
+                type="job",
+                retry_policy=TaskRetryPolicy(max_attempts=2),
+            )
+        )
+        handler_started = threading.Event()
+        handler_stopped = threading.Event()
+        release_handler = threading.Event()
+
+        def opaque_work() -> None:
+            handler_started.set()
+            release_handler.wait()
+            handler_stopped.set()
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            await asyncio.to_thread(opaque_work)
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="cancelled-retry-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        assert await asyncio.to_thread(handler_started.wait, 1)
+        worker.cancel("stop opaque retry worker")
+        cancelling = worker.cancelling()
+        await asyncio.sleep(1.05)
+        assert worker.done() is False
+        assert handler_stopped.is_set() is False
+        draining = await store.load_task("opaque-cancelled-retry-handler")
+        assert draining is not None
+        assert draining.status is TaskStatus.CLAIMED
+        assert draining.worker_id == "cancelled-retry-worker"
+        assert draining.lease_expires_at is not None
+        assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+        assert await store.claim_task("replacement-retry-worker") is None
+
+        release_handler.set()
+        with pytest.raises(asyncio.CancelledError, match="stop opaque retry worker") as raised:
+            await asyncio.wait_for(worker, timeout=2)
+        released = await store.load_task("opaque-cancelled-retry-handler")
+        assert released is not None
+        assert released.status is TaskStatus.PENDING
+        assert released.worker_id is None
+        assert released.lease_expires_at is None
+        assert released.retry_series is not None
+        assert released.retry_series.successor_task_id is None
+        return raised.value, cancelling, worker.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancellation.args == ("stop opaque retry worker",)
+    assert cancelling == 1
+    assert cancelled is True
+
+
+def test_task_retry_worker_revalidates_cancellation_after_deadline_query() -> None:
+    class CancellationDuringDeadlineQueryStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def task_retry_deadline_elapsed(
+            self,
+            task_id,
+            worker_id,
+            *,
+            lease_expires_at,
+        ):
+            await self.cancel_task(task_id, {"code": "cancel_during_deadline_query"})
+            return await super().task_retry_deadline_elapsed(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_expires_at,
+            )
+
+    async def scenario() -> None:
+        store = CancellationDuringDeadlineQueryStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(
+            TaskCreate(
+                task_id="retry-cancelled-during-deadline-query",
+                type="job",
+                retry_policy=TaskRetryPolicy(
+                    max_attempts=2,
+                    max_elapsed_seconds=300,
+                ),
+            )
+        )
+        handler_called = False
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        assert (
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="deadline-query-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+            == 1
+        )
+        assert handler_called is False
+        terminal = await store.load_task("retry-cancelled-during-deadline-query")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.worker_id is None
+
+    asyncio.run(scenario())
+
+
+def test_completed_handler_still_fences_a_stalled_heartbeat() -> None:
+    class BlockingHeartbeatStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.heartbeat_calls = 0
+            self.periodic_heartbeat_started = asyncio.Event()
+            self.release_periodic_heartbeat = asyncio.Event()
+
+        async def heartbeat(
+            self,
+            task_id,
+            worker_id,
+            *,
+            lease_expires_at,
+            handoff_id=None,
+            extend_seconds=300,
+        ):
+            self.heartbeat_calls += 1
+            if self.heartbeat_calls == 2:
+                self.periodic_heartbeat_started.set()
+                await self.release_periodic_heartbeat.wait()
+            return await super().heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_expires_at,
+                handoff_id=handoff_id,
+                extend_seconds=extend_seconds,
+            )
+
+    async def scenario() -> None:
+        store = BlockingHeartbeatStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="completed-before-heartbeat", type="job"))
+        handler_started = asyncio.Event()
+        allow_handler_completion = asyncio.Event()
+        effects: list[str] = []
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            handler_started.set()
+            await allow_handler_completion.wait()
+            effects.append("completed")
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="completed-handler-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=1)
+        allow_handler_completion.set()
+
+        with pytest.raises(TaskClaimLost, match="positively known lease deadline"):
+            await asyncio.wait_for(worker, timeout=2)
+        assert effects == ["completed"]
+        terminal = await store.load_task("completed-before-heartbeat")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.worker_id is None
+        assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+        assert await store.claim_task("replacement-worker") is None
+
+        store.release_periodic_heartbeat.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_task_worker_rechecks_cancellation_marker_before_handler_dispatch() -> None:
+    async def scenario() -> None:
+        class CancellationDuringRenewalStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            async def heartbeat(
+                self,
+                task_id,
+                worker_id,
+                *,
+                lease_expires_at,
+                handoff_id=None,
+                extend_seconds=300,
+            ):
+                renewed = await super().heartbeat(
+                    task_id,
+                    worker_id,
+                    lease_expires_at=lease_expires_at,
+                    handoff_id=handoff_id,
+                    extend_seconds=extend_seconds,
+                )
+                if renewed.status_reason is None:
+                    return await self.cancel_task(
+                        task_id,
+                        {"code": "cancellation_won_before_dispatch"},
+                    )
+                return renewed
+
+        store = CancellationDuringRenewalStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        await store.create_task(TaskCreate(task_id="cancel-before-dispatch", type="job"))
+        handler_called = False
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        assert (
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="cancelled-before-dispatch-worker",
+                lease_seconds=1,
+                poll_interval_s=0.001,
+                reclaim=False,
+                max_tasks=1,
+            )
+            == 1
+        )
+        terminal = await store.load_task("cancel-before-dispatch")
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert handler_called is False
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure_method", ["reclaim_expired", "claim_task"])
 def test_ordinary_task_worker_preserves_store_failure_identity_and_traceback(
     failure_method: str,
 ) -> None:
-    class OrdinaryFailureStore:
+    class OrdinaryFailureStore(InMemoryTaskStore):
         supports_verified_work_contracts = False
         hold_claimed_work_contract_task = TaskStore.hold_claimed_work_contract_task
 
         def __init__(self) -> None:
+            super().__init__()
             self.failure = KeyError(f"ordinary {failure_method} failure")
 
         async def reclaim_expired(self, *, query=None):
-            del query
             if failure_method == "reclaim_expired":
                 raise self.failure
-            return []
+            return await super().reclaim_expired(query=query)
 
         async def claim_task(self, worker_id, query, *, lease_seconds):
-            del worker_id, query, lease_seconds
             if failure_method == "claim_task":
                 raise self.failure
-            return None
+            return await super().claim_task(
+                worker_id,
+                query,
+                lease_seconds=lease_seconds,
+            )
 
     async def scenario() -> tuple[BaseException, OrdinaryFailureStore]:
         store = OrdinaryFailureStore()
@@ -255,7 +969,7 @@ def test_ordinary_task_worker_preserves_store_failure_identity_and_traceback(
         with pytest.raises(KeyError) as raised:
             await run_task_worker(
                 app,
-                store,  # type: ignore[arg-type]
+                store,
                 handler,
                 worker_id="ordinary-worker-failure",
                 poll_interval_s=0.001,
@@ -288,11 +1002,13 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
             task_id: str,
             worker_id: str,
             *,
+            lease_expires_at,
             handoff_id: str | None = None,
             extend_seconds: int,
         ) -> None:
             assert handoff_id is None
             assert elapsed < 1.0
+            del lease_expires_at
             observed_heartbeats.append((task_id, worker_id, extend_seconds, elapsed))
             stop.set()
 
@@ -309,6 +1025,7 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
         "worker-a",
         1,
         stop,
+        lease_authority=task_worker_module._TaskLeaseAuthority(datetime.now(UTC)),
     )
 
     assert observed_heartbeats == [("task-1", "worker-a", 1, pytest.approx(1 / 3))]
@@ -327,6 +1044,7 @@ async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
         "task-1",
         {"ok": True},
         worker_id="worker-a",
+        lease_expires_at=renewed.lease_expires_at,
     )
     load_task_calls = 0
 
@@ -336,14 +1054,21 @@ async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
             task_id: str,
             worker_id: str,
             *,
+            lease_expires_at: datetime,
             handoff_id: str | None = None,
             extend_seconds: int,
         ) -> Task:
-            del task_id, worker_id, handoff_id, extend_seconds
+            del task_id, worker_id, lease_expires_at, handoff_id, extend_seconds
             return renewed
 
-        async def task_retry_deadline_elapsed(self, task_id: str, worker_id: str) -> bool:
-            del task_id, worker_id
+        async def task_retry_deadline_elapsed(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            lease_expires_at: datetime,
+        ) -> bool:
+            del task_id, worker_id, lease_expires_at
             raise inspection_failure
 
         async def load_task(self, task_id: str) -> Task:
@@ -363,11 +1088,80 @@ async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
         "worker-a",
         3,
         asyncio.Event(),
+        lease_authority=task_worker_module._TaskLeaseAuthority(renewed.lease_expires_at),
         enforce_retry_deadline=True,
     )
 
     assert outcome is task_worker_module._TaskHeartbeatOutcome.TERMINAL
     assert load_task_calls == 1
+
+
+@pytest.mark.anyio
+async def test_task_heartbeat_rejects_acknowledgement_that_consumed_renewed_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_time = 0.0
+    stop = asyncio.Event()
+
+    class DelayedHeartbeatStore:
+        async def heartbeat(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            lease_expires_at,
+            handoff_id: str | None = None,
+            extend_seconds: int,
+        ) -> None:
+            nonlocal monotonic_time
+            del task_id, worker_id, lease_expires_at, handoff_id, extend_seconds
+            monotonic_time += 2
+
+    async def advance_clock(seconds: float, wait_stop: asyncio.Event) -> bool:
+        nonlocal monotonic_time
+        monotonic_time += seconds
+        return wait_stop.is_set()
+
+    monkeypatch.setattr(task_worker_module, "monotonic", lambda: monotonic_time)
+    monkeypatch.setattr(task_worker_module, "_wait_or_stop", advance_clock)
+
+    with pytest.raises(TaskClaimLost, match="acknowledgement consumed"):
+        await task_worker_module._heartbeat_until(
+            DelayedHeartbeatStore(),  # type: ignore[arg-type]
+            "task-1",
+            "worker-a",
+            1,
+            stop,
+            lease_authority=task_worker_module._TaskLeaseAuthority(datetime.now(UTC)),
+        )
+
+
+@pytest.mark.anyio
+async def test_task_cancellation_fence_rejects_reused_worker_lease_generation() -> None:
+    ownership_now = datetime(2026, 1, 1, tzinfo=UTC)
+    store = InMemoryTaskStore(ownership_clock=lambda: ownership_now)
+    await store.create_task(TaskCreate(task_id="same-worker-cancellation", type="job"))
+    stale = await store.claim_task("shared-worker", lease_seconds=1)
+    assert stale is not None
+    assert stale.lease_expires_at is not None
+    stale_authority = task_worker_module._TaskLeaseAuthority(stale.lease_expires_at)
+
+    ownership_now += timedelta(seconds=1)
+    assert [task.id for task in await store.reclaim_expired()] == [stale.id]
+    successor = await store.claim_task("shared-worker", lease_seconds=30)
+    assert successor is not None
+    assert successor.lease_expires_at != stale.lease_expires_at
+
+    with pytest.raises(TaskClaimLost, match="expected lease generation"):
+        await task_worker_module._request_task_cancellation_fence(
+            store,
+            stale,
+            "shared-worker",
+            {"code": "stale-owner-cancelled"},
+            lease_authority=stale_authority,
+        )
+
+    assert await store.load_task(successor.id) == successor
 
 
 def test_handler_may_finish_cleanup_after_terminalizing_its_task() -> None:
@@ -378,7 +1172,12 @@ def test_handler_may_finish_cleanup_after_terminalizing_its_task() -> None:
         cleanup_finished = asyncio.Event()
 
         async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
-            await store.complete_task(task.id, {"ok": True}, worker_id=worker_id)
+            await store.complete_task(
+                task.id,
+                {"ok": True},
+                worker_id=worker_id,
+                lease_expires_at=task.lease_expires_at,
+            )
             await asyncio.sleep(0.5)
             cleanup_finished.set()
 
@@ -409,6 +1208,7 @@ async def _run_handler(app: CayuApp, task: Task, worker_id: str) -> None:
             session_id=f"sess-{task.id}",
             task_id=task.id,
             task_worker_id=worker_id,
+            task_lease_expires_at=task.lease_expires_at,
             messages=[Message.text("user", "go")],
         )
     ):
@@ -489,12 +1289,219 @@ def test_run_task_worker_claims_runs_and_completes_a_task(tmp_path: Path) -> Non
     assert task.status == "completed"
 
 
+def test_worker_uses_current_hidden_lease_for_session_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    periodic_heartbeat = asyncio.Event()
+    acknowledged_leases: list[datetime] = []
+
+    class HeartbeatRecordingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def heartbeat(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            lease_expires_at: datetime,
+            handoff_id: str | None = None,
+            extend_seconds: int = 300,
+        ) -> Task:
+            updated = await super().heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_expires_at,
+                handoff_id=handoff_id,
+                extend_seconds=extend_seconds,
+            )
+            assert updated.lease_expires_at is not None
+            acknowledged_leases.append(updated.lease_expires_at)
+            if len(acknowledged_leases) >= 2:
+                periodic_heartbeat.set()
+            return updated
+
+    async def scenario() -> Task | None:
+        store = HeartbeatRecordingStore()
+        provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        created = await store.create_task(TaskCreate(task_id="renew-before-attach", type="job"))
+        original_start_task = app._session_engine._start_task
+
+        async def start_after_periodic_renewal(**kwargs):
+            await asyncio.wait_for(periodic_heartbeat.wait(), timeout=3)
+            assert kwargs["lease_expires_at"] == acknowledged_leases[0]
+            assert acknowledged_leases[-1] != kwargs["lease_expires_at"]
+            return await original_start_task(**kwargs)
+
+        monkeypatch.setattr(app._session_engine, "_start_task", start_after_periodic_renewal)
+        handled = await run_task_worker(
+            app,
+            store,
+            _run_handler,
+            worker_id="stable-worker",
+            query=TaskQuery(type="job"),
+            lease_seconds=3,
+            max_tasks=1,
+            poll_interval_s=0.01,
+            reclaim=False,
+        )
+        assert handled == 1
+        assert len(provider.requests) == 1
+        return await store.load_task(created.id)
+
+    task = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+
+
+@pytest.mark.parametrize("terminal_kind", ["complete", "fail"])
+@pytest.mark.parametrize("entrypoint", ["managed_helper", "store_method"])
+def test_managed_handler_terminalization_uses_latest_acknowledged_lease(
+    terminal_kind: str,
+    entrypoint: str,
+) -> None:
+    periodic_heartbeat = asyncio.Event()
+    acknowledged_leases: list[datetime] = []
+    terminal_leases: list[datetime | None] = []
+
+    class LeaseRecordingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def heartbeat(self, task_id, worker_id, **kwargs):
+            updated = await super().heartbeat(task_id, worker_id, **kwargs)
+            assert updated.lease_expires_at is not None
+            acknowledged_leases.append(updated.lease_expires_at)
+            if len(acknowledged_leases) >= 2:
+                periodic_heartbeat.set()
+            return updated
+
+        async def complete_task(self, task_id, result, **kwargs):
+            terminal_leases.append(kwargs.get("lease_expires_at"))
+            return await super().complete_task(task_id, result, **kwargs)
+
+        async def fail_task(self, task_id, error, **kwargs):
+            terminal_leases.append(kwargs.get("lease_expires_at"))
+            return await super().fail_task(task_id, error, **kwargs)
+
+    async def scenario() -> Task | None:
+        store = LeaseRecordingStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        created = await store.create_task(
+            TaskCreate(task_id=f"managed-{terminal_kind}-latest-lease", type="job")
+        )
+
+        async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
+            original_lease = task.lease_expires_at
+            await asyncio.wait_for(periodic_heartbeat.wait(), timeout=3)
+            assert acknowledged_leases[-1] != original_lease
+            if terminal_kind == "complete":
+                if entrypoint == "managed_helper":
+                    await complete_managed_task(store, task, worker_id, {"ok": True})
+                else:
+                    await store.complete_task(
+                        task.id,
+                        {"ok": True},
+                        worker_id=worker_id,
+                        lease_expires_at=original_lease,
+                    )
+            else:
+                if entrypoint == "managed_helper":
+                    await fail_managed_task(store, task, worker_id, {"code": "expected"})
+                else:
+                    await store.fail_task(
+                        task.id,
+                        {"code": "expected"},
+                        worker_id=worker_id,
+                        lease_expires_at=original_lease,
+                    )
+
+        assert (
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="managed-terminal-worker",
+                query=TaskQuery(type="job"),
+                lease_seconds=3,
+                max_tasks=1,
+                poll_interval_s=0.01,
+                reclaim=False,
+            )
+            == 1
+        )
+        return await store.load_task(created.id)
+
+    task = asyncio.run(scenario())
+    assert task is not None
+    assert task.status is (
+        TaskStatus.COMPLETED if terminal_kind == "complete" else TaskStatus.FAILED
+    )
+    assert len(terminal_leases) == 1
+    if entrypoint == "managed_helper":
+        assert terminal_leases[0] == acknowledged_leases[-1]
+    else:
+        assert terminal_leases[0] != acknowledged_leases[-1]
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_session_engine_terminalizes_worker_task_with_nonreceipt_custom_store(
+    provider_fails: bool,
+) -> None:
+    class NonReceiptStore(InMemoryTaskStore):
+        supports_idempotent_terminalization = False
+        verified_work_mutations_are_cancellation_quiescent = True
+
+    async def scenario() -> tuple[list[Event], Task | None]:
+        store = NonReceiptStore()
+        provider = ScriptedModelProvider(
+            [
+                [
+                    *([ModelStreamEvent.error("provider unavailable")] if provider_fails else []),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+        created = await store.create_task(
+            TaskCreate(task_id="nonreceipt-terminalization", type="job")
+        )
+        claimed = await store.claim_task("custom-worker", TaskQuery(type="job"))
+        assert claimed is not None
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="nonreceipt-terminalization-session",
+                    task_id=claimed.id,
+                    task_worker_id="custom-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+        assert len(provider.requests) == 1
+        return events, await store.load_task(created.id)
+
+    events, task = asyncio.run(scenario())
+    assert events[-1].type is (
+        EventType.SESSION_FAILED if provider_fails else EventType.SESSION_COMPLETED
+    )
+    assert task is not None
+    assert task.status is (TaskStatus.FAILED if provider_fails else TaskStatus.COMPLETED)
+
+
 def test_running_ordinary_task_cancellation_is_worker_terminalized(tmp_path: Path) -> None:
     app, store = _build(tmp_path)
 
     async def scenario() -> None:
         started = asyncio.Event()
         stopped = asyncio.Event()
+        release = asyncio.Event()
         created = await store.create_task(TaskCreate(task_id="cancel-live", type="job"))
 
         async def blocking_handler(
@@ -504,7 +1511,7 @@ def test_running_ordinary_task_cancellation_is_worker_terminalized(tmp_path: Pat
         ) -> None:
             started.set()
             try:
-                await asyncio.Event().wait()
+                await release.wait()
             finally:
                 stopped.set()
 
@@ -532,6 +1539,10 @@ def test_running_ordinary_task_cancellation_is_worker_terminalized(tmp_path: Pat
         assert requested.status_reason == "cancellation_requested"
         assert requested.status_payload is not None
 
+        await asyncio.sleep(0)
+        assert worker.done() is False
+        assert stopped.is_set() is False
+        release.set()
         assert await asyncio.wait_for(worker, timeout=3) == 1
         assert stopped.is_set()
 
@@ -546,6 +1557,126 @@ def test_running_ordinary_task_cancellation_is_worker_terminalized(tmp_path: Pat
         assert receipt is not None
         assert receipt.kind is TaskTerminalKind.CANCELLED
         assert receipt.task == terminal
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "missing_capability",
+    ["cancellation_reconciliation", "idempotent_terminalization"],
+)
+def test_run_task_worker_rejects_incomplete_cancellation_reconciliation_before_claim(
+    missing_capability: str,
+) -> None:
+    class IncompleteCancellationStore(InMemoryTaskStore):
+        pass
+
+    async def scenario() -> None:
+        store = IncompleteCancellationStore()
+        if missing_capability == "cancellation_reconciliation":
+            store.supports_task_cancellation_reconciliation = False
+        else:
+            store.supports_idempotent_terminalization = False
+        app = CayuApp(task_store=store, enable_logging=False)
+        created = await store.create_task(TaskCreate(task_id="unsupported-worker", type="job"))
+        handler_called = False
+
+        async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        with pytest.raises(
+            NotImplementedError,
+            match="cancellation reconciliation before it can claim work",
+        ):
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="unsupported-worker",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+            )
+        assert handler_called is False
+        assert await store.load_task(created.id) == created
+
+    asyncio.run(scenario())
+
+
+def test_owner_lost_cancellation_reconciliation_uses_store_owned_time() -> None:
+    async def scenario() -> None:
+        now = {"value": datetime(2026, 1, 1, tzinfo=UTC)}
+        store = InMemoryTaskStore(ownership_clock=lambda: now["value"])
+        created = await store.create_task(TaskCreate(task_id="store-time-cancel", type="job"))
+        claimed = await store.claim_task(
+            "store-time-worker",
+            TaskQuery(type="job"),
+            lease_seconds=5,
+        )
+        assert claimed is not None
+        requested = await store.cancel_task(created.id, {"code": "worker_cancelled"})
+        assert requested.lease_expires_at is not None
+        now["value"] = requested.lease_expires_at + timedelta(seconds=1)
+
+        await task_worker_module._settle_ordinary_task_cancellation_after_quiescence(
+            store,
+            created.id,
+            "store-time-worker",
+        )
+        terminal = await store.load_task(created.id)
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.status_payload is not None
+        reconciliation = terminal.status_payload["cancellation_reconciliation"]
+        assert datetime.fromisoformat(reconciliation["reconciliation_requested_at"]) == (
+            requested.lease_expires_at
+        )
+
+    asyncio.run(scenario())
+
+
+def test_owner_lost_retry_reconciliation_uses_store_owned_time() -> None:
+    class CapturingTaskStore(InMemoryTaskStore):
+        reconciliation_requested_at: datetime | None = None
+
+        async def reconcile_task_retry_cancellation(self, request):
+            self.reconciliation_requested_at = request.reconciliation_requested_at
+            return await super().reconcile_task_retry_cancellation(request)
+
+    async def scenario() -> None:
+        now = {"value": datetime(2026, 1, 1, tzinfo=UTC)}
+        store = CapturingTaskStore(
+            clock=lambda: now["value"],
+            ownership_clock=lambda: now["value"],
+        )
+        created = await store.create_task(
+            TaskCreate(
+                task_id="store-time-retry-cancel",
+                type="job",
+                retry_policy=TaskRetryPolicy(max_attempts=2),
+            )
+        )
+        claimed = await store.claim_task(
+            "store-time-retry-worker",
+            TaskQuery(type="job"),
+            lease_seconds=5,
+        )
+        assert claimed is not None
+        requested = await store.cancel_task(created.id, {"code": "worker_cancelled"})
+        assert requested.lease_expires_at is not None
+        now["value"] = requested.lease_expires_at + timedelta(seconds=1)
+
+        await task_worker_module._settle_retry_task_cancellation_after_quiescence(
+            store,
+            created.id,
+            "store-time-retry-worker",
+            cancellation_baseline=0,
+            report=None,
+        )
+        terminal = await store.load_task(created.id)
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert store.reconciliation_requested_at == requested.lease_expires_at
 
     asyncio.run(scenario())
 
@@ -598,7 +1729,12 @@ def test_run_task_worker_continues_after_handler_terminalizes_then_raises() -> N
         await store.create_task(TaskCreate(task_id="worker-second", type="job"))
 
         async def terminalize_then_raise(_app: CayuApp, task: Task, worker_id: str):
-            await store.complete_task(task.id, {"winner": "handler"}, worker_id=worker_id)
+            await store.complete_task(
+                task.id,
+                {"winner": "handler"},
+                worker_id=worker_id,
+                lease_expires_at=task.lease_expires_at,
+            )
             if task.id == "worker-first":
                 raise RuntimeError("handler raised after terminalizing")
 
@@ -634,6 +1770,7 @@ def test_run_task_worker_keeps_same_key_changed_intent_conflict_explicit() -> No
                 TaskTerminalizationRequest(
                     task_id=request.task_id,
                     worker_id=request.worker_id,
+                    lease_expires_at=request.lease_expires_at,
                     kind=TaskTerminalKind.COMPLETED,
                     result={"winner": "other-intent"},
                     idempotency_key=request.idempotency_key,
@@ -1004,6 +2141,7 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
                 session_id="session-handoff",
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 messages=[Message.text("user", "Publish the reviewed change.")],
             )
         ):
@@ -1150,6 +2288,7 @@ def test_terminal_peer_winner_during_handoff_does_not_stop_worker() -> None:
                     TaskTerminalizationRequest(
                         task_id=request.task_id,
                         worker_id=request.worker_id,
+                        lease_expires_at=request.lease_expires_at,
                         kind=TaskTerminalKind.COMPLETED,
                         result={"winner": "peer"},
                         idempotency_key="terminal-peer-winner",
@@ -1174,12 +2313,14 @@ def test_terminal_peer_winner_during_handoff_does_not_stop_worker() -> None:
                     "session-handoff-peer-winner",
                 ),
                 worker_id=worker_id,
+                lease_expires_at=task.lease_expires_at,
             )
             return TaskHandlerOutcome.SESSION_INTERRUPTED
         await task_store.complete_task(
             task.id,
             {"handled": True},
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return None
 
@@ -1271,6 +2412,7 @@ def test_interrupted_handoff_retries_or_reads_back_without_failing_task(
                 "session-faulted-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -1356,6 +2498,7 @@ def test_interrupted_handoff_event_failure_never_owns_task_release(
                 "session-event-failure-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -1435,6 +2578,7 @@ def test_interrupted_handoff_releases_before_slow_event_publication() -> None:
                 "session-slow-event-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -1491,6 +2635,7 @@ def test_interrupted_handoff_does_not_attest_secret_bearing_task_id() -> None:
                 "session-secret-task-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -1563,6 +2708,7 @@ def test_interrupted_handoff_rejects_malformed_store_receipt_without_retry() -> 
                 "session-malformed-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -1645,6 +2791,7 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
                 session_id="session-recovery-handoff",
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 messages=[Message.text("user", "Publish after durable recovery.")],
             )
         ):
@@ -1844,6 +2991,7 @@ def test_interrupted_handoff_recovery_yields_to_fresh_work_between_pages(
                 session_id,
             ),
             worker_id="expired-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
     async def handler(
@@ -1851,7 +2999,12 @@ def test_interrupted_handoff_recovery_yields_to_fresh_work_between_pages(
         task: Task,
         worker_id: str,
     ) -> None:
-        await task_store.complete_task(task.id, worker_id=worker_id, result={"ok": True})
+        await task_store.complete_task(
+            task.id,
+            worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
+            result={"ok": True},
+        )
 
     async def scenario() -> tuple[Task | None, Task | None, Task | None]:
         await attach_expiring_task(
@@ -1970,6 +3123,7 @@ def test_interrupted_handoff_recovery_stops_between_candidates() -> None:
                 session_id,
             ),
             worker_id="expired-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
     async def scenario() -> int:
@@ -2506,6 +3660,7 @@ def test_expired_attached_session_is_recovered_handed_off_and_resumed() -> None:
                 "expired-attached-session",
             ),
             worker_id="dead-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         await asyncio.sleep(1.05)
 
@@ -2521,7 +3676,7 @@ def test_expired_attached_session_is_recovered_handed_off_and_resumed() -> None:
                 recovered_interrupted_task_handler=resume_handler,
                 max_tasks=1,
             ),
-            timeout=5,
+            timeout=15,
         )
         task = await task_store.load_task("expired-attached-task")
         session = await app.session_store.load("expired-attached-session")
@@ -2649,6 +3804,7 @@ def test_interrupted_handoff_recovery_skips_new_cancellation_request() -> None:
                 "session-cancellation-winner",
             ),
             worker_id="expired-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         await task_store.create_task(TaskCreate(task_id="fresh-after-cancel", type="fresh"))
         await asyncio.sleep(1.05)
@@ -2658,7 +3814,12 @@ def test_interrupted_handoff_recovery_skips_new_cancellation_request() -> None:
             task: Task,
             worker_id: str,
         ) -> None:
-            await task_store.complete_task(task.id, {"ok": True}, worker_id=worker_id)
+            await task_store.complete_task(
+                task.id,
+                {"ok": True},
+                worker_id=worker_id,
+                lease_expires_at=task.lease_expires_at,
+            )
 
         assert (
             await run_task_worker(
@@ -2725,6 +3886,7 @@ def test_operator_cancellation_winning_live_handoff_is_terminalized() -> None:
                 "session-live-cancellation-winner",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -2817,6 +3979,7 @@ def test_interrupted_handoff_recovery_retains_bounded_cursor_between_idle_polls(
                 session_id,
             ),
             worker_id="expired-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
     async def scenario() -> None:
@@ -2889,6 +4052,7 @@ def test_interrupted_handoff_cancellation_waits_for_dispatched_release() -> None
                 "session-cancelled-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -2984,6 +4148,7 @@ def test_interrupted_handoff_pending_cancellation_owns_dispatched_release() -> N
                 "session-pending-cancelled-handoff",
             ),
             worker_id="worker-a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         request = task_worker_module.interrupted_task_handoff_request(
             attached,
@@ -3071,6 +4236,7 @@ def test_interrupted_handoff_cancellation_sanitizes_concurrent_store_failure(
                 "session-cancelled-failing-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -3197,6 +4363,7 @@ def test_interrupted_handoff_event_cancellation_drops_store_failure_context(
                 "session-event-cancelled-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -3315,6 +4482,7 @@ def test_interrupted_handoff_cancellation_validates_commit_receipt_before_redeli
                 "session-cancelled-malformed-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -3424,6 +4592,7 @@ def test_run_task_worker_fails_handoff_when_session_is_not_interrupted(
                 "session-invalid-handoff",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -3491,6 +4660,7 @@ def test_run_task_worker_fails_handoff_for_missing_attached_session(tmp_path: Pa
                 "session-missing",
             ),
             worker_id=worker_id,
+            lease_expires_at=task.lease_expires_at,
         )
         return TaskHandlerOutcome.SESSION_INTERRUPTED
 
@@ -3598,6 +4768,7 @@ def test_resume_rejects_stale_or_missing_worker_authority_before_provider(
                 "fenced-resume-session",
             ),
             worker_id="stale-worker",
+            lease_expires_at=prior.lease_expires_at,
         )
         session = await session_store.load("fenced-resume-session")
         assert session is not None
@@ -3737,6 +4908,7 @@ def test_typed_continuations_require_elected_worker_authority_before_execution(
                 "typed-continuation-session",
             ),
             worker_id="prior-worker",
+            lease_expires_at=prior.lease_expires_at,
         )
         session = await app.session_store.load("typed-continuation-session")
         assert session is not None
@@ -3842,6 +5014,7 @@ def test_elected_worker_completes_task_through_tool_approval_continuation() -> N
                 session_id="elected-approval-session",
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 messages=[Message.text("user", "Publish the reviewed change.")],
             )
         ):
@@ -3960,6 +5133,7 @@ def test_elected_worker_replays_approval_failure_after_terminalization_interrupt
                     session_id="approval-failure-session",
                     task_id=task.id,
                     task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
                     messages=[Message.text("user", "Publish the reviewed change.")],
                 )
             ):
@@ -4308,6 +5482,7 @@ def test_elected_worker_completes_task_through_user_input_continuation() -> None
                 session_id="elected-input-session",
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 messages=[Message.text("user", "Prepare the release.")],
             )
         ):
@@ -4442,6 +5617,7 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
                     session_id="generic-continuation-failure-session",
                     task_id=task.id,
                     task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
                     messages=[Message.text("user", "Prepare the release.")],
                 )
             ):
@@ -4827,6 +6003,7 @@ def test_elected_worker_completes_task_through_manual_tool_recovery() -> None:
                 session_id="elected-tool-recovery-session",
                 task_id=claimed.id,
                 task_worker_id="prior-worker",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "Publish the recovered release.")],
             )
         ):
@@ -4963,6 +6140,7 @@ def test_tool_approval_rechecks_worker_authority_after_session_admission() -> No
                 session_id="approval-race-session",
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 messages=[Message.text("user", "Publish the reviewed change.")],
             )
         ):
@@ -5097,6 +6275,7 @@ def test_ownerless_resume_cannot_cross_a_concurrent_continuation_claim() -> None
                 "ownerless-race-session",
             ),
             worker_id="prior-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         session = await app.session_store.load("ownerless-race-session")
         assert session is not None
@@ -5238,6 +6417,7 @@ def test_resume_rechecks_worker_authority_after_session_admission() -> None:
                 "post-admission-fence-session",
             ),
             worker_id="stale-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         session = await app.session_store.load("post-admission-fence-session")
         assert session is not None
@@ -5318,6 +6498,7 @@ def test_resume_rejects_a_replacement_session_incarnation_before_provider() -> N
                 "replacement-session",
             ),
             worker_id="prior-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         original = await session_store.load("replacement-session")
         assert original is not None

@@ -108,7 +108,7 @@ async def run_one_worker_task(
 
     stop_heartbeat = asyncio.Event()
     heartbeat_task = asyncio.create_task(
-        heartbeat_until_done(task_store, task.id, worker_id, stop_heartbeat)
+        heartbeat_until_done(task_store, task, worker_id, stop_heartbeat)
     )
     try:
         request = RunRequest(
@@ -116,6 +116,7 @@ async def run_one_worker_task(
             session_id=f"session_{task.id}",
             task_id=task.id,
             task_worker_id=worker_id,
+            task_lease_expires_at=task.lease_expires_at,
             messages=[
                 Message.text(
                     "user",
@@ -138,7 +139,7 @@ async def run_one_worker_task(
 
 async def heartbeat_until_done(
     task_store: InMemoryTaskStore,
-    task_id: str,
+    task: Task,
     worker_id: str,
     stop: asyncio.Event,
 ) -> int:
@@ -147,8 +148,15 @@ async def heartbeat_until_done(
         await asyncio.sleep(0.05)
         if stop.is_set():
             break
+        if task.lease_expires_at is None:
+            raise RuntimeError("Claimed task lost its worker lease.")
         try:
-            await task_store.heartbeat(task_id, worker_id, extend_seconds=30)
+            task = await task_store.heartbeat(
+                task.id,
+                worker_id,
+                lease_expires_at=task.lease_expires_at,
+                extend_seconds=30,
+            )
         except ValueError:
             break
         count += 1
@@ -175,6 +183,8 @@ async def fail_one_worker_task(
     return await task_store.fail_task(
         task.id,
         {"message": "Worker setup failed before model execution."},
+        worker_id=worker_id,
+        lease_expires_at=task.lease_expires_at,
     )
 
 

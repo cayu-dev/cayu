@@ -6,8 +6,9 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,9 +19,11 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 from tests.core.task_store_conformance import (
+    assert_exact_claimed_task_cancellation_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
     assert_task_session_invocation_binding_conformance,
+    assert_worker_terminalization_generation_conformance,
 )
 from tests.core.task_terminalization_conformance import (
     assert_live_ordinary_cancellation_conformance,
@@ -55,13 +58,23 @@ from cayu._validation import (
     extract_durable_value_error,
 )
 from cayu.runtime.tasks import (
+    _legacy_task_terminalization_request_sha256,
     _require_interrupted_task_handoff_authority,
+    _task_terminalization_request_matches_sha256,
     prepare_interrupted_task_handoff,
+    prepare_task_terminalization,
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
 StoreFactory = Callable[[object], TaskStore]
+
+
+async def _exact_task_lease(store: TaskStore, task_id: str) -> datetime:
+    task = await store.load_task(task_id)
+    assert task is not None
+    assert task.lease_expires_at is not None
+    return task.lease_expires_at
 
 
 def _interrupted_handoff_request(
@@ -121,6 +134,7 @@ def test_sqlite_consumed_continuation_generation_survives_restart(tmp_path) -> N
                     "durable-generation-session",
                 ),
                 worker_id="prior-worker",
+                lease_expires_at=claimed.lease_expires_at,
             )
             await store.release_interrupted_task_worker(
                 interrupted_task_handoff_request(attached, session_run_epoch=1)
@@ -174,6 +188,38 @@ def test_task_stores_task_claim_lost_conformance(store_factory: StoreFactory, tm
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_worker_terminalization_generation_conformance(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_worker_terminalization_generation_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_exact_claimed_cancellation_conformance(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_exact_claimed_task_cancellation_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_reject_competing_terminalization_after_winner(
     store_factory: StoreFactory,
     tmp_path,
@@ -182,11 +228,13 @@ def test_task_stores_reject_competing_terminalization_after_winner(
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_conflict", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         winner = await store.terminalize_task(
             TaskTerminalizationRequest(
                 task_id="task_conflict",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "winner"},
                 idempotency_key="winner-key",
@@ -198,6 +246,7 @@ def test_task_stores_reject_competing_terminalization_after_winner(
                 TaskTerminalizationRequest(
                     task_id="task_conflict",
                     worker_id="worker_a",
+                    lease_expires_at=claimed.lease_expires_at,
                     kind=TaskTerminalKind.FAILED,
                     error={"message": "loser"},
                     idempotency_key="loser-key",
@@ -224,12 +273,14 @@ def test_task_stores_reject_wrong_worker_before_terminalization(
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_wrong_worker", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         with pytest.raises(TaskClaimLost):
             await store.terminalize_task(
                 TaskTerminalizationRequest(
                     task_id="task_wrong_worker",
                     worker_id="worker_b",
+                    lease_expires_at=claimed.lease_expires_at,
                     kind=TaskTerminalKind.COMPLETED,
                     result={"summary": "unauthorized"},
                     idempotency_key="wrong-worker",
@@ -325,6 +376,7 @@ def test_sqlite_ordinary_cancellation_reconciliation_replays_after_restart(tmp_p
                 "ordinary-restart-session",
             ),
             worker_id="ordinary-prior-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         await store.release_interrupted_task_worker(
             interrupted_task_handoff_request(attached, session_run_epoch=1)
@@ -396,19 +448,20 @@ def test_task_stores_replay_exact_terminalization_after_lease_clearance(
         claimed = await store.claim_task("worker_a")
         assert claimed is not None
 
-        first = await store.terminalize_task(
-            TaskTerminalizationRequest(
-                task_id="task_terminal",
-                worker_id="worker_a",
-                kind=TaskTerminalKind.COMPLETED,
-                result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
-                idempotency_key="terminal-attempt-1",
-            )
+        first_request = TaskTerminalizationRequest(
+            task_id="task_terminal",
+            worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
+            idempotency_key="terminal-attempt-1",
         )
+        first = await store.terminalize_task(first_request)
         replayed = await store.terminalize_task(
             TaskTerminalizationRequest(
                 task_id="task_terminal",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"metrics": {"checked": 4, "changed": 2}, "summary": "done"},
                 idempotency_key="terminal-attempt-1",
@@ -427,9 +480,7 @@ def test_task_stores_replay_exact_terminalization_after_lease_clearance(
             "task_terminal", "terminal-attempt-1"
         )
         assert receipt is not None
-        assert receipt.request_sha256 == (
-            "f44314f4f13d93a708c544e83a90ecb2e2dea4d6dd7f4ceb0512b2f895d364a8"
-        )
+        assert receipt.request_sha256 == prepare_task_terminalization(first_request)[1]
 
         assert first.result is not None
         first.result["summary"] = "mutated"
@@ -437,6 +488,7 @@ def test_task_stores_replay_exact_terminalization_after_lease_clearance(
             TaskTerminalizationRequest(
                 task_id="task_terminal",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
                 idempotency_key="terminal-attempt-1",
@@ -451,6 +503,27 @@ def test_task_stores_replay_exact_terminalization_after_lease_clearance(
     asyncio.run(run_store_operations())
 
 
+def test_task_terminalization_digest_accepts_pre_lease_receipt() -> None:
+    request = TaskTerminalizationRequest(
+        task_id="task_terminal",
+        worker_id="worker_a",
+        lease_expires_at=datetime(2026, 9, 2, 12, tzinfo=UTC),
+        kind=TaskTerminalKind.COMPLETED,
+        result={"summary": "done", "metrics": {"changed": 2, "checked": 4}},
+        idempotency_key="terminal-attempt-1",
+    )
+    request, request_sha256 = prepare_task_terminalization(request)
+    legacy_sha256 = _legacy_task_terminalization_request_sha256(request)
+
+    assert request_sha256 != legacy_sha256
+    assert legacy_sha256 == "f44314f4f13d93a708c544e83a90ecb2e2dea4d6dd7f4ceb0512b2f895d364a8"
+    assert _task_terminalization_request_matches_sha256(
+        request,
+        request_sha256=request_sha256,
+        candidate_sha256=legacy_sha256,
+    )
+
+
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_expose_detached_terminalization_receipt(
     store_factory: StoreFactory,
@@ -461,11 +534,13 @@ def test_task_stores_expose_detached_terminalization_receipt(
     async def run_store_operations() -> None:
         assert await store.load_task_terminalization_receipt("task_receipt", "failure-1") is None
         await store.create_task(TaskCreate(task_id="task_receipt", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         terminal_task = await store.terminalize_task(
             TaskTerminalizationRequest(
                 task_id="task_receipt",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error={"message": "provider unavailable"},
                 idempotency_key="failure-1",
@@ -981,14 +1056,27 @@ def test_task_stores_claim_heartbeat_and_release_task(
         assert linked.status == TaskStatus.PENDING
         assert linked.worker_id is None
 
-        heartbeat = await store.heartbeat("task_a", "worker_a", extend_seconds=600)
+        heartbeat = await store.heartbeat(
+            "task_a",
+            "worker_a",
+            lease_expires_at=first.lease_expires_at,
+            extend_seconds=600,
+        )
         assert heartbeat.lease_expires_at is not None
         assert heartbeat.lease_expires_at > first.lease_expires_at
 
         with pytest.raises(ValueError, match="does not own"):
-            await store.heartbeat("task_a", "worker_b")
+            await store.heartbeat(
+                "task_a",
+                "worker_b",
+                lease_expires_at=heartbeat.lease_expires_at,
+            )
 
-        released = await store.release_task("task_a", "worker_a")
+        released = await store.release_task(
+            "task_a",
+            "worker_a",
+            lease_expires_at=heartbeat.lease_expires_at,
+        )
         assert released.status == TaskStatus.PENDING
         assert released.worker_id is None
         assert released.lease_expires_at is None
@@ -1067,6 +1155,7 @@ def test_task_stores_attach_task_starts_claimed_task(store_factory: StoreFactory
                 "sess_claimed",
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         assert started.status == TaskStatus.RUNNING
         assert started.session_id == "sess_claimed"
@@ -1092,7 +1181,11 @@ def test_task_stores_reject_expired_claim_handoff(store_factory: StoreFactory, t
         with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_expired_handoff", session_id="sess_expired")
         with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
-            await store.heartbeat("task_expired_handoff", "worker_a")
+            await store.heartbeat(
+                "task_expired_handoff",
+                "worker_a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
 
         await _close_store(store)
 
@@ -1120,10 +1213,15 @@ def test_task_stores_reject_release_after_session_attachment(
                 "sess_attached",
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
         with pytest.raises(ValueError, match="already attached to session sess_attached"):
-            await store.release_task("task_attached_release", "worker_a")
+            await store.release_task(
+                "task_attached_release",
+                "worker_a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
 
         loaded = await store.load_task("task_attached_release")
         assert loaded is not None
@@ -1167,11 +1265,13 @@ def test_task_stores_release_attached_task_worker_without_requeueing(
                 "sess_attached_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
         released = await store.release_attached_task_worker(
             "task_attached_handoff",
             "worker_a",
+            lease_expires_at=attached.lease_expires_at,
         )
 
         assert released.status == TaskStatus.RUNNING
@@ -1204,7 +1304,8 @@ def test_interrupted_task_handoff_is_exact_and_replay_safe(
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_exact_handoff", type="review"))
-        await store.claim_task("worker_a", lease_seconds=300)
+        claimed = await store.claim_task("worker_a", lease_seconds=300)
+        assert claimed is not None
         attached = await store.attach_task(
             "task_exact_handoff",
             session_id="session_exact_handoff",
@@ -1214,6 +1315,7 @@ def test_interrupted_task_handoff_is_exact_and_replay_safe(
                 "session_exact_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1264,7 +1366,8 @@ def test_base_direct_resume_keeps_legacy_custom_stores_compatible_and_recovery_s
     async def scenario() -> None:
         store = LegacyCustomTaskStore()
         await store.create_task(TaskCreate(task_id="legacy-direct", type="review"))
-        assert await store.claim_task("legacy-worker") is not None
+        claimed = await store.claim_task("legacy-worker")
+        assert claimed is not None
         attached = await store.attach_task(
             "legacy-direct",
             session_id="legacy-session",
@@ -1274,8 +1377,13 @@ def test_base_direct_resume_keeps_legacy_custom_stores_compatible_and_recovery_s
                 "legacy-session",
             ),
             worker_id="legacy-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
-        released = await store.release_attached_task_worker(attached.id, "legacy-worker")
+        released = await store.release_attached_task_worker(
+            attached.id,
+            "legacy-worker",
+            lease_expires_at=attached.lease_expires_at,
+        )
         assert released.session_instance_id is not None
         loaded = await store.load_direct_attached_task_resume(
             released.id,
@@ -1331,6 +1439,10 @@ def test_in_memory_interrupted_task_handoff_faults_reconcile_exactly(
                 "session_memory_fault_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(
+                store,
+                "task_memory_fault_handoff",
+            ),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1392,6 +1504,7 @@ def test_interrupted_task_handoff_revalidates_mutated_request_before_serializati
                 "session_mutated_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_mutated_handoff"),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1445,6 +1558,7 @@ def test_interrupted_task_handoff_receipt_copies_mutated_task_without_serializer
                 "session_mutated_receipt",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_mutated_receipt"),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1494,6 +1608,7 @@ def test_interrupted_task_handoff_rejects_wrong_owner_and_recovers_expired_owner
                 "session_expired_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_expired_handoff"),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1540,6 +1655,10 @@ def test_interrupted_task_handoff_rejects_retry_cancellation_marker() -> None:
                 "session_retry_cancel_marker",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(
+                store,
+                "task_retry_cancel_marker",
+            ),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1595,6 +1714,7 @@ def test_interrupted_task_handoff_candidate_pages_have_stable_store_order(
                     f"session_{task_id}",
                 ),
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
             )
         await asyncio.sleep(1.05)
 
@@ -1634,6 +1754,10 @@ def test_interrupted_task_handoff_converges_with_concurrent_terminalization(
                 "session_handoff_terminal_race",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(
+                store,
+                "task_handoff_terminal_race",
+            ),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1642,6 +1766,7 @@ def test_interrupted_task_handoff_converges_with_concurrent_terminalization(
         terminal_request = TaskTerminalizationRequest(
             task_id=attached.id,
             worker_id="worker_a",
+            lease_expires_at=attached.lease_expires_at,
             kind=TaskTerminalKind.COMPLETED,
             result={"winner": "terminal"},
             idempotency_key="terminal-handoff-race",
@@ -1696,6 +1821,7 @@ def test_sqlite_interrupted_task_handoff_receipt_survives_restart(tmp_path) -> N
                 "session_restart_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(first, "task_restart_handoff"),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1740,6 +1866,7 @@ def test_sqlite_interrupted_task_handoff_rejects_rewritten_receipt_authority(
                 "session_corrupt_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_corrupt_handoff"),
         )
         request = _interrupted_handoff_request(
             attached,
@@ -1796,6 +1923,7 @@ def test_sqlite_interrupted_task_handoff_rejects_receipt_from_another_storage_ke
                 session_id,
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, task_id),
         )
         request = _interrupted_handoff_request(attached, handoff_id=handoff_id)
         await store.release_interrupted_task_worker(request)
@@ -1860,6 +1988,7 @@ def test_sqlite_interrupted_task_handoff_survives_real_process_loss(tmp_path) ->
                 "session_process_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_process_handoff"),
         )
         await store.close()
         return _interrupted_handoff_request(
@@ -1921,14 +2050,22 @@ def test_task_stores_reject_invalid_attached_worker_release(
 
     async def run_store_operations() -> None:
         with pytest.raises(KeyError, match="Task not found"):
-            await store.release_attached_task_worker("missing", "worker_a")
+            await store.release_attached_task_worker(
+                "missing",
+                "worker_a",
+                lease_expires_at=datetime.now(UTC),
+            )
 
         await store.create_task(TaskCreate(task_id="task_unattached", type="review"))
         await store.claim_task("worker_a", lease_seconds=300)
         unattached_before = await store.load_task("task_unattached")
         assert unattached_before is not None
         with pytest.raises(ValueError, match="not running"):
-            await store.release_attached_task_worker("task_unattached", "worker_a")
+            await store.release_attached_task_worker(
+                "task_unattached",
+                "worker_a",
+                lease_expires_at=unattached_before.lease_expires_at,
+            )
 
         await store.create_task(TaskCreate(task_id="task_wrong_worker", type="review"))
         await store.claim_task("worker_a", lease_seconds=300)
@@ -1941,11 +2078,16 @@ def test_task_stores_reject_invalid_attached_worker_release(
                 "sess_wrong_worker",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_wrong_worker"),
         )
         wrong_worker_before = await store.load_task("task_wrong_worker")
         assert wrong_worker_before is not None
         with pytest.raises(ValueError, match="does not own"):
-            await store.release_attached_task_worker("task_wrong_worker", "worker_b")
+            await store.release_attached_task_worker(
+                "task_wrong_worker",
+                "worker_b",
+                lease_expires_at=wrong_worker_before.lease_expires_at,
+            )
 
         await store.create_task(TaskCreate(task_id="task_expired_worker", type="review"))
         await store.claim_task("worker_a", lease_seconds=1)
@@ -1958,12 +2100,17 @@ def test_task_stores_reject_invalid_attached_worker_release(
                 "sess_expired_worker",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_expired_worker"),
         )
         await asyncio.sleep(1.05)
         expired_before = await store.load_task("task_expired_worker")
         assert expired_before is not None
         with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
-            await store.release_attached_task_worker("task_expired_worker", "worker_a")
+            await store.release_attached_task_worker(
+                "task_expired_worker",
+                "worker_a",
+                lease_expires_at=expired_before.lease_expires_at,
+            )
 
         await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
         terminal_before = await store.complete_task(
@@ -1971,7 +2118,11 @@ def test_task_stores_reject_invalid_attached_worker_release(
             {"winner": "terminal-state"},
         )
         with pytest.raises(ValueError, match="running"):
-            await store.release_attached_task_worker("task_terminal", "worker_a")
+            await store.release_attached_task_worker(
+                "task_terminal",
+                "worker_a",
+                lease_expires_at=datetime.now(UTC),
+            )
 
         unattached_after = await store.load_task("task_unattached")
         wrong_worker_after = await store.load_task("task_wrong_worker")
@@ -2009,6 +2160,7 @@ def test_task_stores_do_not_reclaim_attached_expired_leases(
                 "sess_attached_expired",
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
         await asyncio.sleep(1.05)
@@ -2075,7 +2227,12 @@ def test_task_stores_validate_worker_lease_inputs(store_factory: StoreFactory, t
         assert claimed is not None
 
         with pytest.raises(ValueError, match="extend_seconds must be >= 1"):
-            await store.heartbeat("task_validate_worker", "worker_a", extend_seconds=0)
+            await store.heartbeat(
+                "task_validate_worker",
+                "worker_a",
+                lease_expires_at=claimed.lease_expires_at,
+                extend_seconds=0,
+            )
         with pytest.raises(ValueError, match="max_reclaims must be >= 1"):
             await store.reclaim_expired(max_reclaims=0)
         with pytest.raises(ValueError, match="do not support q"):
@@ -2132,6 +2289,77 @@ def test_sqlite_task_store_concurrent_claims_do_not_duplicate_tasks(tmp_path):
         await second.close()
 
     asyncio.run(run_store_operations())
+
+
+def test_sqlite_claimed_cancellation_rechecks_lease_after_writer_wait(tmp_path):
+    db_path = tmp_path / "tasks.sqlite"
+    clock_lock = threading.Lock()
+    clock_value = [datetime(2026, 1, 1, tzinfo=UTC)]
+
+    def ownership_clock() -> datetime:
+        with clock_lock:
+            return clock_value[0]
+
+    owner = SQLiteTaskStore(db_path, ownership_clock=ownership_clock)
+    contender = SQLiteTaskStore(db_path, ownership_clock=ownership_clock)
+
+    async def prepare() -> Task:
+        await owner.create_task(TaskCreate(task_id="sqlite-cancellation-race", type="review"))
+        claimed = await owner.claim_task("worker-a", lease_seconds=1)
+        assert claimed is not None
+        assert claimed.lease_expires_at is not None
+        return claimed
+
+    claimed = asyncio.run(prepare())
+    writer = sqlite3.connect(db_path, check_same_thread=False)
+    writer.execute("PRAGMA busy_timeout = 5000")
+    writer.execute("BEGIN IMMEDIATE")
+    transaction_started = threading.Event()
+    contender._connection.set_trace_callback(
+        lambda statement: (
+            transaction_started.set() if statement.strip().upper() == "BEGIN IMMEDIATE" else None
+        )
+    )
+    failures: list[BaseException] = []
+
+    def request_cancellation() -> None:
+        try:
+            asyncio.run(
+                contender.request_claimed_task_cancellation(
+                    claimed.id,
+                    "worker-a",
+                    claimed.lease_expires_at,
+                    {"reason": "lease-expired-while-waiting"},
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    requester = threading.Thread(target=request_cancellation)
+    requester.start()
+    try:
+        assert transaction_started.wait(timeout=2)
+        with clock_lock:
+            clock_value[0] += timedelta(seconds=2)
+        writer.commit()
+        requester.join(timeout=5)
+        assert not requester.is_alive()
+        assert len(failures) == 1
+        assert isinstance(failures[0], TaskClaimLost)
+
+        current = asyncio.run(owner.load_task(claimed.id))
+        assert current is not None
+        assert current.status_reason is None
+        assert current.worker_id == "worker-a"
+        assert current.lease_expires_at == claimed.lease_expires_at
+    finally:
+        if writer.in_transaction:
+            writer.rollback()
+        writer.close()
+        if requester.is_alive():
+            requester.join(timeout=5)
+        asyncio.run(owner.close())
+        asyncio.run(contender.close())
 
 
 def test_sqlite_task_store_persists_tasks_across_reopen(tmp_path):
@@ -2287,10 +2515,12 @@ def test_task_stores_reject_same_key_with_changed_logical_intent(
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_changed", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         winner = TaskTerminalizationRequest(
             task_id="task_changed",
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
             kind=TaskTerminalKind.COMPLETED,
             result={"summary": "winner"},
             idempotency_key="shared-key",
@@ -2302,6 +2532,7 @@ def test_task_stores_reject_same_key_with_changed_logical_intent(
             TaskTerminalizationRequest(
                 task_id="task_changed",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error={"message": "failed"},
                 idempotency_key="shared-key",
@@ -2330,10 +2561,12 @@ def test_task_stores_concurrent_retries_converge_and_conflicts_choose_one_winner
 
     async def run_store_operations() -> None:
         await store.create_task(TaskCreate(task_id="task_exact_race", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        exact_claim = await store.claim_task("worker_a")
+        assert exact_claim is not None
         exact = TaskTerminalizationRequest(
             task_id="task_exact_race",
             worker_id="worker_a",
+            lease_expires_at=exact_claim.lease_expires_at,
             kind=TaskTerminalKind.COMPLETED,
             result={"summary": "done"},
             idempotency_key="race-key",
@@ -2342,11 +2575,13 @@ def test_task_stores_concurrent_retries_converge_and_conflicts_choose_one_winner
         assert all(result == exact_results[0] for result in exact_results)
 
         await store.create_task(TaskCreate(task_id="task_conflict_race", type="review"))
-        assert await store.claim_task("worker_b") is not None
+        conflict_claim = await store.claim_task("worker_b")
+        assert conflict_claim is not None
         requests = (
             TaskTerminalizationRequest(
                 task_id="task_conflict_race",
                 worker_id="worker_b",
+                lease_expires_at=conflict_claim.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"winner": "completed"},
                 idempotency_key="conflict-key",
@@ -2354,6 +2589,7 @@ def test_task_stores_concurrent_retries_converge_and_conflicts_choose_one_winner
             TaskTerminalizationRequest(
                 task_id="task_conflict_race",
                 worker_id="worker_b",
+                lease_expires_at=conflict_claim.lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error={"winner": "failed"},
                 idempotency_key="conflict-key",
@@ -2382,22 +2618,24 @@ def test_task_stores_concurrent_retries_converge_and_conflicts_choose_one_winner
 def test_sqlite_task_terminalization_receipt_survives_restart(tmp_path) -> None:
     db_path = tmp_path / "tasks.sqlite"
     store = SQLiteTaskStore(db_path)
-    request = TaskTerminalizationRequest(
-        task_id="task_restart",
-        worker_id="worker_a",
-        kind=TaskTerminalKind.COMPLETED,
-        result={"summary": "done"},
-        idempotency_key="restart-key",
-    )
 
-    async def first_process() -> Task:
+    async def first_process() -> tuple[Task, TaskTerminalizationRequest]:
         await store.create_task(TaskCreate(task_id="task_restart", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
+        request = TaskTerminalizationRequest(
+            task_id="task_restart",
+            worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
+            kind=TaskTerminalKind.COMPLETED,
+            result={"summary": "done"},
+            idempotency_key="restart-key",
+        )
         terminal = await store.terminalize_task(request)
         await store.close()
-        return terminal
+        return terminal, request
 
-    terminal = asyncio.run(first_process())
+    terminal, request = asyncio.run(first_process())
     reopened = SQLiteTaskStore(db_path)
 
     async def second_process() -> None:
@@ -2418,10 +2656,12 @@ def test_sqlite_task_terminalization_converges_across_connections(tmp_path) -> N
     async def run() -> None:
         try:
             await first_store.create_task(TaskCreate(task_id="task_connection_race", type="review"))
-            assert await first_store.claim_task("worker_a") is not None
+            claim = await first_store.claim_task("worker_a")
+            assert claim is not None
             request = TaskTerminalizationRequest(
                 task_id="task_connection_race",
                 worker_id="worker_a",
+                lease_expires_at=claim.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done"},
                 idempotency_key="connection-race",
@@ -2435,10 +2675,12 @@ def test_sqlite_task_terminalization_converges_across_connections(tmp_path) -> N
             await first_store.create_task(
                 TaskCreate(task_id="task_connection_conflict", type="review")
             )
-            assert await first_store.claim_task("worker_b") is not None
+            conflict_claim = await first_store.claim_task("worker_b")
+            assert conflict_claim is not None
             completed = TaskTerminalizationRequest(
                 task_id="task_connection_conflict",
                 worker_id="worker_b",
+                lease_expires_at=conflict_claim.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"winner": "completed"},
                 idempotency_key="connection-conflict",
@@ -2446,6 +2688,7 @@ def test_sqlite_task_terminalization_converges_across_connections(tmp_path) -> N
             failed = TaskTerminalizationRequest(
                 task_id="task_connection_conflict",
                 worker_id="worker_b",
+                lease_expires_at=conflict_claim.lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error={"winner": "failed"},
                 idempotency_key="connection-conflict",
@@ -2582,7 +2825,8 @@ def test_sqlite_revision_seventy_six_backfills_live_handoff_authority(
             ) -> TaskInterruptedHandoffRequest:
                 await store.create_task(TaskCreate(task_id=task_id, type=task_type))
                 worker_id = f"prior-{task_id}"
-                assert await store.claim_task(worker_id, TaskQuery(type=task_type)) is not None
+                claimed = await store.claim_task(worker_id, TaskQuery(type=task_type))
+                assert claimed is not None
                 attached = await store.attach_task(
                     task_id,
                     session_id=session_id,
@@ -2592,6 +2836,7 @@ def test_sqlite_revision_seventy_six_backfills_live_handoff_authority(
                         session_id,
                     ),
                     worker_id=worker_id,
+                    lease_expires_at=claimed.lease_expires_at,
                 )
                 request = _interrupted_handoff_request(
                     attached,
@@ -2634,6 +2879,7 @@ def test_sqlite_revision_seventy_six_backfills_live_handoff_authority(
                 TaskTerminalizationRequest(
                     task_id=terminal_owner.id,
                     worker_id="terminal-owner",
+                    lease_expires_at=terminal_owner.lease_expires_at,
                     handoff_id=terminal_owner.interrupted_handoff_id,
                     kind=TaskTerminalKind.COMPLETED,
                     result={"outcome": "done"},
@@ -2705,7 +2951,8 @@ def test_sqlite_revision_seventy_six_rejects_ambiguous_handoff_authority(tmp_pat
         store = SQLiteTaskStore(db_path)
         try:
             await store.create_task(TaskCreate(task_id="ambiguous-handoff", type="review"))
-            assert await store.claim_task("prior-worker") is not None
+            claimed = await store.claim_task("prior-worker")
+            assert claimed is not None
             attached = await store.attach_task(
                 "ambiguous-handoff",
                 session_id="ambiguous-session",
@@ -2715,6 +2962,7 @@ def test_sqlite_revision_seventy_six_rejects_ambiguous_handoff_authority(tmp_pat
                     "ambiguous-session",
                 ),
                 worker_id="prior-worker",
+                lease_expires_at=claimed.lease_expires_at,
             )
             request = _interrupted_handoff_request(
                 attached,

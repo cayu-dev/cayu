@@ -32,9 +32,11 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 from tests.core.task_store_conformance import (
+    assert_exact_claimed_task_cancellation_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
     assert_task_session_invocation_binding_conformance,
+    assert_worker_terminalization_generation_conformance,
 )
 from tests.core.task_terminalization_conformance import (
     assert_live_ordinary_cancellation_conformance,
@@ -83,9 +85,11 @@ from cayu import (
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
+    LocalExecutionAttemptConflict,
     LocalExecutionAttemptEffectOutcome,
     LocalExecutionAttemptQuiescence,
     LocalExecutionAttemptReceipt,
+    LocalExecutionAttemptRecord,
     LocalExecutionAttemptRecoveryClaim,
     LocalExecutionAttemptRequest,
     LocalExecutionAttemptSettlement,
@@ -1417,6 +1421,7 @@ def test_postgres_verified_work_clock_does_not_expire_task_worker_lease(postgres
                     "session:postgres:separate-clock",
                 ),
                 worker_id="postgres-task-worker",
+                lease_expires_at=task.lease_expires_at,
             )
             attempt = await store.begin_work_attempt(
                 WorkAttemptCreate(
@@ -1432,7 +1437,95 @@ def test_postgres_verified_work_clock_does_not_expire_task_worker_lease(postgres
             assert attempt.started_at == verifier_now
             assert attempt.worker_id == "postgres-task-worker"
             assert running.updated_at < verifier_now
+
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-separate-clock-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("postgres-separate-clock"),
+                )
+            )
+            first_request = CompletionVerificationClaimRequest(
+                claim_id="postgres-separate-clock-verifier-claim-1",
+                proposal_id=proposal.proposal_id,
+                worker_id="postgres-verifier-one",
+                verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+                lease_seconds=1,
+            )
+            first_claim = await _claim_completion_verification(store, first_request)
+            assert first_claim.claimed_at < verifier_now
+            await asyncio.sleep(1.1)
+            replacement = await _claim_completion_verification(
+                store,
+                first_request.model_copy(
+                    update={
+                        "claim_id": "postgres-separate-clock-verifier-claim-2",
+                        "worker_id": "postgres-verifier-two",
+                    }
+                ),
+            )
+            assert replacement.attempt_number == 2
+            assert replacement.claimed_at < verifier_now
         finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_attach_rechecks_lease_after_session_authority_wait(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        contract = _contract(contract_id="postgres-attach-authority-wait")
+        attach_caller: asyncio.Task[object] | None = None
+        session_id = "session:postgres:attach-authority-wait"
+        try:
+            await store.publish_work_contract(contract)
+            task = await store.create_task(
+                TaskCreate(
+                    task_id="postgres-attach-authority-wait-task",
+                    type="verified-work",
+                    work_contract=contract.reference(),
+                )
+            )
+            claimed = await store.claim_task("postgres-expiring-attacher", lease_seconds=1)
+            assert claimed is not None
+            binding = await task_backed_session_invocation(store, task.id, session_id)
+            await blocker.execute(
+                "INSERT INTO cayu_task_session_execution_authority "
+                "(session_id, authority_kind, committed_at) "
+                "VALUES (%s, 'contracted', clock_timestamp())",
+                (session_id,),
+            )
+            attach_caller = asyncio.create_task(
+                store.attach_task(
+                    task.id,
+                    session_id=session_id,
+                    session_invocation=binding,
+                    worker_id="postgres-expiring-attacher",
+                    lease_expires_at=task.lease_expires_at,
+                )
+            )
+            await asyncio.sleep(1.1)
+            await blocker.commit()
+
+            with pytest.raises(TaskClaimLost):
+                await attach_caller
+            stored = await store.load_task(task.id)
+            assert stored is not None
+            assert stored.status is TaskStatus.CLAIMED
+            assert stored.session_id is None
+        finally:
+            await blocker.rollback()
+            if attach_caller is not None and not attach_caller.done():
+                attach_caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await attach_caller
+            await blocker.close()
             await store.close()
 
     asyncio.run(run())
@@ -1471,6 +1564,7 @@ def test_postgres_verified_work_lease_checks_use_post_lock_time(postgres_dsn):
                     "session:postgres:post-lock-task-lease",
                 ),
                 worker_id="postgres-post-lock-worker",
+                lease_expires_at=task.lease_expires_at,
             )
             await lock_connection.execute(
                 "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
@@ -2052,6 +2146,7 @@ def test_postgres_ordinary_cancellation_reconciler_and_late_worker_serialize(
                     "postgres-ordinary-reconciliation-session",
                 ),
                 worker_id="postgres-prior-worker",
+                lease_expires_at=claimed.lease_expires_at,
             )
             await reconciler.release_interrupted_task_worker(
                 interrupted_task_handoff_request(attached, session_run_epoch=1)
@@ -2131,6 +2226,7 @@ def test_postgres_task_retry_series_success_budget_and_duplicate_conformance(
             retry_request = TaskRetrySettlementRequest(
                 task_id="retry-success",
                 worker_id="worker-a",
+                lease_expires_at=first_claim.lease_expires_at,
                 idempotency_key="attempt-one",
                 causal_budget_id=_retry_causal_budget_id(first_claim),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2149,6 +2245,7 @@ def test_postgres_task_retry_series_success_budget_and_duplicate_conformance(
                 TaskRetrySettlementRequest(
                     task_id=second.id,
                     worker_id="worker-b",
+                    lease_expires_at=second.lease_expires_at,
                     idempotency_key="attempt-two",
                     causal_budget_id=_retry_causal_budget_id(second),
                     disposition=TaskRetryAttemptDisposition.SUCCEEDED,
@@ -2178,6 +2275,7 @@ def test_postgres_task_retry_series_success_budget_and_duplicate_conformance(
                 TaskRetrySettlementRequest(
                     task_id="retry-budget",
                     worker_id="worker-c",
+                    lease_expires_at=budget_claim.lease_expires_at,
                     idempotency_key="budget-attempt",
                     causal_budget_id=_retry_causal_budget_id(budget_claim),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2209,6 +2307,7 @@ def test_postgres_task_retry_series_success_budget_and_duplicate_conformance(
                 TaskRetrySettlementRequest(
                     task_id="retry-overspend",
                     worker_id="worker-d",
+                    lease_expires_at=overspend_claim.lease_expires_at,
                     idempotency_key="overspend-attempt",
                     causal_budget_id=_retry_causal_budget_id(overspend_claim),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2262,6 +2361,7 @@ def test_postgres_task_retry_series_restart_cancellation_and_claim_race(
                 TaskRetrySettlementRequest(
                     task_id="retry-restart",
                     worker_id="worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="restart-attempt",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2287,6 +2387,7 @@ def test_postgres_task_retry_series_restart_cancellation_and_claim_race(
             await (first if winner.worker_id == "worker-b" else second).release_task(
                 successor_id,
                 winner.worker_id,
+                lease_expires_at=winner.lease_expires_at,
             )
             cancelled = await first.cancel_task(successor_id, {"code": "operator"})
             assert cancelled.retry_series is not None
@@ -2342,13 +2443,18 @@ def test_postgres_task_retry_active_cancellation_retains_owner_until_settlement(
                     await action(claimed.id)
                 assert await store.load_task(claimed.id) == requested
             with pytest.raises(TaskTerminalizationConflict, match="still draining"):
-                await store.release_task(claimed.id, "worker-a")
+                await store.release_task(
+                    claimed.id,
+                    "worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
+                )
             assert await store.load_task(claimed.id) == requested
 
             receipt = await store.settle_task_retry_attempt(
                 TaskRetrySettlementRequest(
                     task_id=claimed.id,
                     worker_id="worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key=key,
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -2395,6 +2501,7 @@ def test_postgres_task_retry_owner_lost_cancellation_reconciliation_and_late_wor
                     TaskRetrySettlementRequest(
                         task_id=request.task_id,
                         worker_id=request.original_worker_id,
+                        lease_expires_at=request.original_lease_expires_at,
                         idempotency_key=request.cancellation_idempotency_key,
                         causal_budget_id=request.causal_budget_id,
                         disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -2450,6 +2557,7 @@ def test_postgres_task_retry_owner_lost_cancellation_reconciliation_and_late_wor
                 TaskRetrySettlementRequest(
                     task_id=worker_claim.id,
                     worker_id="live-worker",
+                    lease_expires_at=worker_claim.lease_expires_at,
                     idempotency_key=(losing_reconciliation.cancellation_idempotency_key),
                     causal_budget_id=losing_reconciliation.causal_budget_id,
                     disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -2601,6 +2709,7 @@ def test_postgres_task_retry_series_expires_before_late_claim(postgres_dsn):
                 TaskRetrySettlementRequest(
                     task_id="retry-elapsed",
                     worker_id="worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
                     idempotency_key="elapsed-attempt-one",
                     causal_budget_id=_retry_causal_budget_id(claimed),
                     disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -2648,11 +2757,26 @@ def test_postgres_task_retry_series_enforces_active_deadline_with_store_clock(po
             )
             claimed = await store.claim_task("worker-a")
             assert claimed is not None
-            assert not await store.task_retry_deadline_elapsed(claimed.id, "worker-a")
-            assert await store.enforce_task_retry_deadline(claimed.id, "worker-a") is None
+            assert not await store.task_retry_deadline_elapsed(
+                claimed.id,
+                "worker-a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
+            assert (
+                await store.enforce_task_retry_deadline(
+                    claimed.id,
+                    "worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
+                )
+                is None
+            )
 
             clock.value = started_at + timedelta(seconds=11)
-            assert await store.task_retry_deadline_elapsed(claimed.id, "worker-a")
+            assert await store.task_retry_deadline_elapsed(
+                claimed.id,
+                "worker-a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
             still_owned = await store.load_task(claimed.id)
             assert still_owned is not None
             assert still_owned.status is TaskStatus.CLAIMED
@@ -2660,6 +2784,7 @@ def test_postgres_task_retry_series_enforces_active_deadline_with_store_clock(po
             receipt = await store.enforce_task_retry_deadline(
                 claimed.id,
                 "worker-a",
+                lease_expires_at=claimed.lease_expires_at,
                 token_count=17,
                 estimated_cost=Decimal("4.25"),
             )
@@ -2938,7 +3063,11 @@ def test_postgres_local_execution_attempt_survives_restart_and_settles_exactly(
                 started_at=datetime.now(UTC),
             )
             await first.start_local_execution_attempt(started)
-            await first.release_task(task.id, "worker-a")
+            await first.release_task(
+                task.id,
+                "worker-a",
+                lease_expires_at=task.lease_expires_at,
+            )
             fenced_snapshot = await first.aggregate_operational_snapshot()
             assert fenced_snapshot.counts_by_status.pending == 1
             assert fenced_snapshot.claimable_pending_count == 0
@@ -3148,6 +3277,79 @@ def test_postgres_attempt_publication_fences_stale_lease_reclamation_snapshot(
     asyncio.run(run())
 
 
+def test_postgres_local_attempt_start_rechecks_lease_after_task_row_wait(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        starting: asyncio.Task[LocalExecutionAttemptRecord] | None = None
+        try:
+            app = CayuApp(task_store=store, enable_logging=False)
+            await store.create_task(
+                TaskCreate(task_id="postgres-local-start-lock-expiry", type="job")
+            )
+            task = await store.claim_task("worker-a", lease_seconds=300)
+            assert task is not None
+            authority = build_local_execution_attempt_authority(
+                app=app,
+                task=task,
+                worker_id="worker-a",
+                request=LocalExecutionAttemptRequest(
+                    effect_lineage_id="postgres-local-start-lock-effect",
+                    argv=("/usr/bin/true",),
+                    effect_policy=LocalExecutionEffectPolicy.LOCAL_ONLY,
+                ),
+            )
+            await store.prepare_local_execution_attempt(authority)
+            start = LocalExecutionAttemptStart(
+                attempt_id=authority.attempt_id,
+                request_sha256=authority.request_sha256,
+                host_identity="host-a",
+                boot_id="boot-a",
+                supervisor_nonce="a" * 64,
+                rendezvous_identity="b" * 64,
+                supervisor=LocalExecutionProcessIdentity(
+                    pid=100,
+                    process_group=100,
+                    start_tick=1000,
+                    proc_inode=2000,
+                ),
+                root=None,
+                started_at=datetime.now(UTC),
+            )
+
+            await blocker.execute(
+                "UPDATE cayu_tasks SET lease_expires_at = "
+                "clock_timestamp() + INTERVAL '250 milliseconds' WHERE id = %s",
+                (task.id,),
+            )
+            starting = asyncio.create_task(store.start_local_execution_attempt(start))
+            await asyncio.sleep(0.05)
+            assert not starting.done()
+            await asyncio.sleep(0.30)
+            await blocker.commit()
+
+            with pytest.raises(LocalExecutionAttemptConflict, match="task ownership"):
+                await starting
+            durable = await store.load_local_execution_attempt(authority.attempt_id)
+            assert durable is not None
+            assert durable.start is None
+        finally:
+            if starting is not None and not starting.done():
+                starting.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await starting
+            await blocker.rollback()
+            await blocker.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
 async def _truncate(dsn: str) -> None:
     import psycopg
 
@@ -3192,9 +3394,30 @@ def _run(dsn: str, coro_factory) -> object:
     return asyncio.run(runner())
 
 
+async def _exact_task_lease(store: PostgresTaskStore, task_id: str) -> datetime:
+    task = await store.load_task(task_id)
+    assert task is not None
+    assert task.lease_expires_at is not None
+    return task.lease_expires_at
+
+
 def test_postgres_task_store_task_claim_lost_conformance(postgres_dsn):
     async def ops(store):
         await assert_task_claim_lost_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_worker_terminalization_generation_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_worker_terminalization_generation_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_exact_claimed_cancellation_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_exact_claimed_task_cancellation_conformance(store)
 
     _run(postgres_dsn, ops)
 
@@ -3326,7 +3549,11 @@ def test_postgres_injected_availability_clock_does_not_expire_new_task_lease(
             )
             claimed = await store.claim_task("worker")
             assert claimed is not None
-            released = await store.release_task("lease-clock", "worker")
+            released = await store.release_task(
+                "lease-clock",
+                "worker",
+                lease_expires_at=claimed.lease_expires_at,
+            )
             assert released.status is TaskStatus.PENDING
         finally:
             await store.close()
@@ -3365,6 +3592,158 @@ def test_postgres_production_claim_uses_database_clock(postgres_dsn):
             store._clock = lambda: available_at + timedelta(hours=1)
             assert await store.claim_task("clock-skewed-worker") is None
         finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_claim_lease_starts_after_retry_fence_wait(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        claim_task: asyncio.Task[Task | None] | None = None
+        try:
+            await store.ensure_schema()
+            task = await store.create_task(
+                TaskCreate(task_id="claim-post-retry-fence-clock", type="job")
+            )
+            fence_scope = f"cayu:verified-work:local-execution-retry-admission:task:{task.id}"
+            await blocker.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s, 449))",
+                (fence_scope,),
+            )
+
+            entered_fence = asyncio.Event()
+            original_lock = store._lock_local_execution_retry_fence
+
+            async def observed_lock(self, cur, claimed):
+                del self
+                entered_fence.set()
+                await original_lock(cur, claimed)
+
+            store._lock_local_execution_retry_fence = MethodType(observed_lock, store)
+            claim_task = asyncio.create_task(store.claim_task("post-fence-worker", lease_seconds=1))
+            await asyncio.wait_for(entered_fence.wait(), timeout=5)
+            await asyncio.sleep(1.05)
+            async with blocker.cursor() as cur:
+                await cur.execute("SELECT clock_timestamp()")
+                release_boundary_row = await cur.fetchone()
+            assert release_boundary_row is not None
+            release_boundary = release_boundary_row[0]
+            await blocker.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 449))",
+                (fence_scope,),
+            )
+
+            claimed = await asyncio.wait_for(claim_task, timeout=5)
+            assert claimed is not None
+            assert claimed.lease_expires_at is not None
+            assert claimed.updated_at >= release_boundary
+            assert claimed.lease_expires_at > release_boundary
+        finally:
+            await blocker.execute("SELECT pg_advisory_unlock_all()")
+            if claim_task is not None and not claim_task.done():
+                claim_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await claim_task
+            await blocker.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_claim_rechecks_retry_deadline_after_retry_fence_wait(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        claim_task: asyncio.Task[Task | None] | None = None
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="claim-post-fence-retry-deadline",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        max_elapsed_seconds=2.0,
+                        initial_backoff_seconds=0.0,
+                    ),
+                )
+            )
+            first = await store.claim_task("first-worker")
+            assert first is not None
+            settlement = await store.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id=first.id,
+                    worker_id="first-worker",
+                    lease_expires_at=first.lease_expires_at,
+                    idempotency_key="post-fence-first-attempt",
+                    causal_budget_id=_retry_causal_budget_id(first),
+                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                    error={"code": "temporary"},
+                )
+            )
+            successor = settlement.successor
+            assert successor is not None
+            assert successor.retry_series is not None
+            assert successor.retry_series.elapsed_deadline is not None
+            fence_scope = (
+                "cayu:verified-work:local-execution-retry-admission:"
+                f"{store._local_execution_retry_fence_scope(successor)}"
+            )
+            await blocker.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s, 449))",
+                (fence_scope,),
+            )
+
+            entered_fence = asyncio.Event()
+            original_lock = store._lock_local_execution_retry_fence
+
+            async def observed_lock(self, cur, claimed):
+                del self
+                entered_fence.set()
+                await original_lock(cur, claimed)
+
+            store._lock_local_execution_retry_fence = MethodType(observed_lock, store)
+            claim_task = asyncio.create_task(store.claim_task("late-retry-worker"))
+            await asyncio.wait_for(entered_fence.wait(), timeout=5)
+            async with blocker.cursor() as cur:
+                await cur.execute(
+                    "SELECT GREATEST(EXTRACT(EPOCH FROM (%s::timestamptz - clock_timestamp())), 0)",
+                    (successor.retry_series.elapsed_deadline,),
+                )
+                remaining_row = await cur.fetchone()
+            assert remaining_row is not None
+            await asyncio.sleep(float(remaining_row[0]) + 0.10)
+            await blocker.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 449))",
+                (fence_scope,),
+            )
+
+            assert await asyncio.wait_for(claim_task, timeout=5) is None
+            expired = await store.load_task(successor.id)
+            assert expired is not None
+            assert expired.status is TaskStatus.FAILED
+            assert expired.retry_series is not None
+            assert expired.retry_series.disposition is TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED
+            assert expired.status_payload is not None
+            receipt_key = expired.status_payload["settlement_idempotency_key"]
+            assert isinstance(receipt_key, str)
+            receipt = await store.load_task_retry_settlement(expired.id, receipt_key)
+            assert receipt is not None
+            assert receipt.task == expired
+        finally:
+            await blocker.execute("SELECT pg_advisory_unlock_all()")
+            if claim_task is not None and not claim_task.done():
+                claim_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await claim_task
+            await blocker.close()
             await store.close()
 
     asyncio.run(run())
@@ -3993,14 +4372,27 @@ def test_postgres_task_store_claim_heartbeat_and_release_task(postgres_dsn):
         assert linked.status == TaskStatus.PENDING
         assert linked.worker_id is None
 
-        heartbeat = await store.heartbeat("task_a", "worker_a", extend_seconds=600)
+        heartbeat = await store.heartbeat(
+            "task_a",
+            "worker_a",
+            lease_expires_at=first.lease_expires_at,
+            extend_seconds=600,
+        )
         assert heartbeat.lease_expires_at is not None
         assert heartbeat.lease_expires_at > first.lease_expires_at
 
         with pytest.raises(ValueError, match="does not own"):
-            await store.heartbeat("task_a", "worker_b")
+            await store.heartbeat(
+                "task_a",
+                "worker_b",
+                lease_expires_at=heartbeat.lease_expires_at,
+            )
 
-        released = await store.release_task("task_a", "worker_a")
+        released = await store.release_task(
+            "task_a",
+            "worker_a",
+            lease_expires_at=heartbeat.lease_expires_at,
+        )
         assert released.status == TaskStatus.PENDING
         assert released.worker_id is None
         assert released.lease_expires_at is None
@@ -4073,6 +4465,7 @@ def test_postgres_task_store_attach_task_starts_claimed_task(postgres_dsn):
                 store, "task_claimed", "sess_claimed"
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
         assert started.status == TaskStatus.RUNNING
         assert started.session_id == "sess_claimed"
@@ -4093,7 +4486,11 @@ def test_postgres_task_store_rejects_expired_claim_handoff(postgres_dsn):
         with pytest.raises(ValueError, match="cannot transition to running from claimed"):
             await store.start_task("task_expired_handoff", session_id="sess_expired")
         with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
-            await store.heartbeat("task_expired_handoff", "worker_a")
+            await store.heartbeat(
+                "task_expired_handoff",
+                "worker_a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
 
     _run(postgres_dsn, ops)
 
@@ -4119,7 +4516,12 @@ def test_postgres_heartbeat_rechecks_lease_after_row_lock_wait(postgres_dsn):
                     (claimed.id,),
                 )
             heartbeat = asyncio.create_task(
-                store.heartbeat(claimed.id, "worker-a", extend_seconds=300)
+                store.heartbeat(
+                    claimed.id,
+                    "worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
+                    extend_seconds=300,
+                )
             )
             await asyncio.sleep(0.05)
             assert not heartbeat.done()
@@ -4136,6 +4538,63 @@ def test_postgres_heartbeat_rechecks_lease_after_row_lock_wait(postgres_dsn):
         finally:
             await blocker.close()
             await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_heartbeat_release_race_preserves_single_owner(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        first = _new_store(postgres_dsn)
+        second = _new_store(postgres_dsn)
+        try:
+            await first.create_task(TaskCreate(task_id="heartbeat-release-race", type="job"))
+            claimed = await first.claim_task("worker-a", lease_seconds=300)
+            assert claimed is not None
+
+            heartbeat, release = await asyncio.gather(
+                first.heartbeat(
+                    claimed.id,
+                    "worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
+                    extend_seconds=300,
+                ),
+                second.release_task(
+                    claimed.id,
+                    "worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(heartbeat, BaseException):
+                assert isinstance(heartbeat, TaskClaimLost)
+                assert not isinstance(release, BaseException)
+                assert release.status is TaskStatus.PENDING
+            else:
+                assert heartbeat.worker_id == "worker-a"
+                if isinstance(release, TaskClaimLost):
+                    release = await second.release_task(
+                        claimed.id,
+                        "worker-a",
+                        lease_expires_at=heartbeat.lease_expires_at,
+                    )
+                else:
+                    assert heartbeat.lease_expires_at == claimed.lease_expires_at
+                assert release.status is TaskStatus.PENDING
+
+            durable = await first.load_task(claimed.id)
+            assert durable is not None
+            assert durable.status is TaskStatus.PENDING
+            assert durable.worker_id is None
+            with pytest.raises(TaskClaimLost):
+                await first.heartbeat(
+                    claimed.id,
+                    "worker-a",
+                    lease_expires_at=claimed.lease_expires_at,
+                )
+        finally:
+            await second.close()
+            await first.close()
 
     asyncio.run(run())
 
@@ -4161,6 +4620,7 @@ def test_postgres_retry_settlement_rechecks_lease_after_row_lock_wait(postgres_d
             request = TaskRetrySettlementRequest(
                 task_id=claimed.id,
                 worker_id="worker-a",
+                lease_expires_at=claimed.lease_expires_at,
                 idempotency_key="lock-expiry-attempt",
                 causal_budget_id=_retry_causal_budget_id(claimed),
                 disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -4200,6 +4660,76 @@ def test_postgres_retry_settlement_rechecks_lease_after_row_lock_wait(postgres_d
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("operation", ["settle", "deadline"])
+def test_postgres_retry_mutation_rejects_prior_lease_after_same_worker_reclaim(
+    postgres_dsn,
+    operation: str,
+):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id=f"postgres-same-worker-{operation}",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        max_elapsed_seconds=300,
+                    ),
+                )
+            )
+            first_claim = await store.claim_task("same-worker", lease_seconds=300)
+            assert first_claim is not None
+            stale_request = TaskRetrySettlementRequest(
+                task_id=first_claim.id,
+                worker_id="same-worker",
+                lease_expires_at=first_claim.lease_expires_at,
+                idempotency_key=f"postgres-same-worker-{operation}-settlement",
+                causal_budget_id=_retry_causal_budget_id(first_claim),
+                disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                error={"code": "temporary"},
+            )
+            connection = await psycopg.AsyncConnection.connect(postgres_dsn)
+            try:
+                await connection.execute(
+                    "UPDATE cayu_tasks SET lease_expires_at = "
+                    "clock_timestamp() - INTERVAL '1 second' WHERE id = %s",
+                    (first_claim.id,),
+                )
+                await connection.commit()
+            finally:
+                await connection.close()
+            assert [task.id for task in await store.reclaim_expired()] == [first_claim.id]
+            successor_claim = await store.claim_task("same-worker", lease_seconds=300)
+            assert successor_claim is not None
+            assert successor_claim.lease_expires_at != first_claim.lease_expires_at
+
+            with pytest.raises(TaskClaimLost, match="lease"):
+                if operation == "settle":
+                    await store.settle_task_retry_attempt(stale_request)
+                else:
+                    await store.task_retry_deadline_elapsed(
+                        first_claim.id,
+                        "same-worker",
+                        lease_expires_at=first_claim.lease_expires_at,
+                    )
+            assert await store.load_task(first_claim.id) == successor_claim
+            assert (
+                await store.load_task_retry_settlement(
+                    first_claim.id,
+                    stale_request.idempotency_key,
+                )
+                is None
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_postgres_task_store_rejects_release_after_session_attachment(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_attached_release", type="review"))
@@ -4213,10 +4743,15 @@ def test_postgres_task_store_rejects_release_after_session_attachment(postgres_d
                 store, "task_attached_release", "sess_attached"
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
         with pytest.raises(ValueError, match="already attached to session sess_attached"):
-            await store.release_task("task_attached_release", "worker_a")
+            await store.release_task(
+                "task_attached_release",
+                "worker_a",
+                lease_expires_at=claimed.lease_expires_at,
+            )
 
         loaded = await store.load_task("task_attached_release")
         assert loaded is not None
@@ -4245,11 +4780,13 @@ def test_postgres_task_store_releases_attached_worker_without_requeueing(postgre
                 store, "task_attached_handoff", "sess_attached_handoff"
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_attached_handoff"),
         )
 
         released = await store.release_attached_task_worker(
             "task_attached_handoff",
             "worker_a",
+            lease_expires_at=attached.lease_expires_at,
         )
 
         assert released.status == TaskStatus.RUNNING
@@ -4280,6 +4817,10 @@ def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
                 "session_exact_interrupted_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(
+                store,
+                "task_exact_interrupted_handoff",
+            ),
         )
         assert attached.lease_expires_at is not None
         assert attached.session_instance_id is not None
@@ -4332,6 +4873,7 @@ def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
                 await store.release_attached_task_worker(
                     continuation_owner.id,
                     continuation_owner.worker_id,
+                    lease_expires_at=continuation_owner.lease_expires_at,
                 )
             assert first_receipt.task.session_id is not None
             assert first_receipt.task.session_instance_id is not None
@@ -4392,6 +4934,10 @@ def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
                     "session_interrupted_terminal_race",
                 ),
                 worker_id="worker_b",
+                lease_expires_at=await _exact_task_lease(
+                    store,
+                    "task_interrupted_terminal_race",
+                ),
             )
             assert race_task.lease_expires_at is not None
             assert race_task.session_instance_id is not None
@@ -4455,6 +5001,7 @@ def test_postgres_same_continuation_generation_converges_across_instances(
                 session_id,
             ),
             worker_id="prior-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         await store.release_interrupted_task_worker(
             interrupted_task_handoff_request(attached, session_run_epoch=1)
@@ -4500,6 +5047,7 @@ def test_postgres_interrupted_task_handoff_candidates_page_stably(postgres_dsn):
                     f"session_{task_id}",
                 ),
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
             )
         await asyncio.sleep(1.05)
 
@@ -4535,6 +5083,7 @@ def test_postgres_continuation_claim_rejects_malformed_receipt_authority(postgre
                 session_id,
             ),
             worker_id="prior-worker",
+            lease_expires_at=claimed.lease_expires_at,
         )
         assert attached.lease_expires_at is not None
         assert attached.session_instance_id is not None
@@ -4574,6 +5123,7 @@ def test_postgres_continuation_claim_rejects_malformed_receipt_authority(postgre
                 valid_session_id,
             ),
             worker_id="valid-prior-worker",
+            lease_expires_at=valid_prior.lease_expires_at,
         )
         assert valid_attached.lease_expires_at is not None
         assert valid_attached.session_instance_id is not None
@@ -4631,6 +5181,7 @@ def test_postgres_interrupted_continuation_cursor_does_not_skip_locked_rows(post
                     session_id,
                 ),
                 worker_id=worker_id,
+                lease_expires_at=claimed.lease_expires_at,
             )
             assert attached.lease_expires_at is not None
             assert attached.session_instance_id is not None
@@ -4695,6 +5246,10 @@ def test_postgres_interrupted_task_handoff_survives_real_process_loss(postgres_d
                 "session_postgres_process_handoff",
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(
+                store,
+                "task_postgres_process_handoff",
+            ),
         )
         assert attached.lease_expires_at is not None
         assert attached.session_instance_id is not None
@@ -4768,6 +5323,7 @@ def test_postgres_interrupted_task_handoff_rejects_receipt_from_another_storage_
                     session_id,
                 ),
                 worker_id="worker_a",
+                lease_expires_at=await _exact_task_lease(store, task_id),
             )
             assert attached.lease_expires_at is not None
             assert attached.session_instance_id is not None
@@ -4872,6 +5428,10 @@ def test_postgres_interrupted_task_handoff_faults_reconcile_exactly(
                     "session_postgres_fault_handoff",
                 ),
                 worker_id="worker_a",
+                lease_expires_at=await _exact_task_lease(
+                    store,
+                    "task_postgres_fault_handoff",
+                ),
             )
             assert attached.lease_expires_at is not None
             assert attached.session_instance_id is not None
@@ -4917,14 +5477,22 @@ def test_postgres_interrupted_task_handoff_faults_reconcile_exactly(
 def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_dsn):
     async def ops(store):
         with pytest.raises(KeyError, match="Task not found"):
-            await store.release_attached_task_worker("missing", "worker_a")
+            await store.release_attached_task_worker(
+                "missing",
+                "worker_a",
+                lease_expires_at=datetime.now(UTC),
+            )
 
         await store.create_task(TaskCreate(task_id="task_unattached", type="review"))
         await store.claim_task("worker_a", lease_seconds=300)
         unattached_before = await store.load_task("task_unattached")
         assert unattached_before is not None
         with pytest.raises(ValueError, match="not running"):
-            await store.release_attached_task_worker("task_unattached", "worker_a")
+            await store.release_attached_task_worker(
+                "task_unattached",
+                "worker_a",
+                lease_expires_at=unattached_before.lease_expires_at,
+            )
 
         await store.create_task(TaskCreate(task_id="task_wrong_worker", type="review"))
         await store.claim_task("worker_a", lease_seconds=300)
@@ -4935,11 +5503,16 @@ def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_ds
                 store, "task_wrong_worker", "sess_wrong_worker"
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_wrong_worker"),
         )
         wrong_worker_before = await store.load_task("task_wrong_worker")
         assert wrong_worker_before is not None
         with pytest.raises(ValueError, match="does not own"):
-            await store.release_attached_task_worker("task_wrong_worker", "worker_b")
+            await store.release_attached_task_worker(
+                "task_wrong_worker",
+                "worker_b",
+                lease_expires_at=wrong_worker_before.lease_expires_at,
+            )
 
         await store.create_task(TaskCreate(task_id="task_expired_worker", type="review"))
         await store.claim_task("worker_a", lease_seconds=1)
@@ -4950,12 +5523,17 @@ def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_ds
                 store, "task_expired_worker", "sess_expired_worker"
             ),
             worker_id="worker_a",
+            lease_expires_at=await _exact_task_lease(store, "task_expired_worker"),
         )
         await asyncio.sleep(1.05)
         expired_before = await store.load_task("task_expired_worker")
         assert expired_before is not None
         with pytest.raises(TaskClaimLost, match="lease for worker worker_a has expired"):
-            await store.release_attached_task_worker("task_expired_worker", "worker_a")
+            await store.release_attached_task_worker(
+                "task_expired_worker",
+                "worker_a",
+                lease_expires_at=expired_before.lease_expires_at,
+            )
 
         await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
         terminal_before = await store.complete_task(
@@ -4963,7 +5541,11 @@ def test_postgres_task_store_rejects_invalid_attached_worker_release(postgres_ds
             {"winner": "terminal-state"},
         )
         with pytest.raises(ValueError, match="running"):
-            await store.release_attached_task_worker("task_terminal", "worker_a")
+            await store.release_attached_task_worker(
+                "task_terminal",
+                "worker_a",
+                lease_expires_at=datetime.now(UTC),
+            )
 
         unattached_after = await store.load_task("task_unattached")
         wrong_worker_after = await store.load_task("task_wrong_worker")
@@ -4991,6 +5573,7 @@ def test_postgres_task_store_does_not_reclaim_attached_expired_leases(postgres_d
                 store, "task_attached_expired", "sess_attached_expired"
             ),
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
         await asyncio.sleep(1.05)
@@ -5048,7 +5631,12 @@ def test_postgres_task_store_validate_worker_lease_inputs(postgres_dsn):
         assert claimed is not None
 
         with pytest.raises(ValueError, match="extend_seconds must be >= 1"):
-            await store.heartbeat("task_validate_worker", "worker_a", extend_seconds=0)
+            await store.heartbeat(
+                "task_validate_worker",
+                "worker_a",
+                lease_expires_at=claimed.lease_expires_at,
+                extend_seconds=0,
+            )
         with pytest.raises(ValueError, match="max_reclaims must be >= 1"):
             await store.reclaim_expired(max_reclaims=0)
         with pytest.raises(ValueError, match="do not support session_id"):

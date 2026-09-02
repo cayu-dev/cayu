@@ -4,12 +4,12 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
-from cayu._clock import utc_clock
+from cayu._clock import utc_clock, utc_duration_cutoff
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
@@ -289,14 +289,16 @@ class SQLiteBudgetLedger(BudgetLedger):
     ) -> tuple[BudgetReservationRecord, ...]:
         reservation_ids = _validate_reservation_id_batch(reservation_ids)
         dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
-        marked_at = (
+        supplied_dispatched_at = (
             sqlite_support.parse_datetime(sqlite_support.format_datetime(dispatched_at))
             if dispatched_at is not None
-            else self._clock()
+            else None
         )
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
+                now = self._clock()
+                marked_at = now if supplied_dispatched_at is None else supplied_dispatched_at
                 records = tuple(
                     self._load_record_unlocked(reservation_id) for reservation_id in reservation_ids
                 )
@@ -310,6 +312,12 @@ class SQLiteBudgetLedger(BudgetLedger):
                         raise ValueError(
                             f"Budget reservation is not active: {record.reservation_id}"
                         )
+                    if record.dispatch_id is None and _reservation_is_expired(
+                        record,
+                        now=now,
+                        ttl_seconds=self._reservation_ttl_seconds,
+                    ):
+                        raise ValueError(f"Budget reservation has expired: {record.reservation_id}")
                 dispatched_records = tuple(
                     (
                         record
@@ -682,7 +690,9 @@ class SQLiteBudgetLedger(BudgetLedger):
     ) -> None:
         if self._reservation_ttl_seconds is None:
             return
-        cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        cutoff = utc_duration_cutoff(now, self._reservation_ttl_seconds)
+        if cutoff is None:
+            return
         rows = self._connection.execute(
             """
             SELECT reservation_id
@@ -706,7 +716,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     record.settlement_fallback.expiration_reason
                     or _expired_reservation_reason(self._reservation_ttl_seconds)
                 ),
-                updated_at=record.settlement_fallback.settled_at,
+                updated_at=now,
             )
             reconciliation = _reconciliation_from_record(
                 released,

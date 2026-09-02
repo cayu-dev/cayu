@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -24,12 +25,18 @@ from cayu import (
     EventType,
     ExecutionProfileBehaviorIdentity,
     ForkSessionRequest,
+    IncompleteSessionRecoveryRequest,
     Message,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RetryPolicy,
     RunRequest,
     SessionStatus,
     Task,
+    TaskCancellationReconciliationEvidence,
+    TaskCancellationReconciliationOutcome,
+    TaskCancellationReconciliationRequest,
     TaskQuery,
     TaskStatus,
     TaskStoreDispatcher,
@@ -196,10 +203,13 @@ def _build_app(
     *,
     session_store_type: type[SQLiteSessionStore] = SQLiteSessionStore,
     task_store_type: type[SQLiteTaskStore] = SQLiteTaskStore,
-    task_clock: Callable[[], datetime] | None = None,
+    task_ownership_clock: Callable[[], datetime] | None = None,
 ) -> tuple[CayuApp, TaskStoreDispatcher, SQLiteSessionStore, SQLiteTaskStore]:
     sessions = session_store_type(root / "sessions.sqlite")
-    tasks = task_store_type(root / "tasks.sqlite", clock=task_clock)
+    tasks = task_store_type(
+        root / "tasks.sqlite",
+        ownership_clock=task_ownership_clock,
+    )
     dispatcher = TaskStoreDispatcher(
         tasks,
         lease_seconds=1,
@@ -223,6 +233,73 @@ async def _collect(stream) -> list[Any]:
 async def _close_stores(sessions: SQLiteSessionStore, tasks: SQLiteTaskStore) -> None:
     await sessions.close()
     await tasks.close()
+
+
+async def _reconcile_expired_dispatch(
+    sessions: SQLiteSessionStore,
+    tasks: SQLiteTaskStore,
+    task: Task,
+    *,
+    boundary: str,
+) -> Task:
+    """Settle one owner-lost dispatch from durable terminal-session evidence."""
+
+    if task.worker_id is None or task.lease_expires_at is None or task.status_payload is None:
+        raise AssertionError("Expired dispatch has no exact cancellation authority.")
+    session = await sessions.load(_CHILD_SESSION_ID)
+    if session is None or session.status not in {
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.INTERRUPTED,
+    }:
+        raise AssertionError("Expired dispatch has no durable terminal-session evidence.")
+    cancellation_key = task.status_payload.get("terminalization_idempotency_key")
+    event = task.status_payload.get("event")
+    if type(cancellation_key) is not str or type(event) is not dict:
+        raise AssertionError("Expired dispatch has malformed cancellation evidence.")
+    cancellation_requested_at = event.get("occurred_at")
+    if type(cancellation_requested_at) is not str:
+        raise AssertionError("Expired dispatch has no cancellation timestamp.")
+    evidence_payload = json.dumps(
+        {
+            "boundary": boundary,
+            "queue_task_id": task.id,
+            "worker_id": task.worker_id,
+            "lease_expires_at": task.lease_expires_at.isoformat(),
+            "session_id": session.id,
+            "session_instance_id": session.instance_id,
+            "session_run_epoch": session.run_epoch,
+            "session_status": session.status.value,
+            "session_updated_at": session.updated_at.isoformat(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    result = await tasks.reconcile_task_cancellation(
+        TaskCancellationReconciliationRequest(
+            task_id=task.id,
+            original_worker_id=task.worker_id,
+            original_handoff_id=task.interrupted_handoff_id,
+            original_lease_expires_at=task.lease_expires_at,
+            cancellation_requested_at=datetime.fromisoformat(cancellation_requested_at),
+            cancellation_idempotency_key=cancellation_key,
+            reconciliation_idempotency_key=f"process-supervisor:{boundary}:{task.id}",
+            reconciliation_requested_at=task.updated_at,
+            reconciled_by=ResolutionActor(
+                subject="example:process-supervisor",
+                source=ResolutionActorSource.SYSTEM,
+            ),
+            evidence=TaskCancellationReconciliationEvidence(
+                outcome=TaskCancellationReconciliationOutcome.EFFECT_COMPLETED,
+                validator_id="example.terminal-session",
+                validator_version="1",
+                evidence_id=f"process-exit:{boundary}:{task.id}",
+                evidence_sha256=hashlib.sha256(evidence_payload).hexdigest(),
+                validated_at=task.updated_at,
+            ),
+        )
+    )
+    return result.task
 
 
 async def _setup(root: Path) -> None:
@@ -288,7 +365,7 @@ async def _recover(root: Path, boundary: str) -> dict[str, str]:
     recovery_clock = datetime.now(UTC) + timedelta(days=1)
     app, dispatcher, sessions, tasks = _build_app(
         root,
-        task_clock=lambda: recovery_clock,
+        task_ownership_clock=lambda: recovery_clock,
     )
     try:
         source = await app.snapshot_fork_source(_SOURCE_SESSION_ID)
@@ -310,9 +387,39 @@ async def _recover(root: Path, boundary: str) -> dict[str, str]:
         if replayed.metadata["queue_task_id"] != state["queue_task_id"]:
             raise AssertionError("Fresh producer reconstruction changed queue identity.")
 
+        expired = await tasks.load_task(state["queue_task_id"])
+        if expired is None:
+            raise AssertionError("Fresh worker could not load the durable queue task.")
         reclaimed = await tasks.reclaim_expired(query=TaskQuery())
-        if [task.id for task in reclaimed] != [state["queue_task_id"]]:
-            raise AssertionError("Fresh worker did not reclaim the expired durable lease.")
+        if expired.started_at is None:
+            if [task.id for task in reclaimed] != [state["queue_task_id"]]:
+                raise AssertionError("Fresh worker did not reclaim the idle expired lease.")
+        elif reclaimed:
+            raise AssertionError("Fresh worker reclaimed dispatched work without quiescence proof.")
+
+        if boundary == "provider_completion":
+            recovery = await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=_CHILD_SESSION_ID,
+                    inactive_for_seconds=0,
+                    reason="Recover the durably completed provider operation.",
+                )
+            )
+            if recovery.status is not SessionStatus.INTERRUPTED:
+                raise AssertionError(
+                    "Provider-completion recovery did not interrupt the child session."
+                )
+
+        if expired.started_at is not None:
+            requested = await tasks.load_task(state["queue_task_id"])
+            if requested is None:
+                raise AssertionError("Expired dispatch disappeared before reconciliation.")
+            await _reconcile_expired_dispatch(
+                sessions,
+                tasks,
+                requested,
+                boundary=boundary,
+            )
 
         for ordinal in range(5):
             await dispatcher.process_next(
@@ -320,12 +427,20 @@ async def _recover(root: Path, boundary: str) -> dict[str, str]:
                 worker_id=f"recovery-{boundary}-{ordinal}",
             )
             task = await tasks.load_task(state["queue_task_id"])
-            if task is not None and task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            if task is not None and task.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
                 break
         task = await tasks.load_task(state["queue_task_id"])
         session = await sessions.load(_CHILD_SESSION_ID)
-        if task is None or task.status is not TaskStatus.COMPLETED:
-            raise AssertionError(f"Recovered task is not complete: {task!r}")
+        expected_task_status = TaskStatus.COMPLETED if boundary == "claim" else TaskStatus.CANCELLED
+        if task is None or task.status is not expected_task_status:
+            raise AssertionError(
+                "Recovered task has the wrong terminal status: "
+                f"expected {expected_task_status.value}, got {task!r}"
+            )
         expected_session_status = (
             SessionStatus.INTERRUPTED
             if boundary == "provider_completion"

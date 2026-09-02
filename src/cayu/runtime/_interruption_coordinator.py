@@ -3,14 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from math import isfinite
 from typing import Any, Protocol
 
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    restore_task_cancellation_requests,
+)
 from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -163,6 +168,7 @@ class _BackgroundInterruptionCascadeState:
     attempt_id: str
     generation: int
     claim_id: str
+    claim_deadline_monotonic: float
     reason: str | None
     metadata: dict[str, Any]
     requested_by: ResolutionActor | None
@@ -176,6 +182,13 @@ class _BackgroundInterruptionCascadeState:
     claim_lost: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+def _consume_background_interruption_store_task(task: asyncio.Task[Any]) -> None:
+    """Observe a store mutation retained past the local ownership deadline."""
+
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
 @dataclass(frozen=True)
 class _BackgroundInterruptionNode:
     state: _BackgroundInterruptionCascadeState
@@ -186,7 +199,7 @@ class _BackgroundInterruptionNode:
 @dataclass(frozen=True)
 class _DeferredBackgroundInterruption:
     interrupt_payload: dict[str, Any]
-    retry_at: datetime
+    retry_at_monotonic: float
     drain_required: bool
     retry_request: dict[str, Any] | None = None
 
@@ -433,7 +446,7 @@ class BackgroundInterruptionCoordinator:
             self.defer(
                 parent_session_id=parent_session_id,
                 interrupt_payload=interrupt_payload,
-                retry_at=self._clock(),
+                retry_after_seconds=0.0,
                 drain_required=True,
                 retry_request=retry_request,
             )
@@ -494,12 +507,13 @@ class BackgroundInterruptionCoordinator:
         *,
         parent_session_id: str,
         interrupt_payload: dict[str, Any],
-        retry_at: datetime,
+        retry_after_seconds: float,
         drain_required: bool,
         retry_request: dict[str, Any] | None,
     ) -> None:
         if self._draining and not drain_required:
             return
+        retry_at_monotonic = time.monotonic() + max(0.0, retry_after_seconds)
         existing = self._deferred.get(parent_session_id)
         if existing is None:
             self._deferred[parent_session_id] = _DeferredBackgroundInterruption(
@@ -507,14 +521,17 @@ class BackgroundInterruptionCoordinator:
                     interrupt_payload,
                     "interrupt_payload",
                 ),
-                retry_at=retry_at,
+                retry_at_monotonic=retry_at_monotonic,
                 drain_required=drain_required,
                 retry_request=_copy_interruption_cascade_retry_request(retry_request),
             )
         else:
             self._deferred[parent_session_id] = _DeferredBackgroundInterruption(
                 interrupt_payload=existing.interrupt_payload,
-                retry_at=min(existing.retry_at, retry_at),
+                retry_at_monotonic=min(
+                    existing.retry_at_monotonic,
+                    retry_at_monotonic,
+                ),
                 drain_required=existing.drain_required or drain_required,
                 retry_request=(
                     _copy_interruption_cascade_retry_request(retry_request)
@@ -533,7 +550,7 @@ class BackgroundInterruptionCoordinator:
         try:
             while self._deferred:
                 self._deferred_wakeup.clear()
-                now = self._clock()
+                now = time.monotonic()
                 available = max(
                     0,
                     _BACKGROUND_INTERRUPTION_CONCURRENCY - len(self._tasks),
@@ -542,9 +559,9 @@ class BackgroundInterruptionCoordinator:
                     (
                         (parent_session_id, deferred)
                         for parent_session_id, deferred in (self._deferred.items())
-                        if deferred.retry_at <= now
+                        if deferred.retry_at_monotonic <= now
                     ),
-                    key=lambda item: item[1].retry_at,
+                    key=lambda item: item[1].retry_at_monotonic,
                 )[:available]
                 for parent_session_id, deferred in due:
                     self._deferred.pop(parent_session_id, None)
@@ -562,8 +579,10 @@ class BackgroundInterruptionCoordinator:
                 if available == 0:
                     await self._deferred_wakeup.wait()
                     continue
-                next_retry_at = min(deferred.retry_at for deferred in self._deferred.values())
-                delay = max(0.0, (next_retry_at - self._clock()).total_seconds())
+                next_retry_at = min(
+                    deferred.retry_at_monotonic for deferred in self._deferred.values()
+                )
+                delay = max(0.0, next_retry_at - time.monotonic())
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         self._deferred_wakeup.wait(),
@@ -648,6 +667,7 @@ class BackgroundInterruptionCoordinator:
             )
             return
 
+        claim_started_monotonic = time.monotonic()
         if retry_request is None:
             marker = await self._claim_pending_interruption_cascade(
                 parent_session_id,
@@ -672,15 +692,29 @@ class BackgroundInterruptionCoordinator:
                 return
             if current_marker is None:
                 return
-            claim_expires_at = _interruption_cascade_marker_datetime(
-                current_marker,
-                "claim_expires_at",
-            )
-            retry_at = claim_expires_at if claim_expires_at is not None else self._clock()
             self.defer(
                 parent_session_id=parent_session_id,
                 interrupt_payload=current_marker["interrupt_payload"],
-                retry_at=retry_at,
+                # The marker's absolute expiry belongs to the session store's
+                # clock domain.  Poll the authoritative claim boundary at a
+                # bounded monotonic interval instead of comparing it with the
+                # worker's application clock.
+                retry_after_seconds=_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS,
+                drain_required=False,
+                retry_request=retry_request,
+            )
+            return
+        claim_deadline_monotonic = claim_started_monotonic + _BACKGROUND_INTERRUPTION_LEASE_SECONDS
+        remaining_claim_seconds = claim_deadline_monotonic - time.monotonic()
+        if remaining_claim_seconds <= 0:
+            # Claim publication may have committed long before its acknowledgement
+            # arrived.  Do not start descendant effects without enough positively
+            # known lease time. A short but positive remainder is renewed
+            # immediately by the heartbeat before its normal sleep interval.
+            self.defer(
+                parent_session_id=parent_session_id,
+                interrupt_payload=interrupt_payload,
+                retry_after_seconds=_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS,
                 drain_required=False,
                 retry_request=retry_request,
             )
@@ -690,6 +724,7 @@ class BackgroundInterruptionCoordinator:
             attempt_id=marker["attempt_id"],
             generation=marker["generation"],
             claim_id=marker["claim_id"],
+            claim_deadline_monotonic=claim_deadline_monotonic,
             reason=reason,
             metadata=copy_json_value(metadata, "metadata"),
             requested_by=requested_by,
@@ -874,40 +909,68 @@ class BackgroundInterruptionCoordinator:
         self,
         state: _BackgroundInterruptionCascadeState,
     ) -> None:
-        claim_expires_at = self._clock() + timedelta(seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS)
+        claim_deadline = state.claim_deadline_monotonic
         sleep_seconds = _BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS
         while True:
-            await asyncio.sleep(sleep_seconds)
-            try:
-                renewed = await self._renew_pending_interruption_cascade_claim(
+            remaining = claim_deadline - time.monotonic()
+            if remaining <= 0:
+                state.claim_lost.set()
+                return
+            await asyncio.sleep(sleep_seconds if remaining > sleep_seconds else 0)
+            renewal_started_monotonic = time.monotonic()
+
+            async def renew_claim() -> bool:
+                return await self._renew_pending_interruption_cascade_claim(
                     state.parent_session_id,
                     state.attempt_id,
                     state.generation,
                     state.claim_id,
                 )
+
+            renewal_task = asyncio.create_task(renew_claim())
+            try:
+                outcome = await await_shielded_task_outcome(
+                    renewal_task,
+                    timeout_s=max(0.0, claim_deadline - time.monotonic()),
+                )
             except asyncio.CancelledError:
+                renewal_task.add_done_callback(_consume_background_interruption_store_task)
                 raise
-            except Exception as exc:
+            if outcome.cancellation is not None:
+                renewal_task.add_done_callback(_consume_background_interruption_store_task)
+                raise outcome.cancellation
+            if outcome.timed_out:
+                renewal_task.add_done_callback(_consume_background_interruption_store_task)
+                state.claim_lost.set()
+                return
+            if outcome.error is not None:
+                if not isinstance(outcome.error, Exception):
+                    raise outcome.error
+                exc = outcome.error
                 logger.warning(
                     "Could not renew background interruption claim for parent %s: %s",
                     state.parent_session_id,
                     self._safe_exception_message(exc),
                 )
-                if self._clock() >= claim_expires_at:
+                now = time.monotonic()
+                if now >= claim_deadline:
                     state.claim_lost.set()
                     return
-                remaining = max(0.0, (claim_expires_at - self._clock()).total_seconds())
+                remaining = max(0.0, claim_deadline - now)
                 sleep_seconds = min(
                     _BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS,
                     remaining,
                 )
                 continue
+            renewed = outcome.result
             if not renewed:
                 state.claim_lost.set()
                 return
-            claim_expires_at = self._clock() + timedelta(
-                seconds=_BACKGROUND_INTERRUPTION_LEASE_SECONDS
-            )
+            claim_deadline = renewal_started_monotonic + _BACKGROUND_INTERRUPTION_LEASE_SECONDS
+            state.claim_deadline_monotonic = claim_deadline
+            if time.monotonic() >= claim_deadline:
+                state.claim_lost.set()
+                return
             sleep_seconds = _BACKGROUND_INTERRUPTION_HEARTBEAT_SECONDS
 
     def _enqueue_background_interruption_node(
@@ -975,10 +1038,64 @@ class BackgroundInterruptionCoordinator:
                 SessionStatus.INTERRUPTING,
             }
         ):
-            await self._interrupt_background_session(state, session)
+            await self._interrupt_background_session_while_claimed(state, session)
         if state.claim_lost.is_set():
             return
         await self._enqueue_background_descendants(state, node.session_id)
+
+    async def _interrupt_background_session_while_claimed(
+        self,
+        state: _BackgroundInterruptionCascadeState,
+        session: Session,
+    ) -> None:
+        """Stop one descendant operation when its cascade generation loses ownership."""
+
+        interruption_task = asyncio.create_task(
+            self._interrupt_background_session(state, session),
+            name="cayu-background-interruption-node",
+        )
+        claim_lost_task = asyncio.create_task(
+            state.claim_lost.wait(),
+            name="cayu-background-interruption-claim-loss",
+        )
+        retained_cancellation: asyncio.CancelledError | None = None
+        cancellation_requests_consumed = 0
+        try:
+            done, _pending = await asyncio.wait(
+                {interruption_task, claim_lost_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if interruption_task in done:
+                await interruption_task
+                return
+            interruption_task.cancel("Background interruption cascade ownership was lost.")
+            outcome = await await_shielded_task_outcome(interruption_task)
+            if outcome.cancellation is not None:
+                retained_cancellation = outcome.cancellation
+                cancellation_requests_consumed = outcome.cancellation_requests_consumed
+            if outcome.error is not None and not isinstance(
+                outcome.error,
+                asyncio.CancelledError,
+            ):
+                raise outcome.error
+            # Cancellation delivered by this branch is the expected cooperative
+            # stop signal. The claim-lost generation must not record it as a child
+            # interruption failure or enqueue more descendants.
+        except asyncio.CancelledError:
+            if not interruption_task.done():
+                interruption_task.cancel()
+            await asyncio.gather(interruption_task, return_exceptions=True)
+            raise
+        finally:
+            if not claim_lost_task.done():
+                claim_lost_task.cancel()
+            await asyncio.gather(claim_lost_task, return_exceptions=True)
+        if retained_cancellation is not None:
+            restore_task_cancellation_requests(
+                cancellation_requests_consumed,
+                cancellation=retained_cancellation,
+            )
+            raise retained_cancellation
 
     async def _interrupt_background_session(
         self,

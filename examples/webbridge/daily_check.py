@@ -25,6 +25,8 @@ from cayu import (
     TaskStatus,
     TaskStore,
     WebBridge,
+    complete_managed_task,
+    fail_managed_task,
     run_task_worker,
 )
 from cayu._validation import require_clean_nonblank
@@ -122,6 +124,7 @@ async def handle_daily_check(
                 session_id=session_id,
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 environment_name=environment_name,
                 messages=[
                     Message.text(
@@ -138,6 +141,8 @@ async def handle_daily_check(
         if app.task_store is None:
             raise RuntimeError("Daily check recovery requires the configured task store.")
         if task.status is TaskStatus.CLAIMED:
+            if task.lease_expires_at is None:
+                raise RuntimeError("Daily check task claim has no worker lease.")
             task = await app.task_store.attach_task(
                 task.id,
                 session_id=session_id,
@@ -147,6 +152,7 @@ async def handle_daily_check(
                     invocation=existing_session.invocation,
                 ),
                 worker_id=worker_id,
+                lease_expires_at=task.lease_expires_at,
             )
         handled, outcome = await _recover_existing_daily_check(
             app,
@@ -258,11 +264,10 @@ async def _settle_daily_task_from_terminal_session(
             "environment_name": session.environment_name,
         }
         try:
-            await task_store.complete_task(
-                current.id,
-                result,
-                worker_id=worker_id,
-            )
+            if worker_id is None:
+                await task_store.complete_task(current.id, result)
+            else:
+                await complete_managed_task(task_store, task, worker_id, result)
         except ValueError as conflict:
             settled = await task_store.load_task(current.id)
             if (
@@ -279,11 +284,10 @@ async def _settle_daily_task_from_terminal_session(
             "message": "The attached daily check session failed.",
         }
         try:
-            await task_store.fail_task(
-                current.id,
-                error,
-                worker_id=worker_id,
-            )
+            if worker_id is None:
+                await task_store.fail_task(current.id, error)
+            else:
+                await fail_managed_task(task_store, task, worker_id, error)
         except ValueError as conflict:
             settled = await task_store.load_task(current.id)
             if (

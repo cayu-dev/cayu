@@ -68,7 +68,11 @@ def test_asynchronous_session_forks_recover_in_fresh_processes() -> None:
         "provider_completion": "interrupted",
         "terminal_publication": "completed",
     }
-    assert result.task_statuses == {boundary: "completed" for boundary in result.boundaries}
+    assert result.task_statuses == {
+        "claim": "completed",
+        "provider_completion": "cancelled",
+        "terminal_publication": "cancelled",
+    }
     assert result.provider_calls == {
         boundary: {"child": 1, "source": 1} for boundary in result.boundaries
     }

@@ -47,7 +47,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without 
         'Install them with `pip install "cayu[postgres]"`.'
     ) from exc
 
-from cayu._clock import utc_clock
+from cayu._clock import normalize_utc_datetime, utc_clock, utc_duration_cutoff
 from cayu._validation import (
     EXECUTION_UNIT_ID_MAX_CHARS,
     MAX_DURABLE_JSON_INTEGER,
@@ -107,6 +107,7 @@ from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
 from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
+from cayu.runtime._task_lease_authority import managed_task_lease_mutation
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
@@ -290,6 +291,8 @@ from cayu.runtime.sessions import (
     SessionTopologyDepthExceeded,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
+    StoreTimeCheckpointTransform,
+    StoreTimeSessionOperationTransform,
     TerminalPublicationMarker,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
@@ -339,10 +342,10 @@ from cayu.runtime.sessions import (
     _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
+    _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_checkpoint,
     _initial_transcript_prefix_count,
     _interaction_transition_receipt_record,
-    _interaction_transition_recovery_claim_observed_at,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
     _invocation_terminal_event_receipt_record,
@@ -392,6 +395,7 @@ from cayu.runtime.sessions import (
     _require_invocation_release_recovery_claim,
     _require_invocation_release_settlement_record,
     _require_invocation_release_terminal_session_event,
+    _require_live_incomplete_recovery_claim_for_run_epoch_transfer,
     _run_session_commit_guard_owned,
     _runtime_publication_json_equal,
     _runtime_publication_receipt_record,
@@ -408,11 +412,12 @@ from cayu.runtime.sessions import (
     _validate_equivalent_queued_session_message,
     _validate_execution_profile_admission,
     _validate_execution_profile_rejection_session,
+    _validate_inactive_for_seconds,
     _validate_interaction_page,
     _validate_interaction_transition_invocation_authority_parameters,
     _validate_interaction_transition_receipt_authority,
     _validate_interaction_transition_receipt_recovery_authority,
-    _validate_interaction_transition_recovery_claim_parameters,
+    _validate_interaction_transition_recovery_claim_id,
     _validate_invocation_release_settlement_receipt_authority,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
@@ -543,9 +548,12 @@ from cayu.runtime.tasks import (
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_claim_query_supported,
+    _ensure_exact_owned_active_task_lease,
     _ensure_owned_active_task_lease,
     _ensure_retry_series_queue_attempt,
     _ensure_task_handoff_authority,
+    _ensure_task_terminalization_lease_authority,
+    _expired_dispatched_task_cancellation,
     _expired_task_retry_settlement,
     _interrupted_task_continuation_handoff_id_sha256,
     _raise_task_claim_attach_error,
@@ -12156,11 +12164,20 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             schema_mode=schema_mode,
         )
         self._clock = utc_clock(clock)
+        self._clock_is_injected = clock is not None
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
 
     @property
     def reservation_ttl_seconds(self) -> int | None:
         return self._reservation_ttl_seconds
+
+    @staticmethod
+    async def _budget_database_now(cur: Any) -> datetime:
+        await cur.execute("SELECT clock_timestamp()")
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL did not return authoritative budget time.")
+        return pg_support.to_utc(row[0])
 
     async def claim_reservation_identity(
         self,
@@ -12260,7 +12277,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         "SELECT pg_advisory_xact_lock(%s)",
                         (_budget_advisory_lock_key(limit),),
                     )
-                    now = self._clock()
+                    reap_now = await self._budget_database_now(cur)
+                    await self._reap_expired(cur, reap_now, limit=limit)
+                    # Reaping can wait behind a heartbeat or settlement that owns
+                    # an existing reservation row.  Stamp the replacement from a
+                    # fresh database observation after that wait so a newly
+                    # accepted reservation receives its full configured TTL.
+                    now = await self._budget_database_now(cur)
+                    accounting_now = self._clock() if self._clock_is_injected else now
                     durable_settlement_fallback = (
                         BudgetSettlementFallback(
                             settled_at=now,
@@ -12274,7 +12298,9 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         else copy_budget_settlement_fallback(settlement_fallback)
                     )
                     pricing_effective_at = (
-                        now if effective_at is None else _utc_datetime(effective_at, "effective_at")
+                        accounting_now
+                        if effective_at is None
+                        else _utc_datetime(effective_at, "effective_at")
                     )
                     requested = (
                         _budget_reservation_amount(
@@ -12287,8 +12313,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         if requested_amount is None
                         else _validate_amount(requested_amount, "requested_amount")
                     )
-                    await self._reap_expired(cur, now, limit=limit)
-                    current = await self._used_amount(cur, limit, now=now)
+                    current = await self._used_amount(cur, limit, now=accounting_now)
                     projected = current + requested
                     if projected > limit.max_estimated_cost:
                         # Reaping is an independent terminal transition with
@@ -12361,7 +12386,9 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     ) -> tuple[BudgetReservationRecord, ...]:
         reservation_ids = _validate_reservation_id_batch(reservation_ids)
         dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
-        marked_at = pg_support.to_utc(dispatched_at) if dispatched_at is not None else self._clock()
+        supplied_dispatched_at = (
+            pg_support.to_utc(dispatched_at) if dispatched_at is not None else None
+        )
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -12376,6 +12403,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                     records = tuple(
                         records_by_id[reservation_id] for reservation_id in reservation_ids
                     )
+                    now = await self._budget_database_now(cur)
+                    marked_at = now if supplied_dispatched_at is None else supplied_dispatched_at
                     for record in records:
                         if record.dispatch_id is not None and record.dispatch_id != dispatch_id:
                             raise ValueError(
@@ -12385,6 +12414,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         if record.dispatch_id is None and record.status != "active":
                             raise ValueError(
                                 f"Budget reservation is not active: {record.reservation_id}"
+                            )
+                        if record.dispatch_id is None and _reservation_is_expired(
+                            record,
+                            now=now,
+                            ttl_seconds=self._reservation_ttl_seconds,
+                        ):
+                            raise ValueError(
+                                f"Budget reservation has expired: {record.reservation_id}"
                             )
                     dispatched_records = tuple(
                         (
@@ -12473,7 +12510,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             try:
                 async with conn.cursor() as cur:
                     record = await self._load_record(cur, reservation_id)
-                    now = self._clock()
+                    now = await self._budget_database_now(cur)
                     if record.status != "active" or _reservation_is_expired(
                         record,
                         now=now,
@@ -12696,7 +12733,9 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     ) -> None:
         if self._reservation_ttl_seconds is None:
             return
-        cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
+        cutoff = utc_duration_cutoff(now, self._reservation_ttl_seconds)
+        if cutoff is None:
+            return
         await cur.execute(
             """
             SELECT reservation_id
@@ -12721,7 +12760,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                     record.settlement_fallback.expiration_reason
                     or _expired_reservation_reason(self._reservation_ttl_seconds)
                 ),
-                updated_at=record.settlement_fallback.settled_at,
+                updated_at=now,
             )
             reconciliation = _reconciliation_from_record(
                 released,
@@ -23785,6 +23824,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
         return self._public_authority_alias_codec
 
+    @staticmethod
+    async def _session_store_now(cur: Any) -> datetime:
+        await cur.execute("SELECT clock_timestamp()")
+        row = await cur.fetchone()
+        if row is None or type(row[0]) is not datetime:
+            raise RuntimeError("Postgres did not return authoritative session-store time.")
+        return pg_support.to_utc(row[0])
+
     async def register_public_authority_alias(
         self,
         public_alias: str,
@@ -24064,7 +24111,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     cur,
                                     reused_event,
                                     expected_run_epoch=expected_run_epoch,
-                                    activity_at=reused_event.timestamp,
                                 )
                             )
                             continue
@@ -24147,7 +24193,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         session_id,
                         new_events,
                         expected_run_epoch=expected_run_epoch,
-                        activity_at=datetime.now(UTC),
                     )
                 await conn.commit()
             except BaseException:
@@ -24319,7 +24364,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             cur,
                             event,
                             expected_run_epoch=request.expected_run_epoch,
-                            activity_at=observed_at,
                         )
                         validate_targeted_tool_unresolved_rejection_evidence(
                             request,
@@ -24401,7 +24445,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                         cur,
                                         expiry_event,
                                         expected_run_epoch=request.expected_run_epoch,
-                                        activity_at=observed_at,
                                     )
                                     validate_targeted_tool_grant_lifecycle_event(
                                         record,
@@ -24422,7 +24465,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     cur,
                                     rejection_event,
                                     expected_run_epoch=request.expected_run_epoch,
-                                    activity_at=observed_at,
                                 )
                                 validate_targeted_tool_use_rejection_evidence(
                                     record,
@@ -24534,7 +24576,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                             cur,
                                             rejoined_event,
                                             expected_run_epoch=request.expected_run_epoch,
-                                            activity_at=observed_at,
                                         )
                                         result = TargetedToolUseResult(
                                             disposition=TargetedToolUseDisposition.REJOINED,
@@ -24617,7 +24658,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                         request.session_id,
                                         [new_event],
                                         expected_run_epoch=request.expected_run_epoch,
-                                        activity_at=observed_at,
                                     )
                 await conn.commit()
             except BaseException:
@@ -24786,7 +24826,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     session_id,
                                     [event],
                                     expected_run_epoch=expected_run_epoch,
-                                    activity_at=revoked_at,
                                 )
                 await conn.commit()
             except BaseException:
@@ -24929,7 +24968,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                         rejection_reason=reason,
                                     ),
                                     expected_run_epoch=expected_run_epoch,
-                                    activity_at=observed_at,
                                 )
                                 validate_targeted_tool_grant_lifecycle_event(
                                     record,
@@ -24952,7 +24990,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             cur,
                             event,
                             expected_run_epoch=expected_run_epoch,
-                            activity_at=observed_at,
                         )
                         validate_targeted_tool_grant_lifecycle_event(
                             record,
@@ -25389,7 +25426,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
         await self._ensure_ready()
-        now = datetime.now(UTC)
         session_id = request.session_id if request.session_id is not None else _new_id()
         if request.parent_session_id == session_id:
             raise ValueError("Session cannot be its own parent.")
@@ -25403,6 +25439,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if request.parent_session_id is not None and parent_session is None:
                         raise ValueError(f"Parent session not found: {request.parent_session_id}")
+                    now = await self._session_store_now(cur)
                     session = Session(
                         id=session_id,
                         instance_id=session_instance_id_for_run_request(
@@ -25943,7 +25980,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if events:
                         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
-                        activity_at = datetime.now(UTC)
+                        activity_at = await self._session_store_now(cur)
                         await cur.execute(
                             "UPDATE cayu_sessions SET event_seq = %s, last_activity_at = %s "
                             "WHERE id = %s",
@@ -26698,7 +26735,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             _durable_subagent_parent_delete_block_reason(durable_child[0])
                         )
                     checkpoint = await self._load_checkpoint(cur, session_id)
-                    deletion_now = datetime.now(UTC)
+                    deletion_now = await self._session_store_now(cur)
                     active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
                         checkpoint,
                         now=deletion_now,
@@ -26754,7 +26791,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             f"{active_operation_id} is active: {session_id}"
                         )
                     completion_result_publication_block = (
-                        _completion_result_event_publication_delete_block_reason(checkpoint)
+                        _completion_result_event_publication_delete_block_reason(
+                            checkpoint,
+                            now=deletion_now,
+                        )
                     )
                     if completion_result_publication_block is not None:
                         raise ValueError(
@@ -26819,10 +26859,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         new_labels = copy_label_map(labels, "labels", allow_reserved=False)
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._connection() as conn:
             async with conn.cursor() as cur:
+                if await self._load_for_update(cur, session_id) is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                updated_at = await self._session_store_now(cur)
                 if expected_run_epoch is None:
                     await cur.execute(
                         "UPDATE cayu_sessions SET updated_at = %s WHERE id = %s",
@@ -26867,7 +26909,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         user_metadata = copy_session_user_metadata(metadata)
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
@@ -26879,6 +26920,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if row is None:
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch_value(session_id, row[0])
+                    updated_at = await self._session_store_now(cur)
                     new_metadata = replace_session_user_metadata(_json_obj(row[1]), user_metadata)
                     await cur.execute(
                         "UPDATE cayu_sessions SET metadata = %s, updated_at = %s WHERE id = %s",
@@ -26913,10 +26955,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         expected_run_epoch = _current_session_run_epoch(session_id)
         async with self._connection() as conn:
             async with conn.cursor() as cur:
+                if await self._load_for_update(cur, session_id) is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                updated_at = await self._session_store_now(cur)
                 params: list[object] = [
                     str(to_status),
                     updated_at,
@@ -26950,6 +26994,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
+                if to_status is SessionStatus.RUNNING:
+                    _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                        await self._load_checkpoint(cur, session_id),
+                        now=updated_at,
+                    )
                 loaded = await self._load(cur, session_id)
             await conn.commit()
             if loaded is None:
@@ -26964,7 +27013,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: CheckpointTransform | None = None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         result_checkpoint_transform: CheckpointTransform | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
@@ -26982,8 +27032,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
-        if checkpoint_transform is None:
-            raise TypeError("checkpoint_transform is required.")
+        if (checkpoint_transform is None) == (store_time_checkpoint_transform is None):
+            raise TypeError("Exactly one checkpoint transform is required.")
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
         admission = _copy_transition_interaction_admission(
@@ -27016,13 +27066,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, loaded)
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
@@ -27067,13 +27117,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
 
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
-                    transformed_checkpoint = checkpoint_transform(
-                        loaded,
-                        _copy_checkpoint_for_transform(
+                    if to_status is SessionStatus.RUNNING:
+                        _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
                             current_checkpoint,
-                            session_id=session_id,
-                        ),
+                            now=updated_at,
+                        )
+                    checkpoint_copy = _copy_checkpoint_for_transform(
+                        current_checkpoint,
+                        session_id=session_id,
                     )
+                    if store_time_checkpoint_transform is not None:
+                        transformed_checkpoint = store_time_checkpoint_transform(
+                            loaded,
+                            checkpoint_copy,
+                            updated_at,
+                        )
+                    else:
+                        assert checkpoint_transform is not None
+                        transformed_checkpoint = checkpoint_transform(
+                            loaded,
+                            checkpoint_copy,
+                        )
                     if transformed_checkpoint is not None:
                         transformed_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
                             current_checkpoint,
@@ -27409,7 +27473,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await conn.commit()
                         return ExecutionProfileRejectionResult(event=existing, replayed=True)
 
-                    activity_at = datetime.now(UTC)
+                    activity_at = await self._session_store_now(cur)
                     await cur.execute(
                         "UPDATE cayu_sessions "
                         "SET event_seq = event_seq + 1, last_activity_at = %s "
@@ -27481,7 +27545,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if not isinstance(to_status, SessionStatus):
             raise ValueError("to_status must be a SessionStatus.")
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
@@ -27489,6 +27552,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch(session_id, loaded)
+                    updated_at = await self._session_store_now(cur)
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
@@ -27542,7 +27606,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_active_invocation_profile: ActiveInvocationExecutionProfile | None = None,
         expected_invocation_authority_state: Literal["active", "released"] = "active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock: Callable[[], datetime] | None = None,
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -27553,11 +27616,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 expected_invocation_authority_state=expected_invocation_authority_state,
             )
         )
-        expected_recovery_claim_id, expected_recovery_claim_clock = (
-            _validate_interaction_transition_recovery_claim_parameters(
-                expected_recovery_claim_id=expected_recovery_claim_id,
-                expected_recovery_claim_clock=expected_recovery_claim_clock,
-            )
+        expected_recovery_claim_id = _validate_interaction_transition_recovery_claim_id(
+            expected_recovery_claim_id
         )
 
         session_id, transition = _prepare_interaction_transition(
@@ -27628,19 +27688,20 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Interaction transition event exists without its immutable receipt."
                         )
-                    if expected_recovery_claim_id is not None:
-                        assert expected_recovery_claim_clock is not None
-                        checkpoint = await self._load_checkpoint(cur, session_id)
-                        active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
-                            checkpoint,
-                            now=_interaction_transition_recovery_claim_observed_at(
-                                expected_recovery_claim_clock
-                            ),
-                        )
-                        if active_recovery_claim_id != expected_recovery_claim_id:
+                    checkpoint = await self._load_checkpoint(cur, session_id)
+                    active_recovery_claim_id = _active_unexpired_incomplete_recovery_claim_id(
+                        checkpoint,
+                        now=await self._session_store_now(cur),
+                    )
+                    if expected_recovery_claim_id is None:
+                        if active_recovery_claim_id is not None:
                             raise SessionRunFenced(
-                                "Interaction transition lost its exact terminal recovery claim."
+                                "Interaction transition is owned by another terminal recovery claim."
                             )
+                    elif active_recovery_claim_id != expected_recovery_claim_id:
+                        raise SessionRunFenced(
+                            "Interaction transition lost its exact terminal recovery claim."
+                        )
                     if expected_active_invocation_profile is not None:
                         from cayu.runtime._invocation_lifecycle import (
                             require_invocation_command_authority,
@@ -27683,7 +27744,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             (session_id,),
                         )
                         queued = await cur.fetchone() is not None
-                    updated_at = datetime.now(UTC)
+                    updated_at = await self._session_store_now(cur)
                     settlement_record = None
                     settlement_storage_key = None
                     if settlement_request is not None:
@@ -28021,31 +28082,38 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         *,
         statuses: set[SessionStatus],
-        inactive_before: datetime,
+        inactive_for_seconds: int,
     ) -> Session | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(statuses, "statuses")
-        if inactive_before.tzinfo is None or inactive_before.utcoffset() is None:
-            raise ValueError("inactive_before must be timezone-aware.")
+        validated_inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
+        assert validated_inactive_for_seconds is not None
         await self._ensure_ready()
-        now = datetime.now(UTC)
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    checkpoint = await self._load_checkpoint(cur, session_id)
+                    now = await self._session_store_now(cur)
                     if (
                         active_provider_operation_cancellation_claim_from_checkpoint(
-                            await self._load_checkpoint(cur, session_id),
+                            checkpoint,
                             now=now,
                         )
                         is not None
+                        or _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None
                     ):
                         await conn.commit()
                         return None
+                    inactive_before = utc_duration_cutoff(
+                        now,
+                        validated_inactive_for_seconds,
+                    )
                     if (
-                        loaded.status not in allowed_statuses
+                        inactive_before is None
+                        or loaded.status not in allowed_statuses
                         or loaded.last_activity_at > inactive_before
                     ):
                         await conn.commit()
@@ -28065,6 +28133,72 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             _activate_session_run_fence(loaded)
             return loaded
 
+    async def reserve_stalled_run_recovery(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_for_seconds: int | None,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> Session | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        allowed_statuses = _validate_status_set(statuses, "statuses")
+        inactive_for_seconds = _validate_inactive_for_seconds(inactive_for_seconds)
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    current = await self._load_checkpoint(cur, session_id)
+                    now = await self._session_store_now(cur)
+                    inactive_before = (
+                        None
+                        if inactive_for_seconds is None
+                        else utc_duration_cutoff(now, inactive_for_seconds)
+                    )
+                    if (
+                        loaded.status not in allowed_statuses
+                        or (
+                            inactive_for_seconds is not None
+                            and (
+                                inactive_before is None or loaded.last_activity_at > inactive_before
+                            )
+                        )
+                        or active_provider_operation_cancellation_claim_from_checkpoint(
+                            current,
+                            now=now,
+                        )
+                        is not None
+                    ):
+                        await conn.commit()
+                        return None
+                    transformed = checkpoint_transform(
+                        loaded,
+                        _copy_checkpoint_for_transform(
+                            current,
+                            session_id=session_id,
+                        ),
+                        now,
+                    )
+                    if transformed is None:
+                        await conn.commit()
+                        return None
+                    transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current,
+                        transformed,
+                        session_id=session_id,
+                    )
+                    await self._upsert_checkpoint(cur, session_id, transformed, now)
+                await conn.commit()
+                return loaded
+            except BaseException:
+                await conn.rollback()
+                raise
+
     async def fence_run_and_transform_checkpoint(
         self,
         session_id: str,
@@ -28080,18 +28214,22 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if result_checkpoint_transform is not None and not callable(result_checkpoint_transform):
             raise TypeError("result_checkpoint_transform must be callable.")
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    updated_at = await self._session_store_now(cur)
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             f"Session status cannot be fenced: {loaded.status}"
                         )
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
+                    _require_live_incomplete_recovery_claim_for_run_epoch_transfer(
+                        current_checkpoint,
+                        now=updated_at,
+                    )
                     if (
                         active_provider_operation_cancellation_claim_from_checkpoint(
                             current_checkpoint,
@@ -28468,12 +28606,22 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         events: Sequence[Event],
         *,
         expected_run_epoch: int | None,
-        activity_at: datetime,
     ) -> None:
         """Append events and their delivery outbox rows in the caller's transaction."""
 
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
+        # Serialize with every competing session writer before sampling the
+        # liveness timestamp. Sampling database time before this row lock can
+        # backdate activity by the duration of a blocked write and let recovery
+        # steal a run earlier than the configured inactivity duration.
+        await cur.execute(
+            "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
+            (session_id,),
+        )
+        if await cur.fetchone() is None:
+            raise KeyError(f"Session not found: {session_id}")
+        activity_at = await self._session_store_now(cur)
         if expected_run_epoch is None:
             await cur.execute(
                 "UPDATE cayu_sessions SET event_seq = event_seq + %s, "
@@ -28582,7 +28730,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         event: Event,
         *,
         expected_run_epoch: int,
-        activity_at: datetime,
     ) -> Event:
         """Return existing exact evidence or append it in the caller's transaction."""
 
@@ -28598,7 +28745,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             event.session_id,
             [event],
             expected_run_epoch=expected_run_epoch,
-            activity_at=activity_at,
         )
         return event
 
@@ -28615,7 +28761,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         session_id,
                         copied_events,
                         expected_run_epoch=expected_run_epoch,
-                        activity_at=datetime.now(UTC),
                     )
                 await conn.commit()
             except UniqueViolation as exc:
@@ -28660,7 +28805,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    activity_at = datetime.now(UTC)
+                    if await self._load_for_update(cur, session_id) is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    activity_at = await self._session_store_now(cur)
                     if expected_run_epoch is None:
                         await cur.execute(
                             """
@@ -28851,7 +28998,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         baseline_updates=updates,
                         events=copied_events,
                     )
-                    activity_at = datetime.now(UTC)
+                    if await self._load_for_update(cur, session_id) is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    activity_at = await self._session_store_now(cur)
                     if expected_run_epoch is None:
                         await cur.execute(
                             """
@@ -29358,7 +29507,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Session messages may be enqueued only while a session is pending or running."
                         )
                     transcript_cursor = await _transcript_cursor(cur, request.session_id)
-                    accepted_at = datetime.now(UTC)
+                    accepted_at = await self._session_store_now(cur)
                     queue_id = str(uuid4())
                     accepted_event_id = str(uuid4())
                     await cur.execute(
@@ -29653,7 +29802,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     if interaction_started_event is None
                                     else _dumps(interaction_started_event.model_dump(mode="json"))
                                 ),
-                                datetime.now(UTC),
+                                await self._session_store_now(cur),
                             ),
                         )
                         await conn.commit()
@@ -29664,7 +29813,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             has_more=False,
                         )
                     transcript_cursor = await _transcript_cursor(cur, session_id)
-                    delivered_at = datetime.now(UTC)
+                    delivered_at = await self._session_store_now(cur)
                     updated_messages: list[SessionQueuedMessage] = []
                     delivery_events: list[Event] = []
                     transcript_messages: list[Message] = []
@@ -29886,7 +30035,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             checkpoint_transform=checkpoint_transform,
             operation_idempotency_key=None,
             operation_transform=None,
+            store_time_operation_transform=None,
             operation_commit_guard=None,
+            operation_commit_time_guard=None,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -29898,15 +30049,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         self,
         session_id: str,
         *,
-        checkpoint_transform: CheckpointTransform,
+        checkpoint_transform: StoreTimeCheckpointTransform,
         events: list[Event],
     ) -> Session:
         return await self._publish_checkpoint_and_events(
             session_id,
-            checkpoint_transform=checkpoint_transform,
+            checkpoint_transform=None,
+            store_time_checkpoint_transform=checkpoint_transform,
             operation_idempotency_key=None,
             operation_transform=None,
+            store_time_operation_transform=None,
             operation_commit_guard=None,
+            operation_commit_time_guard=None,
             events=events,
             expected_statuses=None,
             expected_run_epoch=None,
@@ -31444,7 +31598,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 "idempotency_key",
             ),
             operation_transform=operation_transform,
+            store_time_operation_transform=None,
             operation_commit_guard=None,
+            operation_commit_time_guard=None,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -31472,7 +31628,40 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 "idempotency_key",
             ),
             operation_transform=operation_transform,
+            store_time_operation_transform=None,
             operation_commit_guard=commit_guard,
+            operation_commit_time_guard=None,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
+        )
+
+    async def publish_session_operation_guarded_with_store_time(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str,
+        operation_transform: StoreTimeSessionOperationTransform,
+        commit_guard: Callable[[], None],
+        commit_time_guard: Callable[[datetime], None],
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None = None,
+        expected_run_epoch: int | None = None,
+        expected_transcript_cursor: int | None = None,
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=None,
+            operation_idempotency_key=require_clean_nonblank(
+                idempotency_key,
+                "idempotency_key",
+            ),
+            operation_transform=None,
+            store_time_operation_transform=operation_transform,
+            operation_commit_guard=commit_guard,
+            operation_commit_time_guard=commit_time_guard,
             events=events,
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
@@ -31485,9 +31674,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         *,
         checkpoint_transform: CheckpointTransform | None,
+        store_time_checkpoint_transform: StoreTimeCheckpointTransform | None = None,
         operation_idempotency_key: str | None,
         operation_transform: SessionOperationTransform | None,
+        store_time_operation_transform: StoreTimeSessionOperationTransform | None,
         operation_commit_guard: Callable[[], None] | None,
+        operation_commit_time_guard: Callable[[datetime], None] | None,
         events: list[Event],
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
@@ -31497,16 +31689,26 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
         session_id, copied_events = _copy_session_event_batch(session_id, events)
-        if (checkpoint_transform is None) == (operation_transform is None):
+        transform_count = sum(
+            transform is not None
+            for transform in (
+                checkpoint_transform,
+                store_time_checkpoint_transform,
+                operation_transform,
+                store_time_operation_transform,
+            )
+        )
+        if transform_count != 1:
             raise TypeError("Exactly one checkpoint publication transform is required.")
-        if operation_transform is not None and operation_idempotency_key is None:
+        if (
+            operation_transform is not None or store_time_operation_transform is not None
+        ) and operation_idempotency_key is None:
             raise TypeError("operation_idempotency_key is required.")
         allowed_statuses = (
             None
             if expected_statuses is None
             else _validate_status_set(expected_statuses, "expected_statuses")
         )
-        updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._connection() as conn:
             commit_guard_signal: BaseException | None = None
@@ -31515,6 +31717,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, loaded)
                     if allowed_statuses is not None and loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
@@ -31542,7 +31745,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     operation_records: dict[str, dict[str, Any]] = {}
                     model_completion_stage_release = None
-                    if operation_transform is not None:
+                    if (
+                        operation_transform is not None
+                        or store_time_operation_transform is not None
+                    ):
                         await cur.execute(
                             "SELECT record FROM cayu_session_operations "
                             "WHERE session_id = %s AND idempotency_key = %s",
@@ -31552,11 +31758,20 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         current_operation = (
                             None if operation_row is None else _json_obj(operation_row[0])
                         )
-                        publication = operation_transform(
-                            loaded,
-                            callback_checkpoint,
-                            current_operation,
-                        )
+                        if operation_transform is not None:
+                            publication = operation_transform(
+                                loaded,
+                                callback_checkpoint,
+                                current_operation,
+                            )
+                        else:
+                            assert store_time_operation_transform is not None
+                            publication = store_time_operation_transform(
+                                loaded,
+                                callback_checkpoint,
+                                current_operation,
+                                updated_at,
+                            )
                         if type(publication) is not SessionOperationPublication:
                             raise TypeError(
                                 "Session operation transform must return a "
@@ -31578,8 +31793,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         model_completion_stage_release = publication.model_completion_stage_release
                         _validate_session_operation_record_keys(operation_records)
                     else:
-                        assert checkpoint_transform is not None
-                        transformed = checkpoint_transform(loaded, callback_checkpoint)
+                        if checkpoint_transform is not None:
+                            transformed = checkpoint_transform(loaded, callback_checkpoint)
+                        else:
+                            assert store_time_checkpoint_transform is not None
+                            transformed = store_time_checkpoint_transform(
+                                loaded,
+                                callback_checkpoint,
+                                updated_at,
+                            )
                         if transformed is None:
                             raise ValueError("Checkpoint transform must return a checkpoint.")
                         transformed = copy_durable_json_object(transformed, "checkpoint")
@@ -31730,6 +31952,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         commit_guard_signal = await _run_session_commit_guard_owned(
                             operation_commit_guard
                         )
+                    activity_at = (
+                        await self._session_store_now(cur)
+                        if operation_commit_guard is not None
+                        else updated_at
+                    )
+                    if operation_commit_time_guard is not None:
+                        activity_at = await self._session_store_now(cur)
+                        operation_commit_time_guard(activity_at)
+                    if activity_at != updated_at:
+                        await cur.execute(
+                            "UPDATE cayu_sessions SET last_activity_at = %s WHERE id = %s",
+                            (activity_at, session_id),
+                        )
                 await conn.commit()
                 if commit_guard_signal is not None:
                     raise commit_guard_signal
@@ -31752,7 +31987,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     raise commit_guard_signal from error
                 raise
             return loaded.model_copy(
-                update={"updated_at": updated_at, "last_activity_at": updated_at}
+                update={"updated_at": updated_at, "last_activity_at": activity_at}
             )
 
     async def load_events(self, session_id: str) -> list[Event]:
@@ -34021,10 +34256,34 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             if pending_interruption_cascade_only
             else "cayu_sessions"
         )
-        plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
-
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
+            inactive_before = query.last_activity_before
+            if query.inactive_for_seconds is not None:
+                await cur.execute("SELECT clock_timestamp()")
+                now_row = await cur.fetchone()
+                if now_row is None or type(now_row[0]) is not datetime:
+                    raise RuntimeError("Postgres did not return authoritative store time.")
+                inactive_before = utc_duration_cutoff(
+                    now_row[0],
+                    query.inactive_for_seconds,
+                )
+                if inactive_before is None:
+                    return SessionListResult(
+                        sessions=[],
+                        next_cursor=None,
+                        total_count=0 if query.include_total_count else None,
+                    )
+            resolved_query = query.model_copy(
+                update={
+                    "last_activity_before": inactive_before,
+                    "inactive_for_seconds": None,
+                }
+            )
+            plan = session_store_sql.build_session_query_sql(
+                resolved_query,
+                dialect=_SQL_DIALECT,
+            )
             # Interpolations are trusted: SESSION_COLUMNS is a constant, order_sql is
             # an enum-derived literal, the clauses are hard-coded; values bind via %s.
             total_count: int | None = None
@@ -34083,7 +34342,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+                await cur.execute(
+                    "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                    (session_id,),
+                )
                 if await cur.fetchone() is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if copied_messages:
@@ -34092,7 +34354,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         session_id,
                         interaction_ids=(() if interaction_id is None else (interaction_id,)),
                     )
-                    await _touch_session_activity(cur, session_id, datetime.now(UTC))
+                    await _touch_session_activity(
+                        cur,
+                        session_id,
+                        await self._session_store_now(cur),
+                    )
                     await cur.executemany(
                         """
                         INSERT INTO cayu_transcript_messages
@@ -34128,7 +34394,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             raise ValueError("Initial transcript publication requires an interaction identity.")
         expected = copy_transcript_messages(expected_messages)
         replacement = copy_transcript_messages(replacement_messages)
-        updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
@@ -34136,6 +34401,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     session = await self._load_for_update(cur, session_id)
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, session)
                     await cur.execute(
                         "SELECT interaction_id, source_messages "
@@ -34282,7 +34548,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
                         (session_id,),
                     )
-                    await _touch_session_activity(cur, session_id, datetime.now(UTC))
+                    await _touch_session_activity(
+                        cur,
+                        session_id,
+                        await self._session_store_now(cur),
+                    )
                 await conn.commit()
                 return True
             except Exception:
@@ -34321,7 +34591,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         copied_messages = copy_transcript_messages(messages)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
-        updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
@@ -34329,6 +34598,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     session = await self._load_for_update(cur, session_id)
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, session)
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
@@ -34695,12 +34965,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if not isinstance(state, dict):
             raise ValueError("Checkpoint state must be a dictionary.")
         copied = copy_durable_json_object(state, "checkpoint")
-        updated_at = datetime.now(UTC)
         await self._ensure_ready()
         async with self._connection() as conn:
             async with conn.cursor() as cur:
                 if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
+                updated_at = await self._session_store_now(cur)
                 replacement = _replace_checkpoint_preserving_completion_result_event_publications(
                     await self._load_checkpoint(cur, session_id),
                     copied,
@@ -34719,13 +34989,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
         await self._ensure_ready()
-        updated_at = datetime.now(UTC)
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     session = await self._load_for_update(cur, session_id)
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, session)
                     current = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
@@ -34744,6 +35014,44 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
                 await conn.commit()
             except Exception:
+                await conn.rollback()
+                raise
+
+    async def transform_checkpoint_with_store_time(
+        self,
+        session_id: str,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+    ) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint_transform is None:
+            raise TypeError("checkpoint_transform is required.")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, session)
+                    current = await self._load_checkpoint(cur, session_id)
+                    now = await self._session_store_now(cur)
+                    transformed = checkpoint_transform(
+                        session,
+                        _copy_checkpoint_for_transform(current, session_id=session_id),
+                        now,
+                    )
+                    if transformed is not None:
+                        transformed = (
+                            _replace_checkpoint_preserving_completion_result_event_publications(
+                                current,
+                                copy_durable_json_object(transformed, "checkpoint"),
+                                session_id=session_id,
+                            )
+                        )
+                        await _touch_session_activity(cur, session_id, now)
+                        await self._upsert_checkpoint(cur, session_id, transformed, now)
+                await conn.commit()
+            except BaseException:
                 await conn.rollback()
                 raise
 
@@ -35421,10 +35729,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 raise LocalExecutionAttemptConflict(
                     "Local execution start has no prepared attempt."
                 )
-            now = await self._database_now(cur)
+            authority_task = None
             if record.start is None:
+                authority_task = await self._load_task_locked(
+                    cur,
+                    record.authority.task_id,
+                )
+            now = await self._database_now(cur)
+            if authority_task is not None:
                 require_local_execution_task_authority(
-                    await self._load_task_locked(cur, record.authority.task_id),
+                    authority_task,
                     record.authority,
                     now=now,
                 )
@@ -35598,7 +35912,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         async def operation(conn: Any, cur: Any) -> tuple[Task, bool]:
             nonlocal notification_sender_connection, notification_sender_pid
             await self._lock_verified_work_task(cur, task_id)
-            retry_started_at = await self._verified_now(cur)
+            retry_started_at = await self._verified_evidence_now(cur)
             parent: TaskInvocationSnapshot | None = None
             if request.parent_task_id is not None:
                 if request.parent_task_id == task_id:
@@ -36220,10 +36534,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         session_id: str,
         session_invocation: SessionInvocationBinding,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         session_binding = _copy_required_session_binding(session_invocation)
         await self._ensure_ready()
 
@@ -36232,6 +36552,22 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             await self._lock_verified_work_task(cur, task_id)
             task = await self._load_task_locked(cur, task_id)
             _ensure_retry_series_queue_attempt(task.retry_series)
+            if task.work_contract is not None:
+                await self._require_task_contract(cur, task, task.work_contract)
+                await self._ensure_session_authority(cur, session_id, "contracted")
+            _task_invocation_for_attachment(
+                task.invocation,
+                session_id=session_id,
+                session_binding=session_binding,
+            )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=session_id,
+                session_binding=session_binding,
+            )
+            # Contract and session-authority lookups may wait behind another
+            # transaction.  Sample ownership time only after those locks so an
+            # expired queue worker cannot attach using a stale pre-wait value.
             now = await self._database_now(cur)
             if not _can_attach_claimed_task_state(
                 status=task.status,
@@ -36247,18 +36583,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     worker_id,
                     now=now,
                 )
-            if task.work_contract is not None:
-                await self._require_task_contract(cur, task, task.work_contract)
-                await self._ensure_session_authority(cur, session_id, "contracted")
-            _task_invocation_for_attachment(
-                task.invocation,
-                session_id=session_id,
-                session_binding=session_binding,
-            )
-            session_instance_id = _task_session_instance_for_attachment(
-                stored_session_instance_id=task.session_instance_id,
-                session_id=session_id,
-                session_binding=session_binding,
+            if expected_lease is None:
+                raise TaskClaimLost("Task attachment requires its exact worker lease.")
+            _ensure_exact_owned_active_task_lease(
+                task,
+                worker_id,
+                expected_lease,
+                now=now,
             )
             updated = task.model_copy(
                 update={
@@ -36280,18 +36611,30 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         result: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
-        return await self._finish_task(
-            task_id,
-            TaskStatus.COMPLETED,
-            result=result,
-            error=None,
+        if worker_id is not None and lease_expires_at is None:
+            raise TaskClaimLost(
+                "Worker-owned task terminalization requires its exact lease generation."
+            )
+        async with managed_task_lease_mutation(
+            task_id=task_id,
             worker_id=worker_id,
             handoff_id=handoff_id,
-        )
+            presented_lease_expires_at=lease_expires_at,
+        ) as effective_lease:
+            return await self._finish_task(
+                task_id,
+                TaskStatus.COMPLETED,
+                result=result,
+                error=None,
+                worker_id=worker_id,
+                expected_lease_expires_at=effective_lease,
+                handoff_id=handoff_id,
+            )
 
     async def fail_task(
         self,
@@ -36299,18 +36642,30 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         error: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
-        return await self._finish_task(
-            task_id,
-            TaskStatus.FAILED,
-            result=None,
-            error=error,
+        if worker_id is not None and lease_expires_at is None:
+            raise TaskClaimLost(
+                "Worker-owned task terminalization requires its exact lease generation."
+            )
+        async with managed_task_lease_mutation(
+            task_id=task_id,
             worker_id=worker_id,
             handoff_id=handoff_id,
-        )
+            presented_lease_expires_at=lease_expires_at,
+        ) as effective_lease:
+            return await self._finish_task(
+                task_id,
+                TaskStatus.FAILED,
+                result=None,
+                error=error,
+                worker_id=worker_id,
+                expected_lease_expires_at=effective_lease,
+                handoff_id=handoff_id,
+            )
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
         request, request_sha256 = prepare_task_terminalization(request)
@@ -36335,6 +36690,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             row=receipt_row,
                         )
                         replayed = _replay_task_terminalization_receipt(
+                            request=request,
                             request_sha256=request_sha256,
                             receipt=receipt,
                             current_task=task,
@@ -36364,7 +36720,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             "Task is terminal without the matching terminalization receipt."
                         )
                     now = await self._database_now(cur)
-                    _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                    _ensure_task_terminalization_lease_authority(task, request, now=now)
                     _ensure_task_handoff_authority(task, request.handoff_id)
                     _validate_ordinary_task_terminalization_against_cancellation(task, request)
                     status = TaskStatus(request.kind.value)
@@ -37139,6 +37495,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             _json_obj(receipt_row[1])
                         )
                         replayed = _replay_task_retry_settlement(
+                            request=request,
                             request_sha256=request_sha256,
                             receipt=receipt,
                             current_task=task,
@@ -37148,7 +37505,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
 
                     now = await self._database_now(cur)
                     series_now = self._clock() if self._clock_is_injected else now
-                    _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                    if request.lease_expires_at is None:
+                        raise TaskClaimLost(
+                            "Task retry settlement requires its exact worker lease."
+                        )
+                    _ensure_exact_owned_active_task_lease(
+                        task,
+                        request.worker_id,
+                        request.lease_expires_at,
+                        now=now,
+                    )
                     settled, successor = _settled_task_retry_attempt(
                         task,
                         request,
@@ -37441,11 +37807,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         token_count, estimated_cost = _validated_task_retry_terminal_accounting(
             token_count=token_count,
             estimated_cost=estimated_cost,
@@ -37469,7 +37837,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     lease_now = timestamp_row[0]
                     series_now = self._clock() if self._clock_is_injected else lease_now
                     task = pg_support.task_from_row(row)
-                    _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+                    _ensure_exact_owned_active_task_lease(
+                        task,
+                        worker_id,
+                        expected_lease,
+                        now=lease_now,
+                    )
                     if not _claimed_task_retry_attempt_elapsed(task, series_now=series_now):
                         await conn.commit()
                         return None
@@ -37489,7 +37862,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             lease_expires_at = NULL, started_at = %s,
                             completed_at = %s, updated_at = %s, retry_series = %s
                         WHERE id = %s AND status IN (%s, %s) AND worker_id = %s
-                          AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                          AND lease_expires_at = %s AND lease_expires_at > %s
                         RETURNING {pg_support.TASK_COLUMNS}
                         """,
                         (
@@ -37505,6 +37878,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             str(TaskStatus.CLAIMED),
                             str(TaskStatus.RUNNING),
                             worker_id,
+                            expected_lease,
                             lease_now,
                         ),
                     )
@@ -37537,9 +37911,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         self,
         task_id: str,
         worker_id: str,
+        *,
+        lease_expires_at: datetime,
     ) -> bool:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -37559,7 +37936,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     lease_now = timestamp_row[0]
                     series_now = self._clock() if self._clock_is_injected else lease_now
                     task = pg_support.task_from_row(row)
-                    _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+                    _ensure_exact_owned_active_task_lease(
+                        task,
+                        worker_id,
+                        expected_lease,
+                        now=lease_now,
+                    )
                     elapsed = _claimed_task_retry_attempt_elapsed(
                         task,
                         series_now=series_now,
@@ -37580,6 +37962,65 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         return await self._finish_task(
             task_id, TaskStatus.CANCELLED, result=None, error=copied_error
         )
+
+    async def request_claimed_task_cancellation(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+        error: dict[str, Any] | None = None,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        copied_error = None if error is None else copy_durable_json_object(error, "error")
+        return await self._finish_task(
+            task_id,
+            TaskStatus.CANCELLED,
+            result=None,
+            error=copied_error,
+            worker_id=worker_id,
+            expected_lease_expires_at=expected_lease,
+            request_claimed_cancellation=True,
+        )
+
+    async def mark_claimed_task_execution_started(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> Task:
+            del conn
+            await self._lock_verified_work_task(cur, task_id)
+            current = await self._load_task_locked(cur, task_id)
+            now = await self._database_now(cur)
+            if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                raise TaskClaimLost(
+                    "Claimed-task execution no longer owns the expected worker lease."
+                )
+            _ensure_owned_active_task_lease(current, worker_id, now=now)
+            if (
+                current.status is not TaskStatus.CLAIMED
+                or current.session_id is not None
+                or _task_cancellation_requested(current)
+                or current.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+            ):
+                raise TaskTerminalizationConflict(
+                    "Claimed task cannot begin ordinary worker execution."
+                )
+            if current.started_at is not None:
+                return current.model_copy(deep=True)
+            started = current.model_copy(update={"started_at": now, "updated_at": now})
+            await self._update_task_snapshot(cur, started)
+            return started.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
 
     async def pause_task(
         self,
@@ -37626,7 +38067,6 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     async def resume_task(self, task_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         await self._ensure_ready()
-        now = datetime.now(UTC)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await self._load_task_locked(cur, task_id)
@@ -37638,6 +38078,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     raise WorkAttemptExecutionClaimLost(
                         "Admitted work attempts cannot use ordinary task resumption."
                     )
+                now = await self._database_now(cur)
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -37890,6 +38331,98 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         cur,
                         claimed,
                     )
+                    if not fenced:
+                        post_fence_now = await self._database_now(cur)
+                        post_fence_series_now = (
+                            self._clock() if self._clock_is_injected else post_fence_now
+                        )
+                        retry_elapsed = _claimed_task_retry_attempt_elapsed(
+                            claimed,
+                            series_now=post_fence_series_now,
+                        )
+                    else:
+                        retry_elapsed = False
+                    if retry_elapsed:
+                        expiration = _elapsed_claimed_task_retry_settlement(
+                            claimed,
+                            committed_at=post_fence_now,
+                        )
+                        settled = expiration.task
+                        assert settled.retry_series is not None
+                        await cur.execute(
+                            """
+                            UPDATE cayu_tasks
+                            SET status = %s, status_reason = %s, status_payload = %s,
+                                result = NULL, error = %s, worker_id = NULL,
+                                lease_expires_at = NULL, started_at = %s,
+                                completed_at = %s, updated_at = %s, retry_series = %s
+                            WHERE id = %s AND status = %s AND worker_id = %s
+                            """,
+                            (
+                                str(settled.status),
+                                settled.status_reason,
+                                _dumps(settled.status_payload),
+                                _dumps(settled.error),
+                                settled.started_at,
+                                settled.completed_at,
+                                settled.updated_at,
+                                _dumps(settled.retry_series.model_dump(mode="json")),
+                                claimed.id,
+                                str(TaskStatus.CLAIMED),
+                                worker_id,
+                            ),
+                        )
+                        if cur.rowcount != 1:
+                            raise TaskTerminalizationConflict(
+                                "Elapsed task retry attempt changed during claim admission."
+                            )
+                        await cur.execute(
+                            "INSERT INTO cayu_task_retry_settlements "
+                            "(task_id, idempotency_key, request_sha256, receipt_json, "
+                            "committed_at) VALUES (%s, %s, %s, %s, %s)",
+                            (
+                                expiration.task_id,
+                                expiration.idempotency_key,
+                                expiration.request_sha256,
+                                _dumps(expiration.model_dump(mode="json")),
+                                expiration.committed_at,
+                            ),
+                        )
+                        claimed = None
+                    elif not fenced:
+                        # ``transaction_timestamp()`` used by the claim statement is
+                        # frozen before the advisory-lock wait.  Restamp the newly
+                        # acquired lease only after the retry fence is known clear so
+                        # the returned ownership cannot already be expired at commit.
+                        await cur.execute(
+                            f"""
+                            WITH authority AS (
+                                SELECT %s::timestamptz AS now
+                            )
+                            UPDATE cayu_tasks AS task
+                            SET lease_expires_at = authority.now
+                                    + (%s * INTERVAL '1 second'),
+                                updated_at = authority.now
+                            FROM authority
+                            WHERE task.id = %s
+                              AND task.status = %s
+                              AND task.worker_id = %s
+                            RETURNING {_TASK_RETURNING_COLUMNS}
+                            """,
+                            (
+                                post_fence_now,
+                                lease_seconds,
+                                claimed.id,
+                                str(TaskStatus.CLAIMED),
+                                worker_id,
+                            ),
+                        )
+                        refreshed_row = await cur.fetchone()
+                        if refreshed_row is None:
+                            raise RuntimeError(
+                                "Task claim changed while its retry fence was acquired."
+                            )
+                        claimed = pg_support.task_from_row(refreshed_row)
             if fenced:
                 await conn.rollback()
                 return None
@@ -37901,11 +38434,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
 
         await self._ensure_ready()
@@ -37914,6 +38449,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
                 _ensure_task_handoff_authority(task, handoff_id)
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
@@ -37932,7 +38469,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     WHERE id = %s AND worker_id = %s
                       AND interrupted_handoff_id IS NOT DISTINCT FROM %s
                       AND status IN (%s, %s)
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                      AND lease_expires_at = %s AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
@@ -37943,6 +38480,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         handoff_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
+                        expected_lease,
                         now,
                     ),
                 )
@@ -37959,9 +38497,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             await conn.commit()
             return updated.model_copy(deep=True)
 
-    async def release_task(self, task_id: str, worker_id: str) -> Task:
+    async def release_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
 
         await self._ensure_ready()
         async with self._pool.connection() as conn:
@@ -37969,6 +38514,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost("Task release no longer owns the expected worker lease.")
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
                     (task_id,),
@@ -37983,12 +38530,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     SET status = %s,
                         worker_id = NULL,
                         lease_expires_at = NULL,
+                        started_at = NULL,
                         updated_at = %s
                     WHERE id = %s AND worker_id = %s AND status = %s
                       AND session_id IS NULL
                       AND status_reason IS DISTINCT FROM %s
                       AND status_reason IS DISTINCT FROM %s
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                      AND lease_expires_at = %s AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
@@ -37999,6 +38547,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         str(TaskStatus.CLAIMED),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         _TASK_CANCELLATION_REQUESTED_REASON,
+                        expected_lease,
                         now,
                     ),
                 )
@@ -38015,9 +38564,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             await conn.commit()
             return updated.model_copy(deep=True)
 
-    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+    async def release_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
 
         await self._ensure_ready()
         async with self._pool.connection() as conn:
@@ -38025,6 +38581,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost(
+                        "Attached-task release no longer owns the expected worker lease."
+                    )
                 if task.interrupted_handoff_id is not None:
                     raise TaskInterruptedHandoffConflict(
                         "Recovery-owned attached tasks must publish an interrupted handoff."
@@ -38046,7 +38606,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     WHERE id = %s AND worker_id = %s AND status = %s
                       AND session_id IS NOT NULL
                       AND status_reason IS DISTINCT FROM %s
-                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s
+                      AND lease_expires_at = %s AND lease_expires_at > %s
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
@@ -38055,6 +38615,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         worker_id,
                         str(TaskStatus.RUNNING),
                         _TASK_CANCELLATION_REQUESTED_REASON,
+                        expected_lease,
                         now,
                     ),
                 )
@@ -38116,8 +38677,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 "status_reason IS DISTINCT FROM %s",
                 "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
                 "WHERE NOT attempt.retry_admissible AND ("
-                "attempt.task_id = cayu_tasks.id OR (cayu_tasks.retry_series IS NOT NULL "
-                "AND attempt.retry_series_id = cayu_tasks.retry_series->>'series_id')))",
+                "attempt.task_id = task.id OR (task.retry_series IS NOT NULL "
+                "AND attempt.retry_series_id = task.retry_series->>'series_id')))",
                 *clauses,
             ]
         )
@@ -38130,24 +38691,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         f"""
                         WITH timing AS MATERIALIZED (
                             SELECT clock_timestamp() AS now
-                        ), expired AS (
-                            SELECT id
-                            FROM cayu_tasks
-                            CROSS JOIN timing
-                            WHERE {where_sql}
-                            ORDER BY lease_expires_at ASC, id ASC
-                            FOR UPDATE SKIP LOCKED
-                            LIMIT %s
                         )
-                        UPDATE cayu_tasks AS task
-                        SET status = %s,
-                            worker_id = NULL,
-                            lease_expires_at = NULL,
-                            updated_at = timing.now
-                        FROM expired
+                        SELECT {_TASK_RETURNING_COLUMNS}, timing.now
+                        FROM cayu_tasks AS task
                         CROSS JOIN timing
-                        WHERE task.id = expired.id
-                        RETURNING {_TASK_RETURNING_COLUMNS}
+                        WHERE {where_sql}
+                        ORDER BY task.lease_expires_at ASC, task.id ASC
+                        FOR UPDATE OF task SKIP LOCKED
+                        LIMIT %s
                         """,
                     ),
                     [
@@ -38156,16 +38707,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         _TASK_CANCELLATION_REQUESTED_REASON,
                         *params,
                         max_reclaims,
-                        str(TaskStatus.PENDING),
                     ],
                 )
                 rows = await cur.fetchall()
-                reclaimed = [pg_support.task_from_row(row) for row in rows]
+                expired = [pg_support.task_from_row(row) for row in rows]
                 # Acquire scope locks in canonical order so a multi-row reclaim
                 # cannot deadlock another reclaimer.  Every eligibility check is
                 # then repeated in a new statement after any lock wait.
                 tasks_by_scope = {
-                    self._local_execution_retry_fence_scope(task): task for task in reclaimed
+                    self._local_execution_retry_fence_scope(task): task for task in expired
                 }
                 for scope in sorted(tasks_by_scope):
                     await self._lock_local_execution_retry_fence(
@@ -38173,11 +38723,29 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         tasks_by_scope[scope],
                     )
                 fenced = any(
-                    [
-                        await self._local_execution_attempt_fences_task(cur, task)
-                        for task in reclaimed
-                    ]
+                    [await self._local_execution_attempt_fences_task(cur, task) for task in expired]
                 )
+                reclaimed: list[Task] = []
+                if not fenced:
+                    now = rows[0][-1] if rows else None
+                    for task in expired:
+                        assert now is not None
+                        if task.started_at is not None:
+                            updated = _expired_dispatched_task_cancellation(
+                                task,
+                                updated_at=now,
+                            )
+                        else:
+                            updated = task.model_copy(
+                                update={
+                                    "status": TaskStatus.PENDING,
+                                    "worker_id": None,
+                                    "lease_expires_at": None,
+                                    "updated_at": now,
+                                }
+                            )
+                            reclaimed.append(updated)
+                        await self._update_task_snapshot(cur, updated)
             if fenced:
                 # Roll back every row selected by this batch.  A later reclaim
                 # starts from a fresh snapshot and can still settle unrelated
@@ -38201,7 +38769,6 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         reason = _copy_optional_status_reason(reason)
         payload = _copy_optional_status_payload(payload)
         await self._ensure_ready()
-        now = datetime.now(UTC)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await self._load_task_locked(cur, task_id)
@@ -38213,6 +38780,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     raise WorkAttemptExecutionClaimLost(
                         "Admitted work attempts cannot use ordinary task holds."
                     )
+                now = await self._database_now(cur)
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -38269,12 +38837,20 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         error: dict[str, Any] | None,
         worker_id: str | None = None,
         handoff_id: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
+        request_claimed_cancellation: bool = False,
     ) -> Task:
         await self._ensure_ready()
+        if expected_lease_expires_at is not None:
+            expected_lease_expires_at = normalize_utc_datetime(
+                expected_lease_expires_at,
+                "lease_expires_at",
+            )
         # When a worker_id is given, only terminalize if that worker still owns an active
         # lease — a worker that lost its lease must not clobber a task another has reclaimed.
         owner_clause = ""
         owner_params: list[Any] = []
+        effective_handoff_id = handoff_id
         if worker_id is not None:
             owner_clause = (
                 "\n                      AND worker_id = %s"
@@ -38285,9 +38861,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             async with conn.cursor() as cur:
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
-                if worker_id is not None:
-                    _ensure_owned_active_task_lease(task, worker_id, now=now)
-                    _ensure_task_handoff_authority(task, handoff_id)
+                if (
+                    worker_id is not None
+                    and expected_lease_expires_at is not None
+                    and (
+                        task.worker_id != worker_id
+                        or task.lease_expires_at != expected_lease_expires_at
+                    )
+                ):
+                    raise TaskClaimLost(
+                        "Task terminalization no longer owns the expected worker lease."
+                    )
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
                     (task_id,),
@@ -38296,9 +38880,21 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     raise WorkAttemptExecutionClaimLost(
                         "Admitted work attempts cannot use ordinary terminalization."
                     )
-                if worker_id is not None:
-                    owner_params = [worker_id, now, handoff_id]
                 verified_work_support.require_contracted_completion_authority(task, status)
+                if request_claimed_cancellation and (
+                    _task_cancellation_requested(task)
+                    or task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+                ):
+                    await conn.commit()
+                    return task.model_copy(deep=True)
+                if worker_id is not None:
+                    if not (request_claimed_cancellation and task.started_at is not None):
+                        _ensure_owned_active_task_lease(task, worker_id, now=now)
+                    effective_handoff_id = (
+                        task.interrupted_handoff_id if request_claimed_cancellation else handoff_id
+                    )
+                    _ensure_task_handoff_authority(task, effective_handoff_id)
+                    owner_params = [worker_id, now, effective_handoff_id]
                 cancellation = None
                 if task.retry_series is not None:
                     if status is not TaskStatus.CANCELLED:
@@ -38347,6 +38943,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     and status is TaskStatus.CANCELLED
                     and task.worker_id is not None
                     and task.lease_expires_at is not None
+                    and not _task_cancellation_requested(task)
                 ):
                     cancellation_requested = _task_cancellation_requested_task(
                         task,
@@ -38447,7 +39044,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             now=now,
                         )
                         current = await self._require_task(cur, task_id)
-                        _ensure_task_handoff_authority(current, handoff_id)
+                        _ensure_task_handoff_authority(current, effective_handoff_id)
                     task = await self._require_task(cur, task_id)
                     _ensure_can_transition(task, status)
                     raise ValueError(f"Task {task.id} cannot transition from {task.status}")

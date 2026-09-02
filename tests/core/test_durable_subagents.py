@@ -3798,6 +3798,7 @@ def test_durable_queue_task_preserves_real_parent_task_lineage() -> None:
                     session_id="durable-task-parent-session",
                     task_id=parent_task.id,
                     task_worker_id="parent-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
                     messages=[Message.text("user", "parent task")],
                 )
             )
@@ -5316,7 +5317,11 @@ def test_cancelled_queue_worker_reclaims_child_without_second_provider_dispatch(
         claimed = await tasks.load_task(queued.id)
         assert claimed is not None
         assert claimed.status is TaskStatus.CLAIMED
-        await tasks.release_task(queued.id, "cancelled-child-worker")
+        await tasks.release_task(
+            queued.id,
+            "cancelled-child-worker",
+            lease_expires_at=claimed.lease_expires_at,
+        )
 
         replayed = await worker_dispatcher.process_next(
             worker_app,
@@ -5483,8 +5488,13 @@ def test_postgres_concurrent_submission_and_stale_worker_converge(
                     intent.queue_task_id,
                     {"reason": "stale worker must not win"},
                     worker_id="stale-worker",
+                    lease_expires_at=claimed_a.lease_expires_at,
                 )
-            await tasks_b.release_task(intent.queue_task_id, "replacement-worker")
+            await tasks_b.release_task(
+                intent.queue_task_id,
+                "replacement-worker",
+                lease_expires_at=claimed_b.lease_expires_at,
+            )
 
             completed = await dispatcher_b.process_next(
                 app_b,

@@ -1068,8 +1068,12 @@ def test_explicit_compaction_replay_does_not_repeat_sanitized_work_after_lost_ac
             super().__init__()
             self.failed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if not self.failed and any(
                 event.type == EventType.SESSION_CHECKPOINTED for event in kwargs.get("events", [])
             ):
@@ -1138,7 +1142,8 @@ def test_explicit_compaction_reprojects_transcript_when_reclaiming_after_restart
             Message.text("assistant", "old answer"),
             Message.text("user", "current request"),
         ]
-        store = InMemorySessionStore()
+        store_now = {"value": accepted_at}
+        store = InMemorySessionStore(ownership_clock=lambda: store_now["value"])
         first_compactor = _CapturingCompactor()
         first_app = CayuApp(
             session_store=store,
@@ -1171,6 +1176,7 @@ def test_explicit_compaction_reprojects_transcript_when_reclaiming_after_restart
         await abandoned_stream.aclose()
         assert first_compactor.requests == []
 
+        store_now["value"] = accepted_at + timedelta(minutes=6)
         recovering_compactor = _CapturingCompactor()
         recovered_app = CayuApp(
             session_store=store,

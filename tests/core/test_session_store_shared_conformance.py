@@ -1771,7 +1771,7 @@ def test_session_store_conformance_repairs_provider_cancellation_terminal_public
             recovered = await recovered_app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
             assert any(event.type == EventType.SESSION_INTERRUPTED for event in recovered.events)
@@ -1911,7 +1911,7 @@ def test_session_store_conformance_recovers_provider_cancellation_after_marker_o
                 await recovered_app.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(
                         session_id=session_id,
-                        inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                        inactive_for_seconds=0,
                     )
                 )
             assert await store.load_checkpoint(session_id) == malformed_checkpoint
@@ -1939,7 +1939,7 @@ def test_session_store_conformance_recovers_provider_cancellation_after_marker_o
                 await recovered_app.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(
                         session_id=session_id,
-                        inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                        inactive_for_seconds=0,
                     )
                 )
             assert await store.load_checkpoint(session_id) == malformed_checkpoint
@@ -7985,7 +7985,15 @@ def test_session_store_conformance_unclaimed_interruption_cancellation_is_finali
     [
         pytest.param("ack-loss", id="commit-then-lose-acknowledgement"),
         pytest.param("cancellation", id="cancel-after-commit"),
+        pytest.param(
+            "cancellation-read-failure",
+            id="cancel-after-commit-before-checkpoint-read-failure",
+        ),
         pytest.param("generator-exit", id="generator-exit-after-commit"),
+        pytest.param(
+            "generator-exit-read-failure",
+            id="generator-exit-after-commit-before-checkpoint-read-failure",
+        ),
         pytest.param("grouped-control", id="grouped-process-control-after-commit"),
         pytest.param("payload-conflict", id="conflicting-payload-before-claim"),
     ],
@@ -8048,16 +8056,28 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
             assert "pending_session_interrupt" in prepared
             assert "incomplete_session_recovery_claim" not in prepared
 
-            original_transform = store.transform_checkpoint
+            original_transform = store.transform_checkpoint_with_store_time
+            original_load_checkpoint = store.load_checkpoint
             claim_committed = asyncio.Event()
             injected = False
+            fail_next_checkpoint_read = False
+
+            async def fail_checkpoint_read_after_transfer(loaded_session_id: str):
+                nonlocal fail_next_checkpoint_read
+                if fail_next_checkpoint_read:
+                    fail_next_checkpoint_read = False
+                    raise OSError("post-claim checkpoint read failed")
+                return await original_load_checkpoint(loaded_session_id)
 
             async def interrupt_claim_acknowledgement(
                 transformed_session_id: str,
                 transform,
             ):
                 nonlocal injected
-                before = await store.load_checkpoint(transformed_session_id)
+                nonlocal fail_next_checkpoint_read
+                if injected:
+                    return await original_transform(transformed_session_id, transform)
+                before = await original_load_checkpoint(transformed_session_id)
                 claim_transfer_candidate = (
                     not injected
                     and before is not None
@@ -8067,7 +8087,11 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                 if claim_boundary == "payload-conflict" and claim_transfer_candidate:
                     injected = True
 
-                    def replace_pending_payload(_session: Session, checkpoint):
+                    def replace_pending_payload(
+                        _session: Session,
+                        checkpoint,
+                        _store_now: datetime,
+                    ):
                         updated = dict({} if checkpoint is None else checkpoint)
                         pending_interrupt = dict(updated["pending_session_interrupt"])
                         pending_interrupt["reason"] = "conflicting concurrent interrupt"
@@ -8079,7 +8103,7 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                         replace_pending_payload,
                     )
                 result = await original_transform(transformed_session_id, transform)
-                after = await store.load_checkpoint(transformed_session_id)
+                after = await original_load_checkpoint(transformed_session_id)
                 installed_now = (
                     not injected
                     and before is not None
@@ -8094,7 +8118,11 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                 claim_committed.set()
                 if claim_boundary == "ack-loss":
                     raise OSError("terminal claim acknowledgement lost")
-                if claim_boundary == "generator-exit":
+                if claim_boundary in {
+                    "generator-exit",
+                    "generator-exit-read-failure",
+                }:
+                    fail_next_checkpoint_read = claim_boundary.endswith("read-failure")
                     raise GeneratorExit("terminal claim transfer stopped")
                 if claim_boundary == "grouped-control":
                     raise BaseExceptionGroup(
@@ -8105,9 +8133,11 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                         ],
                     )
                 await release_acknowledgement.wait()
+                fail_next_checkpoint_read = claim_boundary.endswith("read-failure")
                 return result
 
-            store.transform_checkpoint = (  # type: ignore[method-assign]
+            store.load_checkpoint = fail_checkpoint_read_after_transfer  # type: ignore[method-assign]
+            store.transform_checkpoint_with_store_time = (  # type: ignore[method-assign]
                 interrupt_claim_acknowledgement
             )
             if claim_boundary == "ack-loss":
@@ -8139,7 +8169,11 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                 ]
                 assert records == []
                 return
-            elif claim_boundary in {"generator-exit", "grouped-control"}:
+            elif claim_boundary in {
+                "generator-exit",
+                "generator-exit-read-failure",
+                "grouped-control",
+            }:
                 with (
                     session_engine_module.suppress_interruption_cascade(),
                     pytest.raises(
@@ -8163,7 +8197,23 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                         )
                         == 1
                     )
-                store.transform_checkpoint = original_transform  # type: ignore[method-assign]
+                elif claim_boundary == "generator-exit-read-failure":
+                    assert process_control.value.__cause__ is not None
+                    retained_failures = tuple(
+                        candidate
+                        for candidate in iter_exception_tree(process_control.value.__cause__)
+                        if not isinstance(candidate, BaseExceptionGroup)
+                    )
+                    assert (
+                        sum(
+                            isinstance(candidate, OSError)
+                            and str(candidate) == "post-claim checkpoint read failed"
+                            for candidate in retained_failures
+                        )
+                        == 1
+                    )
+                store.load_checkpoint = original_load_checkpoint  # type: ignore[method-assign]
+                store.transform_checkpoint_with_store_time = original_transform  # type: ignore[method-assign]
                 with session_engine_module.suppress_interruption_cascade():
                     events = await _collect_events(app.interrupt_session(request))
                 assert events[-1].type is EventType.SESSION_INTERRUPTED
@@ -8178,11 +8228,30 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
                         await retrying
                     assert cancellation.value.args == ("cancel terminal claim acknowledgement",)
                     assert retrying.cancelled() is True
-                after_cancellation = await store.load_checkpoint(session_id)
+                    if claim_boundary == "cancellation-read-failure":
+                        assert cancellation.value.__cause__ is not None
+                        retained_failures = tuple(
+                            candidate
+                            for candidate in iter_exception_tree(cancellation.value.__cause__)
+                            if not isinstance(candidate, BaseExceptionGroup)
+                        )
+                        assert (
+                            sum(
+                                isinstance(candidate, OSError)
+                                and str(candidate) == "post-claim checkpoint read failed"
+                                for candidate in retained_failures
+                            )
+                            == 1
+                        )
+                store.load_checkpoint = original_load_checkpoint  # type: ignore[method-assign]
+                after_cancellation = await original_load_checkpoint(session_id)
                 assert after_cancellation is not None
-                assert "pending_session_interrupt" not in after_cancellation
+                if claim_boundary == "cancellation-read-failure":
+                    assert "pending_session_interrupt" in after_cancellation
+                else:
+                    assert "pending_session_interrupt" not in after_cancellation
                 assert "incomplete_session_recovery_claim" not in after_cancellation
-                store.transform_checkpoint = original_transform  # type: ignore[method-assign]
+                store.transform_checkpoint_with_store_time = original_transform  # type: ignore[method-assign]
                 store = await _reopen_store(session_store_case, store)
                 recovery_app = CayuApp(session_store=store, enable_logging=False)
                 recovery_app.register_provider(_UserInputRecoveryProvider(), default=True)
@@ -8212,6 +8281,128 @@ def test_session_store_conformance_reconciles_terminal_finalization_claim_transf
             assert len(records) == 1
         finally:
             release_acknowledgement.set()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_settles_replacement_claim_when_terminal_event_wins(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"terminal-event-wins-replacement-claim-{session_store_case[0]}"
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UserInputRecoveryProvider(), default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[UserInputTool()],
+            )
+            await _collect_events(
+                app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "ask a question")],
+                    )
+                )
+            )
+            request = InterruptSessionRequest(
+                session_id=session_id,
+                reason="operator supersedes the paused question",
+            )
+            engine = app._session_engine
+            original_transition = store.transition_status_and_checkpoint
+
+            async def commit_supersession_then_stop(*args, **kwargs):
+                transitioned = await original_transition(*args, **kwargs)
+                if kwargs.get("to_status") is SessionStatus.INTERRUPTING:
+                    raise _SimulatedProcessLoss("stop after supersession transition")
+                return transitioned
+
+            store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
+                commit_supersession_then_stop
+            )
+            with (
+                session_engine_module.suppress_interruption_cascade(),
+                pytest.raises(_SimulatedProcessLoss, match="supersession transition"),
+            ):
+                await _collect_events(app.interrupt_session(request))
+            store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
+
+            def release_abandoned_claim(_session: Session, checkpoint):
+                updated = dict({} if checkpoint is None else checkpoint)
+                updated.pop("incomplete_session_recovery_claim", None)
+                return updated
+
+            await store.transform_checkpoint(session_id, release_abandoned_claim)
+
+            interrupting = await store.load(session_id)
+            checkpoint = await store.load_checkpoint(session_id)
+            assert interrupting is not None
+            assert interrupting.status is SessionStatus.INTERRUPTING
+            assert checkpoint is not None
+            expected_payload = checkpoint["pending_session_interrupt"]
+            assert "incomplete_session_recovery_claim" not in checkpoint
+
+            recovery = engine._recovery_coordinator
+            original_renewal = recovery._renew_terminal_evidence_finalization_claim
+            persisted_event: Event | None = None
+
+            async def publish_terminal_after_replacement_renewal(*args, **kwargs):
+                nonlocal persisted_event
+                renewal = await original_renewal(*args, **kwargs)
+                if renewal is not None and persisted_event is None:
+                    terminal_session = await store.update_status(
+                        session_id,
+                        SessionStatus.INTERRUPTED,
+                    )
+                    repair_event = recovery._terminal_evidence_repair_event(
+                        session=terminal_session,
+                        terminal_run_epoch=terminal_session.run_epoch,
+                        terminal_timestamp=terminal_session.updated_at,
+                        pending_interrupt_payload=expected_payload,
+                        pending_action_interrupt_payload=None,
+                        run_operation=None,
+                    )
+                    persisted_event = await recovery._persist_terminal_evidence_repair_event(
+                        repair_event
+                    )
+                return renewal
+
+            original_cancel_active_runs = engine._session_control.cancel_active_runs
+            recovery._renew_terminal_evidence_finalization_claim = (  # type: ignore[method-assign]
+                publish_terminal_after_replacement_renewal
+            )
+            engine._session_control.cancel_active_runs = (  # type: ignore[method-assign]
+                lambda _session_id: True
+            )
+            try:
+                with session_engine_module.suppress_interruption_cascade():
+                    replayed = await _collect_events(app.interrupt_session(request))
+            finally:
+                recovery._renew_terminal_evidence_finalization_claim = (  # type: ignore[method-assign]
+                    original_renewal
+                )
+                engine._session_control.cancel_active_runs = (  # type: ignore[method-assign]
+                    original_cancel_active_runs
+                )
+
+            assert persisted_event is not None
+            assert (
+                await _private_event_for_public_event(store, replayed[-1])
+            ).id == persisted_event.id
+            settled = await store.load_checkpoint(session_id)
+            assert settled is not None
+            assert "pending_session_interrupt" not in settled
+            assert "incomplete_session_recovery_claim" not in settled
+            assert not any(
+                task.get_name() == f"cayu-terminal-finalization-heartbeat:{session_id}"
+                and not task.done()
+                for task in asyncio.all_tasks()
+            )
+        finally:
             await _close_store(store)
 
     asyncio.run(run())
@@ -8271,7 +8462,11 @@ def test_session_store_conformance_user_input_supersession_retry_joins_live_fina
                 assert "pending_session_interrupt" in checkpoint
 
                 peer_store = await _open_peer_store(session_store_case, store)
-                peer_app = CayuApp(session_store=peer_store, enable_logging=False)
+                peer_app = CayuApp(
+                    session_store=peer_store,
+                    enable_logging=False,
+                    clock=lambda: datetime(2200, 1, 1, tzinfo=UTC),
+                )
                 peer_app.register_provider(_UserInputRecoveryProvider(), default=True)
                 peer_app.register_agent(
                     AgentSpec(name="assistant", model="fake-model"),
@@ -9342,7 +9537,6 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
     async def run() -> None:
         store = await _open_store(session_store_case)
         session_id = f"expired-terminal-finalization-claim-{session_store_case[0]}"
-        now = {"value": datetime(2026, 8, 31, tzinfo=UTC)}
         try:
             monkeypatch.setattr(
                 recovery_coordinator_module,
@@ -9352,7 +9546,6 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
             app = CayuApp(
                 session_store=store,
                 enable_logging=False,
-                clock=lambda: now["value"],
             )
             app.register_provider(_UserInputRecoveryProvider(), default=True)
             app.register_agent(
@@ -9374,13 +9567,27 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
             )
             original_transition = store.transition_status_and_checkpoint
             transition_delayed = False
+            expired_claim_observations: list[datetime] = []
 
             async def expire_claim_after_atomic_transition(*args, **kwargs):
                 nonlocal transition_delayed
                 transitioned = await original_transition(*args, **kwargs)
                 if kwargs.get("to_status") is SessionStatus.INTERRUPTING and not transition_delayed:
                     transition_delayed = True
-                    now["value"] += timedelta(seconds=1)
+
+                    def expire_claim(_session, checkpoint, store_now):
+                        assert checkpoint is not None
+                        updated = copy.deepcopy(checkpoint)
+                        claim = updated["incomplete_session_recovery_claim"]
+                        expired_claim_observations.append(store_now)
+                        claim["claimed_at"] = (store_now - timedelta(minutes=10)).isoformat()
+                        claim["claim_expires_at"] = (store_now - timedelta(minutes=5)).isoformat()
+                        return updated
+
+                    await store.transform_checkpoint_with_store_time(
+                        session_id,
+                        expire_claim,
+                    )
                 return transitioned
 
             store.transition_status_and_checkpoint = (  # type: ignore[method-assign]
@@ -9390,7 +9597,10 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
                 session_engine_module.suppress_interruption_cascade(),
                 pytest.raises(
                     recovery_coordinator_module._IncompleteRecoveryClaimLost,
-                    match="expired before live dispatch",
+                    match=(
+                        "expired before live dispatch|stopped before its store lease|"
+                        "acknowledgement consumed its lease"
+                    ),
                 ),
             ):
                 await _collect_events(app.interrupt_session(request))
@@ -9403,7 +9613,11 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
             assert retained is not None
             assert "pending_session_interrupt" in retained
             retained_claim = retained["incomplete_session_recovery_claim"]
-            assert datetime.fromisoformat(retained_claim["claim_expires_at"]) <= now["value"]
+            assert len(expired_claim_observations) == 1
+            assert (
+                datetime.fromisoformat(retained_claim["claim_expires_at"])
+                < (expired_claim_observations[0])
+            )
             terminal_records = [
                 record
                 for record in await store.query_events(
@@ -9417,6 +9631,11 @@ def test_session_store_conformance_does_not_dispatch_expired_terminal_finalizati
             assert terminal_records == []
 
             store.transition_status_and_checkpoint = original_transition  # type: ignore[method-assign]
+            monkeypatch.setattr(
+                recovery_coordinator_module,
+                "_INCOMPLETE_RECOVERY_CLAIM_LEASE",
+                timedelta(minutes=5),
+            )
             with session_engine_module.suppress_interruption_cascade():
                 retried = await _collect_events(app.interrupt_session(request))
             assert retried[-1].type is EventType.SESSION_INTERRUPTED
@@ -9505,7 +9724,6 @@ def test_session_store_conformance_status_only_finalization_requires_exact_live_
     async def run() -> None:
         store = await _open_store(session_store_case)
         session_id = f"status-only-finalization-claim-{session_store_case[0]}"
-        observed_at = datetime(2040, 1, 1, tzinfo=UTC)
         try:
             created = await store.create(
                 RunRequest(
@@ -9517,26 +9735,38 @@ def test_session_store_conformance_status_only_finalization_requires_exact_live_
             )
             interrupting = await store.update_status(created.id, SessionStatus.INTERRUPTING)
 
-            def install_claim(claim_id: str):
-                def transform(_session, checkpoint):
+            def install_claim(claim_id: str, *, expired: bool = False):
+                def transform(_session, checkpoint, store_now):
                     updated = {} if checkpoint is None else copy.deepcopy(checkpoint)
                     updated["incomplete_session_recovery_claim"] = {
                         "version": 1,
                         "claim_id": claim_id,
-                        "claimed_at": observed_at.isoformat(),
-                        "claim_expires_at": (observed_at + timedelta(minutes=5)).isoformat(),
+                        "claimed_at": (
+                            store_now - timedelta(minutes=10) if expired else store_now
+                        ).isoformat(),
+                        "claim_expires_at": (
+                            store_now - timedelta(minutes=5)
+                            if expired
+                            else store_now + timedelta(minutes=5)
+                        ).isoformat(),
                     }
                     return updated
 
                 return transform
 
-            await store.transform_checkpoint(session_id, install_claim("stale-finalizer"))
+            await store.transform_checkpoint_with_store_time(
+                session_id,
+                install_claim("stale-finalizer"),
+            )
             stale_session = interrupting.model_copy(deep=True)
-            await store.transform_checkpoint(session_id, install_claim("replacement-finalizer"))
+            await store.transform_checkpoint_with_store_time(
+                session_id,
+                install_claim("replacement-finalizer"),
+            )
             app = CayuApp(
                 session_store=store,
                 enable_logging=False,
-                clock=lambda: observed_at,
+                clock=lambda: datetime(2200, 1, 1, tzinfo=UTC),
             )
 
             with pytest.raises(
@@ -9568,20 +9798,56 @@ def test_session_store_conformance_status_only_finalization_requires_exact_live_
             assert finalized.status is SessionStatus.INTERRUPTED
             assert event is None
             assert status_changed is True
+
+            expired_session_id = f"{session_id}-expired"
+            expired_created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=expired_session_id,
+                    messages=[Message.text("user", "create expired")],
+                ),
+                identity=_identity(),
+            )
+            expired_interrupting = await store.update_status(
+                expired_created.id,
+                SessionStatus.INTERRUPTING,
+            )
+            await store.transform_checkpoint_with_store_time(
+                expired_session_id,
+                install_claim("expired-finalizer", expired=True),
+            )
+            past_clock_app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                clock=lambda: datetime(2000, 1, 1, tzinfo=UTC),
+            )
+            with pytest.raises(
+                SessionRunFenced,
+                match="lost its exact terminal recovery claim",
+            ):
+                await past_clock_app._session_engine._publish_interaction_transition(
+                    session=expired_interrupting,
+                    agent_name="assistant",
+                    environment_name=None,
+                    to_status=SessionStatus.INTERRUPTED,
+                    expected_recovery_claim_id="expired-finalizer",
+                )
+            retained_expired = await store.load(expired_session_id)
+            assert retained_expired is not None
+            assert retained_expired.status is SessionStatus.INTERRUPTING
         finally:
             await _close_store(store)
 
     asyncio.run(run())
 
 
-def test_session_store_conformance_interaction_claim_uses_issuer_clock(
+def test_session_store_conformance_interaction_claim_uses_store_clock(
     session_store_case,
 ) -> None:
     async def run() -> None:
         store = await _open_store(session_store_case)
         session_id = f"interaction-claim-clock-{session_store_case[0]}"
         interaction_id = f"interaction-claim-clock-{session_store_case[0]}"
-        issuer_now = {"value": datetime(2040, 1, 1, tzinfo=UTC)}
         try:
             started = Event(
                 id=f"evt-{interaction_id}-started",
@@ -9599,18 +9865,25 @@ def test_session_store_conformance_interaction_claim_uses_issuer_clock(
                 interaction_started_event=started,
                 interaction_source_messages=[Message.text("user", "start")],
             )
-            claimed_at = issuer_now["value"]
-            await store.checkpoint(
-                session_id,
-                {
+            claim_times: list[datetime] = []
+
+            def install_claim(_session, checkpoint, store_now):
+                claim_times.append(store_now)
+                return {
+                    **({} if checkpoint is None else checkpoint),
                     "incomplete_session_recovery_claim": {
                         "version": 1,
-                        "claim_id": "issuer-clock-claim",
-                        "claimed_at": claimed_at.isoformat(),
-                        "claim_expires_at": (claimed_at + timedelta(minutes=5)).isoformat(),
-                    }
-                },
+                        "claim_id": "store-clock-claim",
+                        "claimed_at": store_now.isoformat(),
+                        "claim_expires_at": (store_now + timedelta(minutes=5)).isoformat(),
+                    },
+                }
+
+            await store.transform_checkpoint_with_store_time(
+                session_id,
+                install_claim,
             )
+            assert len(claim_times) == 1
             interrupted = Event(
                 id=f"evt-{interaction_id}-interrupted",
                 type=EventType.INTERACTION_INTERRUPTED,
@@ -9622,20 +9895,36 @@ def test_session_store_conformance_interaction_claim_uses_issuer_clock(
                 from_statuses=(SessionStatus.RUNNING,),
                 to_status=SessionStatus.INTERRUPTED,
             )
+            with pytest.raises(
+                SessionRunFenced,
+                match="owned by another terminal recovery claim",
+            ):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=interrupted,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+            retained_before_claimed_publication = await store.load(session_id)
+            assert retained_before_claimed_publication is not None
+            assert retained_before_claimed_publication.status is SessionStatus.RUNNING
+            assert (
+                await store.query_events(EventQuery(session_id=session_id, event_id=interrupted.id))
+                == []
+            )
             published = await store.publish_interaction_transition(
                 session_id,
                 event=interrupted,
                 from_statuses={SessionStatus.RUNNING},
                 to_status=SessionStatus.INTERRUPTED,
-                expected_recovery_claim_id="issuer-clock-claim",
-                expected_recovery_claim_clock=lambda: issuer_now["value"],
+                expected_recovery_claim_id="store-clock-claim",
             )
             assert published.replayed is False
             assert published.session.status is SessionStatus.INTERRUPTED
             loaded_receipt = await store.load_interaction_transition_receipt(
                 session_id,
                 transition=transition,
-                expected_recovery_claim_id="issuer-clock-claim",
+                expected_recovery_claim_id="store-clock-claim",
             )
             assert loaded_receipt is not None
             assert loaded_receipt.transition == transition
@@ -9668,35 +9957,45 @@ def test_session_store_conformance_interaction_claim_uses_issuer_clock(
                     from_statuses={SessionStatus.RUNNING},
                     to_status=SessionStatus.INTERRUPTED,
                     expected_recovery_claim_id="substituted-claim",
-                    expected_recovery_claim_clock=lambda: issuer_now["value"],
                 )
 
-            issuer_now["value"] += timedelta(hours=1)
+            def expire_original_claim(_session, checkpoint, store_now):
+                assert checkpoint is not None
+                updated = copy.deepcopy(checkpoint)
+                updated["incomplete_session_recovery_claim"] = {
+                    "version": 1,
+                    "claim_id": "store-clock-claim",
+                    "claimed_at": (store_now - timedelta(minutes=10)).isoformat(),
+                    "claim_expires_at": (store_now - timedelta(minutes=5)).isoformat(),
+                }
+                return updated
+
+            await store.transform_checkpoint_with_store_time(
+                session_id,
+                expire_original_claim,
+            )
             replayed = await store.publish_interaction_transition(
                 session_id,
                 event=interrupted,
                 from_statuses={SessionStatus.RUNNING},
                 to_status=SessionStatus.INTERRUPTED,
-                expected_recovery_claim_id="issuer-clock-claim",
-                expected_recovery_claim_clock=lambda: issuer_now["value"],
+                expected_recovery_claim_id="store-clock-claim",
             )
             assert replayed.replayed is True
             assert replayed.event == interrupted
 
-            replacement_claimed_at = issuer_now["value"]
-
-            def replace_claim(_session, checkpoint):
+            def replace_claim(_session, checkpoint, store_now):
                 assert checkpoint is not None
                 updated = copy.deepcopy(checkpoint)
                 updated["incomplete_session_recovery_claim"] = {
                     "version": 1,
                     "claim_id": "replacement-claim",
-                    "claimed_at": replacement_claimed_at.isoformat(),
-                    "claim_expires_at": (replacement_claimed_at + timedelta(minutes=5)).isoformat(),
+                    "claimed_at": store_now.isoformat(),
+                    "claim_expires_at": (store_now + timedelta(minutes=5)).isoformat(),
                 }
                 return updated
 
-            await store.transform_checkpoint(session_id, replace_claim)
+            await store.transform_checkpoint_with_store_time(session_id, replace_claim)
             with pytest.raises(
                 SessionRunFenced,
                 match="superseded by another recovery authority",
@@ -9704,7 +10003,7 @@ def test_session_store_conformance_interaction_claim_uses_issuer_clock(
                 await store.load_interaction_transition_receipt(
                     session_id,
                     transition=transition,
-                    expected_recovery_claim_id="issuer-clock-claim",
+                    expected_recovery_claim_id="store-clock-claim",
                 )
             with pytest.raises(
                 SessionRunFenced,
@@ -9715,16 +10014,79 @@ def test_session_store_conformance_interaction_claim_uses_issuer_clock(
                     event=interrupted,
                     from_statuses={SessionStatus.RUNNING},
                     to_status=SessionStatus.INTERRUPTED,
-                    expected_recovery_claim_id="issuer-clock-claim",
-                    expected_recovery_claim_clock=lambda: issuer_now["value"],
+                    expected_recovery_claim_id="store-clock-claim",
                 )
+
+            expired_session_id = f"{session_id}-expired"
+            expired_interaction_id = f"{interaction_id}-expired"
+            expired_started = Event(
+                id=f"evt-{expired_interaction_id}-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=expired_session_id,
+                interaction_id=expired_interaction_id,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=expired_session_id,
+                    messages=[Message.text("user", "expired claim")],
+                ),
+                identity=_identity(),
+                interaction_started_event=expired_started,
+                interaction_source_messages=[Message.text("user", "expired claim")],
+            )
+
+            def install_expired_claim(_session, checkpoint, store_now):
+                return {
+                    **({} if checkpoint is None else checkpoint),
+                    "incomplete_session_recovery_claim": {
+                        "version": 1,
+                        "claim_id": "expired-store-clock-claim",
+                        "claimed_at": (store_now - timedelta(minutes=10)).isoformat(),
+                        "claim_expires_at": (store_now - timedelta(minutes=5)).isoformat(),
+                    },
+                }
+
+            await store.transform_checkpoint_with_store_time(
+                expired_session_id,
+                install_expired_claim,
+            )
+            expired_event = Event(
+                id=f"evt-{expired_interaction_id}-interrupted",
+                type=EventType.INTERACTION_INTERRUPTED,
+                session_id=expired_session_id,
+                interaction_id=expired_interaction_id,
+            )
+            with pytest.raises(
+                SessionRunFenced,
+                match="lost its exact terminal recovery claim",
+            ):
+                await store.publish_interaction_transition(
+                    expired_session_id,
+                    event=expired_event,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.INTERRUPTED,
+                    expected_recovery_claim_id="expired-store-clock-claim",
+                )
+            retained_expired = await store.load(expired_session_id)
+            assert retained_expired is not None
+            assert retained_expired.status is SessionStatus.RUNNING
+            assert (
+                await store.query_events(
+                    EventQuery(
+                        session_id=expired_session_id,
+                        event_id=expired_event.id,
+                    )
+                )
+                == []
+            )
         finally:
             await _close_store(store)
 
     asyncio.run(run())
 
 
-def test_sqlite_interaction_claim_clock_fatal_signal_releases_writer_transaction(
+def test_sqlite_interaction_claim_store_clock_fatal_signal_releases_writer_transaction(
     tmp_path,
 ) -> None:
     class FatalClaimClockSignal(BaseException):
@@ -9732,11 +10094,18 @@ def test_sqlite_interaction_claim_clock_fatal_signal_releases_writer_transaction
 
     async def run() -> None:
         database = tmp_path / "fatal-interaction-claim-clock.sqlite"
-        store = SQLiteSessionStore(database)
+        observed_at = datetime(2040, 1, 1, tzinfo=UTC)
+        fail_clock = {"value": False}
+
+        def ownership_clock() -> datetime:
+            if fail_clock["value"]:
+                raise FatalClaimClockSignal("claim clock stopped")
+            return observed_at
+
+        store = SQLiteSessionStore(database, ownership_clock=ownership_clock)
         peer: SQLiteSessionStore | None = None
         session_id = "fatal-interaction-claim-clock"
         interaction_id = "fatal-interaction-claim-clock"
-        observed_at = datetime(2040, 1, 1, tzinfo=UTC)
         try:
             started = Event(
                 id=f"evt-{interaction_id}-started",
@@ -9772,9 +10141,7 @@ def test_sqlite_interaction_claim_clock_fatal_signal_releases_writer_transaction
                 interaction_id=interaction_id,
             )
 
-            def fail_clock() -> datetime:
-                raise FatalClaimClockSignal("claim clock stopped")
-
+            fail_clock["value"] = True
             with pytest.raises(FatalClaimClockSignal, match="claim clock stopped"):
                 await store.publish_interaction_transition(
                     session_id,
@@ -9782,17 +10149,16 @@ def test_sqlite_interaction_claim_clock_fatal_signal_releases_writer_transaction
                     from_statuses={SessionStatus.RUNNING},
                     to_status=SessionStatus.INTERRUPTED,
                     expected_recovery_claim_id="fatal-clock-claim",
-                    expected_recovery_claim_clock=fail_clock,
                 )
             assert store._connection.in_transaction is False
 
+            fail_clock["value"] = False
             published = await store.publish_interaction_transition(
                 session_id,
                 event=interrupted,
                 from_statuses={SessionStatus.RUNNING},
                 to_status=SessionStatus.INTERRUPTED,
                 expected_recovery_claim_id="fatal-clock-claim",
-                expected_recovery_claim_clock=lambda: observed_at,
             )
             assert published.session.status is SessionStatus.INTERRUPTED
             assert published.replayed is False
@@ -11978,7 +12344,7 @@ def test_session_store_conformance_fences_stale_reservation_claims(
                 replacement = await store.fence_stalled_run(
                     created.id,
                     statuses={SessionStatus.RUNNING},
-                    inactive_before=datetime.max.replace(tzinfo=UTC),
+                    inactive_for_seconds=0,
                 )
                 assert replacement is not None
                 assert replacement.run_epoch == owned.run_epoch + 1
@@ -23828,7 +24194,7 @@ def test_session_store_conformance_interaction_receipts_do_not_bypass_run_fencin
         fenced = await store.fence_stalled_run(
             session_id,
             statuses={status},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is not None
 

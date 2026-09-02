@@ -1591,6 +1591,7 @@ def test_contract_bound_creation_reserves_claim_lifecycle_headroom(
                 session_id,
             ),
             worker_id=worker_id,
+            lease_expires_at=claimed.lease_expires_at,
         )
         assert attached.status is TaskStatus.RUNNING
         assert attached.session_id == session_id
@@ -2423,6 +2424,7 @@ def test_contracted_task_transitions_require_a_bounded_session_binding() -> None
                     oversized_session_id,
                 ),
                 worker_id="bounded-transition-worker",
+                lease_expires_at=claimed.lease_expires_at,
             )
         unchanged_claim = await store.load_task(claimed.id)
         assert unchanged_claim is not None
@@ -2469,6 +2471,7 @@ def test_task_worker_lease_uses_wall_clock_not_verification_clock(store_factory)
                     "session:separate-clock",
                 ),
                 worker_id="task-worker",
+                lease_expires_at=task.lease_expires_at,
             )
 
             attempt = await store.begin_work_attempt(
@@ -2488,6 +2491,90 @@ def test_task_worker_lease_uses_wall_clock_not_verification_clock(store_factory)
             close = getattr(store, "close", None)
             if close is not None:
                 await close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_verifier_claim_lease_uses_store_ownership_clock(backend: str, tmp_path) -> None:
+    async def scenario() -> None:
+        evidence_now = [datetime(2100, 1, 1, tzinfo=UTC)]
+        ownership_now = [datetime(2026, 8, 31, tzinfo=UTC)]
+        store = (
+            InMemoryTaskStore(
+                clock=lambda: evidence_now[0],
+                ownership_clock=lambda: ownership_now[0],
+            )
+            if backend == "memory"
+            else SQLiteTaskStore(
+                tmp_path / "verifier-claim-store-time.db",
+                clock=lambda: evidence_now[0],
+                ownership_clock=lambda: ownership_now[0],
+            )
+        )
+        try:
+            contract = _contract(contract_id=f"verifier-claim-store-time-{backend}")
+            await store.publish_work_contract(contract)
+            session_id = f"session:verifier-claim-store-time:{backend}"
+            task = await store.create_running_task(
+                TaskCreate(
+                    task_id=f"verifier-claim-store-time-task-{backend}",
+                    type="verified-work",
+                    session_id=session_id,
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(session_id),
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id=f"verifier-claim-store-time-attempt-{backend}",
+                    task_id=task.id,
+                    session_id=session_id,
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("verifier-claim-store-time"),
+                )
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id=f"verifier-claim-store-time-proposal-{backend}",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("verifier-claim-store-time"),
+                )
+            )
+            first_request = CompletionVerificationClaimRequest(
+                claim_id=f"verifier-claim-store-time-claim-1-{backend}",
+                proposal_id=proposal.proposal_id,
+                worker_id="verifier-one",
+                verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+                lease_seconds=30,
+            )
+            first = await _claim_completion_verification(store, first_request)
+
+            assert attempt.started_at == evidence_now[0]
+            assert proposal.proposed_at == evidence_now[0]
+            assert first.claimed_at == ownership_now[0]
+            assert first.lease_expires_at == ownership_now[0] + timedelta(seconds=30)
+
+            evidence_now[0] = datetime(1900, 1, 1, tzinfo=UTC)
+            assert await _claim_completion_verification(store, first_request) == first
+            assert await store.renew_completion_verification_claim(first_request) == first
+
+            ownership_now[0] += timedelta(seconds=31)
+            replacement = await _claim_completion_verification(
+                store,
+                first_request.model_copy(
+                    update={
+                        "claim_id": f"verifier-claim-store-time-claim-2-{backend}",
+                        "worker_id": "verifier-two",
+                    }
+                ),
+            )
+            assert replacement.attempt_number == 2
+            assert replacement.claimed_at == ownership_now[0]
+        finally:
+            if isinstance(store, SQLiteTaskStore):
+                await store.close()
 
     asyncio.run(scenario())
 
@@ -2519,6 +2606,7 @@ def test_durable_decision_applies_after_originating_task_lease_expires() -> None
                 "session:decision-after-worker-expiry",
             ),
             worker_id="task-worker",
+            lease_expires_at=task.lease_expires_at,
         )
         attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -2605,6 +2693,7 @@ def test_rejected_continue_decision_fences_live_attempt_worker() -> None:
                 "session:continue-fences-attempt-worker",
             ),
             worker_id="originating-worker",
+            lease_expires_at=task.lease_expires_at,
         )
         attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -2654,9 +2743,17 @@ def test_rejected_continue_decision_fences_live_attempt_worker() -> None:
         assert continued.worker_id is None
         assert continued.lease_expires_at is None
         with pytest.raises(TaskClaimLost):
-            await store.heartbeat(task.id, "originating-worker")
+            await store.heartbeat(
+                task.id,
+                "originating-worker",
+                lease_expires_at=task.lease_expires_at,
+            )
         with pytest.raises(TaskClaimLost):
-            await store.release_attached_task_worker(task.id, "originating-worker")
+            await store.release_attached_task_worker(
+                task.id,
+                "originating-worker",
+                lease_expires_at=task.lease_expires_at,
+            )
 
         next_attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -3100,7 +3197,7 @@ def test_decision_application_prepares_receipt_before_publishing_task_transition
                 return now if tz is not None else now.replace(tzinfo=None)
 
         monkeypatch.setattr(tasks_module, "datetime", ApplicationDatetime)
-        store = InMemoryTaskStore(clock=lambda: now)
+        store = InMemoryTaskStore(clock=lambda: now, ownership_clock=lambda: now)
         contract = _contract()
         await store.publish_work_contract(contract)
         task = await store.create_running_task(
@@ -3348,6 +3445,7 @@ def test_decision_application_holds_attached_tasks(
                 f"session:{verdict.value}",
             ),
             worker_id="task-worker",
+            lease_expires_at=task.lease_expires_at,
         )
         attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -3498,7 +3596,10 @@ def test_decision_application_holds_attached_tasks(
 def test_decision_requires_complete_contract_coverage_and_current_claim() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 8, 19, tzinfo=UTC)]
-        store = InMemoryTaskStore(clock=lambda: now[0])
+        store = InMemoryTaskStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract()
         await store.publish_work_contract(contract)
         task = await store.create_running_task(
@@ -3624,7 +3725,10 @@ def test_decision_requires_complete_contract_coverage_and_current_claim() -> Non
 def test_terminal_task_rejects_new_verifier_authority_but_preserves_exact_replay() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 8, 19, tzinfo=UTC)]
-        store = InMemoryTaskStore(clock=lambda: now[0])
+        store = InMemoryTaskStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract(contract_id="terminal-verifier-authority-contract")
         await store.publish_work_contract(contract)
 
@@ -4994,6 +5098,7 @@ def test_stale_ordinary_worker_cannot_park_successor_claim() -> None:
             task_id: str,
             *,
             worker_id: str,
+            lease_expires_at: datetime | None = None,
             contract: WorkContractRef,
         ) -> Task:
             self.parking_started.set()
@@ -5001,6 +5106,7 @@ def test_stale_ordinary_worker_cannot_park_successor_claim() -> None:
             return await super().hold_claimed_work_contract_task(
                 task_id,
                 worker_id=worker_id,
+                lease_expires_at=lease_expires_at,
                 contract=contract,
             )
 
@@ -5043,7 +5149,7 @@ def test_stale_ordinary_worker_cannot_park_successor_claim() -> None:
         reclaimed = await store.reclaim_expired(query=TaskQuery(type=task.type))
         assert [item.id for item in reclaimed] == [task.id]
         successor = await store.claim_task(
-            "successor-worker",
+            "stale-worker",
             TaskQuery(type=task.type),
             lease_seconds=30,
         )
@@ -5056,7 +5162,7 @@ def test_stale_ordinary_worker_cannot_park_successor_claim() -> None:
         current = await store.load_task(task.id)
         assert current is not None
         assert current.status is TaskStatus.CLAIMED
-        assert current.worker_id == "successor-worker"
+        assert current.worker_id == "stale-worker"
         assert current.lease_expires_at == successor.lease_expires_at
 
     asyncio.run(scenario())
@@ -5662,10 +5768,16 @@ def test_contracted_task_rejects_every_legacy_completion_entrance() -> None:
                 "session:bypass",
             ),
             worker_id="worker-a",
+            lease_expires_at=claimed.lease_expires_at,
         )
 
         with pytest.raises(TaskCompletionDecisionRequired):
-            await store.complete_task(running.id, {"unauthorized": True}, worker_id="worker-a")
+            await store.complete_task(
+                running.id,
+                {"unauthorized": True},
+                worker_id="worker-a",
+                lease_expires_at=running.lease_expires_at,
+            )
         with pytest.raises(TaskCompletionDecisionRequired):
             await store.terminalize_task(
                 TaskTerminalizationRequest(
@@ -5689,6 +5801,7 @@ def test_contracted_task_rejects_every_legacy_completion_entrance() -> None:
             running.id,
             {"message": "Independent execution failure remains allowed."},
             worker_id="worker-a",
+            lease_expires_at=running.lease_expires_at,
         )
         assert failed.status is TaskStatus.FAILED
 
@@ -5939,6 +6052,7 @@ def test_sqlite_attachment_rechecks_worker_lease_after_writer_lock_wait(tmp_path
                     session_id=session_id,
                     session_invocation=binding,
                     worker_id=worker_id,
+                    lease_expires_at=claimed.lease_expires_at,
                 )
             finally:
                 await store.close()
@@ -7275,12 +7389,14 @@ def test_unproven_worker_parking_is_rejected_before_claim_mutation() -> None:
             task_id: str,
             *,
             worker_id: str,
+            lease_expires_at: datetime | None = None,
             contract: WorkContractRef,
         ) -> Task:
             await asyncio.to_thread(lambda: None)
             return await super().hold_claimed_work_contract_task(
                 task_id,
                 worker_id=worker_id,
+                lease_expires_at=lease_expires_at,
                 contract=contract,
             )
 
@@ -7687,6 +7803,7 @@ def test_runtime_admission_and_worker_parking_store_failures_are_detached(
             task_id: str,
             *,
             worker_id: str,
+            lease_expires_at: datetime | None = None,
             contract: WorkContractRef,
         ) -> Task:
             loaded = await super().load_task(task_id)
@@ -7981,7 +8098,7 @@ def test_startup_interruption_recovery_preserves_contracted_parent_for_verifier(
         events_before = await session_store.load_events(session_id)
 
         scheduled = await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=datetime.now(UTC)
+            interrupting_inactive_for_seconds=0
         )
 
         assert scheduled == 0

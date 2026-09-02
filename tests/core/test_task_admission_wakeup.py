@@ -54,7 +54,13 @@ async def _complete_handler(
     worker_id: str,
 ) -> None:
     assert app.task_store is not None
-    await app.task_store.complete_task(task.id, {"ok": True}, worker_id=worker_id)
+    assert task.lease_expires_at is not None
+    await app.task_store.complete_task(
+        task.id,
+        {"ok": True},
+        worker_id=worker_id,
+        lease_expires_at=task.lease_expires_at,
+    )
 
 
 async def _wait_for_subscribers(store: InMemoryTaskStore | SQLiteTaskStore, count: int) -> None:
@@ -274,9 +280,11 @@ async def test_immediate_retry_successor_wakes_once_after_settlement_commit(
         )
         claimed = await store.claim_task("retry-worker", TaskQuery(type="job"))
         assert claimed is not None and claimed.retry_series is not None
+        assert claimed.lease_expires_at is not None
         request = TaskRetrySettlementRequest(
             task_id=claimed.id,
             worker_id="retry-worker",
+            lease_expires_at=claimed.lease_expires_at,
             idempotency_key="retry-once",
             causal_budget_id=claimed.retry_series.causal_budget_id,
             disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
@@ -321,7 +329,12 @@ async def test_duplicate_and_stale_hints_never_duplicate_claim_authority() -> No
 
         claimed = await store.claim_task("winner", TaskQuery(type="job"))
         assert claimed is not None and claimed.id == created.id
-        await store.complete_task(claimed.id, {"ok": True}, worker_id="winner")
+        await store.complete_task(
+            claimed.id,
+            {"ok": True},
+            worker_id="winner",
+            lease_expires_at=claimed.lease_expires_at,
+        )
         store._publish_task_admission_broadcast()
         assert await wakeup.wait(0.5, None) is False
         assert await store.claim_task("late-worker", TaskQuery(type="job")) is None

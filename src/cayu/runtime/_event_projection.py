@@ -3147,7 +3147,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         },
     )
     policies[EventType.SESSION_RUN_FENCED] = _observed_policy(
-        "inactive_before metadata previous_run_epoch reason run_epoch",
+        "inactive_for_seconds metadata previous_run_epoch reason run_epoch",
         untrusted_container_keys={"metadata"},
     )
     policies[EventType.TURN_COMPLETED] = _observed_policy(

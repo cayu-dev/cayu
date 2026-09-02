@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
 from tests.core.task_invocation_fixtures import unattributed_task_invocation
+from tests.core.task_store_conformance import assert_task_store_time_conformance
 
 from cayu import (
     CayuApp,
     InMemoryTaskStore,
     SQLiteTaskStore,
     Task,
+    TaskClaimLost,
     TaskCreate,
     TaskOrder,
     TaskQuery,
@@ -119,10 +123,104 @@ def test_injected_availability_clock_does_not_expire_new_task_leases(tmp_path) -
                 )
                 claimed = await store.claim_task(f"worker-{index}")
                 assert claimed is not None
-                released = await store.release_task(task_id, f"worker-{index}")
+                released = await store.release_task(
+                    task_id,
+                    f"worker-{index}",
+                    lease_expires_at=claimed.lease_expires_at,
+                )
                 assert released.status is TaskStatus.PENDING
         finally:
             await stores[1].close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_heartbeat_samples_ownership_time_after_writer_lock(tmp_path) -> None:
+    async def run() -> None:
+        boundary = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        ownership_clock = _MutableClock(boundary)
+        path = tmp_path / "heartbeat-lock-clock.sqlite"
+        store = SQLiteTaskStore(path, ownership_clock=ownership_clock)
+        blocker: sqlite3.Connection | None = None
+        release_timer: threading.Timer | None = None
+        try:
+            await store.create_task(TaskCreate(task_id="locked-heartbeat", type="scheduled"))
+            claimed = await store.claim_task("worker", lease_seconds=1)
+            assert claimed is not None
+
+            blocker = sqlite3.connect(path, timeout=5, check_same_thread=False)
+            blocker.execute("PRAGMA busy_timeout = 5000")
+            blocker.execute("BEGIN IMMEDIATE")
+
+            def release_writer() -> None:
+                ownership_clock.value = boundary + timedelta(seconds=2)
+                assert blocker is not None
+                blocker.commit()
+
+            release_timer = threading.Timer(0.05, release_writer)
+            release_timer.start()
+            with pytest.raises(TaskClaimLost, match="lease.*expired"):
+                await store.heartbeat(
+                    "locked-heartbeat",
+                    "worker",
+                    lease_expires_at=claimed.lease_expires_at,
+                    extend_seconds=30,
+                )
+        finally:
+            if release_timer is not None:
+                release_timer.join(timeout=5)
+            if blocker is not None:
+                blocker.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_task_ownership_uses_the_store_clock(backend: str, tmp_path) -> None:
+    async def run() -> None:
+        boundary = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        availability_clock = _MutableClock(boundary)
+        ownership_clock = _MutableClock(boundary)
+        if backend == "memory":
+            store: InMemoryTaskStore | SQLiteTaskStore = InMemoryTaskStore(
+                clock=availability_clock,
+                ownership_clock=ownership_clock,
+            )
+            contender_store: SQLiteTaskStore | None = None
+        else:
+            path = tmp_path / "authoritative-task-clock.sqlite"
+            store = SQLiteTaskStore(
+                path,
+                clock=availability_clock,
+                ownership_clock=ownership_clock,
+            )
+            contender_store = SQLiteTaskStore(
+                path,
+                clock=availability_clock,
+                ownership_clock=ownership_clock,
+            )
+        try:
+            await assert_task_store_time_conformance(
+                store,
+                initial_time=boundary,
+                set_evidence_time=lambda value: setattr(
+                    availability_clock,
+                    "value",
+                    value,
+                ),
+                set_ownership_time=lambda value: setattr(
+                    ownership_clock,
+                    "value",
+                    value,
+                ),
+                contender_store=contender_store,
+            )
+        finally:
+            if contender_store is not None:
+                await contender_store.close()
+            if isinstance(store, SQLiteTaskStore):
+                await store.close()
 
     asyncio.run(run())
 

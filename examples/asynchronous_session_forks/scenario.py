@@ -7,7 +7,6 @@ import contextlib
 from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from cayu import (
@@ -474,7 +473,13 @@ async def run_asynchronous_fork_trace() -> AsynchronousForkTrace:
     claimed = tasks.claimed_task
     if claimed is None:
         raise AssertionError("Claim barrier did not retain the claimed task.")
-    await tasks.release_task(claimed.id, "worker-before-reconstruction")
+    if claimed.lease_expires_at is None:
+        raise AssertionError("Claim barrier retained a task without a lease.")
+    await tasks.release_task(
+        claimed.id,
+        "worker-before-reconstruction",
+        lease_expires_at=claimed.lease_expires_at,
+    )
     trace.append("worker_reconstructed_after_claim_boundary")
 
     worker, dispatcher = _build_app(sessions, tasks, provider, effect)
@@ -540,9 +545,13 @@ async def run_asynchronous_fork_trace() -> AsynchronousForkTrace:
     else:
         raise AssertionError("Terminal-publication worker loss was not injected.")
     trace.append("worker_lost_after_durable_terminal_publication")
+    claimed_a = await tasks.load_task(handles["A"].metadata["queue_task_id"])
+    if claimed_a is None or claimed_a.lease_expires_at is None:
+        raise AssertionError("Child A lost its claimed dispatch lease.")
     await tasks.release_task(
-        handles["A"].metadata["queue_task_id"],
+        claimed_a.id,
         "worker-a",
+        lease_expires_at=claimed_a.lease_expires_at,
     )
     terminal_recovery_worker, terminal_recovery_dispatcher = _build_app(
         sessions,
@@ -568,9 +577,13 @@ async def run_asynchronous_fork_trace() -> AsynchronousForkTrace:
     else:
         raise AssertionError("Provider-completion worker loss was not injected.")
     trace.append("worker_lost_after_durable_provider_completion")
+    claimed_c = await tasks.load_task(handles["C"].metadata["queue_task_id"])
+    if claimed_c is None or claimed_c.lease_expires_at is None:
+        raise AssertionError("Child C lost its claimed dispatch lease.")
     await tasks.release_task(
-        handles["C"].metadata["queue_task_id"],
+        claimed_c.id,
         "worker-c",
+        lease_expires_at=claimed_c.lease_expires_at,
     )
     calls_before_c_recovery = Counter(provider.calls)
     provider_recovery_worker, provider_recovery_dispatcher = _build_app(
@@ -582,7 +595,7 @@ async def run_asynchronous_fork_trace() -> AsynchronousForkTrace:
     recovery_c = await provider_recovery_worker.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=CHILD_SESSION_IDS["C"],
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
             reason="Application no longer needs child C after worker reconstruction.",
         )
     )

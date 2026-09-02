@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from fnmatch import fnmatchcase
 from hashlib import sha256
 from itertools import islice
@@ -1270,9 +1270,7 @@ class CayuApp:
         self.budget_store = (
             budget_store if budget_store is not None else SessionBudgetStore(self.session_store)
         )
-        self.budget_ledger = (
-            budget_ledger if budget_ledger is not None else InMemoryBudgetLedger(clock=self._clock)
-        )
+        self.budget_ledger = budget_ledger if budget_ledger is not None else InMemoryBudgetLedger()
         self.event_watcher_store = (
             event_watcher_store if event_watcher_store is not None else InMemoryEventWatcherStore()
         )
@@ -2125,17 +2123,10 @@ class CayuApp:
     async def resume_pending_interruption_cascades(
         self,
         *,
-        interrupting_inactive_before: datetime | None = None,
+        interrupting_inactive_for_seconds: int | None = None,
     ) -> int:
-        if interrupting_inactive_before is not None:
-            if (
-                interrupting_inactive_before.tzinfo is None
-                or interrupting_inactive_before.utcoffset() is None
-            ):
-                raise ValueError("interrupting_inactive_before must be timezone-aware.")
-            interrupting_inactive_before = interrupting_inactive_before.astimezone(UTC)
         return await self._session_engine.resume_pending_interruption_cascades(
-            interrupting_inactive_before=interrupting_inactive_before
+            interrupting_inactive_for_seconds=interrupting_inactive_for_seconds
         )
 
     async def interruption_cascade_status(self, session_id: str) -> str:
@@ -7647,6 +7638,7 @@ class CayuApp:
             ),
             task_id=task_id,
             task_worker_id=task_worker_id,
+            task_lease_expires_at=None,
             task_handoff_id=task_handoff_id,
             start_event_type=start_event_type,
             start_event_payload=start_event_payload,

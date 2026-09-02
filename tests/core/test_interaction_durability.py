@@ -1109,7 +1109,6 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
         expected_recovery_claim_id=None,
-        expected_recovery_claim_clock=None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_model_completion_stage_settlements.append(model_completion_stage_settlement)
@@ -1124,7 +1123,6 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
             expected_recovery_claim_id=expected_recovery_claim_id,
-            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
         if self.remaining_lost_acknowledgements > 0:
             self.remaining_lost_acknowledgements -= 1
@@ -1325,7 +1323,6 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
         expected_recovery_claim_id: str | None = None,
-        expected_recovery_claim_clock=None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_from_statuses.append(set(from_statuses))
@@ -1341,7 +1338,6 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
             expected_recovery_claim_id=expected_recovery_claim_id,
-            expected_recovery_claim_clock=expected_recovery_claim_clock,
         )
         if not self._lost_acknowledgement:
             self._lost_acknowledgement = True
@@ -2899,7 +2895,7 @@ def test_runtime_cancellation_clears_transition_handoff_after_run_fence_loss() -
             fenced = await store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.RUNNING},
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
             assert fenced is not None
             fence_acquired.set()
@@ -3865,7 +3861,7 @@ def test_runtime_replay_fails_closed_after_run_fence_transfer() -> None:
             fenced = await store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.COMPLETED},
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
             assert fenced is not None
             fence_acquired.set()

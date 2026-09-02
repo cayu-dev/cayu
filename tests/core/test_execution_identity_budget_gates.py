@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -1062,7 +1061,7 @@ def test_stale_run_cannot_claim_or_release_a_reserved_identity() -> None:
                 replacement = await self.fence_stalled_run(
                     publication_session_id,
                     statuses={SessionStatus.RUNNING},
-                    inactive_before=datetime.max.replace(tzinfo=UTC),
+                    inactive_for_seconds=0,
                 )
                 assert replacement is not None
                 self.replacement_epoch = replacement.run_epoch

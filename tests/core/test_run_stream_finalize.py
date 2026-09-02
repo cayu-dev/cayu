@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from datetime import timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -547,7 +546,7 @@ def test_wait_for_stream_resumption_retains_stale_run_fence() -> None:
             replacement = await h.store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.RUNNING},
-                inactive_before=stale_owner.last_activity_at + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
             assert replacement is not None
             return replacement.run_epoch

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -375,8 +376,12 @@ def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -
             super().__init__()
             self.failed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if not self.failed and any(
                 event.type == EventType.SESSION_CHECKPOINTED for event in kwargs.get("events", [])
             ):
@@ -449,8 +454,12 @@ def test_compact_session_cancellation_during_terminal_reconciliation_propagates(
     class LostTerminalAcknowledgementStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if any(
                 event.type == EventType.SESSION_CHECKPOINTED for event in kwargs.get("events", [])
             ):
@@ -550,7 +559,9 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
             self.release = asyncio.Event()
             self.child_cancellation_observed = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.blocked_once and any(
                 event.type == blocked_event_type for event in kwargs.get("events", [])
             ):
@@ -563,7 +574,9 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
                         # SQLite's physical worker has this shape: cancelling
                         # its await does not stop the write already in progress.
                         self.child_cancellation_observed.set()
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     class CountingProvider(ModelProvider):
         name = "stalled-publication-provider"
@@ -864,7 +877,9 @@ def test_compact_session_late_completion_commit_is_not_republished(
             self.blocked_once = False
             self.cancellations = 0
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.blocked_once and any(
                 event.type == EventType.MODEL_COMPLETED for event in kwargs.get("events", [])
             ):
@@ -877,7 +892,9 @@ def test_compact_session_late_completion_commit_is_not_republished(
                         # Match a SQLite worker whose physical commit continues
                         # after cancellation of the awaiting task.
                         self.cancellations += 1
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if any(event.type == EventType.MODEL_COMPLETED for event in kwargs.get("events", [])):
                 self.committed.set()
             return result
@@ -1031,8 +1048,12 @@ def test_compact_session_lost_budget_event_ack_releases_without_duplicate() -> N
             super().__init__()
             self.failed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if not self.failed and any(
                 event.type == EventType.BUDGET_RESERVED for event in kwargs.get("events", [])
             ):
@@ -1155,8 +1176,12 @@ def test_compact_session_lost_limit_event_ack_is_not_duplicated(action: str) -> 
             super().__init__()
             self.failed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if not self.failed and any(
                 event.type == EventType.BUDGET_LIMIT_REACHED for event in kwargs.get("events", [])
             ):
@@ -1272,8 +1297,12 @@ def test_compact_session_attempt_ack_expiry_blocks_first_provider_dispatch() -> 
     class ExpiringAttemptAcknowledgementStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if any(event.type == EventType.BUDGET_RESERVED for event in kwargs.get("events", [])):
                 now["value"] = accepted_at + timedelta(minutes=6)
             return result
@@ -1289,7 +1318,7 @@ def test_compact_session_attempt_ack_expiry_blocks_first_provider_dispatch() -> 
             yield ModelStreamEvent.completed({"model": request.model})
 
     async def run() -> None:
-        store = ExpiringAttemptAcknowledgementStore()
+        store = ExpiringAttemptAcknowledgementStore(ownership_clock=lambda: now["value"])
         provider = CountingProvider()
         sink = InMemoryEventSink()
         pricing = PriceBook(
@@ -1382,8 +1411,12 @@ def test_compact_session_completion_ack_expiry_blocks_next_hierarchy_dispatch() 
         invocation_lifecycle_command_version = 1
         expired = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if not self.expired and any(
                 event.type == EventType.MODEL_COMPLETED for event in kwargs.get("events", [])
             ):
@@ -1408,7 +1441,7 @@ def test_compact_session_completion_ack_expiry_blocks_next_hierarchy_dispatch() 
             )
 
     async def run() -> None:
-        store = ExpiringCompletionAcknowledgementStore()
+        store = ExpiringCompletionAcknowledgementStore(ownership_clock=lambda: now["value"])
         provider = HierarchyProvider()
         app = CayuApp(
             session_store=store,
@@ -1669,14 +1702,18 @@ def test_explicit_compaction_lost_completion_ack_is_restart_safe() -> None:
             super().__init__()
             self.failed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             events = kwargs.get("events", [])
             is_compaction_completion = any(
                 event.type == EventType.MODEL_COMPLETED
                 and event.payload.get("purpose") == "context_compaction"
                 for event in events
             )
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if is_compaction_completion and not self.failed:
                 self.failed = True
                 raise ConnectionError("explicit completion acknowledgement lost")
@@ -1988,14 +2025,14 @@ class FailingCompletionPublishStore(InMemorySessionStore):
         super().__init__()
         self.failed = False
 
-    async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+    async def publish_session_operation_guarded_with_store_time(self, session_id: str, **kwargs):
         events = kwargs.get("events", [])
         if not self.failed and any(
             event.type == EventType.SESSION_CHECKPOINTED for event in events
         ):
             self.failed = True
             raise RuntimeError("simulated completion publication failure")
-        return await super().publish_session_operation_guarded(session_id, **kwargs)
+        return await super().publish_session_operation_guarded_with_store_time(session_id, **kwargs)
 
 
 class BlockingCompactor(ContextCompactor):
@@ -2033,6 +2070,19 @@ class BlockingCompactionProvider(ModelProvider):
         yield ModelStreamEvent.completed(
             {"model": request.model, "usage": {"input_tokens": 8, "output_tokens": 2}}
         )
+
+
+def _test_compaction_heartbeat_state(
+    claim_expires_at: datetime,
+) -> session_engine_module._SessionOperationClaimHeartbeatState:
+    state = session_engine_module._SessionOperationClaimHeartbeatState()
+    state.confirm_claim(
+        claim_expires_at,
+        claim_deadline_monotonic=(
+            time.monotonic() + session_engine_module._SESSION_OPERATION_CLAIM_LEASE.total_seconds()
+        ),
+    )
+    return state
 
 
 class OverlappingCompactor(ModelCompactor):
@@ -3530,7 +3580,7 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
             Message.text("assistant", "current answer"),
         ]
         await store.append_transcript_messages(session_id, transcript)
-        completed = await store.update_status(session_id, SessionStatus.COMPLETED)
+        await store.update_status(session_id, SessionStatus.COMPLETED)
         stale_owner_ready = asyncio.Event()
         release_stale_owner = asyncio.Event()
 
@@ -3538,7 +3588,7 @@ def test_compact_session_fences_expired_recovery_owner_before_retry() -> None:
             fenced = await store.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.COMPLETED},
-                inactive_before=completed.last_activity_at,
+                inactive_for_seconds=0,
             )
             assert fenced is not None
 
@@ -4028,11 +4078,15 @@ def test_compact_session_generator_exit_propagates_abandonment_accounting_failur
     class FailingAbandonmentPublishStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             events = kwargs.get("events", [])
             if any(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events):
                 raise RuntimeError("simulated abandonment accounting failure")
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     class AbandonSecondHierarchyCallProvider(ModelProvider):
         name = "abandon-hierarchy-accounting-failure"
@@ -4141,15 +4195,13 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
             self.fail_heartbeat_reconciliation = False
             self.heartbeat_failed = asyncio.Event()
 
-        async def load_checkpoint(self, session_id: str):
-            checkpoint = await super().load_checkpoint(session_id)
-            if self.fail_heartbeat_reconciliation and checkpoint is not None:
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            if self.fail_heartbeat_reconciliation and kwargs.get("events") == []:
                 self.fail_heartbeat_reconciliation = False
-                checkpoint["session_operations"]["active_operation_id"] = "replacement"
                 self.heartbeat_failed.set()
-            return checkpoint
-
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+                raise RuntimeError("Session compaction operation ownership changed during renewal.")
             if any(
                 event.type == EventType.CONTEXT_COMPACTION_FAILED
                 for event in kwargs.get("events", [])
@@ -4157,7 +4209,9 @@ def test_compact_session_generator_exit_keeps_accounting_failure_authoritative_w
                 self.fail_heartbeat_reconciliation = True
                 await asyncio.wait_for(self.heartbeat_failed.wait(), timeout=5)
                 raise RuntimeError("simulated abandonment accounting failure")
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     class AbandonAfterHeartbeatFailureProvider(ModelProvider):
         name = "abandon-after-heartbeat-failure"
@@ -4253,12 +4307,16 @@ def test_compact_session_cancellation_preserves_completed_hierarchy_usage() -> N
             self.failure_publish_started = asyncio.Event()
             self.allow_failure_publish = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             events = kwargs.get("events", [])
             if any(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events):
                 self.failure_publish_started.set()
                 await self.allow_failure_publish.wait()
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     class CancelSecondHierarchyCallProvider(ModelProvider):
         name = "cancel-explicit-hierarchy"
@@ -4514,24 +4572,34 @@ def test_compact_session_expired_initial_claim_never_enters_compactor(
         class ExpiringInitialClaimStore(InMemorySessionStore):
             invocation_lifecycle_command_version = 1
 
-            async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+            async def publish_session_operation_guarded_with_store_time(
+                self,
+                session_id: str,
+                **kwargs,
+            ):
                 events = kwargs.get("events", [])
                 if [event.type for event in events] != [EventType.CONTEXT_COMPACTION_STARTED]:
-                    return await super().publish_session_operation_guarded(session_id, **kwargs)
-                commit_guard = kwargs["commit_guard"]
+                    return await super().publish_session_operation_guarded_with_store_time(
+                        session_id,
+                        **kwargs,
+                    )
+                commit_time_guard = kwargs["commit_time_guard"]
                 if expiry_boundary == "commit":
 
-                    def expire_then_guard() -> None:
+                    def expire_then_guard(_commit_at: datetime) -> None:
                         now["value"] = accepted_at + timedelta(minutes=6)
-                        commit_guard()
+                        commit_time_guard(now["value"])
 
-                    kwargs["commit_guard"] = expire_then_guard
-                result = await super().publish_session_operation_guarded(session_id, **kwargs)
+                    kwargs["commit_time_guard"] = expire_then_guard
+                result = await super().publish_session_operation_guarded_with_store_time(
+                    session_id,
+                    **kwargs,
+                )
                 if expiry_boundary == "acknowledgement":
                     now["value"] = accepted_at + timedelta(minutes=6)
                 return result
 
-        store = ExpiringInitialClaimStore()
+        store = ExpiringInitialClaimStore(ownership_clock=lambda: now["value"])
         compactor = RecordingCompactor()
         app = CayuApp(
             session_store=store,
@@ -4565,7 +4633,7 @@ def test_compact_session_expired_initial_claim_never_enters_compactor(
 
         with pytest.raises(
             session_engine_module.SessionCompactionAttemptSuperseded,
-            match="initial publication.*expired",
+            match="(?:initial publication|operation claim).*expired",
         ):
             async for _event in app.compact_session(
                 CompactSessionRequest(
@@ -4602,7 +4670,7 @@ def test_compact_session_heartbeats_claim_during_blocked_provider_dispatch(
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
-        store = InMemorySessionStore()
+        store = InMemorySessionStore(ownership_clock=lambda: now["value"])
         provider = BlockingCompactionProvider()
         app = CayuApp(
             session_store=store,
@@ -4692,7 +4760,9 @@ def test_compact_session_claim_heartbeat_loss_cancels_provider_and_fences_public
             super().__init__()
             self.stolen = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.stolen and kwargs.get("events") == []:
                 self.stolen = True
 
@@ -4708,7 +4778,9 @@ def test_compact_session_claim_heartbeat_loss_cancels_provider_and_fences_public
                     return updated
 
                 await self.transform_checkpoint(session_id, steal)
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -4780,15 +4852,21 @@ def test_compact_session_claim_heartbeat_retries_transient_store_failure(monkeyp
             self.heartbeat_calls = 0
             self.renewed = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if kwargs.get("events") == []:
                 self.heartbeat_calls += 1
                 if self.heartbeat_calls == 1:
                     raise ConnectionError("transient heartbeat write failure")
-                result = await super().publish_session_operation_guarded(session_id, **kwargs)
+                result = await super().publish_session_operation_guarded_with_store_time(
+                    session_id, **kwargs
+                )
                 self.renewed.set()
                 return result
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -4866,11 +4944,15 @@ def test_compact_session_claim_heartbeat_reconciles_lost_renewal_acknowledgement
         invocation_lifecycle_command_version = 1
 
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(ownership_clock=lambda: now["value"])
             self.acknowledgement_lost = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if kwargs.get("events") == [] and not self.acknowledgement_lost.is_set():
                 self.acknowledgement_lost.set()
                 raise ConnectionError("renewal acknowledgement lost after commit")
@@ -4975,13 +5057,17 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
         invocation_lifecycle_command_version = 1
 
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(ownership_clock=lambda: now["value"])
             self.renewal_committed = asyncio.Event()
             self.release_acknowledgement = asyncio.Event()
             self.delayed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
-            result = await super().publish_session_operation_guarded(session_id, **kwargs)
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
+            result = await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
             if kwargs.get("events") == [] and not self.delayed:
                 self.delayed = True
                 self.renewal_committed.set()
@@ -4992,12 +5078,12 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_LEASE",
-            timedelta(milliseconds=100),
+            timedelta(milliseconds=500),
         )
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
-            0.01,
+            0.2,
         )
         store = DelayedRenewalAcknowledgementStore()
         provider = BlockingCompactionProvider()
@@ -5053,15 +5139,16 @@ def test_compact_session_stops_when_renewal_acknowledgement_exceeds_lease_deadli
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             60.0,
         )
-        await asyncio.sleep(0.11)
-
-        with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
-            await asyncio.wait_for(task, timeout=1)
+        try:
+            with pytest.raises(RuntimeError, match="not confirmed before its lease deadline"):
+                await asyncio.wait_for(task, timeout=0.4)
+        finally:
+            store.release_acknowledgement.set()
+            if not task.done():
+                await asyncio.gather(task, return_exceptions=True)
 
         assert provider.calls == 1
         assert provider.cancelled.is_set()
-        store.release_acknowledgement.set()
-        await asyncio.sleep(0)
         checkpoint = await store.load_checkpoint(created.id)
         assert checkpoint is not None
         operation = checkpoint["session_operations"]["records"][
@@ -5121,15 +5208,16 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_renewal_fai
             expected_run_epoch=session.run_epoch,
             expected_transcript_cursor=0,
         )
+        claim_expires_at = accepted_at + timedelta(minutes=5)
         task = asyncio.create_task(
             engine._heartbeat_compaction_operation_claim(
                 session=session,
                 request=request,
                 operation_id="operation-id",
                 attempt_id="attempt-id",
-                claim_expires_at=accepted_at + timedelta(minutes=5),
+                claim_expires_at=claim_expires_at,
                 stop=asyncio.Event(),
-                state=session_engine_module._SessionOperationClaimHeartbeatState(),
+                state=_test_compaction_heartbeat_state(claim_expires_at),
             )
         )
         heartbeat_task = task
@@ -5198,15 +5286,16 @@ def test_compaction_claim_heartbeat_cancellation_observes_concurrent_reconciliat
             expected_run_epoch=session.run_epoch,
             expected_transcript_cursor=0,
         )
+        claim_expires_at = accepted_at + timedelta(minutes=5)
         task = asyncio.create_task(
             engine._heartbeat_compaction_operation_claim(
                 session=session,
                 request=request,
                 operation_id="operation-id",
                 attempt_id="attempt-id",
-                claim_expires_at=accepted_at + timedelta(minutes=5),
+                claim_expires_at=claim_expires_at,
                 stop=asyncio.Event(),
-                state=session_engine_module._SessionOperationClaimHeartbeatState(),
+                state=_test_compaction_heartbeat_state(claim_expires_at),
             )
         )
         heartbeat_task = task
@@ -5295,15 +5384,16 @@ def test_compaction_claim_heartbeat_converts_concurrent_child_cancellation_to_fa
             expected_run_epoch=session.run_epoch,
             expected_transcript_cursor=0,
         )
+        claim_expires_at = accepted_at + timedelta(minutes=5)
         task = asyncio.create_task(
             engine._heartbeat_compaction_operation_claim(
                 session=session,
                 request=request,
                 operation_id="operation-id",
                 attempt_id="attempt-id",
-                claim_expires_at=accepted_at + timedelta(minutes=5),
+                claim_expires_at=claim_expires_at,
                 stop=asyncio.Event(),
-                state=session_engine_module._SessionOperationClaimHeartbeatState(),
+                state=_test_compaction_heartbeat_state(claim_expires_at),
             )
         )
         heartbeat_task = task
@@ -5415,20 +5505,24 @@ def test_compact_session_caller_cancellation_does_not_wait_for_uncertain_claim_c
             self.renewal_finished = asyncio.Event()
             self.delayed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.delayed and kwargs.get("events") == []:
                 self.delayed = True
                 kwargs["commit_guard"]()
                 self.guard_passed.set()
                 try:
                     await self.release_renewal.wait()
-                    return await super().publish_session_operation_guarded(
+                    return await super().publish_session_operation_guarded_with_store_time(
                         session_id,
                         **kwargs,
                     )
                 finally:
                     self.renewal_finished.set()
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -5510,7 +5604,7 @@ def test_compact_session_claim_heartbeat_cannot_revive_an_expired_lease(monkeypa
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
-        store = InMemorySessionStore()
+        store = InMemorySessionStore(ownership_clock=lambda: now["value"])
         provider = BlockingCompactionProvider()
         app = CayuApp(
             session_store=store,
@@ -5558,7 +5652,7 @@ def test_compact_session_claim_heartbeat_cannot_revive_an_expired_lease(monkeypa
         task = asyncio.create_task(collect())
         await asyncio.wait_for(provider.started.wait(), timeout=5)
         now["value"] = accepted_at + timedelta(minutes=6)
-        with pytest.raises(RuntimeError, match="expired before renewal"):
+        with pytest.raises(RuntimeError, match="expired before (?:renewal|reconciliation)"):
             await asyncio.wait_for(task, timeout=5)
 
         assert provider.calls == 1
@@ -5596,7 +5690,9 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
             self.heartbeat_started = asyncio.Event()
             self.heartbeat_cancelled = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if kwargs.get("events") == []:
                 self.heartbeat_started.set()
                 try:
@@ -5604,7 +5700,9 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
                 except asyncio.CancelledError:
                     self.heartbeat_cancelled.set()
                     raise
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -5687,7 +5785,9 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
             self.reconciliation_started = asyncio.Event()
             self.reconciliation_cancelled = asyncio.Event()
 
-        async def load_checkpoint(self, session_id: str):
+        async def transform_checkpoint_with_store_time(
+            self, session_id: str, checkpoint_transform
+        ) -> None:
             if self.block_reconciliation:
                 self.reconciliation_started.set()
                 try:
@@ -5695,7 +5795,10 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
                 except asyncio.CancelledError:
                     self.reconciliation_cancelled.set()
                     raise
-            return await super().load_checkpoint(session_id)
+            await super().transform_checkpoint_with_store_time(
+                session_id,
+                checkpoint_transform,
+            )
 
     class BlockingCompactorWithReconciliation(ContextCompactor):
         def __init__(self, store: StalledReconciliationStore) -> None:
@@ -5811,8 +5914,16 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
     class StalledCommitGuardSQLiteStore(SQLiteSessionStore):
         invocation_lifecycle_command_version = 1
 
-        def __init__(self, work_started: asyncio.Event) -> None:
-            super().__init__(tmp_path / "stalled-renewal.sqlite")
+        def __init__(
+            self,
+            work_started: asyncio.Event,
+            *,
+            ownership_clock: Callable[[], datetime],
+        ) -> None:
+            super().__init__(
+                tmp_path / "stalled-renewal.sqlite",
+                ownership_clock=ownership_clock,
+            )
             self.work_started = work_started
             self.guard_started = threading.Event()
             self.release_guard = threading.Event()
@@ -5820,14 +5931,16 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
             self.failure_publication_finished = asyncio.Event()
             self.delayed_renewal = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if any(
                 event.type == EventType.CONTEXT_COMPACTION_FAILED
                 for event in kwargs.get("events", [])
             ):
                 self.failure_publication_started.set()
                 try:
-                    return await super().publish_session_operation_guarded(
+                    return await super().publish_session_operation_guarded_with_store_time(
                         session_id,
                         **kwargs,
                     )
@@ -5852,7 +5965,9 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
                         commit_guard()
 
                 kwargs["commit_guard"] = delayed_commit_guard
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
@@ -5868,7 +5983,10 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
             0.01,
         )
         compactor = CancellableCompactor()
-        store = StalledCommitGuardSQLiteStore(compactor.started)
+        store = StalledCommitGuardSQLiteStore(
+            compactor.started,
+            ownership_clock=lambda: now["value"],
+        )
         try:
             app = CayuApp(
                 session_store=store,
@@ -5979,13 +6097,15 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
             self.failure_publication_finished = asyncio.Event()
             self.delayed_renewal = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if any(
                 event.type == EventType.CONTEXT_COMPACTION_FAILED
                 for event in kwargs.get("events", [])
             ):
                 try:
-                    return await super().publish_session_operation_guarded(
+                    return await super().publish_session_operation_guarded_with_store_time(
                         session_id,
                         **kwargs,
                     )
@@ -6007,7 +6127,9 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
                         raise TimeoutError("test did not release the renewal commit guard")
 
                 kwargs["commit_guard"] = delayed_commit_guard
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -6090,12 +6212,14 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
     class StalledHeartbeatStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, *, ownership_clock: Callable[[], datetime]) -> None:
+            super().__init__(ownership_clock=ownership_clock)
             self.heartbeat_started = asyncio.Event()
             self.heartbeat_cancelled = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if kwargs.get("events") == []:
                 self.heartbeat_started.set()
                 try:
@@ -6103,22 +6227,25 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
                 except asyncio.CancelledError:
                     self.heartbeat_cancelled.set()
                     raise
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
-        now = {"value": accepted_at}
+        store_now = {"value": accepted_at}
+        worker_now = {"value": accepted_at}
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
-        store = StalledHeartbeatStore()
+        store = StalledHeartbeatStore(ownership_clock=lambda: store_now["value"])
         compactor = BlockingCompactor()
         app = CayuApp(
             session_store=store,
             enable_logging=False,
-            clock=lambda: now["value"],
+            clock=lambda: worker_now["value"],
         )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -6161,7 +6288,7 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
         task = asyncio.create_task(collect())
         await asyncio.wait_for(compactor.started.wait(), timeout=5)
         await asyncio.wait_for(store.heartbeat_started.wait(), timeout=5)
-        now["value"] = accepted_at + timedelta(minutes=6)
+        store_now["value"] = accepted_at + timedelta(minutes=6)
         compactor.release.set()
         with pytest.raises(RuntimeError, match="expired before terminal publication"):
             await asyncio.wait_for(task, timeout=5)
@@ -6179,7 +6306,7 @@ def test_compact_session_expired_claim_cannot_publish_terminal_checkpoint(monkey
             "compact-terminal-after-claim-expiry"
         ]
         assert operation["status"] == "running"
-        assert datetime.fromisoformat(operation["claim_expires_at"]) <= now["value"]
+        assert datetime.fromisoformat(operation["claim_expires_at"]) <= store_now["value"]
 
         recovered_events = await collect()
         assert recovered_events[-1].type == EventType.SESSION_CHECKPOINTED
@@ -6207,13 +6334,15 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
     class DelayedFailureStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, *, ownership_clock: Callable[[], datetime]) -> None:
+            super().__init__(ownership_clock=ownership_clock)
             self.failure_publication_started = asyncio.Event()
             self.release_failure_publication = asyncio.Event()
             self.delayed = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.delayed and any(
                 event.type == EventType.CONTEXT_COMPACTION_FAILED
                 for event in kwargs.get("events", [])
@@ -6221,12 +6350,14 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
                 self.delayed = True
                 self.failure_publication_started.set()
                 await self.release_failure_publication.wait()
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         accepted_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
         now = {"value": accepted_at}
-        store = DelayedFailureStore()
+        store = DelayedFailureStore(ownership_clock=lambda: now["value"])
         compactor = FailOnceCompactor()
         app = CayuApp(
             session_store=store,
@@ -6296,7 +6427,9 @@ def test_compact_session_terminal_publication_wins_blocked_heartbeat_race(monkey
             self.heartbeat_started = asyncio.Event()
             self.heartbeat_cancelled = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if kwargs.get("events") == []:
                 self.heartbeat_started.set()
                 try:
@@ -6304,7 +6437,9 @@ def test_compact_session_terminal_publication_wins_blocked_heartbeat_race(monkey
                 except asyncio.CancelledError:
                     self.heartbeat_cancelled.set()
                     raise
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -6396,7 +6531,9 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
             self.heartbeat_failed = asyncio.Event()
             self.stolen = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.stolen and kwargs.get("events") == []:
                 await self.ledger.reconcile_started.wait()
                 self.stolen = True
@@ -6414,13 +6551,15 @@ def test_compact_session_claim_loss_waits_for_completed_dispatch_settlement(monk
 
                 await self.transform_checkpoint(session_id, steal)
                 try:
-                    return await super().publish_session_operation_guarded(
+                    return await super().publish_session_operation_guarded_with_store_time(
                         session_id,
                         **kwargs,
                     )
                 finally:
                     self.heartbeat_failed.set()
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -6568,7 +6707,9 @@ def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypa
             self.compactor = compactor
             self.stolen = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.stolen and kwargs.get("events") == []:
                 await self.compactor.result_ready.wait()
                 self.stolen = True
@@ -6587,7 +6728,9 @@ def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypa
                 await self.transform_checkpoint(session_id, steal)
                 self.compactor.release_result.set()
                 await asyncio.sleep(0)
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -6659,7 +6802,9 @@ def test_compact_session_caller_cancellation_interrupts_blocked_claim_heartbeat(
             self.heartbeat_started = asyncio.Event()
             self.heartbeat_cancelled = asyncio.Event()
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if kwargs.get("events") == []:
                 self.heartbeat_started.set()
                 try:
@@ -6667,7 +6812,9 @@ def test_compact_session_caller_cancellation_interrupts_blocked_claim_heartbeat(
                 except asyncio.CancelledError:
                     self.heartbeat_cancelled.set()
                     raise
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     async def run() -> None:
         monkeypatch.setattr(
@@ -6788,7 +6935,8 @@ def test_compact_session_no_context_failure_is_replayable_without_provider_spend
 def test_compact_session_recovers_an_abandoned_accepted_operation() -> None:
     async def run() -> None:
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
-        store = InMemorySessionStore()
+        store_now = {"value": accepted_at}
+        store = InMemorySessionStore(ownership_clock=lambda: store_now["value"])
         first_app = CayuApp(
             session_store=store,
             enable_logging=False,
@@ -6830,6 +6978,7 @@ def test_compact_session_recovers_an_abandoned_accepted_operation() -> None:
         abandoned_started = await anext(abandoned_stream)
         await abandoned_stream.aclose()
 
+        store_now["value"] = accepted_at + timedelta(minutes=6)
         recovering_compactor = RecordingCompactor()
         recovered_app = CayuApp(
             session_store=store,
@@ -6874,10 +7023,12 @@ def test_compact_session_renews_operation_claim_between_provider_dispatches(monk
             invocation_lifecycle_command_version = 1
 
             def __init__(self) -> None:
-                super().__init__()
+                super().__init__(ownership_clock=lambda: now["value"])
                 self.delayed = False
 
-            async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+            async def publish_session_operation_guarded_with_store_time(
+                self, session_id: str, **kwargs
+            ):
                 events = kwargs["events"]
                 if not self.delayed and any(
                     event.type == EventType.MODEL_COMPLETED for event in events
@@ -6886,7 +7037,9 @@ def test_compact_session_renews_operation_claim_between_provider_dispatches(monk
                     # The operation transform was already created at minute four,
                     # but the store does not execute it until thirty seconds later.
                     now["value"] = accepted_at + timedelta(minutes=4, seconds=30)
-                return await super().publish_session_operation_guarded(session_id, **kwargs)
+                return await super().publish_session_operation_guarded_with_store_time(
+                    session_id, **kwargs
+                )
 
         class MultiDispatchProvider(ModelProvider):
             name = "compaction-provider"
@@ -7005,18 +7158,22 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
     class StalledFirstHeartbeatStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, *, ownership_clock: Callable[[], datetime]) -> None:
+            super().__init__(ownership_clock=ownership_clock)
             self.heartbeat_started = asyncio.Event()
             self.release_heartbeat = asyncio.Event()
             self.stalled = False
 
-        async def publish_session_operation_guarded(self, session_id: str, **kwargs):
+        async def publish_session_operation_guarded_with_store_time(
+            self, session_id: str, **kwargs
+        ):
             if not self.stalled and kwargs.get("events") == []:
                 self.stalled = True
                 self.heartbeat_started.set()
                 await self.release_heartbeat.wait()
-            return await super().publish_session_operation_guarded(session_id, **kwargs)
+            return await super().publish_session_operation_guarded_with_store_time(
+                session_id, **kwargs
+            )
 
     class PublishWhileHeartbeatStalledProvider(ModelProvider):
         name = "compaction-provider"
@@ -7037,6 +7194,9 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
             self.calls += 1
             if self.calls == 1:
                 await self._store.heartbeat_started.wait()
+                # Publish the first attempt late enough that its guarded claim
+                # renewal extends beyond the original local lease deadline.
+                await asyncio.sleep(1)
                 self._advance_clock()
             else:
                 self.second_dispatch_started.set()
@@ -7055,17 +7215,17 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_LEASE",
-            timedelta(milliseconds=100),
+            timedelta(seconds=2),
         )
         monkeypatch.setattr(
             session_engine_module,
             "_SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS",
             0.01,
         )
-        store = StalledFirstHeartbeatStore()
+        store = StalledFirstHeartbeatStore(ownership_clock=lambda: now["value"])
         provider = PublishWhileHeartbeatStalledProvider(
             store=store,
-            advance_clock=lambda: now.update(value=accepted_at + timedelta(milliseconds=50)),
+            advance_clock=lambda: now.update(value=accepted_at + timedelta(seconds=1)),
         )
         app = CayuApp(
             session_store=store,
@@ -7116,7 +7276,9 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
         task = asyncio.create_task(collect())
         try:
             await asyncio.wait_for(provider.second_dispatch_started.wait(), timeout=5)
-            await asyncio.sleep(0.15)
+            # This is past the original two-second deadline, but remains
+            # inside the two-second lease measured from event publication.
+            await asyncio.sleep(1.1)
             assert not task.done()
             assert provider.calls == 2
 
@@ -7126,11 +7288,27 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
                 "compact-concurrent-publication-renewal"
             ]
             assert datetime.fromisoformat(record["claim_expires_at"]) > (
-                accepted_at + timedelta(milliseconds=100)
+                accepted_at + timedelta(seconds=2)
             )
 
-            store.release_heartbeat.set()
+            # Let the second attempt publish under later authoritative store
+            # time while the old heartbeat store call is still stalled. Its
+            # own dispatch point establishes the next conservative deadline.
+            now["value"] = accepted_at + timedelta(seconds=2)
             provider.release_second_dispatch.set()
+            async with asyncio.timeout(5):
+                while True:
+                    checkpoint = await store.load_checkpoint(created.id)
+                    assert checkpoint is not None
+                    record = checkpoint["session_operations"]["records"][
+                        "compact-concurrent-publication-renewal"
+                    ]
+                    if datetime.fromisoformat(record["claim_expires_at"]) >= (
+                        accepted_at + timedelta(seconds=4)
+                    ):
+                        break
+                    await asyncio.sleep(0)
+            store.release_heartbeat.set()
             events = await asyncio.wait_for(task, timeout=5)
             assert events[-1].type == EventType.SESSION_CHECKPOINTED
         finally:
@@ -7146,7 +7324,8 @@ def test_compact_session_heartbeat_timeout_honors_concurrent_publication_renewal
 def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage() -> None:
     async def run() -> None:
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
-        store = InMemorySessionStore()
+        store_now = {"value": accepted_at}
+        store = InMemorySessionStore(ownership_clock=lambda: store_now["value"])
         compactor = OverlappingCompactor()
 
         def configured_app(*, now: datetime) -> CayuApp:
@@ -7207,6 +7386,7 @@ def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage(
 
         first_task = asyncio.create_task(collect_first())
         await compactor.started[0].wait()
+        store_now["value"] = accepted_at + timedelta(minutes=6)
         recovered_task = asyncio.create_task(collect_recovered())
         await compactor.started[1].wait()
         compactor.release[1].set()
@@ -7345,7 +7525,8 @@ def test_compact_session_completion_publication_failure_releases_the_claim() -> 
 def test_expired_compaction_claim_does_not_block_resume() -> None:
     async def run() -> None:
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
-        store = InMemorySessionStore()
+        store_now = {"value": accepted_at}
+        store = InMemorySessionStore(ownership_clock=lambda: store_now["value"])
         first_app = CayuApp(session_store=store, enable_logging=False, clock=lambda: accepted_at)
         first_app.register_provider(CompletingProvider())
         first_app.register_agent(
@@ -7389,6 +7570,7 @@ def test_expired_compaction_claim_does_not_block_resume() -> None:
         await anext(abandoned)
         await abandoned.aclose()
 
+        store_now["value"] = accepted_at + timedelta(minutes=6)
         resumed_app = CayuApp(
             session_store=store,
             enable_logging=False,
@@ -7421,6 +7603,66 @@ def test_expired_compaction_claim_does_not_block_resume() -> None:
         assert operations["records"]["compact-expired-resume"]["status"] == "abandoned"
 
     asyncio.run(run())
+
+
+def test_compaction_store_wait_ignores_application_clock_skew() -> None:
+    async def run() -> None:
+        store_now = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
+        application_now = datetime(2100, 1, 1, tzinfo=UTC)
+        store = InMemorySessionStore(ownership_clock=lambda: store_now)
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            clock=lambda: application_now,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=RecordingCompactor(),
+                max_user_turns=1,
+            ),
+        )
+        created = await _create_profiled_session(
+            app,
+            store,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_compaction_application_clock_skew",
+                messages=[Message.text("user", "create only")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+            Message.text("assistant", "current answer"),
+        ]
+        await store.append_transcript_messages(created.id, transcript)
+        completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+
+        events = [
+            event
+            async for event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=created.id,
+                    idempotency_key="compact-with-skewed-application-clock",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            )
+        ]
+        operation = await store.load_session_operation(
+            created.id,
+            "compact-with-skewed-application-clock",
+        )
+        return events, operation
+
+    events, operation = asyncio.run(run())
+
+    assert events[-1].type is EventType.SESSION_CHECKPOINTED
+    assert operation is not None
+    assert operation["status"] == "completed"
 
 
 def test_failed_attempt_evidence_extends_an_archived_abandoned_record() -> None:
@@ -7472,7 +7714,8 @@ def test_failed_attempt_evidence_extends_an_archived_abandoned_record() -> None:
 def test_expired_compaction_claim_does_not_block_fork_or_a_new_key() -> None:
     async def run() -> None:
         accepted_at = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
-        store = InMemorySessionStore()
+        store_now = {"value": accepted_at}
+        store = InMemorySessionStore(ownership_clock=lambda: store_now["value"])
         first_app = CayuApp(session_store=store, enable_logging=False, clock=lambda: accepted_at)
         first_app.register_provider(CompletingProvider())
         first_app.register_agent(
@@ -7515,6 +7758,7 @@ def test_expired_compaction_claim_does_not_block_fork_or_a_new_key() -> None:
         await anext(abandoned)
         await abandoned.aclose()
 
+        store_now["value"] = accepted_at + timedelta(minutes=6)
         recovered_app = CayuApp(
             session_store=store,
             enable_logging=False,

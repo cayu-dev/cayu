@@ -58,6 +58,7 @@ from cayu import (
 from cayu.runtime.sessions import (
     CheckpointTransform,
     SessionStore,
+    StoreTimeCheckpointTransform,
     run_request_with_task_invocation,
 )
 from cayu.runtime.tasks import CompletionDecisionApplicationReceipt, TaskStore
@@ -843,6 +844,739 @@ def test_session_delete_is_fenced_until_result_event_publication() -> None:
     asyncio.run(scenario())
 
 
+def test_delayed_publication_reservation_acknowledgement_prevents_resolver_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class DelayedReservationStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            result = await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+            self.publication_calls += 1
+            if self.publication_calls == 1:
+                monotonic_now[0] += 2.0
+            return result
+
+    async def scenario() -> None:
+        session_store = DelayedReservationStore()
+        app, _session_store, task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+        )
+        resolver = _Resolver(_result("1"))
+        app.register_completion_result_resolver(_contract().result_resolver, resolver)
+
+        with pytest.raises(
+            CompletionResultResolverExecutionError,
+            match="acknowledgement consumed its lease",
+        ):
+            await app.resolve_completion_result(_resolution_request(decision_id))
+        assert resolver.requests == []
+        task = await task_store.load_task("application-task")
+        assert task is not None
+        assert task.status is TaskStatus.RUNNING
+        assert task.result is None
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
+def test_delayed_publication_heartbeat_acknowledgement_prevents_application(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class DelayedHeartbeatStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            result = await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+            self.publication_calls += 1
+            if self.publication_calls == 2:
+                monotonic_now[0] += 2.0
+            return result
+
+    class BlockingResolver(CompletionResultResolver):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def resolve(
+            self,
+            request: CompletionResultResolverRequest,
+        ) -> dict[str, object]:
+            del request
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return _result("1")
+
+    async def scenario() -> None:
+        session_store = DelayedHeartbeatStore()
+        app, _session_store, task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+        )
+        resolver = BlockingResolver()
+        app.register_completion_result_resolver(_contract().result_resolver, resolver)
+        operation = asyncio.create_task(
+            app.resolve_completion_result(_resolution_request(decision_id))
+        )
+        await resolver.started.wait()
+        while session_store.publication_calls < 2:
+            await asyncio.sleep(0)
+        resolver.release.set()
+
+        with pytest.raises(
+            CompletionResultResolverExecutionError,
+            match="acknowledgement consumed its lease",
+        ):
+            await operation
+        assert resolver.calls == 1
+        task = await task_store.load_task("application-task")
+        assert task is not None
+        assert task.status is TaskStatus.RUNNING
+        assert task.result is None
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
+def test_foreground_renewal_keeps_existing_publication_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingForegroundRenewalStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+            self.foreground_renewal_started = asyncio.Event()
+            self.foreground_renewal_allowed = asyncio.Event()
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            self.publication_calls += 1
+            if self.publication_calls == 2:
+                self.foreground_renewal_started.set()
+                await self.foreground_renewal_allowed.wait()
+            return await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+
+    async def scenario() -> None:
+        session_store = BlockingForegroundRenewalStore()
+        app, _session_store, _task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+        )
+        resolver = _Resolver(_result("1"))
+        app.register_completion_result_resolver(_contract().result_resolver, resolver)
+        operation = asyncio.create_task(
+            app.resolve_completion_result(_resolution_request(decision_id))
+        )
+        await session_store.foreground_renewal_started.wait()
+        await asyncio.sleep(0.12)
+
+        assert session_store.publication_calls >= 3
+        with pytest.raises(
+            ValueError,
+            match="completion-result event publication is incomplete",
+        ):
+            await session_store.delete_session("session:application")
+
+        session_store.foreground_renewal_allowed.set()
+        assert (await operation).status is TaskStatus.COMPLETED
+        assert len(resolver.requests) == 1
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "monotonic",
+        lambda: 0.0,
+    )
+    asyncio.run(scenario())
+
+
+def test_late_heartbeat_acknowledgement_preserves_newer_foreground_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class InvertedRenewalStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+            self.heartbeat_started = asyncio.Event()
+            self.heartbeat_allowed = asyncio.Event()
+            self.heartbeat_completed = asyncio.Event()
+            self.foreground_completed = asyncio.Event()
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            self.publication_calls += 1
+            call = self.publication_calls
+            if call == 2:
+                self.heartbeat_started.set()
+                await self.heartbeat_allowed.wait()
+            result = await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+            if call == 2:
+                self.heartbeat_completed.set()
+            elif call == 3:
+                self.foreground_completed.set()
+            return result
+
+    class BlockingApplicationStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.application_started = asyncio.Event()
+            self.application_allowed = asyncio.Event()
+
+        async def apply_completion_decision(
+            self,
+            request: CompletionDecisionApplicationRequest,
+        ) -> Task:
+            self.application_started.set()
+            await self.application_allowed.wait()
+            return await super().apply_completion_decision(request)
+
+    class HeartbeatFirstResolver(CompletionResultResolver):
+        def __init__(self, store: InvertedRenewalStore) -> None:
+            self._store = store
+            self.calls = 0
+
+        async def resolve(
+            self,
+            request: CompletionResultResolverRequest,
+        ) -> dict[str, object]:
+            del request
+            self.calls += 1
+            await self._store.heartbeat_started.wait()
+            monotonic_now[0] = 0.4
+            return _result("1")
+
+    async def scenario() -> None:
+        session_store = InvertedRenewalStore()
+        task_store = BlockingApplicationStore()
+        app, _session_store, _task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+            task_store=task_store,
+        )
+        resolver = HeartbeatFirstResolver(session_store)
+        app.register_completion_result_resolver(_contract().result_resolver, resolver)
+        operation = asyncio.create_task(
+            app.resolve_completion_result(_resolution_request(decision_id))
+        )
+
+        await session_store.foreground_completed.wait()
+        await task_store.application_started.wait()
+        monotonic_now[0] = 1.3
+        session_store.heartbeat_allowed.set()
+        await session_store.heartbeat_completed.wait()
+        await asyncio.sleep(0)
+
+        assert not operation.done()
+        task_store.application_allowed.set()
+        assert (await operation).status is TaskStatus.COMPLETED
+        assert resolver.calls == 1
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
+def test_late_foreground_acknowledgement_preserves_newer_heartbeat_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class InvertedRenewalStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+            self.foreground_started = asyncio.Event()
+            self.foreground_allowed = asyncio.Event()
+            self.heartbeat_completed = asyncio.Event()
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            self.publication_calls += 1
+            call = self.publication_calls
+            if call == 2:
+                self.foreground_started.set()
+                await self.foreground_allowed.wait()
+            result = await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+            if call == 3:
+                self.heartbeat_completed.set()
+            return result
+
+    async def scenario() -> None:
+        session_store = InvertedRenewalStore()
+        app, _session_store, _task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+        )
+        resolver = _Resolver(_result("1"))
+        app.register_completion_result_resolver(_contract().result_resolver, resolver)
+        operation = asyncio.create_task(
+            app.resolve_completion_result(_resolution_request(decision_id))
+        )
+
+        await session_store.foreground_started.wait()
+        monotonic_now[0] = 0.4
+        await session_store.heartbeat_completed.wait()
+        monotonic_now[0] = 1.2
+        session_store.foreground_allowed.set()
+
+        assert (await operation).status is TaskStatus.COMPLETED
+        assert len(resolver.requests) == 1
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
+def test_inflight_publication_renewal_fences_application_until_store_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingHeartbeatStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+            self.renewal_started = asyncio.Event()
+            self.renewal_allowed = asyncio.Event()
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            self.publication_calls += 1
+            if self.publication_calls == 3:
+                self.renewal_started.set()
+                await self.renewal_allowed.wait()
+            return await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+
+    class BlockingApplicationStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.application_started = asyncio.Event()
+            self.application_cancelled = asyncio.Event()
+            self.application_commits = 0
+
+        async def apply_completion_decision(
+            self,
+            request: CompletionDecisionApplicationRequest,
+        ) -> Task:
+            self.application_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.application_cancelled.set()
+                raise
+            self.application_commits += 1
+            return await super().apply_completion_decision(request)
+
+    async def scenario() -> None:
+        session_store = BlockingHeartbeatStore()
+        task_store = BlockingApplicationStore()
+        app, _session_store, _task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+            task_store=task_store,
+        )
+        app.register_completion_result_resolver(
+            _contract().result_resolver,
+            _Resolver(_result("1")),
+        )
+        operation = asyncio.create_task(
+            app.resolve_completion_result(_resolution_request(decision_id))
+        )
+        await task_store.application_started.wait()
+        await session_store.renewal_started.wait()
+        await asyncio.wait_for(task_store.application_cancelled.wait(), timeout=1.0)
+
+        # The application is quiescent, but the renewal mutation remains an
+        # owned part of settlement rather than disappearing behind a callback.
+        assert not operation.done()
+        assert task_store.application_commits == 0
+
+        session_store.renewal_allowed.set()
+        with pytest.raises(
+            CompletionResultResolverExecutionError,
+            match="publication ownership",
+        ) as captured:
+            await operation
+        pending: list[BaseException] = [captured.value]
+        observed: set[int] = set()
+        ownership_failures = 0
+        while pending:
+            failure = pending.pop()
+            if id(failure) in observed:
+                continue
+            observed.add(id(failure))
+            if "not acknowledged before its local lease deadline" in str(failure):
+                ownership_failures += 1
+            if failure.__cause__ is not None:
+                pending.append(failure.__cause__)
+            if failure.__context__ is not None:
+                pending.append(failure.__context__)
+            if isinstance(failure, BaseExceptionGroup):
+                pending.extend(failure.exceptions)
+        assert ownership_failures == 1
+        persisted = await task_store.load_task("application-task")
+        assert persisted is not None
+        assert persisted.status is TaskStatus.RUNNING
+        assert persisted.result is None
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    asyncio.run(scenario())
+
+
+def test_ownership_loss_releases_publication_after_positive_application_noncommit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class LateHeartbeatStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            self.publication_calls += 1
+            call = self.publication_calls
+            result = await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+            if call == 3:
+                monotonic_now[0] = 2.0
+            return result
+
+    application_started = asyncio.Event()
+
+    async def positively_noncommitting_application(
+        request: CompletionDecisionApplicationRequest,
+    ) -> Task:
+        del request
+        application_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise resolver_coordinator_module._CompletionDecisionApplicationNotCommitted(
+                "application did not commit"
+            ) from None
+
+    async def scenario() -> None:
+        session_store = LateHeartbeatStore()
+        app, _session_store, task_store, decision_id = await _prepared_app_with_stores(
+            session_store=session_store,
+        )
+        monkeypatch.setattr(
+            app._completion_result_resolver_coordinator._application_coordinator,
+            "apply",
+            positively_noncommitting_application,
+        )
+        app.register_completion_result_resolver(
+            _contract().result_resolver,
+            _Resolver(_result("1")),
+        )
+
+        with pytest.raises(
+            CompletionResultResolverExecutionError,
+            match="publication ownership",
+        ):
+            await app.resolve_completion_result(_resolution_request(decision_id))
+
+        assert application_started.is_set()
+        persisted = await task_store.load_task("application-task")
+        assert persisted is not None
+        assert persisted.status is TaskStatus.RUNNING
+        assert persisted.result is None
+        checkpoint = await session_store.load_checkpoint("session:application")
+        assert checkpoint is not None
+        assert "completion_result_event_publications" not in checkpoint
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
+def test_capacity_counts_adapter_completed_publication_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingHeartbeatStore(InMemorySessionStore):
+        supports_completion_result_event_publication_reservations = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_calls = 0
+            self.renewal_started = asyncio.Event()
+            self.renewal_allowed = asyncio.Event()
+
+        async def _publish_completion_result_event_publication(
+            self,
+            session_id: str,
+            *,
+            checkpoint_transform: StoreTimeCheckpointTransform,
+            events: list[Event],
+        ):
+            self.publication_calls += 1
+            if self.publication_calls == 3:
+                self.renewal_started.set()
+                await self.renewal_allowed.wait()
+            return await super()._publish_completion_result_event_publication(
+                session_id,
+                checkpoint_transform=checkpoint_transform,
+                events=events,
+            )
+
+    class BlockingApplicationStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.application_started = asyncio.Event()
+            self.application_allowed = asyncio.Event()
+
+        async def apply_completion_decision(
+            self,
+            request: CompletionDecisionApplicationRequest,
+        ) -> Task:
+            self.application_started.set()
+            await self.application_allowed.wait()
+            return await super().apply_completion_decision(request)
+
+    async def scenario() -> None:
+        session_store = BlockingHeartbeatStore()
+        task_store = BlockingApplicationStore()
+        app, _session_store, _task_store, first_decision = await _prepared_app_with_stores(
+            session_store=session_store,
+            task_store=task_store,
+        )
+        contract = _contract()
+        second_task = await task_store.create_running_task(
+            TaskCreate(
+                task_id="application-task-2",
+                type="verified-work",
+                session_id="session:application",
+                work_contract=contract.reference(),
+            ),
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "session:application",
+            ),
+        )
+        second_decision, _reference = await _persist_decision(
+            task_store,
+            task=second_task,
+            ordinal=2,
+            verdict=CompletionVerdict.ACCEPTED,
+        )
+        resolver = _Resolver(_result("1"))
+        app.register_completion_result_resolver(contract.result_resolver, resolver)
+        first = asyncio.create_task(
+            app.resolve_completion_result(_resolution_request(first_decision))
+        )
+        await task_store.application_started.wait()
+        await session_store.renewal_started.wait()
+
+        with pytest.raises(
+            CompletionResultResolverExecutionError,
+            match="capacity is exhausted",
+        ):
+            await app.resolve_completion_result(
+                CompletionResultResolutionRequest(
+                    task_id="application-task-2",
+                    decision_id=second_decision,
+                    idempotency_key="resolve-result-2",
+                )
+            )
+        assert len(resolver.requests) == 1
+        second_after = await task_store.load_task("application-task-2")
+        assert second_after is not None
+        assert second_after.status is TaskStatus.RUNNING
+        assert second_after.result is None
+
+        session_store.renewal_allowed.set()
+        task_store.application_allowed.set()
+        assert (await first).status is TaskStatus.COMPLETED
+
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_MAX_ACTIVE_RESULT_RESOLVERS",
+        1,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_LEASE_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        resolver_coordinator_module,
+        "_PUBLICATION_OWNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    asyncio.run(scenario())
+
+
 def test_foreground_resolver_renews_publication_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -964,7 +1698,7 @@ def test_foreground_event_publication_renews_publication_ownership(
             self,
             session_id: str,
             *,
-            checkpoint_transform: CheckpointTransform,
+            checkpoint_transform: StoreTimeCheckpointTransform,
             events: list[Event],
         ) -> Session:
             if any(event.type is EventType.TASK_COMPLETION_RESULT_RESOLVED for event in events):
@@ -1094,7 +1828,7 @@ def test_cancellation_during_publication_reservation_release_remains_authoritati
             self,
             session_id: str,
             *,
-            checkpoint_transform: CheckpointTransform,
+            checkpoint_transform: StoreTimeCheckpointTransform,
             events: list[Event],
         ) -> Session:
             if not events:
@@ -1176,7 +1910,7 @@ def test_primary_and_publication_release_failure_are_both_preserved() -> None:
             self,
             session_id: str,
             *,
-            checkpoint_transform: CheckpointTransform,
+            checkpoint_transform: StoreTimeCheckpointTransform,
             events: list[Event],
         ) -> Session:
             if not events:
@@ -1240,7 +1974,7 @@ def test_cancellation_preserves_primary_and_publication_release_failure() -> Non
             self,
             session_id: str,
             *,
-            checkpoint_transform: CheckpointTransform,
+            checkpoint_transform: StoreTimeCheckpointTransform,
             events: list[Event],
         ) -> Session:
             if not events:
@@ -1326,7 +2060,7 @@ def test_process_control_during_publication_reservation_release_is_authoritative
             self,
             session_id: str,
             *,
-            checkpoint_transform: CheckpointTransform,
+            checkpoint_transform: StoreTimeCheckpointTransform,
             events: list[Event],
         ) -> Session:
             if not events:
@@ -1772,6 +2506,7 @@ def test_receipt_replay_reacquires_publication_ownership_before_event_readback()
         def expire_prior_owner(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            _store_now: datetime,
         ) -> dict[str, Any]:
             assert checkpoint is not None
             reservations = checkpoint["completion_result_event_publications"]["reservations"]

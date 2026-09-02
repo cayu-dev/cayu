@@ -14,6 +14,7 @@ from psycopg import AsyncCursor
 from psycopg.rows import tuple_row
 from psycopg_pool import AsyncConnectionPool
 
+from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.runtime.completion_verifier_profiles import (
     CompletionVerifierProfilePreparationRequest,
@@ -31,7 +32,7 @@ from cayu.runtime.tasks import (
     TaskClaimLost,
     TaskStatus,
     TaskTopologyInconsistent,
-    _ensure_owned_active_task_lease,
+    _ensure_exact_owned_active_task_lease,
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
     copy_task,
@@ -53,6 +54,7 @@ from cayu.runtime.work_attempt_admission import (
     copy_work_attempt_admission_prepare,
     copy_work_attempt_execution_claim_request,
     copy_work_attempt_recovery_activate,
+    work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
@@ -462,9 +464,12 @@ class PostgresVerifiedWorkMixin:
 
         await self._lock_verified_work_identity(cur, "task", task_id)
 
-    async def _verified_now(self, cur: Any) -> datetime:
+    async def _verified_evidence_now(self, cur: Any) -> datetime:
         if self._clock_is_injected:
             return self._clock()
+        return await self._database_now(cur)
+
+    async def _verified_lease_now(self, cur: Any) -> datetime:
         return await self._database_now(cur)
 
     async def _load_work_contract_row(
@@ -1142,10 +1147,16 @@ class PostgresVerifiedWorkMixin:
         task_id: str,
         *,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
         contract: WorkContractRef,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         copied_contract = copy_work_contract_ref(contract)
         if copied_contract is None:
             raise TypeError("contract must be a WorkContractRef.")
@@ -1155,11 +1166,20 @@ class PostgresVerifiedWorkMixin:
             del conn
             await self._lock_verified_work_task(cur, task_id)
             task = await self._load_task_locked(cur, task_id)
-            now = await self._database_now(cur)
-            _ensure_owned_active_task_lease(task, worker_id, now=now)
             if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
                 raise TaskClaimLost("Only the current worker may park its unattached claimed task.")
             await self._require_task_contract(cur, task, copied_contract)
+            # The shared contract row can be locked by another verifier
+            # transaction.  Revalidate worker ownership after that wait.
+            now = await self._database_now(cur)
+            if expected_lease is None:
+                raise TaskClaimLost("Contracted task parking requires its exact worker lease.")
+            _ensure_exact_owned_active_task_lease(
+                task,
+                worker_id,
+                expected_lease,
+                now=now,
+            )
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.NEEDS_ATTENTION,
@@ -1282,7 +1302,10 @@ class PostgresVerifiedWorkMixin:
                 for_update=True,
             )
             if existing is not None:
-                if existing.prepare_request_sha256 != request_sha256:
+                if not work_attempt_admission_prepare_matches_sha256(
+                    request,
+                    existing.prepare_request_sha256,
+                ):
                     raise WorkAttemptAdmissionConflict(
                         "Work-attempt admission identity is bound to another request."
                     )
@@ -1358,12 +1381,14 @@ class PostgresVerifiedWorkMixin:
                     "Task already has an unreleased work-attempt admission."
                 )
             contract = await self._require_task_contract(cur, task, request.contract)
-            now = await self._verified_now(cur)
             continuation = await self._work_attempt_continuation_context(
                 cur,
                 task,
                 contract,
             )
+            await self._ensure_session_authority(cur, request.session_id, "contracted")
+            lease_now = await self._verified_lease_now(cur)
+            availability_now = await self._verified_evidence_now(cur)
             if continuation is None:
                 if request.kind != "initial":
                     raise WorkAttemptAdmissionConflict(
@@ -1373,7 +1398,7 @@ class PostgresVerifiedWorkMixin:
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission requires a pending or claimed contracted task."
                     )
-                if task.available_at is not None and task.available_at > now:
+                if task.available_at is not None and task.available_at > availability_now:
                     raise WorkAttemptAdmissionConflict(
                         "Contracted task is not yet available for admission."
                     )
@@ -1382,21 +1407,33 @@ class PostgresVerifiedWorkMixin:
                     # while an inherited queue-worker lease is wall-clock authority.
                     # Sample the latter from PostgreSQL after every lock and lookup
                     # that can delay the ownership decision.
-                    queue_now = await self._database_now(cur)
-                    _ensure_owned_active_task_lease(
+                    if request.task_lease_expires_at is None:
+                        raise TaskClaimLost(
+                            "Work-attempt admission requires the claimed task's exact lease."
+                        )
+                    _ensure_exact_owned_active_task_lease(
                         task,
                         request.worker_id,
-                        now=queue_now,
+                        request.task_lease_expires_at,
+                        now=lease_now,
                     )
                 elif task.worker_id is not None or task.lease_expires_at is not None:
                     raise WorkAttemptAdmissionConflict(
                         "Pending contracted task has conflicting worker ownership."
+                    )
+                elif request.task_lease_expires_at is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Pending work-attempt admission cannot consume worker lease authority."
                     )
                 if task.session_id not in {None, request.session_id}:
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission conflicts with the task's session."
                     )
             else:
+                if request.task_lease_expires_at is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission cannot consume prior worker lease authority."
+                    )
                 if request.kind != "continuation":
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission cannot consume continuation authority."
@@ -1421,8 +1458,6 @@ class PostgresVerifiedWorkMixin:
                     raise WorkAttemptAdmissionConflict(
                         "The frozen contract does not authorize continuation."
                     )
-
-            await self._ensure_session_authority(cur, request.session_id, "contracted")
             _task_invocation_for_attachment(
                 task.invocation,
                 session_id=request.session_id,
@@ -1448,8 +1483,8 @@ class PostgresVerifiedWorkMixin:
                 execution_owner_id=request.execution_owner_id,
                 generation=request.generation,
                 request_sha256=work_attempt_execution_claim_request_sha256(claim_request),
-                claimed_at=now,
-                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+                claimed_at=lease_now,
+                lease_expires_at=lease_now + timedelta(seconds=request.lease_seconds),
             )
             admission = WorkAttemptAdmission(
                 admission_id=request.admission_id,
@@ -1466,7 +1501,7 @@ class PostgresVerifiedWorkMixin:
                 source_execution_profile_fingerprint=(request.source_execution_profile_fingerprint),
                 claim=claim,
                 continuation=continuation,
-                prepared_at=now,
+                prepared_at=lease_now,
             )
             updated_task = task.model_copy(
                 update={
@@ -1475,8 +1510,8 @@ class PostgresVerifiedWorkMixin:
                     "session_instance_id": session_instance_id,
                     "worker_id": request.worker_id,
                     "lease_expires_at": claim.lease_expires_at,
-                    "started_at": task.started_at or now,
-                    "updated_at": now,
+                    "started_at": task.started_at or lease_now,
+                    "updated_at": lease_now,
                 }
             )
             await self._update_task_snapshot(cur, updated_task)
@@ -1553,8 +1588,8 @@ class PostgresVerifiedWorkMixin:
                 raise WorkAttemptAdmissionConflict(
                     "Only a prepared admission can publish its work attempt."
                 )
-            now = await self._verified_now(cur)
-            self._ensure_live_work_attempt_admission_claim(admission, now=now)
+            lease_now = await self._verified_lease_now(cur)
+            self._ensure_live_work_attempt_admission_claim(admission, now=lease_now)
             if (
                 task.status is not TaskStatus.RUNNING
                 or task.worker_id != admission.claim.worker_id
@@ -1587,7 +1622,7 @@ class PostgresVerifiedWorkMixin:
                 **attempt_request.model_dump(mode="python"),
                 ordinal=ordinal,
                 request_sha256=work_attempt_request_sha256(attempt_request),
-                started_at=now,
+                started_at=(evidence_now := await self._verified_evidence_now(cur)),
             )
             activated = WorkAttemptAdmission.model_validate(
                 admission.model_copy(
@@ -1595,7 +1630,7 @@ class PostgresVerifiedWorkMixin:
                         "state": WorkAttemptAdmissionState.ACTIVE,
                         "attempt": attempt,
                         "session_evidence_sha256": request.session_evidence_sha256,
-                        "activated_at": now,
+                        "activated_at": evidence_now,
                     }
                 ).model_dump(mode="python", warnings=False)
             )
@@ -1672,8 +1707,8 @@ class PostgresVerifiedWorkMixin:
             await self._lock_verified_work_identity(cur, "claim", claim.claim_id)
             await self._lock_verified_work_task(cur, admission.task_id)
             task = await self._load_task_locked(cur, admission.task_id)
-            now = await self._verified_now(cur)
-            self._ensure_live_work_attempt_admission_claim(admission, now=now)
+            lease_now = await self._verified_lease_now(cur)
+            self._ensure_live_work_attempt_admission_claim(admission, now=lease_now)
             await cur.execute(
                 "SELECT 1 FROM cayu_completion_proposals WHERE attempt_id = %s",
                 (admission.attempt_id,),
@@ -1697,7 +1732,7 @@ class PostgresVerifiedWorkMixin:
                     update={
                         "lease_expires_at": max(
                             claim.lease_expires_at,
-                            now + timedelta(seconds=request.lease_seconds),
+                            lease_now + timedelta(seconds=request.lease_seconds),
                         )
                     }
                 ).model_dump(mode="python", warnings=False)
@@ -1727,7 +1762,7 @@ class PostgresVerifiedWorkMixin:
                 task.model_copy(
                     update={
                         "lease_expires_at": renewed_claim.lease_expires_at,
-                        "updated_at": now,
+                        "updated_at": lease_now,
                     }
                 ),
             )
@@ -1772,7 +1807,7 @@ class PostgresVerifiedWorkMixin:
                 )
             await self._lock_verified_work_task(cur, admission.task_id)
             task = await self._load_task_locked(cur, admission.task_id)
-            now = await self._verified_now(cur)
+            now = await self._verified_lease_now(cur)
             current = admission.claim
             exact_current_request = (
                 current.claim_id == request.claim_id
@@ -1933,7 +1968,7 @@ class PostgresVerifiedWorkMixin:
                 )
             if admission.state is WorkAttemptAdmissionState.ACTIVE:
                 return admission.model_copy(deep=True)
-            now = await self._verified_now(cur)
+            now = await self._verified_lease_now(cur)
             self._ensure_live_work_attempt_admission_claim(
                 admission,
                 now=now,
@@ -2015,12 +2050,6 @@ class PostgresVerifiedWorkMixin:
                 raise ValueError("Work attempts require a running contracted task.")
             if task.session_id != request.session_id:
                 raise WorkCompletionConflict("Work attempt is bound to a different task session.")
-            lease_now = await self._database_now(cur)
-            verified_work_support.require_attempt_worker(
-                task,
-                request.worker_id,
-                now=lease_now,
-            )
             prior_id = await self._latest_attempt_id(cur, task.id)
             prior = (
                 None
@@ -2052,6 +2081,15 @@ class PostgresVerifiedWorkMixin:
                     raise WorkCompletionConflict(
                         "A prior verifier decision has not reached durable task application."
                     )
+            started_at = await self._verified_evidence_now(cur)
+            # Prior-attempt and decision rows are independent lock domains.
+            # They must all settle before the task lease is sampled.
+            lease_now = await self._database_now(cur)
+            verified_work_support.require_attempt_worker(
+                task,
+                request.worker_id,
+                now=lease_now,
+            )
             attempt = WorkAttempt(
                 attempt_id=request.attempt_id,
                 task_id=request.task_id,
@@ -2061,7 +2099,7 @@ class PostgresVerifiedWorkMixin:
                 worker_id=request.worker_id,
                 ordinal=ordinal,
                 request_sha256=request_sha256,
-                started_at=await self._verified_now(cur),
+                started_at=started_at,
             )
             await cur.execute(
                 "INSERT INTO cayu_work_attempts "
@@ -2153,7 +2191,7 @@ class PostgresVerifiedWorkMixin:
                 task_id=attempt.task_id,
                 contract=attempt.contract,
                 request_sha256=request_sha256,
-                proposed_at=await self._verified_now(cur),
+                proposed_at=await self._verified_evidence_now(cur),
             )
             await cur.execute(
                 "INSERT INTO cayu_completion_proposals "
@@ -2241,7 +2279,7 @@ class PostgresVerifiedWorkMixin:
                 )
             await self._lock_verified_work_task(cur, admission.task_id)
             task = await self._load_task_locked(cur, admission.task_id)
-            now = await self._verified_now(cur)
+            now = await self._verified_lease_now(cur)
             self._ensure_live_work_attempt_admission_claim(admission, now=now)
             if existing is not None:
                 if existing.request_sha256 != proposal_sha256:
@@ -2284,7 +2322,7 @@ class PostgresVerifiedWorkMixin:
                 task_id=admission.task_id,
                 contract=admission.contract,
                 request_sha256=proposal_sha256,
-                proposed_at=now,
+                proposed_at=await self._verified_evidence_now(cur),
             )
             released = WorkAttemptAdmission.model_validate(
                 admission.model_copy(
@@ -2402,7 +2440,7 @@ class PostgresVerifiedWorkMixin:
             record = completion_verifier_profile_record_from_preparation(
                 request,
                 request_sha256=request_sha256,
-                prepared_at=await self._verified_now(cur),
+                prepared_at=await self._verified_evidence_now(cur),
             )
             await cur.execute(
                 "INSERT INTO cayu_completion_verifier_profiles "
@@ -2519,7 +2557,7 @@ class PostgresVerifiedWorkMixin:
                 and current.claim_id == request.claim_id
                 and current.request_sha256 == request_sha256
             ):
-                replay_now = await self._verified_now(cur)
+                replay_now = await self._verified_lease_now(cur)
                 if current.lease_expires_at > replay_now or decision is not None:
                     return current.model_copy(deep=True)
                 raise CompletionVerificationClaimLost(
@@ -2542,7 +2580,7 @@ class PostgresVerifiedWorkMixin:
                 latest_attempt_id=await self._latest_attempt_id(cur, task.id),
                 contract=contract,
             )
-            now = await self._verified_now(cur)
+            now = await self._verified_lease_now(cur)
             if current is not None and current.lease_expires_at > now:
                 raise CompletionVerificationClaimLost(
                     "Completion proposal is owned by another live verifier claim."
@@ -2660,7 +2698,7 @@ class PostgresVerifiedWorkMixin:
                 latest_attempt_id=await self._latest_attempt_id(cur, task.id),
                 contract=contract,
             )
-            now = await self._verified_now(cur)
+            now = await self._verified_lease_now(cur)
             if current.lease_expires_at <= now:
                 raise CompletionVerificationClaimLost(
                     "Verification claim cannot be renewed without exact current live authority."
@@ -2768,8 +2806,8 @@ class PostgresVerifiedWorkMixin:
                 contract=contract,
             )
             validate_completion_decision_contract(contract, request)
-            now = await self._verified_now(cur)
-            if claim.lease_expires_at <= now:
+            lease_now = await self._verified_lease_now(cur)
+            if claim.lease_expires_at <= lease_now:
                 raise CompletionVerificationClaimLost(
                     "Completion decision requires the current live verifier claim."
                 )
@@ -2792,7 +2830,7 @@ class PostgresVerifiedWorkMixin:
                 claim_authority_sha256=completion_verification_claim_authority_sha256(claim),
                 request_sha256=request_sha256,
                 gap_fingerprint=completion_gap_fingerprint(request),
-                decided_at=now,
+                decided_at=await self._verified_evidence_now(cur),
             )
             await cur.execute(
                 "INSERT INTO cayu_completion_decisions "

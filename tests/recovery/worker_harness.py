@@ -954,6 +954,7 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
                     session_id=session_id,
                     task_id=task_id,
                     task_worker_id="worker-a",
+                    task_lease_expires_at=claimed.lease_expires_at,
                     messages=[Message.text("user", "Execute the attached task.")],
                 )
             ):
@@ -987,6 +988,7 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
                     session_id=session_id,
                     task_id=task_id,
                     task_worker_id="worker-b",
+                    task_lease_expires_at=worker_b_claim.lease_expires_at,
                     messages=[Message.text("user", "Complete the reclaimed task.")],
                 )
             ):

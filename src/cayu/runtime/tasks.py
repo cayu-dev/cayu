@@ -45,6 +45,7 @@ from cayu.runtime._task_admission_wakeup import (
     TaskAdmissionWakeup,
     TaskAdmissionWakeupBroker,
 )
+from cayu.runtime._task_lease_authority import managed_task_lease_mutation
 from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
 from cayu.runtime.approvals import (
     ResolutionActor,
@@ -112,6 +113,7 @@ from cayu.runtime.work_attempt_admission import (
     copy_work_attempt_admission_prepare,
     copy_work_attempt_execution_claim_request,
     copy_work_attempt_recovery_activate,
+    work_attempt_admission_prepare_matches_sha256,
     work_attempt_admission_prepare_sha256,
     work_attempt_execution_claim_request_sha256,
 )
@@ -1747,6 +1749,9 @@ class TaskTerminalizationRequest(BaseModel):
 
     task_id: str
     worker_id: str
+    # Exact lease generation returned by claim/heartbeat. A worker name is
+    # reusable and therefore is not sufficient terminalization authority.
+    lease_expires_at: datetime | None = None
     # Exact interrupted-continuation generation. ``None`` is the authority for
     # ordinary task claims and direct attachments; recovered continuations must
     # present the non-null generation returned by their claim.
@@ -1767,6 +1772,13 @@ class TaskTerminalizationRequest(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, "handoff_id")
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def normalize_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "lease_expires_at")
 
     @field_validator("idempotency_key")
     @classmethod
@@ -2087,6 +2099,7 @@ class TaskCancellationReconciliationResult(BaseModel):
         terminalization = TaskTerminalizationRequest(
             task_id=reconciliation.task_id,
             worker_id=reconciliation.original_worker_id,
+            lease_expires_at=reconciliation.original_lease_expires_at,
             handoff_id=reconciliation.original_handoff_id,
             kind=TaskTerminalKind.CANCELLED,
             error=self.task.error,
@@ -2109,7 +2122,11 @@ class TaskCancellationReconciliationResult(BaseModel):
             or receipt.kind is not TaskTerminalKind.CANCELLED
             or receipt.worker_id != reconciliation.original_worker_id
             or receipt.idempotency_key != reconciliation.cancellation_idempotency_key
-            or receipt.request_sha256 != terminalization_sha256
+            or not _task_terminalization_request_matches_sha256(
+                terminalization,
+                request_sha256=terminalization_sha256,
+                candidate_sha256=receipt.request_sha256,
+            )
             or receipt.committed_at != self.committed_at
             or reconciliation.events[2].occurred_at != self.committed_at
         ):
@@ -2181,12 +2198,20 @@ class TaskRetrySettlementRequest(_TaskRetryAttemptOutcome):
 
     task_id: str
     worker_id: str
+    lease_expires_at: datetime | None = None
     causal_budget_id: str
 
     @field_validator("task_id", "worker_id", "causal_budget_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def normalize_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "lease_expires_at")
 
 
 class TaskRetryAttemptReport(_TaskRetryAttemptOutcome):
@@ -3115,7 +3140,13 @@ class TaskTopologyStoreResult(BaseModel):
 
 
 class TaskStore(ABC):
-    """Persistent store for durable work items."""
+    """Persistent store for durable work items.
+
+    Worker-lease and recovery-owner transitions use store-authoritative time.
+    Implementations sample, compare, and stamp that time inside the atomic
+    ownership mutation; worker-provided timestamps or cutoffs are not lease
+    authority.
+    """
 
     supports_delayed_availability: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
@@ -3249,6 +3280,7 @@ class TaskStore(ABC):
         task_id: str,
         *,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
         contract: WorkContractRef,
     ) -> Task:
         """Claim-fence an unsupported contracted task into operator attention."""
@@ -3591,10 +3623,12 @@ class TaskStore(ABC):
         session_id: str,
         session_invocation: SessionInvocationBinding,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
     ) -> Task:
         """Attach a live worker-claimed task to a session and mark it running.
 
-        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        Raise ``TaskClaimLost`` unless the worker and exact lease generation
+        still own a live claim.
         """
 
     @abstractmethod
@@ -3604,14 +3638,15 @@ class TaskStore(ABC):
         result: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         """Mark a pending or running task as completed.
 
-        If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
-        worker still owns an active lease and exact continuation generation on
-        the task, so a worker that lost its lease cannot clobber a task another
-        worker has since reclaimed.
+        If ``worker_id`` is given, ``lease_expires_at`` must identify the exact
+        active lease generation. The update also requires the exact continuation
+        generation, so a stale worker cannot clobber a task after renewal or
+        reclaim.
         """
 
     @abstractmethod
@@ -3621,13 +3656,14 @@ class TaskStore(ABC):
         error: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         """Mark a pending or running task as failed.
 
-        If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
-        worker still owns an active lease and exact continuation generation on
-        the task.
+        If ``worker_id`` is given, ``lease_expires_at`` must identify the exact
+        active lease generation. The update also requires the exact continuation
+        generation.
         """
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -3774,6 +3810,7 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
@@ -3790,6 +3827,8 @@ class TaskStore(ABC):
         self,
         task_id: str,
         worker_id: str,
+        *,
+        lease_expires_at: datetime,
     ) -> bool:
         """Return store-authoritative elapsed evidence without releasing ownership."""
 
@@ -3806,6 +3845,41 @@ class TaskStore(ABC):
         Tasks with a live worker remain fenced until that worker proves its
         dispatched work quiescent and commits the cancellation receipt.
         """
+
+    async def request_claimed_task_cancellation(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+        error: dict[str, Any] | None = None,
+    ) -> Task:
+        """Request cancellation only for one exact live worker lease.
+
+        A delayed stale owner must not place a cancellation marker on a claim
+        acquired by a replacement worker.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support exact claimed-task cancellation."
+        )
+
+    async def mark_claimed_task_execution_started(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Fence an exact claim before its worker can dispatch opaque work.
+
+        Supporting stores persist ``started_at`` while the exact worker lease is
+        still live.  Exact replay is idempotent.  Once this marker exists, expiry
+        reclamation must enter cancellation reconciliation instead of making the
+        task claimable while the original effect may still be running.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support exact claimed-task execution starts."
+        )
 
     @abstractmethod
     async def pause_task(
@@ -3857,26 +3931,42 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
-        """Extend a worker-owned active lease.
+        """Extend the exact worker-owned lease identified by its expiry.
 
-        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
+        the live claim.
         """
 
     @abstractmethod
-    async def release_task(self, task_id: str, worker_id: str) -> Task:
-        """Release a claimed task back to pending and clear worker ownership.
+    async def release_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Release the exact claimed task lease back to pending.
 
-        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
+        the live claim.
         """
 
     @abstractmethod
-    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
-        """Release worker ownership while preserving a running task's session link.
+    async def release_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
+        """Release an exact lease while preserving a running task's session link.
 
-        Raise ``TaskClaimLost`` if ``worker_id`` no longer owns a live claim.
+        Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
+        the live claim.
         """
 
     @abstractmethod
@@ -3904,10 +3994,16 @@ class InMemoryTaskStore(TaskStore):
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
-    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        ownership_clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._enable_task_admission_wakeups()
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
+        self._ownership_clock = utc_clock(ownership_clock)
         self._tasks: dict[str, Task] = {}
         self._task_id_by_interrupted_handoff_id: dict[str, str] = {}
         self._interrupted_continuation_claims: dict[str, tuple[str, str]] = {}
@@ -4017,17 +4113,30 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         *,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
         contract: WorkContractRef,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         copied_contract = copy_work_contract_ref(contract)
         if copied_contract is None:  # pragma: no cover - excluded by the public type
             raise TypeError("contract must be a WorkContractRef.")
         async with self._lock:
             task = self._require_task(task_id)
-            now = datetime.now(UTC)
-            _ensure_owned_active_task_lease(task, worker_id, now=now)
+            now = self._ownership_clock()
+            if expected_lease is None:
+                raise TaskClaimLost("Contracted task parking requires its exact worker lease.")
+            _ensure_exact_owned_active_task_lease(
+                task,
+                worker_id,
+                expected_lease,
+                now=now,
+            )
             if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
                 raise TaskClaimLost("Only the current worker may park its unattached claimed task.")
             self._ensure_task_contract_matches(task, copied_contract)
@@ -4122,7 +4231,10 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             existing = self._work_attempt_admissions.get(request.admission_id)
             if existing is not None:
-                if existing.prepare_request_sha256 != request_sha256:
+                if not work_attempt_admission_prepare_matches_sha256(
+                    request,
+                    existing.prepare_request_sha256,
+                ):
                     raise WorkAttemptAdmissionConflict(
                         "Work-attempt admission identity is bound to another request."
                     )
@@ -4161,8 +4273,8 @@ class InMemoryTaskStore(TaskStore):
 
             task = self._require_task(request.task_id)
             contract = self._ensure_task_contract_matches(task, request.contract)
-            queue_now = datetime.now(UTC)
-            now = self._clock()
+            lease_now = self._ownership_clock()
+            availability_now = self._clock()
             continuation = self._work_attempt_continuation_context(task, contract)
             if continuation is None:
                 if request.kind != "initial":
@@ -4173,21 +4285,38 @@ class InMemoryTaskStore(TaskStore):
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission requires a pending or claimed contracted task."
                     )
-                if task.available_at is not None and task.available_at > now:
+                if task.available_at is not None and task.available_at > availability_now:
                     raise WorkAttemptAdmissionConflict(
                         "Contracted task is not yet available for admission."
                     )
                 if task.status is TaskStatus.CLAIMED:
-                    _ensure_owned_active_task_lease(task, request.worker_id, now=queue_now)
+                    if request.task_lease_expires_at is None:
+                        raise TaskClaimLost(
+                            "Work-attempt admission requires the claimed task's exact lease."
+                        )
+                    _ensure_exact_owned_active_task_lease(
+                        task,
+                        request.worker_id,
+                        request.task_lease_expires_at,
+                        now=lease_now,
+                    )
                 elif task.worker_id is not None or task.lease_expires_at is not None:
                     raise WorkAttemptAdmissionConflict(
                         "Pending contracted task has conflicting worker ownership."
+                    )
+                elif request.task_lease_expires_at is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Pending work-attempt admission cannot consume worker lease authority."
                     )
                 if task.session_id not in {None, request.session_id}:
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission conflicts with the task's session."
                     )
             else:
+                if request.task_lease_expires_at is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission cannot consume prior worker lease authority."
+                    )
                 if request.kind != "continuation":
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission cannot consume continuation authority."
@@ -4242,8 +4371,8 @@ class InMemoryTaskStore(TaskStore):
                 execution_owner_id=request.execution_owner_id,
                 generation=request.generation,
                 request_sha256=work_attempt_execution_claim_request_sha256(claim_request),
-                claimed_at=now,
-                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+                claimed_at=lease_now,
+                lease_expires_at=lease_now + timedelta(seconds=request.lease_seconds),
             )
             admission = WorkAttemptAdmission(
                 admission_id=request.admission_id,
@@ -4260,7 +4389,7 @@ class InMemoryTaskStore(TaskStore):
                 source_execution_profile_fingerprint=(request.source_execution_profile_fingerprint),
                 claim=claim,
                 continuation=continuation,
-                prepared_at=now,
+                prepared_at=lease_now,
             )
             updated_task = task.model_copy(
                 update={
@@ -4269,8 +4398,8 @@ class InMemoryTaskStore(TaskStore):
                     "session_instance_id": session_instance_id,
                     "worker_id": request.worker_id,
                     "lease_expires_at": claim.lease_expires_at,
-                    "started_at": task.started_at or now,
-                    "updated_at": now,
+                    "started_at": task.started_at or lease_now,
+                    "updated_at": lease_now,
                 }
             )
             self._store_task(updated_task)
@@ -4317,8 +4446,8 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkAttemptAdmissionConflict(
                     "Only a prepared admission can publish its work attempt."
                 )
-            now = self._clock()
-            self._ensure_live_work_attempt_claim(admission, now=now)
+            lease_now = self._ownership_clock()
+            self._ensure_live_work_attempt_claim(admission, now=lease_now)
             if (
                 task.status is not TaskStatus.RUNNING
                 or task.worker_id != admission.claim.worker_id
@@ -4347,14 +4476,14 @@ class InMemoryTaskStore(TaskStore):
                 **attempt_request.model_dump(mode="python"),
                 ordinal=len(attempt_ids) + 1,
                 request_sha256=work_attempt_request_sha256(attempt_request),
-                started_at=now,
+                started_at=(evidence_now := self._clock()),
             )
             activated = admission.model_copy(
                 update={
                     "state": WorkAttemptAdmissionState.ACTIVE,
                     "attempt": attempt,
                     "session_evidence_sha256": request.session_evidence_sha256,
-                    "activated_at": now,
+                    "activated_at": evidence_now,
                 }
             )
             activated = self._copy_work_attempt_admission(activated)
@@ -4408,8 +4537,8 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkAttemptExecutionClaimLost(
                     "Execution-claim renewal conflicts with current authority."
                 )
-            now = self._clock()
-            self._ensure_live_work_attempt_claim(admission, now=now)
+            lease_now = self._ownership_clock()
+            self._ensure_live_work_attempt_claim(admission, now=lease_now)
             if admission.attempt_id in self._proposal_id_by_attempt:
                 raise WorkAttemptExecutionClaimLost(
                     "Completion proposal has already closed execution authority."
@@ -4418,7 +4547,7 @@ class InMemoryTaskStore(TaskStore):
                 update={
                     "lease_expires_at": max(
                         claim.lease_expires_at,
-                        now + timedelta(seconds=request.lease_seconds),
+                        lease_now + timedelta(seconds=request.lease_seconds),
                     ),
                 }
             )
@@ -4440,7 +4569,7 @@ class InMemoryTaskStore(TaskStore):
                 task.model_copy(
                     update={
                         "lease_expires_at": renewed_claim.lease_expires_at,
-                        "updated_at": now,
+                        "updated_at": lease_now,
                     }
                 )
             )
@@ -4469,7 +4598,7 @@ class InMemoryTaskStore(TaskStore):
                     "Only a prepared or published admission can enter recovery."
                 )
             current = admission.claim
-            now = self._clock()
+            now = self._ownership_clock()
             exact_current_request = (
                 current.claim_id == request.claim_id
                 and current.worker_id == request.worker_id
@@ -4596,8 +4725,8 @@ class InMemoryTaskStore(TaskStore):
                 )
             if admission.state is WorkAttemptAdmissionState.ACTIVE:
                 return self._copy_work_attempt_admission(admission)
-            now = self._clock()
-            self._ensure_live_work_attempt_claim(admission, now=now)
+            lease_now = self._ownership_clock()
+            self._ensure_live_work_attempt_claim(admission, now=lease_now)
             if (
                 task.status is not TaskStatus.RUNNING
                 or task.worker_id != admission.claim.worker_id
@@ -4707,8 +4836,8 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkAttemptExecutionClaimLost(
                     "Completion proposal no longer owns the exact active admission."
                 )
-            now = self._clock()
-            self._ensure_live_work_attempt_claim(admission, now=now)
+            lease_now = self._ownership_clock()
+            self._ensure_live_work_attempt_claim(admission, now=lease_now)
             if existing is not None:
                 if existing.request_sha256 != proposal_sha256:
                     raise WorkCompletionConflict(
@@ -4738,7 +4867,7 @@ class InMemoryTaskStore(TaskStore):
                 task_id=admission.task_id,
                 contract=admission.contract,
                 request_sha256=proposal_sha256,
-                proposed_at=now,
+                proposed_at=self._clock(),
             )
             released = self._copy_work_attempt_admission(
                 admission.model_copy(update={"state": WorkAttemptAdmissionState.RELEASED})
@@ -4756,7 +4885,7 @@ class InMemoryTaskStore(TaskStore):
                     update={
                         "worker_id": None,
                         "lease_expires_at": None,
-                        "updated_at": now,
+                        "updated_at": lease_now,
                     }
                 )
             )
@@ -4908,7 +5037,7 @@ class InMemoryTaskStore(TaskStore):
                 raise WorkCompletionConflict(
                     "Verification claim requires the exact prepared verifier profile."
                 )
-            now = self._clock()
+            now = self._ownership_clock()
             current = self._completion_verification_claims.get(request.proposal_id)
             if (
                 current is not None
@@ -4970,7 +5099,7 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             proposal = self._require_completion_proposal(request.proposal_id)
             current = self._completion_verification_claims.get(request.proposal_id)
-            now = self._clock()
+            lease_now = self._ownership_clock()
             if (
                 current is None
                 or current.claim_id != request.claim_id
@@ -4981,7 +5110,7 @@ class InMemoryTaskStore(TaskStore):
                 or current.verifier != request.verifier
                 or current.verifier_profile_fingerprint != request.verifier_profile_fingerprint
                 or current.request_sha256 != request_sha256
-                or current.lease_expires_at <= now
+                or current.lease_expires_at <= lease_now
                 or proposal.proposal_id in self._decision_id_by_proposal
             ):
                 raise CompletionVerificationClaimLost(
@@ -5001,7 +5130,7 @@ class InMemoryTaskStore(TaskStore):
                 claimed_at=current.claimed_at,
                 lease_expires_at=max(
                     current.lease_expires_at,
-                    now + timedelta(seconds=request.lease_seconds),
+                    lease_now + timedelta(seconds=request.lease_seconds),
                 ),
             )
             self._completion_verification_claims[proposal.proposal_id] = renewed
@@ -5030,7 +5159,8 @@ class InMemoryTaskStore(TaskStore):
             proposal = self._require_completion_proposal(request.proposal_id)
             profile = self._completion_verifier_profiles.get(request.proposal_id)
             claim = self._completion_verification_claims.get(proposal.proposal_id)
-            now = self._clock()
+            lease_now = self._ownership_clock()
+            evidence_now = self._clock()
             if (
                 claim is None
                 or claim.claim_id != request.claim_id
@@ -5039,7 +5169,7 @@ class InMemoryTaskStore(TaskStore):
                 or claim.verifier_profile_fingerprint != request.verifier_profile_fingerprint
                 or profile is None
                 or profile.profile.fingerprint != request.verifier_profile_fingerprint
-                or claim.lease_expires_at <= now
+                or claim.lease_expires_at <= lease_now
             ):
                 raise CompletionVerificationClaimLost(
                     "Completion decision requires the current live verifier claim."
@@ -5066,7 +5196,7 @@ class InMemoryTaskStore(TaskStore):
                 claim_authority_sha256=completion_verification_claim_authority_sha256(claim),
                 request_sha256=request_sha256,
                 gap_fingerprint=completion_gap_fingerprint(request),
-                decided_at=now,
+                decided_at=evidence_now,
             )
             self._completion_decisions[decision.decision_id] = decision
             self._decision_id_by_proposal[proposal.proposal_id] = decision.decision_id
@@ -5153,6 +5283,7 @@ class InMemoryTaskStore(TaskStore):
                     result=request.result,
                     error=None,
                     worker_id=None,
+                    expected_lease_expires_at=None,
                     accepted_decision_id=decision.decision_id,
                     now=applied_at,
                 )
@@ -5320,7 +5451,7 @@ class InMemoryTaskStore(TaskStore):
                 worker_id=worker_id,
                 session_id=session_id,
                 session_instance_id=session_instance_id,
-                now=datetime.now(UTC),
+                now=self._ownership_clock(),
             )
 
     async def load_direct_attached_task_resume(
@@ -5441,7 +5572,7 @@ class InMemoryTaskStore(TaskStore):
                 load_parent_links,
             )
             result = build_task_topology_result(
-                observed_at=datetime.now(UTC),
+                observed_at=self._ownership_clock(),
                 linked_session_ids=query.linked_session_ids,
                 session_branch_candidates=session_candidates,
                 session_branch_limits=session_branch_limits,
@@ -5500,7 +5631,7 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             task = self._require_task(task_id)
             _ensure_retry_series_queue_attempt(task.retry_series)
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             _ensure_can_transition(task, TaskStatus.RUNNING)
             effective_session_id = _task_session_id_for_start(
                 task_id=task.id,
@@ -5541,17 +5672,31 @@ class InMemoryTaskStore(TaskStore):
         session_id: str,
         session_invocation: SessionInvocationBinding,
         worker_id: str,
+        lease_expires_at: datetime | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
             task = self._require_task(task_id)
             _ensure_retry_series_queue_attempt(task.retry_series)
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             if not _can_attach_claimed_task(task, worker_id=worker_id, now=now):
                 _raise_task_claim_attach_error(task, worker_id, now=now)
+            if expected_lease is None:
+                raise TaskClaimLost("Task attachment requires its exact worker lease.")
+            _ensure_exact_owned_active_task_lease(
+                task,
+                worker_id,
+                expected_lease,
+                now=now,
+            )
             self._ensure_contract_session_accepts_attachment(
                 task.work_contract,
                 session_id,
@@ -5584,17 +5729,31 @@ class InMemoryTaskStore(TaskStore):
         result: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
-        async with self._lock:
+        if worker_id is not None and lease_expires_at is None:
+            raise TaskClaimLost(
+                "Worker-owned task terminalization requires its exact lease generation."
+            )
+        async with (
+            managed_task_lease_mutation(
+                task_id=task_id,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                presented_lease_expires_at=lease_expires_at,
+            ) as effective_lease,
+            self._lock,
+        ):
             return self._finish_task(
                 task_id,
                 TaskStatus.COMPLETED,
                 result=result,
                 error=None,
                 worker_id=worker_id,
+                expected_lease_expires_at=effective_lease,
                 handoff_id=handoff_id,
             )
 
@@ -5604,17 +5763,31 @@ class InMemoryTaskStore(TaskStore):
         error: dict[str, Any],
         *,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
-        async with self._lock:
+        if worker_id is not None and lease_expires_at is None:
+            raise TaskClaimLost(
+                "Worker-owned task terminalization requires its exact lease generation."
+            )
+        async with (
+            managed_task_lease_mutation(
+                task_id=task_id,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                presented_lease_expires_at=lease_expires_at,
+            ) as effective_lease,
+            self._lock,
+        ):
             return self._finish_task(
                 task_id,
                 TaskStatus.FAILED,
                 result=None,
                 error=error,
                 worker_id=worker_id,
+                expected_lease_expires_at=effective_lease,
                 handoff_id=handoff_id,
             )
 
@@ -5625,6 +5798,7 @@ class InMemoryTaskStore(TaskStore):
             existing = self._terminalization_receipts.get(receipt_key)
             if existing is not None:
                 return _replay_task_terminalization_receipt(
+                    request=request,
                     request_sha256=request_sha256,
                     receipt=existing,
                     current_task=self._tasks.get(request.task_id),
@@ -5648,7 +5822,12 @@ class InMemoryTaskStore(TaskStore):
                 raise TaskTerminalizationConflict(
                     "Task is terminal without the matching terminalization receipt."
                 )
-            _ensure_owned_active_task_lease(task, request.worker_id)
+            committed_at = self._ownership_clock()
+            _ensure_task_terminalization_lease_authority(
+                task,
+                request,
+                now=committed_at,
+            )
             _ensure_task_handoff_authority(task, request.handoff_id)
             _validate_ordinary_task_terminalization_against_cancellation(task, request)
             status = TaskStatus(request.kind.value)
@@ -5658,7 +5837,9 @@ class InMemoryTaskStore(TaskStore):
                 result=request.result,
                 error=request.error,
                 worker_id=request.worker_id,
+                expected_lease_expires_at=request.lease_expires_at,
                 handoff_id=request.handoff_id,
+                now=committed_at,
             )
             self._terminalization_receipts[receipt_key] = TaskTerminalizationReceipt(
                 task_id=request.task_id,
@@ -5667,7 +5848,7 @@ class InMemoryTaskStore(TaskStore):
                 kind=request.kind,
                 request_sha256=request_sha256,
                 task=terminal_task,
-                committed_at=datetime.now(UTC),
+                committed_at=committed_at,
             )
             return terminal_task.model_copy(deep=True)
 
@@ -5727,13 +5908,13 @@ class InMemoryTaskStore(TaskStore):
                 raise TaskInterruptedHandoffConflict(
                     "Admitted work attempts do not use interrupted-task handoff release."
                 )
+            committed_at = self._ownership_clock()
             _require_interrupted_task_handoff_authority(
                 task,
                 request,
-                now=datetime.now(UTC),
+                now=committed_at,
                 recover_expired=recover_expired,
             )
-            committed_at = datetime.now(UTC)
             released = task.model_copy(
                 update={
                     "worker_id": None,
@@ -5778,7 +5959,7 @@ class InMemoryTaskStore(TaskStore):
             limit=limit,
         )
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             candidates = sorted(
                 (
                     task
@@ -5818,7 +5999,7 @@ class InMemoryTaskStore(TaskStore):
             limit=scan_limit,
         )
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             prior_claim = self._interrupted_continuation_claims.get(handoff_id_sha256)
             if prior_claim is not None:
                 existing = self._tasks.get(prior_claim[0])
@@ -5922,7 +6103,7 @@ class InMemoryTaskStore(TaskStore):
         receipt_key = (request.task_id, request.cancellation_idempotency_key)
         rejection_key = (request.task_id, request.reconciliation_idempotency_key)
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             rejection = self._cancellation_reconciliation_rejections.get(rejection_key)
             if rejection is not None:
                 raise _replay_task_cancellation_reconciliation_rejection(
@@ -5982,13 +6163,21 @@ class InMemoryTaskStore(TaskStore):
             existing = self._retry_settlements.get(receipt_key)
             if existing is not None:
                 return _replay_task_retry_settlement(
+                    request=request,
                     request_sha256=request_sha256,
                     receipt=existing,
                     current_task=self._tasks.get(request.task_id),
                 )
             task = self._require_task(request.task_id)
-            now = datetime.now(UTC)
-            _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+            now = self._ownership_clock()
+            if request.lease_expires_at is None:
+                raise TaskClaimLost("Task retry settlement requires its exact worker lease.")
+            _ensure_exact_owned_active_task_lease(
+                task,
+                request.worker_id,
+                request.lease_expires_at,
+                now=now,
+            )
             if task.retry_series is None:
                 raise ValueError("Task does not belong to a retry series.")
             series_now = self._clock()
@@ -6025,19 +6214,26 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         token_count, estimated_cost = _validated_task_retry_terminal_accounting(
             token_count=token_count,
             estimated_cost=estimated_cost,
         )
         async with self._lock:
             task = self._require_task(task_id)
-            lease_now = datetime.now(UTC)
-            _ensure_owned_active_task_lease(task, worker_id, now=lease_now)
+            lease_now = self._ownership_clock()
+            _ensure_exact_owned_active_task_lease(
+                task,
+                worker_id,
+                expected_lease,
+                now=lease_now,
+            )
             series_now = self._clock()
             if not _claimed_task_retry_attempt_elapsed(task, series_now=series_now):
                 return None
@@ -6055,12 +6251,20 @@ class InMemoryTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
+        *,
+        lease_expires_at: datetime,
     ) -> bool:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         async with self._lock:
             task = self._require_task(task_id)
-            _ensure_owned_active_task_lease(task, worker_id, now=datetime.now(UTC))
+            _ensure_exact_owned_active_task_lease(
+                task,
+                worker_id,
+                expected_lease,
+                now=self._ownership_clock(),
+            )
             return _claimed_task_retry_attempt_elapsed(task, series_now=self._clock())
 
     async def load_task_retry_settlement(
@@ -6084,7 +6288,7 @@ class InMemoryTaskStore(TaskStore):
         receipt_key = (request.task_id, request.cancellation_idempotency_key)
         rejection_key = (request.task_id, request.reconciliation_idempotency_key)
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             rejection = self._retry_reconciliation_rejections.get(rejection_key)
             if rejection is not None:
                 raise _replay_task_retry_cancellation_reconciliation_rejection(
@@ -6145,6 +6349,74 @@ class InMemoryTaskStore(TaskStore):
                 error=copied_error,
             )
 
+    async def request_claimed_task_cancellation(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+        error: dict[str, Any] | None = None,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        copied_error = None if error is None else copy_durable_json_object(error, "error")
+        async with self._lock:
+            current = self._require_task(task_id)
+            if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                raise TaskClaimLost(
+                    "Claimed-task cancellation no longer owns the expected worker lease."
+                )
+            if _task_cancellation_requested(current) or _task_retry_cancellation_requested(current):
+                return current.model_copy(deep=True)
+            if current.started_at is not None:
+                requested = _expired_dispatched_task_cancellation(
+                    current,
+                    updated_at=self._ownership_clock(),
+                    error=copied_error,
+                )
+                self._store_task(requested)
+                return requested.model_copy(deep=True)
+            return self._finish_task(
+                task_id,
+                TaskStatus.CANCELLED,
+                result=None,
+                error=copied_error,
+                worker_id=worker_id,
+                expected_lease_expires_at=expected_lease,
+            )
+
+    async def mark_claimed_task_execution_started(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_expires_at: datetime,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        async with self._lock:
+            now = self._ownership_clock()
+            current = self._require_task(task_id)
+            if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                raise TaskClaimLost(
+                    "Claimed-task execution no longer owns the expected worker lease."
+                )
+            _ensure_owned_active_task_lease(current, worker_id, now=now)
+            if (
+                current.status is not TaskStatus.CLAIMED
+                or current.session_id is not None
+                or _task_cancellation_requested(current)
+                or _task_retry_cancellation_requested(current)
+            ):
+                raise TaskTerminalizationConflict(
+                    "Claimed task cannot begin ordinary worker execution."
+                )
+            if current.started_at is not None:
+                return current.model_copy(deep=True)
+            started = current.model_copy(update={"started_at": now, "updated_at": now})
+            self._store_task(started)
+            return started.model_copy(deep=True)
+
     async def pause_task(
         self,
         task_id: str,
@@ -6197,7 +6469,7 @@ class InMemoryTaskStore(TaskStore):
                     "Admitted work attempts cannot use ordinary task resumption."
                 )
             _ensure_can_resume_task(task)
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.PENDING,
@@ -6227,7 +6499,7 @@ class InMemoryTaskStore(TaskStore):
             return None
         async with self._lock:
             availability_now = self._clock()
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             for task in tuple(self._tasks.values()):
                 if _task_retry_attempt_elapsed(
                     task, series_now=availability_now
@@ -6273,22 +6545,25 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
+        lease_expires_at: datetime,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         extend_seconds = _validate_positive_int(extend_seconds, "extend_seconds")
         async with self._lock:
-            task = self._require_owned_leased_task(task_id, worker_id)
+            now = self._ownership_clock()
+            task = self._require_owned_leased_task(task_id, worker_id, now=now)
+            if task.lease_expires_at != expected_lease:
+                raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
             _ensure_task_handoff_authority(task, handoff_id)
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
                     "Admitted work attempts require claim-fenced lease renewal."
                 )
-            now = datetime.now(UTC)
-            _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
                 update={
                     "lease_expires_at": now + timedelta(seconds=extend_seconds),
@@ -6298,11 +6573,21 @@ class InMemoryTaskStore(TaskStore):
             self._store_task(updated)
             return updated.model_copy(deep=True)
 
-    async def release_task(self, task_id: str, worker_id: str) -> Task:
+    async def release_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         async with self._lock:
-            task = self._require_owned_leased_task(task_id, worker_id)
+            now = self._ownership_clock()
+            task = self._require_owned_leased_task(task_id, worker_id, now=now)
+            if task.lease_expires_at != expected_lease:
+                raise TaskClaimLost("Task release no longer owns the expected worker lease.")
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
@@ -6318,24 +6603,35 @@ class InMemoryTaskStore(TaskStore):
                 raise TaskTerminalizationConflict(
                     "Task cancellation is still draining under its current owner."
                 )
-            now = datetime.now(UTC)
-            _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.PENDING,
                     "worker_id": None,
                     "lease_expires_at": None,
+                    "started_at": None,
                     "updated_at": now,
                 }
             )
             self._store_task(updated)
             return updated.model_copy(deep=True)
 
-    async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
+    async def release_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         async with self._lock:
-            task = self._require_owned_leased_task(task_id, worker_id)
+            now = self._ownership_clock()
+            task = self._require_owned_leased_task(task_id, worker_id, now=now)
+            if task.lease_expires_at != expected_lease:
+                raise TaskClaimLost(
+                    "Attached-task release no longer owns the expected worker lease."
+                )
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
@@ -6353,8 +6649,6 @@ class InMemoryTaskStore(TaskStore):
                 raise TaskTerminalizationConflict(
                     "Task cancellation is still draining under its current owner."
                 )
-            now = datetime.now(UTC)
-            _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
                 update={
                     "worker_id": None,
@@ -6377,7 +6671,7 @@ class InMemoryTaskStore(TaskStore):
         if query.status is not None and query.status is not TaskStatus.CLAIMED:
             return []
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             expired = [
                 task
                 for task in self._tasks.values()
@@ -6393,6 +6687,13 @@ class InMemoryTaskStore(TaskStore):
             expired = _sort_tasks(expired, TaskOrder.UPDATED_AT_ASC)
             reclaimed: list[Task] = []
             for task in expired[:max_reclaims]:
+                if task.started_at is not None:
+                    requested = _expired_dispatched_task_cancellation(
+                        task,
+                        updated_at=now,
+                    )
+                    self._store_task(requested)
+                    continue
                 updated = task.model_copy(
                     update={
                         "status": TaskStatus.PENDING,
@@ -6429,15 +6730,19 @@ class InMemoryTaskStore(TaskStore):
         authority = _copy_local_execution_attempt_authority(authority)
         async with self._lock:
             existing = self._local_execution_attempts.get(authority.attempt_id)
+            lease_now = self._ownership_clock()
             task = (
                 None
                 if existing is not None
-                else self._require_owned_leased_task(authority.task_id, authority.worker_id)
+                else self._require_owned_leased_task(
+                    authority.task_id,
+                    authority.worker_id,
+                    now=lease_now,
+                )
             )
             lineage_key = local_execution_effect_scope(authority)
             prior_id = self._local_execution_attempt_by_lineage.get(lineage_key)
             evidence_now = self._clock()
-            lease_now = datetime.now(UTC)
             record = prepare_local_execution_attempt_record(
                 authority=authority,
                 task=task,
@@ -6464,7 +6769,7 @@ class InMemoryTaskStore(TaskStore):
                     "Local execution start has no prepared attempt."
                 )
             evidence_now = self._clock()
-            lease_now = datetime.now(UTC)
+            lease_now = self._ownership_clock()
             if record.start is None:
                 require_local_execution_task_authority(
                     self._require_task(record.authority.task_id),
@@ -6495,7 +6800,7 @@ class InMemoryTaskStore(TaskStore):
                 record,
                 settlement,
                 evidence_now=self._clock(),
-                lease_now=datetime.now(UTC),
+                lease_now=self._ownership_clock(),
             )
             self._local_execution_attempts[settlement.attempt_id] = updated
             return updated.model_copy(deep=True)
@@ -6553,7 +6858,7 @@ class InMemoryTaskStore(TaskStore):
                 )
             task = self._require_task(record.authority.task_id)
             evidence_now = self._clock()
-            lease_now = datetime.now(UTC)
+            lease_now = self._ownership_clock()
             require_local_execution_recovery_eligible(
                 task,
                 record,
@@ -6710,9 +7015,9 @@ class InMemoryTaskStore(TaskStore):
         if task.worker_id != worker_id:
             raise TaskClaimLost("Work attempt does not carry the task's current worker authority.")
         if worker_id is not None:
-            # Task ownership leases use wall-clock time. ``self._clock`` is the
+            # Task ownership uses the store-owned clock. ``self._clock`` is the
             # independently injectable availability/verifier lifecycle clock.
-            _ensure_active_task_lease(task, worker_id)
+            _ensure_active_task_lease(task, worker_id, now=self._ownership_clock())
 
     def _ensure_attempt_is_current(self, task: Task, attempt: WorkAttempt) -> None:
         self._ensure_attempt_state_is_current(task, attempt)
@@ -6798,9 +7103,15 @@ class InMemoryTaskStore(TaskStore):
             invocation=parent.invocation,
         )
 
-    def _require_owned_leased_task(self, task_id: str, worker_id: str) -> Task:
+    def _require_owned_leased_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        now: datetime,
+    ) -> Task:
         task = self._require_task(task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         return task
 
     def _finish_task(
@@ -6811,8 +7122,10 @@ class InMemoryTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
         worker_id: str | None = None,
+        expected_lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
         accepted_decision_id: str | None = None,
+        now: datetime | None = None,
     ) -> Task:
         updated = self._prepare_finished_task(
             task_id,
@@ -6820,9 +7133,10 @@ class InMemoryTaskStore(TaskStore):
             result=result,
             error=error,
             worker_id=worker_id,
+            expected_lease_expires_at=expected_lease_expires_at,
             handoff_id=handoff_id,
             accepted_decision_id=accepted_decision_id,
-            now=datetime.now(UTC),
+            now=self._ownership_clock() if now is None else now,
         )
         self._store_task(updated)
         return updated.model_copy(deep=True)
@@ -6835,15 +7149,22 @@ class InMemoryTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
         worker_id: str | None,
+        expected_lease_expires_at: datetime | None,
         handoff_id: str | None = None,
         accepted_decision_id: str | None,
         now: datetime,
     ) -> Task:
         task = self._require_task(task_id)
         if worker_id is not None:
-            if task.worker_id != worker_id:
-                raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
-            _ensure_active_task_lease(task, worker_id, now=now)
+            if expected_lease_expires_at is None:
+                _ensure_owned_active_task_lease(task, worker_id, now=now)
+            else:
+                _ensure_exact_owned_active_task_lease(
+                    task,
+                    worker_id,
+                    expected_lease_expires_at,
+                    now=now,
+                )
             _ensure_task_handoff_authority(task, handoff_id)
         admission_id = self._latest_admission_id_by_task.get(task_id)
         if admission_id is not None and accepted_decision_id is None:
@@ -6886,9 +7207,9 @@ class InMemoryTaskStore(TaskStore):
         if (
             task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
             and status is TaskStatus.CANCELLED
-            and worker_id is None
             and task.worker_id is not None
             and task.lease_expires_at is not None
+            and not _task_cancellation_requested(task)
         ):
             cancellation_requested = _task_cancellation_requested_task(
                 task,
@@ -6999,7 +7320,7 @@ class InMemoryTaskStore(TaskStore):
                     "Admitted work attempts cannot use ordinary task holds."
                 )
             _ensure_can_hold_task(task, status)
-            now = datetime.now(UTC)
+            now = self._ownership_clock()
             updated = task.model_copy(
                 update={
                     "status": status,
@@ -7677,6 +7998,32 @@ def prepare_task_terminalization(
         )
     copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
     material = {
+        "schema": "cayu.task-terminalization.v3",
+        "task_id": copied.task_id,
+        "idempotency_key": copied.idempotency_key,
+        "worker_id": copied.worker_id,
+        "lease_expires_at": (
+            None if copied.lease_expires_at is None else copied.lease_expires_at.isoformat()
+        ),
+        "kind": copied.kind.value,
+        "result": copied.result,
+        "error": copied.error,
+    }
+    if copied.handoff_id is not None:
+        material["handoff_id"] = copied.handoff_id
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(material, "task_terminalization")
+    ).hexdigest()
+    return copied, request_sha256
+
+
+def _legacy_task_terminalization_request_sha256(
+    request: TaskTerminalizationRequest,
+) -> str:
+    """Reconstruct the digest emitted before lease-generation fencing."""
+
+    copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
+    material = {
         "schema": (
             "cayu.task-terminalization.v1"
             if copied.handoff_id is None
@@ -7691,10 +8038,19 @@ def prepare_task_terminalization(
     }
     if copied.handoff_id is not None:
         material["handoff_id"] = copied.handoff_id
-    request_sha256 = sha256(
-        canonical_durable_json_bytes(material, "task_terminalization")
-    ).hexdigest()
-    return copied, request_sha256
+    return sha256(canonical_durable_json_bytes(material, "task_terminalization")).hexdigest()
+
+
+def _task_terminalization_request_matches_sha256(
+    request: TaskTerminalizationRequest,
+    *,
+    request_sha256: str,
+    candidate_sha256: str,
+) -> bool:
+    return candidate_sha256 in {
+        request_sha256,
+        _legacy_task_terminalization_request_sha256(request),
+    }
 
 
 def prepare_interrupted_task_handoff(
@@ -7895,13 +8251,48 @@ def prepare_task_retry_settlement(
     request_sha256 = sha256(
         canonical_durable_json_bytes(
             {
-                "schema": "cayu.task-retry-settlement.v1",
+                "schema": "cayu.task-retry-settlement.v2",
                 **copied.model_dump(mode="json", warnings=False),
             },
             "task_retry_settlement",
         )
     ).hexdigest()
     return copied, request_sha256
+
+
+def _legacy_task_retry_settlement_request_sha256(
+    request: TaskRetrySettlementRequest,
+) -> str:
+    """Reconstruct the digest emitted before lease-generation fencing."""
+
+    copied = TaskRetrySettlementRequest.model_validate(
+        request.model_dump(mode="python", warnings=False)
+    )
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "schema": "cayu.task-retry-settlement.v1",
+                **copied.model_dump(
+                    mode="json",
+                    warnings=False,
+                    exclude={"lease_expires_at"},
+                ),
+            },
+            "task_retry_settlement",
+        )
+    ).hexdigest()
+
+
+def _task_retry_settlement_request_matches_sha256(
+    request: TaskRetrySettlementRequest,
+    *,
+    request_sha256: str,
+    candidate_sha256: str,
+) -> bool:
+    return candidate_sha256 in {
+        request_sha256,
+        _legacy_task_retry_settlement_request_sha256(request),
+    }
 
 
 def prepare_task_retry_cancellation_reconciliation(
@@ -7971,13 +8362,18 @@ def prepare_task_cancellation_reconciliation(
 
 def _replay_task_retry_settlement(
     *,
+    request: TaskRetrySettlementRequest,
     request_sha256: str,
     receipt: TaskRetrySettlementResult,
     current_task: Task | None,
 ) -> TaskRetrySettlementResult:
     receipt = _copy_task_retry_settlement_result(receipt)
     current_task = None if current_task is None else copy_task(current_task)
-    if receipt.request_sha256 != request_sha256:
+    if not _task_retry_settlement_request_matches_sha256(
+        request,
+        request_sha256=request_sha256,
+        candidate_sha256=receipt.request_sha256,
+    ):
         raise TaskTerminalizationConflict(
             "Task retry settlement idempotency key is bound to another intent."
         )
@@ -8081,7 +8477,11 @@ def _validate_task_retry_settlement_receipt_identity(
     if (
         receipt.task_id != request.task_id
         or receipt.idempotency_key != request.idempotency_key
-        or receipt.request_sha256 != request_sha256
+        or not _task_retry_settlement_request_matches_sha256(
+            request,
+            request_sha256=request_sha256,
+            candidate_sha256=receipt.request_sha256,
+        )
     ):
         raise TaskTerminalizationConflict(
             "Task retry settlement receipt conflicts with the requested operation."
@@ -8648,6 +9048,36 @@ def _task_cancellation_requested_task(
     )
 
 
+def _expired_dispatched_task_cancellation(
+    task: Task,
+    *,
+    updated_at: datetime,
+    error: dict[str, Any] | None = None,
+) -> Task:
+    """Retain an expired dispatched claim until positive quiescence evidence exists."""
+
+    if task.started_at is None:
+        raise TaskTerminalizationConflict(
+            "A task without durable dispatch evidence cannot enter drain reconciliation."
+        )
+    cancellation_error = (
+        {"code": "task_worker_lease_expired_after_dispatch"}
+        if error is None
+        else copy_durable_json_object(error, "error")
+    )
+    if task.retry_series is not None:
+        return _task_retry_cancellation_requested_task(
+            task,
+            error=cancellation_error,
+            updated_at=updated_at,
+        )
+    return _task_cancellation_requested_task(
+        task,
+        error=cancellation_error,
+        updated_at=updated_at,
+    )
+
+
 def _task_cancellation_terminalization_request(
     task: Task,
     *,
@@ -8657,7 +9087,7 @@ def _task_cancellation_terminalization_request(
 
     if not _task_cancellation_requested(task):
         return None
-    if task.worker_id != worker_id:
+    if task.worker_id != worker_id or task.lease_expires_at is None:
         raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
     payload = task.status_payload
     if type(payload) is not dict or set(payload) != {
@@ -8683,6 +9113,7 @@ def _task_cancellation_terminalization_request(
     return TaskTerminalizationRequest(
         task_id=task.id,
         worker_id=worker_id,
+        lease_expires_at=task.lease_expires_at,
         handoff_id=task.interrupted_handoff_id,
         kind=TaskTerminalKind.CANCELLED,
         error=error,
@@ -8998,6 +9429,7 @@ def _task_retry_requested_cancellation_settlement(
         or series is None
         or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
         or task.worker_id != worker_id
+        or task.lease_expires_at is None
         or type(payload) is not dict
         or set(payload) != {"settlement_idempotency_key", "error", "event"}
         or type(payload.get("settlement_idempotency_key")) is not str
@@ -9023,6 +9455,7 @@ def _task_retry_requested_cancellation_settlement(
     return TaskRetrySettlementRequest(
         task_id=task.id,
         worker_id=worker_id,
+        lease_expires_at=task.lease_expires_at,
         idempotency_key=expected_key,
         causal_budget_id=series.causal_budget_id,
         disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -9452,6 +9885,7 @@ def _task_retry_runtime_terminal_request(
         TaskRetrySettlementRequest(
             task_id=task.id,
             worker_id=f"cayu-runtime-retry-{operation}",
+            lease_expires_at=task.lease_expires_at,
             idempotency_key=_task_retry_runtime_idempotency_key(task, operation),
             causal_budget_id=series.causal_budget_id,
             disposition=request_disposition,
@@ -9826,13 +10260,18 @@ def _validate_task_terminalization_idempotency_key(value: str) -> str:
 
 def _replay_task_terminalization_receipt(
     *,
+    request: TaskTerminalizationRequest,
     request_sha256: str,
     receipt: TaskTerminalizationReceipt,
     current_task: Task | None,
 ) -> Task:
     """Validate durable replay proof and return a detached terminal task."""
 
-    if receipt.request_sha256 != request_sha256:
+    if not _task_terminalization_request_matches_sha256(
+        request,
+        request_sha256=request_sha256,
+        candidate_sha256=receipt.request_sha256,
+    ):
         raise TaskTerminalizationConflict(
             "Task terminalization idempotency key conflicts with another intent."
         )
@@ -9914,7 +10353,11 @@ async def terminalize_task_with_retry(
                 or receipt.idempotency_key != request.idempotency_key
                 or receipt.worker_id != request.worker_id
                 or receipt.kind is not request.kind
-                or receipt.request_sha256 != request_sha256
+                or not _task_terminalization_request_matches_sha256(
+                    request,
+                    request_sha256=request_sha256,
+                    candidate_sha256=receipt.request_sha256,
+                )
             ):
                 raise TaskTerminalizationConflict(
                     "Task terminalization receipt conflicts with the retry request."
@@ -9932,6 +10375,7 @@ async def terminalize_task_with_retry(
                 if current_task is not None and type(current_task) is not Task:
                     raise TypeError("Task loads must return Task instances.")
                 reconciled_task = _replay_task_terminalization_receipt(
+                    request=request,
                     request_sha256=request_sha256,
                     receipt=receipt,
                     current_task=current_task,
@@ -10039,6 +10483,7 @@ async def settle_task_retry_attempt_with_retry(
                 last_error_category = _task_terminalization_error_category(exc)
             else:
                 return _replay_task_retry_settlement(
+                    request=request,
                     request_sha256=request_sha256,
                     receipt=receipt,
                     current_task=current_task,
@@ -10071,25 +10516,42 @@ async def _terminalize_claimed_task(
         return (await terminalize_task_with_retry(task_store, request)).task
 
     request, _request_sha256 = prepare_task_terminalization(request)
-    if request.kind is TaskTerminalKind.COMPLETED:
-        if request.result is None:  # pragma: no cover - enforced by the request model
-            raise AssertionError("Completed task terminalization requires a result.")
-        return await task_store.complete_task(
-            request.task_id,
-            request.result,
-            worker_id=request.worker_id,
-            handoff_id=request.handoff_id,
-        )
     if request.kind is TaskTerminalKind.CANCELLED:
         return await task_store.cancel_task(request.task_id, request.error)
-    if request.error is None:  # pragma: no cover - enforced by the request model
-        raise AssertionError("Failed task terminalization requires an error.")
-    return await task_store.fail_task(
-        request.task_id,
-        request.error,
-        worker_id=request.worker_id,
-        handoff_id=request.handoff_id,
-    )
+
+    async def apply(lease_expires_at: datetime | None) -> Task:
+        if request.kind is TaskTerminalKind.COMPLETED:
+            if request.result is None:  # pragma: no cover - request model invariant
+                raise AssertionError("Completed task terminalization requires a result.")
+            return await task_store.complete_task(
+                request.task_id,
+                request.result,
+                worker_id=request.worker_id,
+                lease_expires_at=lease_expires_at,
+                handoff_id=request.handoff_id,
+            )
+        if request.error is None:  # pragma: no cover - request model invariant
+            raise AssertionError("Failed task terminalization requires an error.")
+        return await task_store.fail_task(
+            request.task_id,
+            request.error,
+            worker_id=request.worker_id,
+            lease_expires_at=lease_expires_at,
+            handoff_id=request.handoff_id,
+        )
+
+    if request.worker_id is None or request.lease_expires_at is not None:
+        return await apply(request.lease_expires_at)
+
+    current = await task_store.load_task(request.task_id)
+    if (
+        current is None
+        or current.worker_id != request.worker_id
+        or current.interrupted_handoff_id != request.handoff_id
+        or current.lease_expires_at is None
+    ):
+        raise TaskClaimLost("Task terminalization cannot reconstruct its exact live worker lease.")
+    return await apply(current.lease_expires_at)
 
 
 async def _terminalize_claimed_task_or_detect_peer_winner(
@@ -10707,9 +11169,8 @@ def _can_attach_claimed_task(
     task: Task,
     *,
     worker_id: str,
-    now: datetime | None = None,
+    now: datetime,
 ) -> bool:
-    now = datetime.now(UTC) if now is None else now
     return _can_attach_claimed_task_state(
         status=task.status,
         session_id=task.session_id,
@@ -10738,8 +11199,7 @@ def _can_attach_claimed_task_state(
     )
 
 
-def _ensure_active_task_lease(task: Task, worker_id: str, *, now: datetime | None = None) -> None:
-    now = datetime.now(UTC) if now is None else now
+def _ensure_active_task_lease(task: Task, worker_id: str, *, now: datetime) -> None:
     if task.lease_expires_at is None:
         raise TaskClaimLost(f"Task {task.id} has no active lease.")
     if task.lease_expires_at <= now:
@@ -10750,7 +11210,7 @@ def _ensure_owned_active_task_lease(
     task: Task,
     worker_id: str,
     *,
-    now: datetime | None = None,
+    now: datetime,
 ) -> None:
     """Require the supplied worker to own the task's current live lease."""
 
@@ -10759,6 +11219,44 @@ def _ensure_owned_active_task_lease(
     if task.worker_id != worker_id:
         raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
     _ensure_active_task_lease(task, worker_id, now=now)
+
+
+def _ensure_exact_owned_active_task_lease(
+    task: Task,
+    worker_id: str,
+    lease_expires_at: datetime,
+    *,
+    now: datetime,
+) -> None:
+    """Require one exact live worker-lease generation."""
+
+    expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+    _ensure_owned_active_task_lease(task, worker_id, now=now)
+    if task.lease_expires_at != expected_lease:
+        raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id} lease generation.")
+
+
+def _ensure_task_terminalization_lease_authority(
+    task: Task,
+    request: TaskTerminalizationRequest,
+    *,
+    now: datetime,
+) -> None:
+    """Fence reclaimable claims exactly while preserving attached-task handoffs."""
+
+    _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+    if request.lease_expires_at is not None:
+        _ensure_exact_owned_active_task_lease(
+            task,
+            request.worker_id,
+            request.lease_expires_at,
+            now=now,
+        )
+        return
+    if task.status is TaskStatus.CLAIMED and task.session_id is None:
+        raise TaskClaimLost(
+            "Unattached task terminalization requires the exact worker lease generation."
+        )
 
 
 def _ensure_task_handoff_authority(task: Task, handoff_id: str | None) -> None:
@@ -10834,7 +11332,7 @@ def _raise_task_claim_attach_error(
     task: Task,
     worker_id: str,
     *,
-    now: datetime | None = None,
+    now: datetime,
 ) -> None:
     if task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
         raise TaskClaimLost(f"Task {task.id} is not claimed by worker {worker_id}.")

@@ -7,9 +7,11 @@ from decimal import Decimal
 
 import pytest
 from tests.core._budget_ledger_contract import (
+    assert_budget_reservation_store_time_conformance,
     assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
     assert_load_reservation_reconstructs_exact_record,
+    assert_maximum_reservation_ttl_preserves_minimum_timestamp,
     assert_portable_text_boundaries,
     assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
@@ -1513,6 +1515,31 @@ def test_in_memory_budget_ledger_has_crash_safe_settlement_outbox() -> None:
     )
 
 
+def test_in_memory_budget_ledger_uses_store_time_for_reservation_leases() -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+    asyncio.run(
+        assert_budget_reservation_store_time_conformance(
+            InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60),
+            _reservation_budget_limit(max_cost="0.25"),
+            clock=clock,
+            ttl_seconds=60,
+        )
+    )
+
+
+def test_in_memory_budget_ledger_maximum_ttl_preserves_minimum_timestamp() -> None:
+    clock = MutableClock(datetime.min.replace(tzinfo=UTC))
+    asyncio.run(
+        assert_maximum_reservation_ttl_preserves_minimum_timestamp(
+            InMemoryBudgetLedger(
+                clock=clock,
+                reservation_ttl_seconds=MAX_DURABLE_JSON_INTEGER,
+            ),
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+    )
+
+
 def test_in_memory_budget_ledger_separates_pricing_and_durable_billing_identity() -> None:
     asyncio.run(
         assert_prepriced_reservation_stores_only_durable_billing_identity(
@@ -1770,6 +1797,54 @@ def test_budget_ledgers_keep_active_reservation_across_calendar_boundary(
     assert blocked.actual == Decimal("0.44")
 
 
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_budget_ledgers_accept_maximum_durable_ttl_without_overflow(
+    tmp_path,
+    backend: str,
+) -> None:
+    async def run() -> None:
+        clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+        ledger = (
+            InMemoryBudgetLedger(
+                clock=clock,
+                reservation_ttl_seconds=MAX_DURABLE_JSON_INTEGER,
+            )
+            if backend == "memory"
+            else SQLiteBudgetLedger(
+                tmp_path / "budget-max-ttl.sqlite",
+                clock=clock,
+                reservation_ttl_seconds=MAX_DURABLE_JSON_INTEGER,
+            )
+        )
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            first = await _reserve(
+                ledger,
+                limit=limit,
+                session_id="sess_maximum_ttl_owner",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert first.record is not None
+            assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
+            blocked = await _reserve(
+                ledger,
+                limit=limit,
+                session_id="sess_maximum_ttl_contender",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            assert blocked.accepted is False
+        finally:
+            close = getattr(ledger, "close", None)
+            if close is not None:
+                await close()
+
+    asyncio.run(run())
+
+
 def test_sqlite_budget_ledger_reserves_reconciles_and_releases(tmp_path) -> None:
     async def run():
         ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
@@ -1891,6 +1966,53 @@ def test_sqlite_budget_ledger_has_crash_safe_settlement_outbox(tmp_path) -> None
                 _reservation_budget_limit(max_cost="0.25"),
                 clock=clock,
                 ttl_seconds=60,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_uses_store_time_for_reservation_leases(tmp_path) -> None:
+    async def run() -> None:
+        clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget-store-time.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        contender = SQLiteBudgetLedger(
+            tmp_path / "budget-store-time.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        try:
+            await assert_budget_reservation_store_time_conformance(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
+                clock=clock,
+                ttl_seconds=60,
+                contender_ledger=contender,
+            )
+        finally:
+            await contender.close()
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_maximum_ttl_preserves_minimum_timestamp(tmp_path) -> None:
+    async def run() -> None:
+        clock = MutableClock(datetime.min.replace(tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget-minimum-timestamp.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=MAX_DURABLE_JSON_INTEGER,
+        )
+        try:
+            await assert_maximum_reservation_ttl_preserves_minimum_timestamp(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
             )
         finally:
             await ledger.close()

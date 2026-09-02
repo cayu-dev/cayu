@@ -8,12 +8,13 @@ recovery rules to the shared durable worker scheduler and lease-heartbeat clock,
 so a caller only supplies a handler that turns a claimed task into an
 ``app.run(...)``.
 
-The handler owns the task's terminal state. Legacy tasks may run with
-``RunRequest(task_id=..., task_worker_id=...)`` so the runtime completes/fails the
-task, or call ``task_store.complete_task``/``fail_task`` explicitly. Retry-series
-tasks instead return an explicit :class:`TaskRetryAttemptReport`; generic runtime
-failures are never inferred to be retryable. A handler whose attached session
-durably stops at an interrupted continuation boundary may return
+The handler owns the task's terminal state. Ordinary tasks may run with
+``RunRequest(task_id=..., task_worker_id=..., task_lease_expires_at=...)`` so the
+runtime completes/fails the
+task, or call ``complete_managed_task``/``fail_managed_task`` explicitly.
+Retry-series tasks instead return an explicit :class:`TaskRetryAttemptReport`;
+generic runtime failures are never inferred to be retryable. A handler whose
+attached session durably stops at an interrupted continuation boundary may return
 ``TaskHandlerOutcome.SESSION_INTERRUPTED`` to release worker ownership while a
 control-plane process waits to resume that session. If the handler raises or
 returns ``None`` while the task is still active, the worker marks the task failed
@@ -31,6 +32,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
 
 from cayu._exception_groups import (
@@ -38,6 +40,11 @@ from cayu._exception_groups import (
     exception_tree_contains,
     iter_exception_tree,
     set_exception_cause,
+)
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    restore_task_cancellation_requests,
+    unexpected_child_cancellation_error,
 )
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
 from cayu.core.events import (
@@ -57,16 +64,29 @@ from cayu.runtime._durable_worker_loop import (
     wait_or_stop,
     worker_stop_requested,
 )
+from cayu.runtime._task_lease_authority import (
+    TaskLeaseAuthority as _TaskLeaseAuthority,
+)
+from cayu.runtime._task_lease_authority import (
+    bind_task_lease_authority,
+    managed_task_lease_mutation,
+)
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
+    task_store_cancellation_reconciliation_capability_is_complete,
     task_store_interrupted_handoff_capability_is_complete,
     task_store_mutation_is_cancellation_quiescent,
 )
+from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
 from cayu.runtime.sessions import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.runtime.tasks import (
     InterruptedTaskContinuationClaimPage,
     Task,
+    TaskCancellationReconciliationEvent,
+    TaskCancellationReconciliationEvidence,
+    TaskCancellationReconciliationOutcome,
+    TaskCancellationReconciliationRequest,
     TaskClaimLost,
     TaskInterruptedHandoffConflict,
     TaskInterruptedHandoffReceipt,
@@ -74,6 +94,10 @@ from cayu.runtime.tasks import (
     TaskQuery,
     TaskRetryAttemptDisposition,
     TaskRetryAttemptReport,
+    TaskRetryCancellationReconciliationEvent,
+    TaskRetryCancellationReconciliationEvidence,
+    TaskRetryCancellationReconciliationOutcome,
+    TaskRetryCancellationReconciliationRequest,
     TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
@@ -121,7 +145,6 @@ RecoveredInterruptedTaskHandler = Callable[
     Awaitable[TaskHandlerOutcome | None],
 ]
 _MAX_TASK_FAILURE_MESSAGE_BYTES = 500
-_TASK_RETRY_HANDLER_CANCELLATION_GRACE_SECONDS = 1.0
 _INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
 _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
@@ -129,6 +152,54 @@ _INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 10
 _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
+
+
+async def complete_managed_task(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    result: dict[str, Any],
+) -> Task:
+    """Complete a managed worker task against its latest acknowledged lease."""
+
+    task = copy_task(task)
+    async with managed_task_lease_mutation(
+        task_id=task.id,
+        worker_id=worker_id,
+        handoff_id=task.interrupted_handoff_id,
+        presented_lease_expires_at=task.lease_expires_at,
+    ) as effective_lease:
+        return await task_store.complete_task(
+            task.id,
+            result,
+            worker_id=worker_id,
+            lease_expires_at=effective_lease,
+            handoff_id=task.interrupted_handoff_id,
+        )
+
+
+async def fail_managed_task(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    error: dict[str, Any],
+) -> Task:
+    """Fail a managed worker task against its latest acknowledged lease."""
+
+    task = copy_task(task)
+    async with managed_task_lease_mutation(
+        task_id=task.id,
+        worker_id=worker_id,
+        handoff_id=task.interrupted_handoff_id,
+        presented_lease_expires_at=task.lease_expires_at,
+    ) as effective_lease:
+        return await task_store.fail_task(
+            task.id,
+            error,
+            worker_id=worker_id,
+            lease_expires_at=effective_lease,
+            handoff_id=task.interrupted_handoff_id,
+        )
 
 
 class _TaskRetryElapsed(Exception):
@@ -206,7 +277,8 @@ async def run_task_worker(
 
     For each claimed task, ``handler(app, task, worker_id)`` is awaited while the
     task lease is heartbeated in the background. The handler typically builds a
-    ``RunRequest(task_id=task.id, task_worker_id=worker_id, ...)`` and awaits
+    ``RunRequest(task_id=task.id, task_worker_id=worker_id,
+    task_lease_expires_at=task.lease_expires_at, ...)`` and awaits
     ``app.run(...)`` so the runtime completes/fails the task. If that run ends at
     a durable interrupted boundary, return ``TaskHandlerOutcome.SESSION_INTERRUPTED``
     so the helper validates the session and releases only the task's worker lease.
@@ -246,6 +318,11 @@ async def run_task_worker(
         )
     if max_tasks == 0 or _is_stopped(stop):
         return 0
+    if not task_store_cancellation_reconciliation_capability_is_complete(task_store):
+        raise NotImplementedError(
+            "The generic task worker requires complete idempotent ordinary-task "
+            "cancellation reconciliation before it can claim work."
+        )
     materialized_work_contract_queue_supported = (
         task_store.supports_verified_work_contracts
         or type(task_store).hold_claimed_work_contract_task
@@ -450,11 +527,15 @@ async def run_task_worker(
         if task.work_contract is not None:
             task_id = task.id
             contract = task.work_contract
+            lease_expires_at = task.lease_expires_at
+            if lease_expires_at is None:  # pragma: no cover - claim contract
+                raise TaskClaimLost("Contracted task claim has no worker lease.")
             parking_outcome = await capture_task_store_operation(
-                lambda task_id=task_id, contract=contract: (
+                lambda task_id=task_id, contract=contract, lease_expires_at=lease_expires_at: (
                     task_store.hold_claimed_work_contract_task(
                         task_id,
                         worker_id=worker_id,
+                        lease_expires_at=lease_expires_at,
                         contract=contract,
                     )
                 ),
@@ -465,7 +546,7 @@ async def run_task_worker(
             )
             if parking_outcome.failure is not None:
                 failure = parking_outcome.failure
-                del contract, parking_outcome, task, task_id
+                del contract, lease_expires_at, parking_outcome, task, task_id
                 raise_task_store_operation_failure(failure)
             del contract, parking_outcome, task_id
             return DurableWorkerStep(
@@ -506,11 +587,29 @@ async def _handle_with_heartbeat(
     *,
     recover_interrupted_authority_loss: bool = False,
 ) -> None:
+    (
+        task,
+        claim_deadline_monotonic,
+        retry_deadline_elapsed,
+        cancellation_requested,
+    ) = await _renew_task_claim_before_dispatch(
+        task_store,
+        task,
+        worker_id,
+        lease_seconds,
+    )
     owner_task = asyncio.current_task()
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
         raise RuntimeError("Task worker handler execution requires an owning task.")
     cancellation_baseline = owner_task.cancelling()
     stop_heartbeat = asyncio.Event()
+    lease_authority = _TaskLeaseAuthority(
+        lease_expires_at=_require_task_lease_expires_at(task),
+        handoff_id=task.interrupted_handoff_id,
+        task_id=task.id,
+        worker_id=worker_id,
+        deadline_monotonic=claim_deadline_monotonic,
+    )
     heartbeat_task = asyncio.create_task(
         _heartbeat_until(
             task_store,
@@ -518,7 +617,9 @@ async def _handle_with_heartbeat(
             worker_id,
             lease_seconds,
             stop_heartbeat,
+            lease_authority=lease_authority,
             handoff_id=task.interrupted_handoff_id,
+            claim_deadline_monotonic=claim_deadline_monotonic,
             enforce_retry_deadline=(
                 task.retry_series is not None and task.retry_series.elapsed_deadline is not None
             ),
@@ -527,8 +628,8 @@ async def _handle_with_heartbeat(
     handler_error: Exception | None = None
     handler_outcome: TaskHandlerOutcome | TaskRetryAttemptReport | None = None
     interrupted_authority_loss = False
-    retry_elapsed = False
-    retry_cancellation_requested = False
+    retry_elapsed = retry_deadline_elapsed
+    retry_cancellation_requested = cancellation_requested
     retry_elapsed_cancellation: asyncio.CancelledError | None = None
     retry_terminal_report: TaskRetryAttemptReport | None = None
     disposition_cancellation: asyncio.CancelledError | None = None
@@ -536,47 +637,47 @@ async def _handle_with_heartbeat(
     ownership_settled = False
     pending_failure: BaseException | None = None
     try:
-        try:
-            handler_outcome = await _await_task_handler(
-                app,
-                task_store,
-                task,
-                handler,
-                worker_id,
-                lease_seconds,
-                cancellation_baseline=cancellation_baseline,
-                heartbeat_task=heartbeat_task,
-                stop_heartbeat=stop_heartbeat,
-            )
-        except _TaskRetryElapsed as exc:
-            retry_elapsed = True
-            retry_elapsed_cancellation = exc.owner_cancellation
-            retry_terminal_report = exc.report
-        except _TaskRetryCancellationRequested as exc:
-            retry_cancellation_requested = True
-            retry_elapsed_cancellation = exc.owner_cancellation
-            retry_terminal_report = exc.report
-        except _TaskRetryHandlerUnsettled:
-            raise
-        except Exception as exc:  # a single bad task must not stop the worker
-            if heartbeat_task.done() and not heartbeat_task.cancelled():
-                try:
-                    heartbeat_task.result()
-                except Exception as heartbeat_failure:
-                    heartbeat_authority_failure = heartbeat_failure
-                    if exc is heartbeat_failure:
-                        raise
-                    raise BaseExceptionGroup(
-                        "Task handler shutdown failed after heartbeat authority loss.",
-                        [heartbeat_failure, exc],
-                    ) from None
-            if recover_interrupted_authority_loss and isinstance(
-                exc,
-                (SessionRunFenced, TaskClaimLost),
-            ):
-                interrupted_authority_loss = True
-            else:
-                handler_error = exc
+        if not retry_elapsed and not retry_cancellation_requested:
+            try:
+                handler_outcome = await _await_task_handler(
+                    app,
+                    task_store,
+                    task,
+                    handler,
+                    worker_id,
+                    lease_seconds,
+                    cancellation_baseline=cancellation_baseline,
+                    heartbeat_task=heartbeat_task,
+                    stop_heartbeat=stop_heartbeat,
+                    lease_authority=lease_authority,
+                )
+            except _TaskRetryElapsed as exc:
+                retry_elapsed = True
+                retry_elapsed_cancellation = exc.owner_cancellation
+                retry_terminal_report = exc.report
+            except _TaskRetryCancellationRequested as exc:
+                retry_cancellation_requested = True
+                retry_elapsed_cancellation = exc.owner_cancellation
+                retry_terminal_report = exc.report
+            except Exception as exc:  # a single bad task must not stop the worker
+                if heartbeat_task.done() and not heartbeat_task.cancelled():
+                    try:
+                        heartbeat_task.result()
+                    except Exception as heartbeat_failure:
+                        heartbeat_authority_failure = heartbeat_failure
+                        if exc is heartbeat_failure:
+                            raise
+                        raise BaseExceptionGroup(
+                            "Task handler shutdown failed after heartbeat authority loss.",
+                            [heartbeat_failure, exc],
+                        ) from None
+                if recover_interrupted_authority_loss and isinstance(
+                    exc,
+                    (SessionRunFenced, TaskClaimLost),
+                ):
+                    interrupted_authority_loss = True
+                else:
+                    handler_error = exc
 
         if retry_elapsed or retry_cancellation_requested:
             terminalization_label = "cancellation" if retry_cancellation_requested else "deadline"
@@ -621,6 +722,7 @@ async def _handle_with_heartbeat(
                         task_store,
                         task,
                         worker_id,
+                        lease_expires_at=lease_authority.lease_expires_at,
                         cancellation_baseline=cancellation_baseline,
                         owner_cancellation=retry_elapsed_cancellation,
                         report=retry_terminal_report,
@@ -667,7 +769,14 @@ async def _handle_with_heartbeat(
             if handler_error is not None:
                 failure_payload = _task_failure_payload(app, handler_error)
                 handler_error = None
-                await _safe_fail_payload(task_store, task.id, worker_id, failure_payload)
+                await _safe_fail_payload(
+                    task_store,
+                    task.id,
+                    worker_id,
+                    failure_payload,
+                    lease_expires_at=lease_authority.lease_expires_at,
+                    lease_authority=lease_authority,
+                )
             elif type(handler_outcome) is TaskRetryAttemptReport:
                 if task.retry_series is None:
                     await _safe_fail(
@@ -676,6 +785,8 @@ async def _handle_with_heartbeat(
                         task.id,
                         worker_id,
                         TypeError("TaskRetryAttemptReport requires a task retry policy."),
+                        lease_expires_at=lease_authority.lease_expires_at,
+                        lease_authority=lease_authority,
                     )
                 else:
                     await _settle_retry_attempt_report(
@@ -683,6 +794,7 @@ async def _handle_with_heartbeat(
                         task,
                         worker_id,
                         handler_outcome,
+                        lease_authority=lease_authority,
                     )
             elif handler_outcome is TaskHandlerOutcome.SESSION_INTERRUPTED:
                 await _handoff_interrupted_session(app, task_store, task.id, worker_id)
@@ -693,12 +805,22 @@ async def _handle_with_heartbeat(
                     task.id,
                     worker_id,
                     TypeError(f"Unsupported task handler outcome: {handler_outcome!r}."),
+                    lease_expires_at=lease_authority.lease_expires_at,
+                    lease_authority=lease_authority,
                 )
             else:
-                await _safe_fail_unfinished(app, task_store, task.id, worker_id)
+                await _safe_fail_unfinished(
+                    app,
+                    task_store,
+                    task.id,
+                    worker_id,
+                    lease_expires_at=lease_authority.lease_expires_at,
+                    lease_authority=lease_authority,
+                )
 
         if task.retry_series is None:
-            await finalize_handler_outcome()
+            async with lease_authority.lock:
+                await finalize_handler_outcome()
         else:
             (
                 _receipt,
@@ -718,7 +840,10 @@ async def _handle_with_heartbeat(
     finally:
         stop_heartbeat.set()
         try:
-            await heartbeat_task
+            if heartbeat_task.done():
+                heartbeat_task.result()
+            else:
+                await heartbeat_task
         except Exception as heartbeat_failure:
             if heartbeat_authority_failure is not None:
                 if heartbeat_failure is not heartbeat_authority_failure:
@@ -741,6 +866,111 @@ async def _handle_with_heartbeat(
                 )
             else:
                 raise
+            if isinstance(pending_failure, asyncio.CancelledError):
+                cancellation_cause = exception_cause(pending_failure)
+                if cancellation_cause is not None:
+                    raise pending_failure from cancellation_cause
+
+
+async def _renew_task_claim_before_dispatch(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    lease_seconds: int,
+) -> tuple[Task, float, bool, bool]:
+    """Prove that an acknowledged lease can still authorize handler dispatch."""
+
+    renewal_started = monotonic()
+    renewed = await task_store.heartbeat(
+        task.id,
+        worker_id,
+        lease_expires_at=_require_task_lease_expires_at(task),
+        handoff_id=task.interrupted_handoff_id,
+        extend_seconds=lease_seconds,
+    )
+    claim_deadline_monotonic = _conservative_task_lease_deadline(
+        renewal_started,
+        lease_seconds,
+    )
+    if monotonic() >= claim_deadline_monotonic:
+        raise TaskClaimLost(
+            "Task heartbeat acknowledgement consumed the renewed lease before dispatch."
+        )
+    retry_deadline_elapsed = False
+    if renewed.retry_series is not None and renewed.retry_series.elapsed_deadline is not None:
+        retry_deadline_elapsed = await task_store.task_retry_deadline_elapsed(
+            renewed.id,
+            worker_id,
+            lease_expires_at=_require_task_lease_expires_at(renewed),
+        )
+        if monotonic() >= claim_deadline_monotonic:
+            raise TaskClaimLost(
+                "Task retry-deadline validation consumed the renewed lease before dispatch."
+            )
+        if not retry_deadline_elapsed:
+            # The deadline query is a separate store operation. Cancellation can
+            # commit while it is awaiting, so its earlier heartbeat result is no
+            # longer sufficient admission evidence. Linearize dispatch through a
+            # final renewal and inspect the returned authoritative task snapshot.
+            renewal_started = monotonic()
+            renewed = await task_store.heartbeat(
+                renewed.id,
+                worker_id,
+                lease_expires_at=_require_task_lease_expires_at(renewed),
+                handoff_id=renewed.interrupted_handoff_id,
+                extend_seconds=lease_seconds,
+            )
+            claim_deadline_monotonic = _conservative_task_lease_deadline(
+                renewal_started,
+                lease_seconds,
+            )
+            if monotonic() >= claim_deadline_monotonic:
+                raise TaskClaimLost(
+                    "Task post-deadline heartbeat acknowledgement consumed the renewed "
+                    "lease before dispatch."
+                )
+    cancellation_requested = _task_retry_cancellation_requested(
+        renewed
+    ) or _task_cancellation_requested(renewed)
+    if (
+        not retry_deadline_elapsed
+        and not cancellation_requested
+        and renewed.interrupted_handoff_id is None
+    ):
+        if renewed.lease_expires_at is None:  # pragma: no cover - heartbeat contract
+            raise TaskClaimLost("Task heartbeat returned no worker lease before dispatch.")
+        execution_lease_expires_at = renewed.lease_expires_at
+        renewed = await task_store.mark_claimed_task_execution_started(
+            renewed.id,
+            worker_id,
+            execution_lease_expires_at,
+        )
+        if monotonic() >= claim_deadline_monotonic:
+            renewed = await task_store.request_claimed_task_cancellation(
+                renewed.id,
+                worker_id,
+                execution_lease_expires_at,
+                {"code": "task_execution_start_acknowledgement_consumed_lease"},
+            )
+            cancellation_requested = True
+    return (
+        copy_task(renewed),
+        claim_deadline_monotonic,
+        retry_deadline_elapsed,
+        cancellation_requested,
+    )
+
+
+def _conservative_task_lease_deadline(started: float, lease_seconds: int) -> float:
+    """Retain one-third of the durable lease for a fail-closed drain handoff."""
+
+    return started + (lease_seconds * 2 / 3)
+
+
+def _require_task_lease_expires_at(task: Task) -> datetime:
+    if task.lease_expires_at is None:
+        raise TaskClaimLost("Task claim has no worker lease.")
+    return task.lease_expires_at
 
 
 async def _await_task_handler(
@@ -754,8 +984,10 @@ async def _await_task_handler(
     cancellation_baseline: int,
     heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
     stop_heartbeat: asyncio.Event,
+    lease_authority: _TaskLeaseAuthority,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
-    handler_task = asyncio.ensure_future(handler(app, task, worker_id))
+    with bind_task_lease_authority(lease_authority):
+        handler_task = asyncio.ensure_future(handler(app, task, worker_id))
     try:
         completed, _pending = await asyncio.wait(
             (handler_task, heartbeat_task),
@@ -765,8 +997,31 @@ async def _await_task_handler(
         if heartbeat_task.done():
             try:
                 heartbeat_result = heartbeat_task.result()
-            except Exception:
-                await _cancel_task_handler_after_authority_loss(handler_task)
+            except Exception as heartbeat_failure:
+                if task.retry_series is None:
+                    await _drain_ordinary_task_handler_under_cancellation_fence(
+                        task_store,
+                        task,
+                        worker_id,
+                        handler_task,
+                        heartbeat_task,
+                        stop_heartbeat,
+                        lease_authority=lease_authority,
+                        cancellation_error={"code": "task_worker_lease_authority_lost"},
+                        primary_failure=heartbeat_failure,
+                    )
+                else:
+                    await _drain_retry_task_handler_under_cancellation_fence(
+                        task_store,
+                        task,
+                        worker_id,
+                        handler_task,
+                        heartbeat_task,
+                        stop_heartbeat,
+                        lease_authority=lease_authority,
+                        cancellation_baseline=cancellation_baseline,
+                        primary_failure=heartbeat_failure,
+                    )
                 raise
         if handler_task in completed and heartbeat_result not in {
             _TaskHeartbeatOutcome.ELAPSED,
@@ -775,7 +1030,34 @@ async def _await_task_handler(
             if task.retry_series is not None and not heartbeat_task.done():
                 return await handler_task
             stop_heartbeat.set()
-            final_heartbeat_result = await heartbeat_task
+            try:
+                final_heartbeat_result = await heartbeat_task
+            except Exception as heartbeat_failure:
+                if task.retry_series is None:
+                    await _drain_ordinary_task_handler_under_cancellation_fence(
+                        task_store,
+                        task,
+                        worker_id,
+                        handler_task,
+                        heartbeat_task,
+                        stop_heartbeat,
+                        lease_authority=lease_authority,
+                        cancellation_error={"code": "task_worker_lease_authority_lost"},
+                        primary_failure=heartbeat_failure,
+                    )
+                else:
+                    await _drain_retry_task_handler_under_cancellation_fence(
+                        task_store,
+                        task,
+                        worker_id,
+                        handler_task,
+                        heartbeat_task,
+                        stop_heartbeat,
+                        lease_authority=lease_authority,
+                        cancellation_baseline=cancellation_baseline,
+                        primary_failure=heartbeat_failure,
+                    )
+                raise
             if final_heartbeat_result is _TaskHeartbeatOutcome.ELAPSED:
                 quiescence = await _quiesce_task_retry_handler_before_terminalization(
                     task_store,
@@ -784,6 +1066,7 @@ async def _await_task_handler(
                     lease_seconds,
                     handler_task,
                     cancellation_baseline,
+                    lease_authority,
                 )
                 raise _TaskRetryElapsed(
                     quiescence.owner_cancellation,
@@ -797,6 +1080,7 @@ async def _await_task_handler(
                     lease_seconds,
                     handler_task,
                     cancellation_baseline,
+                    lease_authority,
                 )
                 raise _TaskRetryCancellationRequested(
                     quiescence.owner_cancellation,
@@ -811,6 +1095,7 @@ async def _await_task_handler(
                 lease_seconds,
                 handler_task,
                 cancellation_baseline,
+                lease_authority,
             )
             raise _TaskRetryElapsed(quiescence.owner_cancellation, quiescence.report)
         if heartbeat_result is _TaskHeartbeatOutcome.CANCELLATION_REQUESTED:
@@ -821,6 +1106,7 @@ async def _await_task_handler(
                 lease_seconds,
                 handler_task,
                 cancellation_baseline,
+                lease_authority,
             )
             raise _TaskRetryCancellationRequested(
                 quiescence.owner_cancellation,
@@ -837,6 +1123,7 @@ async def _await_task_handler(
                 lease_seconds,
                 handler_task,
                 cancellation_baseline,
+                lease_authority,
             )
             raise _TaskRetryElapsed(quiescence.owner_cancellation, quiescence.report)
         if final_heartbeat_result is _TaskHeartbeatOutcome.CANCELLATION_REQUESTED:
@@ -847,6 +1134,7 @@ async def _await_task_handler(
                 lease_seconds,
                 handler_task,
                 cancellation_baseline,
+                lease_authority,
             )
             raise _TaskRetryCancellationRequested(
                 quiescence.owner_cancellation,
@@ -888,6 +1176,7 @@ async def _await_task_handler(
                 handler_task,
                 heartbeat_task,
                 stop_heartbeat,
+                lease_authority,
                 cancellation_baseline=cancellation_baseline,
                 owner_cancellation=owner_cancellation,
             )
@@ -920,16 +1209,26 @@ async def _await_task_handler(
                 handler_task,
                 heartbeat_task,
                 stop_heartbeat,
+                lease_authority,
                 cancellation_baseline=cancellation_baseline,
                 owner_cancellation=owner_cancellation,
             )
             raise AssertionError(
                 "Task retry cancellation handling returned unexpectedly."
             ) from None
-        handler_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await handler_task
-        raise
+        await _drain_ordinary_task_handler_under_cancellation_fence(
+            task_store,
+            task,
+            worker_id,
+            handler_task,
+            heartbeat_task,
+            stop_heartbeat,
+            lease_authority=lease_authority,
+            cancellation_error={"code": "task_worker_owner_cancelled"},
+            primary_failure=owner_cancellation,
+            owner_cancellation=owner_cancellation,
+        )
+        raise owner_cancellation from exception_cause(owner_cancellation)
 
 
 async def _raise_task_retry_owner_cancellation(
@@ -940,163 +1239,185 @@ async def _raise_task_retry_owner_cancellation(
     handler_task: asyncio.Future[Any],
     heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
     stop_heartbeat: asyncio.Event,
+    lease_authority: _TaskLeaseAuthority,
     *,
     cancellation_baseline: int,
     owner_cancellation: asyncio.CancelledError,
 ) -> None:
-    """Settle or release one retry attempt before propagating owner cancellation."""
+    """Naturally drain one retry attempt before propagating owner cancellation."""
 
-    try:
-        quiescence = await _quiesce_task_retry_handler_before_terminalization(
-            task_store,
-            task.id,
-            worker_id,
-            lease_seconds,
-            handler_task,
-            cancellation_baseline,
+    async def cleanup() -> None:
+        report: TaskRetryAttemptReport | None = None
+        handler_failure: BaseException | None = None
+        heartbeat_failure: BaseException | None = None
+        heartbeat_outcome: _TaskHeartbeatOutcome | None = None
+
+        completed, _pending = await asyncio.wait(
+            (handler_task, heartbeat_task),
+            return_when=asyncio.FIRST_COMPLETED,
         )
-    except BaseExceptionGroup as grouped_failure:
-        if exception_tree_contains(
-            grouped_failure,
-            (KeyboardInterrupt, SystemExit, GeneratorExit),
-        ):
-            raise
-        _attach_grouped_task_handler_failures_to_cancellation(
-            owner_cancellation,
-            grouped_failure,
-        )
-        quiescence = _TaskRetryQuiescence(None, None)
-    if quiescence.owner_cancellation is not None:
-        owner_cancellation.add_note(
-            "Task retry handler quiescence received an additional caller cancellation request."
-        )
-        quiescence_failure = quiescence.owner_cancellation.__cause__
-        if quiescence_failure is not None:
-            _attach_task_worker_secondary_failure(
-                owner_cancellation,
-                quiescence_failure,
-                label="Task retry handler-quiescence failures",
-            )
-    stop_heartbeat.set()
-    heartbeat_failure: Exception | None = None
-    heartbeat_outcome: _TaskHeartbeatOutcome | None = None
-    try:
-        heartbeat_outcome = await _await_task_retry_cleanup_resisting_cancellation(
-            heartbeat_task,
-            label="heartbeat shutdown",
-            owner_cancellation=owner_cancellation,
-        )
-    except Exception as exc:
-        heartbeat_failure = exc
-    if heartbeat_outcome is _TaskHeartbeatOutcome.ELAPSED:
-        raise _TaskRetryElapsed(owner_cancellation, quiescence.report) from None
-    if heartbeat_outcome is _TaskHeartbeatOutcome.CANCELLATION_REQUESTED:
-        raise _TaskRetryCancellationRequested(
-            owner_cancellation,
-            quiescence.report,
-        ) from None
-    if heartbeat_outcome is _TaskHeartbeatOutcome.TERMINAL:
-        _raise_task_retry_owner_cancellation_with_secondary(
-            owner_cancellation,
-            heartbeat_failure,
-        )
-    if quiescence.report is not None:
-        try:
-            await _await_task_retry_cleanup_resisting_cancellation(
-                _settle_retry_attempt_report(
+        if heartbeat_task in completed:
+            try:
+                heartbeat_outcome = heartbeat_task.result()
+            except BaseException as exc:
+                heartbeat_failure = exc
+            if (
+                heartbeat_failure is None
+                and heartbeat_outcome is _TaskHeartbeatOutcome.ELAPSED
+                and not handler_task.done()
+            ):
+                quiescence = await _quiesce_task_retry_handler_before_terminalization(
+                    task_store,
+                    task.id,
+                    worker_id,
+                    lease_seconds,
+                    handler_task,
+                    cancellation_baseline=0,
+                    lease_authority=lease_authority,
+                )
+                receipt = await _enforce_task_retry_deadline_with_retry(
                     task_store,
                     task,
                     worker_id,
-                    quiescence.report,
-                ),
-                label="shutdown settlement",
-                owner_cancellation=owner_cancellation,
-            )
-        except Exception as settlement_failure:
-            secondary_failure: BaseException = settlement_failure
-            if heartbeat_failure is not None:
-                secondary_failure = BaseExceptionGroup(
-                    "Task retry shutdown-settlement failures",
-                    [heartbeat_failure, settlement_failure],
-                )
-            _raise_task_retry_owner_cancellation_with_secondary(
-                owner_cancellation,
-                secondary_failure,
-            )
-        _raise_task_retry_owner_cancellation_with_secondary(
-            owner_cancellation,
-            heartbeat_failure,
-        )
-    try:
-        await _await_task_retry_cleanup_resisting_cancellation(
-            task_store.release_task(task.id, worker_id),
-            label="owner release",
-            owner_cancellation=owner_cancellation,
-        )
-    except Exception as release_failure:
-        try:
-            current = await _await_task_retry_cleanup_resisting_cancellation(
-                task_store.load_task(task.id),
-                label="owner-release reconciliation",
-                owner_cancellation=owner_cancellation,
-            )
-        except Exception as reconciliation_failure:
-            failures: list[BaseException] = [release_failure, reconciliation_failure]
-            if heartbeat_failure is not None:
-                failures.insert(0, heartbeat_failure)
-            _raise_task_retry_owner_cancellation_with_secondary(
-                owner_cancellation,
-                BaseExceptionGroup(
-                    "Task retry owner-release failures",
-                    failures,
-                ),
-            )
-        if current is not None and _task_retry_cancellation_requested(current):
-            secondary_failures: list[BaseException] = []
-            existing_cause = exception_cause(owner_cancellation)
-            if existing_cause is not None:
-                secondary_failures.append(existing_cause)
-            if heartbeat_failure is not None:
-                secondary_failures.append(heartbeat_failure)
-            if not isinstance(release_failure, TaskTerminalizationConflict):
-                secondary_failures.append(release_failure)
-            if len(secondary_failures) == 1:
-                set_exception_cause(owner_cancellation, secondary_failures[0])
-            elif secondary_failures:
-                set_exception_cause(
-                    owner_cancellation,
-                    BaseExceptionGroup(
-                        "Task retry owner-release failures",
-                        secondary_failures,
+                    lease_expires_at=lease_authority.lease_expires_at,
+                    token_count=(0 if quiescence.report is None else quiescence.report.token_count),
+                    estimated_cost=(
+                        Decimal(0)
+                        if quiescence.report is None
+                        else quiescence.report.estimated_cost
                     ),
                 )
-            raise _TaskRetryCancellationRequested(
-                owner_cancellation,
-                quiescence.report,
-            ) from None
-        if current is not None and current.status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-        }:
-            _raise_task_retry_owner_cancellation_with_secondary(
-                owner_cancellation,
-                heartbeat_failure,
+                if receipt is None:
+                    raise RuntimeError(
+                        "Task retry owner-cancellation drain lost its elapsed deadline receipt."
+                    )
+                return
+            if heartbeat_failure is not None or heartbeat_outcome is (
+                _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
+            ):
+                await _drain_retry_task_handler_under_cancellation_fence(
+                    task_store,
+                    task,
+                    worker_id,
+                    handler_task,
+                    heartbeat_task,
+                    stop_heartbeat,
+                    lease_authority=lease_authority,
+                    cancellation_baseline=cancellation_baseline,
+                    cancellation_error={"code": "task_worker_owner_cancelled"},
+                    primary_failure=heartbeat_failure or owner_cancellation,
+                )
+                if heartbeat_failure is not None:
+                    raise heartbeat_failure
+                return
+
+        try:
+            outcome = await handler_task
+            if type(outcome) is TaskRetryAttemptReport:
+                report = TaskRetryAttemptReport.model_validate(
+                    outcome.model_dump(mode="python", warnings=False)
+                )
+        except asyncio.CancelledError as exc:
+            handler_failure = unexpected_child_cancellation_error(
+                exc,
+                operation="Task retry handler owner-cancellation drain",
             )
-        secondary_failure: BaseException = release_failure
-        if heartbeat_failure is not None:
-            secondary_failure = BaseExceptionGroup(
-                "Task retry owner-release failures",
-                [heartbeat_failure, release_failure],
+        except (GeneratorExit, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            handler_failure = exc
+
+        stop_heartbeat.set()
+        if heartbeat_outcome is None:
+            try:
+                heartbeat_outcome = await heartbeat_task
+            except BaseException as exc:
+                heartbeat_failure = exc
+        if heartbeat_failure is not None or heartbeat_outcome is (
+            _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
+        ):
+            await _drain_retry_task_handler_under_cancellation_fence(
+                task_store,
+                task,
+                worker_id,
+                handler_task,
+                heartbeat_task,
+                stop_heartbeat,
+                lease_authority=lease_authority,
+                cancellation_baseline=cancellation_baseline,
+                cancellation_error={"code": "task_worker_owner_cancelled"},
+                primary_failure=heartbeat_failure or owner_cancellation,
             )
-        _raise_task_retry_owner_cancellation_with_secondary(
-            owner_cancellation,
-            secondary_failure,
+            if handler_failure is not None:
+                _attach_task_worker_secondary_failure(
+                    owner_cancellation,
+                    handler_failure,
+                    label="Task retry handler failures during owner cancellation",
+                )
+            if heartbeat_failure is not None:
+                raise heartbeat_failure
+            return
+
+        if heartbeat_outcome is _TaskHeartbeatOutcome.ELAPSED:
+            receipt = await _enforce_task_retry_deadline_with_retry(
+                task_store,
+                task,
+                worker_id,
+                lease_expires_at=lease_authority.lease_expires_at,
+                token_count=0 if report is None else report.token_count,
+                estimated_cost=(Decimal(0) if report is None else report.estimated_cost),
+            )
+            if receipt is None:
+                raise RuntimeError(
+                    "Task retry owner-cancellation drain lost its elapsed deadline receipt."
+                )
+            if handler_failure is not None:
+                raise handler_failure
+            return
+
+        if report is not None:
+            await _settle_retry_attempt_report(
+                task_store,
+                task,
+                worker_id,
+                report,
+                lease_authority=lease_authority,
+            )
+        else:
+            await task_store.release_task(
+                task.id,
+                worker_id,
+                lease_expires_at=lease_authority.lease_expires_at,
+            )
+        if handler_failure is not None:
+            raise handler_failure
+
+    cleanup_failure: BaseException | None = None
+    try:
+        await _await_task_retry_cleanup_resisting_cancellation(
+            cleanup(),
+            label="owner-cancellation drain",
+            owner_cancellation=owner_cancellation,
         )
-    _raise_task_retry_owner_cancellation_with_secondary(
-        owner_cancellation,
-        heartbeat_failure,
-    )
+    except BaseException as exc:
+        cleanup_failure = exc
+    if cleanup_failure is not None and exception_tree_contains(
+        cleanup_failure,
+        (GeneratorExit, KeyboardInterrupt, SystemExit),
+    ):
+        _attach_task_worker_secondary_failure(
+            cleanup_failure,
+            owner_cancellation,
+            label="Task retry process-control and owner-cancellation evidence",
+        )
+        raise cleanup_failure from exception_cause(cleanup_failure)
+    if cleanup_failure is not None:
+        _attach_task_worker_secondary_failure(
+            owner_cancellation,
+            cleanup_failure,
+            label="Task retry owner-cancellation drain failures",
+        )
+    _raise_task_retry_owner_cancellation_with_secondary(owner_cancellation, None)
 
 
 def _raise_task_retry_owner_cancellation_with_secondary(
@@ -1113,32 +1434,6 @@ def _raise_task_retry_owner_cancellation_with_secondary(
     if cause is None:
         raise owner_cancellation from None
     raise owner_cancellation from cause
-
-
-def _attach_grouped_task_handler_failures_to_cancellation(
-    owner_cancellation: asyncio.CancelledError,
-    grouped_failure: BaseExceptionGroup,
-) -> None:
-    secondary_leaves = [
-        candidate
-        for candidate in iter_exception_tree(grouped_failure)
-        if not isinstance(candidate, (BaseExceptionGroup, asyncio.CancelledError))
-    ]
-    if not secondary_leaves:
-        return
-    secondary: BaseException = (
-        secondary_leaves[0]
-        if len(secondary_leaves) == 1
-        else BaseExceptionGroup(
-            "Task retry handler failures concurrent with cancellation",
-            secondary_leaves,
-        )
-    )
-    _attach_task_worker_secondary_failure(
-        owner_cancellation,
-        secondary,
-        label="Task retry handler failures concurrent with cancellation",
-    )
 
 
 def _attach_task_worker_secondary_failure(
@@ -1169,21 +1464,568 @@ def _attach_task_worker_secondary_failure(
     )
 
 
-async def _cancel_task_handler_after_authority_loss(
+async def _drain_retry_task_handler_under_cancellation_fence(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
     handler_task: asyncio.Future[Any],
+    heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
+    stop_heartbeat: asyncio.Event,
+    *,
+    lease_authority: _TaskLeaseAuthority,
+    cancellation_baseline: int,
+    cancellation_error: dict[str, Any] | None = None,
+    primary_failure: BaseException,
+    owner_cancellation: asyncio.CancelledError | None = None,
 ) -> None:
-    handler_task.cancel()
-    completed, _pending = await asyncio.wait(
-        (handler_task,),
-        timeout=_TASK_RETRY_HANDLER_CANCELLATION_GRACE_SECONDS,
+    """Fence a retry attempt before naturally draining cancellation-opaque work."""
+
+    async def cleanup() -> None:
+        failures: list[BaseException] = []
+        requested: Task | None = None
+        try:
+            requested = await _request_task_cancellation_fence(
+                task_store,
+                task,
+                worker_id,
+                (
+                    {"code": "task_worker_lease_authority_lost"}
+                    if cancellation_error is None
+                    else cancellation_error
+                ),
+                lease_authority=lease_authority,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+        report: TaskRetryAttemptReport | None = None
+        try:
+            outcome = await handler_task
+            if type(outcome) is TaskRetryAttemptReport:
+                report = outcome
+        except asyncio.CancelledError as exc:
+            failures.append(
+                unexpected_child_cancellation_error(
+                    exc,
+                    operation="Task retry handler drain",
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            try:
+                await heartbeat_task
+            except BaseException as exc:
+                failures.append(exc)
+
+        try:
+            if requested is None or not _task_retry_cancellation_requested(requested):
+                raise TaskTerminalizationConflict(
+                    "Task retry drain lost its durable cancellation request."
+                )
+            await _settle_retry_task_cancellation_after_quiescence(
+                task_store,
+                task.id,
+                worker_id,
+                cancellation_baseline=cancellation_baseline,
+                report=report,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                "Task retry cancellation-fence drain failures",
+                failures,
+            )
+
+    cleanup_outcome = await await_shielded_task_outcome(
+        asyncio.create_task(cleanup()),
+        cancellation=owner_cancellation,
     )
-    if handler_task in completed:
-        with contextlib.suppress(asyncio.CancelledError):
-            await handler_task
+    cleanup_failure = cleanup_outcome.error
+    if cleanup_failure is not None and exception_tree_contains(
+        cleanup_failure,
+        (GeneratorExit, KeyboardInterrupt, SystemExit),
+    ):
+        _attach_task_worker_secondary_failure(
+            cleanup_failure,
+            primary_failure,
+            label="Task retry process-control and ownership-loss evidence",
+        )
+        raise cleanup_failure from exception_cause(cleanup_failure)
+
+    delivered_cancellation = cleanup_outcome.cancellation
+    if delivered_cancellation is not None:
+        if cleanup_failure is not None:
+            _attach_task_worker_secondary_failure(
+                primary_failure,
+                cleanup_failure,
+                label="Task retry ownership-loss and cancellation-fence drain failures",
+            )
+        _attach_task_worker_secondary_failure(
+            delivered_cancellation,
+            primary_failure,
+            label="Task retry cancellation and ownership-loss evidence",
+        )
+        if cleanup_failure is not None:
+            _attach_task_worker_secondary_failure(
+                delivered_cancellation,
+                cleanup_failure,
+                label="Task retry cancellation-fence drain failures",
+            )
+        restore_task_cancellation_requests(
+            cleanup_outcome.cancellation_requests_consumed,
+            cancellation=delivered_cancellation,
+        )
+        if owner_cancellation is None:
+            raise delivered_cancellation from exception_cause(delivered_cancellation)
         return
-    handler_task.add_done_callback(_consume_detached_handler_outcome)
-    raise _TaskRetryHandlerUnsettled(
-        "Task retry handler did not stop after its store authority was lost."
+
+    if cleanup_failure is not None:
+        if owner_cancellation is None:
+            raise cleanup_failure from primary_failure
+        _attach_task_worker_secondary_failure(
+            primary_failure,
+            cleanup_failure,
+            label="Task retry cancellation-fence drain failures",
+        )
+
+
+async def _drain_ordinary_task_handler_under_cancellation_fence(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    handler_task: asyncio.Future[Any],
+    heartbeat_task: asyncio.Task[_TaskHeartbeatOutcome],
+    stop_heartbeat: asyncio.Event,
+    *,
+    lease_authority: _TaskLeaseAuthority,
+    cancellation_error: dict[str, Any],
+    primary_failure: BaseException,
+    owner_cancellation: asyncio.CancelledError | None = None,
+) -> None:
+    """Fence an ordinary task durably until its handler is positively quiescent."""
+
+    async def cleanup() -> None:
+        failures: list[BaseException] = []
+        requested: Task | None = None
+        try:
+            requested = await _request_task_cancellation_fence(
+                task_store,
+                task,
+                worker_id,
+                cancellation_error,
+                lease_authority=lease_authority,
+            )
+        except (GeneratorExit, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            failures.append(exc)
+        cancellation_requested = requested is not None and _task_cancellation_requested(requested)
+
+        try:
+            await handler_task
+        except asyncio.CancelledError as exc:
+            failures.append(
+                unexpected_child_cancellation_error(
+                    exc,
+                    operation="Ordinary task handler drain",
+                )
+            )
+        except (GeneratorExit, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            failures.append(exc)
+
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            try:
+                await heartbeat_task
+            except (GeneratorExit, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                failures.append(exc)
+
+        if cancellation_requested:
+            try:
+                await _settle_ordinary_task_cancellation_after_quiescence(
+                    task_store,
+                    task.id,
+                    worker_id,
+                )
+            except (GeneratorExit, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                failures.append(exc)
+
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                "Ordinary task cancellation-fence cleanup failures",
+                failures,
+            )
+
+    cleanup_outcome = await await_shielded_task_outcome(
+        asyncio.create_task(cleanup()),
+        cancellation=owner_cancellation,
+    )
+    cleanup_failure = cleanup_outcome.error
+    if cleanup_failure is not None and exception_tree_contains(
+        cleanup_failure,
+        (GeneratorExit, KeyboardInterrupt, SystemExit),
+    ):
+        _attach_task_worker_secondary_failure(
+            cleanup_failure,
+            primary_failure,
+            label="Task-worker process-control and ownership-loss evidence",
+        )
+        raise cleanup_failure from exception_cause(cleanup_failure)
+
+    delivered_cancellation = cleanup_outcome.cancellation
+    if delivered_cancellation is not None:
+        _attach_task_worker_secondary_failure(
+            delivered_cancellation,
+            primary_failure,
+            label="Task-worker cancellation and ownership-loss evidence",
+        )
+        if cleanup_failure is not None:
+            _attach_task_worker_secondary_failure(
+                delivered_cancellation,
+                cleanup_failure,
+                label="Task-worker cancellation-fence cleanup failures",
+            )
+        restore_task_cancellation_requests(
+            cleanup_outcome.cancellation_requests_consumed,
+            cancellation=delivered_cancellation,
+        )
+        if owner_cancellation is None:
+            raise delivered_cancellation from exception_cause(delivered_cancellation)
+        return
+
+    if cleanup_failure is not None:
+        _attach_task_worker_secondary_failure(
+            primary_failure,
+            cleanup_failure,
+            label="Task-worker cancellation-fence cleanup failures",
+        )
+
+
+async def _request_task_cancellation_fence(
+    task_store: TaskStore,
+    task: Task,
+    worker_id: str,
+    cancellation_error: dict[str, Any],
+    *,
+    lease_authority: _TaskLeaseAuthority,
+) -> Task | None:
+    """Retry until durable state prevents another worker from dispatching the task."""
+
+    async with lease_authority.lock:
+        while True:
+            expected_lease_expires_at = lease_authority.lease_expires_at
+            current = await task_store.load_task(task.id)
+            if current is None:
+                raise TaskClaimLost("Task cancellation fence target no longer exists.")
+            if (
+                current.status
+                in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }
+                or _task_cancellation_requested(current)
+                or _task_retry_cancellation_requested(current)
+            ):
+                return current
+            if (
+                current.worker_id != worker_id
+                or current.lease_expires_at != expected_lease_expires_at
+            ):
+                raise TaskClaimLost(
+                    "Task cancellation fence no longer owns the expected lease generation."
+                )
+            try:
+                requested = await task_store.request_claimed_task_cancellation(
+                    task.id,
+                    worker_id,
+                    expected_lease_expires_at,
+                    cancellation_error,
+                )
+            except (GeneratorExit, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as request_failure:
+                if exception_tree_contains(
+                    request_failure,
+                    (GeneratorExit, KeyboardInterrupt, SystemExit),
+                ):
+                    raise
+                try:
+                    current = await task_store.load_task(task.id)
+                except (GeneratorExit, KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as reconciliation_failure:
+                    if exception_tree_contains(
+                        reconciliation_failure,
+                        (GeneratorExit, KeyboardInterrupt, SystemExit),
+                    ):
+                        raise
+                    await asyncio.sleep(0.05)
+                    continue
+                if current is None:
+                    raise request_failure
+                if (
+                    current.status
+                    in {
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    }
+                    or _task_cancellation_requested(current)
+                    or _task_retry_cancellation_requested(current)
+                ):
+                    return current
+                if (
+                    current.worker_id != worker_id
+                    or current.lease_expires_at != expected_lease_expires_at
+                ):
+                    raise TaskClaimLost(
+                        "Task cancellation fence lost its exact worker lease."
+                    ) from request_failure
+                if isinstance(request_failure, TaskClaimLost):
+                    raise
+                await asyncio.sleep(0.05)
+                continue
+            if (
+                requested.status
+                in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }
+                or _task_cancellation_requested(requested)
+                or _task_retry_cancellation_requested(requested)
+            ):
+                return requested
+            await asyncio.sleep(0.05)
+
+
+async def _settle_ordinary_task_cancellation_after_quiescence(
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+) -> None:
+    """Settle the exact cancellation after this runtime observed natural quiescence."""
+
+    current = await task_store.load_task(task_id)
+    if current is None or current.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return
+    if current.worker_id != worker_id:
+        # A peer claim may have won immediately before the cancellation marker.
+        # That peer now observes and owns the same durable cancellation request.
+        return
+    terminalization = _task_cancellation_terminalization_request(
+        current,
+        worker_id=worker_id,
+    )
+    if terminalization is None:
+        raise TaskTerminalizationConflict(
+            "Ordinary task drain lost its durable cancellation request."
+        )
+    with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
+        await _terminalize_claimed_task_or_detect_peer_winner(
+            task_store,
+            terminalization,
+        )
+    current = await task_store.load_task(task_id)
+    if current is None or current.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return
+    if (
+        current is None
+        or current.worker_id != worker_id
+        or current.lease_expires_at is None
+        or not _task_cancellation_requested(current)
+    ):
+        return
+
+    terminalization = _task_cancellation_terminalization_request(
+        current,
+        worker_id=worker_id,
+    )
+    if terminalization is None:  # pragma: no cover - guarded above
+        raise AssertionError("Task cancellation request disappeared during reconciliation.")
+    execution_profile_fingerprint = current.metadata.get("execution_profile_fingerprint")
+    effect_fingerprint = current.metadata.get("effect_fingerprint")
+    for name, value in (
+        ("execution_profile_fingerprint", execution_profile_fingerprint),
+        ("effect_fingerprint", effect_fingerprint),
+    ):
+        if value is not None and type(value) is not str:
+            raise TaskTerminalizationConflict(
+                f"Task cancellation reconciliation has invalid {name} authority."
+            )
+    evidence_identity = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-worker-quiescence.v1",
+            "task_id": current.id,
+            "worker_id": worker_id,
+            "cancellation_idempotency_key": terminalization.idempotency_key,
+        },
+        "task_worker_quiescence",
+    )
+    evidence_sha256 = sha256(evidence_identity).hexdigest()
+    cancellation_payload = current.status_payload
+    if (
+        type(cancellation_payload) is not dict
+        or type(cancellation_payload.get("event")) is not dict
+    ):
+        raise TaskTerminalizationConflict(
+            "Task cancellation reconciliation lost its request event."
+        )
+    cancellation_requested_at = TaskCancellationReconciliationEvent.model_validate(
+        cancellation_payload["event"]
+    ).occurred_at
+    # This timestamp describes locally observed evidence only. The store still
+    # decides owner-loss eligibility from its own transaction time; a skewed
+    # evidence timestamp can only reject this reconciliation and retain the
+    # cancellation fence.
+    # Both values are stamped by the task store.  Worker wall time must not
+    # decide whether an owner-lost reconciliation is accepted by a differently
+    # clocked durable store.
+    quiescence_validated_at = max(
+        cancellation_requested_at,
+        current.lease_expires_at,
+    )
+    request = TaskCancellationReconciliationRequest(
+        task_id=current.id,
+        original_worker_id=worker_id,
+        original_lease_expires_at=current.lease_expires_at,
+        cancellation_requested_at=cancellation_requested_at,
+        cancellation_idempotency_key=terminalization.idempotency_key,
+        reconciliation_idempotency_key=(f"task-worker-quiescence:v1:{evidence_sha256}"),
+        reconciliation_requested_at=quiescence_validated_at,
+        reconciled_by=ResolutionActor(
+            subject="cayu:task-worker-quiescence",
+            source=ResolutionActorSource.SYSTEM,
+        ),
+        evidence=TaskCancellationReconciliationEvidence(
+            outcome=TaskCancellationReconciliationOutcome.QUIESCENT,
+            validator_id="cayu.task-worker",
+            validator_version="1",
+            evidence_id=f"task-worker-quiescence:{evidence_sha256}",
+            evidence_sha256=evidence_sha256,
+            validated_at=quiescence_validated_at,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            effect_fingerprint=effect_fingerprint,
+        ),
+        expected_execution_profile_fingerprint=execution_profile_fingerprint,
+        expected_effect_fingerprint=effect_fingerprint,
+    )
+    await task_store.reconcile_task_cancellation(request)
+
+
+async def _settle_retry_task_cancellation_after_quiescence(
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+    *,
+    cancellation_baseline: int,
+    report: TaskRetryAttemptReport | None,
+) -> None:
+    """Settle a lease-loss cancellation from this worker's positive quiescence."""
+
+    try:
+        receipt, _cancellation = await _settle_task_retry_cancellation_resisting_cancellation(
+            task_store,
+            task_id,
+            worker_id,
+            cancellation_baseline=cancellation_baseline,
+            owner_cancellation=None,
+            report=report,
+        )
+    except (TaskClaimLost, TaskTerminalizationConflict):
+        receipt = None
+    if receipt is not None:
+        return
+    current = await task_store.load_task(task_id)
+    if current is None or current.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return
+    series = current.retry_series
+    payload = current.status_payload
+    if (
+        current.worker_id != worker_id
+        or current.lease_expires_at is None
+        or series is None
+        or type(payload) is not dict
+        or not _task_retry_cancellation_requested(current)
+        or type(payload.get("event")) is not dict
+        or type(payload.get("settlement_idempotency_key")) is not str
+    ):
+        raise TaskTerminalizationConflict(
+            "Task retry quiescence lost its durable cancellation authority."
+        )
+    event = TaskRetryCancellationReconciliationEvent.model_validate(payload["event"])
+    execution_profile_fingerprint = current.metadata.get("execution_profile_fingerprint")
+    effect_fingerprint = current.metadata.get("effect_fingerprint")
+    evidence_identity = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-worker-retry-quiescence.v1",
+            "task_id": current.id,
+            "worker_id": worker_id,
+            "cancellation_idempotency_key": payload["settlement_idempotency_key"],
+        },
+        "task_retry_worker_quiescence",
+    )
+    evidence_sha256 = sha256(evidence_identity).hexdigest()
+    # Reconciliation is eligible only after this store-owned lease expiry. Use
+    # durable task time for the evidence boundary rather than worker wall time.
+    validated_at = max(event.occurred_at, current.lease_expires_at)
+    await task_store.reconcile_task_retry_cancellation(
+        TaskRetryCancellationReconciliationRequest(
+            task_id=current.id,
+            series_id=series.series_id,
+            attempt=series.attempt,
+            causal_budget_id=series.causal_budget_id,
+            original_worker_id=worker_id,
+            original_lease_expires_at=current.lease_expires_at,
+            cancellation_requested_at=event.occurred_at,
+            cancellation_idempotency_key=payload["settlement_idempotency_key"],
+            reconciliation_idempotency_key=(f"task-worker-retry-quiescence:v1:{evidence_sha256}"),
+            reconciliation_requested_at=validated_at,
+            reconciled_by=ResolutionActor(
+                subject="cayu:task-worker-retry-quiescence",
+                source=ResolutionActorSource.SYSTEM,
+            ),
+            evidence=TaskRetryCancellationReconciliationEvidence(
+                outcome=TaskRetryCancellationReconciliationOutcome.QUIESCENT,
+                validator_id="cayu.task-worker",
+                validator_version="1",
+                evidence_id=f"task-worker-retry-quiescence:{evidence_sha256}",
+                evidence_sha256=evidence_sha256,
+                validated_at=validated_at,
+                execution_profile_fingerprint=execution_profile_fingerprint,
+                effect_fingerprint=effect_fingerprint,
+            ),
+            expected_execution_profile_fingerprint=execution_profile_fingerprint,
+            expected_effect_fingerprint=effect_fingerprint,
+        )
     )
 
 
@@ -1194,10 +2036,10 @@ async def _quiesce_task_retry_handler_before_terminalization(
     lease_seconds: int,
     handler_task: asyncio.Future[Any],
     cancellation_baseline: int,
+    lease_authority: _TaskLeaseAuthority,
 ) -> _TaskRetryQuiescence:
-    """Retain the claim until the handler acknowledges cancellation and settles."""
+    """Retain the claim until the handler naturally settles."""
 
-    handler_task.cancel()
     interval = min(lease_seconds / 3, 1.0)
     owner_task = asyncio.current_task()
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
@@ -1209,7 +2051,14 @@ async def _quiesce_task_retry_handler_before_terminalization(
             completed, _pending = await asyncio.wait((handler_task,), timeout=interval)
             if handler_task in completed:
                 break
-            await task_store.heartbeat(task_id, worker_id, extend_seconds=lease_seconds)
+            renewed = await task_store.heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_authority.lease_expires_at,
+                handoff_id=lease_authority.handoff_id,
+                extend_seconds=lease_seconds,
+            )
+            lease_authority.lease_expires_at = _require_task_lease_expires_at(renewed)
         except asyncio.CancelledError as exc:
             if owner_task.cancelling() <= cancellation_baseline:
                 if lease_maintenance_failure is None:
@@ -1220,9 +2069,10 @@ async def _quiesce_task_retry_handler_before_terminalization(
             if lease_maintenance_failure is None:
                 lease_maintenance_failure = exc
         except BaseException:
-            handler_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await handler_task
+            # The durable cancellation request keeps replacement disabled. Do
+            # not cancel an opaque wrapper: its delegated thread, subprocess,
+            # adapter, or remote call may still be running after the wrapper
+            # reports cancellation.
             raise
     report: TaskRetryAttemptReport | None = None
     try:
@@ -1273,12 +2123,12 @@ async def _await_task_retry_cleanup_resisting_cancellation(
                 continue
             if operation_task.done() and operation_task.cancelled():
                 raise RuntimeError(f"Task retry {label} was unexpectedly cancelled.") from exc
-            raise
-
-
-def _consume_detached_handler_outcome(handler_task: asyncio.Future[Any]) -> None:
-    with contextlib.suppress(BaseException):
-        handler_task.result()
+            # ``owner_cancellation`` was already captured by the caller. A
+            # shield can redeliver that same request at this nested boundary
+            # without increasing ``Task.cancelling()``. Keep supervising the
+            # dispatched cleanup so its eventual failure is observed and
+            # attached exactly once instead of orphaning the task.
+            continue
 
 
 async def _handoff_interrupted_session(
@@ -1304,6 +2154,7 @@ async def _handoff_interrupted_session(
                 "Task handler requested an interrupted-session handoff without a "
                 "running attached task."
             ),
+            lease_expires_at=task.lease_expires_at,
         )
         return
     if (
@@ -1327,6 +2178,7 @@ async def _handoff_interrupted_session(
             task_id,
             worker_id,
             RuntimeError(f"Attached session not found: {task.session_id}."),
+            lease_expires_at=task.lease_expires_at,
         )
         return
     if session.status is not SessionStatus.INTERRUPTED:
@@ -1339,6 +2191,7 @@ async def _handoff_interrupted_session(
                 "Task handler requested an interrupted-session handoff while session "
                 f"{task.session_id} was {session.status}."
             ),
+            lease_expires_at=task.lease_expires_at,
         )
         return
     if session.instance_id != task.session_instance_id:
@@ -1351,6 +2204,7 @@ async def _handoff_interrupted_session(
                 "Task handler requested an interrupted-session handoff for a "
                 "different session incarnation."
             ),
+            lease_expires_at=task.lease_expires_at,
         )
         return
     request = interrupted_task_handoff_request(
@@ -1785,7 +2639,7 @@ async def _recover_expired_interrupted_task_handoffs(
                 await app.recover_incomplete_session(
                     IncompleteSessionRecoveryRequest(
                         session_id=session.id,
-                        inactive_before=task.lease_expires_at,
+                        inactive_for_seconds=None,
                         reason="expired_attached_task_owner",
                         metadata={"recovery_scope": "attached_task"},
                     )
@@ -1987,16 +2841,37 @@ async def _heartbeat_until(
     lease_seconds: int,
     stop: asyncio.Event,
     *,
+    lease_authority: _TaskLeaseAuthority,
     handoff_id: str | None = None,
+    claim_deadline_monotonic: float | None = None,
     enforce_retry_deadline: bool = False,
 ) -> _TaskHeartbeatOutcome:
+    if claim_deadline_monotonic is None:
+        deadline_started = monotonic()
+        claim_deadline_monotonic = _conservative_task_lease_deadline(
+            deadline_started,
+            lease_seconds,
+        )
+
+    def current_deadline() -> float:
+        assert claim_deadline_monotonic is not None
+        return claim_deadline_monotonic
+
+    def expired_lease() -> BaseException:
+        return TaskClaimLost("Task heartbeat acknowledgement expired before lease renewal.")
+
     async def heartbeat() -> Task | None:
-        return await task_store.heartbeat(
+        nonlocal claim_deadline_monotonic
+        updated, claim_deadline_monotonic = await _renew_task_lease_before_deadline(
+            task_store,
             task_id,
             worker_id,
+            lease_seconds,
+            lease_authority=lease_authority,
             handoff_id=handoff_id,
-            extend_seconds=lease_seconds,
+            claim_deadline_monotonic=current_deadline(),
         )
+        return updated
 
     async def inspect_heartbeat(updated: Task | None) -> _TaskHeartbeatOutcome | None:
         if updated is not None and (
@@ -2004,7 +2879,9 @@ async def _heartbeat_until(
         ):
             return _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
         if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(
-            task_id, worker_id
+            task_id,
+            worker_id,
+            lease_expires_at=lease_authority.lease_expires_at,
         ):
             return _TaskHeartbeatOutcome.ELAPSED
         return None
@@ -2012,8 +2889,23 @@ async def _heartbeat_until(
     async def reconcile_heartbeat_failure(
         heartbeat_error: Exception,
     ) -> _TaskHeartbeatOutcome | None:
+        load_task = getattr(task_store, "load_task", None)
+        if not callable(load_task):
+            raise heartbeat_error
+        reconciliation_task = asyncio.create_task(load_task(task_id))
         try:
-            task = await task_store.load_task(task_id)
+            completed, _pending = await asyncio.wait(
+                {reconciliation_task},
+                timeout=max(0.0, current_deadline() - monotonic()),
+            )
+        except asyncio.CancelledError:
+            reconciliation_task.add_done_callback(_consume_task_heartbeat_outcome)
+            raise
+        if reconciliation_task not in completed:
+            reconciliation_task.add_done_callback(_consume_task_heartbeat_outcome)
+            raise heartbeat_error
+        try:
+            task = reconciliation_task.result()
         except Exception as reconciliation_error:
             raise heartbeat_error from reconciliation_error
         if task is not None and task.status in {
@@ -2036,7 +2928,67 @@ async def _heartbeat_until(
         after_heartbeat=inspect_heartbeat,
         on_failure=reconcile_heartbeat_failure,
         wait=_wait_or_stop,
+        lease_deadline=current_deadline,
+        deadline_failure=expired_lease,
+        clock=monotonic,
     )
+
+
+async def _renew_task_lease_before_deadline(
+    task_store: TaskStore,
+    task_id: str,
+    worker_id: str,
+    lease_seconds: int,
+    *,
+    lease_authority: _TaskLeaseAuthority,
+    handoff_id: str | None,
+    claim_deadline_monotonic: float,
+) -> tuple[Task | None, float]:
+    """Serialize one renewal with mutations that consume the exact lease token."""
+
+    async with lease_authority.lock:
+        renewal_started = monotonic()
+        renewal_task = asyncio.create_task(
+            task_store.heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_authority.lease_expires_at,
+                handoff_id=handoff_id,
+                extend_seconds=lease_seconds,
+            )
+        )
+        try:
+            completed, _pending = await asyncio.wait(
+                {renewal_task},
+                timeout=max(0.0, claim_deadline_monotonic - monotonic()),
+            )
+        except asyncio.CancelledError:
+            renewal_task.add_done_callback(_consume_task_heartbeat_outcome)
+            raise
+        if renewal_task not in completed:
+            renewal_task.add_done_callback(_consume_task_heartbeat_outcome)
+            raise TaskClaimLost(
+                "Task heartbeat acknowledgement did not arrive before the last positively "
+                "known lease deadline."
+            )
+        updated = renewal_task.result()
+        if updated is not None:
+            lease_authority.lease_expires_at = _require_task_lease_expires_at(updated)
+        renewed_deadline = _conservative_task_lease_deadline(
+            renewal_started,
+            lease_seconds,
+        )
+        if monotonic() >= renewed_deadline:
+            raise TaskClaimLost("Task heartbeat acknowledgement consumed the renewed lease.")
+        lease_authority.deadline_monotonic = renewed_deadline
+        return updated, renewed_deadline
+
+
+def _consume_task_heartbeat_outcome(task: asyncio.Task[Any]) -> None:
+    """Observe a store heartbeat that outlived this worker's local authority."""
+
+    with contextlib.suppress(BaseException):
+        task.result()
 
 
 async def _enforce_task_retry_deadline_with_retry(
@@ -2044,13 +2996,14 @@ async def _enforce_task_retry_deadline_with_retry(
     task: Task,
     worker_id: str,
     *,
+    lease_expires_at: datetime,
     token_count: int = 0,
     estimated_cost: Decimal = Decimal(0),
 ) -> TaskRetrySettlementResult | None:
     """Enforce or authenticate a deadline commit whose acknowledgement was lost."""
 
     expected_request, expected_request_sha256 = _task_retry_runtime_terminal_request(
-        task,
+        task.model_copy(update={"lease_expires_at": lease_expires_at}, deep=True),
         operation="elapsed",
         request_disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
         error={"code": TaskRetrySeriesDisposition.ELAPSED_EXHAUSTED.value},
@@ -2063,6 +3016,7 @@ async def _enforce_task_retry_deadline_with_retry(
             receipt = await task_store.enforce_task_retry_deadline(
                 task.id,
                 worker_id,
+                lease_expires_at=lease_expires_at,
                 token_count=token_count,
                 estimated_cost=estimated_cost,
             )
@@ -2116,6 +3070,7 @@ async def _enforce_task_retry_deadline_resisting_cancellation(
     task: Task,
     worker_id: str,
     *,
+    lease_expires_at: datetime,
     cancellation_baseline: int,
     owner_cancellation: asyncio.CancelledError | None,
     report: TaskRetryAttemptReport | None,
@@ -2127,6 +3082,7 @@ async def _enforce_task_retry_deadline_resisting_cancellation(
             task_store,
             task,
             worker_id,
+            lease_expires_at=lease_expires_at,
             token_count=0 if report is None else report.token_count,
             estimated_cost=Decimal(0) if report is None else report.estimated_cost,
         ),
@@ -2273,10 +3229,20 @@ async def _safe_fail(
     task_id: str,
     worker_id: str,
     exc: Exception,
+    *,
+    lease_expires_at: datetime | None = None,
+    lease_authority: _TaskLeaseAuthority | None = None,
 ) -> None:
     payload = _task_failure_payload(app, exc)
     del exc
-    await _safe_fail_payload(task_store, task_id, worker_id, payload)
+    await _safe_fail_payload(
+        task_store,
+        task_id,
+        worker_id,
+        payload,
+        lease_expires_at=lease_expires_at,
+        lease_authority=lease_authority,
+    )
 
 
 def _task_failure_payload(app: CayuApp, exc: Exception) -> dict[str, Any]:
@@ -2320,25 +3286,35 @@ async def _safe_fail_payload(
     task_id: str,
     worker_id: str,
     payload: dict[str, Any],
+    *,
+    lease_expires_at: datetime | None = None,
+    lease_authority: _TaskLeaseAuthority | None = None,
 ) -> None:
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
         return
     if task.retry_series is not None:
+        request = TaskRetrySettlementRequest(
+            task_id=task_id,
+            worker_id=worker_id,
+            lease_expires_at=lease_expires_at,
+            causal_budget_id=task.retry_series.causal_budget_id,
+            disposition=TaskRetryAttemptDisposition.NON_RETRYABLE_FAILURE,
+            error=payload,
+            idempotency_key=_worker_failure_terminalization_key(
+                task_id,
+                worker_id,
+            ),
+        )
         try:
-            await _settle_task_retry_request_honoring_cancellation(
-                task_store,
-                TaskRetrySettlementRequest(
-                    task_id=task_id,
-                    worker_id=worker_id,
-                    causal_budget_id=task.retry_series.causal_budget_id,
-                    disposition=TaskRetryAttemptDisposition.NON_RETRYABLE_FAILURE,
-                    error=payload,
-                    idempotency_key=_worker_failure_terminalization_key(
-                        task_id,
-                        worker_id,
-                    ),
-                ),
+            await (
+                _settle_task_retry_request_with_lease_authority(
+                    task_store,
+                    request,
+                    lease_authority,
+                )
+                if lease_authority is not None
+                else _settle_task_retry_request_honoring_cancellation(task_store, request)
             )
         except TaskClaimLost:
             return
@@ -2349,6 +3325,7 @@ async def _safe_fail_payload(
             TaskTerminalizationRequest(
                 task_id=task_id,
                 worker_id=worker_id,
+                lease_expires_at=lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error=payload,
                 idempotency_key=_worker_failure_terminalization_key(
@@ -2382,20 +3359,62 @@ async def _settle_retry_attempt_report(
     task: Task,
     worker_id: str,
     report: TaskRetryAttemptReport,
+    *,
+    lease_authority: _TaskLeaseAuthority,
 ) -> None:
     copied = TaskRetryAttemptReport.model_validate(report.model_dump(mode="python", warnings=False))
     series = task.retry_series
     if series is None:
         raise TypeError("TaskRetryAttemptReport requires a task retry policy.")
-    await _settle_task_retry_request_honoring_cancellation(
+    await _settle_task_retry_request_with_lease_authority(
         task_store,
         TaskRetrySettlementRequest(
             task_id=task.id,
             worker_id=worker_id,
+            lease_expires_at=lease_authority.lease_expires_at,
             causal_budget_id=series.causal_budget_id,
             **copied.model_dump(mode="python", warnings=False),
         ),
+        lease_authority,
     )
+
+
+async def _settle_task_retry_request_with_lease_authority(
+    task_store: TaskStore,
+    request: TaskRetrySettlementRequest,
+    lease_authority: _TaskLeaseAuthority,
+) -> TaskRetrySettlementResult:
+    """Settle against the latest acknowledged lease without stopping heartbeats."""
+
+    last_claim_loss: TaskClaimLost | None = None
+    for _attempt in range(3):
+        effective_lease = lease_authority.lease_expires_at
+        effective_request = request.model_copy(
+            update={"lease_expires_at": effective_lease},
+            deep=True,
+        )
+        try:
+            return await _settle_task_retry_request_honoring_cancellation(
+                task_store,
+                effective_request,
+            )
+        except TaskClaimLost as exc:
+            last_claim_loss = exc
+
+        receipt = await task_store.load_task_retry_settlement(
+            effective_request.task_id,
+            effective_request.idempotency_key,
+        )
+        if receipt is not None:
+            return await _settle_task_retry_request_honoring_cancellation(
+                task_store,
+                effective_request,
+            )
+        if lease_authority.lease_expires_at == effective_lease:
+            raise last_claim_loss
+
+    assert last_claim_loss is not None
+    raise last_claim_loss
 
 
 async def _settle_task_retry_request_honoring_cancellation(
@@ -2438,6 +3457,9 @@ async def _safe_fail_unfinished(
     task_store: TaskStore,
     task_id: str,
     worker_id: str,
+    *,
+    lease_expires_at: datetime,
+    lease_authority: _TaskLeaseAuthority | None = None,
 ) -> None:
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
@@ -2448,6 +3470,8 @@ async def _safe_fail_unfinished(
         task_id,
         worker_id,
         RuntimeError("Task handler returned without completing or failing the task."),
+        lease_expires_at=lease_expires_at,
+        lease_authority=lease_authority,
     )
 
 

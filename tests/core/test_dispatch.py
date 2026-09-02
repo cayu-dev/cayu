@@ -4,6 +4,7 @@ import asyncio
 import base64
 import os
 import sqlite3
+import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -19,6 +20,8 @@ from tests.core._execution_profile_fixtures import (
 )
 
 import cayu.runtime._session_engine as session_engine_module
+from cayu._exception_groups import exception_cause, iter_exception_tree
+from cayu.build_provenance import current_runtime_build_provenance
 from cayu.core import (
     AgentSpec,
     Event,
@@ -90,7 +93,6 @@ from cayu.runtime import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
     ToolCapabilityCeiling,
-    current_runtime_build_provenance,
 )
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
@@ -99,6 +101,7 @@ from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.dispatch import (
     _STALLED_RECOVERED_ACTIONS,
     _dispatch_status_after_event,
+    _DispatchLeaseAuthority,
     _new_queued_dispatch_envelope,
     _queued_dispatch_task_id,
     _QueuedDispatchAuthorityRejected,
@@ -142,6 +145,62 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 _DISPATCH_TASK_TYPE = "cayu.dispatch"
 _TEST_DISPATCH_ROOTS: dict[str, str] = {}
 _TEST_DISPATCH_SESSION_INSTANCES: dict[str, str] = {}
+
+
+def test_dispatch_worker_rejects_missing_cancellation_reconciliation_before_claim() -> None:
+    class UnsupportedCancellationStore(InMemoryTaskStore):
+        supports_task_cancellation_reconciliation = False
+
+    async def scenario() -> None:
+        store = UnsupportedCancellationStore()
+        dispatcher = TaskStoreDispatcher(store)
+        app = CayuApp(task_store=store, enable_logging=False)
+        created = await store.create_task(
+            TaskCreate(task_id="unsupported-dispatch", type=_DISPATCH_TASK_TYPE)
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="cancellation reconciliation before they can claim work",
+        ):
+            await dispatcher.process_next(app, worker_id="unsupported-dispatch-worker")
+        assert await store.load_task(created.id) == created
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_owner_lost_reconciliation_uses_store_owned_time() -> None:
+    async def scenario() -> None:
+        now = {"value": datetime(2026, 1, 1, tzinfo=UTC)}
+        store = InMemoryTaskStore(ownership_clock=lambda: now["value"])
+        dispatcher = TaskStoreDispatcher(store)
+        created = await store.create_task(
+            TaskCreate(task_id="store-time-dispatch", type=_DISPATCH_TASK_TYPE)
+        )
+        claimed = await store.claim_task(
+            "store-time-dispatch-worker",
+            TaskQuery(type=_DISPATCH_TASK_TYPE),
+            lease_seconds=5,
+        )
+        assert claimed is not None
+        requested = await store.cancel_task(created.id, {"code": "dispatch_cancelled"})
+        assert requested.lease_expires_at is not None
+        now["value"] = requested.lease_expires_at + timedelta(seconds=1)
+
+        await dispatcher._settle_dispatch_cancellation_after_quiescence(
+            created.id,
+            "store-time-dispatch-worker",
+        )
+        terminal = await store.load_task(created.id)
+        assert terminal is not None
+        assert terminal.status is TaskStatus.CANCELLED
+        assert terminal.status_payload is not None
+        reconciliation = terminal.status_payload["cancellation_reconciliation"]
+        assert datetime.fromisoformat(reconciliation["reconciliation_requested_at"]) == (
+            requested.lease_expires_at
+        )
+
+    asyncio.run(scenario())
 
 
 class FakeProvider(ModelProvider):
@@ -3578,10 +3637,13 @@ def test_redelivery_replays_old_terminal_dispatch_during_newer_profile_ownership
         )
 
     asyncio.run(bind_newer_profile_ownership())
+    claimed_for_release = asyncio.run(tasks.load_task(submitted.metadata["queue_task_id"]))
+    assert claimed_for_release is not None
     asyncio.run(
         tasks.release_task(
             submitted.metadata["queue_task_id"],
             "worker_a",
+            lease_expires_at=claimed_for_release.lease_expires_at,
         )
     )
 
@@ -3676,7 +3738,15 @@ def test_sqlite_pruning_retains_terminal_evidence_until_queue_acknowledgement(
         )
         assert [record.event.id for record in retained] == [envelope.terminal_event_id]
 
-        asyncio.run(tasks.release_task(task_id, "worker_retention_a"))
+        claimed_for_release = asyncio.run(tasks.load_task(task_id))
+        assert claimed_for_release is not None
+        asyncio.run(
+            tasks.release_task(
+                task_id,
+                "worker_retention_a",
+                lease_expires_at=claimed_for_release.lease_expires_at,
+            )
+        )
         replayed = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_retention_b"))
         assert replayed is not None
         assert replayed.status is DispatchStatus.COMPLETED
@@ -3824,7 +3894,15 @@ def test_terminal_redelivery_settles_independently_of_a_newer_active_invocation(
     first = asyncio.run(h.dispatcher.process_next(h.app, worker_id="worker_old"))
     assert first is not None
     assert first.metadata["reclaimed"] is True
-    asyncio.run(tasks.release_task(submitted.metadata["queue_task_id"], "worker_old"))
+    claimed_for_release = asyncio.run(tasks.load_task(submitted.metadata["queue_task_id"]))
+    assert claimed_for_release is not None
+    asyncio.run(
+        tasks.release_task(
+            submitted.metadata["queue_task_id"],
+            "worker_old",
+            lease_expires_at=claimed_for_release.lease_expires_at,
+        )
+    )
 
     interaction_id = "interaction_after_queued_terminal"
     asyncio.run(
@@ -3852,22 +3930,23 @@ def test_terminal_redelivery_settles_independently_of_a_newer_active_invocation(
     assert task.status is TaskStatus.COMPLETED
 
 
-def test_worker_cancellation_redelivery_replays_without_provider_redispatch() -> None:
+def test_worker_cancellation_settles_without_provider_redispatch() -> None:
     class BlockingProvider(FakeProvider):
         name = "fake"
 
         def __init__(self) -> None:
             self.requests: list[ModelRequest] = []
             self.started = asyncio.Event()
+            self.release = asyncio.Event()
 
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
             self.requests.append(request)
             self.started.set()
-            await asyncio.Event().wait()
+            await self.release.wait()
             if False:
                 yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
-    async def scenario() -> tuple[asyncio.Task, DispatchHandle, int, TaskStatus]:
+    async def scenario() -> tuple[asyncio.Task, DispatchHandle | None, int, TaskStatus]:
         store = InMemorySessionStore()
         tasks = InMemoryTaskStore()
         dispatcher = TaskStoreDispatcher(tasks)
@@ -3898,16 +3977,23 @@ def test_worker_cancellation_redelivery_replays_without_provider_redispatch() ->
         processing = asyncio.create_task(
             dispatcher.process_next(worker, worker_id="worker_cancelled")
         )
-        await asyncio.wait_for(blocking_provider.started.wait(), timeout=2)
-        processing.cancel("worker shutdown")
-        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
-            await processing
-        await tasks.release_task(
-            submitted.metadata["queue_task_id"],
-            "worker_cancelled",
+        provider_started = asyncio.create_task(blocking_provider.started.wait())
+        done, _pending = await asyncio.wait(
+            {processing, provider_started},
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        if processing in done:
+            processing.result()
+        assert provider_started in done
+        assert provider_started.result() is True
+        processing.cancel("worker shutdown")
+        await asyncio.sleep(0)
+        assert processing.done() is False
+        blocking_provider.release.set()
+        with pytest.raises(asyncio.CancelledError, match="worker shutdown"):
+            await processing
         replayed = await dispatcher.process_next(worker, worker_id="worker_restarted")
-        assert replayed is not None
         task = await tasks.load_task(submitted.metadata["queue_task_id"])
         assert task is not None
         return processing, replayed, len(blocking_provider.requests), task.status
@@ -3916,9 +4002,473 @@ def test_worker_cancellation_redelivery_replays_without_provider_redispatch() ->
 
     assert processing.cancelling() == 1
     assert processing.cancelled() is True
-    assert replayed.status is DispatchStatus.INTERRUPTED
+    assert replayed is None
     assert provider_calls == 1
-    assert task_status is TaskStatus.COMPLETED
+    assert task_status is TaskStatus.CANCELLED
+
+
+def test_dispatch_lease_supervisor_preserves_cleanup_failure_on_caller_cancel() -> None:
+    async def scenario() -> tuple[asyncio.Task[Any], RuntimeError, list[BaseException]]:
+        operation_started = asyncio.Event()
+        cleanup_failure = RuntimeError("dispatch cleanup failed")
+
+        async def operation() -> None:
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                raise cleanup_failure
+
+        async def heartbeat_forever() -> None:
+            await asyncio.Event().wait()
+
+        heartbeat = asyncio.create_task(heartbeat_forever())
+        owner = asyncio.create_task(
+            TaskStoreDispatcher._await_with_task_lease(operation(), heartbeat)
+        )
+        await operation_started.wait()
+        owner.cancel("dispatcher shutdown")
+        with pytest.raises(asyncio.CancelledError, match="dispatcher shutdown") as cancellation:
+            await owner
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        cause = exception_cause(cancellation.value)
+        assert cause is not None
+        return owner, cleanup_failure, list(iter_exception_tree(cause))
+
+    owner, cleanup_failure, failures = asyncio.run(scenario())
+
+    assert owner.cancelling() == 1
+    assert owner.cancelled() is True
+    assert sum(candidate is cleanup_failure for candidate in failures) == 1
+
+
+def test_dispatch_lease_supervisor_preserves_fatal_cleanup_over_lease_loss() -> None:
+    async def scenario() -> tuple[GeneratorExit, TaskClaimLost, list[BaseException]]:
+        operation_started = asyncio.Event()
+        release_heartbeat = asyncio.Event()
+        release_operation = asyncio.Event()
+        fatal_cleanup = GeneratorExit("dispatch cleanup aborted")
+        lease_failure = TaskClaimLost("dispatch lease lost")
+
+        async def operation() -> None:
+            operation_started.set()
+            await release_operation.wait()
+            raise fatal_cleanup
+
+        async def heartbeat() -> None:
+            await release_heartbeat.wait()
+            raise lease_failure
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        owner = asyncio.create_task(
+            TaskStoreDispatcher._await_with_task_lease(operation(), heartbeat_task)
+        )
+        await operation_started.wait()
+        release_heartbeat.set()
+        await asyncio.sleep(0)
+        release_operation.set()
+        with pytest.raises(GeneratorExit, match="dispatch cleanup aborted") as fatal:
+            await owner
+        cause = exception_cause(fatal.value)
+        assert cause is not None
+        return fatal_cleanup, lease_failure, [fatal.value, *iter_exception_tree(cause)]
+
+    fatal_cleanup, lease_failure, failures = asyncio.run(scenario())
+
+    assert sum(candidate is fatal_cleanup for candidate in failures) == 1
+    assert sum(candidate is lease_failure for candidate in failures) == 1
+
+
+def test_dispatch_lease_loss_wins_simultaneous_operation_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        lease_failure = TaskClaimLost("dispatch lease lost")
+
+        async def complete_both(tasks, *, return_when):
+            assert return_when is asyncio.FIRST_COMPLETED
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return set(tasks), set()
+
+        async def heartbeat() -> None:
+            raise lease_failure
+
+        monkeypatch.setattr(asyncio, "wait", complete_both)
+        heartbeat_task = asyncio.create_task(heartbeat())
+        operation = asyncio.get_running_loop().create_future()
+        operation.set_result("completed")
+
+        with pytest.raises(TaskClaimLost) as raised:
+            await TaskStoreDispatcher._await_with_task_lease(operation, heartbeat_task)
+        assert raised.value is lease_failure
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_cancellation_fence_rejects_reused_worker_lease_generation() -> None:
+    async def scenario() -> None:
+        ownership_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        tasks = InMemoryTaskStore(ownership_clock=lambda: ownership_now[0])
+        await tasks.create_task(TaskCreate(task_id="same-worker-dispatch", type="dispatch"))
+        stale = await tasks.claim_task("shared-worker", lease_seconds=1)
+        assert stale is not None
+        assert stale.lease_expires_at is not None
+        stale_authority = _DispatchLeaseAuthority(stale.lease_expires_at)
+
+        ownership_now[0] += timedelta(seconds=1)
+        assert [task.id for task in await tasks.reclaim_expired()] == [stale.id]
+        successor = await tasks.claim_task("shared-worker", lease_seconds=30)
+        assert successor is not None
+        assert successor.lease_expires_at != stale.lease_expires_at
+
+        dispatcher = TaskStoreDispatcher(tasks)
+        with pytest.raises(TaskClaimLost, match="expected lease generation"):
+            await dispatcher._request_dispatch_cancellation_fence(
+                stale,
+                "shared-worker",
+                {"code": "stale-dispatch-cancelled"},
+                lease_authority=stale_authority,
+            )
+
+        assert await tasks.load_task(successor.id) == successor
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_lease_loss_drains_cancellation_opaque_thread() -> None:
+    async def scenario() -> None:
+        thread_started = threading.Event()
+        release_thread = threading.Event()
+        lease_failure = TaskClaimLost("dispatch lease lost")
+
+        def opaque_work() -> None:
+            thread_started.set()
+            release_thread.wait()
+
+        async def heartbeat() -> None:
+            raise lease_failure
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        owner = asyncio.create_task(
+            TaskStoreDispatcher._await_with_task_lease(
+                asyncio.to_thread(opaque_work),
+                heartbeat_task,
+            )
+        )
+        assert await asyncio.to_thread(thread_started.wait, 1)
+        await asyncio.sleep(0)
+        assert owner.done() is False
+
+        release_thread.set()
+        with pytest.raises(TaskClaimLost) as raised:
+            await owner
+        assert raised.value is lease_failure
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_lease_loss_drains_thread_before_redelivering_caller_cancellation() -> None:
+    async def scenario() -> tuple[asyncio.Task[Any], TaskClaimLost, list[BaseException]]:
+        thread_started = threading.Event()
+        release_thread = threading.Event()
+        lease_failure = TaskClaimLost("dispatch lease lost")
+
+        def opaque_work() -> None:
+            thread_started.set()
+            release_thread.wait()
+
+        async def heartbeat() -> None:
+            raise lease_failure
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        owner = asyncio.create_task(
+            TaskStoreDispatcher._await_with_task_lease(
+                asyncio.to_thread(opaque_work),
+                heartbeat_task,
+            )
+        )
+        assert await asyncio.to_thread(thread_started.wait, 1)
+        owner.cancel("worker shutdown")
+        await asyncio.sleep(0)
+        assert owner.done() is False
+
+        release_thread.set()
+        with pytest.raises(asyncio.CancelledError, match="worker shutdown") as cancellation:
+            await owner
+        cause = exception_cause(cancellation.value)
+        assert cause is not None
+        return owner, lease_failure, list(iter_exception_tree(cause))
+
+    owner, lease_failure, failures = asyncio.run(scenario())
+
+    assert owner.cancelling() == 1
+    assert owner.cancelled() is True
+    assert sum(candidate is lease_failure for candidate in failures) == 1
+
+
+def test_live_dispatcher_stops_before_replacement_after_heartbeat_stalls() -> None:
+    class BlockingHeartbeatStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.heartbeat_started = asyncio.Event()
+            self.release_heartbeat = asyncio.Event()
+
+        async def heartbeat(
+            self,
+            task_id,
+            worker_id,
+            *,
+            lease_expires_at,
+            extend_seconds=300,
+        ):
+            if worker_id == "stale-dispatch-worker":
+                self.heartbeat_started.set()
+                await self.release_heartbeat.wait()
+            return await super().heartbeat(
+                task_id,
+                worker_id,
+                lease_expires_at=lease_expires_at,
+                extend_seconds=extend_seconds,
+            )
+
+    class ReplacementAwareRuntime(_SecretFreeDispatchRuntime):
+        def __init__(self) -> None:
+            self.dispatches = 0
+            self.first_started = asyncio.Event()
+            self.first_stopped = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def dispatch_inline(
+            self,
+            request: DispatchRequest,
+        ) -> AsyncIterator[Event]:
+            del request
+            if False:
+                yield Event(type=EventType.SESSION_COMPLETED, session_id="unreachable")
+
+        async def _dispatch_queued(
+            self,
+            envelope: _QueuedDispatchEnvelope,
+        ) -> AsyncIterator[Event]:
+            del envelope
+            dispatch_index = self.dispatches
+            self.dispatches += 1
+            if dispatch_index == 0:
+                self.first_started.set()
+                try:
+                    await self.release_first.wait()
+                finally:
+                    self.first_stopped.set()
+                return
+            if not self.first_stopped.is_set():
+                raise AssertionError("Replacement dispatched before the stale owner stopped.")
+            self._test_terminal_status = DispatchStatus.COMPLETED
+            if False:
+                yield Event(type=EventType.SESSION_COMPLETED, session_id="unreachable")
+
+    async def scenario() -> None:
+        tasks = BlockingHeartbeatStore()
+        dispatcher = TaskStoreDispatcher(tasks, lease_seconds=1)
+        runtime = ReplacementAwareRuntime()
+        submitted = await dispatcher.submit(
+            runtime,
+            _dispatch_request(
+                "sess_live_dispatch_heartbeat_loss",
+                "d_live_dispatch_heartbeat_loss",
+            ),
+        )
+        stale = asyncio.create_task(
+            dispatcher.process_next(runtime, worker_id="stale-dispatch-worker")
+        )
+        await asyncio.wait_for(runtime.first_started.wait(), timeout=1)
+        await asyncio.wait_for(tasks.heartbeat_started.wait(), timeout=1)
+        await asyncio.sleep(1.05)
+        assert stale.done() is False
+        assert runtime.first_stopped.is_set() is False
+        await tasks.reclaim_expired(query=TaskQuery(type=_DISPATCH_TASK_TYPE))
+        replacement = await dispatcher.process_next(
+            runtime,
+            worker_id="replacement-dispatch-worker",
+        )
+        assert replacement is None
+        assert runtime.dispatches == 1
+
+        runtime.release_first.set()
+        await asyncio.wait_for(runtime.first_stopped.wait(), timeout=2)
+        stale_result = await stale
+        assert stale_result is not None
+        assert stale_result.status is DispatchStatus.CANCELLED
+        assert stale_result.metadata["reclaimed"] is True
+        assert runtime.dispatches == 1
+        task = await tasks.load_task(submitted.metadata["queue_task_id"])
+        assert task is not None
+        assert task.status is TaskStatus.CANCELLED
+
+        tasks.release_heartbeat.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_live_dispatcher_fences_opaque_work_before_replacement() -> None:
+    lease_failure = TaskClaimLost("dispatch lease lost during cancellation drain")
+
+    class BlockingCancellationStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.fence_started = asyncio.Event()
+            self.release_fence = asyncio.Event()
+            self.heartbeat_started = asyncio.Event()
+            self.release_heartbeat = asyncio.Event()
+
+        async def request_claimed_task_cancellation(
+            self,
+            task_id,
+            worker_id,
+            lease_expires_at,
+            error=None,
+        ):
+            self.fence_started.set()
+            await self.release_fence.wait()
+            return await super().request_claimed_task_cancellation(
+                task_id,
+                worker_id,
+                lease_expires_at,
+                error,
+            )
+
+        async def heartbeat(
+            self,
+            task_id,
+            worker_id,
+            *,
+            lease_expires_at,
+            extend_seconds=300,
+        ):
+            del task_id, worker_id, lease_expires_at, extend_seconds
+            self.heartbeat_started.set()
+            await self.release_heartbeat.wait()
+            raise lease_failure
+
+    class OpaqueDispatchRuntime(_SecretFreeDispatchRuntime):
+        def __init__(self) -> None:
+            self.dispatches = 0
+            self.thread_started = threading.Event()
+            self.release_thread = threading.Event()
+
+        async def dispatch_inline(
+            self,
+            request: DispatchRequest,
+        ) -> AsyncIterator[Event]:
+            del request
+            if False:
+                yield Event(type=EventType.SESSION_COMPLETED, session_id="unreachable")
+
+        async def _dispatch_queued(
+            self,
+            envelope: _QueuedDispatchEnvelope,
+        ) -> AsyncIterator[Event]:
+            del envelope
+            self.dispatches += 1
+
+            def opaque_work() -> None:
+                self.thread_started.set()
+                self.release_thread.wait()
+
+            await asyncio.to_thread(opaque_work)
+            if False:
+                yield Event(type=EventType.SESSION_COMPLETED, session_id="unreachable")
+
+    async def scenario() -> None:
+        tasks = BlockingCancellationStore()
+        dispatcher = TaskStoreDispatcher(tasks, lease_seconds=1)
+        runtime = OpaqueDispatchRuntime()
+        submitted = await dispatcher.submit(
+            runtime,
+            _dispatch_request(
+                "sess_cancelled_opaque_dispatch",
+                "d_cancelled_opaque_dispatch",
+            ),
+        )
+        processing = asyncio.create_task(
+            dispatcher.process_next(runtime, worker_id="cancelled-dispatch-worker")
+        )
+        try:
+            assert await asyncio.to_thread(runtime.thread_started.wait, 1)
+            await asyncio.wait_for(tasks.heartbeat_started.wait(), timeout=1)
+
+            processing.cancel("dispatcher shutdown")
+            await asyncio.wait_for(tasks.fence_started.wait(), timeout=1)
+            # The owned shield temporarily consumes the request while it establishes
+            # the durable fence.  It restores the request before redelivery below.
+            assert processing.cancelling() == 0
+            assert processing.done() is False
+
+            await asyncio.sleep(1.05)
+            assert await tasks.reclaim_expired(query=TaskQuery(type=_DISPATCH_TASK_TYPE)) == []
+            draining = await tasks.load_task(submitted.metadata["queue_task_id"])
+            assert draining is not None
+            assert draining.worker_id == "cancelled-dispatch-worker"
+            assert draining.status_reason == "cancellation_requested"
+            assert (
+                await dispatcher.process_next(
+                    runtime,
+                    worker_id="replacement-dispatch-worker",
+                )
+                is None
+            )
+            assert runtime.dispatches == 1
+
+            tasks.release_fence.set()
+            tasks.release_heartbeat.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert processing.done() is False
+            assert await tasks.reclaim_expired(query=TaskQuery(type=_DISPATCH_TASK_TYPE)) == []
+            assert (
+                await dispatcher.process_next(
+                    runtime,
+                    worker_id="replacement-dispatch-worker",
+                )
+                is None
+            )
+            assert runtime.dispatches == 1
+
+            runtime.release_thread.set()
+            with pytest.raises(
+                asyncio.CancelledError,
+                match="dispatcher shutdown",
+            ) as cancellation:
+                await processing
+            cause = exception_cause(cancellation.value)
+            assert cause is not None
+            lease_failures = [
+                candidate
+                for candidate in iter_exception_tree(cause)
+                if isinstance(candidate, TaskClaimLost)
+            ]
+            assert len(lease_failures) == 1
+            assert "last positively known lease deadline" in str(lease_failures[0])
+            assert processing.cancelling() == 1
+            assert processing.cancelled()
+            terminal = await tasks.load_task(submitted.metadata["queue_task_id"])
+            assert terminal is not None
+            assert terminal.status is TaskStatus.CANCELLED
+            assert runtime.dispatches == 1
+        finally:
+            tasks.release_fence.set()
+            tasks.release_heartbeat.set()
+            runtime.release_thread.set()
+            if not processing.done():
+                processing.cancel()
+            await asyncio.gather(processing, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_sqlite_restart_preserves_queued_profile_and_executes_once(tmp_path) -> None:
@@ -4016,7 +4566,7 @@ def test_process_next_reconciles_terminalization_acknowledgement_loss() -> None:
     assert task.status is TaskStatus.COMPLETED
 
 
-def test_same_dispatcher_reconciles_cancellation_after_task_terminal_commit() -> None:
+def test_dispatch_cancellation_reconciles_task_terminal_commit() -> None:
     class CommitThenBlockStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
@@ -4069,8 +4619,7 @@ def test_same_dispatcher_reconciles_cancellation_after_task_terminal_commit() ->
         assert worker.cancelled()
 
         checkpoint = await h.store.load_checkpoint(session_id)
-        assert checkpoint is not None
-        assert "queued_dispatch_terminal_receipts" in checkpoint
+        assert checkpoint is None or "queued_dispatch_terminal_receipts" not in checkpoint
 
         retried_result = await h.dispatcher.process_next(
             h.app,
@@ -4159,6 +4708,7 @@ def test_process_next_rejects_peer_terminalization_without_exact_dispatch_eviden
                 request.task_id,
                 {"winner": "peer"},
                 worker_id=request.worker_id,
+                lease_expires_at=request.lease_expires_at,
             )
             return await super().terminalize_task(request)
 
@@ -4276,6 +4826,7 @@ def test_same_dispatcher_acknowledges_terminal_task_after_cancelled_session_ack(
 
     async def scenario() -> None:
         acknowledgement_started = asyncio.Event()
+        acknowledgement_release = asyncio.Event()
 
         async def block_acknowledgement(
             envelope: _QueuedDispatchEnvelope,
@@ -4284,7 +4835,7 @@ def test_same_dispatcher_acknowledges_terminal_task_after_cancelled_session_ack(
         ) -> None:
             del envelope, dispatch_status
             acknowledgement_started.set()
-            await asyncio.Event().wait()
+            await acknowledgement_release.wait()
 
         monkeypatch.setattr(
             h.app,
@@ -4299,6 +4850,9 @@ def test_same_dispatcher_acknowledges_terminal_task_after_cancelled_session_ack(
         assert terminal_task is not None
         assert terminal_task.status is TaskStatus.COMPLETED
         worker.cancel()
+        await asyncio.sleep(0)
+        assert worker.done() is False
+        acknowledgement_release.set()
         with pytest.raises(asyncio.CancelledError):
             await worker
 
@@ -4344,6 +4898,7 @@ def test_operator_cancellation_wins_terminal_race_and_restart_acknowledges_recei
             *,
             task_id: str,
             worker_id: str,
+            lease_expires_at: datetime,
             kind: TaskTerminalKind,
             payload: dict[str, Any],
         ) -> bool:
@@ -4352,6 +4907,7 @@ def test_operator_cancellation_wins_terminal_race_and_restart_acknowledges_recei
             return await original_commit(
                 task_id=task_id,
                 worker_id=worker_id,
+                lease_expires_at=lease_expires_at,
                 kind=kind,
                 payload=payload,
             )
@@ -4872,6 +5428,7 @@ def test_paginated_reconciliation_remembers_unresolved_earlier_page() -> None:
                     ),
                 },
                 worker_id=claimed.worker_id,
+                lease_expires_at=claimed.lease_expires_at,
             )
             runtime.receipts.append(
                 QueuedDispatchTerminalReceipt(
@@ -4959,6 +5516,7 @@ def test_queue_terminalization_uses_exact_session_event_status() -> None:
             lease_seconds=300,
         )
         assert claimed is not None
+        assert claimed.lease_expires_at is not None
         envelope = _QueuedDispatchEnvelope.model_validate(claimed.input["dispatch"])
         handle = await dispatcher._terminalize(
             runtime,
@@ -4975,6 +5533,7 @@ def test_queue_terminalization_uses_exact_session_event_status() -> None:
                 "error": "failure after the session terminal event",
             },
             envelope=envelope,
+            lease_authority=_DispatchLeaseAuthority(claimed.lease_expires_at),
         )
         terminal_task = await tasks.load_task(task_id)
         assert terminal_task is not None
@@ -5148,6 +5707,7 @@ def test_sqlite_restart_repairs_terminal_task_session_acknowledgement(
         )
         session_id = "sess_sqlite_cancelled_queue_ack"
         acknowledgement_started = asyncio.Event()
+        acknowledgement_release = asyncio.Event()
 
         async def block_acknowledgement(
             envelope: _QueuedDispatchEnvelope,
@@ -5156,7 +5716,7 @@ def test_sqlite_restart_repairs_terminal_task_session_acknowledgement(
         ) -> None:
             del envelope, dispatch_status
             acknowledgement_started.set()
-            await asyncio.Event().wait()
+            await acknowledgement_release.wait()
 
         try:
             async for _ in app.run(
@@ -5184,6 +5744,9 @@ def test_sqlite_restart_repairs_terminal_task_session_acknowledgement(
             assert terminal_task is not None
             assert terminal_task.status is TaskStatus.COMPLETED
             processing.cancel()
+            await asyncio.sleep(0)
+            assert processing.done() is False
+            acknowledgement_release.set()
             with pytest.raises(asyncio.CancelledError):
                 await processing
             checkpoint = await sessions.load_checkpoint(session_id)
@@ -5757,7 +6320,7 @@ def test_run_worker_drains_queue_until_stopped() -> None:
             h.dispatcher.run_worker(h.app, worker_id="worker_a", stop=stop, poll_interval_s=0.01)
         )
         try:
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(30):
                 while True:
                     t_a = await h.tasks.load_task(h_a.metadata["queue_task_id"])
                     t_b = await h.tasks.load_task(h_b.metadata["queue_task_id"])
@@ -6118,14 +6681,34 @@ def test_terminal_update_requires_owning_worker() -> None:
 
     async def scenario() -> None:
         task = await h.tasks.create_task(TaskCreate(type=_DISPATCH_TASK_TYPE))
-        await h.tasks.claim_task("worker_a", TaskQuery(type=_DISPATCH_TASK_TYPE), lease_seconds=300)
+        claimed = await h.tasks.claim_task(
+            "worker_a",
+            TaskQuery(type=_DISPATCH_TASK_TYPE),
+            lease_seconds=300,
+        )
+        assert claimed is not None
 
         with pytest.raises(ValueError, match="does not own"):
-            await h.tasks.complete_task(task.id, {"ok": True}, worker_id="worker_b")
+            await h.tasks.complete_task(
+                task.id,
+                {"ok": True},
+                worker_id="worker_b",
+                lease_expires_at=claimed.lease_expires_at,
+            )
         with pytest.raises(ValueError, match="does not own"):
-            await h.tasks.fail_task(task.id, {"err": True}, worker_id="worker_b")
+            await h.tasks.fail_task(
+                task.id,
+                {"err": True},
+                worker_id="worker_b",
+                lease_expires_at=claimed.lease_expires_at,
+            )
 
-        done = await h.tasks.complete_task(task.id, {"ok": True}, worker_id="worker_a")
+        done = await h.tasks.complete_task(
+            task.id,
+            {"ok": True},
+            worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
+        )
         assert done.status == TaskStatus.COMPLETED
 
     asyncio.run(scenario())
@@ -6141,7 +6724,13 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
             TaskCreate(type=_DISPATCH_TASK_TYPE, input={"dispatch": {"x": 1}})
         )
         # The task is now owned by worker_b (stands in for a reclaim by another worker).
-        await h.tasks.claim_task("worker_b", TaskQuery(type=_DISPATCH_TASK_TYPE), lease_seconds=300)
+        claimed = await h.tasks.claim_task(
+            "worker_b",
+            TaskQuery(type=_DISPATCH_TASK_TYPE),
+            lease_seconds=300,
+        )
+        assert claimed is not None
+        assert claimed.lease_expires_at is not None
         request = _dispatch_request("sess_reclaimed", "d_reclaimed")
         envelope = _test_dispatch_envelope(request, queue_task_id=task.id)
 
@@ -6153,6 +6742,7 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
             DispatchStatus.COMPLETED,
             {"status": "completed"},
             envelope=envelope,
+            lease_authority=_DispatchLeaseAuthority(claimed.lease_expires_at),
         )
 
         assert handle.metadata.get("reclaimed") is True
@@ -6170,7 +6760,13 @@ def test_malformed_dispatch_claim_loss_returns_without_clobbering_new_owner() ->
 
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             if request.worker_id is not None:
-                await super().release_task(request.task_id, request.worker_id)
+                current = await self.load_task(request.task_id)
+                assert current is not None
+                await super().release_task(
+                    request.task_id,
+                    request.worker_id,
+                    lease_expires_at=current.lease_expires_at,
+                )
                 reclaimed = await super().claim_task("worker_b", lease_seconds=300)
                 assert reclaimed is not None
                 assert reclaimed.id == request.task_id

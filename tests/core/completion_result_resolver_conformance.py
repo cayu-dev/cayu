@@ -733,7 +733,7 @@ async def assert_completion_result_resolver_session_publication_conformance(
     expired_at = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
     await session_store._publish_completion_result_event_publication(
         expired_owner_session_id,
-        checkpoint_transform=lambda _session, _checkpoint: {
+        checkpoint_transform=lambda _session, _checkpoint, _store_now: {
             "completion_result_event_publications": {
                 "schema_version": 2,
                 "reservations": {
@@ -780,7 +780,7 @@ async def assert_completion_result_resolver_session_publication_conformance(
     ):
         await session_store._publish_completion_result_event_publication(
             corrupted_session_id,
-            checkpoint_transform=lambda _session, _checkpoint, value=corrupted: value,
+            checkpoint_transform=lambda _session, _checkpoint, _store_now, value=corrupted: value,
             events=[],
         )
         with pytest.raises(ValueError, match="publication authority"):
@@ -788,7 +788,7 @@ async def assert_completion_result_resolver_session_publication_conformance(
         assert await session_store.load(corrupted_session_id) is not None
     await session_store._publish_completion_result_event_publication(
         corrupted_session_id,
-        checkpoint_transform=lambda _session, _checkpoint: {},
+        checkpoint_transform=lambda _session, _checkpoint, _store_now: {},
         events=[],
     )
     await session_store.delete_session(corrupted_session_id)

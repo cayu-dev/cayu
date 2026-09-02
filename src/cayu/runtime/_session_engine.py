@@ -235,6 +235,7 @@ from cayu.runtime._model_step_executor import (
     model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._recovery_coordinator import (
+    _INCOMPLETE_RECOVERY_CLAIM_LEASE,
     ModelCompletionManualRecoveryRequired,
     RecoveryAbandonedSessionRequest,
     RecoveryCoordinator,
@@ -281,6 +282,10 @@ from cayu.runtime._structured_output_tool_round import (
     _structured_output_validating_event,
     _StructuredOutputToolRoundPublicationExtension,
     _validate_structured_output_tool_round,
+)
+from cayu.runtime._task_lease_authority import (
+    active_task_lease_authority,
+    managed_task_lease_mutation,
 )
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_result_validation,
@@ -813,19 +818,12 @@ def _validate_fork_source_checkpoint_state(
     source_checkpoint: dict[str, Any] | None,
     *,
     copy_checkpoint: bool,
-    clock: Callable[[], datetime],
     redactor: SecretRedactor,
 ) -> dict[str, Any] | None:
     """Reject source state that no direct session fork may inherit."""
 
-    claim_now = clock()
-    recovery_claim = _incomplete_recovery_claim_from_checkpoint(source_checkpoint)
-    if recovery_claim is not None and recovery_claim[1] <= claim_now:
-        raise _ExpiredIncompleteRecoveryClaim(recovery_claim[0])
-    source_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
-        source_checkpoint,
-        now=claim_now,
-    )
+    if _incomplete_recovery_claim_from_checkpoint(source_checkpoint) is not None:
+        raise RuntimeError("Session has an active incomplete-session recovery operation.")
     if _initial_transcript_pending_interaction_id(source_checkpoint) is not None:
         raise RuntimeError(
             "Source session setup did not publish its authoritative initial "
@@ -833,7 +831,6 @@ def _validate_fork_source_checkpoint_state(
         )
     if source_checkpoint is not None and _SESSION_OPERATIONS_CHECKPOINT_KEY in source_checkpoint:
         operations = _session_operation_state(source_checkpoint)
-        _abandon_expired_session_operation(operations, now=clock())
         source_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
     active_operation_id = _active_session_operation_id(source_checkpoint)
     if active_operation_id is not None:
@@ -2326,46 +2323,29 @@ class _SessionOperationClaimHeartbeatState:
     def __init__(self) -> None:
         self.pending_store_task: asyncio.Task[Any] | None = None
         self.confirmed_claim_expires_at: datetime | None = None
+        self.claim_deadline_monotonic: float | None = None
 
-    def confirm_claim(self, expires_at: datetime) -> None:
+    def confirm_claim(
+        self,
+        expires_at: datetime,
+        *,
+        claim_deadline_monotonic: float,
+    ) -> None:
         confirmed = self.confirmed_claim_expires_at
         if confirmed is None or expires_at > confirmed:
             self.confirmed_claim_expires_at = expires_at
+            self.claim_deadline_monotonic = claim_deadline_monotonic
+
+    def remaining_claim_seconds(self) -> float:
+        deadline = self.claim_deadline_monotonic
+        if deadline is None:
+            raise AssertionError("Session operation claim has no local monotonic deadline.")
+        return deadline - time.monotonic()
 
     def observe_store_task(self, task: asyncio.Task[Any]) -> None:
         if self.pending_store_task is task:
             self.pending_store_task = None
         _consume_detached_session_operation_task(task)
-
-
-def _require_unexpired_session_operation_commit(
-    *,
-    clock: Callable[[], datetime],
-    claim_expires_at: datetime,
-    operation: str,
-) -> None:
-    commit_at = clock()
-    if commit_at.tzinfo is None or commit_at.utcoffset() is None:
-        raise ValueError(f"{operation} commit time must be timezone-aware.")
-    if claim_expires_at <= commit_at:
-        raise SessionCompactionAttemptSuperseded(f"{operation} claim expired before commit.")
-
-
-def _require_unexpired_session_operation_claim(
-    *,
-    clock: Callable[[], datetime],
-    claim_expires_at: datetime,
-    operation: str,
-) -> None:
-    observed_at = clock()
-    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-        raise ValueError(f"{operation} observation time must be timezone-aware.")
-    if claim_expires_at.tzinfo is None or claim_expires_at.utcoffset() is None:
-        raise ValueError(f"{operation} claim expiry must be timezone-aware.")
-    if claim_expires_at <= observed_at:
-        raise SessionCompactionAttemptSuperseded(
-            f"{operation} returned a claim that had already expired."
-        )
 
 
 async def _run_while_session_operation_claimed(
@@ -3873,22 +3853,8 @@ def _checkpoint_with_pending_session_interrupt(
     cascade_created_at: datetime | None = None,
     expected_interrupted_user_input: PendingUserInput | None = None,
     expected_ambiguous_user_input: AmbiguousPendingUserInput | None = None,
-    terminal_finalization_claim: dict[str, Any] | None = None,
-    terminal_finalization_clock: Callable[[], datetime] | None = None,
 ):
     copied_payload = copy_json_value(payload, "interrupt_payload")
-    copied_terminal_claim = (
-        None
-        if terminal_finalization_claim is None
-        else copy_json_value(
-            terminal_finalization_claim,
-            "terminal_finalization_claim",
-        )
-    )
-    if copied_terminal_claim is not None:
-        _incomplete_recovery_claim_from_checkpoint(
-            {_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY: copied_terminal_claim}
-        )
     if (
         expected_interrupted_user_input is not None
         and type(expected_interrupted_user_input) is not PendingUserInput
@@ -3910,7 +3876,6 @@ def _checkpoint_with_pending_session_interrupt(
     def transform(session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
         transition_payload = copy_json_value(copied_payload, "interrupt_payload")
         copied_checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-        user_input_superseded = False
         active_profile = active_invocation_execution_profile_from_checkpoint(copied_checkpoint)
         if active_profile is not None:
             if not active_invocation_execution_profile_matches_session_epoch(
@@ -4000,7 +3965,6 @@ def _checkpoint_with_pending_session_interrupt(
             )
             copied_checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY)
             copied_checkpoint.pop(USER_INPUT_RESOLUTION_INTENT_CHECKPOINT_KEY, None)
-            user_input_superseded = True
         elif (
             ambiguous_user_input is not None
             and transition_payload.get("interruption_type") == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
@@ -4014,32 +3978,6 @@ def _checkpoint_with_pending_session_interrupt(
                 supersession_intent.model_dump(mode="json")
             )
             copied_checkpoint.pop(AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY)
-            user_input_superseded = True
-        if copied_terminal_claim is not None and user_input_superseded:
-            existing_claim = copied_checkpoint.get(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY)
-            if existing_claim is not None and existing_claim != copied_terminal_claim:
-                parsed_existing_claim = _incomplete_recovery_claim_from_checkpoint(
-                    {_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY: existing_claim}
-                )
-                if parsed_existing_claim is None:
-                    raise SessionRuntimePublicationConflict(
-                        "Terminal finalization ownership changed before supersession."
-                    )
-                now = (
-                    datetime.now(UTC)
-                    if terminal_finalization_clock is None
-                    else terminal_finalization_clock()
-                )
-                if now.tzinfo is None or now.utcoffset() is None:
-                    raise ValueError("terminal finalization clock must be timezone-aware.")
-                if parsed_existing_claim[1] > now:
-                    raise SessionRuntimePublicationConflict(
-                        "Terminal finalization ownership changed before supersession."
-                    )
-            copied_checkpoint[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
-                copied_terminal_claim,
-                "terminal_finalization_claim",
-            )
         copied_checkpoint[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY] = copy_json_value(
             transition_payload,
             "interrupt_payload",
@@ -4057,6 +3995,59 @@ def _checkpoint_with_pending_session_interrupt(
                 "created_at": resolved_cascade_created_at.isoformat(),
             }
         return copied_checkpoint
+
+    return transform
+
+
+def _store_time_checkpoint_with_claimed_pending_session_interrupt(
+    payload: dict[str, Any],
+    *,
+    claim_id: str,
+    claim_lease: timedelta,
+    include_interruption_cascade: bool = True,
+    cascade_created_at: datetime | None = None,
+    expected_interrupted_user_input: PendingUserInput | None = None,
+    expected_ambiguous_user_input: AmbiguousPendingUserInput | None = None,
+):
+    """Install a supersession claim using the transition transaction's clock."""
+
+    base_transform = _checkpoint_with_pending_session_interrupt(
+        payload,
+        include_interruption_cascade=include_interruption_cascade,
+        cascade_created_at=cascade_created_at,
+        expected_interrupted_user_input=expected_interrupted_user_input,
+        expected_ambiguous_user_input=expected_ambiguous_user_input,
+    )
+
+    def transform(
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        store_now: datetime,
+    ) -> dict[str, Any]:
+        updated = base_transform(session, checkpoint)
+        pending_payload = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+        if type(pending_payload) is not dict or not (
+            USER_INPUT_SUPERSESSION_INTENT_KEY in pending_payload
+            or AMBIGUOUS_USER_INPUT_SUPERSESSION_INTENT_KEY in pending_payload
+        ):
+            return updated
+        existing_claim = _incomplete_recovery_claim_from_checkpoint(updated)
+        if (
+            existing_claim is not None
+            and existing_claim[0] != claim_id
+            and existing_claim[1] > store_now
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Terminal finalization ownership changed before supersession."
+            )
+        claim_expires_at = store_now + claim_lease
+        updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
+            "version": 1,
+            "claim_id": claim_id,
+            "claimed_at": store_now.isoformat(),
+            "claim_expires_at": claim_expires_at.isoformat(),
+        }
+        return updated
 
     return transform
 
@@ -5866,23 +5857,13 @@ class SessionEngine:
         task: asyncio.Task[Any],
         *,
         cancellation: asyncio.CancelledError | None = None,
-        claim_expires_at: datetime | None = None,
     ) -> ShieldedTaskOutcome[Any]:
         """Bound a shielded store wait and retain any write that outlives it."""
 
-        timeout_s = _SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS
-        if claim_expires_at is not None:
-            now = self._clock()
-            if now.tzinfo is None or now.utcoffset() is None:
-                raise ValueError("Session operation store wait clock must be timezone-aware.")
-            timeout_s = min(
-                timeout_s,
-                max(0.0, (claim_expires_at - now).total_seconds()),
-            )
         outcome = await await_shielded_task_outcome(
             task,
             cancellation=cancellation,
-            timeout_s=timeout_s,
+            timeout_s=_SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS,
         )
         if outcome.timed_out:
             task.cancel()
@@ -5937,29 +5918,37 @@ class SessionEngine:
     async def resume_pending_interruption_cascades(
         self,
         *,
-        interrupting_inactive_before: datetime | None = None,
+        interrupting_inactive_for_seconds: int | None = None,
     ) -> int:
         """Resume durable descendant interruption work left by an earlier process.
 
         Both ``interrupting`` and ``interrupted`` parents are inspected. An
         ``interrupting`` parent is finalized only when
-        ``interrupting_inactive_before`` is supplied and the store can fence that
+        ``interrupting_inactive_for_seconds`` is supplied and the store can fence that
         inactive run. Work remains checkpointed until traversal succeeds, so
         another restart can retry it safely. Returns the number of roots scheduled.
         """
 
+        if interrupting_inactive_for_seconds is not None and (
+            type(interrupting_inactive_for_seconds) is not int
+            or not 0 <= interrupting_inactive_for_seconds <= MAX_DURABLE_JSON_INTEGER
+        ):
+            raise ValueError(
+                "interrupting_inactive_for_seconds must be a non-negative durable integer."
+            )
+
         scheduled = 0
         admitted_parent_ids: set[str] = set()
         for status in (SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED):
-            if status == SessionStatus.INTERRUPTING and interrupting_inactive_before is None:
+            if status == SessionStatus.INTERRUPTING and interrupting_inactive_for_seconds is None:
                 continue
             cursor: str | None = None
             while True:
                 result = await self.session_store.list_sessions_with_pending_interruption_cascade(
                     SessionQuery(
                         status=status,
-                        last_activity_before=(
-                            interrupting_inactive_before
+                        inactive_for_seconds=(
+                            interrupting_inactive_for_seconds
                             if status == SessionStatus.INTERRUPTING
                             else None
                         ),
@@ -5973,7 +5962,7 @@ class SessionEngine:
                         continue
                     if (
                         session.status == SessionStatus.INTERRUPTING
-                        and interrupting_inactive_before is None
+                        and interrupting_inactive_for_seconds is None
                     ):
                         continue
                     try:
@@ -6031,7 +6020,7 @@ class SessionEngine:
                             recovery = await self._recovery_coordinator.recover_incomplete_session(
                                 IncompleteSessionRecoveryRequest(
                                     session_id=session.id,
-                                    inactive_before=interrupting_inactive_before,
+                                    inactive_for_seconds=(interrupting_inactive_for_seconds),
                                     reason="interruption_cascade_startup_recovery",
                                     metadata={"source": "resume_pending_interruption_cascades"},
                                 ),
@@ -6061,57 +6050,69 @@ class SessionEngine:
 
     async def interruption_cascade_status(self, session_id: str) -> str:
         """Return the public control-plane state of a session's durable cascade."""
+        durable_status = "none"
 
-        marker = await self.session_store.load_interruption_cascade_marker(session_id)
-        if marker is None:
-            return "none"
-        if type(marker) is not dict:
-            return "failed"
-        attempt_id = marker.get("attempt_id")
-        interrupt_payload = marker.get("interrupt_payload")
-        generation = marker.get("generation", 0)
-        if (
-            type(attempt_id) is not str
-            or not attempt_id.strip()
-            or type(interrupt_payload) is not dict
-            or type(generation) is not int
-            or generation < 0
-        ):
-            return "failed"
-        failure_recorded = marker.get("failure_recorded", False)
-        if type(failure_recorded) is not bool:
-            return "failed"
-        try:
-            claim_id = marker.get("claim_id")
-            claim_expires_at = _interruption_cascade_marker_datetime(
-                marker,
-                "claim_expires_at",
-            )
+        def inspect(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> None:
+            nonlocal durable_status
+            if checkpoint is None:
+                return None
+            marker = checkpoint.get(_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY)
+            if marker is None:
+                return None
+            durable_status = "failed"
+            if type(marker) is not dict:
+                return None
+            attempt_id = marker.get("attempt_id")
+            interrupt_payload = marker.get("interrupt_payload")
+            generation = marker.get("generation", 0)
+            if (
+                type(attempt_id) is not str
+                or not attempt_id.strip()
+                or type(interrupt_payload) is not dict
+                or type(generation) is not int
+                or generation < 0
+            ):
+                return None
+            failure_recorded = marker.get("failure_recorded", False)
+            if type(failure_recorded) is not bool:
+                return None
+            try:
+                claim_id = marker.get("claim_id")
+                claim_expires_at = _interruption_cascade_marker_datetime(
+                    marker,
+                    "claim_expires_at",
+                )
+                if claim_id is not None:
+                    if (
+                        type(claim_id) is not str
+                        or not claim_id.strip()
+                        or claim_expires_at is None
+                        or generation < 1
+                    ):
+                        return None
+                elif claim_expires_at is not None:
+                    return None
+                created_at = _interruption_cascade_marker_datetime(marker, "created_at")
+            except ValueError:
+                return None
             if claim_id is not None:
-                if (
-                    type(claim_id) is not str
-                    or not claim_id.strip()
-                    or claim_expires_at is None
-                    or generation < 1
-                ):
-                    return "failed"
-            elif claim_expires_at is not None:
-                return "failed"
-            created_at = _interruption_cascade_marker_datetime(marker, "created_at")
-        except ValueError:
-            return "failed"
+                assert claim_expires_at is not None
+                durable_status = "pending" if claim_expires_at > store_now else "failed"
+                return None
+            if failure_recorded or created_at is None:
+                return None
+            unclaimed_grace = timedelta(seconds=interruption_cascade_lease_seconds())
+            durable_status = "pending" if created_at + unclaimed_grace > store_now else "failed"
+            return None
+
+        await self.session_store.transform_checkpoint_with_store_time(session_id, inspect)
         if self._background_interruption_coordinator.is_pending(session_id):
             return "pending"
-        if claim_id is not None:
-            if claim_expires_at is None:
-                return "failed"
-            return "pending" if claim_expires_at > self._clock() else "failed"
-        if failure_recorded:
-            return "failed"
-        if created_at is None:
-            return "failed"
-        unclaimed_grace = timedelta(seconds=interruption_cascade_lease_seconds())
-        return "pending" if created_at + unclaimed_grace > self._clock() else "failed"
+        return durable_status
 
     def _schedule_background_interruption_cascade(
         self,
@@ -6135,14 +6136,14 @@ class SessionEngine:
         *,
         parent_session_id: str,
         interrupt_payload: dict[str, Any],
-        retry_at: datetime,
+        retry_after_seconds: float,
         drain_required: bool,
         retry_request: dict[str, Any] | None,
     ) -> None:
         self._background_interruption_coordinator.defer(
             parent_session_id=parent_session_id,
             interrupt_payload=interrupt_payload,
-            retry_at=retry_at,
+            retry_after_seconds=retry_after_seconds,
             drain_required=drain_required,
             retry_request=retry_request,
         )
@@ -7301,6 +7302,7 @@ class SessionEngine:
         def retain_exact_claim(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            store_now: datetime,
         ) -> dict[str, Any]:
             if (
                 current_session.instance_id != session.instance_id
@@ -7311,10 +7313,7 @@ class SessionEngine:
                     "Status-only interaction transition lost its exact session authority."
                 )
             claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            now = self._clock()
-            if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-                raise ValueError("terminal finalization clock must return an aware datetime.")
-            if claim is None or claim[0] != claim_id or claim[1] <= now:
+            if claim is None or claim[0] != claim_id or claim[1] <= store_now:
                 raise SessionRunFenced(
                     "Status-only interaction transition lost its exact terminal recovery claim."
                 )
@@ -7324,7 +7323,7 @@ class SessionEngine:
             session.id,
             from_statuses=from_statuses,
             to_status=to_status,
-            checkpoint_transform=retain_exact_claim,
+            store_time_checkpoint_transform=retain_exact_claim,
         )
 
     async def _publish_interaction_transition(
@@ -7370,10 +7369,16 @@ class SessionEngine:
                     "Interaction transition substituted its validated execution profile."
                 )
             execution_profile = invocation_context.profile
-        if expected_recovery_claim_id is not None and only_if_no_queued_messages:
-            raise ValueError(
-                "A terminal recovery claim cannot guard a queue-conditional transition."
-            )
+            context_recovery_claim_id = invocation_context.recovery_claim_id
+            if expected_recovery_claim_id is None:
+                expected_recovery_claim_id = context_recovery_claim_id
+            elif (
+                context_recovery_claim_id is not None
+                and expected_recovery_claim_id != context_recovery_claim_id
+            ):
+                raise SessionRunFenced(
+                    "Interaction transition substituted its recovery claim authority."
+                )
         interaction_id = _current_session_interaction_id(session.id)
         active_model_completion = await self.session_store.load_active_model_completion_stage(
             session.id
@@ -7481,6 +7486,11 @@ class SessionEngine:
                 settled_reservation_ids=active_model_completion.stage.reservation_ids,
             )
         if interaction_id is None:
+            if expected_recovery_claim_id is not None and only_if_no_queued_messages:
+                raise ValueError(
+                    "A context-free terminal recovery claim cannot guard a "
+                    "queue-conditional transition."
+                )
             if expected_recovery_claim_id is not None:
                 transitioned = await self._transition_status_under_terminal_finalization_claim(
                     session=session,
@@ -7689,9 +7699,6 @@ class SessionEngine:
                         replay_transition.model_completion_stage_settlement
                     ),
                     "expected_recovery_claim_id": expected_recovery_claim_id,
-                    "expected_recovery_claim_clock": (
-                        self._clock if expected_recovery_claim_id is not None else None
-                    ),
                 }
                 if settlement_command is not None:
                     transition_kwargs.update(
@@ -8834,6 +8841,7 @@ class SessionEngine:
             session_id=session_binding.id,
             interaction_id=stable.interaction_id,
             worker_id=stable.worker_id,
+            task_lease_expires_at=stable.task_lease_expires_at,
             execution_owner_id=authority.execution_owner_id,
             generation=stable.generation,
             lease_seconds=stable.lease_seconds,
@@ -8845,13 +8853,23 @@ class SessionEngine:
             source_execution_profile_fingerprint=execution_profile.fingerprint,
         )
         del contract
-        outcome = await capture_task_store_operation(
-            lambda: task_store.prepare_work_attempt_admission(prepare),
-            operation_name="Work-attempt admission preparation",
-            redactor=self._secret_redactor,
-            mutation_store=task_store,
-            mutation_method_name="prepare_work_attempt_admission",
-        )
+        async with managed_task_lease_mutation(
+            task_id=task_id,
+            worker_id=stable.worker_id,
+            handoff_id=None,
+            presented_lease_expires_at=stable.task_lease_expires_at,
+        ) as effective_lease:
+            prepare = prepare.model_copy(
+                update={"task_lease_expires_at": effective_lease},
+                deep=True,
+            )
+            outcome = await capture_task_store_operation(
+                lambda: task_store.prepare_work_attempt_admission(prepare),
+                operation_name="Work-attempt admission preparation",
+                redactor=self._secret_redactor,
+                mutation_store=task_store,
+                mutation_method_name="prepare_work_attempt_admission",
+            )
         if outcome.failure is not None:
             raise_task_store_operation_failure(outcome.failure)
         validation = capture_sensitive_result_validation(
@@ -10242,26 +10260,59 @@ class SessionEngine:
             raise session_request_boundary.ForkActiveModelStageError(
                 "Fork source session has an active model-completion stage."
             ) from None
+        await self._settle_fork_source_expiring_authority(source.id)
+        checkpoint = await self.session_store.load_checkpoint(source.id)
         copied_checkpoint = (
             None if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
         )
         try:
-            try:
-                _validate_fork_source_checkpoint_state(
-                    source,
-                    copied_checkpoint,
-                    copy_checkpoint=True,
-                    clock=self._clock,
-                    redactor=self._secret_redactor,
-                )
-            except _ExpiredIncompleteRecoveryClaim as expired_claim:
-                await self._fence_expired_incomplete_recovery_claim_for_fork(
-                    source.id,
-                    expired_claim,
-                )
+            _validate_fork_source_checkpoint_state(
+                source,
+                copied_checkpoint,
+                copy_checkpoint=True,
+                redactor=self._secret_redactor,
+            )
         finally:
             if copied_checkpoint is not None:
                 copied_checkpoint.clear()
+
+    async def _settle_fork_source_expiring_authority(self, session_id: str) -> None:
+        expired_recovery_claim_id: str | None = None
+
+        def settle(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> dict[str, Any] | None:
+            nonlocal expired_recovery_claim_id
+            recovery_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if recovery_claim is not None:
+                if recovery_claim[1] > store_now:
+                    raise RuntimeError(
+                        "Session has an active incomplete-session recovery operation."
+                    )
+                expired_recovery_claim_id = recovery_claim[0]
+                return None
+            if checkpoint is None or _SESSION_OPERATIONS_CHECKPOINT_KEY not in checkpoint:
+                return None
+            updated = copy_json_value(checkpoint, "checkpoint")
+            operations = _session_operation_state(updated)
+            active_before = operations.get("active_operation_id")
+            _abandon_expired_session_operation(operations, now=store_now)
+            active_after = operations.get("active_operation_id")
+            if active_after is not None:
+                raise RuntimeError(f"Session has an active durable operation: {active_after}")
+            if active_before is None:
+                return None
+            updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+            return updated
+
+        await self.session_store.transform_checkpoint_with_store_time(session_id, settle)
+        if expired_recovery_claim_id is not None:
+            await self._fence_expired_incomplete_recovery_claim_for_fork(
+                session_id,
+                _ExpiredIncompleteRecoveryClaim(expired_recovery_claim_id),
+            )
 
     async def _fence_expired_incomplete_recovery_claim_for_fork(
         self,
@@ -10616,6 +10667,7 @@ class SessionEngine:
                         task_id=request.task_id,
                         session=session,
                         worker_id=request.task_worker_id,
+                        lease_expires_at=request.task_lease_expires_at,
                     )
                     pre_run_task_started = True
                     if active_factory_run is not None:
@@ -10991,6 +11043,7 @@ class SessionEngine:
                 ),
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
+                task_lease_expires_at=request.task_lease_expires_at,
                 task_handoff_id=None,
                 start_event_type=EventType.SESSION_STARTED,
                 start_event_payload={
@@ -11808,7 +11861,6 @@ class SessionEngine:
         operation_started_at = time.monotonic()
 
         operation_id = str(uuid4())
-        claim_probe_now = self._clock()
         attempt_id = str(uuid4())
         existing_before_claim: dict[str, Any] | None = None
         if (
@@ -11835,10 +11887,6 @@ class SessionEngine:
                 type(existing_before_claim) is dict
                 and existing_before_claim.get("request_digest") == request_digest
                 and existing_before_claim.get("status") == "running"
-                and (
-                    (expiry := _operation_claim_expiry(existing_before_claim)) is not None
-                    and expiry <= claim_probe_now
-                )
             ):
                 operation_id = require_clean_nonblank(
                     existing_before_claim.get("operation_id"),
@@ -11910,9 +11958,9 @@ class SessionEngine:
             current_session: Session,
             checkpoint: dict[str, Any] | None,
             persisted_record: dict[str, Any] | None,
+            claim_now: datetime,
         ) -> SessionOperationPublication:
             nonlocal operation_id, claimed_checkpoint, claimed_operation_expires_at
-            claim_now = self._clock()
             claim_expires_at = claim_now + _SESSION_OPERATION_CLAIM_LEASE
             if current_session.run_epoch != request.expected_run_epoch:
                 raise ValueError(
@@ -12044,23 +12092,24 @@ class SessionEngine:
         started_event = attribute_event_to_current_interaction(started_event)
         replay_event_ids: tuple[str, ...] | None = None
 
-        def require_unexpired_initial_claim_commit() -> None:
+        def require_unexpired_initial_claim_commit(commit_at: datetime) -> None:
             if claimed_operation_expires_at is None:
                 raise AssertionError(
                     "Session compaction initial publication did not capture its claim."
                 )
-            _require_unexpired_session_operation_commit(
-                clock=self._clock,
-                claim_expires_at=claimed_operation_expires_at,
-                operation="Session compaction initial publication",
-            )
+            if claimed_operation_expires_at <= commit_at:
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction initial publication claim expired before commit."
+                )
 
+        initial_claim_started_monotonic = time.monotonic()
         try:
-            await self.session_store.publish_session_operation_guarded(
+            await self.session_store.publish_session_operation_guarded_with_store_time(
                 loaded_session.id,
                 idempotency_key=request.idempotency_key,
                 operation_transform=claim_operation,
-                commit_guard=require_unexpired_initial_claim_commit,
+                commit_guard=lambda: None,
+                commit_time_guard=require_unexpired_initial_claim_commit,
                 events=[started_event],
                 expected_statuses=_RESUMABLE_SESSION_STATUSES,
                 expected_run_epoch=request.expected_run_epoch,
@@ -12095,23 +12144,33 @@ class SessionEngine:
             raise AssertionError("New session compaction did not persist its operation claim.")
         if claimed_operation_expires_at is None:
             raise AssertionError("New session compaction did not persist its claim expiry.")
+        claimed_operation_expires_at = await self._reconcile_compaction_operation_claim_expiry(
+            session_id=loaded_session.id,
+            idempotency_key=request.idempotency_key,
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+        )
         compaction_invocation_checkpoint = project_compaction_invocation_checkpoint(
             claimed_checkpoint,
             redactor=self._secret_redactor,
         )
         checkpoint_before_claim = None
         claimed_checkpoint = None
-        _require_unexpired_session_operation_claim(
-            clock=self._clock,
-            claim_expires_at=claimed_operation_expires_at,
-            operation="Session compaction initial publication",
-        )
 
         operation_published = False
         operation_failure: BaseException | None = None
         stop_operation_heartbeat = asyncio.Event()
         operation_heartbeat_state = _SessionOperationClaimHeartbeatState()
-        operation_heartbeat_state.confirm_claim(claimed_operation_expires_at)
+        operation_heartbeat_state.confirm_claim(
+            claimed_operation_expires_at,
+            claim_deadline_monotonic=(
+                initial_claim_started_monotonic + _SESSION_OPERATION_CLAIM_LEASE.total_seconds()
+            ),
+        )
+        if operation_heartbeat_state.remaining_claim_seconds() <= 0:
+            raise SessionCompactionAttemptSuperseded(
+                "Session compaction operation claim acknowledgement exceeded its lease."
+            )
         operation_heartbeat_task = asyncio.create_task(
             self._heartbeat_compaction_operation_claim(
                 session=loaded_session,
@@ -13377,22 +13436,21 @@ class SessionEngine:
                 nonlocal terminal_claim_expires_at
                 terminal_claim_expires_at = expires_at
 
-            def require_unexpired_terminal_commit() -> None:
+            def require_unexpired_terminal_commit(commit_at: datetime) -> None:
                 if terminal_claim_expires_at is None:
                     raise AssertionError(
                         "Session compaction terminal publication did not capture its claim."
                     )
-                _require_unexpired_session_operation_commit(
-                    clock=self._clock,
-                    claim_expires_at=terminal_claim_expires_at,
-                    operation="Session compaction terminal publication",
-                )
+                if terminal_claim_expires_at <= commit_at:
+                    raise SessionCompactionAttemptSuperseded(
+                        "Session compaction terminal publication claim expired before commit."
+                    )
 
             async def publish_terminal_success() -> None:
-                await self.session_store.publish_session_operation_guarded(
+                await self.session_store.publish_session_operation_guarded_with_store_time(
                     loaded_session.id,
                     idempotency_key=request.idempotency_key,
-                    operation_transform=lambda _session, checkpoint, persisted_record: (
+                    operation_transform=lambda _session, checkpoint, persisted_record, store_now: (
                         _complete_session_operation_checkpoint(
                             checkpoint=checkpoint,
                             persisted_record=persisted_record,
@@ -13404,11 +13462,12 @@ class SessionEngine:
                             result_cursor=checkpoint_event_payload.get(
                                 "compacted_transcript_cursor"
                             ),
-                            completed_at=self._clock(),
+                            completed_at=store_now,
                             on_terminalize=capture_terminal_claim_expiry,
                         )
                     ),
-                    commit_guard=require_unexpired_terminal_commit,
+                    commit_guard=lambda: None,
+                    commit_time_guard=require_unexpired_terminal_commit,
                     events=published_events,
                     expected_statuses=_RESUMABLE_SESSION_STATUSES,
                     expected_run_epoch=request.expected_run_epoch,
@@ -13418,7 +13477,6 @@ class SessionEngine:
             terminal_publication_task = asyncio.create_task(publish_terminal_success())
             terminal_outcome = await self._await_session_operation_store_task(
                 terminal_publication_task,
-                claim_expires_at=operation_heartbeat_state.confirmed_claim_expires_at,
             )
             terminal_cancellation = terminal_outcome.cancellation
             terminal_publication_unknown = terminal_outcome.timed_out
@@ -13454,7 +13512,6 @@ class SessionEngine:
                 reconciliation_outcome = await self._await_session_operation_store_task(
                     reconciliation_task,
                     cancellation=terminal_cancellation,
-                    claim_expires_at=operation_heartbeat_state.confirmed_claim_expires_at,
                 )
                 terminal_cancellation = reconciliation_outcome.cancellation
                 reconciliation_error: BaseException | None
@@ -13728,29 +13785,35 @@ class SessionEngine:
                     nonlocal failed_terminal_claim_expires_at
                     failed_terminal_claim_expires_at = expires_at
 
-                def require_unexpired_failed_terminal_commit() -> None:
+                def require_unexpired_failed_terminal_commit(commit_at: datetime) -> None:
                     if failed_terminal_claim_expires_at is None:
                         return
-                    _require_unexpired_session_operation_commit(
-                        clock=self._clock,
-                        claim_expires_at=failed_terminal_claim_expires_at,
-                        operation="Session compaction failure publication",
-                    )
+                    if failed_terminal_claim_expires_at <= commit_at:
+                        raise SessionCompactionAttemptSuperseded(
+                            "Session compaction failure publication claim expired before commit."
+                        )
 
-                await self.session_store.publish_session_operation_guarded(
+                await self.session_store.publish_session_operation_guarded_with_store_time(
                     loaded_session.id,
                     idempotency_key=request.idempotency_key,
-                    operation_transform=_fail_session_operation_checkpoint(
-                        idempotency_key=request.idempotency_key,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        failed_event_id=failed_event.id,
-                        attempt_event_ids=[event.id for event in unpublished_attempt_events],
-                        error_type=safe_error_type,
-                        clock=self._clock,
-                        on_terminalize=capture_failed_terminal_claim_expiry,
+                    operation_transform=(
+                        lambda session, checkpoint, persisted_record, store_now: (
+                            _fail_session_operation_checkpoint(
+                                idempotency_key=request.idempotency_key,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                failed_event_id=failed_event.id,
+                                attempt_event_ids=[
+                                    event.id for event in unpublished_attempt_events
+                                ],
+                                error_type=safe_error_type,
+                                clock=lambda: store_now,
+                                on_terminalize=capture_failed_terminal_claim_expiry,
+                            )(session, checkpoint, persisted_record)
+                        )
                     ),
-                    commit_guard=require_unexpired_failed_terminal_commit,
+                    commit_guard=lambda: None,
+                    commit_time_guard=require_unexpired_failed_terminal_commit,
                     events=failed_events,
                 )
                 operation_published = True
@@ -13936,29 +13999,35 @@ class SessionEngine:
                     nonlocal failed_terminal_claim_expires_at
                     failed_terminal_claim_expires_at = expires_at
 
-                def require_unexpired_failed_terminal_commit() -> None:
+                def require_unexpired_failed_terminal_commit(commit_at: datetime) -> None:
                     if failed_terminal_claim_expires_at is None:
                         return
-                    _require_unexpired_session_operation_commit(
-                        clock=self._clock,
-                        claim_expires_at=failed_terminal_claim_expires_at,
-                        operation="Session compaction failure publication",
-                    )
+                    if failed_terminal_claim_expires_at <= commit_at:
+                        raise SessionCompactionAttemptSuperseded(
+                            "Session compaction failure publication claim expired before commit."
+                        )
 
-                await self.session_store.publish_session_operation_guarded(
+                await self.session_store.publish_session_operation_guarded_with_store_time(
                     loaded_session.id,
                     idempotency_key=request.idempotency_key,
-                    operation_transform=_fail_session_operation_checkpoint(
-                        idempotency_key=request.idempotency_key,
-                        operation_id=operation_id,
-                        attempt_id=attempt_id,
-                        failed_event_id=failed_event.id,
-                        attempt_event_ids=[event.id for event in unpublished_attempt_events],
-                        error_type=safe_error_type,
-                        clock=self._clock,
-                        on_terminalize=capture_failed_terminal_claim_expiry,
+                    operation_transform=(
+                        lambda session, checkpoint, persisted_record, store_now: (
+                            _fail_session_operation_checkpoint(
+                                idempotency_key=request.idempotency_key,
+                                operation_id=operation_id,
+                                attempt_id=attempt_id,
+                                failed_event_id=failed_event.id,
+                                attempt_event_ids=[
+                                    event.id for event in unpublished_attempt_events
+                                ],
+                                error_type=safe_error_type,
+                                clock=lambda: store_now,
+                                on_terminalize=capture_failed_terminal_claim_expiry,
+                            )(session, checkpoint, persisted_record)
+                        )
                     ),
-                    commit_guard=require_unexpired_failed_terminal_commit,
+                    commit_guard=lambda: None,
+                    commit_time_guard=require_unexpired_failed_terminal_commit,
                     events=failed_events,
                 )
                 operation_published = True
@@ -14281,18 +14350,17 @@ class SessionEngine:
     ) -> datetime:
         renewed_until: datetime | None = None
 
-        def require_unexpired_claim_commit() -> None:
-            _require_unexpired_session_operation_commit(
-                clock=self._clock,
-                claim_expires_at=claim_expires_at,
-                operation="Session compaction operation renewal",
-            )
-            commit_started.set()
+        def require_unexpired_claim_commit(commit_at: datetime) -> None:
+            if claim_expires_at <= commit_at:
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction operation renewal claim expired before commit."
+                )
 
         def renew(
             _session: Session,
             checkpoint: dict[str, Any] | None,
             persisted_record: dict[str, Any] | None,
+            store_now: datetime,
         ) -> SessionOperationPublication:
             nonlocal renewed_until
             publication, renewed_until = _renew_session_operation_claim_publication(
@@ -14301,16 +14369,17 @@ class SessionEngine:
                 operation_id=operation_id,
                 attempt_id=attempt_id,
                 event_ids=[],
-                renewed_at=self._clock(),
+                renewed_at=store_now,
                 persisted_record=persisted_record,
             )
             return publication
 
-        await self.session_store.publish_session_operation_guarded(
+        await self.session_store.publish_session_operation_guarded_with_store_time(
             session.id,
             idempotency_key=request.idempotency_key,
             operation_transform=renew,
-            commit_guard=require_unexpired_claim_commit,
+            commit_guard=commit_started.set,
+            commit_time_guard=require_unexpired_claim_commit,
             events=[],
             expected_statuses=_RESUMABLE_SESSION_STATUSES,
             expected_run_epoch=request.expected_run_epoch,
@@ -14328,28 +14397,45 @@ class SessionEngine:
         operation_id: str,
         attempt_id: str,
     ) -> datetime:
-        checkpoint = await self.session_store.load_checkpoint(session_id)
-        if checkpoint is None:
-            raise SessionCompactionAttemptSuperseded(
-                "Session compaction operation claim disappeared during renewal reconciliation."
-            )
-        operations = _session_operation_state(checkpoint)
-        record = operations["records"].get(idempotency_key)
-        if (
-            type(record) is not dict
-            or record.get("operation_id") != operation_id
-            or record.get("status") != "running"
-            or record.get("current_attempt_id") != attempt_id
-            or operations.get("active_operation_id") != operation_id
-        ):
-            raise SessionCompactionAttemptSuperseded(
-                "Session compaction operation ownership changed during renewal reconciliation."
-            )
-        claim_expires_at = _operation_claim_expiry(record)
+        claim_expires_at: datetime | None = None
+
+        def inspect(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> None:
+            nonlocal claim_expires_at
+            if checkpoint is None:
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction operation claim disappeared during renewal reconciliation."
+                )
+            operations = _session_operation_state(checkpoint)
+            record = operations["records"].get(idempotency_key)
+            if (
+                type(record) is not dict
+                or record.get("operation_id") != operation_id
+                or record.get("status") != "running"
+                or record.get("current_attempt_id") != attempt_id
+                or operations.get("active_operation_id") != operation_id
+            ):
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction operation ownership changed during renewal reconciliation."
+                )
+            observed_expiry = _operation_claim_expiry(record)
+            if observed_expiry is None:
+                raise RuntimeError(
+                    "Session compaction operation claim has no valid expiry after renewal."
+                )
+            if observed_expiry <= store_now:
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction operation claim expired before reconciliation."
+                )
+            claim_expires_at = observed_expiry
+            return None
+
+        await self.session_store.transform_checkpoint_with_store_time(session_id, inspect)
         if claim_expires_at is None:
-            raise RuntimeError(
-                "Session compaction operation claim has no valid expiry after renewal."
-            )
+            raise AssertionError("Session compaction claim reconciliation returned no expiry.")
         return claim_expires_at
 
     async def _reconcile_compaction_operation_claim_before_deadline(
@@ -14359,21 +14445,10 @@ class SessionEngine:
         idempotency_key: str,
         operation_id: str,
         attempt_id: str,
-        local_claim_expires_at: datetime,
         state: _SessionOperationClaimHeartbeatState,
+        candidate_claim_deadline_monotonic: float | None = None,
     ) -> datetime:
-        confirmed_claim_expires_at = state.confirmed_claim_expires_at
-        if (
-            confirmed_claim_expires_at is not None
-            and confirmed_claim_expires_at > local_claim_expires_at
-        ):
-            local_claim_expires_at = confirmed_claim_expires_at
-        started_at = self._clock()
-        if started_at.tzinfo is None or started_at.utcoffset() is None:
-            raise ValueError(
-                "Session compaction claim reconciliation clock must be timezone-aware."
-            )
-        remaining_seconds = (local_claim_expires_at - started_at).total_seconds()
+        remaining_seconds = state.remaining_claim_seconds()
         if remaining_seconds <= 0:
             raise SessionCompactionAttemptSuperseded(
                 "Session compaction operation claim expired before reconciliation."
@@ -14412,17 +14487,6 @@ class SessionEngine:
             raise
         if reconciliation_task not in done:
             reconciliation_task.cancel()
-            confirmed_claim_expires_at = state.confirmed_claim_expires_at
-            if (
-                confirmed_claim_expires_at is not None
-                and confirmed_claim_expires_at > local_claim_expires_at
-            ):
-                _require_unexpired_session_operation_claim(
-                    clock=self._clock,
-                    claim_expires_at=confirmed_claim_expires_at,
-                    operation="Session compaction operation publication",
-                )
-                return confirmed_claim_expires_at
             raise SessionCompactionAttemptSuperseded(
                 "Session compaction operation claim reconciliation was not confirmed "
                 "before its lease deadline."
@@ -14434,21 +14498,15 @@ class SessionEngine:
                 child_cancellation,
                 operation="Session compaction claim reconciliation",
             ) from child_cancellation
-        observed_at = self._clock()
-        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
-            raise ValueError(
-                "Session compaction claim reconciliation clock must be timezone-aware."
+        confirmed_claim_expires_at = state.confirmed_claim_expires_at
+        if candidate_claim_deadline_monotonic is not None and (
+            confirmed_claim_expires_at is None
+            or durable_claim_expires_at > confirmed_claim_expires_at
+        ):
+            state.confirm_claim(
+                durable_claim_expires_at,
+                claim_deadline_monotonic=candidate_claim_deadline_monotonic,
             )
-        if local_claim_expires_at <= observed_at:
-            raise SessionCompactionAttemptSuperseded(
-                "Session compaction operation claim expired during reconciliation."
-            )
-        _require_unexpired_session_operation_claim(
-            clock=lambda: observed_at,
-            claim_expires_at=durable_claim_expires_at,
-            operation="Session compaction operation reconciliation",
-        )
-        state.confirm_claim(durable_claim_expires_at)
         return state.confirmed_claim_expires_at or durable_claim_expires_at
 
     async def _heartbeat_compaction_operation_claim(
@@ -14464,8 +14522,16 @@ class SessionEngine:
     ) -> None:
         sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS
         while not stop.is_set():
+            remaining_claim_seconds = state.remaining_claim_seconds()
+            if remaining_claim_seconds <= 0:
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction operation claim expired before renewal."
+                )
             try:
-                await asyncio.wait_for(stop.wait(), timeout=sleep_seconds)
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=min(sleep_seconds, remaining_claim_seconds),
+                )
             except TimeoutError:
                 confirmed_claim_expires_at = state.confirmed_claim_expires_at
                 if (
@@ -14473,11 +14539,6 @@ class SessionEngine:
                     and confirmed_claim_expires_at > claim_expires_at
                 ):
                     claim_expires_at = confirmed_claim_expires_at
-                heartbeat_at = self._clock()
-                if heartbeat_at.tzinfo is None or heartbeat_at.utcoffset() is None:
-                    raise ValueError(
-                        "Session compaction operation heartbeat clock must be timezone-aware."
-                    ) from None
                 try:
                     claim_expires_at = (
                         await self._reconcile_compaction_operation_claim_before_deadline(
@@ -14485,33 +14546,22 @@ class SessionEngine:
                             idempotency_key=request.idempotency_key,
                             operation_id=operation_id,
                             attempt_id=attempt_id,
-                            local_claim_expires_at=claim_expires_at,
                             state=state,
                         )
                     )
                 except SessionCompactionAttemptSuperseded:
                     raise
-                except Exception as reconciliation_failure:
-                    failed_at = self._clock()
-                    if failed_at.tzinfo is None or failed_at.utcoffset() is None:
-                        raise ValueError(
-                            "Session compaction operation heartbeat clock must be timezone-aware."
-                        ) from reconciliation_failure
-                    if claim_expires_at <= failed_at:
-                        raise SessionCompactionAttemptSuperseded(
-                            "Session compaction operation claim could not be reconciled "
-                            "before its local lease deadline."
-                        ) from reconciliation_failure
-                renewal_started_at = self._clock()
-                if renewal_started_at.tzinfo is None or renewal_started_at.utcoffset() is None:
-                    raise ValueError(
-                        "Session compaction operation heartbeat clock must be timezone-aware."
-                    ) from None
-                remaining_seconds = (claim_expires_at - renewal_started_at).total_seconds()
+                except Exception:
+                    # The renewal transaction below revalidates the exact claim
+                    # against store time. A failed read cannot make a worker
+                    # clock authoritative for lease ownership.
+                    pass
+                remaining_seconds = state.remaining_claim_seconds()
                 if remaining_seconds <= 0:
                     raise SessionCompactionAttemptSuperseded(
-                        "Session compaction operation claim expired before renewal started."
+                        "Session compaction operation claim expired before renewal."
                     ) from None
+                renewal_started_monotonic = time.monotonic()
                 renewal_task = asyncio.create_task(
                     self._renew_compaction_operation_claim(
                         session=session,
@@ -14537,34 +14587,29 @@ class SessionEngine:
                             confirmed_claim_expires_at is not None
                             and confirmed_claim_expires_at > claim_expires_at
                         ):
-                            _require_unexpired_session_operation_claim(
-                                clock=self._clock,
-                                claim_expires_at=confirmed_claim_expires_at,
-                                operation="Session compaction operation publication",
-                            )
-                            claim_expires_at = confirmed_claim_expires_at
-                            now = self._clock()
-                            if now.tzinfo is None or now.utcoffset() is None:
-                                raise ValueError(
-                                    "Session compaction operation heartbeat clock must be "
-                                    "timezone-aware."
+                            claim_expires_at = (
+                                await self._reconcile_compaction_operation_claim_before_deadline(
+                                    session_id=session.id,
+                                    idempotency_key=request.idempotency_key,
+                                    operation_id=operation_id,
+                                    attempt_id=attempt_id,
+                                    state=state,
                                 )
-                            sleep_seconds = min(
-                                _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS,
-                                max(0.0, (claim_expires_at - now).total_seconds()),
                             )
+                            sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS
                             continue
                         raise SessionCompactionAttemptSuperseded(
                             "Session compaction operation claim renewal was not confirmed "
                             "before its lease deadline."
                         )
                     claim_expires_at = renewal_task.result()
-                    _require_unexpired_session_operation_claim(
-                        clock=self._clock,
-                        claim_expires_at=claim_expires_at,
-                        operation="Session compaction operation renewal",
+                    state.confirm_claim(
+                        claim_expires_at,
+                        claim_deadline_monotonic=(
+                            renewal_started_monotonic
+                            + _SESSION_OPERATION_CLAIM_LEASE.total_seconds()
+                        ),
                     )
-                    state.confirm_claim(claim_expires_at)
                 except asyncio.CancelledError as cancellation:
                     renewal_failure: BaseException | None = None
                     if renewal_task.done():
@@ -14592,8 +14637,11 @@ class SessionEngine:
                                 idempotency_key=request.idempotency_key,
                                 operation_id=operation_id,
                                 attempt_id=attempt_id,
-                                local_claim_expires_at=claim_expires_at,
                                 state=state,
+                                candidate_claim_deadline_monotonic=(
+                                    renewal_started_monotonic
+                                    + _SESSION_OPERATION_CLAIM_LEASE.total_seconds()
+                                ),
                             )
                         )
                     except SessionCompactionAttemptSuperseded as ownership_failure:
@@ -14607,30 +14655,9 @@ class SessionEngine:
                     else:
                         if durable_claim_expires_at > claim_expires_at:
                             claim_expires_at = durable_claim_expires_at
-                            now = self._clock()
-                            if now.tzinfo is None or now.utcoffset() is None:
-                                raise ValueError(
-                                    "Session compaction operation heartbeat clock must be "
-                                    "timezone-aware."
-                                ) from exc
-                            sleep_seconds = min(
-                                _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS,
-                                max(0.0, (claim_expires_at - now).total_seconds()),
-                            )
+                            sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS
                             continue
-                    now = self._clock()
-                    if now.tzinfo is None or now.utcoffset() is None:
-                        raise ValueError(
-                            "Session compaction operation heartbeat clock must be timezone-aware."
-                        ) from exc
-                    if now >= claim_expires_at:
-                        raise SessionCompactionAttemptSuperseded(
-                            "Session compaction operation claim could not be renewed before expiry."
-                        ) from exc
-                    sleep_seconds = min(
-                        _SESSION_OPERATION_CLAIM_HEARTBEAT_RETRY_SECONDS,
-                        max(0.0, (claim_expires_at - now).total_seconds()),
-                    )
+                    sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_RETRY_SECONDS
                     continue
                 sleep_seconds = _SESSION_OPERATION_CLAIM_HEARTBEAT_INTERVAL_SECONDS
 
@@ -14664,43 +14691,47 @@ class SessionEngine:
             if renewed_claim_expires_at is None or expires_at > renewed_claim_expires_at:
                 renewed_claim_expires_at = expires_at
 
-        def require_unexpired_publication_commit() -> None:
+        def require_unexpired_publication_commit(commit_at: datetime) -> None:
             if publication_claim_expires_at is None:
                 raise AssertionError(
                     "Session compaction event publication did not capture its claim."
                 )
-            _require_unexpired_session_operation_commit(
-                clock=self._clock,
-                claim_expires_at=publication_claim_expires_at,
-                operation="Session compaction event publication",
-            )
+            if publication_claim_expires_at <= commit_at:
+                raise SessionCompactionAttemptSuperseded(
+                    "Session compaction event publication claim expired before commit."
+                )
 
         event_ids = [event.id for event in events]
 
         async def publish() -> None:
-            await self.session_store.publish_session_operation_guarded(
+            await self.session_store.publish_session_operation_guarded_with_store_time(
                 session.id,
                 idempotency_key=request.idempotency_key,
-                operation_transform=_append_session_operation_attempt_events(
-                    idempotency_key=request.idempotency_key,
-                    operation_id=operation_id,
-                    attempt_id=attempt_id,
-                    event_ids=event_ids,
-                    clock=self._clock,
-                    on_renew=capture_publication_claim_expiry,
-                    on_renewed=capture_renewed_claim_expiry,
+                operation_transform=(
+                    lambda callback_session, checkpoint, persisted_record, store_now: (
+                        _append_session_operation_attempt_events(
+                            idempotency_key=request.idempotency_key,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            event_ids=event_ids,
+                            clock=lambda: store_now,
+                            on_renew=capture_publication_claim_expiry,
+                            on_renewed=capture_renewed_claim_expiry,
+                        )(callback_session, checkpoint, persisted_record)
+                    )
                 ),
-                commit_guard=require_unexpired_publication_commit,
+                commit_guard=lambda: None,
+                commit_time_guard=require_unexpired_publication_commit,
                 events=events,
                 expected_statuses=_RESUMABLE_SESSION_STATUSES,
                 expected_run_epoch=request.expected_run_epoch,
                 expected_transcript_cursor=request.expected_transcript_cursor,
             )
 
+        publication_started_monotonic = time.monotonic()
         publication_task = asyncio.create_task(publish())
         publication_outcome = await self._await_session_operation_store_task(
             publication_task,
-            claim_expires_at=heartbeat_state.confirmed_claim_expires_at,
         )
         if publication_outcome.timed_out:
             unresolved_store_tasks.add(publication_task)
@@ -14727,17 +14758,18 @@ class SessionEngine:
             if renewed_claim_expires_at is not None and (
                 confirmed_expiry is None or renewed_claim_expires_at > confirmed_expiry
             ):
-                heartbeat_state.confirm_claim(renewed_claim_expires_at)
+                heartbeat_state.confirm_claim(
+                    renewed_claim_expires_at,
+                    claim_deadline_monotonic=(
+                        publication_started_monotonic
+                        + _SESSION_OPERATION_CLAIM_LEASE.total_seconds()
+                    ),
+                )
                 confirmed_expiry = renewed_claim_expires_at
             if confirmed_expiry is None:
                 raise AssertionError(
                     "Session compaction event publication did not renew its claim."
                 )
-            _require_unexpired_session_operation_claim(
-                clock=self._clock,
-                claim_expires_at=confirmed_expiry,
-                operation="Session compaction event publication acknowledgement",
-            )
 
         if publication_error is not None:
 
@@ -14755,7 +14787,6 @@ class SessionEngine:
             reconciliation_outcome = await self._await_session_operation_store_task(
                 reconciliation_task,
                 cancellation=cancellation,
-                claim_expires_at=heartbeat_state.confirmed_claim_expires_at,
             )
             cancellation = reconciliation_outcome.cancellation
             reconciliation_error: BaseException | None
@@ -15085,7 +15116,7 @@ class SessionEngine:
                     )
                 await self._recovery_coordinator._repair_terminal_evidence_owned(
                     session=loaded_session,
-                    inactive_before=None,
+                    inactive_for_seconds=None,
                     previous_status=loaded_session.status,
                 )
                 repaired_event = await self._wait_for_user_input_supersession_interrupt_repair(
@@ -15192,26 +15223,6 @@ class SessionEngine:
             )
             if adopted_user_input_interrupt_payload is None:
                 raise TimeoutError(f"Session interruption is still finalizing: {loaded_session.id}")
-            interrupt_checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-            active_terminal_claim = _incomplete_recovery_claim_from_checkpoint(interrupt_checkpoint)
-            if active_terminal_claim is not None and active_terminal_claim[1] > self._clock():
-                repaired_event = await self._wait_for_user_input_supersession_interrupt_repair(
-                    session=loaded_session,
-                    expected_payload=adopted_user_input_interrupt_payload,
-                )
-                if repaired_event is None:
-                    raise TimeoutError(
-                        f"Session interruption is still finalizing: {loaded_session.id}"
-                    )
-                if not interruption_cascade_suppressed():
-                    self._schedule_background_interruption_cascade(
-                        parent_session_id=loaded_session.id,
-                        interrupt_payload=repaired_event.payload,
-                        create_if_missing=False,
-                    )
-                yield repaired_event
-                return
-
         interruptible_statuses = (
             _INTERRUPTIBLE_SESSION_STATUSES | {SessionStatus.INTERRUPTED}
             if (
@@ -15252,7 +15263,6 @@ class SessionEngine:
         )
         terminal_finalization_claim_id: str | None = None
         terminal_finalization_claim_expires_at: datetime | None = None
-        terminal_finalization_claim: dict[str, Any] | None = None
         terminal_finalization_transfer_cancellation: asyncio.CancelledError | None = None
         terminal_finalization_transfer_failure: BaseException | None = None
         terminal_finalization_transfer_process_control: BaseException | None = None
@@ -15260,11 +15270,9 @@ class SessionEngine:
         terminal_finalization_heartbeat_task: asyncio.Task[None] | None = None
         terminal_finalization_claim_retained_for_recovery = False
         if adopted_user_input_interrupt_payload is None:
-            (
-                terminal_finalization_claim_id,
-                terminal_finalization_claim_expires_at,
-                terminal_finalization_claim,
-            ) = self._recovery_coordinator._new_terminal_evidence_finalization_claim()
+            terminal_finalization_claim_id = (
+                self._recovery_coordinator._new_terminal_evidence_finalization_claim()
+            )
         interruption_request_id = interruption_request_id_from_payload(interrupt_payload)
         if interruption_request_id is None:
             raise SessionRuntimePublicationConflict(
@@ -15378,30 +15386,141 @@ class SessionEngine:
                     self._session_control.end_interruption_request(loaded_session.id)
                 terminal_finalization_preparation_cleaned = True
 
+        async def settle_terminal_finalization_preparation(
+            authoritative_failure: BaseException | None,
+        ) -> None:
+            """Clean local ownership and redeliver a carried transfer signal."""
+
+            nonlocal terminal_finalization_transfer_cancellation
+            nonlocal terminal_finalization_transfer_failure
+            nonlocal terminal_finalization_transfer_process_control
+            control_signal: BaseException | None = (
+                terminal_finalization_transfer_cancellation
+                or terminal_finalization_transfer_process_control
+            )
+            cleanup_failure: BaseException | None = None
+            try:
+                await cleanup_terminal_finalization_preparation(
+                    control_signal or authoritative_failure,
+                )
+            except BaseException as failure:
+                cleanup_failure = failure
+            if control_signal is None:
+                if cleanup_failure is not None:
+                    raise cleanup_failure
+                return
+            if (
+                isinstance(control_signal, asyncio.CancelledError)
+                and cleanup_failure is not None
+                and not isinstance(cleanup_failure, (Exception, asyncio.CancelledError))
+            ):
+                raise cleanup_failure
+            secondary_failures = [
+                failure
+                for failure in (
+                    terminal_finalization_transfer_process_control
+                    if control_signal is terminal_finalization_transfer_cancellation
+                    else None,
+                    terminal_finalization_transfer_failure,
+                    authoritative_failure,
+                    cleanup_failure,
+                )
+                if failure is not None and failure is not control_signal
+            ]
+            terminal_finalization_transfer_cancellation = None
+            terminal_finalization_transfer_failure = None
+            terminal_finalization_transfer_process_control = None
+            _raise_terminal_finalization_process_control(
+                control_signal,
+                secondary_failures,
+            )
+
+        async def clear_locally_claimed_adopted_interrupt(
+            event: Event,
+        ) -> None:
+            """Settle an adopted marker after its exact terminal event is observed."""
+
+            if adopted_user_input_interrupt_payload is None:
+                return
+            require_interruption_event_matches_pending_marker(
+                event,
+                interrupt_payload,
+            )
+            claim_id = terminal_finalization_claim_id
+            if claim_id is None:
+                raise RuntimeError("User-input supersession finalization lost its durable owner.")
+            await await_terminal_finalization_operation(
+                lambda: self._clear_claimed_pending_interrupt_if_retained(
+                    session_id=loaded_session.id,
+                    claim_id=claim_id,
+                    expected_payload=interrupt_payload,
+                ),
+                operation_name="Observed interruption marker cleanup",
+            )
+
         try:
             if adopted_user_input_interrupt_payload is None:
+                assert terminal_finalization_claim_id is not None
                 session = await self.session_store.transition_status_and_checkpoint(
                     loaded_session.id,
                     from_statuses=interruptible_statuses,
                     to_status=SessionStatus.INTERRUPTING,
-                    checkpoint_transform=_checkpoint_with_pending_session_interrupt(
-                        interrupt_payload,
-                        include_interruption_cascade=not cascade_suppressed,
-                        cascade_created_at=self._clock(),
-                        expected_interrupted_user_input=interrupted_pending_user_input,
-                        expected_ambiguous_user_input=interrupted_ambiguous_user_input,
-                        terminal_finalization_claim=terminal_finalization_claim,
-                        terminal_finalization_clock=self._clock,
+                    store_time_checkpoint_transform=(
+                        _store_time_checkpoint_with_claimed_pending_session_interrupt(
+                            interrupt_payload,
+                            claim_id=terminal_finalization_claim_id,
+                            claim_lease=_INCOMPLETE_RECOVERY_CLAIM_LEASE,
+                            include_interruption_cascade=not cascade_suppressed,
+                            cascade_created_at=self._clock(),
+                            expected_interrupted_user_input=interrupted_pending_user_input,
+                            expected_ambiguous_user_input=interrupted_ambiguous_user_input,
+                        )
                     ),
                 )
             else:
                 session = loaded_session
-            if (
-                terminal_finalization_claim_id is not None
-                and terminal_finalization_claim_expires_at is not None
-            ):
+                transferred_claim = await (
+                    self._recovery_coordinator._claim_pending_terminal_evidence_finalization(
+                        session=session,
+                        expected_payload=interrupt_payload,
+                    )
+                )
+                if transferred_claim is None:
+                    await self._recovery_coordinator._repair_terminal_evidence_owned(
+                        session=session,
+                        inactive_for_seconds=None,
+                        previous_status=session.status,
+                    )
+                    repaired_event = await self._wait_for_user_input_supersession_interrupt_repair(
+                        session=session,
+                        expected_payload=interrupt_payload,
+                    )
+                    if repaired_event is None:
+                        raise TimeoutError(
+                            f"Session interruption is still finalizing: {session.id}"
+                        )
+                    await settle_terminal_finalization_preparation(None)
+                    if not interruption_cascade_suppressed():
+                        self._schedule_background_interruption_cascade(
+                            parent_session_id=session.id,
+                            interrupt_payload=repaired_event.payload,
+                            create_if_missing=False,
+                        )
+                    yield repaired_event
+                    return
+                terminal_finalization_claim_id = transferred_claim.claim_id
+                terminal_finalization_claim_expires_at = transferred_claim.claim_expires_at
+                terminal_finalization_transfer_cancellation = transferred_claim.cancellation
+                terminal_finalization_transfer_failure = transferred_claim.transfer_failure
+                terminal_finalization_transfer_process_control = transferred_claim.process_control
+            if terminal_finalization_claim_id is not None:
                 interrupt_checkpoint = await self.session_store.load_checkpoint(session.id)
                 persisted_claim = _incomplete_recovery_claim_from_checkpoint(interrupt_checkpoint)
+                if (
+                    persisted_claim is not None
+                    and persisted_claim[0] == terminal_finalization_claim_id
+                ):
+                    terminal_finalization_claim_expires_at = persisted_claim[1]
                 persisted_payload = (
                     None
                     if interrupt_checkpoint is None
@@ -15432,41 +15551,46 @@ class SessionEngine:
                         raise _IncompleteRecoveryClaimLost(
                             "Terminal finalization ownership expired before live dispatch."
                         )
-                    session, terminal_finalization_claim_expires_at = renewed_claim
+                    (
+                        session,
+                        terminal_finalization_claim_expires_at,
+                        terminal_finalization_local_lease_deadline,
+                    ) = renewed_claim
                     (
                         terminal_finalization_heartbeat_stop,
                         terminal_finalization_heartbeat_task,
                     ) = self._recovery_coordinator._start_preclaimed_terminal_evidence_heartbeat(
                         session_id=session.id,
                         claim_id=terminal_finalization_claim_id,
-                        claim_expires_at=terminal_finalization_claim_expires_at,
+                        local_lease_deadline=terminal_finalization_local_lease_deadline,
                     )
-                    try:
-                        terminal_finalization_handed_to_active_run = (
-                            self._session_control.register_terminal_finalization_claim_handoff(
-                                session.id,
-                                session_instance_id=session.instance_id,
-                                run_epoch=session.run_epoch,
-                                interruption_request_id=interruption_request_id,
-                                expected_interrupt_payload=persisted_payload,
-                                claim_id=terminal_finalization_claim_id,
-                                heartbeat_stop=terminal_finalization_heartbeat_stop,
-                                heartbeat_task=terminal_finalization_heartbeat_task,
+                    if adopted_user_input_interrupt_payload is None:
+                        try:
+                            terminal_finalization_handed_to_active_run = (
+                                self._session_control.register_terminal_finalization_claim_handoff(
+                                    session.id,
+                                    session_instance_id=session.instance_id,
+                                    run_epoch=session.run_epoch,
+                                    interruption_request_id=interruption_request_id,
+                                    expected_interrupt_payload=persisted_payload,
+                                    claim_id=terminal_finalization_claim_id,
+                                    heartbeat_stop=terminal_finalization_heartbeat_stop,
+                                    heartbeat_task=terminal_finalization_heartbeat_task,
+                                )
                             )
-                        )
-                    except BaseException:
-                        terminal_finalization_heartbeat_stop.set()
-                        terminal_finalization_heartbeat_task.cancel()
-                        await asyncio.gather(
-                            terminal_finalization_heartbeat_task,
-                            return_exceptions=True,
-                        )
-                        terminal_finalization_heartbeat_stop = None
-                        terminal_finalization_heartbeat_task = None
-                        raise
-                    if terminal_finalization_handed_to_active_run:
-                        terminal_finalization_heartbeat_stop = None
-                        terminal_finalization_heartbeat_task = None
+                        except BaseException:
+                            terminal_finalization_heartbeat_stop.set()
+                            terminal_finalization_heartbeat_task.cancel()
+                            await asyncio.gather(
+                                terminal_finalization_heartbeat_task,
+                                return_exceptions=True,
+                            )
+                            terminal_finalization_heartbeat_stop = None
+                            terminal_finalization_heartbeat_task = None
+                            raise
+                        if terminal_finalization_handed_to_active_run:
+                            terminal_finalization_heartbeat_stop = None
+                            terminal_finalization_heartbeat_task = None
             self._session_control.signal_interrupt(session.id)
             active_work_signalled = self._session_control.cancel_active_runs(session.id)
             if terminal_finalization_handed_to_active_run and not active_work_signalled:
@@ -15481,8 +15605,8 @@ class SessionEngine:
                     )
                 )
                 if existing_interrupt_event is not None:
-                    request_marker_active = False
-                    self._session_control.end_interruption_request(loaded_session.id)
+                    await clear_locally_claimed_adopted_interrupt(existing_interrupt_event)
+                    await settle_terminal_finalization_preparation(None)
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
@@ -15505,8 +15629,8 @@ class SessionEngine:
                     operation_name="Offline interruption live-owner observation",
                 )
                 if existing_interrupt_event is not None:
-                    request_marker_active = False
-                    self._session_control.end_interruption_request(loaded_session.id)
+                    await clear_locally_claimed_adopted_interrupt(existing_interrupt_event)
+                    await settle_terminal_finalization_preparation(None)
                     yield existing_interrupt_event
                     return
                 raise TimeoutError(f"Session interruption is still finalizing: {session.id}")
@@ -15531,7 +15655,7 @@ class SessionEngine:
             else:
                 invocation_context = None
         except SessionRuntimePublicationConflict as preparation_failure:
-            await cleanup_terminal_finalization_preparation(preparation_failure)
+            await settle_terminal_finalization_preparation(preparation_failure)
             raise
         except ValueError:
             reconciliation_failure: BaseException | None = None
@@ -15579,13 +15703,14 @@ class SessionEngine:
                             "identity."
                         ) from None
                     if existing_interrupt_event is not None:
+                        await clear_locally_claimed_adopted_interrupt(existing_interrupt_event)
                         if not interruption_cascade_suppressed():
                             self._schedule_background_interruption_cascade(
                                 parent_session_id=reloaded_session.id,
                                 interrupt_payload=existing_interrupt_event.payload,
                                 create_if_missing=False,
                             )
-                        await cleanup_terminal_finalization_preparation(None)
+                        await settle_terminal_finalization_preparation(None)
                         yield existing_interrupt_event
                         return
                     if reloaded_session.status is SessionStatus.INTERRUPTED:
@@ -15621,9 +15746,9 @@ class SessionEngine:
                 reconciliation_failure = failure
                 raise
             finally:
-                await cleanup_terminal_finalization_preparation(reconciliation_failure)
+                await settle_terminal_finalization_preparation(reconciliation_failure)
         except BaseException as preparation_failure:
-            await cleanup_terminal_finalization_preparation(preparation_failure)
+            await settle_terminal_finalization_preparation(preparation_failure)
             raise
 
         async def release_offline_provider_interruption(
@@ -15890,7 +16015,7 @@ class SessionEngine:
                     else:
                         await self._recovery_coordinator._repair_terminal_evidence_owned(
                             session=session,
-                            inactive_before=None,
+                            inactive_for_seconds=None,
                             previous_status=session.status,
                         )
                         repaired_event = (
@@ -15921,7 +16046,11 @@ class SessionEngine:
                         raise _IncompleteRecoveryClaimLost(
                             "Terminal finalization ownership changed before offline settlement."
                         )
-                    session, terminal_finalization_claim_expires_at = renewed_claim
+                    (
+                        session,
+                        terminal_finalization_claim_expires_at,
+                        _local_deadline,
+                    ) = renewed_claim
                     await stop_local_terminal_finalization_heartbeat(
                         superseded_by_exact_renewal=True,
                     )
@@ -16310,6 +16439,73 @@ class SessionEngine:
         egress_environment_handoff: EgressAuthorityAdoptionResult | None = None
         invocation_profile: ExecutionProfileIdentity | None = None
 
+        async def require_no_incomplete_recovery_claim() -> None:
+            observed_claim: tuple[str, datetime, datetime] | None = None
+
+            def inspect(
+                _session: Session,
+                current_checkpoint: dict[str, Any] | None,
+                store_now: datetime,
+            ) -> None:
+                nonlocal observed_claim
+                existing = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
+                if existing is not None:
+                    observed_claim = (existing[0], existing[1], store_now)
+                return None
+
+            await self.session_store.transform_checkpoint_with_store_time(
+                loaded_session.id,
+                inspect,
+            )
+            if observed_claim is None:
+                return
+            claim_id, claim_expires_at, store_now = observed_claim
+            if claim_expires_at > store_now:
+                raise RuntimeError("Session has an active incomplete-session recovery operation.")
+            current = await self._require_session(loaded_session.id)
+            fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
+                session=current,
+                claim_id=claim_id,
+            )
+            if not fenced:
+                raise RuntimeError(
+                    "Expired incomplete-session recovery ownership changed while resume "
+                    "was fencing it; retry with current session state."
+                ) from None
+            current = await self._require_session(loaded_session.id)
+            raise ValueError(
+                "Session resume fenced an expired incomplete-session recovery owner; "
+                f"retry with run epoch {current.run_epoch}."
+            ) from None
+
+        async def settle_expired_session_operation() -> None:
+            def settle(
+                _session: Session,
+                current_checkpoint: dict[str, Any] | None,
+                store_now: datetime,
+            ) -> dict[str, Any] | None:
+                if (
+                    current_checkpoint is None
+                    or _SESSION_OPERATIONS_CHECKPOINT_KEY not in current_checkpoint
+                ):
+                    return None
+                updated = copy_json_value(current_checkpoint, "checkpoint")
+                operations = _session_operation_state(updated)
+                active_before = operations.get("active_operation_id")
+                _abandon_expired_session_operation(operations, now=store_now)
+                active_after = operations.get("active_operation_id")
+                if active_after is not None:
+                    raise RuntimeError(f"Session has an active durable operation: {active_after}")
+                if active_before is None:
+                    return None
+                updated[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
+                return updated
+
+            await self.session_store.transform_checkpoint_with_store_time(
+                loaded_session.id,
+                settle,
+            )
+
         def validate_resumable_checkpoint(
             current_session: Session,
             current_checkpoint: dict[str, Any] | None,
@@ -16325,10 +16521,8 @@ class SessionEngine:
                 if current_checkpoint is None
                 else copy_json_value(current_checkpoint, "checkpoint")
             )
-            updated_checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
-                updated_checkpoint,
-                now=self._clock(),
-            )
+            if _incomplete_recovery_claim_from_checkpoint(updated_checkpoint) is not None:
+                raise RuntimeError("Session has an active incomplete-session recovery operation.")
             _reject_pending_provider_operation_disposition(updated_checkpoint)
             if _initial_transcript_pending_interaction_id(updated_checkpoint) is not None:
                 raise RuntimeError(
@@ -16340,7 +16534,6 @@ class SessionEngine:
                 and _SESSION_OPERATIONS_CHECKPOINT_KEY in updated_checkpoint
             ):
                 operations = _session_operation_state(updated_checkpoint)
-                _abandon_expired_session_operation(operations, now=self._clock())
                 updated_checkpoint[_SESSION_OPERATIONS_CHECKPOINT_KEY] = operations
             active_operation_id = _active_session_operation_id(updated_checkpoint)
             if active_operation_id is not None:
@@ -16428,6 +16621,8 @@ class SessionEngine:
         # Report deterministic checkpoint conflicts before claiming the session,
         # then repeat the same validation inside the atomic transition below so a
         # concurrent checkpoint update cannot bypass the guard.
+        await require_no_incomplete_recovery_claim()
+        await settle_expired_session_operation()
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
         checkpoint = await _reconcile_committed_prompt_transition_intents(
             session_store=self.session_store,
@@ -17565,6 +17760,7 @@ class SessionEngine:
             ),
             task_id=task_id,
             task_worker_id=request.task_worker_id,
+            task_lease_expires_at=None,
             task_handoff_id=request.task_handoff_id,
             start_event_type=EventType.SESSION_RESUMED,
             start_event_payload={
@@ -18303,7 +18499,6 @@ class SessionEngine:
                 current_source,
                 source_checkpoint,
                 copy_checkpoint=request.copy_checkpoint,
-                clock=self._clock,
                 redactor=self._secret_redactor,
             )
 
@@ -18528,6 +18723,7 @@ class SessionEngine:
         # Reject known-invalid checkpoint state before ordinary admission. The
         # store-owned transform below repeats the same validation after
         # admission so a concurrent checkpoint change still fails closed.
+        await self._settle_fork_source_expiring_authority(source_session.id)
         source_checkpoint_preflight = await self.session_store.load_checkpoint(source_session.id)
         preflight_checkpoint: dict[str, Any] | None = None
         try:
@@ -18540,11 +18736,6 @@ class SessionEngine:
                 source_session,
                 preflight_checkpoint,
                 require_prepared_intent=False,
-            )
-        except _ExpiredIncompleteRecoveryClaim as expired_claim:
-            await self._fence_expired_incomplete_recovery_claim_for_fork(
-                source_session.id,
-                expired_claim,
             )
         finally:
             if type(preflight_checkpoint) is dict:
@@ -18982,11 +19173,6 @@ class SessionEngine:
                 raise session_request_boundary.ForkActiveModelStageError(
                     "Fork source session has an active model-completion stage."
                 ) from None
-            if isinstance(publication_error, _ExpiredIncompleteRecoveryClaim):
-                await self._fence_expired_incomplete_recovery_claim_for_fork(
-                    source_session.id,
-                    publication_error,
-                )
             raise publication_error
         if publication_value is None:
             if (
@@ -19366,6 +19552,7 @@ class SessionEngine:
         targeted_tool_grants: TargetedToolGrantFootprint | None,
         task_id: str | None,
         task_worker_id: str | None,
+        task_lease_expires_at: datetime | None,
         task_handoff_id: str | None,
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
@@ -19618,6 +19805,8 @@ class SessionEngine:
                 task_id=task_id,
                 session=session,
                 worker_id=task_worker_id,
+                lease_expires_at=task_lease_expires_at,
+                handoff_id=task_handoff_id,
             )
             task_started = True
             if active_run is not None:
@@ -22259,6 +22448,8 @@ class SessionEngine:
         task_id: str,
         session: Session,
         worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         if self.task_store is None:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
@@ -22287,11 +22478,37 @@ class SessionEngine:
             )
             return existing
         if worker_id is not None:
+            if lease_expires_at is None:
+                raise TaskClaimLost("Worker-owned task attachment requires its exact lease.")
+            lease_authority = active_task_lease_authority(
+                task_id=task_id,
+                worker_id=worker_id,
+                handoff_id=handoff_id,
+                presented_lease_expires_at=lease_expires_at,
+            )
+            if lease_authority is not None:
+                async with lease_authority.lock:
+                    attached = await self.task_store.attach_task(
+                        task_id,
+                        session_id=session.id,
+                        session_invocation=session_invocation,
+                        worker_id=worker_id,
+                        lease_expires_at=lease_authority.lease_expires_at,
+                    )
+                    if (
+                        lease_authority.deadline_monotonic is not None
+                        and time.monotonic() >= lease_authority.deadline_monotonic
+                    ):
+                        raise TaskClaimLost(
+                            "Task attachment acknowledgement consumed the current lease."
+                        )
+                    return attached
             return await self.task_store.attach_task(
                 task_id,
                 session_id=session.id,
                 session_invocation=session_invocation,
                 worker_id=worker_id,
+                lease_expires_at=lease_expires_at,
             )
         return await self.task_store.start_task(
             task_id,
@@ -24214,10 +24431,14 @@ class SessionEngine:
     ) -> Event:
         """Atomically bind one terminal event to its exact unexpired owner."""
 
+        claim_expires_at: datetime | None = None
+
         def commit_under_exact_claim(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            store_now: datetime,
         ) -> dict[str, Any]:
+            nonlocal claim_expires_at
             if (
                 current_session.instance_id != session.instance_id
                 or current_session.status is not SessionStatus.INTERRUPTED
@@ -24233,19 +24454,25 @@ class SessionEngine:
                     "Terminal event lost its exact interruption authority."
                 )
             claim = _incomplete_recovery_claim_from_checkpoint(updated)
-            now = self._clock()
-            if now.tzinfo is None or now.utcoffset() is None:
-                raise ValueError("terminal finalization clock must be timezone-aware.")
-            if claim is None or claim[0] != claim_id or claim[1] <= now:
+            if claim is None or claim[0] != claim_id or claim[1] <= store_now:
                 raise _IncompleteRecoveryClaimLost(
                     "Terminal event lost its exact finalization claim."
                 )
+            claim_expires_at = claim[1]
             updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
             return updated
 
-        await self.session_store.publish_checkpoint_and_events(
+        def require_unexpired_finalization_commit(commit_at: datetime) -> None:
+            if claim_expires_at is None or claim_expires_at <= commit_at:
+                raise _IncompleteRecoveryClaimLost(
+                    "Terminal event finalization claim expired before durable publication."
+                )
+
+        await self.session_store.publish_checkpoint_and_events_with_store_time(
             session.id,
+            idempotency_key=f"terminal-finalization:{event.id}",
             checkpoint_transform=commit_under_exact_claim,
+            commit_time_guard=require_unexpired_finalization_commit,
             events=[event],
             expected_statuses={SessionStatus.INTERRUPTED},
             expected_run_epoch=session.run_epoch,
@@ -24310,6 +24537,7 @@ class SessionEngine:
         def transform(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal resolved_marker
             copied_checkpoint = (
@@ -24322,7 +24550,7 @@ class SessionEngine:
                 marker = {
                     "attempt_id": str(uuid4()),
                     "interrupt_payload": copy_json_value(interrupt_payload, "interrupt_payload"),
-                    "created_at": self._clock().isoformat(),
+                    "created_at": now.isoformat(),
                 }
             elif type(existing) is not dict:
                 raise ValueError("Pending interruption cascade checkpoint must be an object.")
@@ -24348,7 +24576,6 @@ class SessionEngine:
             generation = marker.get("generation", 0)
             if type(generation) is not int or generation < 0:
                 raise ValueError("Pending interruption cascade generation must be non-negative.")
-            now = self._clock()
             claim_id = marker.get("claim_id")
             claim_expires_at = _interruption_cascade_marker_datetime(
                 marker,
@@ -24371,7 +24598,7 @@ class SessionEngine:
             resolved_marker = copy_json_value(marker, "pending_interruption_cascade")
             return copied_checkpoint
 
-        await self.session_store.transform_checkpoint(session_id, transform)
+        await self.session_store.transform_checkpoint_with_store_time(session_id, transform)
         return resolved_marker
 
     async def _mark_pending_interruption_cascade_failed(
@@ -24386,6 +24613,7 @@ class SessionEngine:
         def transform(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal recorded
             if checkpoint is None:
@@ -24399,13 +24627,19 @@ class SessionEngine:
                 or marker.get("claim_id") != claim_id
             ):
                 return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
             marker["failure_recorded"] = True
             marker.pop("claim_id", None)
             marker.pop("claim_expires_at", None)
             recorded = True
             return copied_checkpoint
 
-        await self.session_store.transform_checkpoint(session_id, transform)
+        await self.session_store.transform_checkpoint_with_store_time(session_id, transform)
         return recorded
 
     async def _complete_pending_interruption_cascade(
@@ -24421,6 +24655,7 @@ class SessionEngine:
         def transform(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal cleared, failure_recorded
             if checkpoint is None:
@@ -24434,6 +24669,12 @@ class SessionEngine:
                 or marker.get("claim_id") != claim_id
             ):
                 return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
             current_failure_recorded = marker.get("failure_recorded", False)
             if type(current_failure_recorded) is not bool:
                 raise ValueError("Pending interruption cascade failure_recorded must be a boolean.")
@@ -24442,7 +24683,7 @@ class SessionEngine:
             cleared = True
             return copied_checkpoint
 
-        await self.session_store.transform_checkpoint(session_id, transform)
+        await self.session_store.transform_checkpoint_with_store_time(session_id, transform)
         return cleared, failure_recorded
 
     async def _renew_pending_interruption_cascade_claim(
@@ -24457,6 +24698,7 @@ class SessionEngine:
         def transform(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal renewed
             if checkpoint is None:
@@ -24470,13 +24712,19 @@ class SessionEngine:
                 or marker.get("claim_id") != claim_id
             ):
                 return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
             marker["claim_expires_at"] = (
-                self._clock() + timedelta(seconds=interruption_cascade_lease_seconds())
+                now + timedelta(seconds=interruption_cascade_lease_seconds())
             ).isoformat()
             renewed = True
             return copied_checkpoint
 
-        await self.session_store.transform_checkpoint(session_id, transform)
+        await self.session_store.transform_checkpoint_with_store_time(session_id, transform)
         return renewed
 
     async def _release_pending_interruption_cascade_claim(
@@ -24489,6 +24737,7 @@ class SessionEngine:
         def transform(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime,
         ) -> dict[str, Any] | None:
             if checkpoint is None:
                 return None
@@ -24501,11 +24750,17 @@ class SessionEngine:
                 or marker.get("claim_id") != claim_id
             ):
                 return None
+            claim_expires_at = _interruption_cascade_marker_datetime(
+                marker,
+                "claim_expires_at",
+            )
+            if claim_expires_at is None or claim_expires_at <= now:
+                return None
             marker.pop("claim_id", None)
             marker.pop("claim_expires_at", None)
             return copied_checkpoint
 
-        await self.session_store.transform_checkpoint(session_id, transform)
+        await self.session_store.transform_checkpoint_with_store_time(session_id, transform)
 
     async def _clear_pending_interruption_cascade(self, session_id: str) -> str | None:
         cleared_attempt_id: str | None = None
@@ -24898,12 +25153,16 @@ class SessionEngine:
                     if joined_claim is not None:
                         assert current_task is not None
                         assert shared_claim is not None
-                        loaded_interrupted, joined_claim_expires_at = joined_claim
+                        (
+                            loaded_interrupted,
+                            _joined_claim_expires_at,
+                            joined_local_lease_deadline,
+                        ) = joined_claim
                         heartbeat_stop, heartbeat_task = (
                             self._recovery_coordinator._start_preclaimed_terminal_evidence_heartbeat(
                                 session_id=session.id,
                                 claim_id=shared_claim[0],
-                                claim_expires_at=joined_claim_expires_at,
+                                local_lease_deadline=joined_local_lease_deadline,
                             )
                         )
                         terminal_finalization_claim_id = shared_claim[0]
@@ -24931,7 +25190,7 @@ class SessionEngine:
                         if joined_event is None:
                             await self._recovery_coordinator._repair_terminal_evidence_owned(
                                 session=loaded_interrupted,
-                                inactive_before=None,
+                                inactive_for_seconds=None,
                                 previous_status=loaded_interrupted.status,
                             )
                             joined_event = await (
@@ -24968,7 +25227,7 @@ class SessionEngine:
                     raise _IncompleteRecoveryClaimLost(
                         "Terminal finalization ownership changed before live settlement."
                     )
-                loaded_interrupted, _renewed_until = renewed_claim
+                loaded_interrupted, _renewed_until, _local_deadline = renewed_claim
             elif terminal_finalization_handoff is not None:
                 raise SessionRuntimePublicationConflict(
                     "Terminal finalization handoff lost its user-input supersession authority."
@@ -25213,7 +25472,7 @@ class SessionEngine:
                     raise _IncompleteRecoveryClaimLost(
                         "Terminal finalization ownership changed before terminal publication."
                     )
-                loaded_interrupted, _renewed_until = renewed_claim
+                loaded_interrupted, _renewed_until, _local_deadline = renewed_claim
                 await stop_terminal_finalization_handoff(
                     superseded_by_exact_renewal=True,
                 )

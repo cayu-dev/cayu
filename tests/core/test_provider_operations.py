@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -2730,7 +2729,7 @@ class _FenceOnEventStore(InMemorySessionStore):
                 self.fence_stalled_run(
                     session_id,
                     statuses={SessionStatus.RUNNING},
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
             assert fenced is not None

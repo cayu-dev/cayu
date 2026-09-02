@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -743,8 +744,8 @@ def test_cayu_app_uses_one_configured_recovery_cleanup_supervisor() -> None:
 
 def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
     class BlockingClaimReleaseStore(InMemorySessionStore):
-        def __init__(self) -> None:
-            super().__init__()
+        def __init__(self, *, ownership_clock: Callable[[], datetime]) -> None:
+            super().__init__(ownership_clock=ownership_clock)
             self.block_next_checkpoint_transform = False
             self.release_started = asyncio.Event()
             self.allow_release = asyncio.Event()
@@ -772,7 +773,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         def clock() -> datetime:
             return current_time["value"]
 
-        store = BlockingClaimReleaseStore()
+        store = BlockingClaimReleaseStore(ownership_clock=clock)
         session = await store.create(
             RunRequest(
                 agent_name="assistant",
@@ -793,7 +794,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         )
         original_claim = await original_app._recovery_coordinator._claim_incomplete_recovery(
             session=session,
-            inactive_before=None,
+            inactive_for_seconds=None,
         )
         assert original_claim is not None
         original_claim_id = original_claim.claim_id
@@ -818,7 +819,7 @@ def test_timed_out_claim_release_converges_through_fresh_runtime() -> None:
         )
         replacement_claim = await replacement_app._recovery_coordinator._claim_incomplete_recovery(
             session=current,
-            inactive_before=None,
+            inactive_for_seconds=None,
             required_expired_claim_id=original_claim_id,
         )
         assert replacement_claim is not None

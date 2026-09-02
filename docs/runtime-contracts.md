@@ -1473,6 +1473,21 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 
 Run ownership is a required part of the `SessionStore` contract. A successful `transition_status(..., to_status=RUNNING)` or `transition_status_and_checkpoint(..., to_status=RUNNING)` increments `Session.run_epoch` and binds that epoch to the current execution context. `fence_stalled_run(...)` atomically verifies status and inactivity, increments the epoch, refreshes activity, and binds the replacement claim. `fence_run_and_transform_checkpoint(...)` is the checkpoint-authorized counterpart: it persists a required checkpoint transform and advances the run epoch in the same transaction, or rolls back both when the transform returns `None` or raises. Cayu uses that stronger boundary when an exact expired recovery claim authorizes takeover, so the stale owner cannot write between claim replacement and epoch advancement. While a claim is active, runtime progress writes to status, model, labels, metadata, events, transcript, or checkpoint must compare the durable epoch and raise `SessionRunFenced` after ownership changes. An active invocation exits through the versioned `release` command only after exact settlement or recovery proof; that command advances the durable epoch before clearing task-local ownership so child contexts that inherited the old claim cannot write late. The lower-level `release_run_fence(...)` primitive is reserved for ownership that positively has no active invocation profile. Custom stores must implement the fence primitives and equivalent task-local ownership tracking as part of the complete lifecycle command protocol.
 
+Durable lease and inactivity decisions use time owned by the store that owns the mutation. Callers provide a duration, never an authoritative current timestamp or precomputed cutoff. The store samples its clock after entering the same lock or transaction that compares the current record, stamps the replacement, and transfers or releases ownership. PostgreSQL uses database time in that transaction. In-memory and SQLite task/session stores expose explicit injectable ownership clocks, while their budget ledgers own an injectable ledger clock, for deterministic conformance testing. Application and worker clocks cannot advance or delay durable ownership; separate availability, retry, pricing, and evidence clocks remain non-authoritative for lease decisions. This rule applies uniformly to task claims and heartbeats, incomplete-session recovery and run fencing, terminal-evidence finalization claims, interruption-cascade and provider-cancellation claims, and expiring budget reservations. `SessionStore.transition_status_and_checkpoint(...)` accepts exactly one ordinary checkpoint transform or store-time checkpoint transform; the latter receives the transaction's authoritative timestamp and must remain inside the same atomic status/checkpoint boundary. A custom `TaskStore`, `SessionStore`, or expiring `BudgetLedger` must preserve the same compare-and-stamp boundary and pass the reusable scenarios in `tests/core/task_store_conformance.py`, `tests/core/session_store_time_conformance.py`, and `tests/core/_budget_ledger_contract.py` before it is safe for multi-worker use.
+
+Session-operation publication uses
+`publish_session_operation_guarded_with_store_time(...)` when a lease-bearing
+checkpoint record and its events must commit together. The store invokes the
+operation transform with its authoritative time while holding the mutation
+lock, runs the owned external `commit_guard`, samples authoritative time again,
+and invokes `commit_time_guard` before committing. A custom `SessionStore` that
+participates in lease-bearing checkpoint publication must implement this
+boundary; falling back to a caller timestamp or sampling before a blocking
+guard is not safe.
+`publish_checkpoint_and_events_with_store_time(...)` applies that same boundary
+to lease-bearing checkpoint/event publications without creating a terminal
+operation record.
+
 Custom `SessionStore` implementations must also implement the interaction-admission transaction. `create(...)` and `transition_status_and_checkpoint(...)` accept optional interaction admission data and must persist the run-epoch claim, `interaction.started` side-effect handoff, and either attributed transcript messages or a private deferred source batch as one commit. First-interaction creation must persist the pending initial-authority marker in that same commit; when runtime-authenticated initial-transcript authority is present, its complete initial projection must be retained in the same private deferred record. The transition can instead name an existing open interaction when crash recovery must precede the admitted source batch. `replace_initial_transcript_messages(...)` materializes the ordered initial transcript and clears its authority marker without an externally visible intermediate form; its bounded `runtime_suffix_count` places runtime-owned acquisition markers after the exact admitted source segment while attributing both segments to the interaction, and a retained authenticated projection must match the complete replacement exactly. `materialize_deferred_interaction_input(...)` appends the source-only fallback used before terminalization while retaining that marker, and `load_deferred_interaction_input(...)` exposes a detached snapshot for complete export. These methods are required; a store that cannot provide their atomicity is not interaction-safe. Prerelease pending model/tool recovery state without an open interaction is rejected rather than migrated into the new lifecycle.
 
 Branch-local runtime authority may require operation records to exist before a
@@ -1487,7 +1502,7 @@ Provider-neutral tool discovery requires this capability. In-memory, SQLite,
 and PostgreSQL implement it; custom stores that do not advertise it continue to
 work for agents that do not enable discovery.
 
-`Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it, and inactive-session queries must apply `last_activity_before` in storage before `limit` so recent rows cannot hide older stalled work. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Recovery that needs only the inactivity predicate claims the run through `fence_stalled_run(...)`; recovery that also installs a durable checkpoint lease uses `fence_run_and_transform_checkpoint(...)` so lease ownership and epoch fencing cannot diverge. A plain status or checkpoint update is not an ownership transfer.
+`Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it. Recovery callers provide `inactive_for_seconds`; `SessionStore` resolves that duration against its authoritative time and applies the predicate before `limit`, so a fast or slow worker clock cannot steal live work and recent rows cannot hide older stalled work. `last_activity_before` remains available for ordinary absolute-time session queries, but it is not recovery ownership authority. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Profile-aware recovery first uses `reserve_stalled_run_recovery(...)` to atomically verify inactivity and install its exact checkpoint claim without refreshing activity. It then uses the typed invocation-lifecycle rebind boundary to advance the epoch and transfer the frozen profile. Failure or cancellation between those stages releases the exact checkpoint claim; a concurrent worker can never infer ownership from a caller timestamp. Recovery that needs no invocation profile may claim directly through `fence_stalled_run(...)`. A plain status or checkpoint update is not an ownership transfer.
 
 An app can register either a concrete `Environment` or an `EnvironmentFactory` under an `EnvironmentSpec` name. A factory receives durable session context (`session_id`, `agent_name`, `environment_name`, explicit `operation`, parent session id, causal budget id, labels, metadata, and previous reconnect metadata for that session/environment) and returns a concrete `Environment` for that session. `operation=CREATE` is used for new sessions, a retry whose earlier setup never committed an allocation, and a fork's first child allocation; `operation=RECONNECT` is used once that session owns a durable allocation and requires the factory to fail closed rather than allocate a replacement when durable identity is missing. The returned environment must keep the registered environment name so resume/fork/dispatch do not silently switch identity. Factory-backed environments are resolved before workspace binding, MCP setup, tool execution, and, for new sessions, workspace-instruction loading. The runtime emits `environment.factory.started`, `environment.factory.completed`, and `environment.factory.failed` with JSON-safe diagnostics and never serializes live workspace, runner, or vault objects. `EnvironmentFactoryResult.reconnect_metadata` is non-secret durable state such as a sandbox id, region, image, or attach handle. Cayu admits a runner returned directly by the factory before atomically checkpointing reconnect metadata with runtime-owned allocation provenance under the registered environment name and emitting `environment.factory.completed`; a runner created or replaced by binding is admitted immediately after binding instead. Cayu passes the durable metadata back on later resume, approval continuation, or recovery. This provenance closes the checkpoint-to-event crash window: recovery reconnects an already-checkpointed child allocation even if its completion event was never written. A result that owns live reconnectable resources provides an explicit `release` callback: an uncheckpointed new allocation is released with `DISCARD`, while a reconnect or an already-checkpointed new allocation is released with `PRESERVE` so host handles are detached without deleting the durable resource. Cancellation after a checkpoint write begins also selects `PRESERVE`, because cancellation of a threaded or remote store await cannot prove that its durable commit stopped. Release runs to its result-level `release_timeout_s` bound despite caller cancellation (15 seconds by default), after which pending caller cancellation is re-raised. If a durable result omits that callback, Cayu leaves the allocation untouched rather than terminally closing an identity it has already committed, and records that limitation on the failure. Until workspace binding returns successfully, the factory result remains unadopted: the binding rolls back only state created by its own bind attempt, while the result's release callback exclusively owns factory-created runner and allocation cleanup. Bind failure or cancellation invokes that callback once with `PRESERVE` because reconnect identity is already checkpointed. After binding succeeds, ownership transfers to the binding and the factory release callback is no longer invoked. Forks that copy checkpoint state also copy reconnect metadata as context, but the first child factory request is an explicit create operation; later child resumes reconnect the child's own allocation. Factory failure fails a new session before `session.started`; for pending approval continuation or manual approval recovery, factory failure is emitted before `session.resumed` and the session returns to `interrupted` with the approval still recoverable. Static environments admit the session and interaction before workspace-instruction validation; validation failure materializes the deferred source and terminally fails the admitted interaction and session.
 
@@ -2742,7 +2757,7 @@ startup time proportional to total session history.
 
 After the parent's durable `session.interrupted` event is persisted, operator-requested interruption propagates asynchronously through the complete paginated subagent tree: traversal crosses foreground subagent nodes but interrupts only background and durable subagent descendants, and it never crosses fork or other application lineage. Persisting the parent event before launching propagation ensures the recovery marker cannot be cleared while the parent is still `interrupting`. The parent terminal event is yielded without waiting for the descendant cascade; a slow descendant cannot delay the control-plane response, block its siblings, or turn the parent terminal stream into an error. The runtime suppresses recursive cascade creation while walking that tree and applies one app-wide concurrency limit across simultaneous roots, so nested subagent trees cannot multiply interruption work at each depth. Recovery and retries use the original durable operator payload and therefore preserve its provenance.
 
-Background propagation persists a `pending_interruption_cascade` checkpoint marker until the complete descendant traversal succeeds. A shared app-level worker pool bounds traversal across all roots; workers are not multiplied per parent or tree depth. Root coordinators are bounded by the same limit. Roots whose durable lease belongs to another process move to one deferred supervisor instead of occupying a coordinator. Locally admitted roots waiting for coordinator capacity remain part of the shutdown drain, while external-lease retries do not consume the shutdown grace. A coordinator must atomically acquire a durable, expiring claim and renew it while working; another process cannot start overlapping traversal until that lease expires or is explicitly released. Each new owner also advances a private generation so delayed events from an expired owner can be identified and ignored. Session detail reads the durable marker before applying local scheduling hints, then reports an active lease, a locally queued root, or a newly created marker within its admission grace as `pending`, an expired, recorded-failure, or orphaned marker as `failed`, and no marker as `none`; this prevents a stale external-lease timer from masking completion by another worker. The dashboard shows pending propagation explicitly, exposes Retry only for `failed`, withholds Resume for every outstanding marker, and selects the newest failure generation rather than event arrival order. A retry of a failed cascade emits `session.interruption_cascade_retry_requested` with a unique `retry_request_id` and the retrying actor, reason, and metadata while preserving the original interruption provenance used for descendants. When that retry acquires a generation, its failure or completion event carries the same retry request ID and provenance. Existing-terminal replay and cascade retry use the session's durable agent/environment identity, so an application deployment may remove the historical parent agent without disabling control-plane recovery. If a descendant remains `pending`, `running`, or `interrupting` after an interruption attempt, Cayu releases the claim but retains the marker and emits a bounded `session.interruption_cascade_failed` event on the parent with structured descendant IDs, statuses, and error types; exception messages are not persisted. A later successful retry durably publishes `session.interruption_cascade_completed` before clearing the failed marker, so publication failure leaves retryable state instead of losing the resolution event; first-attempt success clears the marker without adding a redundant event. `CayuApp.resume_pending_interruption_cascades(interrupting_inactive_before=...)` discovers durable work after a process restart through a paginated store query backed by a partial checkpoint index; startup does not scan historical interrupted sessions or load unrelated checkpoints. Interrupted roots are admitted immediately when their claim is available; an `interrupting` parent is filtered by the supplied inactivity threshold and finalized only after the store atomically fences it, preventing a new worker from stealing shutdown from a live owner. Recovery claims existing markers only, so a startup race or repeated idempotent request cannot recreate work another owner already completed. `create_server(...)` reads this threshold from `ServerLifecycleConfig.recovery_inactive_after_seconds`, while `mount_cayu(...)` exposes `interruption_recovery_inactive_after_seconds`; both drain accepted background work during shutdown using the configured grace period, including work scheduled before a later startup-recovery error. Internal timeout and caller cancellation signal claim loss, stop the current worker generation, and detach cancellation-resistant code without extending that grace. Cooperative coordinators may release claims immediately; detached work cannot accept new queue entries and leaves its durable lease to expire for takeover. A hard process loss uses the same lease-expiry recovery boundary.
+Background propagation persists a `pending_interruption_cascade` checkpoint marker until the complete descendant traversal succeeds. A shared app-level worker pool bounds traversal across all roots; workers are not multiplied per parent or tree depth. Root coordinators are bounded by the same limit. Roots whose durable lease belongs to another process move to one deferred supervisor instead of occupying a coordinator. Locally admitted roots waiting for coordinator capacity remain part of the shutdown drain, while external-lease retries do not consume the shutdown grace. A coordinator must atomically acquire a durable, expiring claim and renew it while working; another process cannot start overlapping traversal until that lease expires or is explicitly released. Each new owner also advances a private generation so delayed events from an expired owner can be identified and ignored. Session detail reads the durable marker before applying local scheduling hints, then reports an active lease, a locally queued root, or a newly created marker within its admission grace as `pending`, an expired, recorded-failure, or orphaned marker as `failed`, and no marker as `none`; this prevents a stale external-lease timer from masking completion by another worker. The dashboard shows pending propagation explicitly, exposes Retry only for `failed`, withholds Resume for every outstanding marker, and selects the newest failure generation rather than event arrival order. A retry of a failed cascade emits `session.interruption_cascade_retry_requested` with a unique `retry_request_id` and the retrying actor, reason, and metadata while preserving the original interruption provenance used for descendants. When that retry acquires a generation, its failure or completion event carries the same retry request ID and provenance. Existing-terminal replay and cascade retry use the session's durable agent/environment identity, so an application deployment may remove the historical parent agent without disabling control-plane recovery. If a descendant remains `pending`, `running`, or `interrupting` after an interruption attempt, Cayu releases the claim but retains the marker and emits a bounded `session.interruption_cascade_failed` event on the parent with structured descendant IDs, statuses, and error types; exception messages are not persisted. A later successful retry durably publishes `session.interruption_cascade_completed` before clearing the failed marker, so publication failure leaves retryable state instead of losing the resolution event; first-attempt success clears the marker without adding a redundant event. `CayuApp.resume_pending_interruption_cascades(interrupting_inactive_for_seconds=...)` discovers durable work after a process restart through a paginated store query backed by a partial checkpoint index; startup does not scan historical interrupted sessions or load unrelated checkpoints. Interrupted roots are admitted immediately when their claim is available; an `interrupting` parent is filtered by the supplied inactivity duration, resolved against `SessionStore` time inside the fencing transaction, and finalized only after the store atomically fences it, preventing a fast worker clock from stealing shutdown from a live owner. Recovery claims existing markers only, so a startup race or repeated idempotent request cannot recreate work another owner already completed. `create_server(...)` reads this duration from `ServerLifecycleConfig.recovery_inactive_after_seconds`, while `mount_cayu(...)` exposes `interruption_recovery_inactive_after_seconds`; both drain accepted background work during shutdown using the configured grace period, including work scheduled before a later startup-recovery error. Internal timeout and caller cancellation signal claim loss, stop the current worker generation, and detach cancellation-resistant code without extending that grace. Cooperative coordinators may release claims immediately; detached work cannot accept new queue entries and leaves its durable lease to expire for takeover. A hard process loss uses the same lease-expiry recovery boundary.
 
 `CayuApp.snapshot_fork_source(...)` captures caller-visible authority for one safe,
 terminal source: status, run epoch, and a transcript digest that binds both the
@@ -3851,15 +3866,15 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
 - `start_task(task_id, session_id=..., session_invocation=...)`
-- `attach_task(task_id, session_id=..., session_invocation=..., worker_id=...)`
+- `attach_task(task_id, session_id=..., session_invocation=..., worker_id=..., lease_expires_at=...)`
 - `pause_task(task_id, reason=..., payload=...)`
 - `block_task(task_id, reason=..., payload=...)`
 - `mark_task_needs_attention(task_id, reason=..., payload=...)`
 - `resume_task(task_id)`
 - `claim_task(worker_id, TaskQuery(...), lease_seconds=...)`
-- `heartbeat(task_id, worker_id, handoff_id=..., extend_seconds=...)`
-- `release_task(task_id, worker_id)`
-- `release_attached_task_worker(task_id, worker_id)`
+- `heartbeat(task_id, worker_id, lease_expires_at=..., handoff_id=..., extend_seconds=...)`
+- `release_task(task_id, worker_id, lease_expires_at=...)`
+- `release_attached_task_worker(task_id, worker_id, lease_expires_at=...)`
 - `release_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `recover_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `load_interrupted_task_handoff_receipt(task_id, handoff_id)`
@@ -3868,10 +3883,12 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_active_attached_task_worker(task_id, worker_id, session_id=..., session_instance_id=...)`
 - `load_direct_attached_task_resume(task_id, session_id=..., session_instance_id=...)`
 - `reclaim_expired(query=..., max_reclaims=...)`
-- `complete_task(task_id, result, worker_id=..., handoff_id=...)`
-- `fail_task(task_id, error, worker_id=..., handoff_id=...)`
+- `complete_task(task_id, result, worker_id=..., lease_expires_at=..., handoff_id=...)`
+- `fail_task(task_id, error, worker_id=..., lease_expires_at=..., handoff_id=...)`
 - `terminalize_task(TaskTerminalizationRequest(...))`
 - `load_task_terminalization_receipt(task_id, idempotency_key)`
+- `mark_claimed_task_execution_started(task_id, worker_id, lease_expires_at)`
+- `request_claimed_task_cancellation(task_id, worker_id, lease_expires_at, error=...)`
 - `reconcile_task_cancellation(TaskCancellationReconciliationRequest(...))`
 - `cancel_task(task_id, error=...)`
 
@@ -3917,6 +3934,19 @@ cannot race a claimed terminalization and cannot be used to strip elected-worker
 authority. A store without that atomic receipt capability fails closed after the
 workerless task is terminal because the terminal row no longer proves its former
 owner.
+
+The built-in worker and dispatcher first publish their execution-start boundary
+through `mark_claimed_task_execution_started(...)` and later publish their drain
+fence through `request_claimed_task_cancellation(...)`, not through the
+unqualified operator `cancel_task(...)` entrance. The store must compare the
+complete claimed-owner tuple—task ID, worker ID, and exact lease expiry—in the
+same lock or transaction that publishes either boundary. A heartbeat may
+replace the lease expiry before publication; the runtime may then retry against
+that newly read lease while the same worker remains owner. Once ownership
+transfers, a delayed request from the former owner must fail without changing
+the replacement claim. Replaying the exact current tuple is idempotent and
+never advances it to terminal state; terminalization remains a separate,
+quiescence-proving operation.
 
 Verified-work runtime mutations require stronger cancellation settlement than
 the ordinary capability flag alone can prove. A custom store implementation
@@ -3998,7 +4028,8 @@ execution and recovery owners together rather than routing them through ordinary
 session recovery.
 
 The exact admission tuple is the admission, attempt, task, session, interaction,
-claim, worker, process execution-owner, generation, source request digest,
+claim, worker, the source task's exact lease generation when initial admission
+consumes a claimed queue task, process execution-owner, generation, source request digest,
 immutable `WorkContractRef`, session invocation, and source execution-profile
 fingerprint; continuation adds the selected predecessor admission. The source
 request digest binds the canonical public request plus
@@ -4353,24 +4384,26 @@ result reference and digest. The registered resolver is only the narrow automati
 reconstruction layer above this unchanged application boundary; neither entrance
 starts another attempt, resumes a session, or schedules continuation.
 
-`InMemoryTaskStore(clock=...)` uses its injectable clock for availability,
-retry-series timing, and verified-work attempt, proposal, claim, and decision
-evidence. That clock is not authoritative for core `Task` lifecycle fields.
-Decision application uses wall-clock UTC, clamped to the task's existing
-lifecycle timestamps, for the immutable receipt's `applied_at` and any matching
-`Task.updated_at` or `Task.completed_at` transition. Exact application replay
-returns the original receipt snapshot before consulting either clock.
+`InMemoryTaskStore(clock=..., ownership_clock=...)` and
+`SQLiteTaskStore(clock=..., ownership_clock=...)` separate two clock domains.
+`clock` controls availability, retry-series timing, and non-ownership
+verified-work evidence such as attempt, proposal, verifier-profile, and
+decision timestamps. `ownership_clock` controls every worker lease,
+work-attempt execution claim, completion-verifier claim, heartbeat, release,
+expiry, reclaim, and recovery-owner decision under the store lock, together
+with the ownership-sensitive task transition it stamps. Claim creation and
+renewal timestamps are part of that lease authority rather than general audit
+evidence. The clock is injectable so the authoritative timeline can be tested
+deterministically; it is not a worker timestamp.
+`PostgresTaskStore(clock=...)` keeps the first evidence-clock role, while those
+ownership-sensitive transitions sample PostgreSQL time inside their mutation
+transaction. A custom verifier or worker clock therefore cannot expire worker
+authority or make leased work retryable.
 
-`SQLiteTaskStore(clock=...)` and `PostgresTaskStore(clock=...)` apply that same
-split: the injected clock controls attempt, proposal, claim, and decision
-evidence, while worker leases and core task lifecycle transitions use wall-clock
-UTC or PostgreSQL's current database clock. A custom verifier clock therefore
-cannot expire worker authority or move task timestamps. Exact application replay
-returns its stored canonical snapshot without reading either source of time.
 Verification-claim replay is different: it re-evaluates the claim against the
-current verifier clock and returns the stored claim only while its lease remains
-live or a durable decision has already closed the proposal. An expired exact
-claim cannot regain verifier authority through replay.
+current store-owned lease clock and returns the stored claim only while its
+lease remains live or a durable decision has already closed the proposal. An
+expired exact claim cannot regain verifier authority through replay.
 
 The in-memory store also maintains contracted-session authority in a dedicated
 session index under the same lock as task publication and ordinary-session
@@ -4442,17 +4475,18 @@ revision 62 before starting current workers. Mixed revision-61/revision-62
 workers and application-only rollback are unsupported.
 
 `terminalize_task(...)` is the claim-fenced, replay-safe completion, failure, or
-cancellation boundary for worker-owned tasks. A request carries the exact task
-and worker, terminal kind, terminal JSON payload, and a caller-stable
-idempotency key. On its first application, a supporting store verifies the live
-worker lease and commits both the terminal task snapshot and an immutable
+cancellation boundary for worker-owned tasks. A request carries the exact task,
+worker, applicable lease and handoff generations, terminal kind, terminal JSON
+payload, and a caller-stable idempotency key. Unattached claimed tasks require
+the exact lease generation. On its first application, a supporting store verifies
+the live worker lease and commits both the terminal task snapshot and an immutable
 `TaskTerminalizationReceipt` in one lock or database transaction. The receipt
 binds the key to a deterministic SHA-256 digest of the whole logical request.
 The task snapshot clears `worker_id` and `lease_expires_at`.
 
 An exact retry returns the original detached terminal `Task` even though the
 successful commit cleared the lease. Reusing the same task/key with another
-worker, terminal kind, result/error payload, or digest raises
+worker, lease generation, terminal kind, result/error payload, or digest raises
 `TaskTerminalizationConflict`. A different key cannot adopt a task that is
 already terminal, and a terminal task without the matching receipt is never
 treated as proof that the requested operation committed. Receipt and current
@@ -4475,13 +4509,19 @@ time, applied backoff, and whether receipt reconciliation supplied the answer.
 Each task/key evidence field remains within the idempotency-key UTF-8 byte
 limit even when it is truncated with a digest suffix.
 
-`TaskStore.supports_idempotent_terminalization` defaults to `False` so existing
-custom stores remain compatible. A custom store may set it to `True` only when
-both terminalization methods implement the atomic receipt contract above.
-`CayuApp` and `run_task_worker(...)` use the replay-safe boundary for
-worker-claimed tasks when the capability is present; otherwise they retain the
-legacy claim-fenced `complete_task(..., worker_id=...)` /
-`fail_task(..., worker_id=...)` path. The in-memory, SQLite, and PostgreSQL task
+`TaskStore.supports_idempotent_terminalization` defaults to `False`. Custom stores
+must accept and validate the exact lease generation on worker-owned
+`complete_task(...)` and `fail_task(...)` calls. A custom store may set the
+capability to `True` only when both terminalization methods implement the atomic
+receipt contract above.
+`CayuApp` uses the replay-safe boundary for worker-claimed tasks when the
+capability is present; otherwise direct application entrances retain the
+claim-fenced `complete_task(..., worker_id=..., lease_expires_at=...)` /
+`fail_task(..., worker_id=..., lease_expires_at=...)` path. The generic
+`run_task_worker(...)` requires both idempotent terminalization and ordinary
+task-cancellation reconciliation before it claims work, because a managed
+heartbeat cannot safely compose with a non-replayable terminal mutation after
+owner loss. The in-memory, SQLite, and PostgreSQL task
 stores implement the capability, although the in-memory receipt naturally does
 not survive process loss. When a worker or durable dispatcher observes a
 terminal task with no receipt under its own key, it preserves that peer winner
@@ -4614,7 +4654,32 @@ terminal statuses do not transition
 There are two supported task execution modes:
 
 1. **Direct task/session link.** `CayuApp(task_store=...)` can link an agent run to an existing pending task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and marks the task completed or failed when the run reaches those terminal states. Use this when app code already decided exactly which task and session should run.
-2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `claimed`, records `worker_id`, and sets `lease_expires_at`; it does not attach a session or mark the task started. The worker must pass both `task_id` and `task_worker_id` to `RunRequest`; Cayu then calls `attach_task(...)` to move the live owned claim to `running` with the created session id. The worker should call `heartbeat(...)` while it is doing pre-run work or while the agent run is active. It can `release_task(...)` before session attachment if it decides not to process the task. Another worker can call `reclaim_expired(...)` to return abandoned unattached claims to `pending`.
+2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `claimed`, records `worker_id`, and sets `lease_expires_at`; it does not attach a session or mark the task started. The worker must pass `task_id`, `task_worker_id`, and the exact returned `lease_expires_at` as `task_lease_expires_at` to `RunRequest`; Cayu then calls `attach_task(...)` with that complete claim-generation tuple to move the live owned claim to `running` with the created session id. The worker must carry the same exact lease generation into claimed-task terminalization, verified-work parking, cancellation fencing, `heartbeat(...)`, `release_task(...)`, and `release_attached_task_worker(...)`. This prevents a delayed request from an earlier claim from mutating a successor claim that deliberately reuses the same worker ID. The worker should heartbeat while it is doing pre-run work or while the agent run is active. It can release an unattached task before session attachment if it decides not to process it. Another worker can call `reclaim_expired(...)` to return abandoned unattached claims to `pending`.
+
+`run_task_worker(...)` coordinates its private heartbeat generation with session
+attachment, managed handler completion/failure, retry settlement, and retry-
+deadline decisions. Ordinary terminal mutations serialize with heartbeat renewal;
+retry settlement instead keeps renewing while a potentially slow durable mutation
+is in flight, reconciles its exact receipt after acknowledgement loss, and retries
+against a newer positively acknowledged lease only when no prior receipt exists.
+A handler still passes the lease snapshot it received at dispatch;
+when that exact runtime-owned handler has renewed meanwhile, Cayu atomically
+uses the latest positively acknowledged generation for attachment. Equal values
+outside that managed handler context do not receive this process-local authority.
+Handlers that directly settle ordinary tasks call `complete_managed_task(...)`
+or `fail_managed_task(...)`; these functions carry the handler's original task
+snapshot through the private authority boundary and present the latest
+acknowledged lease to custom stores. Built-in stores apply the same boundary to
+their direct completion and failure implementations. A same-worker successor
+claim never enters that private authority and rejects every delayed mutation
+from the prior lease generation.
+An attachment acknowledgement that consumes the conservative local lease
+deadline is rejected before model or tool dispatch. A direct custom worker may
+use a store without idempotent terminalization only outside the generic worker;
+the terminalization boundary reloads and supplies the current exact lease to
+its direct `complete_task(...)` / `fail_task(...)` fallback, and the custom
+worker must serialize its own heartbeat with that mutation. The custom store
+remains authoritative for the final live-lease and handoff check.
 
 `run_task_worker(...)` normally requires its handler to terminalize the claimed
 task; returning `None` with a claimed or running task fails that task. If the
@@ -4793,11 +4858,21 @@ direct-resume check over its required `load_task(...)` implementation. Once a
 store advertises recovery, that fallback fails closed and the store must provide
 an atomic direct-resume read so recovery lineage cannot race the check.
 
+Before a generic worker or queued dispatcher invokes potentially opaque work,
+it durably marks the exact live claim's `started_at` boundary. An expired claim
+without that marker remains normally reclaimable. An expired marked claim is
+atomically converted to the existing cancellation-reconciliation state instead
+of becoming pending: lease expiry proves owner loss but cannot prove that the
+dispatched handler, thread, subprocess, provider call, or external effect is
+quiescent. This makes a late owner fence and concurrent reclaim converge on the
+same non-claimable state.
+
 Cancelling an idle ordinary task terminalizes it immediately. Cancelling an
 ordinary task with a live worker instead records a durable
 `cancellation_requested` intent while retaining the exact worker and lease. The
-built-in worker observes that intent through its heartbeat, cancels the handler,
-continues renewing the lease until the handler is quiescent, and then commits a
+built-in worker observes that intent through its heartbeat, retains the handler
+without cancelling its potentially opaque wrapper, continues renewing the lease
+until the handler naturally settles, and then commits a
 claim-fenced `cancelled` terminalization and its immutable receipt. The stored
 cancellation intent wins a concurrent completion or failure. Expired-claim
 reclamation excludes a cancellation-requested task because lease expiry proves
@@ -4846,6 +4921,25 @@ receipt support, and preserve the same atomic receipt, rejection-replay,
 exact-identity, and first-writer-wins semantics before exposing ordinary
 owner-lost recovery.
 
+If the generic worker itself is cancelled, or if a heartbeat acknowledgement
+does not arrive before its conservative local renewal deadline, it first
+publishes the same durable cancellation intent. The local deadline reserves
+the final third of the last positively acknowledged durable lease for this
+store mutation; it does not make worker time authoritative. The worker then
+retains the handler under an owned shield until the handler settles naturally;
+cancelling an asyncio wrapper is not accepted as proof that delegated thread,
+subprocess, adapter, or remote work stopped. Once the cancellation intent is
+acknowledged, expired-task reclamation remains disabled while opaque work
+drains. Because the execution-start marker is durable before dispatch, expiry
+and a late fence publication serialize under the same task mutation boundary.
+The winner records the same cancellation-reconciliation state, and no
+replacement claim is exposed while the former owner's work may remain active.
+Once natural settlement provides positive quiescence, ordinary workers,
+retry-series workers, and queued dispatchers commit their cancellation receipt
+while the lease is live or use the exact owner-lost reconciliation transition
+after expiry. A replacement that observes an acknowledged cancellation marker
+must not dispatch it.
+
 An unattached queue task may instead opt into a runtime-owned retry series with
 `TaskCreate.retry_policy=TaskRetryPolicy(...)`. The policy requires a positive
 series-wide `max_attempts` and may bound cumulative elapsed seconds and the
@@ -4885,8 +4979,9 @@ Retry-series tasks cannot use the generic task/session terminalization path;
 the handler may run child/session work, but must return the explicit report to
 settle its task attempt.
 
-`settle_task_retry_attempt(...)` is one store-atomic operation. It claim- and
-lease-fences the active attempt, terminalizes it without rewriting prior
+`settle_task_retry_attempt(...)` is one store-atomic operation. Its request binds
+the task, worker, and exact active lease expiry. It claim- and lease-fences the
+active attempt, terminalizes it without rewriting prior
 attempts, updates cumulative accounting, and either creates exactly one
 deterministically identified delayed successor or records one terminal series
 disposition: `succeeded`, `non_retryable_failure`, `cancelled`,
@@ -4897,8 +4992,9 @@ time is before the elapsed deadline. Success, cancellation, and every terminal
 disposition create no successor. Direct cancellation of an idle attempt
 atomically writes the ordinary retry settlement receipt/events. Cancellation of
 a worker-owned active attempt instead records a durable cancellation request
-while retaining its worker and lease. The built-in worker cancels its handler,
-keeps heartbeating until the handler proves quiescent, and only then writes the
+while retaining its worker and lease. The built-in worker retains its handler
+without cancelling its potentially opaque wrapper, keeps heartbeating until the
+handler naturally settles, and only then writes the
 terminal cancellation receipt. If the quiescent handler returns a typed attempt
 report, its token and cost usage is preserved in that operator-authoritative
 cancellation settlement; the report's disposition and payload cannot replace
@@ -4909,6 +5005,10 @@ cancellation request has won that release race. Expired reclaim does not make a
 cancellation-requested attempt runnable; if its owner is lost while effects
 remain uncertain, the attempt stays fenced for explicit operator reconciliation
 rather than risking stale work beside a replacement.
+The retry-deadline probe and enforcing mutation require the same exact lease
+tuple. Reclaiming a task and assigning it to the same worker ID therefore cannot
+let a delayed prior settlement or deadline operation terminalize the successor
+claim.
 
 `reconcile_task_retry_cancellation(...)` is that operator/application boundary.
 It accepts a `TaskRetryCancellationReconciliationRequest` only for the exact
@@ -6698,9 +6798,14 @@ receipt-less pre-provider recovery, completion recovery, or conservative
 post-dispatch settlement resolves it; this
 prevents completed but temporarily unsettled work from making its capacity
 available to another session. All workers sharing a durable ledger must use the
-same TTL and reasonably synchronized clocks. Custom expiring `BudgetLedger`
-implementations must advertise their TTL and implement `heartbeat`; the base
-custom-ledger contract is non-expiring.
+same TTL. Reservation creation, heartbeat, expiry, and reaping use the ledger's
+authoritative time inside the same atomic transition; caller wall clocks and
+caller-computed expiry cutoffs do not decide whether capacity is live.
+PostgreSQL uses database time, while the in-memory and SQLite ledgers use their
+store-owned clock (which tests may inject). Custom expiring `BudgetLedger`
+implementations must advertise their TTL, implement `heartbeat`, and provide
+the same authoritative-time behavior; the base custom-ledger contract is
+non-expiring.
 
 Caller cancellation remains authoritative when it meets a provider-stream
 failure, provider iterator cleanup, or request-billing hook cleanup. The runtime

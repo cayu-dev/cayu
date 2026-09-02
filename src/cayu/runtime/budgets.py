@@ -22,7 +22,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._clock import utc_clock
+from cayu._clock import utc_clock, utc_duration_cutoff
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     MIN_DURABLE_JSON_INTEGER,
@@ -1860,7 +1860,14 @@ class BudgetStore(ABC):
 
 
 class BudgetLedger(ABC):
-    """Atomic reservation ledger for strict budget enforcement."""
+    """Atomic reservation ledger for strict budget enforcement.
+
+    Durable reservation lease decisions use time owned by the ledger. Callers
+    supply durations and transition identities, never an authoritative current
+    time or expiry cutoff. PostgreSQL implementations use database time in the
+    mutation transaction; local implementations expose the same semantics via
+    a store-owned injectable clock.
+    """
 
     async def claim_reservation_identity(
         self,
@@ -2317,12 +2324,12 @@ class InMemoryBudgetLedger(BudgetLedger):
     ) -> tuple[BudgetReservationRecord, ...]:
         reservation_ids = _validate_reservation_id_batch(reservation_ids)
         dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
-        marked_at = (
-            _utc_datetime(dispatched_at, "dispatched_at")
-            if dispatched_at is not None
-            else self._clock()
+        supplied_dispatched_at = (
+            None if dispatched_at is None else _utc_datetime(dispatched_at, "dispatched_at")
         )
         async with self._lock:
+            now = self._clock()
+            marked_at = now if supplied_dispatched_at is None else supplied_dispatched_at
             records: list[BudgetReservationRecord] = []
             for reservation_id in reservation_ids:
                 record = self._records.get(reservation_id)
@@ -2334,6 +2341,12 @@ class InMemoryBudgetLedger(BudgetLedger):
                     )
                 if record.dispatch_id is None and record.status != "active":
                     raise ValueError(f"Budget reservation is not active: {reservation_id}")
+                if record.dispatch_id is None and _reservation_is_expired(
+                    record,
+                    now=now,
+                    ttl_seconds=self._reservation_ttl_seconds,
+                ):
+                    raise ValueError(f"Budget reservation has expired: {reservation_id}")
                 records.append(record)
             dispatched_records = tuple(
                 (
@@ -2398,8 +2411,8 @@ class InMemoryBudgetLedger(BudgetLedger):
 
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
-        now = self._clock()
         async with self._lock:
+            now = self._clock()
             record = self._records.get(reservation_id)
             if record is None:
                 raise KeyError(f"Budget reservation not found: {reservation_id}")
@@ -2583,7 +2596,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                     record.settlement_fallback.expiration_reason
                     or _expired_reservation_reason(self._reservation_ttl_seconds)
                 ),
-                updated_at=record.settlement_fallback.settled_at,
+                updated_at=now,
             )
             reconciliation = _reconciliation_from_record(
                 released,
@@ -3767,8 +3780,8 @@ def _reservation_is_expired(
 ) -> bool:
     if ttl_seconds is None:
         return False
-    cutoff = now - timedelta(seconds=ttl_seconds)
-    return record.updated_at <= cutoff
+    cutoff = utc_duration_cutoff(now, ttl_seconds)
+    return cutoff is not None and record.updated_at <= cutoff
 
 
 _EXPIRED_RESERVATION_REASON_PREFIX = "Reservation expired:"

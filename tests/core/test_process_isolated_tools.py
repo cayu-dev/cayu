@@ -4803,12 +4803,14 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
             task_id: str,
             worker_id: str,
             *,
+            lease_expires_at,
             handoff_id: str | None = None,
             extend_seconds: int = 300,
         ) -> Task:
             task = await super().heartbeat(
                 task_id,
                 worker_id,
+                lease_expires_at=lease_expires_at,
                 handoff_id=handoff_id,
                 extend_seconds=extend_seconds,
             )
@@ -4871,6 +4873,7 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
                 session_id=f"worker-session-{task.id}",
                 task_id=task.id,
                 task_worker_id=worker_id,
+                task_lease_expires_at=task.lease_expires_at,
                 messages=[Message.text("user", "run the isolated tool")],
             )
         ):

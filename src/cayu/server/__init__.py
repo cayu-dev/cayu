@@ -28,7 +28,6 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime, timedelta
 from inspect import Parameter, signature
 from math import isfinite
 from pathlib import Path
@@ -248,12 +247,9 @@ def create_server(
         )
         continuation_request: IncompleteSessionsRecoveryRequest | None = None
         if recovery_statuses is not None:
-            inactive_before = datetime.now(UTC) - timedelta(
-                seconds=lifecycle.recovery_inactive_after_seconds
-            )
             request = IncompleteSessionsRecoveryRequest(
                 statuses=set(recovery_statuses),
-                inactive_before=inactive_before,
+                inactive_for_seconds=lifecycle.recovery_inactive_after_seconds,
                 reason="server_startup_recovery",
                 metadata={"source": "create_server"},
             )
@@ -261,8 +257,7 @@ def create_server(
             if page.next_cursor is not None:
                 continuation_request = request.model_copy(update={"cursor": page.next_cursor})
         await app.resume_pending_interruption_cascades(
-            interrupting_inactive_before=datetime.now(UTC)
-            - timedelta(seconds=lifecycle.recovery_inactive_after_seconds)
+            interrupting_inactive_for_seconds=(lifecycle.recovery_inactive_after_seconds)
         )
         return continuation_request
 
@@ -964,8 +959,7 @@ def _compose_interruption_drain_lifespan(
                     timeout_s=side_effect_startup_timeout_s,
                 )
                 await app.resume_pending_interruption_cascades(
-                    interrupting_inactive_before=datetime.now(UTC)
-                    - timedelta(seconds=recovery_inactive_after_seconds)
+                    interrupting_inactive_for_seconds=recovery_inactive_after_seconds
                 )
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state

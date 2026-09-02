@@ -3243,6 +3243,7 @@ def test_task_backed_targeted_grant_binds_task_scope(targeted_store) -> None:
                 session_id="task-scoped-targeted-grant",
                 task_id=task.id,
                 task_worker_id="targeted-worker",
+                task_lease_expires_at=claimed.lease_expires_at,
                 messages=[Message.text("user", "Review this task.")],
                 tool_grants=(
                     TargetedToolGrant(

@@ -81,6 +81,7 @@ async def handle_pr_review_task(app, task, worker_id):
         session_id=f"pr-review-{owner}-{repo}-{pr}-{short_head_sha}",
         task_id=task.id,
         task_worker_id=worker_id,
+        task_lease_expires_at=task.lease_expires_at,
         environment_name="pr-workspace",
         metadata={"repo_owner": owner, "repo_name": repo, "pr_number": pr,
                   "repo_url": task.input["repo_url"],

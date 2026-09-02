@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
+from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from typing import Any
@@ -17,6 +18,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from cayu._clock import normalize_utc_datetime
 from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -135,6 +137,7 @@ class StepRunOptions(BaseModel):
     thinking: ThinkingConfig | None = None
     task_id: str | None = None
     task_worker_id: str | None = None
+    task_lease_expires_at: datetime | None = None
 
     @field_validator("environment_name", "task_id", "task_worker_id")
     @classmethod
@@ -142,6 +145,13 @@ class StepRunOptions(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_lease_expires_at")
+    @classmethod
+    def normalize_task_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "task_lease_expires_at")
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -181,6 +191,10 @@ class StepRunOptions(BaseModel):
     def validate_task_worker_handoff(self) -> StepRunOptions:
         if self.task_worker_id is not None and self.task_id is None:
             raise ValueError("StepRunOptions.task_worker_id requires task_id.")
+        if (self.task_worker_id is None) != (self.task_lease_expires_at is None):
+            raise ValueError(
+                "StepRunOptions.task_worker_id and task_lease_expires_at must be supplied together."
+            )
         return self
 
 
@@ -765,6 +779,7 @@ async def _run_step(
         thinking=opts.thinking,
         task_id=opts.task_id,
         task_worker_id=opts.task_worker_id,
+        task_lease_expires_at=opts.task_lease_expires_at,
         parent_session_id=parent_session_id,
         causal_budget_id=causal_budget_id,
     )

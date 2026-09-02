@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -648,7 +647,7 @@ async def test_openai_background_generic_stream_error_remains_reconnectable() ->
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     pending = await store.load(session_id)
@@ -715,7 +714,7 @@ async def test_rejected_terminal_event_cannot_self_classify_provider_status() ->
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 
@@ -1526,7 +1525,7 @@ async def test_openai_background_worker_loss_recovers_without_resubmission(
     recovered = await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 
@@ -1612,7 +1611,7 @@ async def test_openai_background_recovers_hosted_tool_search_authority_atomicall
     recovered = await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 
@@ -1792,7 +1791,7 @@ async def test_openai_background_reconstructs_retained_hosted_replay_authority()
     recovered = await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 
@@ -1862,7 +1861,7 @@ async def test_openai_background_recovery_does_not_leave_late_terminal_state_pen
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     with pytest.raises(ModelCompletionManualRecoveryRequired):
@@ -1960,7 +1959,7 @@ async def test_openai_background_protocol_failure_maps_to_malformed_recovery(
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 
@@ -1997,7 +1996,7 @@ async def test_openai_background_lost_start_acknowledgement_stays_ambiguous() ->
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 
@@ -2044,7 +2043,7 @@ async def test_openai_background_terminal_commit_acknowledgement_replays_exactly
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     await app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
@@ -2089,7 +2088,7 @@ async def test_openai_background_malformed_terminal_requires_typed_resolution() 
     recovered = await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
 

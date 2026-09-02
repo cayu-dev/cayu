@@ -745,10 +745,28 @@ class _FenceOnCancellationRequestStore(InMemorySessionStore):
             fenced = await self.fence_stalled_run(
                 session_id,
                 statuses={SessionStatus.INTERRUPTING},
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
             assert fenced is not None
         return await super().publish_checkpoint_and_events(session_id, **kwargs)
+
+    async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
+        events = kwargs["events"]
+        if (
+            any(event.type is EventType.PROVIDER_OPERATION_CANCEL_REQUESTED for event in events)
+            and not self.fenced
+        ):
+            self.fenced = True
+            fenced = await self.fence_stalled_run(
+                session_id,
+                statuses={SessionStatus.INTERRUPTING},
+                inactive_for_seconds=0,
+            )
+            assert fenced is not None
+        return await super().publish_checkpoint_and_events_with_store_time(
+            session_id,
+            **kwargs,
+        )
 
 
 class _CommitThenRaiseInterruptionClaimStore(InMemorySessionStore):
@@ -771,13 +789,23 @@ class _CommitThenRaiseInterruptionClaimStore(InMemorySessionStore):
 class _CrashAfterCancellationEventStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
 
-    def __init__(self, crash_after: EventType) -> None:
-        super().__init__()
+    def __init__(self, crash_after: EventType, *, ownership_clock=None) -> None:
+        super().__init__(ownership_clock=ownership_clock)
         self.crash_after = crash_after
         self.crashed = False
 
     async def publish_checkpoint_and_events(self, session_id: str, **kwargs):
         result = await super().publish_checkpoint_and_events(session_id, **kwargs)
+        if not self.crashed and any(event.type is self.crash_after for event in kwargs["events"]):
+            self.crashed = True
+            raise _SimulatedProcessLoss("worker died after durable cancellation claim")
+        return result
+
+    async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
+        result = await super().publish_checkpoint_and_events_with_store_time(
+            session_id,
+            **kwargs,
+        )
         if not self.crashed and any(event.type is self.crash_after for event in kwargs["events"]):
             self.crashed = True
             raise _SimulatedProcessLoss("worker died after durable cancellation claim")
@@ -802,6 +830,19 @@ class _FailCancellationClaimHeartbeatStore(InMemorySessionStore):
             raise OSError("transient cancellation-claim heartbeat failure")
         return await super().publish_checkpoint_and_events(session_id, **kwargs)
 
+    async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
+        events = kwargs["events"]
+        if any(event.type is EventType.PROVIDER_OPERATION_CANCEL_REQUESTED for event in events):
+            self.fail_heartbeat = True
+        elif self.fail_heartbeat and not events:
+            self.fail_heartbeat = False
+            self.heartbeat_failed.set()
+            raise OSError("transient cancellation-claim heartbeat failure")
+        return await super().publish_checkpoint_and_events_with_store_time(
+            session_id,
+            **kwargs,
+        )
+
 
 class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
@@ -812,6 +853,39 @@ class _DelayCancellationResolutionAcknowledgementStore(InMemorySessionStore):
             event.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED for event in kwargs["events"]
         ):
             await asyncio.sleep(0.03)
+        return result
+
+    async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
+        result = await super().publish_checkpoint_and_events_with_store_time(
+            session_id,
+            **kwargs,
+        )
+        if any(
+            event.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED for event in kwargs["events"]
+        ):
+            await asyncio.sleep(0.03)
+        return result
+
+
+class _DelayCancellationClaimAcknowledgementStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_committed = asyncio.Event()
+        self.release_acknowledgement = asyncio.Event()
+
+    async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
+        result = await super().publish_checkpoint_and_events_with_store_time(
+            session_id,
+            **kwargs,
+        )
+        if any(
+            event.type is EventType.PROVIDER_OPERATION_CANCEL_REQUESTED
+            for event in kwargs["events"]
+        ):
+            self.claim_committed.set()
+            await self.release_acknowledgement.wait()
         return result
 
 
@@ -1228,7 +1302,7 @@ async def _prepare_explicit_fallback_resolution(
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     interrupted = await store.load(session_id)
@@ -1302,7 +1376,7 @@ def test_pending_provider_resolution_rejects_conflicting_source_stage(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -1360,7 +1434,7 @@ def test_pending_fail_resolution_rejects_conflicting_terminal_event() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -1426,7 +1500,7 @@ def test_pending_fail_resolution_rejects_conflicting_terminal_profile(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -1510,7 +1584,7 @@ async def stage_provider_resolution_process_loss(
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     interrupted = await store.load(session_id)
@@ -1616,7 +1690,7 @@ async def assert_provider_resolution_process_loss_recovery(
                 SessionStatus.RUNNING,
                 SessionStatus.FAILED,
             },
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     recovered = next(result for result in recovered_page.results if result.session_id == session_id)
@@ -1648,7 +1722,7 @@ async def assert_provider_resolution_process_loss_recovery(
     replay_page = await app.recover_incomplete_sessions(
         IncompleteSessionsRecoveryRequest(
             statuses={SessionStatus.COMPLETED, SessionStatus.FAILED},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     assert not replay_page.results
@@ -1775,7 +1849,7 @@ async def assert_offline_provider_operation_recovery(store: SessionStore) -> Non
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id="offline-completed",
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     await app.recover_incomplete_session(
@@ -1834,7 +1908,7 @@ def test_offline_provider_operation_recovery_rejects_changed_context_before_retr
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id="offline-context-profile-drift",
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1873,7 +1947,7 @@ async def assert_terminal_session_fails_closed_with_active_provider_operation(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -1903,7 +1977,7 @@ async def assert_terminal_session_fails_closed_without_active_provider(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -1941,7 +2015,7 @@ def test_unregistered_agent_recovery_leaves_terminal_interaction_and_stage_untou
             page = await app.recover_incomplete_sessions(
                 IncompleteSessionsRecoveryRequest(
                     statuses={SessionStatus.COMPLETED},
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
             assert len(page.results) == 1
@@ -1950,7 +2024,7 @@ def test_unregistered_agent_recovery_leaves_terminal_interaction_and_stage_untou
             result = await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -1983,7 +2057,7 @@ async def assert_pending_provider_operation_later_completes(
     await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     pending = await store.load(session_id)
@@ -2045,7 +2119,7 @@ def test_terminal_provider_operation_requires_explicit_resolution_without_redisp
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -2118,7 +2192,7 @@ def test_invalid_provider_retrieval_outcomes_require_typed_resolution(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -2204,7 +2278,7 @@ def test_partial_progress_reconnect_failures_require_typed_resolution(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -2311,7 +2385,7 @@ def test_provider_recovery_treats_child_cancellation_as_unavailable(
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -2384,7 +2458,7 @@ def test_malformed_start_recovery_preserves_typed_outcome_when_close_fails(
             runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -2472,7 +2546,7 @@ def test_malformed_start_recovery_publication_preserves_cleanup_evidence(
             await runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -2528,7 +2602,7 @@ def test_malformed_reconnect_preserves_typed_outcome_when_close_is_child_cancell
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -2612,7 +2686,7 @@ def test_reconnect_event_failure_remains_authoritative_when_close_fails(
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -2719,7 +2793,7 @@ def test_recovery_required_publication_preserves_sanitized_cleanup_evidence(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -2795,7 +2869,7 @@ def test_exact_start_recovery_ignores_child_only_close_cancellation_after_public
             runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -2859,7 +2933,7 @@ def test_exact_start_recovery_preserves_real_task_cancellation_during_close(
             runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -2930,7 +3004,7 @@ def test_exact_start_recovery_does_not_redeliver_cancellation_from_event_fan_out
             runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3004,7 +3078,7 @@ def test_exact_start_recovery_preserves_publication_and_cleanup_failures(
             await runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -3078,7 +3152,7 @@ def test_exact_start_recovery_preserves_cleanup_failure_under_caller_cancellatio
             runtime().recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3133,7 +3207,7 @@ def test_provider_recovery_preserves_real_task_cancellation(
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3192,7 +3266,7 @@ def test_provider_reconnect_preserves_cancellation_suppressed_by_adapter_return(
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3281,7 +3355,7 @@ def test_provider_recovery_preserves_cancellation_before_malformed_return_classi
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3331,7 +3405,7 @@ def test_provider_recovery_preserves_mixed_failure_sibling_under_caller_cancella
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3394,7 +3468,7 @@ def test_provider_recovery_preserves_fatal_signal_under_caller_cancellation(
             app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
         )
@@ -3528,7 +3602,7 @@ def test_sqlite_fallback_pre_dispatch_failure_remains_recoverable_after_restart(
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
             interrupted = await store.load(session_id)
@@ -3575,7 +3649,7 @@ def test_sqlite_fallback_pre_dispatch_failure_remains_recoverable_after_restart(
             recovered = await restarted.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -3637,7 +3711,7 @@ def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_ne
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -3748,7 +3822,7 @@ def test_fallback_retry_without_frozen_exposure_fails_closed_across_recovery() -
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -3803,7 +3877,7 @@ def test_fallback_retry_rejects_frozen_exposure_outside_durable_ceiling() -> Non
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -3866,7 +3940,7 @@ def test_closing_fallback_before_dispatch_preserves_recoverable_disposition() ->
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -3926,7 +4000,7 @@ def test_cancelling_fallback_before_dispatch_preserves_recoverable_disposition()
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -4012,7 +4086,7 @@ def test_concurrent_exact_fallback_replay_does_not_start_a_second_transition(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert (
@@ -4043,7 +4117,7 @@ def test_concurrent_exact_fail_replay_observes_in_progress_terminalization(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -4139,7 +4213,7 @@ def test_provider_failure_replay_runs_hooks_before_retiring_disposition(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -4223,6 +4297,7 @@ def test_same_worker_new_handoff_continues_fallback_after_owner_loss(
                     session_id="fallback-session",
                     task_id=original.id,
                     task_worker_id="original-worker",
+                    task_lease_expires_at=original.lease_expires_at,
                     messages=[Message.text("user", "start ambiguous provider work")],
                 )
             ):
@@ -4230,7 +4305,7 @@ def test_same_worker_new_handoff_continues_fallback_after_owner_loss(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="fallback-session",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert recovered.status is SessionStatus.INTERRUPTED
@@ -4339,6 +4414,7 @@ def test_same_worker_new_handoff_takes_over_pre_execution_failure_claim(
                     session_id="failure-session",
                     task_id=original.id,
                     task_worker_id="original-worker",
+                    task_lease_expires_at=original.lease_expires_at,
                     messages=[Message.text("user", "start ambiguous provider work")],
                 )
             ):
@@ -4346,7 +4422,7 @@ def test_same_worker_new_handoff_takes_over_pre_execution_failure_claim(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="failure-session",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await app.session_store.load("failure-session")
@@ -4675,7 +4751,7 @@ def test_fallback_limit_outcome_recovers_marker_clear_acknowledgement_loss(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -4828,7 +4904,7 @@ def test_successful_provider_resolution_redacts_audit_fields_before_persistence_
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -4949,7 +5025,7 @@ def test_provider_resolved_event_contract_survives_short_schema_secret_collision
         await recovery_app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -5056,7 +5132,7 @@ def test_real_provider_recovery_required_event_survives_schema_secret_collision(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -5102,7 +5178,7 @@ def test_provider_resolution_rejects_secret_bearing_audit_keys_before_persistenc
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -5187,7 +5263,7 @@ def test_provider_resolution_rejects_legacy_store_before_any_publication() -> No
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -5246,7 +5322,7 @@ def test_explicit_fail_resolution_terminalizes_without_provider_redispatch() -> 
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -5392,7 +5468,7 @@ def test_provider_resolution_stale_owner_cannot_overwrite_successor_publication(
                 successor = await store.fence_stalled_run(
                     session_id,
                     statuses={SessionStatus.INTERRUPTED},
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
                 assert successor is not None
                 assert successor.run_epoch == interrupted.run_epoch + 1
@@ -5460,7 +5536,7 @@ def test_existing_provider_resolution_replays_after_store_capability_is_unavaila
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -5551,7 +5627,7 @@ def test_legacy_resolution_replay_rejects_an_unreleased_source_stage(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -5666,7 +5742,7 @@ def test_exact_start_idempotency_recovers_ambiguous_acceptance_without_new_reque
         result = await runtime().recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -5741,7 +5817,7 @@ def test_unsupported_start_process_loss_requires_explicit_resolution_after_resta
             await runtime(store).recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -5839,6 +5915,7 @@ def test_accepted_attached_task_provider_disposition_awaits_typed_continuation(
                     session_id="provider-task-session",
                     task_id=claimed.id,
                     task_worker_id="prior-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
                     messages=[Message.text("user", "start ambiguous provider work")],
                 )
             ):
@@ -5847,7 +5924,7 @@ def test_accepted_attached_task_provider_disposition_awaits_typed_continuation(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="provider-task-session",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert recovered.status is SessionStatus.INTERRUPTED
@@ -5899,7 +5976,7 @@ def test_accepted_attached_task_provider_disposition_awaits_typed_continuation(
         generic_recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="provider-task-session",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         retained_session = await app.session_store.load("provider-task-session")
@@ -5966,6 +6043,7 @@ def test_attached_task_provider_failure_terminalizes_once_and_replays(
                     session_id="provider-task-session",
                     task_id=claimed.id,
                     task_worker_id="prior-worker",
+                    task_lease_expires_at=claimed.lease_expires_at,
                     messages=[Message.text("user", "start ambiguous provider work")],
                 )
             ):
@@ -5974,7 +6052,7 @@ def test_attached_task_provider_failure_terminalizes_once_and_replays(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="provider-task-session",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert recovered.status is SessionStatus.INTERRUPTED
@@ -6114,7 +6192,7 @@ def test_workerless_provider_failure_replays_after_task_terminalization_loss(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="workerless-provider-session",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert recovered.status is SessionStatus.INTERRUPTED
@@ -6178,7 +6256,7 @@ def test_workerless_provider_failure_replays_after_task_terminalization_loss(
             replay_result = await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id="workerless-provider-session",
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
             assert replay_result.status is SessionStatus.FAILED
@@ -6276,7 +6354,7 @@ async def assert_budgeted_offline_provider_operation_recovery(
 
     request = IncompleteSessionRecoveryRequest(
         session_id="offline-budget-recovery",
-        inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+        inactive_for_seconds=0,
     )
     if expect_settlement_acknowledgement_loss:
         with pytest.raises(RuntimeError, match="acknowledgement lost"):
@@ -6427,7 +6505,7 @@ async def assert_offline_provider_operation_reuses_run_limit_accounting(
     recovery = await app.recover_incomplete_session(
         IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
     )
     assert recovery.pending_approval_id is not None
@@ -6639,7 +6717,7 @@ def test_operator_resolution_conservatively_settles_original_provider_reservatio
         await runtime().recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -6737,7 +6815,7 @@ def test_concurrent_exact_resolution_replays_one_budget_settlement() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -6793,7 +6871,7 @@ def test_resolution_does_not_suppress_unrelated_grouped_terminalization_failure(
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -6832,7 +6910,7 @@ def test_resolution_does_not_suppress_unrelated_grouped_terminalization_failure(
         recovered = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -6879,7 +6957,7 @@ def test_operator_resolution_recovers_lost_budget_settlement_acknowledgement() -
         await runtime().recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         interrupted = await store.load(session_id)
@@ -6959,7 +7037,7 @@ def test_competing_provider_recovery_workers_settle_original_reservation_once() 
         provider.adapter.status = ProviderOperationStatus.COMPLETED
         request = IncompleteSessionRecoveryRequest(
             session_id=session_id,
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
 
         results = await asyncio.gather(
@@ -7340,7 +7418,7 @@ def test_cancellation_claim_blocks_epoch_takeover_during_provider_call(
         fenced = await store.fence_stalled_run(
             session_id,
             statuses={SessionStatus.INTERRUPTING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is None
         during = await store.load(session_id)
@@ -7365,7 +7443,7 @@ def test_cancellation_claim_heartbeat_failure_stops_the_active_owner(
     monkeypatch.setattr(
         model_step_executor,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
-        timedelta(milliseconds=50),
+        timedelta(milliseconds=500),
     )
     monkeypatch.setattr(
         model_step_executor,
@@ -7398,13 +7476,61 @@ def test_cancellation_claim_heartbeat_failure_stops_the_active_owner(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(interrupt_task, timeout=1)
 
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(0.51)
         fenced = await store.fence_stalled_run(
             session_id,
             statuses={SessionStatus.INTERRUPTING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is not None
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_claim_acknowledgement_expiry_prevents_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        model_step_executor,
+        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
+        timedelta(milliseconds=50),
+    )
+    monkeypatch.setattr(
+        model_step_executor,
+        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
+        0.005,
+    )
+
+    async def scenario() -> None:
+        store = _DelayCancellationClaimAcknowledgementStore()
+        provider = _CancellableOfflineOperationProvider()
+        session_id = "provider-cancellation-delayed-claim-ack"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        async def interrupt() -> list[Event]:
+            return [
+                event
+                async for event in app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id=session_id,
+                        reason="delay cancellation claim acknowledgement",
+                    )
+                )
+            ]
+
+        interrupt_task = asyncio.create_task(interrupt())
+        await asyncio.wait_for(store.claim_committed.wait(), timeout=1)
+        await asyncio.sleep(0.06)
+        store.release_acknowledgement.set()
+        with pytest.raises(
+            RuntimeError,
+            match="claim acknowledgement consumed its lease",
+        ):
+            await asyncio.wait_for(interrupt_task, timeout=1)
+        assert provider.adapter.cancel_calls == []
 
     asyncio.run(scenario())
 
@@ -7415,7 +7541,7 @@ def test_successful_claim_release_does_not_trigger_heartbeat_ownership_loss(
     monkeypatch.setattr(
         model_step_executor,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
-        timedelta(milliseconds=50),
+        timedelta(milliseconds=500),
     )
     monkeypatch.setattr(
         model_step_executor,
@@ -7665,7 +7791,7 @@ def test_cancellation_claim_blocks_epoch_takeover_during_budget_settlement() -> 
         fenced = await store.fence_stalled_run(
             session_id,
             statuses={SessionStatus.INTERRUPTING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is None
         during = await store.load(session_id)
@@ -7728,7 +7854,7 @@ def test_live_cancellation_claim_blocks_takeover_through_budget_settlement() -> 
         fenced = await store.fence_stalled_run(
             session_id,
             statuses={SessionStatus.INTERRUPTING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is None
         during = await store.load(session_id)
@@ -7772,7 +7898,11 @@ def test_expired_cancellation_claim_allows_worker_loss_takeover(
         def fixed_clock() -> datetime:
             return datetime(2020, 1, 1, tzinfo=UTC)
 
-        store = _CrashAfterCancellationEventStore(crash_after)
+        store_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        store = _CrashAfterCancellationEventStore(
+            crash_after,
+            ownership_clock=lambda: store_now[0],
+        )
         session_id = f"expired-cancellation-claim-{crash_after.value}"
         if crash_after is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED:
             provider = _CancellableBudgetedOfflineOperationProvider()
@@ -7820,11 +7950,11 @@ def test_expired_cancellation_claim_allows_worker_loss_takeover(
             ):
                 pass
 
-        await asyncio.sleep(0.02)
+        store_now[0] += timedelta(milliseconds=20)
         recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         assert recovery.status is SessionStatus.INTERRUPTED
@@ -7905,7 +8035,7 @@ def test_recovery_rejects_an_operation_after_provider_output_was_accepted() -> N
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id="offline-partial-output",
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -7942,7 +8072,7 @@ def test_offline_recovery_preserves_request_billing_identity() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="offline-billing-identity",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -7983,7 +8113,7 @@ def test_offline_recovery_honors_hidden_thinking_transcript_policy() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="offline-hidden-thinking",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -8021,7 +8151,7 @@ def test_offline_recovery_accepts_hidden_thinking_only_completion() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         await app.recover_incomplete_session(
@@ -8079,7 +8209,7 @@ def test_offline_tool_call_recovery_rejects_missing_exposure_authority() -> None
             await app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(
                     session_id=session_id,
-                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                    inactive_for_seconds=0,
                 )
             )
 
@@ -8134,7 +8264,7 @@ def test_offline_recovery_restores_structured_output_tool_contract() -> None:
         result = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="offline-structured-output",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -8193,7 +8323,7 @@ def test_offline_recovery_preserves_an_ordinary_tool_call_during_structured_outp
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 
@@ -8268,7 +8398,7 @@ def test_queued_operation_remains_recoverable_without_redispatch() -> None:
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="offline-queued",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
         for _ in range(4):
@@ -8336,7 +8466,7 @@ def test_competing_offline_recovery_workers_converge_on_one_completion() -> None
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         request = IncompleteSessionRecoveryRequest(
             session_id="competing-offline-recovery",
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
 
         await asyncio.gather(

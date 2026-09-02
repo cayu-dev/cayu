@@ -38,6 +38,7 @@ from cayu import (
     TaskCreate,
     TaskQuery,
     WriteFileTool,
+    complete_managed_task,
     run_task_worker,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -265,10 +266,11 @@ async def run_demo(base_root: Path) -> DemoResult:
                 payload={"artifact": "result.txt"},
             )
             return
-        await task_store.complete_task(
-            task.id,
+        await complete_managed_task(
+            task_store,
+            task,
+            worker_id,
             {"artifact": "result.txt", "content": output, "verified": True},
-            worker_id=worker_id,
         )
 
     handled = await run_task_worker(

@@ -66,10 +66,15 @@ def _sha256(value: str, field_name: str) -> str:
     return value
 
 
-def _model_sha256(value: BaseModel, field_name: str) -> str:
+def _model_sha256(
+    value: BaseModel,
+    field_name: str,
+    *,
+    exclude: set[str] | None = None,
+) -> str:
     return sha256(
         canonical_durable_json_bytes(
-            value.model_dump(mode="json", warnings=False),
+            value.model_dump(mode="json", warnings=False, exclude=exclude),
             field_name,
         )
     ).hexdigest()
@@ -105,6 +110,7 @@ class WorkAttemptExecutionRequest(BaseModel):
     interaction_id: str
     worker_id: str
     task_id: str | None = None
+    task_lease_expires_at: datetime | None = None
     predecessor_admission_id: str | None = None
     generation: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_MAX_GENERATIONS)
     lease_seconds: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS)
@@ -129,6 +135,13 @@ class WorkAttemptExecutionRequest(BaseModel):
         if value is None:
             return None
         return validate_work_completion_linked_id(value, "task_id")
+
+    @field_validator("task_lease_expires_at")
+    @classmethod
+    def normalize_task_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "task_lease_expires_at")
 
 
 class WorkAttemptClaimRenewalRequest(BaseModel):
@@ -177,6 +190,7 @@ class WorkAttemptAdmissionPrepare(BaseModel):
     session_id: str
     interaction_id: str
     worker_id: str
+    task_lease_expires_at: datetime | None = None
     execution_owner_id: str
     generation: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_MAX_GENERATIONS)
     lease_seconds: StrictInt = Field(ge=1, le=WORK_ATTEMPT_ADMISSION_LEASE_MAX_SECONDS)
@@ -206,6 +220,13 @@ class WorkAttemptAdmissionPrepare(BaseModel):
     @classmethod
     def validate_linked_identity(cls, value: str, info) -> str:
         return validate_work_completion_linked_id(value, info.field_name)
+
+    @field_validator("task_lease_expires_at")
+    @classmethod
+    def normalize_task_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "task_lease_expires_at")
 
     @field_validator("source_request_sha256", "source_execution_profile_fingerprint")
     @classmethod
@@ -718,6 +739,23 @@ def work_attempt_admission_prepare_sha256(value: WorkAttemptAdmissionPrepare) ->
     return _model_sha256(copy_work_attempt_admission_prepare(value), "work_attempt_admission")
 
 
+def work_attempt_admission_prepare_matches_sha256(
+    value: WorkAttemptAdmissionPrepare,
+    candidate_sha256: str,
+) -> bool:
+    """Authenticate current and pre-lease admission preparation receipts."""
+
+    copied = copy_work_attempt_admission_prepare(value)
+    return candidate_sha256 in {
+        _model_sha256(copied, "work_attempt_admission"),
+        _model_sha256(
+            copied,
+            "work_attempt_admission",
+            exclude={"task_lease_expires_at"},
+        ),
+    }
+
+
 def work_attempt_execution_claim_request_sha256(
     value: WorkAttemptExecutionClaimRequest,
 ) -> str:
@@ -815,7 +853,10 @@ def require_work_attempt_preparation_result(
     if (
         admission.state is not WorkAttemptAdmissionState.PREPARING
         or admission.admission_id != request.admission_id
-        or admission.prepare_request_sha256 != work_attempt_admission_prepare_sha256(request)
+        or not work_attempt_admission_prepare_matches_sha256(
+            request,
+            admission.prepare_request_sha256,
+        )
         or admission.attempt_id != request.attempt_id
         or admission.task_id != request.task_id
         or admission.session_id != request.session_id
@@ -1090,6 +1131,7 @@ __all__ = [
     "require_work_attempt_execution_claim_result",
     "require_work_attempt_preparation_result",
     "require_work_attempt_recovery_activation_result",
+    "work_attempt_admission_prepare_matches_sha256",
     "work_attempt_admission_prepare_sha256",
     "work_attempt_execution_claim_request_sha256",
     "work_attempt_recovery_session_authority",

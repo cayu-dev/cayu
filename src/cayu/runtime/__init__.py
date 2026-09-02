@@ -687,6 +687,8 @@ from cayu.runtime.sessions import (
     SessionTopologyNode,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
+    StoreTimeCheckpointTransform,
+    StoreTimeSessionOperationTransform,
     TerminalPublicationMarker,
     TerminalSessionEvidence,
     TerminalSessionEvidenceBoundary,
@@ -730,7 +732,12 @@ from cayu.runtime.structured_output import (
     StructuredOutputValidation,
 )
 from cayu.runtime.targeted_tool_projection import TargetedToolMode
-from cayu.runtime.task_worker import TaskHandlerOutcome, run_task_worker
+from cayu.runtime.task_worker import (
+    TaskHandlerOutcome,
+    complete_managed_task,
+    fail_managed_task,
+    run_task_worker,
+)
 from cayu.runtime.tasks import (
     CompletionDecisionApplicationReceipt,
     InMemoryTaskStore,
@@ -1597,6 +1604,8 @@ __all__ = [
     "StopDecision",
     "StopLimit",
     "StoreManifest",
+    "StoreTimeCheckpointTransform",
+    "StoreTimeSessionOperationTransform",
     "StructuredOutputError",
     "StructuredOutputResult",
     "StructuredOutputSpec",
@@ -1811,6 +1820,7 @@ __all__ = [
     "checkpoint_root_field_projection_from_storage",
     "classify_retryable_error",
     "compare_paired_cost_quality",
+    "complete_managed_task",
     "completion_gap_fingerprint",
     "completion_result_sha256",
     "copy_context_counting_config",
@@ -1849,6 +1859,7 @@ __all__ = [
     "estimate_usage_session_cost_breakdown",
     "execution_profile_egress_authority_change",
     "execution_profile_with_egress_authority",
+    "fail_managed_task",
     "first_reached_limit",
     "has_run_limits",
     "inspect_provider_operation",

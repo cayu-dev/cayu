@@ -49,6 +49,7 @@ from tests.workspaces.test_durable_local_workspace_branches import (
 )
 
 from cayu import ExecutionProfileComponentClass, LocalArtifactStore
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import Event, EventType, Message
 from cayu.providers import ProviderOperationStatus
 from cayu.runtime import (
@@ -64,6 +65,7 @@ from cayu.runtime import (
     SessionExecutionSource,
     SessionIdentity,
     SessionLineageQuery,
+    SessionOperationPublication,
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
@@ -2042,7 +2044,7 @@ def test_postgres_session_store_fences_stale_run_writes(postgres_dsn):
         fenced = await store.fence_stalled_run(
             "sess_pg_fenced",
             statuses={SessionStatus.RUNNING},
-            inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            inactive_for_seconds=0,
         )
         assert fenced is not None
         assert fenced.run_epoch == 2
@@ -2057,6 +2059,270 @@ def test_postgres_session_store_fences_stale_run_writes(postgres_dsn):
         release_stale_writer.set()
         await task
         assert await store.load_events("sess_pg_fenced") == []
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_uses_database_time_for_stalled_run_takeover(
+    postgres_dsn,
+):
+    async def ops(store):
+        import psycopg
+
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        session_id = "sess_pg_store_time_takeover"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "database time owns expiry")],
+            ),
+            identity=_identity(),
+        )
+        running = await store.transition_status(
+            session_id,
+            from_statuses={SessionStatus.PENDING},
+            to_status=SessionStatus.RUNNING,
+        )
+
+        live_page = await store.list_sessions(
+            SessionQuery(
+                status=SessionStatus.RUNNING,
+                inactive_for_seconds=60,
+            )
+        )
+        assert live_page.sessions == []
+        assert (
+            await store.list_sessions(
+                SessionQuery(
+                    status=SessionStatus.RUNNING,
+                    inactive_for_seconds=MAX_DURABLE_JSON_INTEGER,
+                )
+            )
+        ).sessions == []
+        assert (
+            await store.fence_stalled_run(
+                session_id,
+                statuses={SessionStatus.RUNNING},
+                inactive_for_seconds=60,
+            )
+            is None
+        )
+        assert (
+            await store.fence_stalled_run(
+                session_id,
+                statuses={SessionStatus.RUNNING},
+                inactive_for_seconds=MAX_DURABLE_JSON_INTEGER,
+            )
+            is None
+        )
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE cayu_sessions "
+                    "SET last_activity_at = clock_timestamp() - interval '61 seconds' "
+                    "WHERE id = %s",
+                    (session_id,),
+                )
+            await connection.commit()
+
+        reservation_times: list[datetime] = []
+        reserved = await store.reserve_stalled_run_recovery(
+            session_id,
+            statuses={SessionStatus.RUNNING},
+            inactive_for_seconds=60,
+            checkpoint_transform=lambda _session, checkpoint, observed_at: (
+                reservation_times.append(observed_at)
+                or {
+                    **({} if checkpoint is None else checkpoint),
+                    "database_recovery_reserved_at": observed_at.isoformat(),
+                }
+            ),
+        )
+        assert reserved is not None
+        assert reserved.run_epoch == running.run_epoch
+        assert len(reservation_times) == 1
+
+        contender = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            results = await asyncio.gather(
+                store.fence_stalled_run(
+                    session_id,
+                    statuses={SessionStatus.RUNNING},
+                    inactive_for_seconds=60,
+                ),
+                contender.fence_stalled_run(
+                    session_id,
+                    statuses={SessionStatus.RUNNING},
+                    inactive_for_seconds=60,
+                ),
+            )
+        finally:
+            await contender.close()
+
+        winners = [result for result in results if result is not None]
+        assert len(winners) == 1
+        assert winners[0].run_epoch == running.run_epoch + 1
+        assert abs((winners[0].last_activity_at - reservation_times[0]).total_seconds()) < 5
+
+        with pytest.raises(SessionRunFenced, match="no longer owns"):
+            await store.checkpoint(session_id, {"stale": True})
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_session_store_rejects_expired_recovery_claim_epoch_transfer(
+    postgres_dsn,
+):
+    async def ops(store):
+        session_id = "sess_pg_expired_recovery_claim_promotion"
+        created = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "expired claim cannot promote")],
+            ),
+            identity=_identity(),
+        )
+        claimed_at = datetime(2000, 1, 1, tzinfo=UTC)
+        await store.checkpoint(
+            session_id,
+            {
+                "incomplete_session_recovery_claim": {
+                    "version": 1,
+                    "claim_id": "expired-postgres-promotion",
+                    "claimed_at": claimed_at.isoformat(),
+                    "claim_expires_at": (claimed_at + timedelta(minutes=5)).isoformat(),
+                }
+            },
+        )
+
+        def preserve_checkpoint(_session, checkpoint):
+            assert checkpoint is not None
+            return checkpoint
+
+        assert (
+            await store.fence_stalled_run(
+                session_id,
+                statuses={SessionStatus.PENDING},
+                inactive_for_seconds=0,
+            )
+            is None
+        )
+        with pytest.raises(SessionRunFenced, match="expired before run ownership transfer"):
+            await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+        with pytest.raises(SessionRunFenced, match="expired before run ownership transfer"):
+            await store.fence_run_and_transform_checkpoint(
+                session_id,
+                statuses={SessionStatus.PENDING},
+                checkpoint_transform=preserve_checkpoint,
+            )
+        with pytest.raises(SessionRunFenced, match="expired before run ownership transfer"):
+            await store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=preserve_checkpoint,
+            )
+        unchanged = await store.load(session_id)
+        assert unchanged is not None
+        assert unchanged.run_epoch == created.run_epoch
+        assert unchanged.status is SessionStatus.PENDING
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_store_time_checkpoint_noop_preserves_activity(postgres_dsn):
+    async def ops(store):
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pg_store_time_noop",
+                messages=[Message.text("user", "no-op")],
+            ),
+            identity=_identity(),
+        )
+        await store.checkpoint(session.id, {"seed": True})
+        before_session = await store.load(session.id)
+        before_checkpoint = await store.load_checkpoint(session.id)
+        assert before_session is not None
+        assert before_checkpoint == {"seed": True}
+
+        observed_times: list[datetime] = []
+        await store.transform_checkpoint_with_store_time(
+            session.id,
+            lambda _session, _checkpoint, observed_at: observed_times.append(observed_at) or None,
+        )
+
+        assert len(observed_times) == 1
+        assert await store.load(session.id) == before_session
+        assert await store.load_checkpoint(session.id) == before_checkpoint
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_store_time_session_operation_samples_database_commit_time(postgres_dsn):
+    async def ops(store):
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_pg_store_time_session_operation",
+                messages=[Message.text("user", "database time owns the operation")],
+            ),
+            identity=_identity(),
+        )
+        operation_key = "store-time-operation"
+        transform_times: list[datetime] = []
+        commit_times: list[datetime] = []
+
+        def operation_transform(
+            _session,
+            checkpoint,
+            _record,
+            observed_at: datetime,
+        ) -> SessionOperationPublication:
+            transform_times.append(observed_at)
+            return SessionOperationPublication(
+                checkpoint={
+                    **({} if checkpoint is None else checkpoint),
+                    "operation_observed_at": observed_at.isoformat(),
+                },
+                operation_records={operation_key: {"observed_at": observed_at.isoformat()}},
+            )
+
+        await store.publish_session_operation_guarded_with_store_time(
+            session.id,
+            idempotency_key=operation_key,
+            operation_transform=operation_transform,
+            commit_guard=lambda: None,
+            commit_time_guard=commit_times.append,
+            events=[],
+        )
+
+        assert len(transform_times) == 1
+        assert len(commit_times) == 1
+        assert commit_times[0] >= transform_times[0]
+        updated_session = await store.load(session.id)
+        assert updated_session is not None
+        assert updated_session.last_activity_at == commit_times[0]
+        checkpoint = await store.load_checkpoint(session.id)
+        assert checkpoint is not None
+        assert checkpoint["operation_observed_at"] == transform_times[0].isoformat()
+        assert await store.load_session_operation(session.id, operation_key) == {
+            "observed_at": transform_times[0].isoformat()
+        }
 
     _run(postgres_dsn, ops)
 
@@ -3421,6 +3687,78 @@ def test_postgres_session_store_delete_session_cascades_and_is_idempotent(postgr
         await store.create(_lifecycle_request("sess_drop"), identity=_identity())
         assert await store.load("sess_drop") is not None
         await store.delete_session("sess_never_existed")
+
+    _run(postgres_dsn, ops)
+
+
+@pytest.mark.parametrize("operation", ["status", "event", "transcript"])
+def test_postgres_session_activity_samples_database_time_after_row_lock(
+    postgres_dsn,
+    operation: str,
+) -> None:
+    async def ops(store):
+        import psycopg
+
+        session_id = f"sess_pg_activity_after_lock_{operation}"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "database time follows the row lock")],
+            ),
+            identity=_identity(),
+        )
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                    (session_id,),
+                )
+                assert await cursor.fetchone() == (1,)
+
+                if operation == "status":
+                    mutation = asyncio.create_task(
+                        store.transition_status(
+                            session_id,
+                            from_statuses={SessionStatus.PENDING},
+                            to_status=SessionStatus.RUNNING,
+                        )
+                    )
+                elif operation == "event":
+                    mutation = asyncio.create_task(
+                        store.append_events(
+                            session_id,
+                            [
+                                Event(
+                                    id=f"event-after-row-lock-{operation}",
+                                    type=EventType.MODEL_TEXT_DELTA,
+                                    session_id=session_id,
+                                    payload={"delta": "after lock"},
+                                )
+                            ],
+                        )
+                    )
+                else:
+                    mutation = asyncio.create_task(
+                        store.append_transcript_messages(
+                            session_id,
+                            [Message.text("assistant", "after lock")],
+                        )
+                    )
+
+                await asyncio.sleep(0.1)
+                assert mutation.done() is False
+                await cursor.execute("SELECT clock_timestamp()")
+                release_time_row = await cursor.fetchone()
+                assert release_time_row is not None
+                release_time = release_time_row[0]
+            await connection.commit()
+
+        await asyncio.wait_for(mutation, timeout=2.0)
+        loaded = await store.load(session_id)
+        assert loaded is not None
+        assert loaded.last_activity_at >= release_time
 
     _run(postgres_dsn, ops)
 

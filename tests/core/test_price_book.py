@@ -802,7 +802,7 @@ def test_budget_reservation_uses_the_ledgers_injected_clock() -> None:
     assert result.requested == Decimal("3")
 
 
-def test_default_app_budget_ledger_inherits_the_runtime_clock() -> None:
+def test_default_app_budget_ledger_does_not_inherit_the_runtime_clock() -> None:
     prices = PriceBook(
         prices=(
             ModelPrice(
@@ -823,10 +823,8 @@ def test_default_app_budget_ledger_inherits_the_runtime_clock() -> None:
             ),
         ),
     )
-    app = CayuApp(
-        enable_logging=False,
-        clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
-    )
+    application_now = [datetime(2026, 9, 1, tzinfo=UTC)]
+    app = CayuApp(enable_logging=False, clock=lambda: application_now[0])
 
     result = asyncio.run(
         app.budget_ledger.reserve(
@@ -843,8 +841,24 @@ def test_default_app_budget_ledger_inherits_the_runtime_clock() -> None:
             provider_name="gateway",
             model="frontier",
             model_attempt_identity=model_attempt_identity(),
+            effective_at=datetime(2026, 9, 1, tzinfo=UTC),
         )
     )
 
     assert result.accepted is True
     assert result.requested == Decimal("3")
+    assert result.record is not None
+
+    application_now[0] = datetime(2100, 1, 1, tzinfo=UTC)
+
+    assert (
+        asyncio.run(app.budget_ledger.heartbeat(reservation_id=result.record.reservation_id))
+        is True
+    )
+    marked = asyncio.run(
+        app.budget_ledger.mark_dispatched(
+            reservation_ids=(result.record.reservation_id,),
+            dispatch_id="dispatch-1",
+        )
+    )
+    assert marked[0].dispatch_id == "dispatch-1"

@@ -252,7 +252,7 @@ def test_local_attempt_store_replays_exact_authority_and_fences_claims(
             running = await store.start_local_execution_attempt(started)
             assert running.quiescence is LocalExecutionAttemptQuiescence.TERMINAL_NOT_QUIESCENT
 
-            await store.release_task(task.id, "worker-a")
+            await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
             assert await store.claim_task("worker-b", lease_seconds=300) is None
 
             settled = await store.settle_local_execution_attempt(
@@ -304,7 +304,7 @@ def test_unsettled_local_attempt_fences_retry_deadline_terminalization(
             await store.prepare_local_execution_attempt(authority)
             start = _start(authority, root=True)
             await store.start_local_execution_attempt(start)
-            await store.release_task(task.id, "worker-a")
+            await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
 
             clock.value = started_at + timedelta(seconds=2)
             assert await store.claim_task("worker-b", lease_seconds=300) is None
@@ -346,7 +346,11 @@ def test_retry_admissible_attempt_mints_a_new_exact_claim_identity(
             started = _start(first, root=True)
             await store.start_local_execution_attempt(started)
             await store.settle_local_execution_attempt(_settlement(first, _receipt(started)))
-            await store.release_task(first_task.id, "worker-a")
+            await store.release_task(
+                first_task.id,
+                "worker-a",
+                lease_expires_at=first_task.lease_expires_at,
+            )
             await asyncio.sleep(0.001)
             replacement_task = await store.claim_task(
                 replacement_worker,
@@ -397,7 +401,7 @@ def test_authenticated_receipt_settles_across_a_stale_recovery_claim(
             await store.prepare_local_execution_attempt(authority)
             started = _start(authority, root=True)
             await store.start_local_execution_attempt(started)
-            await store.release_task(task.id, "worker-a")
+            await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
             claimed = await store.claim_local_execution_attempt_recovery(
                 LocalExecutionAttemptRecoveryClaim(
                     attempt_id=authority.attempt_id,
@@ -541,7 +545,7 @@ def test_claimable_snapshot_excludes_pending_tasks_with_an_unsettled_local_attem
             await store.prepare_local_execution_attempt(authority)
             started = _start(authority, root=True)
             await store.start_local_execution_attempt(started)
-            await store.release_task(task.id, "worker-a")
+            await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
 
             fenced = await store.aggregate_operational_snapshot()
             assert fenced.counts_by_status.pending == 1
@@ -685,7 +689,7 @@ def test_local_attempt_state_transitions_use_the_store_clock(
             started = await store.start_local_execution_attempt(_start(authority, root=False))
             assert started.updated_at == now[0]
 
-            await store.release_task(task.id, "worker-a")
+            await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
             now[0] += timedelta(seconds=1)
             lease_before = datetime.now(UTC)
             claimed = await store.claim_local_execution_attempt_recovery(
@@ -743,7 +747,7 @@ def test_future_evidence_clock_cannot_expire_live_local_attempt_authority(
             started = await store.start_local_execution_attempt(started_evidence)
             assert started.updated_at == evidence_now
 
-            await store.release_task(task.id, "worker-a")
+            await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
             claimed = await store.claim_local_execution_attempt_recovery(
                 LocalExecutionAttemptRecoveryClaim(
                     attempt_id=authority.attempt_id,
@@ -924,7 +928,11 @@ def test_preparation_refreshes_a_same_owner_heartbeat_race() -> None:
         async def prepare_local_execution_attempt(self, authority):
             self.prepare_calls += 1
             if self.prepare_calls == 1:
-                await self.heartbeat(authority.task_id, authority.worker_id)
+                await self.heartbeat(
+                    authority.task_id,
+                    authority.worker_id,
+                    lease_expires_at=authority.task_claim_lease_expires_at,
+                )
             return await super().prepare_local_execution_attempt(authority)
 
     async def scenario() -> None:
@@ -978,7 +986,11 @@ def test_preparation_prefers_exact_replay_across_a_later_heartbeat() -> None:
             request=request,
         )
         expected = await store.prepare_local_execution_attempt(authority)
-        await store.heartbeat(task.id, "worker-a")
+        await store.heartbeat(
+            task.id,
+            "worker-a",
+            lease_expires_at=task.lease_expires_at,
+        )
 
         replay_authority, replayed = await _prepare_current_local_execution_attempt(
             app=app,
@@ -1000,7 +1012,11 @@ def test_preparation_refresh_does_not_cross_released_task_ownership() -> None:
         async def prepare_local_execution_attempt(self, authority):
             self.prepare_calls += 1
             if self.prepare_calls == 1:
-                await self.release_task(authority.task_id, authority.worker_id)
+                await self.release_task(
+                    authority.task_id,
+                    authority.worker_id,
+                    lease_expires_at=authority.task_claim_lease_expires_at,
+                )
             return await super().prepare_local_execution_attempt(authority)
 
     async def scenario() -> None:
@@ -1369,7 +1385,7 @@ def test_reboot_inference_requires_exact_machine_authority(
             update={"host_identity": local_execution_host_identity(), "boot_id": "boot-a"}
         )
         await store.start_local_execution_attempt(start)
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
 
         monkeypatch.setenv("CAYU_LOCAL_EXECUTION_NODE_ID", recovery_node_id)
         monkeypatch.setattr(owner_module, "local_execution_boot_id", lambda: "boot-b")
@@ -1414,7 +1430,7 @@ def test_recovery_promotes_an_authenticated_staged_supervisor_receipt(
         await store.prepare_local_execution_attempt(authority)
         started = _start(authority, root=True)
         await store.start_local_execution_attempt(started)
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         state_dir = tmp_path / "attempt-state"
         state_dir.mkdir(mode=0o700)
         receipt_path = state_dir / f"{authority.request_sha256}.receipt.json"
@@ -1503,7 +1519,7 @@ def test_recovery_does_not_promote_staging_from_a_live_supervisor(
         assert not receipt_path.exists()
 
         supervisor_live = False
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         recovered = await coordinator.recover(worker_id="recovery-worker")
         assert len(recovered) == 1
         assert recovered[0].quiescence is LocalExecutionAttemptQuiescence.QUIESCENT
@@ -1539,7 +1555,7 @@ def test_recovery_reloads_a_final_receipt_renamed_as_the_supervisor_exits(
         await store.prepare_local_execution_attempt(authority)
         started = _start(authority, root=True)
         await store.start_local_execution_attempt(started)
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         state_dir = tmp_path / "attempt-state"
         state_dir.mkdir(mode=0o700)
         receipt_path = state_dir / f"{authority.request_sha256}.receipt.json"
@@ -1611,7 +1627,7 @@ def test_recovery_prefers_a_receipt_published_during_claim_without_machine_ident
         started = _start(authority, root=True)
         assert started.host_identity == "unavailable"
         await store.start_local_execution_attempt(started)
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         state_dir = tmp_path / "attempt-state"
         state_dir.mkdir(mode=0o700)
         receipt_path = state_dir / f"{authority.request_sha256}.receipt.json"
@@ -1694,7 +1710,7 @@ def test_recovery_fences_a_corrupt_staged_supervisor_receipt(
         )
         await store.prepare_local_execution_attempt(authority)
         await store.start_local_execution_attempt(_start(authority, root=True))
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         state_dir = tmp_path / "attempt-state"
         state_dir.mkdir(mode=0o700)
         receipt_path = state_dir / f"{authority.request_sha256}.receipt.json"
@@ -1887,7 +1903,7 @@ def test_local_attempt_drain_never_reports_a_live_owner_as_settled(
         with pytest.raises(LocalExecutionAttemptUnsettled, match="drain elapsed"):
             await coordinator.drain(timeout_seconds=0.01)
 
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         settled = await coordinator.drain(timeout_seconds=1)
         assert len(settled) == 1
         assert settled[0].quiescence is LocalExecutionAttemptQuiescence.NOT_DISPATCHED
@@ -1983,7 +1999,11 @@ def test_unproven_terminal_record_does_not_starve_recoverable_attempts(
                 request=_request(),
             )
             await store.prepare_local_execution_attempt(new_authority)
-            await store.release_task(new_task.id, "worker-a")
+            await store.release_task(
+                new_task.id,
+                "worker-a",
+                lease_expires_at=new_task.lease_expires_at,
+            )
 
             recovered = await LocalExecutionAttemptCoordinator(
                 store,
@@ -2036,7 +2056,11 @@ def test_live_recovery_prefix_does_not_starve_later_recoverable_attempt(
                 request=_request(),
             )
             await store.prepare_local_execution_attempt(recoverable_authority)
-            await store.release_task(recoverable_task.id, "worker-a")
+            await store.release_task(
+                recoverable_task.id,
+                "worker-a",
+                lease_expires_at=recoverable_task.lease_expires_at,
+            )
 
             async def probe(record, *, state_dir):
                 assert state_dir == tmp_path / "attempt-state"
@@ -2220,7 +2244,11 @@ def test_malformed_receipt_does_not_abort_unrelated_recovery(
                     request=_request(),
                 )
                 await store.prepare_local_execution_attempt(authority)
-                await store.release_task(task.id, "worker-a")
+                await store.release_task(
+                    task.id,
+                    "worker-a",
+                    lease_expires_at=task.lease_expires_at,
+                )
                 authorities.append(authority)
 
             state_dir = tmp_path / "attempt-state"

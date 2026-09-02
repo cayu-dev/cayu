@@ -15,6 +15,7 @@ from cayu import (
     Task,
     TaskClaimLost,
     TaskCreate,
+    TaskStatus,
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
@@ -23,6 +24,7 @@ from cayu import (
     TaskTerminalKind,
     terminalize_task_with_retry,
 )
+from cayu.runtime.tasks import _terminalize_claimed_task, prepare_task_terminalization
 
 
 def _request(task_id: str = "task_retry_classification") -> TaskTerminalizationRequest:
@@ -59,6 +61,17 @@ def test_terminalization_request_is_detached_and_bounded() -> None:
     )
     result["summary"]["changed"] = 999
     assert request.result == {"summary": {"changed": 2}}
+
+    first_generation = request.model_copy(
+        update={"lease_expires_at": datetime(2026, 1, 1, tzinfo=UTC)}
+    )
+    second_generation = request.model_copy(
+        update={"lease_expires_at": datetime(2026, 1, 2, tzinfo=UTC)}
+    )
+    assert (
+        prepare_task_terminalization(first_generation)[1]
+        != prepare_task_terminalization(second_generation)[1]
+    )
 
     with pytest.raises(ValidationError, match="at most 256 UTF-8 bytes"):
         TaskTerminalizationRequest(
@@ -102,6 +115,55 @@ def test_terminalization_helper_requires_store_capability() -> None:
     asyncio.run(run())
 
 
+def test_claimed_terminalization_fallback_preserves_exact_lease_generation() -> None:
+    class NonReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+        supports_idempotent_terminalization = False
+
+    async def run() -> None:
+        store = NonReceiptStore()
+        await store.create_task(TaskCreate(task_id="fallback-generation", type="review"))
+        initial = await store.claim_task("stable-worker", lease_seconds=2)
+        assert initial is not None
+        assert initial.lease_expires_at is not None
+        current = await store.heartbeat(
+            initial.id,
+            "stable-worker",
+            lease_expires_at=initial.lease_expires_at,
+            extend_seconds=300,
+        )
+        assert current.lease_expires_at is not None
+
+        with pytest.raises(TaskClaimLost):
+            await _terminalize_claimed_task(
+                store,
+                TaskTerminalizationRequest(
+                    task_id=initial.id,
+                    worker_id="stable-worker",
+                    lease_expires_at=initial.lease_expires_at,
+                    kind=TaskTerminalKind.COMPLETED,
+                    result={"winner": "stale"},
+                    idempotency_key="fallback-stale-generation",
+                ),
+            )
+
+        completed = await _terminalize_claimed_task(
+            store,
+            TaskTerminalizationRequest(
+                task_id=current.id,
+                worker_id="stable-worker",
+                lease_expires_at=current.lease_expires_at,
+                kind=TaskTerminalKind.COMPLETED,
+                result={"winner": "current"},
+                idempotency_key="fallback-current-generation",
+            ),
+        )
+        assert completed.status is TaskStatus.COMPLETED
+        assert completed.result == {"winner": "current"}
+
+    asyncio.run(run())
+
+
 def test_terminalization_helper_reconstructs_commit_before_error() -> None:
     class CommitThenRaiseStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
@@ -118,12 +180,14 @@ def test_terminalization_helper_reconstructs_commit_before_error() -> None:
     async def run() -> None:
         store = CommitThenRaiseStore()
         await store.create_task(TaskCreate(task_id="task_commit", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         result = await terminalize_task_with_retry(
             store,
             TaskTerminalizationRequest(
                 task_id="task_commit",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done"},
                 idempotency_key="terminal-1",
@@ -166,7 +230,8 @@ def test_terminalization_helper_rejects_receipt_current_task_inconsistency() -> 
     async def run() -> None:
         store = InconsistentReceiptStore()
         await store.create_task(TaskCreate(task_id="task_inconsistent", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
 
         with pytest.raises(TaskTerminalizationConflict, match="current terminal task"):
             await terminalize_task_with_retry(
@@ -174,6 +239,7 @@ def test_terminalization_helper_rejects_receipt_current_task_inconsistency() -> 
                 TaskTerminalizationRequest(
                     task_id="task_inconsistent",
                     worker_id="worker_a",
+                    lease_expires_at=claimed.lease_expires_at,
                     kind=TaskTerminalKind.COMPLETED,
                     result={"summary": "done"},
                     idempotency_key="terminal-inconsistent",
@@ -205,12 +271,14 @@ def test_terminalization_helper_retries_exact_request_after_precommit_error() ->
     async def run() -> None:
         store = FailBeforeCommitStore()
         await store.create_task(TaskCreate(task_id="task_retry", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         result = await terminalize_task_with_retry(
             store,
             TaskTerminalizationRequest(
                 task_id="task_retry",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.FAILED,
                 error={"message": "provider unavailable"},
                 idempotency_key="terminal-1",
@@ -252,12 +320,14 @@ def test_terminalization_helper_detaches_request_for_every_retry() -> None:
     async def run() -> None:
         store = MutatingFailureStore()
         await store.create_task(TaskCreate(task_id="task_detached_retry", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         outcome = await terminalize_task_with_retry(
             store,
             TaskTerminalizationRequest(
                 task_id="task_detached_retry",
                 worker_id="worker_a",
+                lease_expires_at=claimed.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done"},
                 idempotency_key="detached-retry",
@@ -289,10 +359,12 @@ def test_terminalization_helper_exhaustion_is_bounded_and_content_free() -> None
     async def run() -> None:
         store = AlwaysUnavailableStore()
         await store.create_task(TaskCreate(task_id="task_uncertain", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         request = TaskTerminalizationRequest(
             task_id="task_uncertain",
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
             kind=TaskTerminalKind.FAILED,
             error={"secret_payload": "must-not-leak"},
             idempotency_key="terminal-uncertain",
@@ -384,13 +456,15 @@ def test_terminalization_helper_does_not_retry_caller_cancellation() -> None:
     async def run() -> None:
         store = CancelledStore()
         await store.create_task(TaskCreate(task_id="task_cancel", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         with pytest.raises(asyncio.CancelledError):
             await terminalize_task_with_retry(
                 store,
                 TaskTerminalizationRequest(
                     task_id="task_cancel",
                     worker_id="worker_a",
+                    lease_expires_at=claimed.lease_expires_at,
                     kind=TaskTerminalKind.COMPLETED,
                     result={"summary": "done"},
                     idempotency_key="terminal-cancel",
@@ -541,11 +615,12 @@ def test_terminalization_helper_exhausts_when_write_and_receipt_acknowledgements
     async def run() -> None:
         store = ReceiptUnavailableStore()
         await store.create_task(TaskCreate(task_id="task_retry_classification", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         with pytest.raises(TaskTerminalizationUncertain) as captured:
             await terminalize_task_with_retry(
                 store,
-                _request(),
+                _request().model_copy(update={"lease_expires_at": claimed.lease_expires_at}),
                 policy=TaskTerminalizationRetryPolicy(
                     max_attempts=3,
                     initial_backoff_seconds=0,
@@ -604,10 +679,12 @@ def test_terminalization_boundaries_reject_hostile_subclasses() -> None:
     async def run() -> None:
         store = HostileResultStore()
         await store.create_task(TaskCreate(task_id="task_hostile", type="review"))
-        assert await store.claim_task("worker_a") is not None
+        claimed = await store.claim_task("worker_a")
+        assert claimed is not None
         request = TaskTerminalizationRequest(
             task_id="task_hostile",
             worker_id="worker_a",
+            lease_expires_at=claimed.lease_expires_at,
             kind=TaskTerminalKind.COMPLETED,
             result={"summary": "done"},
             idempotency_key="terminal-hostile",

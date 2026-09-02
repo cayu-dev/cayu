@@ -10178,8 +10178,8 @@ def session_from_request(
     *,
     identity: SessionIdentity,
     parent_session: Session | None,
+    created_at: datetime,
 ) -> Session:
-    now = datetime.now(UTC)
     session_id = request.session_id if request.session_id is not None else str(uuid4())
     return Session(
         id=session_id,
@@ -10196,9 +10196,9 @@ def session_from_request(
         runtime_version=identity.runtime_version,
         environment_name=request.environment_name,
         status=SessionStatus.PENDING,
-        created_at=now,
-        updated_at=now,
-        last_activity_at=now,
+        created_at=created_at,
+        updated_at=created_at,
+        last_activity_at=created_at,
         invocation=session_invocation_for_run_request(
             request,
             session_id=session_id,

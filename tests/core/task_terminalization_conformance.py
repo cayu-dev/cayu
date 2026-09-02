@@ -103,6 +103,7 @@ async def assert_recovered_continuation_terminalization_conformance(
                 session_id,
             ),
             worker_id=worker_id,
+            lease_expires_at=claimed.lease_expires_at,
         )
         await store.release_interrupted_task_worker(
             interrupted_task_handoff_request(attached, session_run_epoch=1)
@@ -127,6 +128,7 @@ async def assert_recovered_continuation_terminalization_conformance(
         request = TaskTerminalizationRequest(
             task_id=task_id,
             worker_id=recovery_worker,
+            lease_expires_at=recovered.lease_expires_at,
             handoff_id=recovered.interrupted_handoff_id,
             kind=kind,
             result={"outcome": suffix} if kind is TaskTerminalKind.COMPLETED else None,
@@ -170,6 +172,7 @@ async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
     renewed = await store.heartbeat(
         claimed.id,
         "ordinary-lost-worker",
+        lease_expires_at=claimed.lease_expires_at,
         extend_seconds=1,
     )
     assert renewed is not None
@@ -252,6 +255,7 @@ async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
         TaskTerminalizationRequest(
             task_id=request.task_id,
             worker_id=request.original_worker_id,
+            lease_expires_at=request.original_lease_expires_at,
             kind=TaskTerminalKind.CANCELLED,
             error={"code": "operator"},
             idempotency_key=request.cancellation_idempotency_key,
@@ -286,6 +290,7 @@ async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
             "ordinary-recovery-owner-lost-session",
         ),
         worker_id="ordinary-prior-recovery-worker",
+        lease_expires_at=prior_owner.lease_expires_at,
     )
     await store.release_interrupted_task_worker(
         interrupted_task_handoff_request(attached, session_run_epoch=1)
@@ -325,6 +330,7 @@ async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
         TaskTerminalizationRequest(
             task_id=worker_requested.id,
             worker_id="ordinary-winning-worker",
+            lease_expires_at=worker_requested.lease_expires_at,
             kind=TaskTerminalKind.CANCELLED,
             error={"code": "operator"},
             idempotency_key=losing_reconciliation.cancellation_idempotency_key,
@@ -385,6 +391,7 @@ async def assert_live_ordinary_cancellation_conformance(store: TaskStore) -> Non
             TaskTerminalizationRequest(
                 task_id=requested.id,
                 worker_id="worker_live_cancel",
+                lease_expires_at=requested.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "late completion"},
                 idempotency_key="late-completion",
@@ -394,6 +401,7 @@ async def assert_live_ordinary_cancellation_conformance(store: TaskStore) -> Non
     cancellation = TaskTerminalizationRequest(
         task_id=requested.id,
         worker_id="worker_live_cancel",
+        lease_expires_at=requested.lease_expires_at,
         kind=TaskTerminalKind.CANCELLED,
         error={"reason": "operator cancelled live work"},
         idempotency_key=requested.status_payload["terminalization_idempotency_key"],
@@ -421,10 +429,12 @@ async def assert_task_terminalization_acknowledgement_conformance(
     """Exercise acknowledgement loss, bounded exhaustion, and cancellation."""
 
     await store.create_task(TaskCreate(task_id="task_commit_ack", type="review"))
-    assert await store.claim_task("worker_a") is not None
+    commit_claim = await store.claim_task("worker_a")
+    assert commit_claim is not None
     commit_request = TaskTerminalizationRequest(
         task_id="task_commit_ack",
         worker_id="worker_a",
+        lease_expires_at=commit_claim.lease_expires_at,
         kind=TaskTerminalKind.COMPLETED,
         result={"summary": "done"},
         idempotency_key="commit-ack",
@@ -454,7 +464,8 @@ async def assert_task_terminalization_acknowledgement_conformance(
 
     store.terminalize_task = terminalize  # type: ignore[method-assign]
     await store.create_task(TaskCreate(task_id="task_precommit_ack", type="review"))
-    assert await store.claim_task("worker_b") is not None
+    precommit_claim = await store.claim_task("worker_b")
+    assert precommit_claim is not None
     precommit_calls = 0
 
     async def fail_before_once(request: TaskTerminalizationRequest) -> Task:
@@ -470,6 +481,7 @@ async def assert_task_terminalization_acknowledgement_conformance(
         TaskTerminalizationRequest(
             task_id="task_precommit_ack",
             worker_id="worker_b",
+            lease_expires_at=precommit_claim.lease_expires_at,
             kind=TaskTerminalKind.FAILED,
             error={"message": "failed"},
             idempotency_key="precommit-ack",
@@ -486,7 +498,8 @@ async def assert_task_terminalization_acknowledgement_conformance(
 
     store.terminalize_task = terminalize  # type: ignore[method-assign]
     await store.create_task(TaskCreate(task_id="task_repeated_ack", type="review"))
-    assert await store.claim_task("worker_c") is not None
+    repeated_claim = await store.claim_task("worker_c")
+    assert repeated_claim is not None
     repeated_calls = 0
     load_receipt = store.load_task_terminalization_receipt
 
@@ -508,6 +521,7 @@ async def assert_task_terminalization_acknowledgement_conformance(
             TaskTerminalizationRequest(
                 task_id="task_repeated_ack",
                 worker_id="worker_c",
+                lease_expires_at=repeated_claim.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done"},
                 idempotency_key="repeated-ack",
@@ -529,7 +543,8 @@ async def assert_task_terminalization_acknowledgement_conformance(
 
     store.terminalize_task = terminalize  # type: ignore[method-assign]
     await store.create_task(TaskCreate(task_id="task_cancelled_ack", type="review"))
-    assert await store.claim_task("worker_d") is not None
+    cancelled_claim = await store.claim_task("worker_d")
+    assert cancelled_claim is not None
     cancellation_calls = 0
 
     async def cancel_terminalization(request: TaskTerminalizationRequest) -> Task:
@@ -545,6 +560,7 @@ async def assert_task_terminalization_acknowledgement_conformance(
             TaskTerminalizationRequest(
                 task_id="task_cancelled_ack",
                 worker_id="worker_d",
+                lease_expires_at=cancelled_claim.lease_expires_at,
                 kind=TaskTerminalKind.COMPLETED,
                 result={"summary": "done"},
                 idempotency_key="cancelled-ack",

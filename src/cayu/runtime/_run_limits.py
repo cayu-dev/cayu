@@ -2081,7 +2081,6 @@ class RunLimitController:
             if (
                 expiration_reason is None
                 or reconciliation.reason != expiration_reason
-                or reconciliation.settled_at != reservation.record.settlement_fallback.settled_at
                 or _publication_safe_reconciliation(
                     self._event_writer.prepare,
                     reservation=reservation,

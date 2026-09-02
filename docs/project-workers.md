@@ -66,12 +66,17 @@ A fresh-task worker calls the complementary public loop. Its handler owns the
 domain-specific `RunRequest` and terminal task behavior:
 
 ```python
-from cayu import CayuApp, Task, TaskQuery, run_task_worker
+from cayu import CayuApp, Task, TaskQuery, complete_managed_task, run_task_worker
 
 
 async def handle_task(app: CayuApp, task: Task, claimed_by: str) -> None:
     # Consume app.run(RunRequest(task_id=task.id,
-    #                            task_worker_id=claimed_by, ...)) here.
+    #                            task_worker_id=claimed_by,
+    #                            task_lease_expires_at=task.lease_expires_at,
+    #                            ...)) here.
+    # If this handler owns terminalization instead of app.run(), use the
+    # managed boundary so heartbeat renewal cannot race a stale lease snapshot:
+    # await complete_managed_task(app.task_store, task, claimed_by, {"ok": True})
     ...
 
 

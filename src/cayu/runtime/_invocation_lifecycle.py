@@ -234,6 +234,7 @@ class InvocationContext:
         "_binding",
         "_budget_policy",
         "_loop_policies",
+        "_recovery_claim_id",
         "_registered_agent",
         "_registered_environment",
         "_registered_provider",
@@ -252,6 +253,7 @@ class InvocationContext:
     _registered_agent: runtime_records.RegisteredAgentState
     _registered_environment: runtime_records.RegisteredEnvironment | None
     _registered_provider: runtime_records.RegisteredProvider
+    _recovery_claim_id: str | None
     _request_loop_policies: tuple[LoopPolicy, ...]
     _runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...]
     _targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
@@ -272,6 +274,7 @@ class InvocationContext:
         budget_policy: BudgetPolicy | None,
         tool_capability_ceiling: ToolCapabilityCeiling,
         targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
+        _recovery_claim_id: str | None = None,
         _validated_profile: ExecutionProfileIdentity | None = None,
         _authority_token: object = None,
     ) -> None:
@@ -286,6 +289,7 @@ class InvocationContext:
         object.__setattr__(self, "_budget_policy", budget_policy)
         object.__setattr__(self, "_tool_capability_ceiling", tool_capability_ceiling)
         object.__setattr__(self, "_targeted_tool_grants", targeted_tool_grants)
+        object.__setattr__(self, "_recovery_claim_id", _recovery_claim_id)
         object.__setattr__(self, "_validated_profile", _validated_profile)
         object.__setattr__(self, "_authority_token", _authority_token)
         self._validate()
@@ -329,6 +333,8 @@ class InvocationContext:
             raise TypeError("targeted_tool_grants must contain PreparedTargetedToolGrant values.")
         if type(self._validated_profile) is not ExecutionProfileIdentity:
             raise TypeError("Invocation context lacks a validated execution profile.")
+        if self.recovery_claim_id is not None:
+            require_durable_clean_nonblank(self.recovery_claim_id, "recovery_claim_id")
         if self._validated_profile is not self.active_profile.profile:
             raise ValueError(
                 "Live invocation authority must retain the exact validated profile object."
@@ -436,6 +442,12 @@ class InvocationContext:
     def targeted_tool_grants(self) -> tuple[PreparedTargetedToolGrant, ...]:
         return self._targeted_tool_grants
 
+    @property
+    def recovery_claim_id(self) -> str | None:
+        """Return runtime-authenticated terminal-recovery ownership, if any."""
+
+        return self._recovery_claim_id
+
     def with_admitted_session(self, session: Session) -> InvocationContext:
         """Attach the durable admission result without replacing live authority."""
 
@@ -495,6 +507,7 @@ class InvocationContext:
             budget_policy=self.budget_policy,
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
+            recovery_claim_id=self.recovery_claim_id,
         )
 
     def with_registered_environment(
@@ -557,6 +570,7 @@ class InvocationContext:
                 budget_policy=self.budget_policy,
                 tool_capability_ceiling=self.tool_capability_ceiling,
                 targeted_tool_grants=self.targeted_tool_grants,
+                recovery_claim_id=self.recovery_claim_id,
             )
         if self.binding.environment_name is None:
             raise ValueError("Invocation authority does not permit an environment.")
@@ -575,6 +589,7 @@ class InvocationContext:
             budget_policy=self.budget_policy,
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
+            recovery_claim_id=self.recovery_claim_id,
         )
 
     @staticmethod
@@ -730,6 +745,27 @@ class InvocationContext:
             budget_policy=self.budget_policy,
             tool_capability_ceiling=self.tool_capability_ceiling,
             targeted_tool_grants=self.targeted_tool_grants,
+            recovery_claim_id=self.recovery_claim_id,
+        )
+
+    def without_recovery_claim(self) -> InvocationContext:
+        """Drop a settled recovery claim while preserving invocation authority."""
+
+        if self.recovery_claim_id is None:
+            return self
+        return _authenticated_invocation_context(
+            active_profile=self.active_profile,
+            binding=self.binding,
+            validated_profile=self.profile,
+            registered_agent=self.registered_agent,
+            registered_provider=self.registered_provider,
+            registered_environment=self.registered_environment,
+            runtime_hooks=self.runtime_hooks,
+            loop_policies=self.loop_policies,
+            request_loop_policies=self.request_loop_policies,
+            budget_policy=self.budget_policy,
+            tool_capability_ceiling=self.tool_capability_ceiling,
+            targeted_tool_grants=self.targeted_tool_grants,
         )
 
 
@@ -747,6 +783,7 @@ def _authenticated_invocation_context(
     budget_policy: BudgetPolicy | None,
     tool_capability_ceiling: ToolCapabilityCeiling,
     targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
+    recovery_claim_id: str | None = None,
 ) -> InvocationContext:
     """Authenticate independently resolved live collaborators against one profile."""
 
@@ -764,6 +801,7 @@ def _authenticated_invocation_context(
         budget_policy=budget_policy,
         tool_capability_ceiling=tool_capability_ceiling,
         targeted_tool_grants=targeted_tool_grants,
+        _recovery_claim_id=recovery_claim_id,
         _validated_profile=validated_profile,
         _authority_token=_INVOCATION_CONTEXT_AUTHORITY_TOKEN,
     )

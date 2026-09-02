@@ -24,6 +24,7 @@ from tests.core._budget_ledger_contract import (
 )
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.runtime import (
     BudgetLimit,
     BudgetPolicy,
@@ -153,6 +154,26 @@ async def _drop_all(dsn: str) -> None:
         async with conn.cursor() as cur:
             for table in _TABLES:
                 await cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+        await conn.commit()
+
+
+async def _age_reservation(
+    dsn: str,
+    reservation_id: str,
+    *,
+    seconds: int,
+) -> None:
+    import psycopg
+
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE cayu_budget_reservations "
+                "SET updated_at = clock_timestamp() - (%s * INTERVAL '1 second') "
+                "WHERE reservation_id = %s",
+                (seconds, reservation_id),
+            )
+            assert cur.rowcount == 1
         await conn.commit()
 
 
@@ -810,11 +831,14 @@ def test_postgres_budget_ledger_heartbeat_keeps_live_reservation_active(postgres
         limit = _reservation_budget_limit(max_cost="0.25")
         first = await _reserve(ledger, limit, "sess_live")
         assert first.record is not None
-        clock.value = datetime(2026, 1, 1, 12, 0, 30, tzinfo=UTC)
         assert await ledger.heartbeat(reservation_id=first.record.reservation_id) is True
-        clock.value = datetime(2026, 1, 1, 12, 1, 1, tzinfo=UTC)
+        clock.value = datetime(2100, 1, 1, tzinfo=UTC)
         blocked = await _reserve(ledger, limit, "sess_blocked")
-        clock.value = datetime(2026, 1, 1, 12, 1, 30, tzinfo=UTC)
+        await _age_reservation(
+            postgres_dsn,
+            first.record.reservation_id,
+            seconds=61,
+        )
         late_heartbeat = await ledger.heartbeat(reservation_id=first.record.reservation_id)
         recovered = await _reserve(ledger, limit, "sess_recovered")
         return blocked, late_heartbeat, recovered
@@ -831,6 +855,145 @@ def test_postgres_budget_ledger_heartbeat_keeps_live_reservation_active(postgres
     assert recovered.accepted is True
 
 
+def test_postgres_budget_ledger_heartbeat_reap_race_uses_database_time(
+    postgres_dsn,
+) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        first = _new_ledger(postgres_dsn, reservation_ttl_seconds=60)
+        second = _new_ledger(postgres_dsn, reservation_ttl_seconds=60)
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            owner = await _reserve(first, limit, "sess_pg_store_time_race_owner")
+            assert owner.record is not None
+
+            live_heartbeat, live_competitor = await asyncio.gather(
+                first.heartbeat(reservation_id=owner.record.reservation_id),
+                _reserve(second, limit, "sess_pg_store_time_live_competitor"),
+            )
+            assert live_heartbeat is True
+            assert live_competitor.accepted is False
+
+            await _age_reservation(
+                postgres_dsn,
+                owner.record.reservation_id,
+                seconds=61,
+            )
+            expired_heartbeat, replacement = await asyncio.gather(
+                first.heartbeat(reservation_id=owner.record.reservation_id),
+                _reserve(second, limit, "sess_pg_store_time_replacement"),
+            )
+            assert expired_heartbeat is False
+            assert replacement.accepted is True
+            settlements = await first.list_pending_settlements(
+                session_id=owner.record.session_id,
+            )
+            assert len(settlements) == 1
+            assert settlements[0].reservation_id == owner.record.reservation_id
+        finally:
+            await second.close()
+            await first.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_budget_ledger_resamples_time_after_reap_lock_wait(
+    postgres_dsn,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresBudgetLedger
+        from cayu.storage.migrations import SchemaMode
+
+        class ObservedPostgresBudgetLedger(PostgresBudgetLedger):
+            def __init__(self) -> None:
+                super().__init__(
+                    postgres_dsn,
+                    min_size=1,
+                    max_size=4,
+                    schema_mode=SchemaMode.CREATE,
+                    reservation_ttl_seconds=1,
+                )
+                self.observe_next_time_sample = False
+                self.time_sampled = asyncio.Event()
+
+            async def _budget_database_now(self, cur):
+                observed = await super()._budget_database_now(cur)
+                if self.observe_next_time_sample:
+                    self.observe_next_time_sample = False
+                    self.time_sampled.set()
+                return observed
+
+        await _drop_all(postgres_dsn)
+        ledger = ObservedPostgresBudgetLedger()
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        replacement_task = None
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            owner = await _reserve(ledger, limit, "sess_pg_reap_wait_owner")
+            assert owner.record is not None
+            await _age_reservation(
+                postgres_dsn,
+                owner.record.reservation_id,
+                seconds=2,
+            )
+
+            async with blocker.cursor() as cur:
+                await cur.execute(
+                    "SELECT reservation_id FROM cayu_budget_reservations "
+                    "WHERE reservation_id = %s FOR UPDATE",
+                    (owner.record.reservation_id,),
+                )
+                assert await cur.fetchone() == (owner.record.reservation_id,)
+
+                ledger.observe_next_time_sample = True
+                replacement_task = asyncio.create_task(
+                    _reserve(ledger, limit, "sess_pg_reap_wait_replacement")
+                )
+                await asyncio.wait_for(ledger.time_sampled.wait(), timeout=5)
+                await asyncio.sleep(1.1)
+                await blocker.commit()
+
+            replacement = await asyncio.wait_for(replacement_task, timeout=5)
+            assert replacement.accepted is True
+            assert replacement.record is not None
+            dispatched = await ledger.mark_dispatched(
+                reservation_ids=(replacement.record.reservation_id,),
+                dispatch_id="dispatch:postgres:post-reap-wait",
+            )
+            assert dispatched[0].dispatch_id == "dispatch:postgres:post-reap-wait"
+        finally:
+            await blocker.close()
+            if replacement_task is not None and not replacement_task.done():
+                replacement_task.cancel()
+            if replacement_task is not None:
+                await asyncio.gather(replacement_task, return_exceptions=True)
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_budget_ledger_accepts_maximum_durable_ttl(postgres_dsn) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        ledger = _new_ledger(
+            postgres_dsn,
+            reservation_ttl_seconds=MAX_DURABLE_JSON_INTEGER,
+        )
+        try:
+            limit = _reservation_budget_limit(max_cost="0.25")
+            owner = await _reserve(ledger, limit, "sess_pg_maximum_ttl_owner")
+            assert owner.record is not None
+            assert await ledger.heartbeat(reservation_id=owner.record.reservation_id) is True
+            blocked = await _reserve(ledger, limit, "sess_pg_maximum_ttl_contender")
+            assert blocked.accepted is False
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
 def test_postgres_budget_ledger_release_tolerates_ttl_reaped_reservation(postgres_dsn) -> None:
     clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
 
@@ -839,7 +1002,12 @@ def test_postgres_budget_ledger_release_tolerates_ttl_reaped_reservation(postgre
         orphaned = await _reserve(ledger, limit, "sess_orphaned")
         assert orphaned.accepted is True
         assert orphaned.record is not None
-        clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+        clock.value = datetime(2100, 1, 1, tzinfo=UTC)
+        await _age_reservation(
+            postgres_dsn,
+            orphaned.record.reservation_id,
+            seconds=61,
+        )
         recovered = await _reserve(ledger, limit, "sess_recovered")
         released = await ledger.release(
             reservation_id=orphaned.record.reservation_id,

@@ -689,7 +689,7 @@ def test_quiescent_attempt_allows_same_worker_exact_replacement_execution(
         )
         await _wait_for_quiescence(_fixture_identities(tree_state))
         shutil.rmtree(tree_state)
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         await asyncio.sleep(0.001)
         replacement_task = await store.claim_task("worker-a", lease_seconds=300)
         assert replacement_task is not None
@@ -1189,7 +1189,7 @@ def test_stale_pid_identity_never_targets_the_unrelated_live_process(
                 started_at=datetime.now(UTC),
             )
         )
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
         recovered = await LocalExecutionAttemptCoordinator(
             store,
             state_dir=tmp_path / "attempt-state",
@@ -1242,7 +1242,7 @@ def test_process_loss_after_receipt_staging_fsync_recovers_exact_settlement(
             started_at=datetime.now(UTC),
         )
         await store.start_local_execution_attempt(started)
-        await store.release_task(task.id, "worker-a")
+        await store.release_task(task.id, "worker-a", lease_expires_at=task.lease_expires_at)
 
         state_dir = tmp_path / "attempt-state"
         state_dir.mkdir(mode=0o700)

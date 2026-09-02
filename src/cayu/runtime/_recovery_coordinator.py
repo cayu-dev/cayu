@@ -20,7 +20,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
@@ -221,6 +221,10 @@ from cayu.runtime.budgets import (
     copy_request_budget_limits,
     request_budget_limits_for_session,
 )
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.dispatch import (
     _new_prepared_subagent_dispatch_envelope,
@@ -314,6 +318,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    StoreTimeCheckpointTransform,
     _activate_owned_session_run_fence,
     _activate_session_interaction,
     _activate_session_run_fence,
@@ -324,6 +329,7 @@ from cayu.runtime.sessions import (
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
+    _invocation_lifecycle_authority_read_scope,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     _SessionRunFenceOwnership,
@@ -1021,6 +1027,43 @@ def _attach_exception_cause_preserving_graph(
     return set_exception_cause(error, combined)
 
 
+def _authoritative_expired_recovery_claim_failure(
+    operation_failure: BaseException | None,
+    lease_failure: _IncompleteRecoveryClaimLost,
+) -> BaseException:
+    """Preserve fatal/cancellation authority while retaining expired-lease evidence."""
+
+    return _authoritative_recovery_ownership_failure(operation_failure, lease_failure)
+
+
+def _recovery_failure_contains_process_control(failure: BaseException | None) -> bool:
+    if failure is None:
+        return False
+    return any(
+        isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
+        for candidate in iter_exception_tree(failure)
+        if not isinstance(candidate, BaseExceptionGroup)
+    )
+
+
+def _authoritative_recovery_ownership_failure(
+    operation_failure: BaseException | None,
+    ownership_failure: BaseException,
+) -> BaseException:
+    """Select recovery-operation authority without dropping ownership evidence."""
+
+    if _recovery_failure_contains_process_control(operation_failure) or isinstance(
+        operation_failure,
+        asyncio.CancelledError,
+    ):
+        assert operation_failure is not None
+        _attach_exception_cause_preserving_graph(operation_failure, ownership_failure)
+        return operation_failure
+    if operation_failure is not None:
+        _attach_exception_cause_preserving_graph(ownership_failure, operation_failure)
+    return ownership_failure
+
+
 async def _run_recovery_cleanup_steps(
     *,
     authoritative_failure: BaseException | None,
@@ -1375,6 +1418,7 @@ class _IncompleteRecoveryClaimAuthority:
 class _IncompleteRecoveryClaim:
     claim_id: str
     claim_expires_at: datetime
+    local_lease_deadline: float
     session_before_fence: Session
     session: Session
     run_operation: _SessionRunOperation | None = None
@@ -1417,6 +1461,58 @@ class _TerminalEvidenceInspection:
 
 class _IncompleteRecoveryClaimLost(RuntimeError):
     """The durable incomplete-session recovery lease is no longer owned."""
+
+
+def _require_live_incomplete_recovery_claim_acknowledgement(
+    *,
+    session_id: str,
+    local_lease_deadline: float,
+) -> None:
+    """Reject an acknowledgement that consumed its complete local lease budget."""
+
+    if time.monotonic() >= local_lease_deadline:
+        raise _IncompleteRecoveryClaimLost(
+            "Incomplete-session recovery claim acknowledgement consumed its lease "
+            f"before work could start for session {session_id}."
+        )
+
+
+def _consume_incomplete_recovery_store_task(task: asyncio.Task[Any]) -> None:
+    """Observe a store mutation retained past the local ownership deadline."""
+
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+def _incomplete_recovery_session_reservation_authority(
+    session: Session,
+) -> tuple[object, ...]:
+    """Return the session fields that authorize stalled-run takeover.
+
+    Labels, user metadata, and ``updated_at`` are deliberately excluded:
+    annotation writes do not refresh ``last_activity_at`` and therefore must
+    not let an expired owner evade recovery. Immutable identity, invocation,
+    status, epoch, and activity evidence remain exact.
+    """
+
+    return (
+        session.id,
+        session.instance_id,
+        session.agent_name,
+        session.provider_name,
+        session.model,
+        session.parent_session_id,
+        session.causal_budget_id,
+        session.runtime_name,
+        session.runtime_version,
+        session.runtime_build_provenance,
+        session.environment_name,
+        session.status,
+        session.created_at,
+        session.last_activity_at,
+        session.run_epoch,
+        session.invocation,
+    )
 
 
 class ModelCompletionManualRecoveryRequired(RuntimeError):
@@ -1781,6 +1877,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         budget_policy: BudgetPolicy | None,
         request_loop_policies: tuple[LoopPolicy, ...] = (),
+        recovery_claim_id: str | None = None,
     ) -> InvocationContext:
         """Authenticate restart-resolved collaborators before recovery effects."""
 
@@ -1812,6 +1909,7 @@ class RecoveryCoordinator:
             request_loop_policies=request_loop_policies,
             budget_policy=budget_policy,
             tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+            recovery_claim_id=recovery_claim_id,
         )
 
     async def _fence_or_rebind_active_invocation(
@@ -1858,6 +1956,140 @@ class RecoveryCoordinator:
         if type(result) is not InvocationMutationResult:
             raise RuntimeError("Invocation rebind returned an incompatible result.")
         return result.session
+
+    async def _reserve_and_fence_incomplete_recovery(
+        self,
+        session_id: str,
+        *,
+        statuses: set[SessionStatus],
+        inactive_for_seconds: int | None,
+        checkpoint_transform: StoreTimeCheckpointTransform,
+        target_status: SessionStatus | None = None,
+    ) -> Session:
+        """Reserve by store time, then cross the typed invocation rebind seam."""
+
+        desired_checkpoint: dict[str, Any] | None = None
+        reserved_checkpoint: dict[str, Any] | None = None
+        reserved_session: Session | None = None
+
+        def reserve(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> dict[str, Any] | None:
+            nonlocal desired_checkpoint, reserved_checkpoint, reserved_session
+            desired = checkpoint_transform(current_session, checkpoint, store_now)
+            if desired is None:
+                return None
+            marker = desired.get(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY)
+            if type(marker) is not dict:
+                raise RuntimeError("Recovery reservation did not produce its claim marker.")
+            reserved = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+            reserved[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
+            reserved[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
+                marker,
+                "incomplete_session_recovery_claim",
+            )
+            desired_checkpoint = copy_json_value(desired, "checkpoint")
+            reserved_checkpoint = copy_json_value(reserved, "checkpoint")
+            reserved_session = current_session.model_copy(deep=True)
+            return reserved
+
+        async def release_tentative_reservation() -> None:
+            if (
+                reserved_checkpoint is None
+                or reserved_session is None
+                or desired_checkpoint is None
+            ):
+                return
+            reserved_marker = reserved_checkpoint.get(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY)
+
+            def release(
+                current_session: Session,
+                checkpoint: dict[str, Any] | None,
+                _store_now: datetime,
+            ) -> dict[str, Any] | None:
+                if checkpoint is None or (
+                    checkpoint.get(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY) != reserved_marker
+                ):
+                    return None
+                if (
+                    current_session.run_epoch == reserved_session.run_epoch + 1
+                    and checkpoint == desired_checkpoint
+                ):
+                    # The fencing transition committed and only its
+                    # acknowledgement was lost. Leave reconciliation authority
+                    # intact for the caller.
+                    return None
+                updated = copy_json_value(checkpoint, "checkpoint")
+                updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
+                return updated
+
+            await self._session_store.reserve_stalled_run_recovery(
+                session_id,
+                statuses=set(SessionStatus),
+                inactive_for_seconds=None,
+                checkpoint_transform=release,
+            )
+
+        try:
+            with _invocation_lifecycle_authority_read_scope():
+                reserved = await self._session_store.reserve_stalled_run_recovery(
+                    session_id,
+                    statuses=statuses,
+                    inactive_for_seconds=inactive_for_seconds,
+                    checkpoint_transform=reserve,
+                )
+        except BaseException as failure:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=failure,
+                steps=(
+                    (
+                        "tentative recovery reservation release",
+                        release_tentative_reservation,
+                    ),
+                ),
+            )
+            raise
+        if (
+            reserved is None
+            or reserved_session is None
+            or reserved_checkpoint is None
+            or desired_checkpoint is None
+        ):
+            raise _IncompleteRecoveryClaimLost(
+                "Incomplete-session recovery is not eligible at store time."
+            )
+        if reserved != reserved_session:
+            raise RuntimeError("Recovery reservation returned conflicting session authority.")
+
+        def fence_reserved(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if (
+                _incomplete_recovery_session_reservation_authority(current_session)
+                != _incomplete_recovery_session_reservation_authority(reserved_session)
+                or checkpoint != reserved_checkpoint
+            ):
+                raise _IncompleteRecoveryClaimLost(
+                    "Incomplete-session recovery reservation changed before fencing."
+                )
+            return copy_json_value(desired_checkpoint, "checkpoint")
+
+        try:
+            return await self._fence_or_rebind_active_invocation(
+                session_id,
+                statuses=statuses,
+                checkpoint_transform=fence_reserved,
+                target_status=target_status,
+            )
+        except BaseException as failure:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=failure,
+                steps=(("tentative recovery reservation release", release_tentative_reservation),),
+            )
+            raise
 
     async def _recoverable_provider_operation(
         self,
@@ -3693,10 +3925,12 @@ class RecoveryCoordinator:
             current_session: Session,
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
-            checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
-                checkpoint,
-                now=self._clock(),
-            )
+            # Expired recovery ownership is reconciled through the store-time
+            # claim path above.  This final typed rebind must reject any marker
+            # that appeared after that reconciliation instead of interpreting
+            # its lease with a worker clock.
+            if _incomplete_recovery_claim_from_checkpoint(checkpoint) is not None:
+                raise RuntimeError("Session has an active incomplete-session recovery operation.")
             if checkpoint_transform is not None:
                 checkpoint = checkpoint_transform(current_session, checkpoint)
             if execution_profile_snapshot is not None:
@@ -5411,7 +5645,7 @@ class RecoveryCoordinator:
                 )
             recovered = await self._recover_incomplete_session_scoped(
                 session=await self._require_session(pending.session_id),
-                inactive_before=None,
+                inactive_for_seconds=None,
                 reason="elected attached-task provider continuation",
                 metadata={},
                 provider_disposition_task_id=task_id,
@@ -9966,7 +10200,7 @@ class RecoveryCoordinator:
         try:
             claim = await self._claim_incomplete_recovery(
                 session=session,
-                inactive_before=None,
+                inactive_for_seconds=None,
                 required_expired_claim_id=claim_id,
             )
             return claim is not None
@@ -10853,6 +11087,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     budget_policy=budget_policy,
                     request_loop_policies=request_loop_policies,
+                    recovery_claim_id=authority.claim_id,
                 )
             except BaseException as reconstruction_failure:
                 failure = reconstruction_failure
@@ -10909,10 +11144,10 @@ class RecoveryCoordinator:
         def claim_checkpoint(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            claimed_at: datetime,
         ) -> dict[str, Any]:
             nonlocal claim_expires_at, claim_run_epoch
             nonlocal claimed_run_operation_id, session_before_fence
-            claimed_at = self._clock()
             _require_aware_datetime(claimed_at, "manual recovery claim clock")
             pending_operator_interruption = (
                 checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint
@@ -10980,10 +11215,12 @@ class RecoveryCoordinator:
                 operation_id=run_operation_id,
             )
 
+        transition_started = time.monotonic()
         transition_task = asyncio.create_task(
-            self._fence_or_rebind_active_invocation(
+            self._reserve_and_fence_incomplete_recovery(
                 session.id,
                 statuses=_TOOL_ROUND_RECOVERABLE_SESSION_STATUSES,
+                inactive_for_seconds=None,
                 target_status=SessionStatus.RUNNING,
                 checkpoint_transform=claim_checkpoint,
             )
@@ -11080,10 +11317,10 @@ class RecoveryCoordinator:
                 def fence_interruption(
                     _current_session: Session,
                     checkpoint: dict[str, Any] | None,
+                    claimed_at: datetime,
                 ) -> dict[str, Any]:
                     nonlocal claim_expires_at, claim_run_epoch
                     require_matching_pending_call(checkpoint)
-                    claimed_at = self._clock()
                     _require_aware_datetime(claimed_at, "manual recovery fence clock")
                     claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
                     claim_run_epoch = _current_session.run_epoch + 1
@@ -11129,14 +11366,16 @@ class RecoveryCoordinator:
                         run_epoch=claim_run_epoch,
                     )
 
+                interruption_fence_started = time.monotonic()
                 fence_outcome = await await_shielded_task_outcome(
                     asyncio.create_task(
-                        self._fence_or_rebind_active_invocation(
+                        self._reserve_and_fence_incomplete_recovery(
                             session.id,
                             statuses={
                                 SessionStatus.INTERRUPTING,
                                 SessionStatus.INTERRUPTED,
                             },
+                            inactive_for_seconds=None,
                             checkpoint_transform=fence_interruption,
                         )
                     ),
@@ -11211,6 +11450,33 @@ class RecoveryCoordinator:
                     fenced_session,
                     authority,
                 )
+                local_lease_deadline = (
+                    interruption_fence_started + _INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds()
+                )
+                try:
+                    _require_live_incomplete_recovery_claim_acknowledgement(
+                        session_id=fenced_session.id,
+                        local_lease_deadline=local_lease_deadline,
+                    )
+                except _IncompleteRecoveryClaimLost as lease_failure:
+                    authoritative_failure = _authoritative_expired_recovery_claim_failure(
+                        interruption_error,
+                        lease_failure,
+                    )
+                    await self._cleanup_incomplete_recovery_claim(
+                        authority=authority,
+                        authoritative_failure=authoritative_failure,
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=invocation_context,
+                        claim_has_not_dispatched_work=True,
+                    )
+                    if authoritative_failure is not lease_failure:
+                        authoritative_failure.add_note(
+                            "The interrupted manual recovery fence acknowledgement "
+                            "also consumed its complete lease."
+                        )
+                        raise authoritative_failure from exception_cause(authoritative_failure)
+                    raise
                 return _ManualRecoveryInterruptionFence(
                     session=fenced_session,
                     claim_id=claim_id,
@@ -11344,6 +11610,9 @@ class RecoveryCoordinator:
         claim = _IncompleteRecoveryClaim(
             claim_id=claim_id,
             claim_expires_at=claim_expires_at,
+            local_lease_deadline=(
+                transition_started + _INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds()
+            ),
             session_before_fence=session_before_fence,
             session=claimed_session,
             run_operation=_SessionRunOperation(
@@ -11353,6 +11622,29 @@ class RecoveryCoordinator:
             invocation_context=invocation_context,
             authority=authority,
         )
+        try:
+            _require_live_incomplete_recovery_claim_acknowledgement(
+                session_id=claimed_session.id,
+                local_lease_deadline=claim.local_lease_deadline,
+            )
+        except _IncompleteRecoveryClaimLost as lease_failure:
+            authoritative_failure = _authoritative_expired_recovery_claim_failure(
+                outcome.cancellation,
+                lease_failure,
+            )
+            await self._cleanup_incomplete_recovery_claim(
+                authority=claim.require_authority(),
+                authoritative_failure=authoritative_failure,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+                claim_has_not_dispatched_work=True,
+            )
+            if outcome.cancellation is not None:
+                outcome.cancellation.add_note(
+                    "The manual recovery claim acknowledgement also consumed its complete lease."
+                )
+                raise outcome.cancellation from exception_cause(outcome.cancellation)
+            raise
         if after_admission is not None:
             try:
                 await after_admission()
@@ -11512,7 +11804,7 @@ class RecoveryCoordinator:
             self._heartbeat_incomplete_recovery_claim(
                 session_id=claim.session.id,
                 claim_id=claim.claim_id,
-                claim_expires_at=claim.claim_expires_at,
+                local_lease_deadline=claim.local_lease_deadline,
                 stop=stop_heartbeat,
             )
         )
@@ -14517,7 +14809,7 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {request.session_id}") from None
         recovered = await self._recover_incomplete_session_scoped(
             session=session,
-            inactive_before=request.inactive_before,
+            inactive_for_seconds=request.inactive_for_seconds,
             reason=request.reason,
             metadata=request.metadata,
             before_mutation=before_mutation,
@@ -14788,7 +15080,7 @@ class RecoveryCoordinator:
                 page = await self._session_store.list_sessions(
                     SessionQuery(
                         status=status,
-                        last_activity_before=request.inactive_before,
+                        inactive_for_seconds=request.inactive_for_seconds,
                         limit=query_limit,
                         cursor=cursor,
                         order_by=SessionOrder.UPDATED_AT_DESC,
@@ -14826,10 +15118,7 @@ class RecoveryCoordinator:
 
                 for candidate_index, candidate in enumerate(page.sessions):
                     inspected_session_count += 1
-                    if (
-                        request.inactive_before is not None
-                        and candidate.last_activity_at > request.inactive_before
-                    ) or candidate.id in result_session_ids:
+                    if candidate.id in result_session_ids:
                         result = None
                     else:
                         result = await self._recover_incomplete_session_fault_isolated(
@@ -14919,7 +15208,7 @@ class RecoveryCoordinator:
             try:
                 result = await self._recover_incomplete_session_scoped(
                     session=session,
-                    inactive_before=request.inactive_before,
+                    inactive_for_seconds=request.inactive_for_seconds,
                     reason=request.reason,
                     metadata=request.metadata,
                     before_mutation=(
@@ -14977,7 +15266,7 @@ class RecoveryCoordinator:
         self,
         *,
         session: Session,
-        inactive_before: datetime | None,
+        inactive_for_seconds: int | None,
         reason: str,
         metadata: dict[str, Any],
         before_mutation: RecoveryMutationHook | None = None,
@@ -15004,7 +15293,7 @@ class RecoveryCoordinator:
 
         return await self._recover_incomplete_session_owned(
             session=session,
-            inactive_before=inactive_before,
+            inactive_for_seconds=inactive_for_seconds,
             reason=reason,
             metadata=metadata,
             previous_status=previous_status,
@@ -15021,7 +15310,7 @@ class RecoveryCoordinator:
         self,
         *,
         session: Session,
-        inactive_before: datetime | None,
+        inactive_for_seconds: int | None,
         reason: str,
         metadata: dict[str, Any],
         previous_status: SessionStatus,
@@ -15164,7 +15453,7 @@ class RecoveryCoordinator:
                     await admit_before_mutation()
                     return await self._settle_terminal_invocation_closure_owned(
                         session=session,
-                        inactive_before=inactive_before,
+                        inactive_for_seconds=inactive_for_seconds,
                         previous_status=previous_status,
                         execution_profile_snapshot=active_invocation_profile,
                     )
@@ -15186,7 +15475,7 @@ class RecoveryCoordinator:
                 await admit_before_mutation()
                 return await self._repair_terminal_evidence_owned(
                     session=session,
-                    inactive_before=inactive_before,
+                    inactive_for_seconds=inactive_for_seconds,
                     previous_status=previous_status,
                 )
 
@@ -15197,7 +15486,7 @@ class RecoveryCoordinator:
                 await admit_before_mutation()
                 return await self._repair_terminal_evidence_owned(
                     session=session,
-                    inactive_before=inactive_before,
+                    inactive_for_seconds=inactive_for_seconds,
                     previous_status=previous_status,
                 )
             return IncompleteSessionRecoveryResult(
@@ -15215,7 +15504,7 @@ class RecoveryCoordinator:
                 await admit_before_mutation()
                 return await self._repair_terminal_evidence_owned(
                     session=session,
-                    inactive_before=inactive_before,
+                    inactive_for_seconds=inactive_for_seconds,
                     previous_status=previous_status,
                 )
             raise
@@ -15347,7 +15636,7 @@ class RecoveryCoordinator:
             await admit_before_mutation()
             claim = await self._claim_incomplete_recovery(
                 session=session,
-                inactive_before=inactive_before,
+                inactive_for_seconds=inactive_for_seconds,
                 execution_profile_snapshot=execution_profile_snapshot,
                 checkpoint_transform=provider_execution_transfer,
             )
@@ -15369,9 +15658,8 @@ class RecoveryCoordinator:
                     registered_provider=registered_provider,
                     registered_environment=registered_environment,
                     budget_policy=budget_policy_snapshot,
+                    recovery_claim_id=claim.claim_id,
                 )
-                if retain_invocation_context is not None:
-                    retain_invocation_context(invocation_context)
             if provider_disposition_after_admission is not None:
                 await provider_disposition_after_admission()
             return await self._recover_incomplete_session_with_heartbeat(
@@ -15380,7 +15668,7 @@ class RecoveryCoordinator:
                     session=claim.session,
                     session_before_fence=claim.session_before_fence,
                     previous_status=previous_status,
-                    inactive_before=inactive_before,
+                    inactive_for_seconds=inactive_for_seconds,
                     reason=reason,
                     metadata=metadata,
                     registered_agent=registered_agent,
@@ -15422,7 +15710,7 @@ class RecoveryCoordinator:
         self,
         *,
         session: Session,
-        inactive_before: datetime | None,
+        inactive_for_seconds: int | None,
         previous_status: SessionStatus,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
     ) -> IncompleteSessionRecoveryResult:
@@ -15433,7 +15721,7 @@ class RecoveryCoordinator:
         try:
             claim = await self._claim_incomplete_recovery(
                 session=session,
-                inactive_before=inactive_before,
+                inactive_for_seconds=inactive_for_seconds,
                 execution_profile_snapshot=execution_profile_snapshot,
             )
             if claim is None:
@@ -15488,11 +15776,6 @@ class RecoveryCoordinator:
         checkpoint: dict[str, Any] | None,
     ) -> tuple[Session, dict[str, Any] | None]:
         """Finish a previous run's terminal publication before claiming the next run."""
-        existing_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-        now = self._clock()
-        _require_aware_datetime(now, "terminal evidence reconciliation clock")
-        if existing_claim is not None and existing_claim[1] > now:
-            raise RuntimeError("Session has an active incomplete-session recovery operation.")
         if session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES:
             if _session_run_operation_from_checkpoint(checkpoint) is None:
                 return session, checkpoint
@@ -15510,7 +15793,7 @@ class RecoveryCoordinator:
             )
         await self._repair_terminal_evidence_owned(
             session=session,
-            inactive_before=None,
+            inactive_for_seconds=None,
             previous_status=session.status,
         )
         current = await self._require_session(session.id)
@@ -15520,12 +15803,7 @@ class RecoveryCoordinator:
             checkpoint=current_checkpoint,
         ):
             current_claim = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
-            current_now = self._clock()
-            _require_aware_datetime(
-                current_now,
-                "terminal evidence reconciliation clock",
-            )
-            if current_claim is not None and current_claim[1] > current_now:
+            if current_claim is not None:
                 raise RuntimeError("Session has an active incomplete-session recovery operation.")
             raise RuntimeError(
                 "Session terminal evidence recovery did not finish the previous run boundary."
@@ -15711,7 +15989,7 @@ class RecoveryCoordinator:
         self,
         *,
         session: Session,
-        inactive_before: datetime | None,
+        inactive_for_seconds: int | None,
         previous_status: SessionStatus,
     ) -> IncompleteSessionRecoveryResult:
         claim: _IncompleteRecoveryClaim | None = None
@@ -15719,7 +15997,7 @@ class RecoveryCoordinator:
         try:
             claim = await self._claim_incomplete_recovery(
                 session=session,
-                inactive_before=inactive_before,
+                inactive_for_seconds=inactive_for_seconds,
             )
             if claim is None:
                 current = await self._require_session(session.id)
@@ -15990,6 +16268,7 @@ class RecoveryCoordinator:
         def clear_marker(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            store_now: datetime,
         ) -> dict[str, Any]:
             if current_session.status != SessionStatus.INTERRUPTED:
                 raise RuntimeError("Session status changed during terminal interruption repair.")
@@ -15999,9 +16278,7 @@ class RecoveryCoordinator:
                 )
             updated = copy_json_value(checkpoint, "checkpoint")
             claim = _incomplete_recovery_claim_from_checkpoint(updated)
-            now = self._clock()
-            _require_aware_datetime(now, "terminal finalization claim clock")
-            if claim is None or claim[0] != claim_id or claim[1] <= now:
+            if claim is None or claim[0] != claim_id or claim[1] <= store_now:
                 raise _IncompleteRecoveryClaimLost(
                     "Terminal evidence recovery ownership changed before marker cleanup."
                 )
@@ -16013,7 +16290,7 @@ class RecoveryCoordinator:
             updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
             return updated
 
-        await self._session_store.transform_checkpoint(session_id, clear_marker)
+        await self._session_store.transform_checkpoint_with_store_time(session_id, clear_marker)
 
     async def _clear_session_run_operation(
         self,
@@ -16129,7 +16406,7 @@ class RecoveryCoordinator:
                                 raise RuntimeError(
                                     "Open recovery invocation lost its authenticated context."
                                 )
-                            retain_invocation_context(invocation_context)
+                            retain_invocation_context(invocation_context.without_recovery_claim())
                         return
                 settlement = await self._session_store.load_invocation_settlement_transition(
                     session_id,
@@ -16333,36 +16610,33 @@ class RecoveryCoordinator:
 
         if expected_run_epoch is None:
             return None
-        checkpoint = await self._session_store.load_checkpoint(session_id)
-        persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-        if persisted_claim is None or persisted_claim[0] != claim_id:
+        owned: tuple[Session, datetime] | None = None
+
+        def inspect(
+            session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> None:
+            nonlocal owned
+            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if persisted_claim is None or persisted_claim[0] != claim_id:
+                return None
+            if session.run_epoch != expected_run_epoch or (
+                require_unexpired and persisted_claim[1] <= store_now
+            ):
+                return None
+            owned = (session.model_copy(deep=True), persisted_claim[1])
             return None
-        session = await self._require_session(session_id)
-        if session.run_epoch != expected_run_epoch or (
-            require_unexpired and persisted_claim[1] <= self._clock()
-        ):
-            return None
-        return session, persisted_claim[1]
+
+        await self._session_store.transform_checkpoint_with_store_time(session_id, inspect)
+        return owned
 
     def _new_terminal_evidence_finalization_claim(
         self,
-    ) -> tuple[str, datetime, dict[str, Any]]:
-        """Prepare one durable lease for a live terminal-evidence finalizer."""
+    ) -> str:
+        """Create an identity whose lease is installed only by authoritative store time."""
 
-        claimed_at = self._clock()
-        _require_aware_datetime(claimed_at, "terminal finalization claim clock")
-        claim_id = str(uuid4())
-        claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
-        return (
-            claim_id,
-            claim_expires_at,
-            {
-                "version": 1,
-                "claim_id": claim_id,
-                "claimed_at": claimed_at.isoformat(),
-                "claim_expires_at": claim_expires_at.isoformat(),
-            },
-        )
+        return str(uuid4())
 
     async def _claim_pending_terminal_evidence_finalization(
         self,
@@ -16376,7 +16650,8 @@ class RecoveryCoordinator:
             expected_payload,
             "expected_pending_session_interrupt",
         )
-        claim_id, claim_expires_at, marker = self._new_terminal_evidence_finalization_claim()
+        claim_id = self._new_terminal_evidence_finalization_claim()
+        claim_expires_at: datetime | None = None
         claim_installed = False
 
         def require_exact_pending_authority(
@@ -16405,18 +16680,23 @@ class RecoveryCoordinator:
         def claim_pending_finalization(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            store_now: datetime,
         ) -> dict[str, Any] | None:
-            nonlocal claim_installed
+            nonlocal claim_expires_at, claim_installed
             require_exact_pending_authority(current_session, checkpoint)
             existing_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            now = self._clock()
-            _require_aware_datetime(now, "terminal finalization claim clock")
-            if existing_claim is not None and existing_claim[1] > now:
+            if existing_claim is not None and existing_claim[1] > store_now:
                 return None
             assert checkpoint is not None
             updated = copy_json_value(checkpoint, "checkpoint")
+            claim_expires_at = store_now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = copy_json_value(
-                marker,
+                {
+                    "version": 1,
+                    "claim_id": claim_id,
+                    "claimed_at": store_now.isoformat(),
+                    "claim_expires_at": claim_expires_at.isoformat(),
+                },
                 "terminal_finalization_claim",
             )
             claim_installed = True
@@ -16424,7 +16704,7 @@ class RecoveryCoordinator:
 
         claim_task = asyncio.create_task(
             capture_awaitable_outcome(
-                lambda: self._session_store.transform_checkpoint(
+                lambda: self._session_store.transform_checkpoint_with_store_time(
                     session.id,
                     claim_pending_finalization,
                 )
@@ -16457,14 +16737,24 @@ class RecoveryCoordinator:
             def inspect_claim(
                 current_session: Session,
                 checkpoint: dict[str, Any] | None,
+                store_now: datetime,
             ) -> None:
-                nonlocal claim_matches
+                nonlocal claim_expires_at, claim_matches
                 require_exact_pending_authority(current_session, checkpoint)
                 current_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-                claim_matches = current_claim is not None and current_claim[0] == claim_id
+                claim_matches = (
+                    current_claim is not None
+                    and current_claim[0] == claim_id
+                    and current_claim[1] > store_now
+                )
+                if claim_matches:
+                    assert current_claim is not None
+                    claim_expires_at = current_claim[1]
                 return None
 
-            await self._session_store.transform_checkpoint(session.id, inspect_claim)
+            await self._session_store.transform_checkpoint_with_store_time(
+                session.id, inspect_claim
+            )
             return claim_matches
 
         if error is not None or cancellation is not None:
@@ -16503,6 +16793,7 @@ class RecoveryCoordinator:
 
         if cancellation is not None:
             if claim_installed:
+                assert claim_expires_at is not None
                 process_control = _terminal_finalization_process_control(error)
                 return _TerminalFinalizationClaimAcquisition(
                     claim_id=claim_id,
@@ -16525,6 +16816,7 @@ class RecoveryCoordinator:
             raise error
         if not claim_installed:
             return None
+        assert claim_expires_at is not None
         process_control = _terminal_finalization_process_control(error)
         return _TerminalFinalizationClaimAcquisition(
             claim_id=claim_id,
@@ -16545,7 +16837,7 @@ class RecoveryCoordinator:
         *,
         session_id: str,
         claim_id: str,
-        claim_expires_at: datetime,
+        local_lease_deadline: float,
     ) -> tuple[asyncio.Event, asyncio.Task[None]]:
         """Retain a live claim from atomic interrupt until its run handler owns it."""
 
@@ -16554,7 +16846,7 @@ class RecoveryCoordinator:
             self._heartbeat_incomplete_recovery_claim(
                 session_id=session_id,
                 claim_id=claim_id,
-                claim_expires_at=claim_expires_at,
+                local_lease_deadline=local_lease_deadline,
                 stop=stop,
             ),
             name=f"cayu-terminal-finalization-heartbeat:{session_id}",
@@ -16632,7 +16924,7 @@ class RecoveryCoordinator:
         session: Session,
         claim_id: str,
         expected_payload: dict[str, Any],
-    ) -> tuple[Session, datetime] | None:
+    ) -> tuple[Session, datetime, float] | None:
         """Atomically re-prove and renew the complete terminal owner tuple."""
 
         expected_payload = copy_json_value(
@@ -16644,6 +16936,7 @@ class RecoveryCoordinator:
         def renew_exact_claim(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            store_now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal renewed
             if (
@@ -16665,9 +16958,7 @@ class RecoveryCoordinator:
                     "Terminal finalization interrupt identity changed before lease renewal."
                 )
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            now = self._clock()
-            _require_aware_datetime(now, "terminal finalization claim clock")
-            if existing is None or existing[0] != claim_id or existing[1] <= now:
+            if existing is None or existing[0] != claim_id or existing[1] <= store_now:
                 return None
             assert checkpoint is not None
             updated = copy_json_value(checkpoint, "checkpoint")
@@ -16675,15 +16966,25 @@ class RecoveryCoordinator:
                 updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY],
                 "terminal_finalization_claim",
             )
-            renewed_until = now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
+            renewed_until = store_now + _INCOMPLETE_RECOVERY_CLAIM_LEASE
             marker["claim_expires_at"] = renewed_until.isoformat()
-            marker["renewed_at"] = now.isoformat()
+            marker["renewed_at"] = store_now.isoformat()
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = marker
             renewed = (current_session.model_copy(deep=True), renewed_until)
             return updated
 
-        await self._session_store.transform_checkpoint(session.id, renew_exact_claim)
-        return renewed
+        renewal_started = time.monotonic()
+        await self._session_store.transform_checkpoint_with_store_time(
+            session.id, renew_exact_claim
+        )
+        if renewed is None:
+            return None
+        local_lease_deadline = renewal_started + _INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds()
+        _require_live_incomplete_recovery_claim_acknowledgement(
+            session_id=session.id,
+            local_lease_deadline=local_lease_deadline,
+        )
+        return renewed[0], renewed[1], local_lease_deadline
 
     async def _run_preclaimed_terminal_evidence_finalization(
         self,
@@ -16704,10 +17005,11 @@ class RecoveryCoordinator:
             raise _IncompleteRecoveryClaimLost(
                 "Terminal evidence finalization ownership changed before execution."
             )
-        owned_session, current_claim_expires_at = owned_claim
+        owned_session, current_claim_expires_at, local_lease_deadline = owned_claim
         claim = _IncompleteRecoveryClaim(
             claim_id=claim_id,
             claim_expires_at=current_claim_expires_at,
+            local_lease_deadline=local_lease_deadline,
             session_before_fence=owned_session,
             session=owned_session,
         )
@@ -16836,7 +17138,7 @@ class RecoveryCoordinator:
         self,
         *,
         session: Session,
-        inactive_before: datetime | None,
+        inactive_for_seconds: int | None,
         required_expired_claim_id: str | None = None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
@@ -16871,14 +17173,14 @@ class RecoveryCoordinator:
         def claim_checkpoint(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
+            claimed_at: datetime,
         ) -> dict[str, Any]:
             nonlocal claim_expires_at, claim_run_epoch, session_before_fence
-            claimed_at = self._clock()
             _require_aware_datetime(claimed_at, "recovery claim clock")
             if (
                 active_provider_operation_cancellation_claim_from_checkpoint(
                     checkpoint,
-                    now=datetime.now(UTC),
+                    now=claimed_at,
                 )
                 is not None
             ):
@@ -16896,13 +17198,8 @@ class RecoveryCoordinator:
                     raise _IncompleteRecoveryClaimLost(
                         "Expired incomplete-session recovery ownership changed."
                     )
-            elif (
-                current_session.status != session.status
-                or (
-                    inactive_before is not None
-                    and current_session.last_activity_at > inactive_before
-                )
-                or (existing is not None and existing[1] > claimed_at)
+            elif current_session.status != session.status or (
+                existing is not None and existing[1] > claimed_at
             ):
                 raise _IncompleteRecoveryClaimLost(
                     "Incomplete-session recovery ownership changed before it was claimed."
@@ -16952,9 +17249,10 @@ class RecoveryCoordinator:
 
         try:
             fence_task = asyncio.create_task(
-                self._fence_or_rebind_active_invocation(
+                self._reserve_and_fence_incomplete_recovery(
                     session.id,
                     statuses={session.status},
+                    inactive_for_seconds=inactive_for_seconds,
                     checkpoint_transform=claim_checkpoint,
                 )
             )
@@ -16963,6 +17261,7 @@ class RecoveryCoordinator:
                 outcome.error,
                 _IncompleteRecoveryClaimLost
                 | InvocationLifecycleCommandConflict
+                | SessionRunFenced
                 | SessionStatusConflict,
             ):
                 if outcome.cancellation is not None:
@@ -17046,33 +17345,39 @@ class RecoveryCoordinator:
                     raise outcome.cancellation from outcome.error
                 raise outcome.error
 
-            if not replacing_expired_owner:
-                try:
-                    renewed_until = await self._renew_incomplete_recovery_claim(
-                        session.id,
-                        claim_id,
-                    )
-                except SessionRunFenced:
-                    await self._cleanup_incomplete_recovery_claim(
-                        authority=authority,
-                        authoritative_failure=None,
-                    )
-                    return None
-                if renewed_until is None:
-                    await self._cleanup_incomplete_recovery_claim(
-                        authority=authority,
-                        authoritative_failure=None,
-                    )
-                    return None
-                claim_expires_at = renewed_until
-
-            return _IncompleteRecoveryClaim(
+            try:
+                renewal_started = time.monotonic()
+                renewed_until = await self._renew_incomplete_recovery_claim(
+                    session.id,
+                    claim_id,
+                )
+            except SessionRunFenced:
+                await self._cleanup_incomplete_recovery_claim(
+                    authority=authority,
+                    authoritative_failure=None,
+                )
+                return None
+            if renewed_until is None:
+                await self._cleanup_incomplete_recovery_claim(
+                    authority=authority,
+                    authoritative_failure=None,
+                )
+                return None
+            claim = _IncompleteRecoveryClaim(
                 claim_id=claim_id,
-                claim_expires_at=claim_expires_at,
+                claim_expires_at=renewed_until,
+                local_lease_deadline=(
+                    renewal_started + _INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds()
+                ),
                 session_before_fence=session_before_fence,
                 session=fenced,
                 authority=authority,
             )
+            _require_live_incomplete_recovery_claim_acknowledgement(
+                session_id=session.id,
+                local_lease_deadline=claim.local_lease_deadline,
+            )
+            return claim
         except BaseException as exc:
             if authority is not None:
                 await self._cleanup_incomplete_recovery_claim(
@@ -17108,9 +17413,25 @@ class RecoveryCoordinator:
     ) -> _RecoveryResultT:
         stop_heartbeat = asyncio.Event()
         recovery_outcome_observed = False
+        shutdown_recovery_outcome_observed = False
+        shutdown_recovery_failure: BaseException | None = None
+
+        _require_live_incomplete_recovery_claim_acknowledgement(
+            session_id=claim.session.id,
+            local_lease_deadline=claim.local_lease_deadline,
+        )
+
+        async def run_live_recovery() -> _RecoveryResultT:
+            # Recheck in the child at the exact dispatch boundary. Creating a
+            # task can yield long enough to consume the remaining local lease.
+            _require_live_incomplete_recovery_claim_acknowledgement(
+                session_id=claim.session.id,
+                local_lease_deadline=claim.local_lease_deadline,
+            )
+            return await recovery()
 
         async def run_recovery() -> CapturedAwaitableOutcome[_RecoveryResultT]:
-            return await capture_awaitable_outcome(recovery)
+            return await capture_awaitable_outcome(run_live_recovery)
 
         def recovery_outcome() -> _RecoveryResultT:
             nonlocal recovery_outcome_observed
@@ -17127,7 +17448,7 @@ class RecoveryCoordinator:
             self._heartbeat_incomplete_recovery_claim(
                 session_id=claim.session.id,
                 claim_id=claim.claim_id,
-                claim_expires_at=claim.claim_expires_at,
+                local_lease_deadline=claim.local_lease_deadline,
                 stop=stop_heartbeat,
             )
         )
@@ -17135,14 +17456,37 @@ class RecoveryCoordinator:
         authoritative_failure: BaseException | None = None
 
         async def stop_workers() -> None:
+            nonlocal recovery_outcome_observed
+            nonlocal shutdown_recovery_failure, shutdown_recovery_outcome_observed
+            if (
+                isinstance(
+                    authoritative_failure,
+                    asyncio.CancelledError | _IncompleteRecoveryClaimLost,
+                )
+                and not recovery_task.done()
+            ):
+                # Cancellation-opaque work must reach natural settlement before
+                # this process reports quiescence. On ownership loss the
+                # heartbeat is already terminal, but cancelling an asyncio
+                # wrapper would not stop an underlying thread or process.
+                await await_shielded_task_outcome(recovery_task)
             stop_heartbeat.set()
-            for task in (recovery_task, heartbeat_task):
-                if not task.done():
-                    task.cancel()
+            if not recovery_task.done():
+                recovery_task.cancel()
+            if not heartbeat_task.done() and not isinstance(
+                authoritative_failure,
+                asyncio.CancelledError,
+            ):
+                heartbeat_task.cancel()
             await asyncio.gather(recovery_task, heartbeat_task, return_exceptions=True)
             if recovery_outcome_observed or recovery_task.cancelled():
                 return
             captured = recovery_task.result()
+            if isinstance(authoritative_failure, _IncompleteRecoveryClaimLost):
+                recovery_outcome_observed = True
+                shutdown_recovery_outcome_observed = True
+                shutdown_recovery_failure = captured.error
+                return
             if captured.error is None:
                 return
             if isinstance(captured.error, asyncio.CancelledError):
@@ -17197,49 +17541,118 @@ class RecoveryCoordinator:
                 authoritative_failure=authoritative_failure,
                 steps=(("incomplete recovery worker shutdown", stop_workers),),
             )
+            if (
+                isinstance(authoritative_failure, _IncompleteRecoveryClaimLost)
+                and shutdown_recovery_outcome_observed
+            ):
+                selected_failure = _authoritative_recovery_ownership_failure(
+                    shutdown_recovery_failure,
+                    authoritative_failure,
+                )
+                if selected_failure is not authoritative_failure:
+                    raise selected_failure
 
     async def _heartbeat_incomplete_recovery_claim(
         self,
         *,
         session_id: str,
         claim_id: str,
-        claim_expires_at: datetime,
+        local_lease_deadline: float,
         stop: asyncio.Event,
     ) -> None:
         sleep_seconds = _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+        last_renewal_failure: BaseException | None = None
         while not stop.is_set():
+            remaining = local_lease_deadline - time.monotonic()
+            if remaining <= 0:
+                failure = _IncompleteRecoveryClaimLost(
+                    "Incomplete-session recovery stopped before its store lease could "
+                    f"be renewed for session {session_id}."
+                )
+                if last_renewal_failure is None:
+                    raise failure
+                raise failure from last_renewal_failure
             try:
                 await asyncio.wait_for(
                     stop.wait(),
-                    timeout=sleep_seconds,
+                    timeout=min(sleep_seconds, remaining),
                 )
             except TimeoutError:
-                try:
-                    renewed_until = await self._renew_incomplete_recovery_claim(
-                        session_id,
-                        claim_id,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    now = self._clock()
-                    _require_aware_datetime(now, "recovery claim clock")
-                    if now >= claim_expires_at:
-                        raise _IncompleteRecoveryClaimLost(
-                            "Incomplete-session recovery claim could not be renewed before "
-                            f"expiry for session {session_id}."
-                        ) from exc
-                    sleep_seconds = min(
-                        _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS,
-                        max(0.0, (claim_expires_at - now).total_seconds()),
-                    )
-                    continue
-                if renewed_until is None:
+                pass
+            else:
+                return
+            renewal_started = time.monotonic()
+            renewal_task = asyncio.create_task(
+                self._renew_incomplete_recovery_claim(
+                    session_id,
+                    claim_id,
+                )
+            )
+            try:
+                outcome = await await_shielded_task_outcome(
+                    renewal_task,
+                    timeout_s=max(
+                        0.0,
+                        local_lease_deadline - time.monotonic(),
+                    ),
+                )
+            except asyncio.CancelledError:
+                renewal_task.add_done_callback(_consume_incomplete_recovery_store_task)
+                raise
+            if outcome.cancellation is not None:
+                renewal_task.add_done_callback(_consume_incomplete_recovery_store_task)
+                restore_task_cancellation_requests(
+                    outcome.cancellation_requests_consumed,
+                    cancellation=outcome.cancellation,
+                )
+                raise outcome.cancellation
+            if outcome.timed_out:
+                renewal_task.add_done_callback(_consume_incomplete_recovery_store_task)
+                raise _IncompleteRecoveryClaimLost(
+                    "Incomplete-session recovery could not confirm store lease renewal "
+                    f"before its local deadline for session {session_id}."
+                ) from last_renewal_failure
+            if outcome.error is not None:
+                if isinstance(outcome.error, asyncio.CancelledError):
                     raise _IncompleteRecoveryClaimLost(
-                        f"Incomplete-session recovery claim lost for session {session_id}."
-                    ) from None
-                claim_expires_at = renewed_until
-                sleep_seconds = _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS
+                        "Incomplete-session recovery store lease renewal was cancelled "
+                        f"without owner cancellation for session {session_id}."
+                    ) from unexpected_child_cancellation_error(
+                        outcome.error,
+                        operation="Incomplete-session recovery store lease renewal",
+                    )
+                if not isinstance(outcome.error, Exception):
+                    raise outcome.error
+                last_renewal_failure = outcome.error
+                # Elapsed monotonic time is only a conservative local stop
+                # boundary. It cannot authorize takeover, but it prevents
+                # this worker from continuing after the store-owned lease
+                # could have expired while renewal was unavailable.
+                remaining = local_lease_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _IncompleteRecoveryClaimLost(
+                        "Incomplete-session recovery could not renew its store lease "
+                        f"for session {session_id}."
+                    ) from outcome.error
+                sleep_seconds = min(
+                    _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS,
+                    remaining,
+                )
+                continue
+            renewed_until = outcome.result
+            if renewed_until is None:
+                raise _IncompleteRecoveryClaimLost(
+                    f"Incomplete-session recovery claim lost for session {session_id}."
+                ) from None
+            last_renewal_failure = None
+            local_lease_deadline = (
+                renewal_started + _INCOMPLETE_RECOVERY_CLAIM_LEASE.total_seconds()
+            )
+            _require_live_incomplete_recovery_claim_acknowledgement(
+                session_id=session_id,
+                local_lease_deadline=local_lease_deadline,
+            )
+            sleep_seconds = _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS
 
     async def _watch_manual_recovery_interruption(
         self,
@@ -17283,10 +17696,10 @@ class RecoveryCoordinator:
         def renew_claim(
             _session: Session,
             checkpoint: dict[str, Any] | None,
+            now: datetime,
         ) -> dict[str, Any] | None:
             nonlocal renewed_until
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            now = self._clock()
             _require_aware_datetime(now, "recovery claim clock")
             if existing is None or existing[0] != claim_id or existing[1] <= now:
                 return None
@@ -17301,7 +17714,10 @@ class RecoveryCoordinator:
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = marker
             return updated
 
-        await self._session_store.transform_checkpoint(session_id, renew_claim)
+        await self._session_store.transform_checkpoint_with_store_time(
+            session_id,
+            renew_claim,
+        )
         return renewed_until
 
     async def _release_incomplete_recovery_claim(
@@ -18420,7 +18836,7 @@ class RecoveryCoordinator:
         session: Session,
         session_before_fence: Session,
         previous_status: SessionStatus,
-        inactive_before: datetime | None,
+        inactive_for_seconds: int | None,
         reason: str,
         metadata: dict[str, Any],
         registered_agent: runtime_records.RegisteredAgentState,
@@ -18742,7 +19158,7 @@ class RecoveryCoordinator:
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
 
-        if inactive_before is not None:
+        if inactive_for_seconds is not None:
             events.append(
                 await self._event_writer.emit(
                     Event(
@@ -18753,7 +19169,7 @@ class RecoveryCoordinator:
                         payload={
                             "previous_run_epoch": session_before_fence.run_epoch,
                             "run_epoch": session.run_epoch,
-                            "inactive_before": inactive_before.isoformat(),
+                            "inactive_for_seconds": inactive_for_seconds,
                             "reason": reason,
                             "metadata": metadata,
                         },
@@ -19591,9 +20007,7 @@ def _incomplete_recovery_request_fingerprint(
 ) -> str:
     material = {
         "statuses": sorted(status.value for status in request.statuses),
-        "inactive_before": (
-            None if request.inactive_before is None else request.inactive_before.isoformat()
-        ),
+        "inactive_for_seconds": request.inactive_for_seconds,
         "reason": request.reason,
         "metadata": request.metadata,
     }

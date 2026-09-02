@@ -5,6 +5,7 @@ import multiprocessing
 import traceback as traceback_module
 import warnings
 from collections.abc import Iterator, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
@@ -16,6 +17,7 @@ from tests.core.completion_verifier_profile_fixtures import (
 from tests.core.task_invocation_fixtures import unattributed_session_invocation_binding
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
+import cayu.runtime._completion_verifier_coordinator as verifier_coordinator_module
 from cayu import (
     CayuApp,
     CompletionContinuationPolicy,
@@ -969,9 +971,16 @@ def test_restart_requires_the_exact_profile_before_replacement_dispatch(
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
         sqlite_path = tmp_path / "verifier-profile-replacement.sqlite"
         store = (
-            InMemoryTaskStore(clock=lambda: now[0])
+            InMemoryTaskStore(
+                clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
+            )
             if store_kind == "memory"
-            else SQLiteTaskStore(sqlite_path, clock=lambda: now[0])
+            else SQLiteTaskStore(
+                sqlite_path,
+                clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
+            )
         )
         contract = _contract()
         proposal_id = await _proposal(store, contract)
@@ -998,7 +1007,11 @@ def test_restart_requires_the_exact_profile_before_replacement_dispatch(
 
         if isinstance(store, SQLiteTaskStore):
             await store.close()
-            store = SQLiteTaskStore(sqlite_path, clock=lambda: now[0])
+            store = SQLiteTaskStore(
+                sqlite_path,
+                clock=lambda: now[0],
+                ownership_clock=lambda: now[0],
+            )
 
         missing = CayuApp(task_store=store, enable_logging=False)
         with pytest.raises(CompletionVerifierUnavailable, match="not registered"):
@@ -1448,7 +1461,10 @@ def test_proposal_scoped_drain_blocks_replacement_claim_after_lease_expiry() -> 
 
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        store = InMemoryTaskStore(clock=lambda: now[0])
+        store = InMemoryTaskStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract()
         proposal_id = await _proposal(store, contract)
         verifier = ResistantVerifier()
@@ -1511,7 +1527,10 @@ def test_retry_cannot_steal_a_completed_adapter_drain_before_its_callback() -> N
 
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        store = InMemoryTaskStore(clock=lambda: now[0])
+        store = InMemoryTaskStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract()
         proposal_id = await _proposal(store, contract)
         verifier = ResistantVerifier()
@@ -1718,7 +1737,10 @@ def test_adapter_and_claim_renewal_failures_are_both_preserved() -> None:
 def test_in_memory_claim_renewal_is_nondecreasing_across_backward_clock_steps() -> None:
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        store = InMemoryTaskStore(clock=lambda: now[0])
+        store = InMemoryTaskStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract()
         proposal_id = await _proposal(store, contract)
         request = _execution_request(
@@ -1783,6 +1805,49 @@ def test_nonextending_initial_claim_renewal_fails_before_adapter_dispatch() -> N
     asyncio.run(scenario())
 
 
+def test_delayed_initial_claim_renewal_acknowledgement_fails_before_adapter_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class DelayedRenewalStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        async def renew_completion_verification_claim(self, request):
+            renewed = await super().renew_completion_verification_claim(request)
+            monotonic_now[0] += 2.0
+            return renewed
+
+    async def scenario() -> None:
+        store = DelayedRenewalStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = RecordingVerifier(_accepted_decision())
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        with pytest.raises(
+            CompletionVerificationClaimLost,
+            match="acknowledgement consumed its lease",
+        ):
+            await app.verify_completion_proposal(
+                _execution_request(
+                    proposal_id,
+                    lease_seconds=1,
+                    timeout_seconds=0.5,
+                )
+            )
+        assert verifier.requests == []
+        assert await store.load_completion_decision("decision-1") is None
+
+    monkeypatch.setattr(
+        verifier_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
 def test_nonextending_heartbeat_renewal_cancels_adapter_before_publication() -> None:
     class NonextendingHeartbeatStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
@@ -1790,14 +1855,19 @@ def test_nonextending_heartbeat_renewal_cancels_adapter_before_publication() -> 
         def __init__(self, *, clock) -> None:
             super().__init__(clock=clock)
             self.renewal_count = 0
+            self.initial_lease_expires_at = None
 
         async def renew_completion_verification_claim(self, request):
             renewed = await super().renew_completion_verification_claim(request)
             self.renewal_count += 1
             if self.renewal_count == 1:
+                self.initial_lease_expires_at = renewed.lease_expires_at
                 return renewed
+            assert self.initial_lease_expires_at is not None
             return renewed.model_copy(
-                update={"lease_expires_at": renewed.lease_expires_at - timedelta(milliseconds=100)}
+                update={
+                    "lease_expires_at": self.initial_lease_expires_at - timedelta(milliseconds=100)
+                }
             )
 
     class CancellableVerifier(_TestCompletionVerifier):
@@ -1838,6 +1908,153 @@ def test_nonextending_heartbeat_renewal_cancels_adapter_before_publication() -> 
         assert verifier.cancelled.is_set()
         assert store.renewal_count == 2
         assert await store.load_completion_decision("decision-1") is None
+
+    asyncio.run(scenario())
+
+
+def test_delayed_heartbeat_renewal_acknowledgement_cancels_adapter_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [0.0]
+
+    class DelayedHeartbeatStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+
+        async def renew_completion_verification_claim(self, request):
+            renewed = await super().renew_completion_verification_claim(request)
+            self.renewal_count += 1
+            if self.renewal_count == 2:
+                monotonic_now[0] += 2.0
+            return renewed
+
+    class CancellableVerifier(_TestCompletionVerifier):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            raise AssertionError("Cancellation-only verifier unexpectedly resumed.")
+
+    async def scenario() -> None:
+        store = DelayedHeartbeatStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = CancellableVerifier()
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        with pytest.raises(
+            CompletionVerificationClaimLost,
+            match="acknowledgement consumed its lease",
+        ):
+            await app.verify_completion_proposal(
+                _execution_request(
+                    proposal_id,
+                    lease_seconds=1,
+                    timeout_seconds=0.9,
+                )
+            )
+        assert verifier.started.is_set()
+        assert verifier.cancelled.is_set()
+        assert store.renewal_count == 2
+        assert await store.load_completion_decision("decision-1") is None
+
+    monkeypatch.setattr(
+        verifier_coordinator_module,
+        "monotonic",
+        lambda: monotonic_now[0],
+    )
+    asyncio.run(scenario())
+
+
+def test_inflight_claim_renewal_remains_owned_through_publication_failure() -> None:
+    class BlockingRenewalStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+            self.renewal_started = asyncio.Event()
+            self.renewal_allowed = asyncio.Event()
+            self.publication_started = asyncio.Event()
+            self.publication_allowed = asyncio.Event()
+
+        async def renew_completion_verification_claim(self, request):
+            self.renewal_count += 1
+            if self.renewal_count == 2:
+                self.renewal_started.set()
+                await self.renewal_allowed.wait()
+            return await super().renew_completion_verification_claim(request)
+
+        async def record_completion_decision(self, request):
+            self.publication_started.set()
+            await self.publication_allowed.wait()
+            return await super().record_completion_decision(request)
+
+    class CompletingVerifier(_TestCompletionVerifier):
+        def __init__(self, store: BlockingRenewalStore) -> None:
+            self._store = store
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            await self._store.renewal_started.wait()
+            return _accepted_decision()
+
+    async def scenario() -> None:
+        store = BlockingRenewalStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = CompletingVerifier(store)
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        operation = asyncio.create_task(
+            app.verify_completion_proposal(
+                _execution_request(
+                    proposal_id,
+                    lease_seconds=1,
+                    timeout_seconds=0.9,
+                )
+            )
+        )
+        await store.renewal_started.wait()
+        await store.publication_started.wait()
+        await asyncio.sleep(1.05)
+
+        store.publication_allowed.set()
+        await asyncio.sleep(0)
+        assert not operation.done()
+        assert await store.load_completion_decision("decision-1") is None
+
+        store.renewal_allowed.set()
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await operation
+        assert await store.load_completion_decision("decision-1") is None
+        assert _exception_leaf_types(captured.value) == (
+            CompletionVerificationClaimLost,
+            CompletionVerificationClaimLost,
+        )
+        assert tuple(str(item) for item in captured.value.exceptions) == (
+            "Completion decision requires the current live verifier claim.",
+            "Completion verification claim renewal was not acknowledged before its local "
+            "lease deadline.",
+        )
 
     asyncio.run(scenario())
 
@@ -1950,6 +2167,320 @@ def test_claim_renewal_failure_does_not_duplicate_its_adapter_cancellation() -> 
             )
         assert await store.load_completion_decision("decision-1") is None
 
+    asyncio.run(scenario())
+
+
+def test_claim_renewal_failure_requests_adapter_cancellation_exactly_once() -> None:
+    class RenewalFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+
+        async def renew_completion_verification_claim(self, request):
+            self.renewal_count += 1
+            if self.renewal_count == 1:
+                return await super().renew_completion_verification_claim(request)
+            raise ConnectionError("claim renewal failed")
+
+    class CancellationCountingVerifier(_TestCompletionVerifier):
+        def __init__(self) -> None:
+            self.cancellation_requests: int | None = None
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                assert current is not None
+                self.cancellation_requests = current.cancelling()
+                raise
+
+    async def scenario() -> int | None:
+        store = RenewalFailureStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = CancellationCountingVerifier()
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        with pytest.raises(ConnectionError, match="claim renewal failed"):
+            await app.verify_completion_proposal(
+                _execution_request(
+                    proposal_id,
+                    lease_seconds=1,
+                    timeout_seconds=0.9,
+                )
+            )
+        return verifier.cancellation_requests
+
+    assert asyncio.run(scenario()) == 1
+
+
+def test_late_claim_renewal_failure_survives_observed_ownership_loss() -> None:
+    class LateRenewalFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+            self.renewal_started = asyncio.Event()
+            self.renewal_allowed = asyncio.Event()
+            self.publication_started = asyncio.Event()
+            self.publication_allowed = asyncio.Event()
+
+        async def renew_completion_verification_claim(self, request):
+            self.renewal_count += 1
+            if self.renewal_count == 2:
+                self.renewal_started.set()
+                await self.renewal_allowed.wait()
+                raise ConnectionError("late claim renewal settlement failed")
+            return await super().renew_completion_verification_claim(request)
+
+        async def record_completion_decision(self, request):
+            self.publication_started.set()
+            await self.publication_allowed.wait()
+            return await super().record_completion_decision(request)
+
+    class CompletingVerifier(_TestCompletionVerifier):
+        def __init__(self, store: LateRenewalFailureStore) -> None:
+            self._store = store
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            await self._store.renewal_started.wait()
+            return _accepted_decision()
+
+    async def scenario() -> BaseException:
+        store = LateRenewalFailureStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, CompletingVerifier(store))
+        operation = asyncio.create_task(
+            app.verify_completion_proposal(
+                _execution_request(
+                    proposal_id,
+                    lease_seconds=1,
+                    timeout_seconds=0.9,
+                )
+            )
+        )
+        await store.renewal_started.wait()
+        await store.publication_started.wait()
+        await asyncio.sleep(1.05)
+
+        store.publication_allowed.set()
+        await asyncio.sleep(0)
+        assert not operation.done()
+        store.renewal_allowed.set()
+        with pytest.raises(BaseException) as captured:
+            await operation
+        return captured.value
+
+    failure = asyncio.run(scenario())
+    pending = [failure]
+    observed: set[int] = set()
+    late_failures = 0
+    while pending:
+        current = pending.pop()
+        if id(current) in observed:
+            continue
+        observed.add(id(current))
+        if "late claim renewal settlement failed" in str(current):
+            late_failures += 1
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    assert late_failures == 1
+
+
+def test_background_drain_replays_late_claim_renewal_failure_once() -> None:
+    class LateRenewalFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+            self.renewal_started = asyncio.Event()
+            self.renewal_allowed = asyncio.Event()
+
+        async def renew_completion_verification_claim(self, request):
+            self.renewal_count += 1
+            if self.renewal_count == 2:
+                self.renewal_started.set()
+                await self.renewal_allowed.wait()
+                raise ConnectionError("late background claim renewal settlement failed")
+            return await super().renew_completion_verification_claim(request)
+
+    class CancellationResistantVerifier(_TestCompletionVerifier):
+        def __init__(self, store: LateRenewalFailureStore) -> None:
+            self._store = store
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+            self.calls = 0
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            self.calls += 1
+            await self._store.renewal_started.wait()
+            while not self.release.is_set():
+                with suppress(asyncio.CancelledError):
+                    await self.release.wait()
+            self.finished.set()
+            return _accepted_decision()
+
+    async def scenario() -> None:
+        store = LateRenewalFailureStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = CancellationResistantVerifier(store)
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        request = _execution_request(
+            proposal_id,
+            lease_seconds=1,
+            timeout_seconds=0.5,
+        )
+
+        with pytest.raises(CompletionVerifierExecutionError, match="bounded execution timeout"):
+            await app.verify_completion_proposal(request)
+
+        coordinator = app._completion_verifier_coordinator
+        draining = coordinator._draining_adapter_tasks[proposal_id]
+        while not draining.heartbeat.ownership_lost.done():
+            await asyncio.sleep(0)
+        assert draining.heartbeat.observed_failure_id is None
+        verifier.release.set()
+        await verifier.finished.wait()
+        while draining.settlement_task is None:
+            await asyncio.sleep(0)
+        store.renewal_allowed.set()
+        settlement = await draining.settlement_task
+        assert isinstance(settlement.failure, CompletionVerificationClaimLost)
+
+        with pytest.raises(
+            CompletionVerificationClaimLost,
+            match="not acknowledged before its local lease deadline",
+        ) as captured:
+            await app.verify_completion_proposal(request)
+        assert verifier.calls == 1
+        assert proposal_id not in coordinator._draining_adapter_tasks
+
+        pending: list[BaseException] = [captured.value]
+        observed: set[int] = set()
+        ownership_failures = 0
+        late_failures = 0
+        while pending:
+            failure = pending.pop()
+            if id(failure) in observed:
+                continue
+            observed.add(id(failure))
+            if isinstance(failure, CompletionVerificationClaimLost):
+                ownership_failures += 1
+            if "late background claim renewal settlement failed" in str(failure):
+                late_failures += 1
+            if failure.__cause__ is not None:
+                pending.append(failure.__cause__)
+            if failure.__context__ is not None:
+                pending.append(failure.__context__)
+            if isinstance(failure, BaseExceptionGroup):
+                pending.extend(failure.exceptions)
+        assert ownership_failures == 1
+        assert late_failures == 1
+
+    asyncio.run(scenario())
+
+
+def test_capacity_counts_adapter_completed_heartbeat_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingSettlementStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+            self.renewal_started = asyncio.Event()
+            self.renewal_allowed = asyncio.Event()
+            self.publication_started = asyncio.Event()
+            self.publication_allowed = asyncio.Event()
+
+        async def renew_completion_verification_claim(self, request):
+            self.renewal_count += 1
+            if self.renewal_count == 2:
+                self.renewal_started.set()
+                await self.renewal_allowed.wait()
+            return await super().renew_completion_verification_claim(request)
+
+        async def record_completion_decision(self, request):
+            self.publication_started.set()
+            await self.publication_allowed.wait()
+            return await super().record_completion_decision(request)
+
+    class CompletingVerifier(_TestCompletionVerifier):
+        def __init__(self, store: BlockingSettlementStore) -> None:
+            self._store = store
+            self.calls = 0
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            self.calls += 1
+            await self._store.renewal_started.wait()
+            return _accepted_decision()
+
+    async def scenario() -> None:
+        store = BlockingSettlementStore()
+        contract = _contract()
+        first_proposal = await _proposal(store, contract, suffix="1")
+        second_proposal = await _proposal(store, contract, suffix="2")
+        verifier = CompletingVerifier(store)
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        first = asyncio.create_task(
+            app.verify_completion_proposal(
+                _execution_request(
+                    first_proposal,
+                    suffix="1",
+                    lease_seconds=1,
+                    timeout_seconds=0.9,
+                )
+            )
+        )
+        await store.renewal_started.wait()
+        await store.publication_started.wait()
+
+        with pytest.raises(CompletionVerifierExecutionError, match="capacity is exhausted"):
+            await app.verify_completion_proposal(_execution_request(second_proposal, suffix="2"))
+        assert await store.load_completion_verification_claim(second_proposal) is None
+        assert verifier.calls == 1
+
+        store.renewal_allowed.set()
+        store.publication_allowed.set()
+        assert (await first).decision_id == "decision-1"
+
+    monkeypatch.setattr(
+        verifier_coordinator_module,
+        "_MAX_ACTIVE_COMPLETION_VERIFIERS",
+        1,
+    )
     asyncio.run(scenario())
 
 
@@ -3693,8 +4224,8 @@ def test_cross_app_drain_renews_claim_until_the_original_adapter_settles() -> No
     class RenewalStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
-        def __init__(self, *, clock) -> None:
-            super().__init__(clock=clock)
+        def __init__(self, *, clock, ownership_clock) -> None:
+            super().__init__(clock=clock, ownership_clock=ownership_clock)
             self.renewal_count = 0
             self.background_renewed = asyncio.Event()
 
@@ -3728,7 +4259,10 @@ def test_cross_app_drain_renews_claim_until_the_original_adapter_settles() -> No
 
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        store = RenewalStore(clock=lambda: now[0])
+        store = RenewalStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract()
         proposal_id = await _proposal(store, contract)
         verifier = ResistantVerifier()
@@ -3851,8 +4385,8 @@ def test_cross_app_takeover_after_renewal_loss_discards_the_stale_result() -> No
     class RenewalLossStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
-        def __init__(self, *, clock) -> None:
-            super().__init__(clock=clock)
+        def __init__(self, *, clock, ownership_clock) -> None:
+            super().__init__(clock=clock, ownership_clock=ownership_clock)
             self.renewal_count = 0
             self.background_renewal_failed = asyncio.Event()
 
@@ -3888,7 +4422,10 @@ def test_cross_app_takeover_after_renewal_loss_discards_the_stale_result() -> No
 
     async def scenario() -> None:
         now = [datetime(2026, 1, 1, tzinfo=UTC)]
-        store = RenewalLossStore(clock=lambda: now[0])
+        store = RenewalLossStore(
+            clock=lambda: now[0],
+            ownership_clock=lambda: now[0],
+        )
         contract = _contract()
         proposal_id = await _proposal(store, contract)
         verifier = FirstCallResistsCancellationVerifier()

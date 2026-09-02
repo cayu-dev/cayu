@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any
@@ -2232,7 +2231,7 @@ def test_runtime_recovers_original_memory_exposure_after_background_process_loss
         await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id="automatic-recall-background-recovery",
-                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                inactive_for_seconds=0,
             )
         )
 

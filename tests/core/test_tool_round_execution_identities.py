@@ -728,7 +728,7 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
         messages = await store.load_transcript(session_id)
         claim = await app._recovery_coordinator._claim_incomplete_recovery(
             session=session,
-            inactive_before=None,
+            inactive_for_seconds=None,
         )
         assert claim is not None
         assert claim.session_before_fence.run_epoch == 1
@@ -872,7 +872,7 @@ def test_pending_round_recovery_calls_apply_patch_with_runtime_authority() -> No
         messages = await store.load_transcript(session_id)
         claim = await app._recovery_coordinator._claim_incomplete_recovery(
             session=session,
-            inactive_before=None,
+            inactive_for_seconds=None,
         )
         assert claim is not None
 

@@ -6,8 +6,9 @@ import asyncio
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
+from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
 
@@ -103,14 +104,32 @@ class _ResolvedEventPublicationAuthority:
 @dataclass(frozen=True, slots=True)
 class _PublicationOwner:
     owner_id: str
-    expires_at: datetime
+
+
+@dataclass(slots=True)
+class _PublicationLeaseDeadline:
+    monotonic: float
 
 
 @dataclass(slots=True)
 class _PublicationHeartbeat:
     stop: asyncio.Event
     task: asyncio.Task[None]
+    lease_deadline: _PublicationLeaseDeadline
+    ownership_lost: asyncio.Future[BaseException]
     transferred: bool = False
+    observed_failure_id: int | None = None
+
+
+@dataclass(slots=True)
+class _ResolutionCapacityLease:
+    reservation: object | None = None
+    transferred: bool = False
+
+
+@dataclass(slots=True)
+class _ApplicationSettlementEvidence:
+    not_committed: bool = False
 
 
 def _resolver_key(reference: CompletionResultResolverRef) -> tuple[str, str, str]:
@@ -153,6 +172,7 @@ class CompletionResultResolverCoordinator:
         self._resolvers: dict[tuple[str, str, str], CompletionResultResolver] = {}
         self._locks: dict[str, _SingleFlightLock] = {}
         self._adapter_tasks: set[asyncio.Task[CapturedAwaitableOutcome[dict[str, object]]]] = set()
+        self._resolution_capacity_reservations: set[object] = set()
         self._draining_adapter_tasks: dict[
             str,
             asyncio.Task[CapturedAwaitableOutcome[None]],
@@ -162,7 +182,12 @@ class CompletionResultResolverCoordinator:
         process_id = os.getpid()
         if process_id == self._process_id:
             return
-        if self._locks or self._adapter_tasks or self._draining_adapter_tasks:
+        if (
+            self._locks
+            or self._adapter_tasks
+            or self._resolution_capacity_reservations
+            or self._draining_adapter_tasks
+        ):
             raise self._safe_execution_error(
                 "Result resolver coordinator inherited active execution state across a "
                 "process boundary; rebuild the application in this worker."
@@ -282,31 +307,36 @@ class CompletionResultResolverCoordinator:
                 del copied
                 raise safe_cancellation
             try:
-                cancellation_baseline = 0 if current_task is None else current_task.cancelling()
-                safe_cancellation = None
-                cancellation_failure = None
+                capacity_lease = _ResolutionCapacityLease()
                 try:
-                    return await self._resolve_locked(copied)
-                except asyncio.CancelledError as cancellation:
-                    current_requests = 0 if current_task is None else current_task.cancelling()
-                    if current_requests > cancellation_baseline:
-                        safe_cancellation = self._redeliver_safe_caller_cancellation(
-                            cancellation,
-                            preserve_requests=cancellation_baseline,
-                        )
-                    else:
-                        cancellation_failure = self._safe_dependency_cancellation_failure(
-                            cancellation,
-                            "Completion result resolution dependency was cancelled without "
-                            "caller cancellation.",
-                        )
-                    del cancellation
-                if cancellation_failure is not None:
+                    cancellation_baseline = 0 if current_task is None else current_task.cancelling()
+                    safe_cancellation = None
+                    cancellation_failure = None
+                    try:
+                        return await self._resolve_locked(copied, capacity_lease)
+                    except asyncio.CancelledError as cancellation:
+                        current_requests = 0 if current_task is None else current_task.cancelling()
+                        if current_requests > cancellation_baseline:
+                            safe_cancellation = self._redeliver_safe_caller_cancellation(
+                                cancellation,
+                                preserve_requests=cancellation_baseline,
+                            )
+                        else:
+                            cancellation_failure = self._safe_dependency_cancellation_failure(
+                                cancellation,
+                                "Completion result resolution dependency was cancelled "
+                                "without caller cancellation.",
+                            )
+                        del cancellation
+                    if cancellation_failure is not None:
+                        del copied
+                        raise_task_store_operation_failure(cancellation_failure)
+                    assert safe_cancellation is not None
                     del copied
-                    raise_task_store_operation_failure(cancellation_failure)
-                assert safe_cancellation is not None
-                del copied
-                raise safe_cancellation
+                    raise safe_cancellation
+                finally:
+                    if not capacity_lease.transferred:
+                        self._release_resolution_capacity(capacity_lease)
             finally:
                 entry.lock.release()
         finally:
@@ -314,7 +344,11 @@ class CompletionResultResolverCoordinator:
             if entry.users == 0 and self._locks.get(key) is entry:
                 self._locks.pop(key, None)
 
-    async def _resolve_locked(self, request: CompletionResultResolutionRequest) -> Task:
+    async def _resolve_locked(
+        self,
+        request: CompletionResultResolutionRequest,
+        capacity_lease: _ResolutionCapacityLease,
+    ) -> Task:
         receipt = None
         decision = None
         claim = None
@@ -336,6 +370,7 @@ class CompletionResultResolverCoordinator:
         publication_reserved = False
         publication_heartbeat = None
         application_started = False
+        application_settlement = _ApplicationSettlementEvidence()
         prepared_event = None
         failure: BaseException | None = None
         try:
@@ -368,6 +403,7 @@ class CompletionResultResolverCoordinator:
                             "The required completion result resolver is unavailable."
                         ),
                     ) from None
+                self._reserve_resolution_capacity(capacity_lease)
 
             publication_authority = self._resolved_event_publication_authority(
                 request=request,
@@ -381,14 +417,19 @@ class CompletionResultResolverCoordinator:
 
             if receipt is None:
                 await self._require_resolver_not_draining(request.decision_id)
-            await self._reserve_resolved_event_publication(
+            publication_deadline = await self._reserve_resolved_event_publication(
                 publication_authority,
                 publication_owner,
             )
             publication_reserved = True
+            if monotonic() >= publication_deadline:
+                raise self._safe_execution_error(
+                    "Completion-result publication ownership acknowledgement consumed its lease."
+                ) from None
             publication_heartbeat = self._start_publication_heartbeat(
                 publication_authority,
                 publication_owner,
+                claim_deadline_monotonic=publication_deadline,
             )
 
             if receipt is None:
@@ -425,6 +466,7 @@ class CompletionResultResolverCoordinator:
                     publication_authority=publication_authority,
                     publication_owner=publication_owner,
                     publication_heartbeat=publication_heartbeat,
+                    capacity_lease=capacity_lease,
                 )
             else:
                 if receipt.task_id != request.task_id or receipt.decision_id != request.decision_id:
@@ -465,12 +507,19 @@ class CompletionResultResolverCoordinator:
             await self._renew_resolved_event_publication(
                 publication_authority,
                 publication_owner,
+                lease_deadline=publication_heartbeat.lease_deadline,
+                ownership_lost=publication_heartbeat.ownership_lost,
             )
+            await self._require_publication_heartbeat_healthy(publication_heartbeat)
             application_request_sha256 = completion_decision_application_request_sha256(
                 application_request
             )
             application_started = True
-            task = await self._application_coordinator.apply(application_request)
+            task = await self._apply_with_publication_ownership(
+                application_request,
+                publication_heartbeat,
+                settlement_evidence=application_settlement,
+            )
             application_request = None
             final_receipt = await self._application_coordinator.load_result_resolution_receipt(
                 task_id=request.task_id,
@@ -532,6 +581,7 @@ class CompletionResultResolverCoordinator:
             and (
                 not application_started
                 or isinstance(failure, _CompletionDecisionApplicationNotCommitted)
+                or application_settlement.not_committed
             )
             and request.decision_id not in self._draining_adapter_tasks
             and publication_authority is not None
@@ -554,7 +604,11 @@ class CompletionResultResolverCoordinator:
                 timeout_after_cancellation_s=0,
             )
             if not release_task.done():
-                self._retain_publication_settlement(request.decision_id, release_task)
+                self._retain_publication_settlement(
+                    request.decision_id,
+                    release_task,
+                    capacity_lease=capacity_lease,
+                )
             release_error = release_outcome.error
             captured_release = release_outcome.result
             if release_error is None and captured_release is not None:
@@ -655,6 +709,7 @@ class CompletionResultResolverCoordinator:
         del verifier_profile, authority_task
         del resolver, adapter_request_validation, adapter_request, result
         del application_validation, application_request, task, final_receipt, prepared_event
+        del application_settlement
         del publication_authority, publication_owner, heartbeat_failure
         if cleanup_authoritative is not None:
             raise cleanup_authoritative from cleanup_cause
@@ -672,11 +727,8 @@ class CompletionResultResolverCoordinator:
         publication_authority: _ResolvedEventPublicationAuthority,
         publication_owner: _PublicationOwner,
         publication_heartbeat: _PublicationHeartbeat,
+        capacity_lease: _ResolutionCapacityLease,
     ) -> dict[str, object]:
-        if len(self._adapter_tasks) >= _MAX_ACTIVE_RESULT_RESOLVERS:
-            raise self._safe_execution_error(
-                "Completion result resolver execution capacity is exhausted."
-            ) from None
         task = asyncio.create_task(
             capture_awaitable_outcome(
                 lambda adapter=resolver, value=request: adapter.resolve(value)
@@ -709,6 +761,7 @@ class CompletionResultResolverCoordinator:
                 publication_authority=publication_authority,
                 publication_owner=publication_owner,
                 publication_heartbeat=publication_heartbeat,
+                capacity_lease=capacity_lease,
             )
             publication_heartbeat.transferred = True
             restore_task_cancellation_requests(consumed, cancellation=safe_cancellation)
@@ -725,6 +778,7 @@ class CompletionResultResolverCoordinator:
                 publication_authority=publication_authority,
                 publication_owner=publication_owner,
                 publication_heartbeat=publication_heartbeat,
+                capacity_lease=capacity_lease,
             )
             publication_heartbeat.transferred = True
             raise self._safe_execution_error(
@@ -780,6 +834,108 @@ class CompletionResultResolverCoordinator:
                 "Completion result resolver must return a JSON object."
             ) from None
         return captured.result
+
+    async def _apply_with_publication_ownership(
+        self,
+        request: CompletionDecisionApplicationRequest,
+        heartbeat: _PublicationHeartbeat,
+        *,
+        settlement_evidence: _ApplicationSettlementEvidence,
+    ) -> Task:
+        application_task = asyncio.create_task(
+            self._application_coordinator.apply(request),
+            name="cayu-completion-result-application",
+        )
+        del request
+        try:
+            completed, _pending = await asyncio.wait(
+                (
+                    application_task,
+                    heartbeat.ownership_lost,
+                    heartbeat.task,
+                ),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError as cancellation:
+            application_task.cancel("Completion result application caller was cancelled.")
+            settlement = await await_shielded_task_outcome(
+                application_task,
+                cancellation=cancellation,
+                timeout_s=None,
+                timeout_after_cancellation_s=None,
+            )
+            safe_cancellation = self._safe_caller_cancellation(cancellation)
+            if settlement.error is not None and not isinstance(
+                settlement.error,
+                asyncio.CancelledError,
+            ):
+                if exception_tree_contains(settlement.error, _PROCESS_CONTROL_SIGNALS):
+                    raise self._detached_process_control_failure(
+                        settlement.error
+                    ) from safe_cancellation
+                safe_cancellation.__cause__ = self._detached_cleanup_failure(settlement.error)
+                safe_cancellation.__suppress_context__ = True
+            retain_workspace_observation_pending_cancellation_requests(
+                safe_cancellation,
+                max(settlement.cancellation_requests_consumed, 1),
+            )
+            restore_task_cancellation_requests(
+                settlement.cancellation_requests_consumed,
+                cancellation=safe_cancellation,
+            )
+            raise safe_cancellation from safe_cancellation.__cause__
+
+        if heartbeat.ownership_lost in completed or heartbeat.task in completed:
+            if heartbeat.ownership_lost.done():
+                raw_ownership_failure = heartbeat.ownership_lost.result()
+                heartbeat.observed_failure_id = id(raw_ownership_failure)
+                ownership_failure = self._detached_cleanup_failure(raw_ownership_failure)
+            else:
+                try:
+                    heartbeat.task.result()
+                except BaseException as failure:
+                    heartbeat.observed_failure_id = id(failure)
+                    ownership_failure = self._detached_cleanup_failure(failure)
+                else:
+                    ownership_failure = self._safe_execution_error(
+                        "Completion-result publication ownership ended during application."
+                    )
+            application_task.cancel("Completion result application lost publication ownership.")
+            settlement = await await_shielded_task_outcome(
+                application_task,
+                timeout_s=None,
+                timeout_after_cancellation_s=None,
+            )
+            if settlement.error is not None and exception_tree_contains(
+                settlement.error,
+                (_CompletionDecisionApplicationNotCommitted,),
+            ):
+                settlement_evidence.not_committed = True
+            if settlement.cancellation is not None:
+                safe_cancellation = self._safe_caller_cancellation(settlement.cancellation)
+                safe_cancellation.__cause__ = ownership_failure
+                safe_cancellation.__suppress_context__ = True
+                retain_workspace_observation_pending_cancellation_requests(
+                    safe_cancellation,
+                    max(settlement.cancellation_requests_consumed, 1),
+                )
+                restore_task_cancellation_requests(
+                    settlement.cancellation_requests_consumed,
+                    cancellation=safe_cancellation,
+                )
+                raise safe_cancellation from ownership_failure
+            if settlement.error is not None and not isinstance(
+                settlement.error,
+                asyncio.CancelledError,
+            ):
+                if exception_tree_contains(settlement.error, _PROCESS_CONTROL_SIGNALS):
+                    raise self._detached_process_control_failure(
+                        settlement.error
+                    ) from ownership_failure
+                raise ownership_failure from self._detached_cleanup_failure(settlement.error)
+            raise ownership_failure from None
+
+        return application_task.result()
 
     async def _require_resolver_not_draining(self, decision_id: str) -> None:
         settlement = self._draining_adapter_tasks.get(decision_id)
@@ -982,6 +1138,7 @@ class CompletionResultResolverCoordinator:
         publication_authority: _ResolvedEventPublicationAuthority,
         publication_owner: _PublicationOwner,
         publication_heartbeat: _PublicationHeartbeat,
+        capacity_lease: _ResolutionCapacityLease,
     ) -> None:
         settlement = asyncio.create_task(
             capture_awaitable_outcome(
@@ -995,10 +1152,14 @@ class CompletionResultResolverCoordinator:
             name="cayu-completion-result-resolver-settlement",
         )
         self._draining_adapter_tasks[decision_id] = settlement
+        capacity_lease.transferred = True
         settlement.add_done_callback(
-            lambda completed, key=decision_id: self._publication_settlement_completed(
-                key,
-                completed,
+            lambda completed, key=decision_id, lease=capacity_lease: (
+                self._publication_settlement_completed(
+                    key,
+                    completed,
+                    capacity_lease=lease,
+                )
             )
         )
 
@@ -1006,12 +1167,18 @@ class CompletionResultResolverCoordinator:
         self,
         decision_id: str,
         settlement: asyncio.Task[CapturedAwaitableOutcome[None]],
+        *,
+        capacity_lease: _ResolutionCapacityLease,
     ) -> None:
         self._draining_adapter_tasks[decision_id] = settlement
+        capacity_lease.transferred = True
         settlement.add_done_callback(
-            lambda completed, key=decision_id: self._publication_settlement_completed(
-                key,
-                completed,
+            lambda completed, key=decision_id, lease=capacity_lease: (
+                self._publication_settlement_completed(
+                    key,
+                    completed,
+                    capacity_lease=lease,
+                )
             )
         )
 
@@ -1061,54 +1228,179 @@ class CompletionResultResolverCoordinator:
         authority: _ResolvedEventPublicationAuthority,
         owner_id: str,
         stop: asyncio.Event,
+        lease_deadline: _PublicationLeaseDeadline,
+        ownership_lost: asyncio.Future[BaseException],
     ) -> None:
         while True:
+            remaining = lease_deadline.monotonic - monotonic()
+            if remaining <= 0:
+                failure = self._safe_execution_error(
+                    "Completion-result publication ownership acknowledgement expired."
+                )
+                self._record_publication_ownership_loss(ownership_lost, failure)
+                raise failure from None
             try:
                 await asyncio.wait_for(
                     stop.wait(),
-                    timeout=_PUBLICATION_OWNER_HEARTBEAT_SECONDS,
+                    timeout=min(
+                        _PUBLICATION_OWNER_HEARTBEAT_SECONDS,
+                        remaining / 2.0,
+                    ),
                 )
             except TimeoutError:
                 pass
             else:
                 return
-            now = datetime.now(UTC)
-            await self._session_store._publish_completion_result_event_publication(
-                authority.session_id,
-                checkpoint_transform=lambda _session, checkpoint, heartbeat_now=now: (
-                    _renew_completion_result_event_publication(
-                        checkpoint,
-                        publication_id=authority.publication_id,
-                        authority_sha256=authority.authority_sha256,
-                        owner_id=owner_id,
-                        owner_expires_at=heartbeat_now
-                        + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
-                        now=heartbeat_now,
-                    )
+            renewal_started_monotonic = monotonic()
+            renewal_task = asyncio.create_task(
+                self._session_store._publish_completion_result_event_publication(
+                    authority.session_id,
+                    checkpoint_transform=lambda _session, checkpoint, store_now: (
+                        _renew_completion_result_event_publication(
+                            checkpoint,
+                            publication_id=authority.publication_id,
+                            authority_sha256=authority.authority_sha256,
+                            owner_id=owner_id,
+                            owner_expires_at=store_now
+                            + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
+                            now=store_now,
+                        )
+                    ),
+                    events=[],
                 ),
-                events=[],
+                name="cayu-completion-result-publication-renewal",
             )
+            while True:
+                renewal_outcome = await await_shielded_task_outcome(
+                    renewal_task,
+                    timeout_s=max(0.0, lease_deadline.monotonic - monotonic()),
+                )
+                if not renewal_outcome.timed_out or monotonic() >= lease_deadline.monotonic:
+                    break
+            if renewal_outcome.cancellation is not None:
+                settlement = await await_shielded_task_outcome(
+                    renewal_task,
+                    cancellation=renewal_outcome.cancellation,
+                    timeout_s=None,
+                    timeout_after_cancellation_s=None,
+                )
+                if settlement.error is not None:
+                    renewal_outcome.cancellation.__cause__ = self._detached_cleanup_failure(
+                        settlement.error
+                    )
+                    renewal_outcome.cancellation.__suppress_context__ = True
+                raise renewal_outcome.cancellation
+            if renewal_outcome.timed_out:
+                failure = self._safe_execution_error(
+                    "Completion-result publication ownership renewal was not acknowledged "
+                    "before its local lease deadline."
+                )
+                self._record_publication_ownership_loss(ownership_lost, failure)
+                settlement = await await_shielded_task_outcome(
+                    renewal_task,
+                    timeout_s=None,
+                    timeout_after_cancellation_s=None,
+                )
+                if settlement.cancellation is not None:
+                    safe_cancellation = self._safe_caller_cancellation(settlement.cancellation)
+                    safe_cancellation.__cause__ = failure
+                    safe_cancellation.__suppress_context__ = True
+                    retain_workspace_observation_pending_cancellation_requests(
+                        safe_cancellation,
+                        max(settlement.cancellation_requests_consumed, 1),
+                    )
+                    restore_task_cancellation_requests(
+                        settlement.cancellation_requests_consumed,
+                        cancellation=safe_cancellation,
+                    )
+                    raise safe_cancellation
+                if settlement.error is not None:
+                    if exception_tree_contains(
+                        settlement.error,
+                        _PROCESS_CONTROL_SIGNALS,
+                    ):
+                        raise self._detached_process_control_failure(settlement.error) from failure
+                    raise failure from self._detached_cleanup_failure(settlement.error)
+                raise failure from None
+            if renewal_outcome.error is not None:
+                self._record_publication_ownership_loss(
+                    ownership_lost,
+                    renewal_outcome.error,
+                )
+                raise renewal_outcome.error
+            self._acknowledge_publication_renewal_deadline(
+                renewal_started_monotonic,
+                lease_deadline=lease_deadline,
+                ownership_lost=ownership_lost,
+            )
+
+    def _acknowledge_publication_renewal_deadline(
+        self,
+        renewal_started_monotonic: float,
+        *,
+        lease_deadline: _PublicationLeaseDeadline | None = None,
+        ownership_lost: asyncio.Future[BaseException] | None = None,
+    ) -> float:
+        acknowledged_deadline = renewal_started_monotonic + _PUBLICATION_OWNER_LEASE_SECONDS
+        if lease_deadline is not None:
+            lease_deadline.monotonic = max(
+                lease_deadline.monotonic,
+                acknowledged_deadline,
+            )
+            acknowledged_deadline = lease_deadline.monotonic
+        if monotonic() >= acknowledged_deadline:
+            failure = self._safe_execution_error(
+                "Completion-result publication ownership renewal acknowledgement "
+                "consumed its lease."
+            )
+            if ownership_lost is not None:
+                self._record_publication_ownership_loss(ownership_lost, failure)
+            raise failure from None
+        return acknowledged_deadline
+
+    @staticmethod
+    def _record_publication_ownership_loss(
+        ownership_lost: asyncio.Future[BaseException],
+        failure: BaseException,
+    ) -> None:
+        if not ownership_lost.done():
+            ownership_lost.set_result(failure)
 
     def _start_publication_heartbeat(
         self,
         authority: _ResolvedEventPublicationAuthority,
         owner: _PublicationOwner,
+        *,
+        claim_deadline_monotonic: float,
     ) -> _PublicationHeartbeat:
         stop = asyncio.Event()
+        lease_deadline = _PublicationLeaseDeadline(claim_deadline_monotonic)
+        ownership_lost: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
         task = asyncio.create_task(
             self._heartbeat_publication_owner(
                 authority,
                 owner.owner_id,
                 stop,
+                lease_deadline,
+                ownership_lost,
             ),
             name="cayu-completion-result-publication-heartbeat",
         )
-        return _PublicationHeartbeat(stop=stop, task=task)
+        return _PublicationHeartbeat(
+            stop=stop,
+            task=task,
+            lease_deadline=lease_deadline,
+            ownership_lost=ownership_lost,
+        )
 
     async def _require_publication_heartbeat_healthy(
         self,
         heartbeat: _PublicationHeartbeat,
     ) -> None:
+        if heartbeat.ownership_lost.done():
+            failure = heartbeat.ownership_lost.result()
+            heartbeat.observed_failure_id = id(failure)
+            raise self._detached_cleanup_failure(failure) from None
         if not heartbeat.task.done():
             return
         try:
@@ -1134,6 +1426,8 @@ class CompletionResultResolverCoordinator:
         except BaseException as error:
             if publication_completed:
                 return None
+            if id(error) == heartbeat.observed_failure_id:
+                return error.__cause__
             return error
         return None
 
@@ -1142,7 +1436,15 @@ class CompletionResultResolverCoordinator:
         authority: _ResolvedEventPublicationAuthority,
         owner: _PublicationOwner,
     ) -> None:
-        heartbeat = self._start_publication_heartbeat(authority, owner)
+        claim_deadline_monotonic = await self._renew_resolved_event_publication(
+            authority,
+            owner,
+        )
+        heartbeat = self._start_publication_heartbeat(
+            authority,
+            owner,
+            claim_deadline_monotonic=claim_deadline_monotonic,
+        )
         release_failure: BaseException | None = None
         try:
             await self._release_resolved_event_publication(
@@ -1169,7 +1471,10 @@ class CompletionResultResolverCoordinator:
         self,
         decision_id: str,
         completed: asyncio.Task[CapturedAwaitableOutcome[None]],
+        *,
+        capacity_lease: _ResolutionCapacityLease,
     ) -> None:
+        self._release_resolution_capacity(capacity_lease)
         if self._draining_adapter_tasks.get(decision_id) is not completed:
             return
         try:
@@ -1178,6 +1483,22 @@ class CompletionResultResolverCoordinator:
             return
         if captured.error is None:
             self._draining_adapter_tasks.pop(decision_id, None)
+
+    def _reserve_resolution_capacity(self, lease: _ResolutionCapacityLease) -> None:
+        if lease.reservation is not None:
+            return
+        if len(self._resolution_capacity_reservations) >= _MAX_ACTIVE_RESULT_RESOLVERS:
+            raise self._safe_execution_error(
+                "Completion result resolver execution capacity is exhausted."
+            ) from None
+        reservation = object()
+        self._resolution_capacity_reservations.add(reservation)
+        lease.reservation = reservation
+
+    def _release_resolution_capacity(self, lease: _ResolutionCapacityLease) -> None:
+        reservation = lease.reservation
+        if reservation is not None:
+            self._resolution_capacity_reservations.discard(reservation)
 
     def _resolved_event_publication_authority(
         self,
@@ -1237,18 +1558,16 @@ class CompletionResultResolverCoordinator:
 
     @staticmethod
     def _new_publication_owner() -> _PublicationOwner:
-        now = datetime.now(UTC)
         owner_token = f"{uuid4().hex}{uuid4().hex}"
         return _PublicationOwner(
             owner_id=f"{_PUBLICATION_OWNER_ID_PREFIX}{owner_token}",
-            expires_at=now + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
         )
 
     async def _reserve_resolved_event_publication(
         self,
         authority: _ResolvedEventPublicationAuthority,
         owner: _PublicationOwner,
-    ) -> None:
+    ) -> float:
         capability = getattr(
             self._session_store,
             "_supports_completion_result_event_publication_reservation_protocol",
@@ -1259,20 +1578,22 @@ class CompletionResultResolverCoordinator:
                 "Completion result resolution requires a SessionStore that owns "
                 "publication reservation, checkpoint replacement, and deletion fencing."
             ) from None
-        now = datetime.now(UTC)
+        reservation_started_monotonic = monotonic()
         await self._session_store._publish_completion_result_event_publication(
             authority.session_id,
-            checkpoint_transform=lambda session, checkpoint: (
+            checkpoint_transform=lambda session, checkpoint, store_now: (
                 self._reserve_resolved_event_publication_checkpoint(
                     session,
                     checkpoint,
                     authority=authority,
                     owner=owner,
-                    now=now,
+                    now=store_now,
                 )
             ),
             events=[],
         )
+        claim_deadline_monotonic = reservation_started_monotonic + _PUBLICATION_OWNER_LEASE_SECONDS
+        return claim_deadline_monotonic
 
     @staticmethod
     def _reserve_resolved_event_publication_checkpoint(
@@ -1292,7 +1613,7 @@ class CompletionResultResolverCoordinator:
             publication_id=authority.publication_id,
             authority_sha256=authority.authority_sha256,
             owner_id=owner.owner_id,
-            owner_expires_at=owner.expires_at,
+            owner_expires_at=now + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
             now=now,
         )
 
@@ -1303,17 +1624,16 @@ class CompletionResultResolverCoordinator:
         *,
         require_present: bool,
     ) -> None:
-        now = datetime.now(UTC)
         await self._session_store._publish_completion_result_event_publication(
             authority.session_id,
-            checkpoint_transform=lambda _session, checkpoint: (
+            checkpoint_transform=lambda _session, checkpoint, store_now: (
                 _release_completion_result_event_publication(
                     checkpoint,
                     publication_id=authority.publication_id,
                     authority_sha256=authority.authority_sha256,
                     owner_id=owner.owner_id,
                     require_present=require_present,
-                    now=now,
+                    now=store_now,
                 )
             ),
             events=[],
@@ -1323,21 +1643,30 @@ class CompletionResultResolverCoordinator:
         self,
         authority: _ResolvedEventPublicationAuthority,
         owner: _PublicationOwner,
-    ) -> None:
-        now = datetime.now(UTC)
+        *,
+        lease_deadline: _PublicationLeaseDeadline | None = None,
+        ownership_lost: asyncio.Future[BaseException] | None = None,
+    ) -> float:
+        renewal_started_monotonic = monotonic()
         await self._session_store._publish_completion_result_event_publication(
             authority.session_id,
-            checkpoint_transform=lambda _session, checkpoint: (
+            checkpoint_transform=lambda _session, checkpoint, store_now: (
                 _renew_completion_result_event_publication(
                     checkpoint,
                     publication_id=authority.publication_id,
                     authority_sha256=authority.authority_sha256,
                     owner_id=owner.owner_id,
-                    owner_expires_at=now + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
-                    now=now,
+                    owner_expires_at=store_now
+                    + timedelta(seconds=_PUBLICATION_OWNER_LEASE_SECONDS),
+                    now=store_now,
                 )
             ),
             events=[],
+        )
+        return self._acknowledge_publication_renewal_deadline(
+            renewal_started_monotonic,
+            lease_deadline=lease_deadline,
+            ownership_lost=ownership_lost,
         )
 
     async def _complete_resolved_event_publication(
@@ -1349,13 +1678,14 @@ class CompletionResultResolverCoordinator:
     ) -> None:
         await self._session_store._publish_completion_result_event_publication(
             authority.session_id,
-            checkpoint_transform=lambda _session, checkpoint: (
+            checkpoint_transform=lambda _session, checkpoint, store_now: (
                 _complete_completion_result_event_publication(
                     checkpoint,
                     publication_id=authority.publication_id,
                     authority_sha256=authority.authority_sha256,
                     owner_id=owner.owner_id,
                     require_present=require_present,
+                    now=store_now,
                 )
             ),
             events=[],
@@ -1448,13 +1778,14 @@ class CompletionResultResolverCoordinator:
         try:
             await self._session_store._publish_completion_result_event_publication(
                 publication_authority.session_id,
-                checkpoint_transform=lambda _session, checkpoint: (
+                checkpoint_transform=lambda _session, checkpoint, store_now: (
                     _complete_completion_result_event_publication(
                         checkpoint,
                         publication_id=publication_authority.publication_id,
                         authority_sha256=publication_authority.authority_sha256,
                         owner_id=publication_owner.owner_id,
                         require_present=True,
+                        now=store_now,
                     )
                 ),
                 events=[prepared],
