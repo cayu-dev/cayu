@@ -164,6 +164,8 @@ class ToolApprovalRequest(BaseModel):
     )
 
     session_id: str
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     approval_id: str
     tool_round_id: str
     tool_call_id: str
@@ -186,6 +188,19 @@ class ToolApprovalRequest(BaseModel):
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ToolApprovalRequest:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("reason")
     @classmethod
@@ -248,6 +263,8 @@ class ToolApprovalRecoveryRequest(BaseModel):
     )
 
     session_id: str
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     approval_id: str
     tool_round_id: str
     tool_call_id: str
@@ -273,6 +290,19 @@ class ToolApprovalRecoveryRequest(BaseModel):
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ToolApprovalRecoveryRequest:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("message")
     @classmethod
@@ -874,6 +904,8 @@ def _copy_approval_resume_fields(
     """Copy the run configuration shared by both approval continuation requests."""
 
     return {
+        "task_worker_id": request.task_worker_id,
+        "task_handoff_id": request.task_handoff_id,
         "reason": request.reason,
         "metadata": copy_durable_json_value(request.metadata, "metadata"),
         "resolved_by": copy_resolution_actor(request.resolved_by),

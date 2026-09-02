@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import uuid4
 
 import pytest
 from tests.core.task_invocation_fixtures import (
@@ -15,8 +16,149 @@ from cayu import (
     TaskQuery,
     TaskStatus,
     TaskStore,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    interrupted_task_handoff_request,
 )
 from cayu.runtime.tasks import task_create_with_runtime_invocation
+
+
+async def assert_interrupted_continuation_scan_bound_conformance(
+    store: TaskStore,
+) -> None:
+    """Apply claim filters after the bounded physical candidate page."""
+
+    async def release(task_id: str, task_type: str) -> None:
+        session_id = f"session-{task_id}"
+        worker_id = f"prior-{task_id}"
+        await store.create_task(TaskCreate(task_id=task_id, type=task_type))
+        claimed = await store.claim_task(worker_id, TaskQuery(type=task_type))
+        assert claimed is not None and claimed.id == task_id
+        attached = await store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task_id,
+                session_id,
+            ),
+            worker_id=worker_id,
+        )
+        await store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(attached, session_run_epoch=1)
+        )
+
+    await release("continuation-scan-filtered", "other")
+    await release("continuation-scan-target", "target")
+
+    first = await store.claim_interrupted_task_continuation(
+        "continuation-worker",
+        TaskQuery(type="target"),
+        handoff_id=str(uuid4()),
+        scan_limit=1,
+    )
+    assert first.task is None
+    assert first.scanned_candidates == 1
+    assert first.filtered_candidates == 1
+    assert first.rejected_candidates == 0
+    assert first.next_after is not None
+    assert not first.exhausted
+
+    claim_handoff_id = str(uuid4())
+    second = await store.claim_interrupted_task_continuation(
+        "continuation-worker",
+        TaskQuery(type="target"),
+        handoff_id=claim_handoff_id,
+        after=first.next_after,
+        scan_limit=1,
+    )
+    assert second.task is not None
+    assert second.task.id == "continuation-scan-target"
+    assert second.scanned_candidates == 1
+    assert second.filtered_candidates == 0
+    assert second.rejected_candidates == 0
+    assert not second.replayed
+
+    replay = await store.claim_interrupted_task_continuation(
+        "continuation-worker",
+        TaskQuery(type="target"),
+        handoff_id=claim_handoff_id,
+    )
+    assert replay.replayed
+    assert replay.task == second.task
+    with pytest.raises(TaskClaimLost):
+        await store.claim_interrupted_task_continuation(
+            "foreign-worker",
+            TaskQuery(type="target"),
+            handoff_id=claim_handoff_id,
+        )
+
+    await store.release_interrupted_task_worker(
+        interrupted_task_handoff_request(second.task, session_run_epoch=2)
+    )
+    successor_handoff_id = str(uuid4())
+    successor = await store.claim_interrupted_task_continuation(
+        "continuation-worker",
+        TaskQuery(type="target"),
+        handoff_id=successor_handoff_id,
+    )
+    assert successor.task is not None
+    await store.release_interrupted_task_worker(
+        interrupted_task_handoff_request(successor.task, session_run_epoch=3)
+    )
+    with pytest.raises(TaskClaimLost):
+        await store.claim_interrupted_task_continuation(
+            "continuation-worker",
+            TaskQuery(type="target"),
+            handoff_id=claim_handoff_id,
+        )
+    current_handoff_id = str(uuid4())
+    current = await store.claim_interrupted_task_continuation(
+        "continuation-worker",
+        TaskQuery(type="target"),
+        handoff_id=current_handoff_id,
+    )
+    assert current.task is not None
+    with pytest.raises(TaskClaimLost):
+        await store.heartbeat(
+            current.task.id,
+            "continuation-worker",
+            handoff_id=successor_handoff_id,
+        )
+    with pytest.raises(TaskClaimLost):
+        await store.complete_task(
+            current.task.id,
+            {"authority": "stale"},
+            worker_id="continuation-worker",
+            handoff_id=successor_handoff_id,
+        )
+    with pytest.raises(TaskClaimLost):
+        await store.fail_task(
+            current.task.id,
+            {"authority": "stale"},
+            worker_id="continuation-worker",
+            handoff_id=successor_handoff_id,
+        )
+    stale_terminalization = TaskTerminalizationRequest(
+        task_id=current.task.id,
+        worker_id="continuation-worker",
+        handoff_id=successor_handoff_id,
+        kind=TaskTerminalKind.COMPLETED,
+        result={"authority": "stale"},
+        idempotency_key="stale-continuation-generation",
+    )
+    with pytest.raises(TaskClaimLost):
+        await store.terminalize_task(stale_terminalization)
+    completed = await store.terminalize_task(
+        stale_terminalization.model_copy(
+            update={
+                "handoff_id": current_handoff_id,
+                "result": {"authority": "current"},
+                "idempotency_key": "current-continuation-generation",
+            }
+        )
+    )
+    assert completed.status is TaskStatus.COMPLETED
 
 
 async def assert_task_session_invocation_binding_conformance(store: TaskStore) -> None:

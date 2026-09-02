@@ -1612,6 +1612,9 @@ class ResumeRequest(BaseModel):
     )
 
     session_id: str
+    # Optional exact task lease owner for a receipt-backed task continuation.
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     messages: list[Message]
     target: ModelTarget | None = None
     # None preserves the durable maximum; an explicit subset narrows it permanently.
@@ -1640,6 +1643,19 @@ class ResumeRequest(BaseModel):
         if not copied_messages:
             raise ValueError("ResumeRequest messages cannot be empty.")
         return copied_messages
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_optional_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ResumeRequest:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -19258,6 +19274,8 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         raise ValueError("ResumeRequest messages must be a list.")
     copied = ResumeRequest(
         session_id=request.session_id,
+        task_worker_id=request.task_worker_id,
+        task_handoff_id=request.task_handoff_id,
         messages=[detach_message(message) for message in messages],
         target=(
             None

@@ -418,9 +418,11 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.tasks import (
     _TASK_CANCELLATION_REQUESTED_REASON,
+    _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     CompletionDecisionApplicationReceipt,
+    InterruptedTaskContinuationClaimPage,
     Task,
     TaskAggregateFilter,
     TaskCancellationReconciliationRequest,
@@ -465,7 +467,9 @@ from cayu.runtime.tasks import (
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
     _ensure_retry_series_queue_attempt,
+    _ensure_task_handoff_authority,
     _expired_task_retry_settlement,
+    _interrupted_task_continuation_handoff_id_sha256,
     _raise_task_claim_attach_error,
     _reconciled_task_cancellation,
     _reconciled_task_retry_cancellation,
@@ -478,6 +482,8 @@ from cayu.runtime.tasks import (
     _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
+    _require_active_attached_task_worker,
+    _require_direct_attached_task_resume,
     _require_interrupted_task_handoff_authority,
     _running_task_from_create,
     _settled_task_retry_attempt,
@@ -487,6 +493,7 @@ from cayu.runtime.tasks import (
     _task_cancellation_requested_task,
     _task_from_create,
     _task_invocation_for_attachment,
+    _task_matches_claim_filter,
     _task_retry_cancellation_reconciliation_conflict,
     _task_retry_cancellation_reconciliation_rejection_record,
     _task_retry_cancellation_requested_task,
@@ -507,6 +514,7 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_interrupted_task_continuation_claim_page,
     prepare_interrupted_task_handoff,
     prepare_interrupted_task_handoff_candidate_page,
     prepare_interrupted_task_handoff_receipt_lookup,
@@ -614,7 +622,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 62
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 70
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 76
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -15179,6 +15187,7 @@ class SQLiteTaskStore(TaskStore):
                     available_at,
                     worker_id,
                     lease_expires_at,
+                    interrupted_handoff_id,
                     status_reason,
                     status_payload_json,
                     input_json,
@@ -15193,7 +15202,7 @@ class SQLiteTaskStore(TaskStore):
                     retry_series_json,
                     work_contract_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_support.task_to_row_values(task),
             )
@@ -15206,6 +15215,50 @@ class SQLiteTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             return self._load_task_unlocked(task_id)
+
+    async def load_active_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session_instance_id = require_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        async with self._lock:
+            return _require_active_attached_task_worker(
+                self._require_task_unlocked(task_id),
+                worker_id=worker_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+                now=datetime.now(UTC),
+            )
+
+    async def load_direct_attached_task_resume(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session_instance_id = require_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        async with self._lock:
+            return _require_direct_attached_task_resume(
+                self._require_task_unlocked(task_id),
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
 
     async def load_invocation_snapshot(
         self,
@@ -15662,7 +15715,12 @@ class SQLiteTaskStore(TaskStore):
                 return updated.model_copy(deep=True)
 
     async def complete_task(
-        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
@@ -15673,10 +15731,16 @@ class SQLiteTaskStore(TaskStore):
                 result=result,
                 error=None,
                 worker_id=worker_id,
+                handoff_id=handoff_id,
             )
 
     async def fail_task(
-        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+        self,
+        task_id: str,
+        error: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
@@ -15687,6 +15751,7 @@ class SQLiteTaskStore(TaskStore):
                 result=None,
                 error=error,
                 worker_id=worker_id,
+                handoff_id=handoff_id,
             )
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -15734,6 +15799,7 @@ class SQLiteTaskStore(TaskStore):
                     )
                 now = datetime.now(UTC)
                 _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                _ensure_task_handoff_authority(task, request.handoff_id)
 
                 _validate_ordinary_task_terminalization_against_cancellation(task, request)
                 status = TaskStatus(request.kind.value)
@@ -15751,12 +15817,14 @@ class SQLiteTaskStore(TaskStore):
                         error_json = ?,
                         worker_id = NULL,
                         lease_expires_at = NULL,
+                        interrupted_handoff_id = NULL,
                         started_at = COALESCE(started_at, ?),
                         completed_at = ?,
                         updated_at = ?
                     WHERE id = ?
                       AND status IN (?, ?)
                       AND worker_id = ?
+                      AND interrupted_handoff_id IS ?
                       AND lease_expires_at IS NOT NULL
                       AND lease_expires_at > ?
                     """,
@@ -15779,6 +15847,7 @@ class SQLiteTaskStore(TaskStore):
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         request.worker_id,
+                        request.handoff_id,
                         sqlite_support.format_datetime(now),
                     ),
                 )
@@ -15894,7 +15963,8 @@ class SQLiteTaskStore(TaskStore):
                 cursor = self._connection.execute(
                     f"""
                     UPDATE cayu_tasks
-                    SET worker_id = NULL, lease_expires_at = NULL, updated_at = ?
+                    SET worker_id = NULL, lease_expires_at = NULL,
+                        interrupted_handoff_id = ?, updated_at = ?
                     WHERE id = ?
                       AND status = ?
                       AND session_id = ?
@@ -15904,6 +15974,7 @@ class SQLiteTaskStore(TaskStore):
                       AND lease_expires_at {lease_comparison} ?
                     """,
                     (
+                        request.handoff_id,
                         sqlite_support.format_datetime(now),
                         request.task_id,
                         str(TaskStatus.RUNNING),
@@ -16007,6 +16078,208 @@ class SQLiteTaskStore(TaskStore):
             ).fetchall()
             return [sqlite_support.task_from_row(row) for row in rows]
 
+    async def claim_interrupted_task_continuation(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        handoff_id: str,
+        lease_seconds: int = 300,
+        after: tuple[datetime, str] | None = None,
+        scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    ) -> InterruptedTaskContinuationClaimPage:
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
+        handoff_id_sha256 = _interrupted_task_continuation_handoff_id_sha256(handoff_id)
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
+        after, scan_limit = prepare_interrupted_task_continuation_claim_page(
+            after=after,
+            limit=scan_limit,
+        )
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                lease_expires_at = now + timedelta(seconds=lease_seconds)
+                prior_claim_row = self._connection.execute(
+                    "SELECT task_id, worker_id "
+                    "FROM cayu_task_interrupted_continuation_claims "
+                    "WHERE handoff_id_sha256 = ?",
+                    (handoff_id_sha256,),
+                ).fetchone()
+                if prior_claim_row is not None:
+                    existing_row = self._connection.execute(
+                        "SELECT * FROM cayu_tasks WHERE id = ?",
+                        (prior_claim_row["task_id"],),
+                    ).fetchone()
+                    existing = (
+                        None if existing_row is None else sqlite_support.task_from_row(existing_row)
+                    )
+                    if (
+                        prior_claim_row["worker_id"] != worker_id
+                        or existing is None
+                        or existing.interrupted_handoff_id != handoff_id
+                        or existing.worker_id != worker_id
+                        or existing.status is not TaskStatus.RUNNING
+                        or existing.session_id is None
+                        or existing.session_instance_id is None
+                        or existing.lease_expires_at is None
+                        or existing.lease_expires_at <= now
+                        or not _task_matches_claim_filter(existing, query)
+                    ):
+                        raise TaskClaimLost(
+                            "Interrupted-task continuation claim generation is no longer live."
+                        )
+                    result = InterruptedTaskContinuationClaimPage(
+                        task=existing,
+                        next_after=(existing.created_at, existing.id),
+                        scanned_candidates=0,
+                        rejected_candidates=0,
+                        replayed=True,
+                        exhausted=False,
+                    )
+                    self._connection.commit()
+                    return result
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM cayu_tasks WHERE interrupted_handoff_id = ? LIMIT 1",
+                        (handoff_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise TaskClaimLost(
+                        "Interrupted-task continuation claim generation is already in use."
+                    )
+                if query.status is not None and query.status is not TaskStatus.RUNNING:
+                    result = InterruptedTaskContinuationClaimPage(
+                        scanned_candidates=0,
+                        rejected_candidates=0,
+                        exhausted=True,
+                    )
+                    self._connection.commit()
+                    return result
+                cursor = (
+                    None if after is None else (sqlite_support.format_datetime(after[0]), after[1])
+                )
+                after_sql = ""
+                after_params: tuple[str, ...] = ()
+                if cursor is not None:
+                    after_sql = "AND (created_at > ? OR (created_at = ? AND id > ?)) "
+                    after_params = (cursor[0], cursor[0], cursor[1])
+                rows = self._connection.execute(
+                    "SELECT * FROM cayu_tasks WHERE status = ? "
+                    "AND session_id IS NOT NULL AND session_instance_id IS NOT NULL "
+                    "AND status_reason IS NULL "
+                    "AND worker_id IS NULL AND lease_expires_at IS NULL "
+                    "AND interrupted_handoff_id IS NOT NULL "
+                    f"{after_sql}"
+                    "ORDER BY created_at ASC, id ASC LIMIT ?",
+                    (
+                        str(TaskStatus.RUNNING),
+                        *after_params,
+                        scan_limit,
+                    ),
+                ).fetchall()
+                rejected = 0
+                filtered = 0
+                last_observed: Task | None = None
+                for index, row in enumerate(rows):
+                    observed = sqlite_support.task_from_row(row)
+                    last_observed = observed
+                    if not _task_matches_claim_filter(observed, query):
+                        filtered += 1
+                        continue
+                    candidate_handoff_id = observed.interrupted_handoff_id
+                    if candidate_handoff_id is None:
+                        raise AssertionError("Continuation candidate lost its handoff generation.")
+                    if (
+                        self._connection.execute(
+                            "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
+                            (observed.id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        rejected += 1
+                        continue
+                    receipt_row = self._connection.execute(
+                        "SELECT request_sha256, request_json, task_json, committed_at "
+                        "FROM cayu_task_interrupted_handoff_receipts "
+                        "WHERE task_id = ? AND handoff_id = ?",
+                        (observed.id, candidate_handoff_id),
+                    ).fetchone()
+                    try:
+                        receipt = (
+                            None
+                            if receipt_row is None
+                            else _sqlite_interrupted_task_handoff_receipt(
+                                task_id=observed.id,
+                                handoff_id=candidate_handoff_id,
+                                row=receipt_row,
+                            )
+                        )
+                    except TaskInterruptedHandoffConflict:
+                        receipt = None
+                    if receipt is None or receipt.task != observed:
+                        rejected += 1
+                        continue
+                    self._connection.execute(
+                        "INSERT INTO cayu_task_interrupted_continuation_claims ("
+                        "handoff_id_sha256, task_id, worker_id, claimed_at"
+                        ") VALUES (?, ?, ?, ?)",
+                        (
+                            handoff_id_sha256,
+                            observed.id,
+                            worker_id,
+                            sqlite_support.format_datetime(now),
+                        ),
+                    )
+                    update_cursor = self._connection.execute(
+                        "UPDATE cayu_tasks SET worker_id = ?, lease_expires_at = ?, "
+                        "interrupted_handoff_id = ?, updated_at = ? "
+                        "WHERE id = ? AND status = ? AND worker_id IS NULL "
+                        "AND lease_expires_at IS NULL AND interrupted_handoff_id = ?",
+                        (
+                            worker_id,
+                            sqlite_support.format_datetime(lease_expires_at),
+                            handoff_id,
+                            sqlite_support.format_datetime(now),
+                            observed.id,
+                            str(TaskStatus.RUNNING),
+                            observed.interrupted_handoff_id,
+                        ),
+                    )
+                    if update_cursor.rowcount != 1:
+                        raise RuntimeError("SQLite continuation claim lost its locked candidate.")
+                    claimed = self._require_task_unlocked(observed.id)
+                    result = InterruptedTaskContinuationClaimPage(
+                        task=claimed,
+                        next_after=(observed.created_at, observed.id),
+                        scanned_candidates=index + 1,
+                        rejected_candidates=rejected,
+                        filtered_candidates=filtered,
+                        exhausted=index == len(rows) - 1 and len(rows) < scan_limit,
+                    )
+                    self._connection.commit()
+                    return result
+                result = InterruptedTaskContinuationClaimPage(
+                    next_after=(
+                        (last_observed.created_at, last_observed.id)
+                        if last_observed is not None
+                        else None
+                    ),
+                    scanned_candidates=len(rows),
+                    rejected_candidates=rejected,
+                    filtered_candidates=filtered,
+                    exhausted=len(rows) < scan_limit,
+                )
+                self._connection.commit()
+                return result
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     async def reconcile_task_cancellation(
         self,
         request: TaskCancellationReconciliationRequest,
@@ -16107,8 +16380,8 @@ class SQLiteTaskStore(TaskStore):
                     UPDATE cayu_tasks
                     SET status = ?, status_reason = NULL, status_payload_json = ?,
                         result_json = NULL, error_json = ?, worker_id = NULL,
-                        lease_expires_at = NULL, started_at = ?, completed_at = ?,
-                        updated_at = ?
+                        lease_expires_at = NULL, interrupted_handoff_id = NULL,
+                        started_at = ?, completed_at = ?, updated_at = ?
                     WHERE id = ? AND status IN (?, ?) AND status_reason = ?
                       AND worker_id = ? AND lease_expires_at = ?
                       AND lease_expires_at <= ? AND retry_series_json IS NULL
@@ -16245,11 +16518,12 @@ class SQLiteTaskStore(TaskStore):
                         INSERT INTO cayu_tasks (
                             id, type, title, description, status, session_id,
                             session_instance_id, parent_task_id, assigned_agent_name, available_at, worker_id,
-                            lease_expires_at, status_reason, status_payload_json, input_json,
+                            lease_expires_at, interrupted_handoff_id, status_reason,
+                            status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
                             work_contract_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_support.task_to_row_values(successor),
                     )
@@ -16835,6 +17109,7 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
+        handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -16846,6 +17121,7 @@ class SQLiteTaskStore(TaskStore):
             with self._connection:
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                _ensure_task_handoff_authority(task, handoff_id)
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -16861,7 +17137,8 @@ class SQLiteTaskStore(TaskStore):
                     UPDATE cayu_tasks
                     SET lease_expires_at = ?,
                         updated_at = ?
-                    WHERE id = ? AND worker_id = ? AND status IN (?, ?)
+                    WHERE id = ? AND worker_id = ? AND interrupted_handoff_id IS ?
+                      AND status IN (?, ?)
                       AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
                       AND NOT EXISTS (
                           SELECT 1 FROM cayu_work_attempt_admissions
@@ -16873,6 +17150,7 @@ class SQLiteTaskStore(TaskStore):
                         sqlite_support.format_datetime(now),
                         task_id,
                         worker_id,
+                        handoff_id,
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         sqlite_support.format_datetime(now),
@@ -16951,6 +17229,10 @@ class SQLiteTaskStore(TaskStore):
             with self._connection:
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.interrupted_handoff_id is not None:
+                    raise TaskInterruptedHandoffConflict(
+                        "Recovery-owned attached tasks must publish an interrupted handoff."
+                    )
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -17155,11 +17437,13 @@ class SQLiteTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
         worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         now = datetime.now(UTC)
         task = self._require_task_unlocked(task_id)
         if worker_id is not None:
             _ensure_owned_active_task_lease(task, worker_id, now=now)
+            _ensure_task_handoff_authority(task, handoff_id)
         if (
             self._connection.execute(
                 "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -17274,18 +17558,20 @@ class SQLiteTaskStore(TaskStore):
                     "started_at": task.started_at or now,
                     "completed_at": now,
                     "updated_at": now,
+                    "interrupted_handoff_id": None,
                 }
             )
         # When a worker_id is given, only terminalize if that worker still owns an active
         # lease — a worker that lost its lease must not clobber a task another has reclaimed.
         owner_clause = ""
-        owner_params: list[str] = []
+        owner_params: list[str | None] = []
         if worker_id is not None:
             owner_clause = (
                 "\n                  AND worker_id = ?"
                 "\n                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?"
+                "\n                  AND interrupted_handoff_id IS ?"
             )
-            owner_params = [worker_id, sqlite_support.format_datetime(now)]
+            owner_params = [worker_id, sqlite_support.format_datetime(now), handoff_id]
         with self._connection:
             cursor = self._connection.execute(
                 f"""
@@ -17297,6 +17583,7 @@ class SQLiteTaskStore(TaskStore):
                     error_json = ?,
                     worker_id = NULL,
                     lease_expires_at = NULL,
+                    interrupted_handoff_id = NULL,
                     started_at = COALESCE(started_at, ?),
                     completed_at = ?,
                     updated_at = ?,
@@ -17361,6 +17648,7 @@ class SQLiteTaskStore(TaskStore):
             if worker_id is not None:
                 current = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(current, worker_id, now=now)
+                _ensure_task_handoff_authority(current, handoff_id)
             self._raise_if_governed_work_attempt_admission(
                 task_id,
                 "Admitted work attempts cannot use ordinary terminalization.",

@@ -16,6 +16,7 @@ from cayu.runtime import InMemorySessionStore, SessionStore
 from cayu.server import ServerConfig, create_server
 from cayu.server.routes import (
     InterruptSessionBody,
+    ProviderOperationResolutionBody,
     ResumeBody,
     RunBody,
     ToolApprovalBody,
@@ -30,6 +31,84 @@ CONTROL_PLANE_PROMPT_MAX_BYTES = 64 * 1024
 CONTROL_PLANE_METADATA_MAX_BYTES = 64 * 1024
 CONTROL_PLANE_METADATA_MAX_MEMBERS = 1024
 CONTROL_PLANE_REQUEST_MAX_BYTES = 1024 * 1024
+
+
+CONTINUATION_BODY_CASES = [
+    (ResumeBody, {"session_id": "session-1", "prompt": "continue"}),
+    (
+        ProviderOperationResolutionBody,
+        {
+            "session_id": "session-1",
+            "stage_id": "stage-1",
+            "expected_run_epoch": 1,
+            "action": "fail",
+        },
+    ),
+    (
+        ToolApprovalBody,
+        {
+            "session_id": "session-1",
+            "approval_id": "approval-1",
+            "tool_round_id": "round-1",
+            "tool_call_id": "call-1",
+            "decision": "approve",
+        },
+    ),
+    (
+        ToolApprovalRecoveryBody,
+        {
+            "session_id": "session-1",
+            "approval_id": "approval-1",
+            "tool_round_id": "round-1",
+            "tool_call_id": "call-1",
+            "outcome": "completed",
+            "message": "verified",
+        },
+    ),
+    (
+        ToolRoundRecoveryBody,
+        {
+            "session_id": "session-1",
+            "round_id": "round-1",
+            "tool_call_id": "call-1",
+            "outcome": "completed",
+            "message": "verified",
+        },
+    ),
+    (
+        UserInputResolveBody,
+        {
+            "session_id": "session-1",
+            "input_id": "input-1",
+            "answer": "approved",
+        },
+    ),
+    (
+        UserInputRecoveryBody,
+        {
+            "session_id": "session-1",
+            "input_id": "input-1",
+            "answer": "approved",
+            "tool_call_id": "call-1",
+            "outcome": "completed",
+            "message": "verified",
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(("body_type", "base"), CONTINUATION_BODY_CASES)
+def test_control_plane_handoff_generation_requires_worker(body_type, base) -> None:
+    with pytest.raises(ValidationError, match="task_handoff_id requires task_worker_id"):
+        body_type(**base, task_handoff_id="generation-1")
+
+    accepted = body_type(
+        **base,
+        task_worker_id="worker-1",
+        task_handoff_id="generation-1",
+    )
+    assert accepted.task_worker_id == "worker-1"
+    assert accepted.task_handoff_id == "generation-1"
 
 
 @pytest.mark.parametrize("body_type", [RunBody, ResumeBody])

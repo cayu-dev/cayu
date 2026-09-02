@@ -3082,7 +3082,15 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
             super().__init__()
             self.heartbeat_failed = asyncio.Event()
 
-        async def heartbeat(self, task_id, worker_id, *, extend_seconds=300):
+        async def heartbeat(
+            self,
+            task_id,
+            worker_id,
+            *,
+            handoff_id=None,
+            extend_seconds=300,
+        ):
+            del handoff_id
             self.heartbeat_failed.set()
             raise ConnectionError("transient task heartbeat failure")
 
@@ -3140,13 +3148,21 @@ def test_task_retry_worker_preserves_cancellation_when_heartbeat_fails_during_se
             self.heartbeat_failed = asyncio.Event()
             self.allow_settlement = asyncio.Event()
 
-        async def heartbeat(self, task_id, worker_id, *, extend_seconds=300):
+        async def heartbeat(
+            self,
+            task_id,
+            worker_id,
+            *,
+            handoff_id=None,
+            extend_seconds=300,
+        ):
             if self.settlement_started.is_set():
                 self.heartbeat_failed.set()
                 raise ConnectionError("settlement heartbeat failure")
             return await super().heartbeat(
                 task_id,
                 worker_id,
+                handoff_id=handoff_id,
                 extend_seconds=extend_seconds,
             )
 

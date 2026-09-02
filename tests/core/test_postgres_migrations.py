@@ -11,10 +11,21 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
+from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
-from cayu import PostgresSessionStore, PostgresTaskStore, TaskCreate
+from cayu import (
+    PostgresSessionStore,
+    PostgresTaskStore,
+    TaskCreate,
+    TaskQuery,
+    TaskStatus,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+    interrupted_task_handoff_request,
+)
 from cayu.core import Event, EventType, Message
 from cayu.runtime import EventOrder, EventQuery, RunRequest, SessionIdentity
 from cayu.runtime.sessions import TRANSCRIPT_SEARCH_TOKENIZER_VERSION
@@ -176,6 +187,25 @@ def test_revision_seventy_builds_handoff_recovery_index_concurrently() -> None:
     assert index.key_definitions == ("status", "lease_expires_at", "id")
     assert "CREATE INDEX CONCURRENTLY" in index.create_statement
     assert postgres_storage._required_concurrent_indexes(70)[-1] == index
+
+
+def test_revision_seventy_six_builds_bounded_continuation_index_concurrently() -> None:
+    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[76]
+
+    assert len(indexes) == 2
+    continuation_index, generation_index = indexes
+    assert continuation_index.index_name == "idx_cayu_tasks_interrupted_handoff_continuation"
+    assert continuation_index.table_name == "cayu_tasks"
+    assert continuation_index.key_definitions == ("status", "created_at", "id")
+    predicate = continuation_index.predicate_definition or ""
+    assert "worker_id IS NULL" in predicate
+    assert "interrupted_handoff_id IS NOT NULL" in predicate
+    assert "CREATE INDEX CONCURRENTLY" in continuation_index.create_statement
+    assert generation_index.index_name == "idx_cayu_tasks_interrupted_handoff_generation"
+    assert generation_index.key_definitions == ("interrupted_handoff_id",)
+    assert generation_index.unique
+    assert "CREATE UNIQUE INDEX CONCURRENTLY" in generation_index.create_statement
+    assert postgres_storage._required_concurrent_indexes(76)[-1] == generation_index
 
 
 def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str) -> None:
@@ -455,7 +485,7 @@ def test_revision_fifty_nine_rejects_a_populated_verified_work_registry(
     asyncio.run(runner())
 
 
-def test_postgres_task_store_validation_requires_revision_seventy(
+def test_postgres_task_store_validation_requires_current_minimum(
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
@@ -475,7 +505,10 @@ def test_postgres_task_store_validation_requires_revision_seventy(
 
         validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 70"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {postgres_storage._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
+            ):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -1687,6 +1720,192 @@ def test_task_store_rejects_recorded_revision_seventy_without_handoff_table(
             await validator.close()
 
         assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+
+    asyncio.run(runner())
+
+
+def test_task_store_validate_rejects_pre_handoff_generation_schema(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_continuation")
+                await cur.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
+                await cur.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+                await cur.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {postgres_storage._POSTGRES_TASK_MIN_REQUIRED_REVISION}",
+            ):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
+def test_task_store_rejects_missing_continuation_claim_registry(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="continuation-claim generation registry"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
+def test_revision_seventy_six_backfills_live_handoff_authority(
+    postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(postgres_storage, "_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE", 1)
+
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+
+            async def release(task_id: str, task_type: str, session_id: str):
+                await creator.create_task(TaskCreate(task_id=task_id, type=task_type))
+                worker_id = f"prior-{task_id}"
+                assert await creator.claim_task(worker_id, TaskQuery(type=task_type)) is not None
+                attached = await creator.attach_task(
+                    task_id,
+                    session_id=session_id,
+                    session_invocation=await task_backed_session_invocation(
+                        creator,
+                        task_id,
+                        session_id,
+                    ),
+                    worker_id=worker_id,
+                )
+                request = interrupted_task_handoff_request(attached, session_run_epoch=1)
+                await creator.release_interrupted_task_worker(request)
+                return request
+
+            live = await release("migrated-live", "migration-live", "migrated-live-session")
+            historical = await release(
+                "migrated-history",
+                "migration-history",
+                "migrated-history-session",
+            )
+            history_owner = (
+                await creator.claim_interrupted_task_continuation(
+                    "history-owner",
+                    TaskQuery(type="migration-history"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task
+            assert history_owner is not None
+            current = interrupted_task_handoff_request(history_owner, session_run_epoch=2)
+            await creator.release_interrupted_task_worker(current)
+            terminal = await release(
+                "migrated-terminal",
+                "migration-terminal",
+                "migrated-terminal-session",
+            )
+            terminal_owner = (
+                await creator.claim_interrupted_task_continuation(
+                    "terminal-owner",
+                    TaskQuery(type="migration-terminal"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task
+            assert terminal_owner is not None
+            await creator.terminalize_task(
+                TaskTerminalizationRequest(
+                    task_id=terminal_owner.id,
+                    worker_id="terminal-owner",
+                    handoff_id=terminal_owner.interrupted_handoff_id,
+                    kind=TaskTerminalKind.COMPLETED,
+                    result={"outcome": "done"},
+                    idempotency_key="migration-terminal-complete",
+                )
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_task_interrupted_handoff_receipts "
+                    "SET task_json = task_json - 'interrupted_handoff_id'"
+                )
+                await cur.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_continuation")
+                await cur.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
+                await cur.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+                await cur.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
+            await conn.commit()
+
+        migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await migrator.ensure_schema()
+            task = await migrator.load_task(live.task_id)
+            assert task is not None
+            assert task.interrupted_handoff_id == live.handoff_id
+            for request in (live, historical, current, terminal):
+                receipt = await migrator.load_interrupted_task_handoff_receipt(
+                    request.task_id,
+                    request.handoff_id,
+                )
+                assert receipt is not None
+                assert receipt.task.interrupted_handoff_id == request.handoff_id
+            historical_task = await migrator.load_task(historical.task_id)
+            assert historical_task is not None
+            assert historical_task.interrupted_handoff_id == current.handoff_id
+            terminal_task = await migrator.load_task(terminal.task_id)
+            assert terminal_task is not None
+            assert terminal_task.status is TaskStatus.COMPLETED
+            assert terminal_task.interrupted_handoff_id is None
+            owner = (
+                await migrator.claim_interrupted_task_continuation(
+                    "migration-owner",
+                    TaskQuery(type="migration-live"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task
+            assert owner is not None
+            assert owner.worker_id == "migration-owner"
+            assert owner.interrupted_handoff_id not in {None, live.handoff_id}
+        finally:
+            await migrator.close()
 
     asyncio.run(runner())
 

@@ -411,6 +411,11 @@ REVISIONS: tuple[Revision, ...] = (
     # pre-75 knowledge stores are rejected rather than assigned inferred
     # governance history; older writers do not maintain the new invariant.
     Revision(revision=75, kind=RevisionKind.BREAKING, compatible_from=75),
+    # Interrupted attached-task continuation now carries a durable, consumable
+    # handoff generation on the task row. Pre-76 task workers neither publish nor
+    # consume that fence and could reauthorize an ABA workerless snapshot, so
+    # mixed-version task execution is unsafe.
+    Revision(revision=76, kind=RevisionKind.BREAKING, compatible_from=76),
 )
 
 #: The revision an empty database is initialized to.

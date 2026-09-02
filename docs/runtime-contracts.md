@@ -2780,7 +2780,7 @@ Before choosing same-session reuse instead, an orchestrator can call
 Both APIs expose only a digest; a mismatch means the current body cannot safely
 reuse the historical prompt and must use an explicit descendant fork.
 
-Fork authority is validated again after agent registration, model and environment resolution, topology inheritance, and taint propagation. The complete derived child must be safe before Cayu creates the child, copies transcript or checkpoint state, or publishes `session.forked`. Caller-supplied identities remain untrusted; positively store-resolved and runtime-generated topology identities may survive incidental short-secret collisions, but exact-secret identities and secret-bearing executable or policy authority fail closed before mutation.
+Fork authority is validated again after agent registration, model and environment resolution, topology inheritance, and taint propagation. The complete derived child must be safe before Cayu creates the child, copies transcript or checkpoint state, or publishes `session.forked`. Caller-supplied identities remain untrusted; positively store-resolved and runtime-generated topology identities may survive incidental short-secret collisions, but exact-secret identities and secret-bearing executable or policy authority fail closed before mutation. Final validation includes runtime-owned taint-label metadata; projecting only caller-authored metadata is not a substitute for validating that policy authority.
 
 `DispatchRequest` asks a `Dispatcher` to submit work for an existing session and return a `DispatchHandle`. Dispatch is separate from fork: fork decides what state a branch starts from, while dispatch decides how a session run is placed. The default `InlineDispatcher` runs immediately in the current process by resuming the target session through the normal runtime loop, then returns a completed, failed, or interrupted handle based on the terminal session event. It is useful for tests, local execution, and proving orchestration logic, but it is not durable background execution. Production apps can provide another `Dispatcher` that submits work to an external queue or hosted runtime and returns a queued/submitted handle while events are observed through the session store. `CayuApp.dispatch_inline(...)` is the explicit local streaming API for callers that want to consume ordinary `session.resumed`, model, tool, task, interrupt, and terminal session events directly. `DispatchRequest.task_id` optionally links dispatched work to a task; using it with inline execution requires `CayuApp(task_store=...)`.
 
@@ -3002,7 +3002,7 @@ Transcript-copying remains the job of `ForkSessionRequest`; future subagent
 context modes can compose with fork when a child truly needs inherited
 conversation state.
 
-`RuntimeHook` provides lifecycle automation around durable runtime boundaries. Hook names must be portable, clean, nonblank text; Cayu validates and freezes each name at registration, so later mutation of a hook's `name` property cannot change its runtime identity or break durable publication. Terminal session phases are `after_session_completed`, `after_session_failed`, and `after_session_interrupted`. These hooks run only after the terminal session status and terminal event have already been persisted. A hook failure does not rewrite the terminal session status; Cayu records `hook.failed` and continues to later hooks. Successful hooks emit `hook.started` and `hook.completed`, including the hook scope, terminal event id/type, and JSON-safe action summaries. `RuntimeHookContext` exposes copied session/event data plus controlled helpers for `fork_session`, `create_task`, `dispatch`, `dispatch_inline`, and custom event emission. `RuntimeHookContext`, `BeforeToolCallHookContext`, and `ToolCallHookContext` also expose `execution_profile`: the exact immutable `ExecutionProfileIdentity` frozen for the admitted invocation. One process-local invocation passes the same profile object through before-tool, after-tool, recovery-owned terminal, and ordinary terminal hooks; internal paths with no admitted invocation expose `None`.
+`RuntimeHook` provides lifecycle automation around durable runtime boundaries. Hook names must be portable, clean, nonblank text; Cayu validates and freezes each name at registration, so later mutation of a hook's `name` property cannot change its runtime identity or break durable publication. Terminal session phases are `after_session_completed`, `after_session_failed`, and `after_session_interrupted`. These hooks run only after the terminal session status and terminal event have already been persisted. A hook failure does not rewrite the terminal session status; Cayu records `hook.failed` and continues to later hooks. Successful hooks emit `hook.started` and `hook.completed`, including the hook scope, registration index, invocation id, terminal event id/type, and JSON-safe action summaries. Before invoking a terminal hook, Cayu inserts its content-addressed `hook.started` event as an at-most-once reservation for that terminal event, phase, app/agent scope, and registration index; the frozen hook name remains exact payload evidence, so a changed registration conflicts instead of inheriting the slot. Its random `hook_invocation_id` distinguishes the durable winner: an acknowledgement-lost winner can recognize and continue its own exact reservation, while another process cannot re-enter the same hook. The owning async stream does not yield that reservation until the hook invocation has returned and its `hook.completed` or `hook.failed` outcome is durable, so closing the stream after observing `hook.started` cannot create a never-entered invocation. `hook.completed` and `hook.failed` use deterministic outcome identities and bind that claimant. A contender may advance past a positively settled earlier slot, but an unmatched `hook.started` remains conservatively in progress: the contender neither invokes it again nor skips ahead to later app or agent hooks, because a process can still disappear while an arbitrary hook effect is executing. This preserves registration and app-before-agent ordering without assuming arbitrary hook effects are idempotent. Receipt-authenticated approval and attached-task failure replay first revalidates the retained execution profile, then converges any missing terminal-hook slots without republishing the terminal event or redispatching provider/tool work. `RuntimeHookContext` exposes copied session/event data plus controlled helpers for `fork_session`, `create_task`, `dispatch`, `dispatch_inline`, and custom event emission. `RuntimeHookContext`, `BeforeToolCallHookContext`, and `ToolCallHookContext` also expose `execution_profile`: the exact immutable `ExecutionProfileIdentity` frozen for the admitted invocation. One process-local invocation passes the same profile object through before-tool, after-tool, recovery-owned terminal, and ordinary terminal hooks; internal paths with no admitted invocation expose `None`.
 
 `before_tool_call` runs after `ToolPolicy` authorizes a call and before the tool executes — policy is the security gate, this phase is the transform layer. It receives `BeforeToolCallHookContext` (copied session data, tool name/id, copied private arguments, optional task id, and the same controlled helpers as terminal hooks) and may return a `BeforeToolCallDecision`: `proceed` (or `None`) runs the tool unchanged, `proceed_modified` runs it with replaced `modified_arguments`, `short_circuit` skips the tool and uses a `synthetic_result`, and `block` skips the tool and returns an error result carrying `block_reason` as `tool.call.blocked`. Before- and after-tool hook contexts validate and copy arguments through the portable durable JSON contract before a hook can observe them; `modified_arguments` crosses the same boundary when its decision is constructed. Hooks compose in app-then-agent registration order, each seeing the prior hook's modified arguments; the first `short_circuit`/`block` stops the chain. When a hook replaces the arguments (`proceed_modified`), the effective arguments are **re-authorized by `ToolPolicy`** before the tool runs, so the gate always vets what actually executes — a hook cannot slip modified arguments past policy. A re-authorization that returns `deny` blocks the call; `require_approval` on hook-modified arguments also blocks (fail-safe) rather than re-entering approval, which is unsupported in v1. In dynamic or legacy/unknown multi-call rounds, before-hook telemetry omits argument-derived actions and uses fixed failure diagnostics; block and short-circuit results enter the same private staged-terminal boundary as ordinary results. The executed (effective) arguments are what `after_tool_call` receives. Terminal event and transcript argument evidence follows the finalized/unavailable publication contract above; `tool.call.started` retains only the quarantine marker. A hook-modified call is therefore authorized twice — once on the original arguments, once on the effective arguments; the re-authorization request carries `metadata[TOOL_POLICY_REAUTHORIZATION_METADATA_KEY] = True`, so a stateful policy (rate limiter, counter, audit sink) can re-verify the effective arguments while incrementing/logging only once.
 
@@ -3623,20 +3623,66 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `mark_task_needs_attention(task_id, reason=..., payload=...)`
 - `resume_task(task_id)`
 - `claim_task(worker_id, TaskQuery(...), lease_seconds=...)`
-- `heartbeat(task_id, worker_id, extend_seconds=...)`
+- `heartbeat(task_id, worker_id, handoff_id=..., extend_seconds=...)`
 - `release_task(task_id, worker_id)`
 - `release_attached_task_worker(task_id, worker_id)`
 - `release_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `recover_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `load_interrupted_task_handoff_receipt(task_id, handoff_id)`
 - `list_expired_interrupted_task_handoff_candidates(after=..., limit=...)`
+- `claim_interrupted_task_continuation(worker_id, query=..., handoff_id=..., lease_seconds=..., after=..., scan_limit=...)`
+- `load_active_attached_task_worker(task_id, worker_id, session_id=..., session_instance_id=...)`
+- `load_direct_attached_task_resume(task_id, session_id=..., session_instance_id=...)`
 - `reclaim_expired(query=..., max_reclaims=...)`
-- `complete_task(task_id, result)`
-- `fail_task(task_id, error)`
+- `complete_task(task_id, result, worker_id=..., handoff_id=...)`
+- `fail_task(task_id, error, worker_id=..., handoff_id=...)`
 - `terminalize_task(TaskTerminalizationRequest(...))`
 - `load_task_terminalization_receipt(task_id, idempotency_key)`
 - `reconcile_task_cancellation(TaskCancellationReconciliationRequest(...))`
 - `cancel_task(task_id, error=...)`
+
+An interrupted-handoff generation is not workerless direct-resume authority.
+The caller creates a fresh opaque generation with
+`new_interrupted_task_continuation_handoff_id()` and supplies it as `handoff_id`
+to `claim_interrupted_task_continuation(...)`. Retrying that exact worker and
+generation after commit-before-acknowledgement loss replays the live claim when
+it still matches the supplied query; another worker, expired lease, or consumed
+generation fails closed rather than adopting the claim. After the claim elects
+a worker, every execution-capable continuation entrance must carry that exact
+worker and generation as `task_worker_id` and `task_handoff_id` in its typed
+request: `ResumeRequest`, `ToolApprovalRequest`,
+`ToolApprovalRecoveryRequest`, `UserInputResponse`,
+`UserInputRecoveryRequest`, `ToolRoundRecoveryRequest`, or
+`ProviderOperationResolutionRequest`. The runtime resolves the one attached
+running task and validates its session incarnation and active lease before
+session admission, immediately before the admission mutation, and again after
+the new run epoch is durable but before provider, tool, hook, or mutating
+environment work. Missing or stale worker or generation authority fails closed.
+The elected authority is passed through the recovery executor, heartbeats,
+direct worker completion/failure, claimed-task terminalization, terminal
+receipts, and owner-lost cancellation reconciliation. The generation remains
+transient for operator-decision identity, so an acknowledgement-lost decision
+can be replayed by a later independently elected generation without changing
+its logical digest. A request without `task_worker_id` may continue only a
+workerless direct attachment that has no interrupted-handoff generation; a
+stable worker name by itself never adopts the current generation.
+
+Generic incomplete-session recovery does not execute an accepted provider
+fallback or failure for an attachment owned by an elected worker, because that
+recovery entrance has no task-worker credential. It leaves the durable
+disposition pending for the typed continuation. A tool-approval failure after
+the atomic approval-close boundary terminalizes the task under the elected
+worker with a content-addressed request; an exact receipt then authorizes replay
+across process loss until the deterministic task/session failure evidence is
+complete, without authorizing a different worker or approval identity.
+For a workerless direct attachment, provider and approval failure replay instead
+requires the exact immutable failed-task payload and session incarnation plus
+authoritative absence of the corresponding claimed-worker receipt. Receipt-capable
+stores commit the claimed mutation and receipt atomically, so this negative proof
+cannot race a claimed terminalization and cannot be used to strip elected-worker
+authority. A store without that atomic receipt capability fails closed after the
+workerless task is terminal because the terminal row no longer proves its former
+owner.
 
 Verified-work runtime mutations require stronger cancellation settlement than
 the ordinary capability flag alone can prove. A custom store implementation
@@ -4370,23 +4416,123 @@ ineligible earlier candidates cannot starve a valid interrupted handoff even for
 a one-shot worker, while each individual store read remains bounded to at most
 100 tasks. Terminal,
 cancel-draining, admitted-work, wrong-owner, different-incarnation, and
-non-interrupted-session states are not released by this recovery path. A
+unrecoverable session states are not released by this recovery path. A live
+`pending`, `running`, or `interrupting` session is first fenced through
+`recover_incomplete_session(...)` using the expired task lease as its inactivity
+boundary; the task owner is released only if the exact attached session then
+reaches `interrupted`. A
 complete recovery scan is rate-limited, so an unchanged ineligible set is not
 re-read on every idle poll or before every fresh claim. A control-plane process
-may later resolve an approval or user-input request,
-resume the session, or run session recovery; the original session/task link then
-terminalizes the same task.
+may later resolve an approval or user-input request. Application recovery code
+can atomically scan at most 100 candidates with
+`claim_interrupted_task_continuation(..., handoff_id=...)`. Claim generations
+are fresh, caller-owned, and concurrently unique in each store. The returned
+`InterruptedTaskContinuationClaimPage` contains the optional claimed task, the
+last inspected `(created_at, task_id)` cursor, scanned and rejected counts, a
+query-filtered count, whether the response is an exact replay, and whether the
+scan is exhausted. The store first selects
+the globally ordered physical page and applies `TaskQuery` only inside that page.
+Each SQLite write transaction materializes at most the requested limit, and each
+PostgreSQL claim locks at most that many candidates; query filters no longer
+force either implementation to search through an unbounded number of unrelated
+eligible rows before reaching its limit. Missing, stale, or malformed receipt
+authority rejects only that candidate and advances the cursor; a normal query
+mismatch is counted as filtered instead of being reported as invalid durable
+authority. Callers retain the cursor and interleave pages fairly with their
+other work rather than draining an unbounded backlog in one scheduling turn.
+
+Only a `running`, attached, workerless task whose exact released version is
+backed by a committed interrupted-handoff receipt and the same durable
+`interrupted_handoff_id` is eligible. Claim consumes that one-use generation by
+replacing it atomically with the caller's claim generation while publishing the
+worker lease. SQLite and PostgreSQL enforce claim-generation uniqueness with a
+partial unique index and permanently retain each claimed token's digest; the
+in-memory store maintains the same one-use invariant in its authority indexes.
+The rotated durable lineage requires the recovery owner to publish a new
+interrupted handoff rather than use the ordinary attached worker release. Until
+then it authorizes neither another continuation claim nor direct ownerless
+resume. A stale receipt
+from an earlier owner release does not authorize
+adoption of a later workerless version, even if a clock rollback recreates an
+otherwise byte-identical task snapshot. A later interrupted handoff also binds
+the rotated lineage into its new handoff identity.
+The claim publishes a new worker lease in the same task-store mutation, so two
+recovery workers cannot invoke the continuation concurrently and an unrelated
+direct task/session link is never adopted. Recovery code passes its worker id
+and returned generation as `ResumeRequest.task_worker_id` and
+`ResumeRequest.task_handoff_id`, and must supervise the lease, terminalization,
+and any later interrupted handoff just as it would for an ordinary claimed task.
+Before session admission, resume calls
+`load_active_attached_task_worker(...)` to reject a missing, expired, stale, or
+mismatched worker lease. The same authority and live Session incarnation are
+revalidated after atomic session admission and before grants, provider calls, or
+tools. Direct ownerless resume uses `load_direct_attached_task_resume(...)` and
+is admitted only for a workerless attachment with no interrupted-handoff
+generation; it cannot bypass a live or claimable recovery owner. If that
+recovery process is
+lost, its expired continuation lease goes through the same session interruption,
+receipt, and re-claim sequence. The original session/task link then terminalizes
+the same task under the elected lease. Completion, failure, and cancellation
+atomically consume the retained handoff lineage with that terminal transition.
+
+An attached-task run that catches an ordinary continuation failure binds the
+session incarnation, run epoch, interaction, observed time, exact invocation
+execution-profile fingerprint, redacted terminal payload, and failed-turn
+summary into a version 2 failure marker in the immutable failed task. Claimed
+tasks additionally bind that
+payload to the exact worker's terminalization receipt. If the process is lost
+after task terminalization but before the interaction/session failure
+publication, any typed continuation entrance first authenticates that durable
+failure evidence and validates freshly resolved providers, agents, hooks,
+policies, budgets, tools, and environment authority against the retained
+invocation profile. A mismatch fails without consuming the retry's durable
+authority; no historical profile may authorize current process-local hooks or
+environment finalization. A matching process reconstructs authenticated
+invocation authority and finishes the same deterministic `task.failed`,
+`interaction.failed`, failed `turn.completed`, and `session.failed` boundaries.
+It does not admit the continuation again or redispatch providers and tools. A
+dispatched model stage is settled conservatively as provider-effect outcome
+unknown because the task receipt proves the runtime observed a failure, not
+that the provider had no effect. Once the terminal session event is durable,
+run-operation cleanup remains best effort and cannot replace that result with a
+cleanup failure. Ownerless replay additionally requires a receipt-capable task
+store and authoritative absence of the claimed-worker receipt; malformed,
+stale-epoch, wrong-worker, profile-mismatched, and conflicting terminal evidence
+fail closed.
 
 Custom task stores opt in with `supports_interrupted_task_handoffs = True` only
 when release, receipt readback, expired-candidate discovery, and recovery have
-the same exact-operation and authoritative-time semantics. Additive schema
+the same exact-operation and authoritative-time semantics. Their continuation
+claim must return an exact, internally consistent
+`InterruptedTaskContinuationClaimPage`; Runtime rejects an untyped result before
+dispatching application code. Additive schema
 revision 70 installs the receipt table and bounded recovery index for SQLite and
-PostgreSQL without inferring historical handoffs. Custom worker loops may use
+PostgreSQL without inferring historical handoffs. Breaking schema revision 76
+adds the task-row handoff-lineage generation. Its migration validates and
+upgrades every historical receipt snapshot with that receipt's own handoff
+generation, then carries the sole receipt exactly matching a current released
+task into the task row. It also installs a partial `(status, created_at, id)`
+continuation index so bounded pages retain storage-engine order without an
+unbounded sort under the claim transaction. Multiple current matches or
+malformed recovery evidence reject the migration, while tasks with no matching
+receipt remain ordinary direct attachments. Built-in task stores require
+revision 76 because pre-76 workers
+cannot preserve or consume the fence, so mixed pre-76/post-76 task execution is
+unsupported. Custom worker loops may use
 the public request builder and store operations after proving the same durable
 interruption boundary; they must preserve the task/session link when release is
 unacknowledged. A concrete subclass must redeclare the capability and the
 cancellation-quiescence proof after reviewing its complete implementation graph;
 inherited declarations alone do not authenticate a changed store implementation.
+Stores used for recovered continuation execution must additionally implement
+the cancellation-quiescent atomic continuation claim and the store-time
+`load_active_attached_task_worker(...)` and
+`load_direct_attached_task_resume(...)` resume fences; stores that only settle
+handoffs can leave those optional methods unsupported. A legacy custom store
+that does not advertise interrupted-handoff support inherits a compatibility
+direct-resume check over its required `load_task(...)` implementation. Once a
+store advertises recovery, that fallback fails closed and the store must provide
+an atomic direct-resume read so recovery lineage cannot race the check.
 
 Cancelling an idle ordinary task terminalizes it immediately. Cancelling an
 ordinary task with a live worker instead records a durable

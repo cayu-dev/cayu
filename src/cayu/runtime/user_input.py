@@ -134,6 +134,8 @@ class UserInputResponse(BaseModel):
     )
 
     session_id: str
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     input_id: str
     answer: str
     structured: dict[str, Any] | None = None
@@ -155,6 +157,19 @@ class UserInputResponse(BaseModel):
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> UserInputResponse:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("answer")
     @classmethod
@@ -709,6 +724,8 @@ def copy_user_input_response(response: UserInputResponse) -> UserInputResponse:
         raise TypeError("User input resolution requires a UserInputResponse.")
     return UserInputResponse(
         session_id=response.session_id,
+        task_worker_id=response.task_worker_id,
+        task_handoff_id=response.task_handoff_id,
         input_id=response.input_id,
         answer=response.answer,
         structured=copy_durable_json_value(response.structured, "structured"),
@@ -892,6 +909,8 @@ class UserInputRecoveryRequest(BaseModel):
     )
 
     session_id: str
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     input_id: str
     answer: str
     tool_call_id: str
@@ -917,6 +936,19 @@ class UserInputRecoveryRequest(BaseModel):
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> UserInputRecoveryRequest:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("resolved_by")
     @classmethod
@@ -975,6 +1007,8 @@ def copy_user_input_recovery_request(
         raise TypeError("User input recovery requires a UserInputRecoveryRequest.")
     return UserInputRecoveryRequest(
         session_id=request.session_id,
+        task_worker_id=request.task_worker_id,
+        task_handoff_id=request.task_handoff_id,
         input_id=request.input_id,
         answer=request.answer,
         tool_call_id=request.tool_call_id,

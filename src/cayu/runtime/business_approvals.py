@@ -277,6 +277,7 @@ async def resolve_business_approval(
     app: CayuApp,
     *,
     session_id: str,
+    task_worker_id: str | None = None,
     approval_id: str,
     approver_id: str,
     approver_tier: str,
@@ -394,6 +395,7 @@ async def resolve_business_approval(
 
     request = ToolApprovalRequest(
         session_id=session_id,
+        task_worker_id=task_worker_id,
         approval_id=approval_id,
         tool_round_id=pending.tool_round_id,
         tool_call_id=pending.tool_call_id,

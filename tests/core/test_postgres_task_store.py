@@ -32,12 +32,14 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 from tests.core.task_store_conformance import (
+    assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
     assert_task_session_invocation_binding_conformance,
 )
 from tests.core.task_terminalization_conformance import (
     assert_live_ordinary_cancellation_conformance,
     assert_owner_lost_ordinary_cancellation_reconciliation_conformance,
+    assert_recovered_continuation_terminalization_conformance,
     assert_task_terminalization_acknowledgement_conformance,
     ordinary_cancellation_reconciliation_request,
 )
@@ -126,6 +128,7 @@ from cayu import (
     WorkAttemptCreate,
     WorkCompletionConflict,
     build_local_execution_attempt_authority,
+    interrupted_task_handoff_request,
     task_create_with_execution_source,
     terminalize_task_with_retry,
 )
@@ -156,6 +159,7 @@ _TABLES = (
     "cayu_task_retry_reconciliation_rejections",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
+    "cayu_task_interrupted_continuation_claims",
     "cayu_task_interrupted_handoff_receipts",
     "cayu_completion_decision_application_receipts",
     "cayu_completion_decisions",
@@ -2009,6 +2013,13 @@ def test_postgres_task_store_live_ordinary_cancellation_conformance(postgres_dsn
     _run(postgres_dsn, ops)
 
 
+def test_postgres_recovered_continuations_terminalize_all_ordinary_kinds(postgres_dsn):
+    async def ops(store):
+        await assert_recovered_continuation_terminalization_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_owner_lost_ordinary_cancellation_reconciliation_conformance(
     postgres_dsn,
 ):
@@ -2029,9 +2040,34 @@ def test_postgres_ordinary_cancellation_reconciler_and_late_worker_serialize(
             await reconciler.create_task(
                 TaskCreate(task_id="postgres-ordinary-reconciliation-race", type="review")
             )
-            claimed = await reconciler.claim_task("postgres-lost-worker", lease_seconds=1)
+            claimed = await reconciler.claim_task("postgres-prior-worker", lease_seconds=60)
             assert claimed is not None
-            requested = await reconciler.cancel_task(claimed.id, {"code": "operator"})
+            attached = await reconciler.attach_task(
+                claimed.id,
+                session_id="postgres-ordinary-reconciliation-session",
+                session_invocation=await task_backed_session_invocation(
+                    reconciler,
+                    claimed.id,
+                    "postgres-ordinary-reconciliation-session",
+                ),
+                worker_id="postgres-prior-worker",
+            )
+            await reconciler.release_interrupted_task_worker(
+                interrupted_task_handoff_request(attached, session_run_epoch=1)
+            )
+            recovery_owner = (
+                await reconciler.claim_interrupted_task_continuation(
+                    "postgres-lost-worker",
+                    handoff_id=str(uuid4()),
+                    lease_seconds=1,
+                )
+            ).task
+            assert recovery_owner is not None
+            assert recovery_owner.interrupted_handoff_id is not None
+            requested = await reconciler.cancel_task(
+                recovery_owner.id,
+                {"code": "operator"},
+            )
             request = ordinary_cancellation_reconciliation_request(requested)
             await asyncio.sleep(1.05)
 
@@ -2041,6 +2077,7 @@ def test_postgres_ordinary_cancellation_reconciler_and_late_worker_serialize(
                     TaskTerminalizationRequest(
                         task_id=request.task_id,
                         worker_id=request.original_worker_id,
+                        handoff_id=request.original_handoff_id,
                         kind=TaskTerminalKind.CANCELLED,
                         error={"code": "operator"},
                         idempotency_key=request.cancellation_idempotency_key,
@@ -2052,6 +2089,7 @@ def test_postgres_ordinary_cancellation_reconciler_and_late_worker_serialize(
                 terminalize_late_worker(),
             )
             assert worker_result == reconciled.task
+            assert reconciled.task.interrupted_handoff_id is None
             assert await late_worker.reconcile_task_cancellation(request) == reconciled
             assert (
                 await reconciler.load_task_terminalization_receipt(
@@ -4265,6 +4303,76 @@ def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
             assert first_receipt.task.worker_id is None
             assert first_receipt.task.lease_expires_at is None
             assert await second.release_interrupted_task_worker(request) == first_receipt
+            continuation_pages = await asyncio.gather(
+                store.claim_interrupted_task_continuation(
+                    "continuation-worker-a",
+                    TaskQuery(type="review"),
+                    handoff_id=str(uuid4()),
+                ),
+                second.claim_interrupted_task_continuation(
+                    "continuation-worker-b",
+                    TaskQuery(type="review"),
+                    handoff_id=str(uuid4()),
+                ),
+            )
+            continuation_claims = [page.task for page in continuation_pages]
+            assert sum(claim is not None for claim in continuation_claims) == 1
+            [continuation_owner] = [claim for claim in continuation_claims if claim is not None]
+            assert continuation_owner.worker_id in {
+                "continuation-worker-a",
+                "continuation-worker-b",
+            }
+            assert continuation_owner.worker_id is not None
+            assert continuation_owner.interrupted_handoff_id not in {
+                None,
+                first_receipt.request.handoff_id,
+            }
+            with pytest.raises(TaskInterruptedHandoffConflict):
+                await store.release_attached_task_worker(
+                    continuation_owner.id,
+                    continuation_owner.worker_id,
+                )
+            assert first_receipt.task.session_id is not None
+            assert first_receipt.task.session_instance_id is not None
+            with pytest.raises(TaskClaimLost):
+                await store.load_direct_attached_task_resume(
+                    continuation_owner.id,
+                    session_id=first_receipt.task.session_id,
+                    session_instance_id=first_receipt.task.session_instance_id,
+                )
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_tasks SET worker_id = NULL, lease_expires_at = NULL, "
+                    "updated_at = %s WHERE id = %s",
+                    (
+                        first_receipt.task.updated_at,
+                        continuation_owner.id,
+                    ),
+                )
+                await conn.commit()
+            collided = await store.load_task(continuation_owner.id)
+            assert collided is not None
+            assert (
+                collided.model_copy(
+                    update={
+                        "interrupted_handoff_id": first_receipt.request.handoff_id,
+                    }
+                )
+                == first_receipt.task
+            )
+            with pytest.raises(TaskClaimLost):
+                await store.load_direct_attached_task_resume(
+                    continuation_owner.id,
+                    session_id=first_receipt.task.session_id,
+                    session_instance_id=first_receipt.task.session_instance_id,
+                )
+            assert (
+                await second.claim_interrupted_task_continuation(
+                    "stale-receipt-worker",
+                    TaskQuery(type="review"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task is None
             with pytest.raises(TaskInterruptedHandoffConflict):
                 await second.release_interrupted_task_worker(
                     request.model_copy(update={"session_run_epoch": 2})
@@ -4318,6 +4426,63 @@ def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
     _run(postgres_dsn, ops)
 
 
+def test_postgres_bounds_continuation_scans_before_applying_query_filters(
+    postgres_dsn,
+) -> None:
+    async def ops(store):
+        await assert_interrupted_continuation_scan_bound_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_same_continuation_generation_converges_across_instances(
+    postgres_dsn,
+) -> None:
+    async def ops(store):
+        task_id = "task_postgres_concurrent_continuation_replay"
+        session_id = "session_postgres_concurrent_continuation_replay"
+        task_type = "concurrent-continuation-replay"
+        await store.create_task(TaskCreate(task_id=task_id, type=task_type))
+        claimed = await store.claim_task("prior-worker", TaskQuery(type=task_type))
+        assert claimed is not None
+        attached = await store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task_id,
+                session_id,
+            ),
+            worker_id="prior-worker",
+        )
+        await store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(attached, session_run_epoch=1)
+        )
+
+        second = _new_store(postgres_dsn)
+        try:
+            handoff_id = str(uuid4())
+            claims = await asyncio.gather(
+                store.claim_interrupted_task_continuation(
+                    "continuation-worker",
+                    TaskQuery(type=task_type),
+                    handoff_id=handoff_id,
+                ),
+                second.claim_interrupted_task_continuation(
+                    "continuation-worker",
+                    TaskQuery(type=task_type),
+                    handoff_id=handoff_id,
+                ),
+            )
+            assert claims[0].task is not None
+            assert claims[1].task == claims[0].task
+            assert sorted(claim.replayed for claim in claims) == [False, True]
+        finally:
+            await second.close()
+
+    _run(postgres_dsn, ops)
+
+
 def test_postgres_interrupted_task_handoff_candidates_page_stably(postgres_dsn):
     async def ops(store):
         for task_id in ("task_postgres_handoff_page_a", "task_postgres_handoff_page_b"):
@@ -4349,6 +4514,169 @@ def test_postgres_interrupted_task_handoff_candidates_page_stably(postgres_dsn):
             "task_postgres_handoff_page_a",
             "task_postgres_handoff_page_b",
         ]
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_continuation_claim_rejects_malformed_receipt_authority(postgres_dsn):
+    async def ops(store):
+        task_id = "task_postgres_malformed_continuation"
+        session_id = "session_postgres_malformed_continuation"
+        await store.create_task(TaskCreate(task_id=task_id, type="review"))
+        claimed = await store.claim_task("prior-worker", lease_seconds=300)
+        assert claimed is not None
+        attached = await store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task_id,
+                session_id,
+            ),
+            worker_id="prior-worker",
+        )
+        assert attached.lease_expires_at is not None
+        assert attached.session_instance_id is not None
+        request = TaskInterruptedHandoffRequest(
+            task_id=task_id,
+            worker_id="prior-worker",
+            lease_expires_at=attached.lease_expires_at,
+            session_id=session_id,
+            session_instance_id=attached.session_instance_id,
+            session_run_epoch=1,
+            handoff_id="postgres-malformed-continuation",
+        )
+        await store.release_interrupted_task_worker(request)
+        async with store._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE cayu_task_interrupted_handoff_receipts "
+                "SET request_sha256 = %s WHERE task_id = %s AND handoff_id = %s",
+                ("0" * 64, task_id, request.handoff_id),
+            )
+            await conn.commit()
+
+        valid_task_id = "task_postgres_valid_after_malformed_continuation"
+        valid_session_id = "session_postgres_valid_after_malformed_continuation"
+        await store.create_task(TaskCreate(task_id=valid_task_id, type="review"))
+        valid_prior = await store.claim_task(
+            "valid-prior-worker",
+            TaskQuery(type="review"),
+            lease_seconds=300,
+        )
+        assert valid_prior is not None and valid_prior.id == valid_task_id
+        valid_attached = await store.attach_task(
+            valid_task_id,
+            session_id=valid_session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                valid_task_id,
+                valid_session_id,
+            ),
+            worker_id="valid-prior-worker",
+        )
+        assert valid_attached.lease_expires_at is not None
+        assert valid_attached.session_instance_id is not None
+        await store.release_interrupted_task_worker(
+            TaskInterruptedHandoffRequest(
+                task_id=valid_task_id,
+                worker_id="valid-prior-worker",
+                lease_expires_at=valid_attached.lease_expires_at,
+                session_id=valid_session_id,
+                session_instance_id=valid_attached.session_instance_id,
+                session_run_epoch=1,
+                handoff_id="postgres-valid-after-malformed-continuation",
+            )
+        )
+
+        rejected_page = await store.claim_interrupted_task_continuation(
+            "recovery-owner",
+            TaskQuery(type="review"),
+            handoff_id=str(uuid4()),
+            scan_limit=1,
+        )
+        assert rejected_page.task is None
+        assert rejected_page.scanned_candidates == 1
+        assert rejected_page.rejected_candidates == 1
+        assert not rejected_page.exhausted
+        assert rejected_page.next_after is not None
+
+        claimed_page = await store.claim_interrupted_task_continuation(
+            "recovery-owner",
+            TaskQuery(type="review"),
+            handoff_id=str(uuid4()),
+            after=rejected_page.next_after,
+            scan_limit=1,
+        )
+        assert claimed_page.task is not None
+        assert claimed_page.task.id == valid_task_id
+        assert claimed_page.rejected_candidates == 0
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_interrupted_continuation_cursor_does_not_skip_locked_rows(postgres_dsn):
+    async def ops(store):
+        async def prepare_candidate(task_id: str, session_id: str) -> None:
+            await store.create_task(TaskCreate(task_id=task_id, type="review"))
+            worker_id = f"prior-{task_id}"
+            claimed = await store.claim_task(worker_id, TaskQuery(type="review"))
+            assert claimed is not None and claimed.id == task_id
+            attached = await store.attach_task(
+                task_id,
+                session_id=session_id,
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task_id,
+                    session_id,
+                ),
+                worker_id=worker_id,
+            )
+            assert attached.lease_expires_at is not None
+            assert attached.session_instance_id is not None
+            await store.release_interrupted_task_worker(
+                TaskInterruptedHandoffRequest(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    lease_expires_at=attached.lease_expires_at,
+                    session_id=session_id,
+                    session_instance_id=attached.session_instance_id,
+                    session_run_epoch=1,
+                    handoff_id=f"handoff-{task_id}",
+                )
+            )
+
+        first_task_id = "a-locked-continuation-candidate"
+        await prepare_candidate(first_task_id, "a-locked-continuation-session")
+        await prepare_candidate(
+            "b-later-continuation-candidate",
+            "b-later-continuation-session",
+        )
+        contender = _new_store(postgres_dsn)
+        try:
+            async with store._pool.connection() as lock_connection:
+                async with lock_connection.cursor() as lock_cursor:
+                    await lock_cursor.execute(
+                        "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                        (first_task_id,),
+                    )
+                    claim = asyncio.create_task(
+                        contender.claim_interrupted_task_continuation(
+                            "continuation-owner",
+                            TaskQuery(type="review"),
+                            handoff_id=str(uuid4()),
+                            scan_limit=2,
+                        )
+                    )
+                    await asyncio.sleep(0.05)
+                    assert not claim.done()
+                    await lock_connection.rollback()
+                page = await asyncio.wait_for(claim, timeout=2)
+            assert page.task is not None
+            assert page.task.id == first_task_id
+            assert page.scanned_candidates == 1
+            assert page.next_after == (page.task.created_at, page.task.id)
+        finally:
+            await contender.close()
 
     _run(postgres_dsn, ops)
 

@@ -107,6 +107,7 @@ from cayu.runtime._completion_result_resolver_coordinator import (
     CompletionResultResolverCoordinator,
 )
 from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
+from cayu.runtime._continuation_task_failure import ApprovalTaskFailureIdentity
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_subagent_coordinator import (
     DurableSubagentCoordinator,
@@ -333,6 +334,7 @@ from cayu.runtime.mcp_manifest_policy import (
 )
 from cayu.runtime.provider_operations import (
     ProviderOperationRecoveryResult,
+    ProviderOperationResolutionAction,
     ProviderOperationResolutionRequest,
     RecoverableProviderOperation,
     RecoverableProviderOperationStart,
@@ -1262,6 +1264,9 @@ class CayuApp:
             effective_retry_policy=self._effective_retry_policy,
             run_session=self._run_recovery_session,
             emit_terminal_event_with_hooks=self._emit_recovery_terminal_event_with_hooks,
+            terminal_runtime_hooks_are_settled=(
+                self._terminal_runtime_hooks_are_settled_for_recovery
+            ),
             fail_provider_operation=self._fail_provider_operation_resolution,
             stop_session_for_limit_reached=self._stop_recovery_session_for_limit_reached,
             task_event=_recovery_task_event,
@@ -6518,10 +6523,109 @@ class CayuApp:
                 "Contracted tasks require the verifier-aware execution entrance."
             ) from None
 
+    async def _prepare_continuation_recovery_authority(
+        self,
+        *,
+        session_id: str,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> tuple[str | None, str | None, tuple[Event, ...] | None]:
+        task_id, session_instance_id = await self._session_engine._linked_continuation_task_id(
+            session_id=session_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+        (
+            replayed_failure,
+            replay_events,
+        ) = await self._session_engine._replay_runtime_task_failure_if_needed(
+            session_id=session_id,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+        )
+        if not replayed_failure:
+            await self._require_ordinary_recovery_execution(
+                session_id=session_id,
+                task_id=task_id,
+                admit_session=False,
+            )
+        return task_id, session_instance_id, replay_events if replayed_failure else None
+
+    async def _require_continuation_task_authority(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str | None,
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_handoff_id: str | None = None,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> None:
+        if task_handoff_id is not None and task_worker_id is None:
+            raise RuntimeError("Task handoff authority requires a continuation worker.")
+        if task_id is None and session_instance_id is None and task_worker_id is None:
+            if task_handoff_id is not None:
+                raise RuntimeError("Workerless continuation retained task handoff authority.")
+            return
+        if task_id is None or session_instance_id is None:
+            raise RuntimeError("Attached-task continuation authority is incomplete.")
+        await self._session_engine._require_linked_continuation_task_authority(
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+
+    async def _require_continuation_recovery_execution(
+        self,
+        *,
+        session_id: str,
+        session_instance_id: str | None,
+        task_id: str | None,
+        task_worker_id: str | None,
+        admit_session: bool,
+        task_handoff_id: str | None = None,
+        enforce_task_handoff_identity: bool = False,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> None:
+        await self._require_continuation_task_authority(
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
+            approval_failure_identity=approval_failure_identity,
+        )
+        await self._require_ordinary_recovery_execution(
+            session_id=session_id,
+            task_id=task_id,
+            admit_session=admit_session,
+        )
+
     async def _run_recovery_session(
         self,
         request: RecoverySessionRunRequest,
     ) -> AsyncGenerator[Event, None]:
+        await self._require_continuation_task_authority(
+            session_id=request.session.id,
+            session_instance_id=(
+                request.session.instance_id if request.task_id is not None else None
+            ),
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
         (
             requires_completion_decision,
             admission_failure,
@@ -6615,6 +6719,7 @@ class CayuApp:
             request_metadata=request.request_metadata,
             task_id=request.task_id,
             task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
             start_event_type=request.start_event_type,
             start_event_payload=request.start_event_payload,
             start_task_on_enter=request.start_task_on_enter,
@@ -6652,6 +6757,7 @@ class CayuApp:
         invocation_semantics_available: bool = False,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
+        record_rejection: bool = True,
     ) -> ActiveInvocationExecutionProfile:
         return await self._session_engine.validate_execution_profile_continuation(
             session=session,
@@ -6670,16 +6776,46 @@ class CayuApp:
             frozen_candidate_profile=frozen_candidate_profile,
             require_open_interaction=require_open_interaction,
             additional_profile_fingerprints=additional_profile_fingerprints,
+            record_rejection=record_rejection,
         )
 
     def _emit_recovery_terminal_event_with_hooks(
         self,
         request: RecoveryTerminalEventRequest,
     ) -> AsyncIterator[Event]:
+        if request.terminal_event_already_durable:
+            return self._session_engine._replay_terminal_event_with_hooks(
+                event=request.event,
+                phase=request.phase,
+                session=request.session,
+                registered_agent=request.registered_agent,
+                registered_environment=request.registered_environment,
+                execution_profile=request.execution_profile,
+                invocation_context=request.invocation_context,
+                run_runtime_hooks=request.run_runtime_hooks,
+                yield_terminal_event=request.yield_durable_terminal_event,
+            )
         return self._emit_terminal_event_with_hooks(
             event=request.event,
             phase=request.phase,
             session=request.session,
+            registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
+            execution_profile=request.execution_profile,
+            invocation_context=request.invocation_context,
+            run_runtime_hooks=request.run_runtime_hooks,
+        )
+
+    async def _terminal_runtime_hooks_are_settled_for_recovery(
+        self,
+        request: RecoveryTerminalEventRequest,
+    ) -> bool:
+        if not request.terminal_event_already_durable:
+            raise ValueError("Terminal hook settlement requires a durable terminal event.")
+        return await self._session_engine.terminal_runtime_hooks_are_settled(
+            phase=request.phase,
+            session=request.session,
+            terminal_event=request.event,
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             execution_profile=request.execution_profile,
@@ -6696,6 +6832,9 @@ class CayuApp:
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             execution_profile=request.execution_profile,
+            task_id=request.task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
             legacy_resolution_without_profile=request.legacy_resolution_without_profile,
             invocation_context=request.invocation_context,
         )
@@ -6734,6 +6873,7 @@ class CayuApp:
             environment_name=request.environment_name,
             execution_profile=request.execution_profile,
             invocation_context=request.invocation_context,
+            run_terminal_hooks=request.run_terminal_hooks,
         )
 
     def _pending_session_interrupt_checkpoint_for_recovery(
@@ -6820,26 +6960,37 @@ class CayuApp:
             raise TypeError("Runtime user input resolution requires a UserInputResponse.")
         response = copy_user_input_response(response)
         (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_recovery_execution_outcome(
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
             session_id=response.session_id,
-            admit_session=False,
+            task_worker_id=response.task_worker_id,
+            task_handoff_id=response.task_handoff_id,
         )
-        if admission_failure is not None:
-            del response
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del response
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
         session_id = response.session_id
+        task_worker_id = response.task_worker_id
+        task_handoff_id = response.task_handoff_id
         stream = self._recovery_coordinator.resolve_user_input(
             response=response,
-            before_mutation=lambda: self._require_ordinary_recovery_execution(
+            before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 admit_session=True,
+            ),
+            after_admission=lambda: self._require_continuation_task_authority(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
             ),
         )
         del response
@@ -6891,26 +7042,37 @@ class CayuApp:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
         request = copy_user_input_recovery_request(request)
         (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_recovery_execution_outcome(
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
             session_id=request.session_id,
-            admit_session=False,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
         )
-        if admission_failure is not None:
-            del request
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del request
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
         session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.recover_user_input_request(
             request=request,
-            before_mutation=lambda: self._require_ordinary_recovery_execution(
+            before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 admit_session=True,
+            ),
+            after_admission=lambda: self._require_continuation_task_authority(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
             ),
         )
         del request
@@ -6967,27 +7129,44 @@ class CayuApp:
             request,
             session_id=session_id,
         )
+        allow_terminal_failure_replay = request.action is ProviderOperationResolutionAction.FAIL
         (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_recovery_execution_outcome(
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
             session_id=request.session_id,
-            admit_session=False,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+            allow_terminal_failure_replay=allow_terminal_failure_replay,
         )
-        if admission_failure is not None:
-            del request
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del request
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
+        if replay_events is not None:
+            for event in replay_events:
+                yield await self._project_emitted_event_for_public_api(event)
+            return
         session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.resolve_provider_operation(
             request,
-            before_mutation=lambda: self._require_ordinary_recovery_execution(
+            task_id=task_id,
+            task_handoff_id=task_handoff_id,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
                 admit_session=True,
+                task_handoff_id=task_handoff_id,
+                allow_terminal_failure_replay=allow_terminal_failure_replay,
+            ),
+            after_admission=lambda: self._require_continuation_task_authority(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                allow_terminal_failure_replay=allow_terminal_failure_replay,
             ),
         )
         del request
@@ -7002,27 +7181,50 @@ class CayuApp:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
         request = _validate_tool_approval_request(request)
-        (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_recovery_execution_outcome(
-            session_id=request.session_id,
-            admit_session=False,
+        approval_failure_identity = ApprovalTaskFailureIdentity(
+            approval_id=request.approval_id,
+            tool_round_id=request.tool_round_id,
+            tool_call_id=request.tool_call_id,
+            resolution_request_digest=(
+                approval_support.approval_resolution_request_digest(request)
+            ),
         )
-        if admission_failure is not None:
-            del request
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del request
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
+        (
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+            approval_failure_identity=approval_failure_identity,
+        )
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
         session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.resolve_tool_approval(
             request=request,
-            before_mutation=lambda: self._require_ordinary_recovery_execution(
+            task_id=task_id,
+            before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 admit_session=True,
+                approval_failure_identity=approval_failure_identity,
+            ),
+            after_admission=lambda: self._require_continuation_task_authority(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                approval_failure_identity=approval_failure_identity,
             ),
         )
         del request
@@ -7071,26 +7273,37 @@ class CayuApp:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         request = _validate_tool_approval_recovery_request(request)
         (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_recovery_execution_outcome(
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
             session_id=request.session_id,
-            admit_session=False,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
         )
-        if admission_failure is not None:
-            del request
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del request
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
         session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.recover_tool_approval_request(
             request=request,
-            before_mutation=lambda: self._require_ordinary_recovery_execution(
+            before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 admit_session=True,
+            ),
+            after_admission=lambda: self._require_continuation_task_authority(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
             ),
         )
         del request
@@ -7155,26 +7368,37 @@ class CayuApp:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
         request = copy_tool_round_recovery_request(request)
         (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_recovery_execution_outcome(
+            task_id,
+            task_session_instance_id,
+            replay_events,
+        ) = await self._prepare_continuation_recovery_authority(
             session_id=request.session_id,
-            admit_session=False,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
         )
-        if admission_failure is not None:
-            del request
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            del request
-            raise TaskCompletionDecisionRequired(
-                "Contracted tasks require the verifier-aware execution entrance."
-            ) from None
+        if replay_events is not None:
+            for event in replay_events:
+                yield event
+            return
         session_id = request.session_id
+        task_worker_id = request.task_worker_id
+        task_handoff_id = request.task_handoff_id
         stream = self._recovery_coordinator.recover_tool_round_request(
             request=request,
-            before_mutation=lambda: self._require_ordinary_recovery_execution(
+            before_mutation=lambda: self._require_continuation_recovery_execution(
                 session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 admit_session=True,
+            ),
+            after_admission=lambda: self._require_continuation_task_authority(
+                session_id=session_id,
+                session_instance_id=task_session_instance_id,
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
             ),
         )
         del request
@@ -7198,6 +7422,7 @@ class CayuApp:
         request_metadata: dict[str, Any],
         task_id: str | None,
         task_worker_id: str | None,
+        task_handoff_id: str | None,
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
@@ -7256,6 +7481,7 @@ class CayuApp:
             ),
             task_id=task_id,
             task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
             start_event_type=start_event_type,
             start_event_payload=start_event_payload,
             start_task_on_enter=start_task_on_enter,
@@ -7476,6 +7702,7 @@ class CayuApp:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        run_terminal_hooks: bool = True,
     ) -> AsyncIterator[Event]:
         stream = self._session_engine._handle_session_interrupted(
             session=session,
@@ -7487,6 +7714,7 @@ class CayuApp:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            run_terminal_hooks=run_terminal_hooks,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
@@ -7581,6 +7809,7 @@ class CayuApp:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
+        run_runtime_hooks: bool = True,
     ) -> AsyncIterator[Event]:
         stream = self._session_engine._emit_terminal_event_with_hooks(
             event=event,
@@ -7590,6 +7819,7 @@ class CayuApp:
             registered_environment=registered_environment,
             execution_profile=execution_profile,
             invocation_context=invocation_context,
+            run_runtime_hooks=run_runtime_hooks,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

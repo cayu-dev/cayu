@@ -5,9 +5,15 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
-from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core._execution_profile_fixtures import (
+    admit_test_invocation,
+    interrupt_and_release_test_invocation,
+    profiled_session_identity,
+    runtime_interaction_started_event,
+)
 from tests.core.task_invocation_fixtures import (
     stored_session_invocation,
     task_backed_session_invocation,
@@ -23,17 +29,23 @@ from cayu import (
     EventQuery,
     EventType,
     ExecutionProfileBehaviorIdentity,
+    ExecutionProfileMismatchError,
     InMemorySessionStore,
     InMemoryTaskStore,
     Message,
     ModelStreamEvent,
     PendingActionQuery,
+    ProviderOperationResolutionAction,
+    ProviderOperationResolutionRequest,
     ResumeRequest,
     RunRequest,
+    RuntimeHook,
+    RuntimeHookContext,
     ScriptedModelProvider,
     SQLiteSessionStore,
     SQLiteTaskStore,
     Task,
+    TaskClaimLost,
     TaskCreate,
     TaskHandlerOutcome,
     TaskInterruptedHandoffConflict,
@@ -49,20 +61,29 @@ from cayu import (
     TaskTerminalKind,
     Tool,
     ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
+    ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     ToolCapabilityCeiling,
     ToolContext,
     ToolEffect,
     ToolResult,
+    ToolRoundRecoveryRequest,
     ToolSpec,
+    UserInputRecoveryRequest,
+    UserInputResponse,
+    interrupted_task_handoff_request,
     run_task_worker,
 )
 from cayu.runtime import SessionStatus
+from cayu.runtime.provider_operations import provider_operation_resolution_request_digest
 from cayu.runtime.sessions import (
+    ModelCompletionStageDisposition,
     SessionIdentity,
     run_request_with_task_invocation,
 )
 from cayu.runtime.tasks import TaskExecutionSource, task_create_with_runtime_invocation
+from cayu.tools.user_input import UserInputTool
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -230,8 +251,10 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
             task_id: str,
             worker_id: str,
             *,
+            handoff_id: str | None = None,
             extend_seconds: int,
         ) -> None:
+            assert handoff_id is None
             assert elapsed < 1.0
             observed_heartbeats.append((task_id, worker_id, extend_seconds, elapsed))
             stop.set()
@@ -321,6 +344,23 @@ class _PublishChangeTool(Tool):
             content=f"Published {args['change']}",
             structured={"session_id": ctx.session_id},
         )
+
+
+class _VersionedSessionFailureHook(RuntimeHook):
+    def __init__(self, implementation_version: str) -> None:
+        self.implementation_version = implementation_version
+        self.failed_sessions: list[str] = []
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:task-worker:session-failure-hook",
+            behavior_version="1",
+            implementation_version=self.implementation_version,
+        )
+
+    async def after_session_failed(self, context: RuntimeHookContext) -> None:
+        self.failed_sessions.append(context.session.id)
 
 
 def _register_approval_agent(app: CayuApp) -> None:
@@ -947,9 +987,19 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
         approval_tool_call_id = pending.actions[0].tool_call_id
         assert approval_round_id is not None
         assert approval_tool_call_id is not None
+        continuation = (
+            await reconstructed.task_store.claim_interrupted_task_continuation(
+                "control-plane-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert continuation is not None
         async for _event in reconstructed.resolve_tool_approval(
             ToolApprovalRequest(
                 session_id="session-handoff",
+                task_worker_id="control-plane-worker",
+                task_handoff_id=continuation.interrupted_handoff_id,
                 approval_id=approval_id,
                 tool_round_id=approval_round_id,
                 tool_call_id=approval_tool_call_id,
@@ -1615,10 +1665,20 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
         assert recovered.session_id == "session-recovery-handoff"
         assert recovered.worker_id is None
         assert recovered.lease_expires_at is None
+        continuation = (
+            await recovered_store.claim_interrupted_task_continuation(
+                "worker-b",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert continuation is not None
 
         async for _event in recovered_app.resolve_tool_approval(
             ToolApprovalRequest(
                 session_id="session-recovery-handoff",
+                task_worker_id="worker-b",
+                task_handoff_id=continuation.interrupted_handoff_id,
                 approval_id=approval_id,
                 tool_round_id=approval_round_id,
                 tool_call_id=approval_tool_call_id,
@@ -2674,6 +2734,1901 @@ def test_run_task_worker_preserves_terminal_task_before_handoff_cleanup(tmp_path
     assert task is not None
     assert task.status == "completed"
     assert task.result == {"winner": "terminal-state"}
+
+
+def test_resume_rejects_stale_or_missing_worker_authority_before_provider(
+    tmp_path: Path,
+) -> None:
+    session_store = SQLiteSessionStore(tmp_path / "fenced-sessions.sqlite")
+    task_store = SQLiteTaskStore(tmp_path / "fenced-tasks.sqlite")
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def collect(worker_id: str | None) -> list[Event]:
+        return [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="fenced-resume-session",
+                    task_worker_id=worker_id,
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+
+    async def scenario() -> Task | None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="fenced-resume-task",
+            session_id="fenced-resume-session",
+        )
+        prior = await task_store.claim_task("stale-worker", lease_seconds=30)
+        assert prior is not None
+        attached = await task_store.attach_task(
+            prior.id,
+            session_id="fenced-resume-session",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "fenced-resume-session",
+            ),
+            worker_id="stale-worker",
+        )
+        session = await session_store.load("fenced-resume-session")
+        assert session is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=session.run_epoch,
+            )
+        )
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None
+
+        with pytest.raises(TaskClaimLost):
+            await collect("stale-worker")
+        with pytest.raises(TaskClaimLost):
+            await collect(None)
+        assert provider.requests == []
+        return await task_store.load_task("fenced-resume-task")
+
+    task = asyncio.run(scenario())
+    assert task is not None and task.status is TaskStatus.RUNNING
+    assert task.worker_id == "elected-worker"
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    "continuation_kind",
+    [
+        "user_input",
+        "user_input_recovery",
+        "tool_approval",
+        "tool_approval_recovery",
+        "tool_round_recovery",
+        "provider_operation",
+    ],
+)
+@pytest.mark.parametrize("worker_id", [None, "stale-worker"])
+def test_typed_continuations_require_elected_worker_authority_before_execution(
+    continuation_kind: str,
+    worker_id: str | None,
+) -> None:
+    task_store = InMemoryTaskStore()
+    provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def invoke_continuation() -> None:
+        if continuation_kind == "user_input":
+            stream = app.resolve_user_input(
+                UserInputResponse(
+                    session_id="typed-continuation-session",
+                    task_worker_id=worker_id,
+                    input_id="input-id",
+                    answer="answer",
+                )
+            )
+        elif continuation_kind == "user_input_recovery":
+            stream = app.recover_user_input(
+                UserInputRecoveryRequest(
+                    session_id="typed-continuation-session",
+                    task_worker_id=worker_id,
+                    input_id="input-id",
+                    answer="answer",
+                    tool_call_id="tool-call-id",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="completed externally",
+                )
+            )
+        elif continuation_kind == "tool_approval":
+            stream = app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="typed-continuation-session",
+                    task_worker_id=worker_id,
+                    approval_id="approval-id",
+                    tool_round_id="tool-round-id",
+                    tool_call_id="tool-call-id",
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        elif continuation_kind == "tool_approval_recovery":
+            stream = app.recover_tool_approval(
+                ToolApprovalRecoveryRequest(
+                    session_id="typed-continuation-session",
+                    task_worker_id=worker_id,
+                    approval_id="approval-id",
+                    tool_round_id="tool-round-id",
+                    tool_call_id="tool-call-id",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="completed externally",
+                )
+            )
+        elif continuation_kind == "tool_round_recovery":
+            stream = app.recover_tool_round(
+                ToolRoundRecoveryRequest(
+                    session_id="typed-continuation-session",
+                    task_worker_id=worker_id,
+                    round_id="tool-round-id",
+                    tool_call_id="tool-call-id",
+                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                    message="completed externally",
+                )
+            )
+        else:
+            stream = app.resolve_provider_operation(
+                ProviderOperationResolutionRequest(
+                    session_id="typed-continuation-session",
+                    task_worker_id=worker_id,
+                    stage_id="provider-stage-id",
+                    expected_run_epoch=0,
+                    action=ProviderOperationResolutionAction.FAIL,
+                )
+            )
+        async for _event in stream:
+            pass
+
+    async def scenario() -> Task | None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="typed-continuation-task",
+            session_id="typed-continuation-session",
+        )
+        prior = await task_store.claim_task("prior-worker", lease_seconds=30)
+        assert prior is not None
+        attached = await task_store.attach_task(
+            prior.id,
+            session_id="typed-continuation-session",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "typed-continuation-session",
+            ),
+            worker_id="prior-worker",
+        )
+        session = await app.session_store.load("typed-continuation-session")
+        assert session is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=session.run_epoch,
+            )
+        )
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None
+
+        with pytest.raises(TaskClaimLost):
+            await invoke_continuation()
+        return await task_store.load_task("typed-continuation-task")
+
+    task = asyncio.run(scenario())
+    assert task is not None and task.status is TaskStatus.RUNNING
+    assert task.worker_id == "elected-worker"
+    assert provider.requests == []
+
+
+def test_typed_continuation_rejects_secret_bearing_worker_authority_before_provider() -> None:
+    secret = "typed-continuation-worker-secret-canary"
+    provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+    app = CayuApp(
+        task_store=InMemoryTaskStore(),
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match="task continuation authority"):
+            async for _event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="secret-worker-continuation",
+                    task_worker_id=f"worker-{secret}",
+                    approval_id="approval-id",
+                    tool_round_id="tool-round-id",
+                    tool_call_id="tool-call-id",
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            ):
+                pass
+
+    asyncio.run(scenario())
+    assert provider.requests == []
+
+
+def test_provider_resolution_digest_excludes_transient_task_worker_authority() -> None:
+    def request(worker_id: str) -> ProviderOperationResolutionRequest:
+        return ProviderOperationResolutionRequest(
+            session_id="provider-resolution-worker-handoff",
+            task_worker_id=worker_id,
+            stage_id="provider-stage-id",
+            expected_run_epoch=7,
+            action=ProviderOperationResolutionAction.FAIL,
+            reason="operator selected a durable failure disposition",
+        )
+
+    assert provider_operation_resolution_request_digest(
+        request("first-elected-worker")
+    ) == provider_operation_resolution_request_digest(request("replacement-elected-worker"))
+
+
+def test_elected_worker_completes_task_through_tool_approval_continuation() -> None:
+    task_store = InMemoryTaskStore()
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="publish-change",
+                    name="publish_change",
+                    arguments={"change": "reviewed-release"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    _register_approval_agent(app)
+
+    async def pause_for_approval(
+        runtime: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        async for _event in runtime.run(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="elected-approval-session",
+                task_id=task.id,
+                task_worker_id=worker_id,
+                messages=[Message.text("user", "Publish the reviewed change.")],
+            )
+        ):
+            pass
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, SessionStatus]:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="elected-approval-task",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+        handled = await run_task_worker(
+            app,
+            task_store,
+            pause_for_approval,
+            worker_id="prior-worker",
+            query=TaskQuery(type="job"),
+            max_tasks=1,
+            reclaim=False,
+        )
+        assert handled == 1
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None and elected.worker_id == "elected-worker"
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id="elected-approval-session")
+        )
+        assert len(pending.actions) == 1
+        approval = pending.actions[0]
+        assert approval.approval_id is not None
+        assert approval.round_id is not None
+        assert approval.tool_call_id is not None
+
+        async for _event in app.resolve_tool_approval(
+            ToolApprovalRequest(
+                session_id="elected-approval-session",
+                task_worker_id="elected-worker",
+                task_handoff_id=elected.interrupted_handoff_id,
+                approval_id=approval.approval_id,
+                tool_round_id=approval.round_id,
+                tool_call_id=approval.tool_call_id,
+                decision=ToolApprovalDecision.APPROVE,
+            )
+        ):
+            pass
+
+        completed_session = await app.session_store.load("elected-approval-session")
+        assert completed_session is not None
+        return await task_store.load_task("elected-approval-task"), completed_session.status
+
+    task, session_status = asyncio.run(scenario())
+    assert task is not None and task.status is TaskStatus.COMPLETED
+    assert task.result == {
+        "session_id": "elected-approval-session",
+        "agent_name": "worker-agent",
+        "environment_name": None,
+    }
+    assert session_status is SessionStatus.COMPLETED
+    assert len(provider.requests) == 2
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("loss_point", ["after_task_failure", "after_session_failure"])
+def test_elected_worker_replays_approval_failure_after_terminalization_interruption(
+    task_store_kind: str,
+    loss_point: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ApprovalProcessLoss(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task_store: TaskStore = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "approval-failure-tasks.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="publish-change",
+                        name="publish_change",
+                        arguments={"change": "reviewed-release"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        original_failure_hook = _VersionedSessionFailureHook("1")
+        app = CayuApp(
+            task_store=task_store,
+            enable_logging=False,
+            runtime_hooks=[original_failure_hook],
+        )
+        app.register_provider(provider, default=True)
+        _register_approval_agent(app)
+
+        async def pause_for_approval(
+            runtime: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> TaskHandlerOutcome:
+            async for _event in runtime.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="approval-failure-session",
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    messages=[Message.text("user", "Publish the reviewed change.")],
+                )
+            ):
+                pass
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+        await task_store.create_task(TaskCreate(task_id="approval-failure-task", type="job"))
+        assert (
+            await run_task_worker(
+                app,
+                task_store,
+                pause_for_approval,
+                worker_id="prior-worker",
+                query=TaskQuery(type="job"),
+                max_tasks=1,
+                reclaim=False,
+            )
+            == 1
+        )
+        elected = await task_store.claim_interrupted_task_continuation(
+            "elected-worker",
+            TaskQuery(type="job"),
+            handoff_id=str(uuid4()),
+        )
+        assert elected.task is not None
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id="approval-failure-session")
+        )
+        assert len(pending.actions) == 1
+        approval = pending.actions[0]
+        assert approval.approval_id is not None
+        assert approval.round_id is not None
+        assert approval.tool_call_id is not None
+        request = ToolApprovalRequest(
+            session_id="approval-failure-session",
+            task_worker_id="elected-worker",
+            task_handoff_id=elected.task.interrupted_handoff_id,
+            approval_id=approval.approval_id,
+            tool_round_id=approval.round_id,
+            tool_call_id=approval.tool_call_id,
+            decision=ToolApprovalDecision.APPROVE,
+        )
+
+        original_materialize = app._recovery_coordinator.materialize_expected_deferred_input
+        original_fan_out = app._event_writer.fan_out_persisted
+        original_terminal = app._recovery_coordinator._emit_terminal_event_with_hooks
+
+        async def fail_after_approval_close(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("injected failure after approval close")
+
+        async def lose_after_task_failure(events: list[Event]) -> list[Event]:
+            if any(event.type is EventType.TASK_FAILED for event in events):
+                raise _ApprovalProcessLoss(
+                    "process lost after task failure and before session failure"
+                )
+            return await original_fan_out(events)
+
+        async def lose_after_session_failure(request):
+            async for event in original_terminal(request):
+                yield event
+                if event.type is EventType.SESSION_FAILED:
+                    raise _ApprovalProcessLoss(
+                        "process lost after approval session failure and before terminal hooks"
+                    )
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "materialize_expected_deferred_input",
+            fail_after_approval_close,
+        )
+        if loss_point == "after_task_failure":
+            monkeypatch.setattr(app._event_writer, "fan_out_persisted", lose_after_task_failure)
+        else:
+            monkeypatch.setattr(
+                app._recovery_coordinator,
+                "_emit_terminal_event_with_hooks",
+                lose_after_session_failure,
+            )
+        with pytest.raises(_ApprovalProcessLoss):
+            async for _event in app.resolve_tool_approval(request):
+                pass
+
+        failed_before_replay = await task_store.load_task("approval-failure-task")
+        assert failed_before_replay is not None
+        assert failed_before_replay.status is TaskStatus.FAILED
+        session_before_replay = await app.session_store.load("approval-failure-session")
+        assert session_before_replay is not None
+        assert session_before_replay.status is (
+            SessionStatus.RUNNING if loss_point == "after_task_failure" else SessionStatus.FAILED
+        )
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "materialize_expected_deferred_input",
+            original_materialize,
+        )
+        monkeypatch.setattr(app._event_writer, "fan_out_persisted", original_fan_out)
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_emit_terminal_event_with_hooks",
+            original_terminal,
+        )
+        drifted_hook = _VersionedSessionFailureHook("2")
+        drifted_app = CayuApp(
+            session_store=app.session_store,
+            task_store=task_store,
+            enable_logging=False,
+            runtime_hooks=[drifted_hook],
+        )
+        drifted_app.register_provider(provider, default=True)
+        _register_approval_agent(drifted_app)
+        with pytest.raises(ExecutionProfileMismatchError):
+            async for _event in drifted_app.resolve_tool_approval(request):
+                pass
+        assert drifted_hook.failed_sessions == []
+        drift_events = await drifted_app.session_store.load_events("approval-failure-session")
+        assert not any(
+            event.type is EventType.SESSION_EXECUTION_PROFILE_REJECTED for event in drift_events
+        )
+
+        recovered_failure_hook = _VersionedSessionFailureHook("1")
+        recovered_app = CayuApp(
+            session_store=app.session_store,
+            task_store=task_store,
+            enable_logging=False,
+            runtime_hooks=[recovered_failure_hook],
+        )
+        recovered_app.register_provider(provider, default=True)
+        _register_approval_agent(recovered_app)
+        events = [event async for event in recovered_app.resolve_tool_approval(request)]
+
+        failed_session = await recovered_app.session_store.load("approval-failure-session")
+        failed_task = await task_store.load_task("approval-failure-task")
+        assert failed_session is not None
+        assert failed_session.status is SessionStatus.FAILED
+        assert failed_task is not None
+        assert failed_task.status is TaskStatus.FAILED
+        assert failed_task.worker_id is None
+        if loss_point == "after_task_failure":
+            assert EventType.TASK_FAILED in {event.type for event in events}
+            assert sum(event.type is EventType.SESSION_FAILED for event in events) == 1
+        else:
+            assert EventType.TASK_FAILED not in {event.type for event in events}
+            assert EventType.SESSION_FAILED not in {event.type for event in events}
+        assert recovered_failure_hook.failed_sessions == ["approval-failure-session"]
+
+        replay = [event async for event in recovered_app.resolve_tool_approval(request)]
+        assert [event.type for event in replay] == [EventType.SESSION_CHECKPOINTED]
+        with pytest.raises(TaskClaimLost):
+            async for _event in recovered_app.resolve_tool_approval(
+                request.model_copy(update={"task_worker_id": "stale-worker"})
+            ):
+                pass
+        with pytest.raises(TaskClaimLost):
+            async for _event in recovered_app.resolve_tool_approval(
+                request.model_copy(update={"task_worker_id": None, "task_handoff_id": None})
+            ):
+                pass
+        with pytest.raises(TaskClaimLost):
+            async for _event in recovered_app.resolve_tool_approval(
+                request.model_copy(update={"reason": "conflicting replay identity"})
+            ):
+                pass
+        stored = await recovered_app.session_store.load_events("approval-failure-session")
+        assert sum(event.type is EventType.TASK_FAILED for event in stored) == 1
+        assert sum(event.type is EventType.SESSION_FAILED for event in stored) == 1
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+def test_workerless_approval_failure_replays_after_task_terminalization_loss(
+    task_store_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ApprovalProcessLoss(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task_store: TaskStore = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "workerless-approval-failure-tasks.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="publish-workerless-change",
+                        name="publish_change",
+                        arguments={"change": "reviewed-workerless-release"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        app = CayuApp(task_store=task_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        _register_approval_agent(app)
+
+        await task_store.create_task(
+            TaskCreate(task_id="workerless-approval-failure-task", type="job")
+        )
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="workerless-approval-failure-session",
+                    task_id="workerless-approval-failure-task",
+                    messages=[Message.text("user", "Publish the reviewed change.")],
+                )
+            )
+        ]
+        assert events[-1].type is EventType.SESSION_INTERRUPTED
+        attached = await task_store.load_task("workerless-approval-failure-task")
+        assert attached is not None
+        assert attached.status is TaskStatus.RUNNING
+        assert attached.worker_id is None
+
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id="workerless-approval-failure-session")
+        )
+        assert len(pending.actions) == 1
+        approval = pending.actions[0]
+        assert approval.approval_id is not None
+        assert approval.round_id is not None
+        assert approval.tool_call_id is not None
+        request = ToolApprovalRequest(
+            session_id="workerless-approval-failure-session",
+            approval_id=approval.approval_id,
+            tool_round_id=approval.round_id,
+            tool_call_id=approval.tool_call_id,
+            decision=ToolApprovalDecision.APPROVE,
+        )
+
+        original_materialize = app._recovery_coordinator.materialize_expected_deferred_input
+        original_fan_out = app._event_writer.fan_out_persisted
+
+        async def fail_after_approval_close(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("injected failure after approval close")
+
+        async def lose_after_task_failure(failure_events: list[Event]) -> list[Event]:
+            if any(event.type is EventType.TASK_FAILED for event in failure_events):
+                raise _ApprovalProcessLoss(
+                    "process lost after workerless task failure and before session failure"
+                )
+            return await original_fan_out(failure_events)
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "materialize_expected_deferred_input",
+            fail_after_approval_close,
+        )
+        monkeypatch.setattr(app._event_writer, "fan_out_persisted", lose_after_task_failure)
+        with pytest.raises(_ApprovalProcessLoss):
+            async for _event in app.resolve_tool_approval(request):
+                pass
+
+        failed_before_replay = await task_store.load_task("workerless-approval-failure-task")
+        interrupted_before_replay = await app.session_store.load(
+            "workerless-approval-failure-session"
+        )
+        assert failed_before_replay is not None
+        assert failed_before_replay.status is TaskStatus.FAILED
+        assert interrupted_before_replay is not None
+        assert interrupted_before_replay.status is SessionStatus.RUNNING
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "materialize_expected_deferred_input",
+            original_materialize,
+        )
+        monkeypatch.setattr(app._event_writer, "fan_out_persisted", original_fan_out)
+        replay_events = [event async for event in app.resolve_tool_approval(request)]
+
+        failed_session = await app.session_store.load("workerless-approval-failure-session")
+        failed_task = await task_store.load_task("workerless-approval-failure-task")
+        assert failed_session is not None
+        assert failed_session.status is SessionStatus.FAILED
+        assert failed_task == failed_before_replay
+        assert EventType.TASK_FAILED in {event.type for event in replay_events}
+        assert replay_events[-1].type is EventType.SESSION_FAILED
+
+        completed_replay = [event async for event in app.resolve_tool_approval(request)]
+        assert [event.type for event in completed_replay] == [EventType.SESSION_CHECKPOINTED]
+        with pytest.raises(TaskClaimLost):
+            async for _event in app.resolve_tool_approval(
+                request.model_copy(update={"task_worker_id": "unrelated-worker"})
+            ):
+                pass
+        with pytest.raises(TaskClaimLost):
+            async for _event in app.resolve_tool_approval(
+                request.model_copy(update={"reason": "conflicting direct replay"})
+            ):
+                pass
+        stored = await app.session_store.load_events("workerless-approval-failure-session")
+        assert sum(event.type is EventType.TASK_FAILED for event in stored) == 1
+        assert sum(event.type is EventType.SESSION_FAILED for event in stored) == 1
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+
+    asyncio.run(scenario())
+
+
+def test_elected_worker_completes_task_through_user_input_continuation() -> None:
+    task_store = InMemoryTaskStore()
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="ask-release-channel",
+                    name="ask_user",
+                    arguments={"question": "Which release channel?"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="worker-agent", model="scripted-model"),
+        tools=[UserInputTool()],
+    )
+
+    async def pause_for_input(
+        runtime: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        async for _event in runtime.run(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="elected-input-session",
+                task_id=task.id,
+                task_worker_id=worker_id,
+                messages=[Message.text("user", "Prepare the release.")],
+            )
+        ):
+            pass
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, SessionStatus]:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="elected-input-task",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+        handled = await run_task_worker(
+            app,
+            task_store,
+            pause_for_input,
+            worker_id="prior-worker",
+            query=TaskQuery(type="job"),
+            max_tasks=1,
+            reclaim=False,
+        )
+        assert handled == 1
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None and elected.worker_id == "elected-worker"
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id="elected-input-session")
+        )
+        assert len(pending.actions) == 1
+        input_action = pending.actions[0]
+        assert input_action.input_id is not None
+
+        async for _event in app.resolve_user_input(
+            UserInputResponse(
+                session_id="elected-input-session",
+                task_worker_id="elected-worker",
+                task_handoff_id=elected.interrupted_handoff_id,
+                input_id=input_action.input_id,
+                answer="stable",
+            )
+        ):
+            pass
+
+        completed_session = await app.session_store.load("elected-input-session")
+        assert completed_session is not None
+        return await task_store.load_task("elected-input-task"), completed_session.status
+
+    task, session_status = asyncio.run(scenario())
+    assert task is not None and task.status is TaskStatus.COMPLETED
+    assert task.result == {
+        "session_id": "elected-input-session",
+        "agent_name": "worker-agent",
+        "environment_name": None,
+    }
+    assert session_status is SessionStatus.COMPLETED
+    assert len(provider.requests) == 2
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("session_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("task_authority", ["elected", "workerless"])
+@pytest.mark.parametrize(
+    "loss_point",
+    ["before_interaction", "before_session_event", "after_session_event"],
+)
+def test_generic_continuation_failure_replays_after_task_terminalization_loss(
+    task_store_kind: str,
+    session_store_kind: str,
+    task_authority: str,
+    loss_point: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ContinuationProcessLoss(BaseException):
+        pass
+
+    async def scenario() -> None:
+        task_store: TaskStore = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "generic-continuation-failure-tasks.sqlite")
+        )
+        session_store = (
+            InMemorySessionStore()
+            if session_store_kind == "memory"
+            else SQLiteSessionStore(tmp_path / "generic-continuation-failure-sessions.sqlite")
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="ask-release-channel-before-failure",
+                        name="ask_user",
+                        arguments={"question": "Which release channel?"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.error("provider failed after continuation admission"),
+                    ModelStreamEvent.completed({"finish_reason": "error"}),
+                ],
+            ]
+        )
+        original_failure_hook = _VersionedSessionFailureHook("1")
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+            runtime_hooks=[original_failure_hook],
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="worker-agent", model="scripted-model"),
+            tools=[UserInputTool()],
+        )
+
+        async def pause_for_input(
+            runtime: CayuApp,
+            task: Task,
+            worker_id: str,
+        ) -> TaskHandlerOutcome:
+            async for _event in runtime.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="generic-continuation-failure-session",
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    messages=[Message.text("user", "Prepare the release.")],
+                )
+            ):
+                pass
+            return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+        await task_store.create_task(
+            TaskCreate(task_id="generic-continuation-failure-task", type="job")
+        )
+        if task_authority == "elected":
+            assert (
+                await run_task_worker(
+                    app,
+                    task_store,
+                    pause_for_input,
+                    worker_id="prior-worker",
+                    query=TaskQuery(type="job"),
+                    max_tasks=1,
+                    reclaim=False,
+                )
+                == 1
+            )
+            elected = await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+            assert elected.task is not None
+            task_worker_id = "elected-worker"
+            task_handoff_id = elected.task.interrupted_handoff_id
+        else:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="generic-continuation-failure-session",
+                    task_id="generic-continuation-failure-task",
+                    messages=[Message.text("user", "Prepare the release.")],
+                )
+            ):
+                pass
+            task_worker_id = None
+            task_handoff_id = None
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id="generic-continuation-failure-session")
+        )
+        assert len(pending.actions) == 1
+        assert pending.actions[0].input_id is not None
+        response = UserInputResponse(
+            session_id="generic-continuation-failure-session",
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            input_id=pending.actions[0].input_id,
+            answer="stable",
+        )
+
+        original_publish = app._session_engine._publish_sibling_interaction_transition
+        original_terminal = app._session_engine._emit_terminal_event_with_hooks
+
+        async def lose_after_task_failure(*args, **kwargs):
+            if kwargs.get("to_status") is SessionStatus.FAILED:
+                raise _ContinuationProcessLoss(
+                    "process lost after task failure and before session failure"
+                )
+            return await original_publish(*args, **kwargs)
+
+        async def lose_before_session_event(*args, **kwargs):
+            event = kwargs.get("event")
+            if (
+                isinstance(event, Event)
+                and event.type is EventType.SESSION_FAILED
+                and event.payload.get("runtime_task_failure_id") is not None
+            ):
+                raise _ContinuationProcessLoss(
+                    "process lost after interaction failure and before session event"
+                )
+            async for emitted in original_terminal(*args, **kwargs):
+                yield emitted
+
+        async def lose_after_session_event(*args, **kwargs):
+            async for emitted in original_terminal(*args, **kwargs):
+                yield emitted
+                if (
+                    emitted.type is EventType.SESSION_FAILED
+                    and emitted.payload.get("runtime_task_failure_id") is not None
+                ):
+                    raise _ContinuationProcessLoss(
+                        "process lost after session failure and before terminal hooks"
+                    )
+
+        if loss_point == "before_interaction":
+            monkeypatch.setattr(
+                app._session_engine,
+                "_publish_sibling_interaction_transition",
+                lose_after_task_failure,
+            )
+        elif loss_point == "before_session_event":
+            monkeypatch.setattr(
+                app._session_engine,
+                "_emit_terminal_event_with_hooks",
+                lose_before_session_event,
+            )
+        else:
+            monkeypatch.setattr(
+                app._session_engine,
+                "_emit_terminal_event_with_hooks",
+                lose_after_session_event,
+            )
+        with pytest.raises(_ContinuationProcessLoss):
+            async for _event in app.resolve_user_input(response):
+                pass
+
+        failed_task = await task_store.load_task("generic-continuation-failure-task")
+        live_session = await app.session_store.load("generic-continuation-failure-session")
+        assert failed_task is not None and failed_task.status is TaskStatus.FAILED
+        assert failed_task.error is not None
+        assert failed_task.error["runtime_task_failure"]["schema"] == (
+            "cayu.runtime-task-failure.v2"
+        )
+        assert live_session is not None
+        assert failed_task.error["runtime_task_failure"]["run_epoch"] == (
+            live_session.run_epoch
+            if loss_point == "before_interaction"
+            else live_session.run_epoch - 1
+        )
+        assert live_session.status is (
+            SessionStatus.RUNNING if loss_point == "before_interaction" else SessionStatus.FAILED
+        )
+        active_stage_before_replay = await app.session_store.load_active_model_completion_stage(
+            live_session.id
+        )
+        if loss_point == "before_interaction":
+            assert active_stage_before_replay is not None
+            unsettled_stage_id = active_stage_before_replay.stage.stage_id
+        else:
+            assert active_stage_before_replay is None
+            unsettled_stage_id = None
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_publish_sibling_interaction_transition",
+            original_publish,
+        )
+        monkeypatch.setattr(
+            app._session_engine,
+            "_emit_terminal_event_with_hooks",
+            original_terminal,
+        )
+        drifted_hook = _VersionedSessionFailureHook("2")
+        drifted_app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+            runtime_hooks=[drifted_hook],
+        )
+        drifted_app.register_provider(provider, default=True)
+        drifted_app.register_agent(
+            AgentSpec(name="worker-agent", model="scripted-model"),
+            tools=[UserInputTool()],
+        )
+        with pytest.raises(ExecutionProfileMismatchError):
+            async for _event in drifted_app.resolve_user_input(response):
+                pass
+        assert drifted_hook.failed_sessions == []
+        assert len(provider.requests) == 2
+        drift_events = await drifted_app.session_store.load_events(response.session_id)
+        assert not any(
+            event.type is EventType.SESSION_EXECUTION_PROFILE_REJECTED for event in drift_events
+        )
+
+        recovered_failure_hook = _VersionedSessionFailureHook("1")
+        recovered_app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            enable_logging=False,
+            runtime_hooks=[recovered_failure_hook],
+        )
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(
+            AgentSpec(name="worker-agent", model="scripted-model"),
+            tools=[UserInputTool()],
+        )
+
+        async def replay_user_input() -> list[Event]:
+            return [event async for event in recovered_app.resolve_user_input(response)]
+
+        async def replay_ordinary_resume() -> list[Event]:
+            return [
+                event
+                async for event in recovered_app.resume(
+                    ResumeRequest(
+                        session_id=response.session_id,
+                        task_worker_id=task_worker_id,
+                        task_handoff_id=task_handoff_id,
+                        messages=[Message.text("user", "retry terminal convergence")],
+                    )
+                )
+            ]
+
+        first_replay, concurrent_replay = await asyncio.gather(
+            replay_user_input(),
+            replay_ordinary_resume(),
+        )
+        replay_events = [*first_replay, *concurrent_replay]
+
+        terminal_session = await recovered_app.session_store.load(
+            "generic-continuation-failure-session"
+        )
+        assert terminal_session is not None
+        assert terminal_session.status is SessionStatus.FAILED
+        assert (
+            await recovered_app.session_store.load_active_model_completion_stage(
+                terminal_session.id
+            )
+            is None
+        )
+        if unsettled_stage_id is not None:
+            settlement = await recovered_app.session_store.load_model_completion_stage_settlement(
+                terminal_session.id,
+                unsettled_stage_id,
+            )
+            assert settlement is not None
+            assert settlement.disposition is (
+                ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+            )
+            assert settlement.reason_code == "model_attempt_failed"
+        assert EventType.SESSION_FAILED in {event.type for event in replay_events}
+        assert len(provider.requests) == 2
+        assert recovered_failure_hook.failed_sessions == ["generic-continuation-failure-session"]
+
+        async def unavailable_terminal_cleanup(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("injected trailing terminal cleanup failure")
+
+        monkeypatch.setattr(
+            recovered_app._session_engine,
+            "_clear_session_run_operation",
+            unavailable_terminal_cleanup,
+        )
+        completed_replay = [event async for event in recovered_app.resolve_user_input(response)]
+        assert [event.type for event in completed_replay] == [EventType.SESSION_FAILED]
+        assert len(provider.requests) == 2
+        with pytest.raises(TaskClaimLost):
+            async for _event in recovered_app.resolve_user_input(
+                response.model_copy(
+                    update={
+                        "task_worker_id": (
+                            "stale-worker" if task_worker_id is not None else "unexpected-worker"
+                        )
+                    }
+                )
+            ):
+                pass
+        stored = await recovered_app.session_store.load_events(terminal_session.id)
+        terminal_hook_events = [
+            event
+            for event in stored
+            if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED}
+            and event.payload.get("phase") == "after_session_failed"
+            and event.payload.get("hook_name") == "_VersionedSessionFailureHook"
+        ]
+        assert [event.type for event in terminal_hook_events] == [
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        ]
+        assert (
+            terminal_hook_events[0].payload["hook_invocation_id"]
+            == terminal_hook_events[1].payload["hook_invocation_id"]
+        )
+        assert {event.payload["hook_index"] for event in terminal_hook_events} == {0}
+        assert sum(event.type == EventType.TASK_FAILED for event in stored) == 1
+        assert sum(event.type == EventType.INTERACTION_FAILED for event in stored) == 1
+        failed_turns = [
+            event
+            for event in stored
+            if event.type is EventType.TURN_COMPLETED
+            and event.payload.get("status") == SessionStatus.FAILED.value
+        ]
+        assert len(failed_turns) == 1
+        assert failed_turns[0].payload["interaction_ids"] == [
+            failed_task.error["runtime_task_failure"]["interaction_id"]
+        ]
+        assert sum(event.type is EventType.SESSION_FAILED for event in stored) == 1
+        terminal_checkpoint = await recovered_app.session_store.load_checkpoint(terminal_session.id)
+        assert terminal_checkpoint is not None
+        assert "session_run_operation" not in terminal_checkpoint
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+        if isinstance(session_store, SQLiteSessionStore):
+            await session_store.close()
+
+    asyncio.run(scenario())
+
+
+def test_elected_worker_completes_task_through_manual_tool_recovery() -> None:
+    class RecoverableTool(Tool):
+        spec = ToolSpec(
+            name="recoverable_tool",
+            description="Exercise manual recovery after a simulated terminal-write crash.",
+            input_schema={"type": "object", "properties": {}},
+            effect=ToolEffect.NONE,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:task-worker:recoverable-tool",
+                behavior_version="1",
+                implementation_version="1",
+            ),
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx, args
+            return ToolResult(content="executed before the simulated crash")
+
+    class FailFirstToolTerminalStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed_terminal_once = False
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            if not self.failed_terminal_once and any(
+                event.type is EventType.TOOL_CALL_COMPLETED for event in events
+            ):
+                self.failed_terminal_once = True
+                raise RuntimeError("simulated crash before the tool terminal became durable")
+            await super().append_events(session_id, events)
+
+    class PreserveTaskThroughSimulatedCrashStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        supports_verified_work_contracts = True
+        verified_work_mutations_are_cancellation_quiescent = True
+        suppress_terminalization = True
+
+        async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
+            if self.suppress_terminalization:
+                raise RuntimeError("simulated worker loss before task terminalization")
+            return await super().terminalize_task(request)
+
+    session_store = FailFirstToolTerminalStore()
+    task_store = PreserveTaskThroughSimulatedCrashStore()
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="recoverable-call",
+                    name="recoverable_tool",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="worker-agent", model="scripted-model"),
+        tools=[RecoverableTool()],
+    )
+
+    async def scenario() -> tuple[Task | None, SessionStatus]:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="elected-tool-recovery-task",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+        claimed = await task_store.claim_task("prior-worker", TaskQuery(type="job"))
+        assert claimed is not None
+        initial_events: list[Event] = []
+        async for event in app.run(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="elected-tool-recovery-session",
+                task_id=claimed.id,
+                task_worker_id="prior-worker",
+                messages=[Message.text("user", "Publish the recovered release.")],
+            )
+        ):
+            initial_events.append(event)
+
+        crashed_session = await session_store.load("elected-tool-recovery-session")
+        attached = await task_store.load_task("elected-tool-recovery-task")
+        checkpoint = await session_store.load_checkpoint("elected-tool-recovery-session")
+        assert initial_events[-1].type is EventType.SESSION_FAILED
+        assert crashed_session is not None and crashed_session.status is SessionStatus.FAILED
+        assert attached is not None and attached.worker_id == "prior-worker"
+        assert checkpoint is not None
+        pending_round = checkpoint["pending_tool_round"]
+        assert pending_round["task_id"] == attached.id
+
+        task_store.suppress_terminalization = False
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=crashed_session.run_epoch,
+            )
+        )
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None and elected.worker_id == "elected-worker"
+
+        async for _event in app.recover_tool_round(
+            ToolRoundRecoveryRequest(
+                session_id="elected-tool-recovery-session",
+                task_worker_id="elected-worker",
+                task_handoff_id=elected.interrupted_handoff_id,
+                round_id=pending_round["tool_round_id"],
+                tool_call_id="recoverable-call",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="publication verified externally",
+            )
+        ):
+            pass
+
+        completed_session = await session_store.load("elected-tool-recovery-session")
+        assert completed_session is not None
+        return (
+            await task_store.load_task("elected-tool-recovery-task"),
+            completed_session.status,
+        )
+
+    task, session_status = asyncio.run(scenario())
+    assert task is not None and task.status is TaskStatus.COMPLETED
+    assert task.worker_id is None
+    assert session_status is SessionStatus.COMPLETED
+    assert len(provider.requests) == 2
+
+
+def test_tool_approval_rechecks_worker_authority_after_session_admission() -> None:
+    preflight_complete = asyncio.Event()
+    release_preflight = asyncio.Event()
+
+    class PausingAuthorityTaskStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        supports_verified_work_contracts = True
+        verified_work_mutations_are_cancellation_quiescent = True
+        reads = 0
+        reject_future_reads = False
+
+        async def load_active_attached_task_worker(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            session_id: str,
+            session_instance_id: str,
+        ) -> Task:
+            task = await super().load_active_attached_task_worker(
+                task_id,
+                worker_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+            self.reads += 1
+            if self.reads == 1:
+                preflight_complete.set()
+                await release_preflight.wait()
+                return task
+            if self.reject_future_reads:
+                raise TaskClaimLost("Continuation worker authority was lost after preflight.")
+            return task
+
+    class AuthorityLossHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.interrupted_sessions: list[str] = []
+
+        async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
+            self.interrupted_sessions.append(context.session.id)
+
+    task_store = PausingAuthorityTaskStore()
+    authority_loss_hook = AuthorityLossHook()
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="publish-change",
+                    name="publish_change",
+                    arguments={"change": "reviewed-release"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        task_store=task_store,
+        runtime_hooks=[authority_loss_hook],
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    _register_approval_agent(app)
+
+    async def pause_for_approval(
+        runtime: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        async for _event in runtime.run(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="approval-race-session",
+                task_id=task.id,
+                task_worker_id=worker_id,
+                messages=[Message.text("user", "Publish the reviewed change.")],
+            )
+        ):
+            pass
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[Task | None, SessionStatus, list[Event]]:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="approval-race-task",
+                type="job",
+                assigned_agent_name="worker-agent",
+            )
+        )
+        await run_task_worker(
+            app,
+            task_store,
+            pause_for_approval,
+            worker_id="prior-worker",
+            query=TaskQuery(type="job"),
+            max_tasks=1,
+            reclaim=False,
+        )
+        authority_loss_hook.interrupted_sessions.clear()
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None
+        pending = await app.session_store.query_pending_actions(
+            PendingActionQuery(session_id="approval-race-session")
+        )
+        assert len(pending.actions) == 1
+        approval = pending.actions[0]
+        assert approval.approval_id is not None
+        assert approval.round_id is not None
+        assert approval.tool_call_id is not None
+
+        async def resolve() -> None:
+            async for _event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="approval-race-session",
+                    task_worker_id="elected-worker",
+                    task_handoff_id=elected.interrupted_handoff_id,
+                    approval_id=approval.approval_id,
+                    tool_round_id=approval.round_id,
+                    tool_call_id=approval.tool_call_id,
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            ):
+                pass
+
+        continuation = asyncio.create_task(resolve())
+        await preflight_complete.wait()
+        task_store.reject_future_reads = True
+        release_preflight.set()
+        with pytest.raises(TaskClaimLost):
+            await continuation
+        session = await app.session_store.load("approval-race-session")
+        assert session is not None
+        records = await app.session_store.query_events(
+            EventQuery(
+                session_id="approval-race-session",
+                event_types=(EventType.TOOL_CALL_COMPLETED,),
+            )
+        )
+        return (
+            await task_store.load_task("approval-race-task"),
+            session.status,
+            [record.event for record in records],
+        )
+
+    task, session_status, completed_tool_events = asyncio.run(scenario())
+    assert task is not None and task.status is TaskStatus.RUNNING
+    assert task.worker_id == "elected-worker"
+    assert session_status is SessionStatus.INTERRUPTED
+    assert completed_tool_events == []
+    assert len(provider.requests) == 1
+    assert authority_loss_hook.interrupted_sessions == []
+
+
+def test_ownerless_resume_cannot_cross_a_concurrent_continuation_claim() -> None:
+    listed = asyncio.Event()
+    continue_resume = asyncio.Event()
+
+    class PausingListTaskStore(InMemoryTaskStore):
+        async def list_tasks(self, query: TaskQuery | None = None) -> list[Task]:
+            tasks = await super().list_tasks(query)
+            if (
+                query is not None
+                and query.session_id == "ownerless-race-session"
+                and not listed.is_set()
+            ):
+                listed.set()
+                await continue_resume.wait()
+            return tasks
+
+    task_store = PausingListTaskStore()
+    provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def collect() -> list[Event]:
+        return [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="ownerless-race-session",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+
+    async def scenario() -> Task | None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="ownerless-race-task",
+            session_id="ownerless-race-session",
+        )
+        claimed = await task_store.claim_task("prior-worker", lease_seconds=30)
+        assert claimed is not None
+        attached = await task_store.attach_task(
+            claimed.id,
+            session_id="ownerless-race-session",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "ownerless-race-session",
+            ),
+            worker_id="prior-worker",
+        )
+        session = await app.session_store.load("ownerless-race-session")
+        assert session is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=session.run_epoch,
+            )
+        )
+
+        resume_task = asyncio.create_task(collect())
+        await listed.wait()
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None
+        continue_resume.set()
+        with pytest.raises(TaskClaimLost):
+            await resume_task
+        return await task_store.load_task("ownerless-race-task")
+
+    task = asyncio.run(scenario())
+    assert task is not None and task.worker_id == "elected-worker"
+    assert provider.requests == []
+
+
+def test_resume_rechecks_worker_authority_after_session_admission() -> None:
+    preflight_complete = asyncio.Event()
+    release_preflight = asyncio.Event()
+
+    class PausingAuthorityTaskStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        supports_verified_work_contracts = True
+        verified_work_mutations_are_cancellation_quiescent = True
+        reads = 0
+
+        async def load_active_attached_task_worker(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            session_id: str,
+            session_instance_id: str,
+        ) -> Task:
+            task = await super().load_active_attached_task_worker(
+                task_id,
+                worker_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+            self.reads += 1
+            if self.reads == 1:
+                preflight_complete.set()
+                await release_preflight.wait()
+            return task
+
+    class AuthorityLossHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.interrupted_sessions: list[str] = []
+
+        async def after_session_interrupted(self, context: RuntimeHookContext) -> None:
+            self.interrupted_sessions.append(context.session.id)
+
+    task_store = PausingAuthorityTaskStore()
+    authority_loss_hook = AuthorityLossHook()
+    provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+    app = CayuApp(
+        task_store=task_store,
+        runtime_hooks=[authority_loss_hook],
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def collect() -> list[Event]:
+        return [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="post-admission-fence-session",
+                    task_worker_id="stale-worker",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+
+    async def scenario() -> tuple[Task | None, SessionStatus]:
+        created = await task_store.create_task(
+            TaskCreate(task_id="post-admission-fence-task", type="job")
+        )
+        await app.session_store.create(
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="post-admission-fence-session",
+                    task_id=created.id,
+                    messages=[Message.text("user", "pause")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                ),
+                TaskInvocationSnapshot(
+                    id=created.id,
+                    session_id=created.session_id,
+                    invocation=created.invocation,
+                ),
+            ),
+            identity=profiled_session_identity(
+                provider_name=provider.name,
+                model="scripted-model",
+                agent_name="worker-agent",
+                app=app,
+            ),
+        )
+        await admit_test_invocation(
+            app.session_store,
+            "post-admission-fence-session",
+            interaction_started_event=runtime_interaction_started_event(
+                app,
+                session_id="post-admission-fence-session",
+                interaction_id="post-admission-fence-interaction",
+                agent_name="worker-agent",
+            ),
+            interaction_source_messages=(Message.text("user", "pause"),),
+        )
+        await interrupt_and_release_test_invocation(
+            app.session_store,
+            "post-admission-fence-session",
+        )
+        claimed = await task_store.claim_task("stale-worker", lease_seconds=30)
+        assert claimed is not None
+        attached = await task_store.attach_task(
+            claimed.id,
+            session_id="post-admission-fence-session",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "post-admission-fence-session",
+            ),
+            worker_id="stale-worker",
+        )
+        session = await app.session_store.load("post-admission-fence-session")
+        assert session is not None
+        handoff = interrupted_task_handoff_request(
+            attached,
+            session_run_epoch=session.run_epoch,
+        )
+
+        resume_task = asyncio.create_task(collect())
+        await preflight_complete.wait()
+        await task_store.release_interrupted_task_worker(handoff)
+        release_preflight.set()
+        with pytest.raises(TaskClaimLost):
+            await resume_task
+        final_session = await app.session_store.load("post-admission-fence-session")
+        assert final_session is not None
+        return await task_store.load_task("post-admission-fence-task"), final_session.status
+
+    task, session_status = asyncio.run(scenario())
+    assert task is not None and task.interrupted_handoff_id is not None
+    assert session_status is SessionStatus.INTERRUPTED
+    assert provider.requests == []
+    assert authority_loss_hook.interrupted_sessions == []
+
+
+def test_resume_rejects_a_replacement_session_incarnation_before_provider() -> None:
+    authority_read = asyncio.Event()
+    continue_resume = asyncio.Event()
+
+    class PausingAuthorityTaskStore(InMemoryTaskStore):
+        reads = 0
+
+        async def load_active_attached_task_worker(
+            self,
+            task_id: str,
+            worker_id: str,
+            *,
+            session_id: str,
+            session_instance_id: str,
+        ) -> Task:
+            task = await super().load_active_attached_task_worker(
+                task_id,
+                worker_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+            self.reads += 1
+            if self.reads == 1:
+                authority_read.set()
+                await continue_resume.wait()
+            return task
+
+    task_store = PausingAuthorityTaskStore()
+    session_store = InMemorySessionStore()
+    provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+    app = CayuApp(
+        task_store=task_store,
+        session_store=session_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def scenario() -> None:
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id="replacement-session-task",
+            session_id="replacement-session",
+        )
+        claimed = await task_store.claim_task("prior-worker", lease_seconds=30)
+        assert claimed is not None
+        attached = await task_store.attach_task(
+            claimed.id,
+            session_id="replacement-session",
+            session_invocation=await stored_session_invocation(
+                session_store,
+                "replacement-session",
+            ),
+            worker_id="prior-worker",
+        )
+        original = await session_store.load("replacement-session")
+        assert original is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=original.run_epoch,
+            )
+        )
+        elected = (
+            await task_store.claim_interrupted_task_continuation(
+                "elected-worker",
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+        ).task
+        assert elected is not None
+
+        async def collect() -> list[Event]:
+            return [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="replacement-session",
+                        task_worker_id="elected-worker",
+                        task_handoff_id=elected.interrupted_handoff_id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            ]
+
+        resume_task = asyncio.create_task(collect())
+        await authority_read.wait()
+        await session_store.append_events(
+            "replacement-session",
+            [
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id="replacement-session",
+                    agent_name="worker-agent",
+                )
+            ],
+        )
+        await session_store.delete_session("replacement-session")
+        replacement = await session_store.create(
+            RunRequest(
+                agent_name="worker-agent",
+                session_id="replacement-session",
+                messages=[Message.text("user", "replacement")],
+            ),
+            identity=SessionIdentity(
+                provider_name="scripted",
+                model="scripted-model",
+            ),
+        )
+        assert replacement.instance_id != original.instance_id
+        await session_store.update_status("replacement-session", SessionStatus.INTERRUPTED)
+        continue_resume.set()
+        with pytest.raises(TaskClaimLost):
+            await resume_task
+
+    asyncio.run(scenario())
+    assert provider.requests == []
+
+
+def test_session_engine_keeps_legacy_custom_store_direct_resume_compatible() -> None:
+    class LegacyCustomTaskStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = False
+        verified_work_mutations_are_cancellation_quiescent = True
+        load_direct_attached_task_resume = TaskStore.load_direct_attached_task_resume
+
+    task_store = LegacyCustomTaskStore()
+    provider = ScriptedModelProvider([[ModelStreamEvent.completed({"finish_reason": "stop"})]])
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def scenario() -> list[Event]:
+        task = await task_store.create_task(TaskCreate(task_id="legacy-resume-task", type="job"))
+        await app.session_store.create(
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="legacy-resume-session",
+                    task_id=task.id,
+                    messages=[Message.text("user", "original")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                ),
+                TaskInvocationSnapshot(
+                    id=task.id,
+                    session_id=task.session_id,
+                    invocation=task.invocation,
+                ),
+            ),
+            identity=profiled_session_identity(
+                provider_name=provider.name,
+                model="scripted-model",
+            ),
+        )
+        await app.session_store.update_status(
+            "legacy-resume-session",
+            SessionStatus.INTERRUPTED,
+        )
+        await task_store.start_task(
+            task.id,
+            session_id="legacy-resume-session",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "legacy-resume-session",
+            ),
+        )
+        return [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="legacy-resume-session",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+
+    events = asyncio.run(scenario())
+    assert provider.requests
+    assert events[-1].type is EventType.SESSION_COMPLETED
 
 
 def test_resume_completes_the_running_task_already_attached_to_the_session(

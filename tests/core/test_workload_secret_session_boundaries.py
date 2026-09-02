@@ -46,6 +46,7 @@ from cayu.runtime._session_request_boundary import (
     prepare_derived_fork_session,
     prepare_fork_session_request,
     prepare_fork_source_session,
+    prepare_resume_request,
     prepare_run_request,
 )
 from cayu.runtime.event_sinks import InMemoryEventSink
@@ -105,6 +106,21 @@ def test_run_request_rejects_a_secret_in_durable_invocation_origin() -> None:
                 invocation_origin=InvocationOriginClaim(subject=f"user:{secret}"),
             ),
             redactor=SecretRedactor(secret),
+        )
+
+
+def test_resume_request_rejects_a_secret_in_task_worker_authority() -> None:
+    secret = "recovery-worker-secret"
+
+    with pytest.raises(ValueError, match="task_worker_id contains a workload secret"):
+        prepare_resume_request(
+            ResumeRequest(
+                session_id="session",
+                task_worker_id=f"worker:{secret}",
+                messages=[Message.text("user", "continue")],
+            ),
+            redactor=SecretRedactor(secret),
+            store_resolved_session_id="session",
         )
 
 
@@ -731,12 +747,16 @@ def test_runtime_hook_fork_survives_terminal_acknowledgement_loss(
                 ),
             )
             self.lost_acknowledgement = False
+            self.lost_hook_acknowledgement = False
 
         async def append_event(self, session_id: str, event: Event) -> None:
             await super().append_event(session_id, event)
             if event.type == EventType.SESSION_COMPLETED and not self.lost_acknowledgement:
                 self.lost_acknowledgement = True
                 raise ConnectionError("terminal acknowledgement lost after commit")
+            if event.type == EventType.HOOK_STARTED and not self.lost_hook_acknowledgement:
+                self.lost_hook_acknowledgement = True
+                raise ConnectionError("terminal hook acknowledgement lost after commit")
 
     class ForkCompletedSessionHook(RuntimeHook):
         def __init__(self) -> None:
@@ -779,6 +799,7 @@ def test_runtime_hook_fork_survives_terminal_acknowledgement_loss(
             )
 
             assert store.lost_acknowledgement is True
+            assert store.lost_hook_acknowledgement is True
             assert hook.calls == 1
             assert [event.type for event in hook.fork_events] == [EventType.SESSION_FORKED]
             assert [event.type for event in events].count(EventType.SESSION_COMPLETED) == 1

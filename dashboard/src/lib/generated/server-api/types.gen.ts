@@ -12170,6 +12170,14 @@ export type ProviderOperationResolutionBody = {
      * Stage Id
      */
     stage_id: string;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
 };
 
 /**
@@ -13380,6 +13388,14 @@ export type ResumeBody = {
      */
     session_id: string;
     structured_output?: StructuredOutputSpec | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
 };
 
@@ -15353,6 +15369,14 @@ export type ToolApprovalBody = {
      */
     session_id: string;
     structured_output?: StructuredOutputSpec | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
     /**
      * Tool Call Id
@@ -15427,6 +15451,14 @@ export type ToolApprovalRecoveryBody = {
         [key: string]: unknown;
     } | null;
     structured_output?: StructuredOutputSpec | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
     /**
      * Tool Call Id
@@ -15911,6 +15943,14 @@ export type ToolRoundRecoveryBody = {
         [key: string]: unknown;
     } | null;
     structured_output?: StructuredOutputSpec | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
     /**
      * Tool Call Id
@@ -16581,6 +16621,14 @@ export type UserInputRecoveryBody = {
         [key: string]: unknown;
     } | null;
     structured_output?: StructuredOutputSpec | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
     /**
      * Tool Call Id
@@ -16641,6 +16689,14 @@ export type UserInputResolveBody = {
         [key: string]: unknown;
     } | null;
     structured_output?: StructuredOutputSpec | null;
+    /**
+     * Task Handoff Id
+     */
+    task_handoff_id?: string | null;
+    /**
+     * Task Worker Id
+     */
+    task_worker_id?: string | null;
     thinking?: ThinkingConfig | null;
 };
 
@@ -19538,6 +19594,12 @@ export type GetPendingKnowledgeApiKnowledgePendingEntryIdGetResponse = GetPendin
 
 export type ApproveKnowledgeApiKnowledgeEntryIdApprovePostData = {
     body?: never;
+    headers?: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key'?: string | null;
+    };
     path: {
         /**
          * Entry Id

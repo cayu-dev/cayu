@@ -96,11 +96,20 @@ from cayu.runtime._child_session_identity import (
     child_session_id_prefix,
     generate_child_session_id,
 )
+from cayu.runtime._continuation_task_failure import (
+    ApprovalTaskFailureIdentity,
+    approval_failure_event_id,
+    approval_task_failure_payload,
+    approval_task_failure_receipt_matches,
+    approval_task_terminalization_idempotency_key,
+    approval_task_terminalization_request,
+    load_direct_task_failure_replay,
+    provider_operation_task_failure_payload,
+    runtime_task_terminalization_idempotency_key,
+)
 from cayu.runtime._diagnostics import (
     bound_diagnostic_text,
     exception_diagnostic,
-    task_failure_payload_from_diagnostic,
-    task_update_error_payload,
 )
 from cayu.runtime._durable_subagents import (
     durable_subagent_submission_from_checkpoint,
@@ -252,11 +261,13 @@ from cayu.runtime.provider_operations import (
     ProviderOperationRecoveryResult,
     ProviderOperationRecoveryStatus,
     ProviderOperationResolutionAction,
+    ProviderOperationResolutionConflict,
     ProviderOperationResolutionRequest,
     ProviderOperationResolutionResult,
     ProviderOperationUnavailableReason,
     RecoverableProviderOperation,
     RecoverableProviderOperationStart,
+    checkpoint_with_provider_operation_disposition_execution_owner,
     clear_pending_provider_operation_disposition,
     load_pending_provider_operation_disposition,
     load_recoverable_provider_operation,
@@ -324,7 +335,13 @@ from cayu.runtime.structured_output import (
 from cayu.runtime.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
 )
-from cayu.runtime.tasks import Task, TaskStatus, TaskStore
+from cayu.runtime.tasks import (
+    Task,
+    TaskStatus,
+    TaskStore,
+    TaskTerminalKind,
+    _terminalize_claimed_task,
+)
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
@@ -1123,6 +1140,7 @@ class RecoverySessionRunRequest:
     request_metadata: dict[str, Any]
     task_id: str | None
     task_worker_id: str | None
+    task_handoff_id: str | None
     start_event_type: EventType | None
     start_event_payload: dict[str, Any]
     start_task_on_enter: bool
@@ -1210,6 +1228,9 @@ class RecoveryTerminalEventRequest:
     registered_environment: runtime_records.RegisteredEnvironment | None
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
+    run_runtime_hooks: bool = True
+    terminal_event_already_durable: bool = False
+    yield_durable_terminal_event: bool = True
 
 
 @dataclass(frozen=True)
@@ -1219,6 +1240,9 @@ class ProviderOperationFailureRequest:
     registered_agent: runtime_records.RegisteredAgentState
     registered_environment: runtime_records.RegisteredEnvironment | None
     execution_profile: ExecutionProfileIdentity
+    task_id: str | None = None
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     legacy_resolution_without_profile: bool = False
     invocation_context: InvocationContext | None = None
 
@@ -1260,6 +1284,7 @@ class RecoveryInterruptionRequest:
     environment_name: str | None
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
+    run_terminal_hooks: bool = True
 
 
 @dataclass(frozen=True)
@@ -1290,6 +1315,7 @@ class RecoveryAbandonedSessionRequest:
     provider_cancellation_failures: tuple[dict[str, Any], ...] = ()
     execution_profile: ExecutionProfileIdentity | None = None
     invocation_context: InvocationContext | None = None
+    run_terminal_hooks: bool = True
 
 
 @dataclass(frozen=True)
@@ -1456,6 +1482,7 @@ class _RecoveryInvocationSemantics:
 
 RunSession = Callable[[RecoverySessionRunRequest], AsyncGenerator[Event, None]]
 TerminalEventStream = Callable[[RecoveryTerminalEventRequest], AsyncIterator[Event]]
+TerminalHooksSettled = Callable[[RecoveryTerminalEventRequest], Awaitable[bool]]
 ProviderOperationFailureStream = Callable[[ProviderOperationFailureRequest], AsyncIterator[Event]]
 LimitStopEventStream = Callable[[RecoveryLimitStopRequest], AsyncIterator[Event]]
 TaskEventFactory = Callable[[RecoveryTaskEventRequest], Event]
@@ -1485,6 +1512,7 @@ class ExecutionProfileContinuationValidator(Protocol):
         invocation_semantics_available: bool = False,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
+        record_rejection: bool = True,
     ) -> Awaitable[ActiveInvocationExecutionProfile]: ...
 
 
@@ -1591,6 +1619,7 @@ class RecoveryCoordinator:
         effective_retry_policy: EffectiveRetryPolicy,
         run_session: RunSession,
         emit_terminal_event_with_hooks: TerminalEventStream,
+        terminal_runtime_hooks_are_settled: TerminalHooksSettled,
         fail_provider_operation: ProviderOperationFailureStream,
         stop_session_for_limit_reached: LimitStopEventStream,
         task_event: TaskEventFactory,
@@ -1623,6 +1652,7 @@ class RecoveryCoordinator:
         self._effective_retry_policy = effective_retry_policy
         self._run_session = run_session
         self._emit_terminal_event_with_hooks = emit_terminal_event_with_hooks
+        self._terminal_runtime_hooks_are_settled = terminal_runtime_hooks_are_settled
         self._fail_provider_operation = fail_provider_operation
         self._stop_session_for_limit_reached = stop_session_for_limit_reached
         self._task_event = task_event
@@ -3467,6 +3497,7 @@ class RecoveryCoordinator:
         preserve_open_interaction_on_failure: bool = False,
         before_mutation: RecoveryMutationHook | None = None,
         before_resume: RecoveryExecutionAdmissionHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
@@ -3648,9 +3679,13 @@ class RecoveryCoordinator:
                 ),
             )
         )
+        post_admission_authority_confirmed = after_admission is None
         try:
             if cancellation is not None:
                 raise cancellation
+            if after_admission is not None:
+                await after_admission()
+                post_admission_authority_confirmed = True
             if before_resume is not None and not await before_resume(session):
                 return session, None
             resumed_event = await self._resume_interaction(
@@ -3675,6 +3710,7 @@ class RecoveryCoordinator:
                                     else execution_profile_snapshot.profile
                                 ),
                                 invocation_context=rebound_invocation_context,
+                                run_terminal_hooks=post_admission_authority_confirmed,
                             ),
                         )
                     )
@@ -4312,6 +4348,7 @@ class RecoveryCoordinator:
         response: UserInputResponse | UserInputRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
@@ -4528,6 +4565,7 @@ class RecoveryCoordinator:
             execution_profile_snapshot=execution_profile_snapshot,
             before_mutation=before_mutation,
             before_resume=admit_exact_user_input_execution,
+            after_admission=after_admission,
             invocation_context=invocation_context,
         )
         if resumed_event is not None:
@@ -4582,6 +4620,7 @@ class RecoveryCoordinator:
         request: UserInputRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a user-input round stuck on `manual_recovery_required`.
 
@@ -4807,6 +4846,7 @@ class RecoveryCoordinator:
             execution_profile_snapshot=execution_profile_snapshot,
             before_mutation=before_mutation,
             before_resume=admit_exact_user_input_recovery_execution,
+            after_admission=after_admission,
             invocation_context=invocation_context,
         )
         if resumed_event is not None:
@@ -4858,7 +4898,9 @@ class RecoveryCoordinator:
         self,
         request: ToolApprovalRequest,
         *,
+        task_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -4904,8 +4946,80 @@ class RecoveryCoordinator:
                 )
             if before_mutation is not None:
                 await before_mutation()
-            await self.materialize_deferred_input_for_receipt(close_receipt)
             closure_event = closure_records[0].event
+            identity = ApprovalTaskFailureIdentity(
+                approval_id=request.approval_id,
+                tool_round_id=request.tool_round_id,
+                tool_call_id=request.tool_call_id,
+                resolution_request_digest=(
+                    approval_support.approval_resolution_request_digest(request)
+                ),
+            )
+            current_session = await self._require_session(loaded_session.id)
+            task_failure_durable = bool(
+                task_id is not None
+                and (
+                    (
+                        request.task_worker_id is not None
+                        and await self._approval_task_failure_receipt_is_durable(
+                            task_id=task_id,
+                            task_worker_id=request.task_worker_id,
+                            task_handoff_id=request.task_handoff_id,
+                            session=current_session,
+                            identity=identity,
+                        )
+                    )
+                    or (
+                        request.task_worker_id is None
+                        and await self._direct_approval_task_failure_is_durable(
+                            task_id=task_id,
+                            session=current_session,
+                            identity=identity,
+                        )
+                    )
+                )
+            )
+            if task_failure_durable:
+                yield closure_event
+                registered_agent = self._resolve_registered_agent(current_session.agent_name)
+                registered_environment = self._resolve_registered_environment(
+                    current_session.environment_name
+                )
+                registered_provider = self._resolve_registered_provider(
+                    current_session.provider_name
+                )
+                checkpoint = await self._session_store.load_checkpoint(current_session.id)
+                budget_policy_snapshot = copy_budget_policy(self._resolve_budget_policy())
+                execution_profile_snapshot = await self._validate_execution_profile_continuation(
+                    current_session,
+                    checkpoint,
+                    registered_agent,
+                    registered_provider,
+                    budget_policy=budget_policy_snapshot,
+                    require_open_interaction=False,
+                    record_rejection=False,
+                )
+                invocation_context = self._reconstruct_invocation_context(
+                    session=current_session,
+                    execution_profile_snapshot=execution_profile_snapshot,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                    budget_policy=budget_policy_snapshot,
+                )
+                async for event in self._finish_closed_approval_failure(
+                    request=request,
+                    task_id=task_id,
+                    session=current_session,
+                    closure_event=closure_event,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=invocation_context.profile,
+                    invocation_context=invocation_context,
+                ):
+                    yield event
+                return
+            await self.materialize_deferred_input_for_receipt(close_receipt)
             yield closure_event
             return
 
@@ -5069,6 +5183,7 @@ class RecoveryCoordinator:
                 checkpoint_transform=claim_exact_approval,
                 execution_profile_snapshot=execution_profile_snapshot,
                 before_mutation=before_mutation,
+                after_admission=after_admission,
                 invocation_context=invocation_context,
             )
         except (InvocationLifecycleCommandConflict, SessionRunFenced) as claim_conflict:
@@ -5089,6 +5204,8 @@ class RecoveryCoordinator:
             ) from claim_conflict
         if pending_approval is None or pending_round is None:
             raise RuntimeError("Tool approval claim completed without approval state.")
+        if task_id != pending_approval.task_id:
+            raise RuntimeError("Tool approval changed its attached task identity.")
         if resumed_event is not None:
             yield resumed_event
         invocation_context = invocation_context.with_rebound_session(
@@ -5136,9 +5253,17 @@ class RecoveryCoordinator:
         self,
         request: ProviderOperationResolutionRequest,
         *,
+        task_id: str | None = None,
+        task_handoff_id: str | None = None,
         before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Accept one disposition and drive its durable effect to a recovery boundary."""
+
+        if request.task_worker_id is None and task_handoff_id is not None:
+            raise ValueError("Workerless provider resolution cannot carry a handoff identity.")
+        if request.task_worker_id is not None and task_id is None:
+            raise ValueError("Typed provider resolution requires an attached task identity.")
 
         request = prepare_provider_operation_resolution_request(
             request,
@@ -5165,19 +5290,57 @@ class RecoveryCoordinator:
             raise ProviderOperationEvidenceError(
                 "Pending provider-operation disposition changed after acceptance."
             )
-        if await self._provider_operation_disposition_execution_started(
+        execution_started = await self._provider_operation_disposition_execution_started(
             pending=pending,
             result=durable_result,
-        ):
+        )
+        if execution_started:
             for settlement_event in await self._settle_provider_operation_disposition_reservations(
                 pending=pending,
                 result=durable_result,
             ):
                 yield settlement_event
+        if (
+            pending.execution_claimed
+            and request.task_worker_id is not None
+            and (
+                pending.execution_task_worker_id,
+                pending.execution_task_handoff_id,
+            )
+            != (request.task_worker_id, task_handoff_id)
+        ):
+            if task_id is None:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation task continuation lost its attached task."
+                )
+            recovered = await self._recover_incomplete_session_scoped(
+                session=await self._require_session(pending.session_id),
+                inactive_before=None,
+                reason="elected attached-task provider continuation",
+                metadata={},
+                provider_disposition_task_id=task_id,
+                provider_disposition_task_worker_id=request.task_worker_id,
+                provider_disposition_task_handoff_id=task_handoff_id,
+                provider_disposition_after_admission=after_admission,
+            )
+            for recovered_event in recovered.events:
+                yield recovered_event
             return
+        if execution_started:
+            if pending.action is ProviderOperationResolutionAction.FAIL:
+                # Failure continuation is deterministic after the interaction
+                # transition: exact callers may race safely through terminal
+                # event and hook reservation reconciliation.
+                pass
+            else:
+                return
         disposition_stream = self._finish_pending_provider_operation_disposition(
             pending=pending,
             result=durable_result,
+            task_id=task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=task_handoff_id,
+            after_admission=after_admission,
         )
         try:
             try:
@@ -5251,11 +5414,62 @@ class RecoveryCoordinator:
         )
         return True
 
+    async def _claim_provider_operation_disposition_execution(
+        self,
+        *,
+        pending: ProviderOperationPendingDisposition,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+    ) -> bool:
+        """Atomically bind a pre-execution disposition to its first caller."""
+
+        if pending.execution_claimed:
+            if (
+                pending.execution_task_worker_id,
+                pending.execution_task_handoff_id,
+            ) != (task_worker_id, task_handoff_id):
+                raise ProviderOperationResolutionConflict(
+                    "Provider-operation execution is owned by another task continuation."
+                )
+            return True
+
+        def claim_execution(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            return checkpoint_with_provider_operation_disposition_execution_owner(
+                checkpoint,
+                expected=pending,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+            )
+
+        try:
+            await self._session_store.transform_checkpoint(
+                pending.session_id,
+                claim_execution,
+            )
+        except ProviderOperationResolutionConflict:
+            latest = await load_pending_provider_operation_disposition(
+                self._session_store,
+                pending.session_id,
+            )
+            if (
+                latest is not None
+                and latest[0].execution_claimed
+                and latest[0].execution_task_worker_id == task_worker_id
+                and latest[0].execution_task_handoff_id == task_handoff_id
+            ):
+                return False
+            raise
+        return True
+
     async def _provider_operation_disposition_effect_is_durable(
         self,
         *,
         pending: ProviderOperationPendingDisposition,
         result: ProviderOperationResolutionResult,
+        terminal_hook_authority: RecoveryTerminalEventRequest | None = None,
     ) -> bool:
         if pending.action is ProviderOperationResolutionAction.FAIL:
             terminal_event_id = provider_operation_resolution_outcome_event_id(
@@ -5308,7 +5522,22 @@ class RecoveryCoordinator:
                 raise ProviderOperationEvidenceError(
                     "Provider-operation failure conflicts with durable session status."
                 )
-            return True
+            if terminal_hook_authority is None:
+                return False
+            terminal_event = terminal_records[0].event
+            if (
+                terminal_hook_authority.event != terminal_event
+                or terminal_hook_authority.phase is not RuntimeHookPhase.AFTER_SESSION_FAILED
+                or terminal_hook_authority.session.id != session.id
+                or terminal_hook_authority.session.instance_id != session.instance_id
+                or terminal_hook_authority.session.run_epoch != session.run_epoch
+                or terminal_hook_authority.session.status is not session.status
+                or not terminal_hook_authority.terminal_event_already_durable
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation terminal-hook authority conflicts with durable evidence."
+                )
+            return await self._terminal_runtime_hooks_are_settled(terminal_hook_authority)
 
         if await self._provider_operation_fallback_terminal_outcome_is_durable(
             pending=pending,
@@ -5426,6 +5655,7 @@ class RecoveryCoordinator:
         *,
         pending: ProviderOperationPendingDisposition,
         result: ProviderOperationResolutionResult,
+        terminal_hook_authority: RecoveryTerminalEventRequest | None = None,
     ) -> bool:
         await self._settle_provider_operation_disposition_reservations(
             pending=pending,
@@ -5434,6 +5664,7 @@ class RecoveryCoordinator:
         if not await self._provider_operation_disposition_effect_is_durable(
             pending=pending,
             result=result,
+            terminal_hook_authority=terminal_hook_authority,
         ):
             return False
         await clear_pending_provider_operation_disposition(self._session_store, pending)
@@ -5523,6 +5754,10 @@ class RecoveryCoordinator:
         pending: ProviderOperationPendingDisposition,
         result: ProviderOperationResolutionResult,
         invocation_context: InvocationContext | None = None,
+        task_id: str | None = None,
+        task_worker_id: str | None = None,
+        task_handoff_id: str | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Finish one accepted disposition without replaying its old provider request."""
 
@@ -5585,6 +5820,10 @@ class RecoveryCoordinator:
             limits=None if recovery_context is None else recovery_context.limits,
             retry_policy=(None if recovery_context is None else recovery_context.retry_policy),
             invocation_semantics_available=recovery_context is not None,
+            require_open_interaction=not (
+                pending.action is ProviderOperationResolutionAction.FAIL
+                and loaded_session.status is SessionStatus.FAILED
+            ),
         )
         if invocation_context is None:
             invocation_context = self._reconstruct_invocation_context(
@@ -5623,6 +5862,21 @@ class RecoveryCoordinator:
         }:
             raise SessionStatusConflict("Fail resolution requires interrupted provider work.")
         if pending.action is ProviderOperationResolutionAction.FAIL:
+            if after_admission is not None:
+                await after_admission()
+            if not await self._claim_provider_operation_disposition_execution(
+                pending=pending,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+            ):
+                return
+            refreshed = await load_pending_provider_operation_disposition(
+                self._session_store,
+                pending.session_id,
+            )
+            if refreshed is None:
+                return
+            pending, result = refreshed
             async for event in self._fail_provider_operation(
                 ProviderOperationFailureRequest(
                     resolution_event=result.event,
@@ -5630,6 +5884,9 @@ class RecoveryCoordinator:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     execution_profile=execution_profile_snapshot.profile,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
                     legacy_resolution_without_profile=(
                         result.record.execution_profile_fingerprint is None
                     ),
@@ -5637,9 +5894,37 @@ class RecoveryCoordinator:
                 )
             ):
                 yield event
+            failed_session = await self._require_session(pending.session_id)
+            terminal_event_id = provider_operation_resolution_outcome_event_id(
+                result.record.resolution_id,
+                "session_failed",
+            )
+            terminal_records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=pending.session_id,
+                    event_id=terminal_event_id,
+                    limit=2,
+                )
+            )
+            if len(terminal_records) != 1:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation failure has incomplete terminal evidence."
+                )
+            terminal_hook_authority = RecoveryTerminalEventRequest(
+                event=copy_event(terminal_records[0].event),
+                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                session=failed_session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
+                terminal_event_already_durable=True,
+                yield_durable_terminal_event=False,
+            )
             if not await self._retire_completed_provider_operation_disposition(
                 pending=pending,
                 result=result,
+                terminal_hook_authority=terminal_hook_authority,
             ):
                 raise RuntimeError(
                     "Provider-operation failure disposition has no durable terminal outcome."
@@ -5656,15 +5941,43 @@ class RecoveryCoordinator:
         detached_billing_failure: BaseExceptionGroup | None = None
         billing_state_check_failure: RuntimeError | None = None
         try:
+
+            def claim_fallback_execution(
+                _session: Session,
+                current_checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                try:
+                    return checkpoint_with_provider_operation_disposition_execution_owner(
+                        current_checkpoint,
+                        expected=pending,
+                        task_worker_id=task_worker_id,
+                        task_handoff_id=task_handoff_id,
+                    )
+                except ProviderOperationResolutionConflict:
+                    raise SessionRunFenced(
+                        "Provider-operation fallback execution ownership changed."
+                    ) from None
+
             session, resumed_event = await self._transition_recovery_session_to_running(
                 loaded_session,
                 checkpoint=checkpoint,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 execution_profile_snapshot=execution_profile_snapshot,
+                checkpoint_transform=claim_fallback_execution,
                 preserve_open_interaction_on_failure=True,
+                after_admission=after_admission,
                 invocation_context=invocation_context,
             )
+            refreshed = await load_pending_provider_operation_disposition(
+                self._session_store,
+                pending.session_id,
+            )
+            if refreshed is None:
+                raise ProviderOperationEvidenceError(
+                    "Fallback execution claim lost its pending disposition."
+                )
+            pending, result = refreshed
             if resumed_event is not None:
                 yield resumed_event
 
@@ -5686,6 +5999,8 @@ class RecoveryCoordinator:
                 recovery_context=recovery_context,
                 budget_policy=budget_policy_snapshot,
                 release_run_fence_on_cleanup=False,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 invocation_context=invocation_context,
             )
             try:
@@ -5731,6 +6046,68 @@ class RecoveryCoordinator:
             del registered_provider, registered_environment
             raise billing_state_check_failure from None
 
+    async def _automatic_provider_disposition_task_context(
+        self,
+        pending: ProviderOperationPendingDisposition,
+    ) -> tuple[str | None, bool]:
+        """Resolve direct task authority or require an elected typed continuation.
+
+        Generic session recovery carries no task-worker credential. It may finish
+        an ordinary workerless attachment, but it must never consume or bypass an
+        interrupted-handoff generation owned by an elected worker. A terminal
+        task likewise requires its exact receipt-authenticated typed replay.
+        """
+
+        stage = await self._session_store.load_model_completion_stage(
+            pending.session_id,
+            pending.stage_id,
+        )
+        if stage is None:
+            raise RuntimeError("Resolved provider-operation stage is missing.")
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        if recovery_context is None:
+            raise RuntimeError(
+                "Provider-operation disposition requires durable model-completion context."
+            )
+        task_id = recovery_context.task_id
+        if task_id is None:
+            return None, False
+        if self._task_store is None:
+            raise RuntimeError("Attached provider disposition requires a task store.")
+        task = await self._task_store.load_task(task_id)
+        session = await self._session_store.load(pending.session_id)
+        if task is None or session is None:
+            raise RuntimeError("Attached provider disposition lost its task or session.")
+        if task.session_id != session.id or task.session_instance_id != session.instance_id:
+            raise RuntimeError("Attached provider disposition changed task-session identity.")
+        if task.status is TaskStatus.FAILED:
+            direct_failure = await load_direct_task_failure_replay(
+                self._task_store,
+                task_id=task_id,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                expected_error=provider_operation_task_failure_payload(session_id=session.id),
+                claimed_terminalization_idempotency_key=(
+                    runtime_task_terminalization_idempotency_key(
+                        task_id=task_id,
+                        session_id=session.id,
+                        kind=TaskTerminalKind.FAILED,
+                    )
+                ),
+            )
+            return task_id, direct_failure is None
+        if task.status is not TaskStatus.RUNNING or task.worker_id is not None:
+            return task_id, True
+        try:
+            await self._task_store.load_direct_attached_task_resume(
+                task_id,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+            )
+        except (KeyError, NotImplementedError, ValueError):
+            return task_id, True
+        return task_id, False
+
     async def _run_pending_provider_operation_fallback(
         self,
         *,
@@ -5744,6 +6121,8 @@ class RecoveryCoordinator:
         recovery_context: ModelCompletionRecoveryContext,
         budget_policy: BudgetPolicy | None,
         release_run_fence_on_cleanup: bool,
+        task_worker_id: str | None = None,
+        task_handoff_id: str | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Run the accepted fallback from an already fenced running session."""
@@ -5810,7 +6189,8 @@ class RecoveryCoordinator:
                 request_loop_policies=(),
                 request_metadata=recovery_context.request_metadata,
                 task_id=recovery_context.task_id,
-                task_worker_id=None,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 start_event_type=None,
                 start_event_payload={},
                 start_task_on_enter=False,
@@ -5900,6 +6280,7 @@ class RecoveryCoordinator:
         request: ToolApprovalRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         loaded_session = await self._session_store.load(request.session_id)
         if loaded_session is None:
@@ -6019,6 +6400,7 @@ class RecoveryCoordinator:
             checkpoint_transform=claim_exact_approval,
             execution_profile_snapshot=execution_profile_snapshot,
             before_mutation=before_mutation,
+            after_admission=after_admission,
             invocation_context=invocation_context,
         )
         if pending_approval is None or pending_round is None:
@@ -6085,6 +6467,7 @@ class RecoveryCoordinator:
         request: ToolRoundRecoveryRequest,
         *,
         before_mutation: RecoveryMutationHook | None = None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Recover a crashed ordinary tool round with an operator-verified outcome.
 
@@ -6282,6 +6665,7 @@ class RecoveryCoordinator:
                 invocation_semantics=invocation_semantics,
                 execution_profile_snapshot=execution_profile_snapshot,
                 budget_policy=budget_policy_snapshot,
+                after_admission=after_admission,
             )
             async for event in recovery_stream:
                 yield event
@@ -7336,7 +7720,8 @@ class RecoveryCoordinator:
                     request_loop_policies=response.loop_policies,
                     request_metadata=response.metadata,
                     task_id=pending.task_id,
-                    task_worker_id=None,
+                    task_worker_id=response.task_worker_id,
+                    task_handoff_id=response.task_handoff_id,
                     start_event_type=None,
                     start_event_payload={},
                     start_task_on_enter=False,
@@ -7829,6 +8214,7 @@ class RecoveryCoordinator:
             model_attempt_id=pending_approval.model_attempt_id,
         )
         pending_approval_cleared = False
+        clear_event: Event | None = None
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         expired = False
         original_resolution_decision = request.decision
@@ -7904,6 +8290,7 @@ class RecoveryCoordinator:
                 expired_at_iso = pending_approval.expires_at.isoformat()
                 request = ToolApprovalRequest(
                     session_id=request.session_id,
+                    task_worker_id=request.task_worker_id,
                     approval_id=request.approval_id,
                     tool_round_id=request.tool_round_id,
                     tool_call_id=request.tool_call_id,
@@ -8829,7 +9216,8 @@ class RecoveryCoordinator:
                     request_loop_policies=request.loop_policies,
                     request_metadata=request.metadata,
                     task_id=pending_approval.task_id,
-                    task_worker_id=None,
+                    task_worker_id=request.task_worker_id,
+                    task_handoff_id=request.task_handoff_id,
                     start_event_type=None,
                     start_event_payload={},
                     start_task_on_enter=False,
@@ -8861,10 +9249,6 @@ class RecoveryCoordinator:
             )
             raise
         except Exception as exc:
-            failure_diagnostic = exception_diagnostic(
-                exc,
-                redactor=self._secret_redactor,
-            )
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self._session_store.update_status(
                     session.id,
@@ -8963,65 +9347,19 @@ class RecoveryCoordinator:
                     yield event
                 return
 
-            task_failure_error: Exception | None = None
-            if pending_approval.task_id is not None and self._task_store is not None:
-                try:
-                    task = await self._task_store.fail_task(
-                        pending_approval.task_id,
-                        task_failure_payload_from_diagnostic(
-                            failure_diagnostic,
-                            session_id=session.id,
-                            additional_fields={
-                                "approval_id": pending_approval.approval_id,
-                            },
-                        ),
-                    )
-                    yield await self._event_writer.emit(
-                        self._task_event(
-                            RecoveryTaskEventRequest(
-                                event_type=EventType.TASK_FAILED,
-                                task=task,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                            )
-                        )
-                    )
-                except Exception as task_exc:
-                    task_failure_error = task_exc
-            session = await self._session_store.update_status(session.id, SessionStatus.FAILED)
-            payload: dict[str, Any] = {
-                **exception_failure_payload(
-                    exc,
-                    diagnostic=failure_diagnostic,
-                    redactor=self._secret_redactor,
-                ),
-                "approval_id": pending_approval.approval_id,
-                "tool_call_id": pending_approval.tool_call_id,
-            }
-            if task_failure_error is not None:
-                payload.update(
-                    task_update_error_payload(
-                        task_failure_error,
-                        redactor=self._secret_redactor,
-                    )
-                )
-            async for event in self._emit_terminal_event_with_hooks(
-                RecoveryTerminalEventRequest(
-                    event=Event(
-                        type=EventType.SESSION_FAILED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload=payload,
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    execution_profile=execution_profile_snapshot.profile,
-                    invocation_context=invocation_context,
-                )
+            if clear_event is None:
+                raise RuntimeError(
+                    "Closed approval failure lost its deterministic closure event."
+                ) from exc
+            async for event in self._finish_closed_approval_failure(
+                request=request,
+                task_id=pending_approval.task_id,
+                session=session,
+                closure_event=clear_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile_snapshot.profile,
+                invocation_context=invocation_context,
             ):
                 yield event
 
@@ -9059,6 +9397,271 @@ class RecoveryCoordinator:
                 "Approval-close receipt has invalid event evidence."
             )
         return True
+
+    async def _approval_task_failure_receipt_is_durable(
+        self,
+        *,
+        task_id: str,
+        task_worker_id: str,
+        task_handoff_id: str | None,
+        session: Session,
+        identity: ApprovalTaskFailureIdentity,
+    ) -> bool:
+        if self._task_store is None or not self._task_store.supports_idempotent_terminalization:
+            return False
+        receipt = await self._task_store.load_task_terminalization_receipt(
+            task_id,
+            approval_task_terminalization_idempotency_key(
+                task_id=task_id,
+                session_id=session.id,
+                identity=identity,
+            ),
+        )
+        task = await self._task_store.load_task(task_id)
+        return approval_task_failure_receipt_matches(
+            receipt=receipt,
+            task=task,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            identity=identity,
+        )
+
+    async def _direct_approval_task_failure_is_durable(
+        self,
+        *,
+        task_id: str,
+        session: Session,
+        identity: ApprovalTaskFailureIdentity,
+    ) -> bool:
+        if self._task_store is None:
+            return False
+        task = await load_direct_task_failure_replay(
+            self._task_store,
+            task_id=task_id,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            expected_error=approval_task_failure_payload(
+                session_id=session.id,
+                identity=identity,
+            ),
+            claimed_terminalization_idempotency_key=(
+                approval_task_terminalization_idempotency_key(
+                    task_id=task_id,
+                    session_id=session.id,
+                    identity=identity,
+                )
+            ),
+        )
+        return task is not None
+
+    async def _approval_failure_effect_is_durable(
+        self,
+        *,
+        session: Session,
+        identity: ApprovalTaskFailureIdentity,
+    ) -> Event | None:
+        records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_id=approval_failure_event_id(identity, "session_failed"),
+                limit=2,
+            )
+        )
+        if not records:
+            return None
+        if len(records) != 1:
+            raise SessionRuntimePublicationConflict(
+                "Approval failure has duplicate terminal session evidence."
+            )
+        event = records[0].event
+        expected_payload = approval_task_failure_payload(
+            session_id=session.id,
+            identity=identity,
+        )
+        if (
+            event.type is not EventType.SESSION_FAILED
+            or event.session_id != session.id
+            or event.payload.get("error") != expected_payload["message"]
+            or event.payload.get("error_type") != expected_payload["type"]
+            or any(
+                event.payload.get(field_name) != expected_payload[field_name]
+                for field_name in (
+                    "approval_id",
+                    "tool_round_id",
+                    "tool_call_id",
+                    "resolution_request_digest",
+                )
+            )
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Approval failure terminal evidence conflicts with its resolution identity."
+            )
+        current = await self._session_store.load(session.id)
+        if current is None or current.status is not SessionStatus.FAILED:
+            raise SessionRuntimePublicationConflict(
+                "Approval failure event exists without terminal session state."
+            )
+        return copy_event(event)
+
+    async def _finish_closed_approval_failure(
+        self,
+        *,
+        request: ToolApprovalRequest,
+        task_id: str | None,
+        session: Session,
+        closure_event: Event,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity,
+        invocation_context: InvocationContext | None,
+    ) -> AsyncGenerator[Event, None]:
+        """Finish one post-close approval failure through exact durable evidence."""
+
+        identity = ApprovalTaskFailureIdentity(
+            approval_id=request.approval_id,
+            tool_round_id=request.tool_round_id,
+            tool_call_id=request.tool_call_id,
+            resolution_request_digest=(
+                approval_support.approval_resolution_request_digest(request)
+            ),
+        )
+        durable_terminal_event = await self._approval_failure_effect_is_durable(
+            session=session,
+            identity=identity,
+        )
+        if durable_terminal_event is not None:
+            async for event in self._emit_terminal_event_with_hooks(
+                RecoveryTerminalEventRequest(
+                    event=durable_terminal_event,
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    terminal_event_already_durable=True,
+                    yield_durable_terminal_event=False,
+                )
+            ):
+                yield event
+            return
+        failure_payload = approval_task_failure_payload(
+            session_id=session.id,
+            identity=identity,
+        )
+        if task_id is not None:
+            if self._task_store is None:
+                raise RuntimeError("Attached approval failure requires a task store.")
+            if request.task_worker_id is None:
+                task = await load_direct_task_failure_replay(
+                    self._task_store,
+                    task_id=task_id,
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    expected_error=failure_payload,
+                    claimed_terminalization_idempotency_key=(
+                        approval_task_terminalization_idempotency_key(
+                            task_id=task_id,
+                            session_id=session.id,
+                            identity=identity,
+                        )
+                    ),
+                )
+                if task is None:
+                    task = await self._task_store.fail_task(
+                        task_id,
+                        failure_payload,
+                        worker_id=None,
+                    )
+            else:
+                task = await _terminalize_claimed_task(
+                    self._task_store,
+                    approval_task_terminalization_request(
+                        task_id=task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                        session_id=session.id,
+                        identity=identity,
+                    ),
+                )
+            task_failed_template = self._task_event(
+                RecoveryTaskEventRequest(
+                    event_type=EventType.TASK_FAILED,
+                    task=task,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                )
+            )
+            task_failed = task_failed_template.model_copy(
+                update={
+                    "id": approval_failure_event_id(identity, "task_failed"),
+                    "interaction_id": closure_event.interaction_id,
+                    "timestamp": closure_event.timestamp,
+                    "payload": {
+                        **task_failed_template.payload,
+                        "approval_id": identity.approval_id,
+                        "tool_round_id": identity.tool_round_id,
+                        "tool_call_id": identity.tool_call_id,
+                        "resolution_request_digest": identity.resolution_request_digest,
+                        "failure_type": failure_payload["type"],
+                    },
+                }
+            )
+            task_failed = event_with_runtime_generated_id(
+                event_with_execution_profile_authority(
+                    event_with_runtime_payload_authority(
+                        task_failed,
+                        "approval_id",
+                        "tool_round_id",
+                        "tool_call_id",
+                    ),
+                    execution_profile,
+                )
+            )
+            persisted_task_failed = await self._event_writer.persist_exact_replay(task_failed)
+            yield (await self._event_writer.fan_out_persisted([persisted_task_failed]))[0]
+
+        session = await self._session_store.update_status(session.id, SessionStatus.FAILED)
+        session_failed = event_with_runtime_generated_id(
+            event_with_runtime_payload_authority(
+                Event(
+                    id=approval_failure_event_id(identity, "session_failed"),
+                    type=EventType.SESSION_FAILED,
+                    session_id=session.id,
+                    interaction_id=closure_event.interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    timestamp=closure_event.timestamp,
+                    payload={
+                        "error": failure_payload["message"],
+                        "error_type": failure_payload["type"],
+                        "approval_id": identity.approval_id,
+                        "tool_round_id": identity.tool_round_id,
+                        "tool_call_id": identity.tool_call_id,
+                        "resolution_request_digest": identity.resolution_request_digest,
+                    },
+                ),
+                "approval_id",
+                "tool_round_id",
+                "tool_call_id",
+            )
+        )
+        async for event in self._emit_terminal_event_with_hooks(
+            RecoveryTerminalEventRequest(
+                event=session_failed,
+                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+            )
+        ):
+            yield event
 
     async def _publish_tool_approval_granted_once(
         self,
@@ -9639,6 +10242,7 @@ class RecoveryCoordinator:
         try:
             response = UserInputResponse(
                 session_id=request.session_id,
+                task_worker_id=request.task_worker_id,
                 input_id=request.input_id,
                 answer=request.answer,
                 structured=request.structured,
@@ -10029,6 +10633,7 @@ class RecoveryCoordinator:
         try:
             approval_request = ToolApprovalRequest(
                 session_id=request.session_id,
+                task_worker_id=request.task_worker_id,
                 approval_id=request.approval_id,
                 tool_round_id=request.tool_round_id,
                 tool_call_id=request.tool_call_id,
@@ -10097,6 +10702,7 @@ class RecoveryCoordinator:
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
         request_loop_policies: tuple[LoopPolicy, ...],
+        after_admission: RecoveryMutationHook | None = None,
     ) -> (
         _IncompleteRecoveryClaim
         | _ManualRecoveryInterruptionFence
@@ -10577,6 +11183,39 @@ class RecoveryCoordinator:
             ),
             invocation_context=invocation_context,
         )
+        if after_admission is not None:
+            try:
+                await after_admission()
+            except BaseException as authority_failure:
+                failure = authority_failure
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=failure,
+                    steps=(
+                        (
+                            "abandoned manual recovery finalization",
+                            lambda: self.finalize_abandoned_session_by_id(
+                                claimed_session.id,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile_snapshot.profile,
+                                invocation_context=invocation_context,
+                                run_terminal_hooks=False,
+                            ),
+                        ),
+                        (
+                            "manual recovery claim cleanup",
+                            lambda: self._cleanup_incomplete_recovery_claim(
+                                session_id=claimed_session.id,
+                                claim_id=claim.claim_id,
+                                authoritative_failure=failure,
+                                execution_profile=execution_profile_snapshot.profile,
+                                invocation_context=invocation_context,
+                                claim_has_not_dispatched_work=True,
+                            ),
+                        ),
+                    ),
+                )
+                raise
         if outcome.cancellation is None:
             return claim
 
@@ -10621,6 +11260,7 @@ class RecoveryCoordinator:
         invocation_semantics: _RecoveryInvocationSemantics,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
+        after_admission: RecoveryMutationHook | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Claim one manual recovery durably and stream its owned continuation."""
         caller_runtime_task = asyncio.current_task()
@@ -10638,6 +11278,7 @@ class RecoveryCoordinator:
             execution_profile_snapshot=execution_profile_snapshot,
             budget_policy=budget_policy,
             request_loop_policies=request.loop_policies,
+            after_admission=after_admission,
         )
         if isinstance(claim, _ManualRecoveryInterruptionReplay):
             yield copy_event(claim.event)
@@ -11529,7 +12170,8 @@ class RecoveryCoordinator:
                     request_loop_policies=request.loop_policies,
                     request_metadata=request.metadata,
                     task_id=pending_round.task_id,
-                    task_worker_id=None,
+                    task_worker_id=request.task_worker_id,
+                    task_handoff_id=request.task_handoff_id,
                     start_event_type=None,
                     start_event_payload={},
                     start_task_on_enter=False,
@@ -13443,6 +14085,7 @@ class RecoveryCoordinator:
                     registered_environment=request.registered_environment,
                     execution_profile=request.execution_profile,
                     invocation_context=request.invocation_context,
+                    run_runtime_hooks=request.run_terminal_hooks,
                 )
             ):
                 if (
@@ -13569,6 +14212,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
+        run_terminal_hooks: bool = True,
     ) -> None:
         """Idempotently finalize a live session when setup-time streaming is abandoned."""
         try:
@@ -13611,6 +14255,7 @@ class RecoveryCoordinator:
                         environment_name=_environment_name(registered_environment),
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
+                        run_terminal_hooks=run_terminal_hooks,
                     )
                 ):
                     pass
@@ -13628,6 +14273,7 @@ class RecoveryCoordinator:
                     environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
+                    run_terminal_hooks=run_terminal_hooks,
                 )
             )
         except InteractionLifecyclePublicationRejected:
@@ -13733,6 +14379,12 @@ class RecoveryCoordinator:
         if pending_resolution is None:
             return recovered
         pending, result = pending_resolution
+        (
+            task_id,
+            requires_typed_continuation,
+        ) = await self._automatic_provider_disposition_task_context(pending)
+        if requires_typed_continuation:
+            return recovered
         if before_mutation is not None:
             await before_mutation()
         disposition_events = [
@@ -13741,6 +14393,7 @@ class RecoveryCoordinator:
                 pending=pending,
                 result=result,
                 invocation_context=invocation_context,
+                task_id=task_id,
             )
         ]
         current = await self._require_session(recovered.session_id)
@@ -14163,6 +14816,10 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None = None,
         retain_open_interaction_invocation: bool = False,
         retain_invocation_context: Callable[[InvocationContext], None] | None = None,
+        provider_disposition_task_id: str | None = None,
+        provider_disposition_task_worker_id: str | None = None,
+        provider_disposition_task_handoff_id: str | None = None,
+        provider_disposition_after_admission: RecoveryMutationHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         reason = require_clean_nonblank(reason, "reason")
         metadata = copy_json_value(metadata, "metadata")
@@ -14187,6 +14844,10 @@ class RecoveryCoordinator:
             before_mutation=before_mutation,
             retain_open_interaction_invocation=retain_open_interaction_invocation,
             retain_invocation_context=retain_invocation_context,
+            provider_disposition_task_id=provider_disposition_task_id,
+            provider_disposition_task_worker_id=provider_disposition_task_worker_id,
+            provider_disposition_task_handoff_id=provider_disposition_task_handoff_id,
+            provider_disposition_after_admission=provider_disposition_after_admission,
         )
 
     async def _recover_incomplete_session_owned(
@@ -14200,7 +14861,22 @@ class RecoveryCoordinator:
         before_mutation: RecoveryMutationHook | None,
         retain_open_interaction_invocation: bool,
         retain_invocation_context: Callable[[InvocationContext], None] | None,
+        provider_disposition_task_id: str | None = None,
+        provider_disposition_task_worker_id: str | None = None,
+        provider_disposition_task_handoff_id: str | None = None,
+        provider_disposition_after_admission: RecoveryMutationHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
+
+        if (provider_disposition_task_id is None) != (
+            provider_disposition_task_worker_id is None
+        ) or (
+            provider_disposition_task_handoff_id is not None
+            and provider_disposition_task_worker_id is None
+        ):
+            raise ValueError(
+                "Typed provider recovery requires task and worker identities; handoff "
+                "authority additionally requires both."
+            )
 
         mutation_admitted = False
 
@@ -14470,12 +15146,43 @@ class RecoveryCoordinator:
         claim: _IncompleteRecoveryClaim | None = None
         invocation_context: InvocationContext | None = None
         authoritative_failure: BaseException | None = None
+        provider_execution_transfer: CheckpointTransform | None = None
+        if provider_disposition_task_id is not None:
+            if pending_provider_disposition is None:
+                raise ProviderOperationEvidenceError(
+                    "Typed provider recovery lost its pending disposition."
+                )
+            expected_pending = pending_provider_disposition[0]
+            if not expected_pending.execution_claimed or (
+                expected_pending.execution_task_worker_id,
+                expected_pending.execution_task_handoff_id,
+            ) == (
+                provider_disposition_task_worker_id,
+                provider_disposition_task_handoff_id,
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Typed provider recovery has no predecessor execution owner to fence."
+                )
+
+            def transfer_provider_execution(
+                _session: Session,
+                current_checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                return checkpoint_with_provider_operation_disposition_execution_owner(
+                    current_checkpoint,
+                    expected=expected_pending,
+                    task_worker_id=provider_disposition_task_worker_id,
+                    task_handoff_id=provider_disposition_task_handoff_id,
+                )
+
+            provider_execution_transfer = transfer_provider_execution
         try:
             await admit_before_mutation()
             claim = await self._claim_incomplete_recovery(
                 session=session,
                 inactive_before=inactive_before,
                 execution_profile_snapshot=execution_profile_snapshot,
+                checkpoint_transform=provider_execution_transfer,
             )
             if claim is None:
                 current = await self._require_session(session.id)
@@ -14498,6 +15205,8 @@ class RecoveryCoordinator:
                 )
                 if retain_invocation_context is not None:
                     retain_invocation_context(invocation_context)
+            if provider_disposition_after_admission is not None:
+                await provider_disposition_after_admission()
             return await self._recover_incomplete_session_with_heartbeat(
                 claim=claim,
                 recovery=lambda: self._recover_incomplete_session(
@@ -14514,6 +15223,9 @@ class RecoveryCoordinator:
                     claim_id=claim.claim_id,
                     execution_profile_snapshot=execution_profile_snapshot,
                     budget_policy=budget_policy_snapshot,
+                    provider_disposition_task_id=provider_disposition_task_id,
+                    provider_disposition_task_worker_id=(provider_disposition_task_worker_id),
+                    provider_disposition_task_handoff_id=(provider_disposition_task_handoff_id),
                 ),
             )
         except BaseException as exc:
@@ -15860,6 +16572,7 @@ class RecoveryCoordinator:
         inactive_before: datetime | None,
         required_expired_claim_id: str | None = None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> _IncompleteRecoveryClaim | None:
         if required_expired_claim_id is not None:
             required_expired_claim_id = require_clean_nonblank(
@@ -16112,6 +16825,13 @@ class RecoveryCoordinator:
                 "claimed_at": claimed_at.isoformat(),
                 "claim_expires_at": claim_expires_at.isoformat(),
             }
+            if checkpoint_transform is not None:
+                transformed = checkpoint_transform(current_session, updated)
+                if transformed is None:
+                    raise _IncompleteRecoveryClaimLost(
+                        "Incomplete-session recovery checkpoint transfer deleted authority."
+                    )
+                updated = transformed
             return _checkpoint_with_rebased_session_run_operation(
                 updated,
                 previous_run_epoch=current_session.run_epoch,
@@ -17600,6 +18320,9 @@ class RecoveryCoordinator:
         claim_id: str,
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None,
         budget_policy: BudgetPolicy | None,
+        provider_disposition_task_id: str | None = None,
+        provider_disposition_task_worker_id: str | None = None,
+        provider_disposition_task_handoff_id: str | None = None,
     ) -> IncompleteSessionRecoveryResult:
         if (execution_profile_snapshot is None) != (invocation_context is None):
             raise RuntimeError(
@@ -17689,6 +18412,28 @@ class RecoveryCoordinator:
         )
         if pending_provider_resolution is not None:
             pending_disposition, resolution_result = pending_provider_resolution
+            if provider_disposition_task_id is not None:
+                source_stage = await self._session_store.load_model_completion_stage(
+                    session.id,
+                    pending_disposition.stage_id,
+                )
+                recovery_context = (
+                    None
+                    if source_stage is None
+                    else model_completion_recovery_context_from_stage(source_stage)
+                )
+                if (
+                    recovery_context is None
+                    or recovery_context.task_id != provider_disposition_task_id
+                    or not pending_disposition.execution_claimed
+                    or pending_disposition.execution_task_worker_id
+                    != provider_disposition_task_worker_id
+                    or pending_disposition.execution_task_handoff_id
+                    != provider_disposition_task_handoff_id
+                ):
+                    raise ProviderOperationEvidenceError(
+                        "Typed provider recovery conflicts with its transferred authority."
+                    )
             if await self._retire_completed_provider_operation_disposition(
                 pending=pending_disposition,
                 result=resolution_result,
@@ -17698,6 +18443,28 @@ class RecoveryCoordinator:
                 )
                 checkpoint = await self._session_store.load_checkpoint(session.id)
             elif pending_disposition.action is ProviderOperationResolutionAction.FAIL:
+                if provider_disposition_task_id is None:
+                    (
+                        task_id,
+                        requires_typed_continuation,
+                    ) = await self._automatic_provider_disposition_task_context(pending_disposition)
+                    task_worker_id = None
+                else:
+                    task_id = provider_disposition_task_id
+                    task_worker_id = provider_disposition_task_worker_id
+                    requires_typed_continuation = False
+                if requires_typed_continuation:
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=session.status,
+                        actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                        events=tuple(events),
+                        message=(
+                            "Accepted provider-operation failure awaits its elected "
+                            "attached-task continuation."
+                        ),
+                    )
                 if execution_profile_snapshot is None:
                     raise RuntimeError(
                         "Provider-operation failure recovery has no execution profile."
@@ -17709,6 +18476,9 @@ class RecoveryCoordinator:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         execution_profile=execution_profile_snapshot.profile,
+                        task_id=task_id,
+                        task_worker_id=task_worker_id,
+                        task_handoff_id=provider_disposition_task_handoff_id,
                         legacy_resolution_without_profile=(
                             resolution_result.record.execution_profile_fingerprint is None
                         ),
@@ -17716,9 +18486,37 @@ class RecoveryCoordinator:
                     )
                 ):
                     events.append(event)
+                failed_session = await self._require_session(pending_disposition.session_id)
+                terminal_event_id = provider_operation_resolution_outcome_event_id(
+                    resolution_result.record.resolution_id,
+                    "session_failed",
+                )
+                terminal_records = await self._session_store.query_events(
+                    EventQuery(
+                        session_id=pending_disposition.session_id,
+                        event_id=terminal_event_id,
+                        limit=2,
+                    )
+                )
+                if len(terminal_records) != 1:
+                    raise ProviderOperationEvidenceError(
+                        "Provider-operation failure has incomplete terminal evidence."
+                    )
+                terminal_hook_authority = RecoveryTerminalEventRequest(
+                    event=copy_event(terminal_records[0].event),
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                    session=failed_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=invocation_context,
+                    terminal_event_already_durable=True,
+                    yield_durable_terminal_event=False,
+                )
                 if not await self._retire_completed_provider_operation_disposition(
                     pending=pending_disposition,
                     result=resolution_result,
+                    terminal_hook_authority=terminal_hook_authority,
                 ):
                     raise RuntimeError(
                         "Recovered provider-operation failure has no terminal outcome."
@@ -17746,6 +18544,28 @@ class RecoveryCoordinator:
                     ),
                 )
             elif session.status is SessionStatus.RUNNING:
+                if provider_disposition_task_id is None:
+                    (
+                        _task_id,
+                        requires_typed_continuation,
+                    ) = await self._automatic_provider_disposition_task_context(pending_disposition)
+                    task_worker_id = None
+                else:
+                    _task_id = provider_disposition_task_id
+                    task_worker_id = provider_disposition_task_worker_id
+                    requires_typed_continuation = False
+                if requires_typed_continuation:
+                    return IncompleteSessionRecoveryResult(
+                        session_id=session.id,
+                        previous_status=previous_status,
+                        status=session.status,
+                        actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                        events=tuple(events),
+                        message=(
+                            "Accepted provider-operation fallback awaits its elected "
+                            "attached-task continuation."
+                        ),
+                    )
                 if execution_profile_snapshot is None:
                     raise RuntimeError(
                         "Provider-operation fallback recovery has no execution profile."
@@ -17777,6 +18597,8 @@ class RecoveryCoordinator:
                     recovery_context=recovery_context,
                     budget_policy=budget_policy,
                     release_run_fence_on_cleanup=False,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=provider_disposition_task_handoff_id,
                     invocation_context=invocation_context,
                 ):
                     events.append(event)

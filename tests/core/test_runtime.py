@@ -212,6 +212,7 @@ from cayu.runtime import (
     RunRequest,
     RuntimeHook,
     RuntimeHookContext,
+    RuntimeHookPhase,
     Session,
     SessionExecutionSource,
     SessionIdentity,
@@ -23240,6 +23241,479 @@ def test_cayu_app_runtime_hooks_run_app_scope_before_agent_scope():
         ("app_hook", "app"),
         ("agent_hook", "agent"),
     ]
+
+
+def test_terminal_runtime_hook_started_ack_loss_recovers_only_its_claimant():
+    class CommitThenLoseHookStartedAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lost_acknowledgement = False
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            await super().append_event(session_id, event)
+            if event.type == EventType.HOOK_STARTED and not self.lost_acknowledgement:
+                self.lost_acknowledgement = True
+                raise ConnectionError("hook-start acknowledgement lost after commit")
+
+    class RecordingHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls += 1
+
+    async def scenario() -> None:
+        store = CommitThenLoseHookStartedAcknowledgementStore()
+        hook = RecordingHook()
+        app = CayuApp(session_store=store, runtime_hooks=[hook], enable_logging=False)
+        app.register_provider(
+            FakeProvider(
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_hook_started_ack_loss",
+                messages=[Message.text("user", "Finish once.")],
+            ),
+        )
+
+        assert store.lost_acknowledgement is True
+        assert hook.calls == 1
+        hook_events = [
+            event
+            for event in events
+            if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED}
+        ]
+        assert [event.type for event in hook_events] == [
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        ]
+        stored_hook_events = [
+            event
+            for event in await store.load_events("sess_terminal_hook_started_ack_loss")
+            if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED}
+        ]
+        assert stored_hook_events[0].id.endswith(":started")
+        assert stored_hook_events[1].id.endswith(":completed")
+        assert (
+            stored_hook_events[0].payload["hook_invocation_id"]
+            == (stored_hook_events[1].payload["hook_invocation_id"])
+        )
+
+    asyncio.run(scenario())
+
+
+def test_terminal_runtime_hook_completed_ack_loss_is_not_reentered():
+    class CommitThenLoseHookCompletedAcknowledgementStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lost_acknowledgement = False
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            await super().append_event(session_id, event)
+            if event.type == EventType.HOOK_COMPLETED and not self.lost_acknowledgement:
+                self.lost_acknowledgement = True
+                raise ConnectionError("hook-completed acknowledgement lost after commit")
+
+    class RecordingHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls += 1
+
+    async def scenario() -> None:
+        store = CommitThenLoseHookCompletedAcknowledgementStore()
+        hook = RecordingHook()
+        app = CayuApp(session_store=store, runtime_hooks=[hook], enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_hook_completed_ack_loss",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        terminal_event = Event(
+            type=EventType.SESSION_COMPLETED,
+            session_id=session.id,
+            agent_name=session.agent_name,
+        )
+        await store.append_event(session.id, terminal_event)
+        registered_agent = app._get_registered_agent("assistant")
+        ordered_hooks = tuple(
+            (registered_hook, "app", index)
+            for index, registered_hook in enumerate(app._runtime_hooks)
+        )
+
+        first_attempt = app._session_engine._run_runtime_hooks(
+            phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+            session=session,
+            terminal_event=terminal_event,
+            registered_agent=registered_agent,
+            registered_environment=None,
+            hooks=ordered_hooks,
+        )
+        first_events = [event async for event in first_attempt]
+
+        retry_events = [
+            event
+            async for event in app._session_engine._run_runtime_hooks(
+                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+                session=session,
+                terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=None,
+                hooks=ordered_hooks,
+            )
+        ]
+
+        assert store.lost_acknowledgement is True
+        assert [event.type for event in first_events] == [
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        ]
+        assert retry_events == []
+        assert hook.calls == 1
+        hook_events = [
+            event
+            for event in await store.load_events(session.id)
+            if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED}
+        ]
+        assert [event.type for event in hook_events] == [
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        ]
+        assert (
+            hook_events[0].payload["hook_invocation_id"]
+            == hook_events[1].payload["hook_invocation_id"]
+        )
+
+    asyncio.run(scenario())
+
+
+def test_terminal_runtime_hook_cancellation_after_reservation_enters_hook_once():
+    class PauseAfterHookReservationStore(InMemorySessionStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.reservation_committed = asyncio.Event()
+            self.release_reservation = asyncio.Event()
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            await super().append_event(session_id, event)
+            if event.type is EventType.HOOK_STARTED:
+                self.reservation_committed.set()
+                await self.release_reservation.wait()
+
+    class RecordingHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls += 1
+            await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        store = PauseAfterHookReservationStore()
+        hook = RecordingHook()
+        app = CayuApp(session_store=store, runtime_hooks=[hook], enable_logging=False)
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_hook_reservation_cancellation",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        terminal_event = Event(
+            type=EventType.SESSION_COMPLETED,
+            session_id=session.id,
+            agent_name=session.agent_name,
+        )
+        await store.append_event(session.id, terminal_event)
+        registered_agent = app._get_registered_agent("assistant")
+        ordered_hooks = tuple(
+            (registered_hook, "app", index)
+            for index, registered_hook in enumerate(app._runtime_hooks)
+        )
+        first_attempt = app._session_engine._run_runtime_hooks(
+            phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+            session=session,
+            terminal_event=terminal_event,
+            registered_agent=registered_agent,
+            registered_environment=None,
+            hooks=ordered_hooks,
+        )
+        delivery = asyncio.create_task(anext(first_attempt))
+        await store.reservation_committed.wait()
+        delivery.cancel("cancel after the hook reservation committed")
+        store.release_reservation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
+
+        assert hook.calls == 1
+        retry_events = [
+            event
+            async for event in app._session_engine._run_runtime_hooks(
+                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+                session=session,
+                terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=None,
+                hooks=ordered_hooks,
+            )
+        ]
+        assert retry_events == []
+        hook_events = [
+            event
+            for event in await store.load_events(session.id)
+            if event.type
+            in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED, EventType.HOOK_FAILED}
+        ]
+        assert [event.type for event in hook_events] == [EventType.HOOK_STARTED]
+
+    asyncio.run(scenario())
+
+
+def test_terminal_runtime_hook_reservations_distinguish_duplicate_names_by_index():
+    class SameNameHook(RuntimeHook):
+        def __init__(self, label: str, calls: list[str]) -> None:
+            self.label = label
+            self.calls = calls
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls.append(self.label)
+
+    async def scenario() -> None:
+        calls: list[str] = []
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            runtime_hooks=[SameNameHook("first", calls), SameNameHook("second", calls)],
+            enable_logging=False,
+        )
+        app.register_provider(
+            FakeProvider(
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_duplicate_terminal_hook_names",
+                messages=[Message.text("user", "Finish in order.")],
+            ),
+        )
+
+        assert calls == ["first", "second"]
+        started = [
+            event
+            for event in await store.load_events("sess_duplicate_terminal_hook_names")
+            if event.type == EventType.HOOK_STARTED
+        ]
+        assert [event.payload["hook_name"] for event in started] == [
+            "SameNameHook",
+            "SameNameHook",
+        ]
+        assert [event.payload["hook_index"] for event in started] == [0, 1]
+        assert len({event.id for event in started}) == 2
+
+    asyncio.run(scenario())
+
+
+def test_terminal_runtime_hook_replay_advances_past_settled_slots():
+    class RecordingHook(RuntimeHook):
+        def __init__(self, label: str, calls: list[str]) -> None:
+            self.label = label
+            self.calls = calls
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls.append(self.label)
+
+    async def scenario() -> None:
+        calls: list[str] = []
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            runtime_hooks=[RecordingHook("first", calls), RecordingHook("second", calls)],
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_terminal_hook_settled_prefix",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        terminal_event = Event(
+            type=EventType.SESSION_COMPLETED,
+            session_id=session.id,
+            agent_name=session.agent_name,
+        )
+        await store.append_event(session.id, terminal_event)
+        registered_agent = app._get_registered_agent("assistant")
+        ordered_hooks = tuple(
+            (registered_hook, "app", index)
+            for index, registered_hook in enumerate(app._runtime_hooks)
+        )
+
+        first_attempt = app._session_engine._run_runtime_hooks(
+            phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+            session=session,
+            terminal_event=terminal_event,
+            registered_agent=registered_agent,
+            registered_environment=None,
+            hooks=ordered_hooks,
+        )
+        assert (await anext(first_attempt)).type is EventType.HOOK_STARTED
+        assert (await anext(first_attempt)).type is EventType.HOOK_COMPLETED
+        await first_attempt.aclose()
+        assert calls == ["first"]
+
+        replay = [
+            event
+            async for event in app._session_engine._run_runtime_hooks(
+                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+                session=session,
+                terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=None,
+                hooks=ordered_hooks,
+            )
+        ]
+        assert [event.type for event in replay] == [
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        ]
+        assert calls == ["first", "second"]
+
+    asyncio.run(scenario())
+
+
+def test_unsettled_terminal_runtime_hook_reservation_is_not_reentered_or_skipped():
+    class RecordingHook(RuntimeHook):
+        def __init__(
+            self,
+            label: str,
+            calls: list[str],
+            *,
+            entered: asyncio.Event | None = None,
+            release: asyncio.Event | None = None,
+        ) -> None:
+            self.label = label
+            self.calls = calls
+            self.entered = entered
+            self.release = release
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls.append(self.label)
+            if self.entered is not None:
+                self.entered.set()
+            if self.release is not None:
+                await self.release.wait()
+
+    async def scenario() -> None:
+        calls: list[str] = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            runtime_hooks=[
+                RecordingHook("first", calls, entered=entered, release=release),
+                RecordingHook("later", calls),
+            ],
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([]), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_unsettled_terminal_hook",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        terminal_event = Event(
+            type=EventType.SESSION_COMPLETED,
+            session_id=session.id,
+            agent_name=session.agent_name,
+        )
+        await store.append_event(session.id, terminal_event)
+        registered_agent = app._get_registered_agent("assistant")
+        ordered_hooks = tuple(
+            (registered_hook, "app", index)
+            for index, registered_hook in enumerate(app._runtime_hooks)
+        )
+
+        first_attempt = app._session_engine._run_runtime_hooks(
+            phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+            session=session,
+            terminal_event=terminal_event,
+            registered_agent=registered_agent,
+            registered_environment=None,
+            hooks=ordered_hooks,
+        )
+        first_delivery = asyncio.create_task(anext(first_attempt))
+        await entered.wait()
+        first_delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_delivery
+
+        retry_events = [
+            event
+            async for event in app._session_engine._run_runtime_hooks(
+                phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
+                session=session,
+                terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=None,
+                hooks=ordered_hooks,
+            )
+        ]
+
+        assert retry_events == []
+        assert calls == ["first"]
+        hook_events = [
+            event
+            for event in await store.load_events(session.id)
+            if event.type
+            in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED, EventType.HOOK_FAILED}
+        ]
+        assert [event.type for event in hook_events] == [EventType.HOOK_STARTED]
+        assert hook_events[0].payload["hook_index"] == 0
+
+    asyncio.run(scenario())
 
 
 def test_cayu_app_after_tool_call_hook_observes_tool_result_and_emits_events():

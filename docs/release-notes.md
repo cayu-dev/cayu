@@ -89,6 +89,85 @@ guard.
 
 ## Unreleased
 
+### Task continuations retain elected worker authority across recovery entrances
+
+An interrupted task claimed with `claim_interrupted_task_continuation(...)` now
+remains fenced by an exact caller-generated handoff generation as well as its
+worker through session resume, tool approval, user-input continuation, manual
+tool recovery, and provider-operation recovery. Generate the opaque claim token
+with `new_interrupted_task_continuation_handoff_id()` and pass it as `handoff_id`.
+An exact retry replays a live commit-before-acknowledgement claim; a stale token,
+expired lease, or different worker fails closed. Each typed continuation request
+accepts `task_worker_id` and `task_handoff_id`; missing, stale, or secret-bearing
+authority fails before provider or tool execution, and authority is rechecked
+after session admission before side effects begin.
+Successful continuations pass both values through heartbeat and every task
+terminal path instead of using the workerless completion path.
+
+SQLite and PostgreSQL add a partial unique index for live handoff generations
+and permanently register the digest of every claimed generation. The in-memory
+store maintains equivalent constant-time indexes. This makes each caller token
+one-use even after its task rotates authority or becomes terminal.
+Direct worker completion/failure, idempotent terminalization receipts, and
+owner-lost cancellation reconciliation all bind the exact generation, so a
+restarted process reusing the same worker name cannot adopt its successor's
+authority. Legacy non-recovery terminalization and reconciliation digests remain
+compatible.
+
+Accepted provider dispositions attached to an elected task remain pending when
+generic session recovery has no worker credential; the elected typed
+continuation must finish them. If a closed approval fails after its task is
+terminalized, the exact immutable terminalization receipt now authenticates a
+retry that deterministically publishes the task and session failure boundaries.
+Workerless direct provider and approval failures use the matching immutable
+failed-task snapshot plus authoritative absence of that claimed-worker receipt,
+so process loss between task and session failure remains recoverable without
+letting a caller omit an elected worker identity.
+
+The same recovery boundary now covers ordinary failures after any attached-task
+continuation has begun. The runtime records a deterministic, redacted version 2
+failure marker containing its identity, invocation execution-profile
+fingerprint, terminal payload, and turn summary in the task terminalization,
+and all typed continuation entrances
+recognize its exact elected-worker receipt or proven workerless origin. A fresh
+process must resolve collaborators matching that retained profile before it may
+run terminal hooks or environment finalization. A retry finishes the same
+deterministic `interaction.failed`, failed `turn.completed`, and
+`session.failed` evidence without invoking another provider or tool;
+already-dispatched model work is classified conservatively as having an unknown
+effect. Once terminal evidence is durable, trailing run-operation cleanup is
+best effort and cannot hide the authoritative result from a retry. That retry
+also validates the retained execution profile and converges terminal-hook slots
+that were still unclaimed when the original process disappeared. Fresh
+`turn.completed` UUIDs now retain their runtime-generated provenance just like
+deterministic replay IDs, so configured secret-fragment redaction cannot reject
+an identity generated inside Cayu.
+
+Terminal runtime hooks now reserve each app/agent registration slot with a
+deterministic `hook.started` identity and a unique durable claimant before the
+hook may apply governed effects. Concurrent exact failure replays therefore run
+each hook at most once instead of duplicating task creation, dispatch, forks, or
+custom events. A claimant can recover its own lost append acknowledgement, while
+a peer stops at an unsettled earlier hook so app-before-agent and registration
+ordering remain intact. Completed and failed hook markers bind the same claimant;
+another contender may advance past only that positively settled slot. The
+owning async stream exposes `hook.started` only after the hook returned and its
+outcome marker is durable, so consumer abandonment cannot strand a reservation
+before the hook was entered.
+
+Final derived-fork validation now also rejects secret-bearing runtime taint
+labels. Filtering runtime-owned keys out of the user-metadata projection no
+longer lets unsafe policy authority bypass the pre-mutation fork boundary.
+
+The server/dashboard contract advances from version 41 to version 42 to expose
+the optional worker and handoff-generation fields on all seven control-plane
+continuation bodies. Upgrade independently deployed servers and regenerate
+clients before dispatching elected task continuations. Workerless direct
+continuation remains available only for a task with no interrupted-handoff
+generation. Terminal workerless replay requires a receipt-capable task store
+because a store without atomic claimed-worker receipts cannot prove whether the
+cleared terminal owner was direct or elected.
+
 ### Evals ship focused onboarding and declarative project judge authority
 
 Three package-shipped guides now lead operators through a first Control Plane

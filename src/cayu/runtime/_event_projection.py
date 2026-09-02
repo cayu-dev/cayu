@@ -3401,10 +3401,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         policies[event_type] = factory_policy
 
     hook_policy = _observed_policy(
-        "actions durable_value_error_code durable_value_error_path error error_type execution_profile_fingerprint hook_name "
-        "phase scope terminal_event_id terminal_event_type tool_call_id tool_name",
-        authority_keys={"execution_profile_fingerprint"},
-        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        "actions durable_value_error_code durable_value_error_path error error_type execution_profile_fingerprint hook_index "
+        "hook_invocation_id hook_name phase scope terminal_event_id terminal_event_type tool_call_id tool_name",
+        authority_keys={"execution_profile_fingerprint", "hook_invocation_id"},
+        public_authority_keys={
+            *_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+            "hook_invocation_id",
+        },
         untrusted_container_keys={"actions"},
     )
     for event_type in (

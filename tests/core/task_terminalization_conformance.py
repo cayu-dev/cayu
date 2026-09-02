@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from uuid import uuid4
 
 import pytest
+from tests.core.task_invocation_fixtures import task_backed_session_invocation
 
 from cayu import (
     ResolutionActor,
@@ -24,6 +26,7 @@ from cayu import (
     TaskTerminalizationRetryPolicy,
     TaskTerminalizationUncertain,
     TaskTerminalKind,
+    interrupted_task_handoff_request,
     terminalize_task_with_retry,
 )
 
@@ -51,6 +54,7 @@ def ordinary_cancellation_reconciliation_request(
     return TaskCancellationReconciliationRequest(
         task_id=task.id,
         original_worker_id=task.worker_id,
+        original_handoff_id=task.interrupted_handoff_id,
         original_lease_expires_at=task.lease_expires_at,
         cancellation_requested_at=datetime.fromisoformat(cancellation_requested_at),
         cancellation_idempotency_key=cancellation_idempotency_key,
@@ -75,6 +79,71 @@ def ordinary_cancellation_reconciliation_request(
         expected_execution_profile_fingerprint="b" * 64,
         expected_effect_fingerprint="c" * 64,
     )
+
+
+async def assert_recovered_continuation_terminalization_conformance(
+    store: TaskStore,
+) -> None:
+    """Prove every ordinary terminal kind consumes recovery lineage."""
+
+    for kind in TaskTerminalKind:
+        suffix = kind.value
+        task_id = f"recovered_terminal_{suffix}"
+        worker_id = f"prior_{suffix}"
+        session_id = f"recovered_terminal_session_{suffix}"
+        await store.create_task(TaskCreate(task_id=task_id, type="review"))
+        claimed = await store.claim_task(worker_id, lease_seconds=60)
+        assert claimed is not None
+        attached = await store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await task_backed_session_invocation(
+                store,
+                task_id,
+                session_id,
+            ),
+            worker_id=worker_id,
+        )
+        await store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(attached, session_run_epoch=1)
+        )
+        recovery_worker = f"recovery_{suffix}"
+        recovered = (
+            await store.claim_interrupted_task_continuation(
+                recovery_worker,
+                handoff_id=str(uuid4()),
+                lease_seconds=60,
+            )
+        ).task
+        assert recovered is not None
+        assert recovered.interrupted_handoff_id is not None
+        idempotency_key = f"recovered-terminal-{suffix}"
+        if kind is TaskTerminalKind.CANCELLED:
+            recovered = await store.cancel_task(task_id, {"outcome": suffix})
+            assert recovered.status_payload is not None
+            stored_key = recovered.status_payload["terminalization_idempotency_key"]
+            assert isinstance(stored_key, str)
+            idempotency_key = stored_key
+        request = TaskTerminalizationRequest(
+            task_id=task_id,
+            worker_id=recovery_worker,
+            handoff_id=recovered.interrupted_handoff_id,
+            kind=kind,
+            result={"outcome": suffix} if kind is TaskTerminalKind.COMPLETED else None,
+            error=None if kind is TaskTerminalKind.COMPLETED else {"outcome": suffix},
+            idempotency_key=idempotency_key,
+        )
+        terminal = await store.terminalize_task(request)
+        assert terminal.status is TaskStatus(kind.value)
+        assert terminal.worker_id is None
+        assert terminal.lease_expires_at is None
+        assert terminal.interrupted_handoff_id is None
+        receipt = await store.load_task_terminalization_receipt(
+            task_id,
+            request.idempotency_key,
+        )
+        assert receipt is not None
+        assert receipt.task == terminal
 
 
 async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
@@ -195,6 +264,54 @@ async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
     )
     with pytest.raises(TaskCancellationReconciliationConflict, match="another intent"):
         await store.reconcile_task_cancellation(changed)
+
+    await store.create_task(
+        TaskCreate(
+            task_id="ordinary_recovery_owner_lost",
+            type="review",
+            metadata={
+                "execution_profile_fingerprint": "b" * 64,
+                "effect_fingerprint": "c" * 64,
+            },
+        )
+    )
+    prior_owner = await store.claim_task("ordinary-prior-recovery-worker", lease_seconds=60)
+    assert prior_owner is not None
+    attached = await store.attach_task(
+        prior_owner.id,
+        session_id="ordinary-recovery-owner-lost-session",
+        session_invocation=await task_backed_session_invocation(
+            store,
+            prior_owner.id,
+            "ordinary-recovery-owner-lost-session",
+        ),
+        worker_id="ordinary-prior-recovery-worker",
+    )
+    await store.release_interrupted_task_worker(
+        interrupted_task_handoff_request(attached, session_run_epoch=1)
+    )
+    recovery_owner = (
+        await store.claim_interrupted_task_continuation(
+            "ordinary-recovery-lost-worker",
+            handoff_id=str(uuid4()),
+            lease_seconds=1,
+        )
+    ).task
+    assert recovery_owner is not None
+    assert recovery_owner.interrupted_handoff_id is not None
+    recovery_requested = await store.cancel_task(
+        recovery_owner.id,
+        {"code": "operator"},
+    )
+    recovery_request = ordinary_cancellation_reconciliation_request(
+        recovery_requested,
+        reconciliation_idempotency_key="ordinary-recovery-reconciliation",
+    )
+    await asyncio.sleep(1.05)
+    recovery_result = await store.reconcile_task_cancellation(recovery_request)
+    assert recovery_result.task.status is TaskStatus.CANCELLED
+    assert recovery_result.task.interrupted_handoff_id is None
+    assert recovery_result.terminalization_receipt.task == recovery_result.task
 
     await store.create_task(TaskCreate(task_id="ordinary_worker_wins", type="review"))
     worker_claim = await store.claim_task("ordinary-winning-worker", lease_seconds=60)

@@ -241,6 +241,11 @@ def prepare_resume_request(
         field_name="session_id",
         redactor=redactor,
     )
+    require_secret_free_session_authority(
+        request.task_worker_id,
+        field_name="task_worker_id",
+        redactor=redactor,
+    )
     if request.target is not None:
         require_secret_free_session_authority(
             request.target.provider_name,
@@ -515,43 +520,13 @@ def prepare_fork_session_request_with_identity(
         aliases = ()
 
 
-def _require_secret_free_fork_policy_metadata(
+def _require_secret_free_fork_taint_metadata(
     metadata: dict[str, Any],
     *,
     redactor: SecretRedactor,
 ) -> None:
-    """Reject fork policy authority before descriptive metadata is redacted."""
+    """Reject secret-bearing taint authority in request or derived metadata."""
 
-    if MODEL_TARGET_PROJECTION_METADATA_KEY in metadata:
-        metadata.clear()
-        raise ForkAuthorityError(
-            f"metadata[{MODEL_TARGET_PROJECTION_METADATA_KEY!r}] is runtime-owned "
-            "model-target authority."
-        ) from None
-    if PROMPT_ANATOMY_TRANSITION_METADATA_KEY in metadata:
-        metadata.clear()
-        raise ForkAuthorityError(
-            f"metadata[{PROMPT_ANATOMY_TRANSITION_METADATA_KEY!r}] is runtime-owned "
-            "prompt-transition authority."
-        ) from None
-    if FORK_EXECUTION_PROFILE_METADATA_KEY in metadata:
-        metadata.clear()
-        raise ForkAuthorityError(
-            f"metadata[{FORK_EXECUTION_PROFILE_METADATA_KEY!r}] is runtime-owned "
-            "fork-profile authority."
-        ) from None
-    if FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY in metadata:
-        metadata.clear()
-        raise ForkAuthorityError(
-            f"metadata[{FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY!r}] is runtime-owned "
-            "fork-group source authority."
-        ) from None
-    if EXECUTION_PROFILE_METADATA_KEY in metadata:
-        metadata.clear()
-        raise ForkAuthorityError(
-            f"metadata[{EXECUTION_PROFILE_METADATA_KEY!r}] is runtime-owned "
-            "execution-profile authority."
-        ) from None
     try:
         labels = taint_labels_from_metadata(metadata)
     except (TypeError, ValueError):
@@ -568,6 +543,28 @@ def _require_secret_free_fork_policy_metadata(
             f"metadata[{TAINT_LABELS_METADATA_KEY!r}] contains a workload secret "
             "and cannot be used as durable session policy authority."
         ) from None
+
+
+def _require_secret_free_fork_policy_metadata(
+    metadata: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+) -> None:
+    """Reject caller-supplied fork policy authority before metadata redaction."""
+
+    for key, description in (
+        (MODEL_TARGET_PROJECTION_METADATA_KEY, "model-target"),
+        (PROMPT_ANATOMY_TRANSITION_METADATA_KEY, "prompt-transition"),
+        (FORK_EXECUTION_PROFILE_METADATA_KEY, "fork-profile"),
+        (FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY, "fork-group source"),
+        (EXECUTION_PROFILE_METADATA_KEY, "execution-profile"),
+    ):
+        if key in metadata:
+            metadata.clear()
+            raise ForkAuthorityError(
+                f"metadata[{key!r}] is runtime-owned {description} authority."
+            ) from None
+    _require_secret_free_fork_taint_metadata(metadata, redactor=redactor)
 
 
 def prepare_fork_source_session(
@@ -732,6 +729,11 @@ def prepare_derived_fork_session(
                 break
     if error is None and _labels_contain_secret(fork_session.labels, redactor=redactor):
         error = "labels contain a workload secret and cannot be used as durable session authority."
+    if error is None:
+        _require_secret_free_fork_taint_metadata(
+            fork_session.metadata,
+            redactor=redactor,
+        )
     user_metadata = session_user_metadata(fork_session.metadata)
     if error is None and _json_contains_secret_key(
         user_metadata,

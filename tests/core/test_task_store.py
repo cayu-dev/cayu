@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import subprocess
@@ -8,6 +9,7 @@ import sys
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -16,12 +18,14 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 from tests.core.task_store_conformance import (
+    assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
     assert_task_session_invocation_binding_conformance,
 )
 from tests.core.task_terminalization_conformance import (
     assert_live_ordinary_cancellation_conformance,
     assert_owner_lost_ordinary_cancellation_reconciliation_conformance,
+    assert_recovered_continuation_terminalization_conformance,
     assert_task_terminalization_acknowledgement_conformance,
     ordinary_cancellation_reconciliation_request,
 )
@@ -43,13 +47,18 @@ from cayu import (
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
     TaskTerminalKind,
+    interrupted_task_handoff_request,
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
     extract_durable_value_error,
 )
-from cayu.runtime.tasks import _require_interrupted_task_handoff_authority
+from cayu.runtime.tasks import (
+    _require_interrupted_task_handoff_authority,
+    prepare_interrupted_task_handoff,
+)
+from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
 StoreFactory = Callable[[object], TaskStore]
@@ -75,6 +84,80 @@ def _interrupted_handoff_request(
         session_run_epoch=session_run_epoch,
         handoff_id=handoff_id,
     )
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_bound_continuation_scans_before_applying_query_filters(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_interrupted_continuation_scan_bound_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_sqlite_consumed_continuation_generation_survives_restart(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+
+    async def run_store_operations() -> None:
+        store = SQLiteTaskStore(db_path)
+        handoff_id = str(uuid4())
+        try:
+            await store.create_task(TaskCreate(task_id="durable-generation", type="review"))
+            claimed = await store.claim_task("prior-worker", TaskQuery(type="review"))
+            assert claimed is not None
+            attached = await store.attach_task(
+                claimed.id,
+                session_id="durable-generation-session",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    claimed.id,
+                    "durable-generation-session",
+                ),
+                worker_id="prior-worker",
+            )
+            await store.release_interrupted_task_worker(
+                interrupted_task_handoff_request(attached, session_run_epoch=1)
+            )
+            continuation = await store.claim_interrupted_task_continuation(
+                "continuation-worker",
+                TaskQuery(type="review"),
+                handoff_id=handoff_id,
+            )
+            assert continuation.task is not None
+            await store.release_interrupted_task_worker(
+                interrupted_task_handoff_request(
+                    continuation.task,
+                    session_run_epoch=2,
+                )
+            )
+        finally:
+            await store.close()
+
+        reopened = SQLiteTaskStore(db_path)
+        try:
+            with pytest.raises(TaskClaimLost):
+                await reopened.claim_interrupted_task_continuation(
+                    "continuation-worker",
+                    TaskQuery(type="review"),
+                    handoff_id=handoff_id,
+                )
+            replacement = await reopened.claim_interrupted_task_continuation(
+                "continuation-worker",
+                TaskQuery(type="review"),
+                handoff_id=str(uuid4()),
+            )
+            assert replacement.task is not None
+        finally:
+            await reopened.close()
+
+    asyncio.run(run_store_operations())
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
@@ -195,6 +278,22 @@ def test_task_stores_live_ordinary_cancellation_conformance(
 
 
 @pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_recovered_continuations_terminalize_all_ordinary_kinds(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        try:
+            await assert_recovered_continuation_terminalization_conformance(store)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
 def test_task_stores_owner_lost_ordinary_cancellation_reconciliation_conformance(
     store_factory: StoreFactory,
     tmp_path,
@@ -215,9 +314,31 @@ def test_sqlite_ordinary_cancellation_reconciliation_replays_after_restart(tmp_p
         path = tmp_path / "ordinary-reconciliation-restart.sqlite"
         store = SQLiteTaskStore(path)
         await store.create_task(TaskCreate(task_id="ordinary_restart", type="review"))
-        claimed = await store.claim_task("ordinary-restart-worker", lease_seconds=1)
+        claimed = await store.claim_task("ordinary-prior-worker", lease_seconds=60)
         assert claimed is not None
-        requested = await store.cancel_task(claimed.id, {"code": "operator"})
+        attached = await store.attach_task(
+            claimed.id,
+            session_id="ordinary-restart-session",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                claimed.id,
+                "ordinary-restart-session",
+            ),
+            worker_id="ordinary-prior-worker",
+        )
+        await store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(attached, session_run_epoch=1)
+        )
+        recovery_owner = (
+            await store.claim_interrupted_task_continuation(
+                "ordinary-restart-worker",
+                handoff_id=str(uuid4()),
+                lease_seconds=1,
+            )
+        ).task
+        assert recovery_owner is not None
+        assert recovery_owner.interrupted_handoff_id is not None
+        requested = await store.cancel_task(recovery_owner.id, {"code": "operator"})
         request = ordinary_cancellation_reconciliation_request(requested)
         await asyncio.sleep(1.05)
         result = await store.reconcile_task_cancellation(request)
@@ -226,6 +347,7 @@ def test_sqlite_ordinary_cancellation_reconciliation_replays_after_restart(tmp_p
         reopened = SQLiteTaskStore(path)
         try:
             assert await reopened.reconcile_task_cancellation(request) == result
+            assert result.task.interrupted_handoff_id is None
             assert (
                 await reopened.load_task_terminalization_receipt(
                     request.task_id,
@@ -1134,6 +1256,46 @@ def test_interrupted_task_handoff_is_exact_and_replay_safe(
     asyncio.run(run_store_operations())
 
 
+def test_base_direct_resume_keeps_legacy_custom_stores_compatible_and_recovery_safe() -> None:
+    class LegacyCustomTaskStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = False
+        load_direct_attached_task_resume = TaskStore.load_direct_attached_task_resume
+
+    async def scenario() -> None:
+        store = LegacyCustomTaskStore()
+        await store.create_task(TaskCreate(task_id="legacy-direct", type="review"))
+        assert await store.claim_task("legacy-worker") is not None
+        attached = await store.attach_task(
+            "legacy-direct",
+            session_id="legacy-session",
+            session_invocation=await task_backed_session_invocation(
+                store,
+                "legacy-direct",
+                "legacy-session",
+            ),
+            worker_id="legacy-worker",
+        )
+        released = await store.release_attached_task_worker(attached.id, "legacy-worker")
+        assert released.session_instance_id is not None
+        loaded = await store.load_direct_attached_task_resume(
+            released.id,
+            session_id="legacy-session",
+            session_instance_id=released.session_instance_id,
+        )
+        assert loaded == released
+
+        recovery_store = InMemoryTaskStore()
+        with pytest.raises(NotImplementedError, match="must implement an atomic"):
+            await TaskStore.load_direct_attached_task_resume(
+                recovery_store,
+                released.id,
+                session_id="legacy-session",
+                session_instance_id=released.session_instance_id,
+            )
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure_point", ["before_commit", "after_commit"])
 def test_in_memory_interrupted_task_handoff_faults_reconcile_exactly(
     failure_point: str,
@@ -1413,6 +1575,12 @@ def test_interrupted_task_handoff_candidate_pages_have_stable_store_order(
     async def run_store_operations() -> None:
         with pytest.raises(ValueError, match="limit must be <= 100"):
             await store.list_expired_interrupted_task_handoff_candidates(limit=101)
+        with pytest.raises(ValueError, match="scan_limit must be <= 100"):
+            await store.claim_interrupted_task_continuation(
+                "continuation-worker",
+                handoff_id=str(uuid4()),
+                scan_limit=101,
+            )
         for task_id in ("task_handoff_page_a", "task_handoff_page_b"):
             await store.create_task(TaskCreate(task_id=task_id, type="review"))
             claimed = await store.claim_task("worker_a", lease_seconds=1)
@@ -2359,6 +2527,243 @@ def test_sqlite_task_store_rejects_missing_terminalization_receipt_table(tmp_pat
 
     with pytest.raises(RuntimeError, match="terminalization receipt"):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_task_store_validate_rejects_pre_handoff_generation_schema(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_continuation")
+        connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
+        connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+        connection.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
+        connection.execute("PRAGMA user_version = 75")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 76"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_task_store_rejects_missing_continuation_claim_registry(tmp_path) -> None:
+    db_path = tmp_path / "tasks.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="task handoff generation"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_revision_seventy_six_backfills_live_handoff_authority(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "tasks-handoff-migration.sqlite"
+    monkeypatch.setattr(sqlite_support, "_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE", 1)
+
+    async def seed() -> tuple[TaskInterruptedHandoffRequest, ...]:
+        store = SQLiteTaskStore(db_path)
+        try:
+
+            async def release(
+                task_id: str,
+                task_type: str,
+                session_id: str,
+            ) -> TaskInterruptedHandoffRequest:
+                await store.create_task(TaskCreate(task_id=task_id, type=task_type))
+                worker_id = f"prior-{task_id}"
+                assert await store.claim_task(worker_id, TaskQuery(type=task_type)) is not None
+                attached = await store.attach_task(
+                    task_id,
+                    session_id=session_id,
+                    session_invocation=await task_backed_session_invocation(
+                        store,
+                        task_id,
+                        session_id,
+                    ),
+                    worker_id=worker_id,
+                )
+                request = _interrupted_handoff_request(
+                    attached,
+                    handoff_id=f"{task_id}-generation-1",
+                )
+                await store.release_interrupted_task_worker(request)
+                return request
+
+            live = await release("migrated-live", "migration-live", "migrated-live-session")
+            historical = await release(
+                "migrated-history",
+                "migration-history",
+                "migrated-history-session",
+            )
+            history_owner = (
+                await store.claim_interrupted_task_continuation(
+                    "history-owner",
+                    TaskQuery(type="migration-history"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task
+            assert history_owner is not None
+            current = interrupted_task_handoff_request(history_owner, session_run_epoch=2)
+            await store.release_interrupted_task_worker(current)
+
+            terminal = await release(
+                "migrated-terminal",
+                "migration-terminal",
+                "migrated-terminal-session",
+            )
+            terminal_owner = (
+                await store.claim_interrupted_task_continuation(
+                    "terminal-owner",
+                    TaskQuery(type="migration-terminal"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task
+            assert terminal_owner is not None
+            await store.terminalize_task(
+                TaskTerminalizationRequest(
+                    task_id=terminal_owner.id,
+                    worker_id="terminal-owner",
+                    handoff_id=terminal_owner.interrupted_handoff_id,
+                    kind=TaskTerminalKind.COMPLETED,
+                    result={"outcome": "done"},
+                    idempotency_key="migration-terminal-complete",
+                )
+            )
+            return live, historical, current, terminal
+        finally:
+            await store.close()
+
+    live, historical, current, terminal = asyncio.run(seed())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE cayu_task_interrupted_handoff_receipts "
+            "SET task_json = json_remove(task_json, '$.interrupted_handoff_id')"
+        )
+        connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_continuation")
+        connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
+        connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+        connection.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
+        connection.execute("PRAGMA user_version = 75")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    async def verify() -> None:
+        try:
+            task = await migrated.load_task(live.task_id)
+            assert task is not None
+            assert task.interrupted_handoff_id == live.handoff_id
+            for request in (live, historical, current, terminal):
+                receipt = await migrated.load_interrupted_task_handoff_receipt(
+                    request.task_id,
+                    request.handoff_id,
+                )
+                assert receipt is not None
+                assert receipt.task.interrupted_handoff_id == request.handoff_id
+            historical_task = await migrated.load_task(historical.task_id)
+            assert historical_task is not None
+            assert historical_task.interrupted_handoff_id == current.handoff_id
+            terminal_task = await migrated.load_task(terminal.task_id)
+            assert terminal_task is not None
+            assert terminal_task.status is TaskStatus.COMPLETED
+            assert terminal_task.interrupted_handoff_id is None
+            owner = (
+                await migrated.claim_interrupted_task_continuation(
+                    "migration-owner",
+                    TaskQuery(type="migration-live"),
+                    handoff_id=str(uuid4()),
+                )
+            ).task
+            assert owner is not None
+            assert owner.worker_id == "migration-owner"
+            assert owner.interrupted_handoff_id not in {None, live.handoff_id}
+        finally:
+            await migrated.close()
+
+    asyncio.run(verify())
+
+
+def test_sqlite_revision_seventy_six_rejects_ambiguous_handoff_authority(tmp_path) -> None:
+    db_path = tmp_path / "tasks-ambiguous-handoff-migration.sqlite"
+
+    async def seed() -> TaskInterruptedHandoffRequest:
+        store = SQLiteTaskStore(db_path)
+        try:
+            await store.create_task(TaskCreate(task_id="ambiguous-handoff", type="review"))
+            assert await store.claim_task("prior-worker") is not None
+            attached = await store.attach_task(
+                "ambiguous-handoff",
+                session_id="ambiguous-session",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    "ambiguous-handoff",
+                    "ambiguous-session",
+                ),
+                worker_id="prior-worker",
+            )
+            request = _interrupted_handoff_request(
+                attached,
+                handoff_id="ambiguous-generation-a",
+            )
+            await store.release_interrupted_task_worker(request)
+            return request
+        finally:
+            await store.close()
+
+    first = asyncio.run(seed())
+    second, second_sha256 = prepare_interrupted_task_handoff(
+        first.model_copy(update={"handoff_id": "ambiguous-generation-b"})
+    )
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE cayu_task_interrupted_handoff_receipts "
+            "SET task_json = json_remove(task_json, '$.interrupted_handoff_id')"
+        )
+        connection.execute(
+            """
+            INSERT INTO cayu_task_interrupted_handoff_receipts (
+                task_id, handoff_id, request_sha256, request_json, task_json, committed_at
+            )
+            SELECT task_id, ?, ?, ?, task_json, committed_at
+            FROM cayu_task_interrupted_handoff_receipts
+            WHERE task_id = ? AND handoff_id = ?
+            """,
+            (
+                second.handoff_id,
+                second_sha256,
+                json.dumps(second.model_dump(mode="json")),
+                first.task_id,
+                first.handoff_id,
+            ),
+        )
+        connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_continuation")
+        connection.execute("DROP INDEX idx_cayu_tasks_interrupted_handoff_generation")
+        connection.execute("DROP TABLE cayu_task_interrupted_continuation_claims")
+        connection.execute("ALTER TABLE cayu_tasks DROP COLUMN interrupted_handoff_id")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 76")
+        connection.execute("PRAGMA user_version = 75")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="cannot determine one interrupted-task handoff"):
+        SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
 
 
 def test_sqlite_revision_thirty_eight_rejects_conflicting_table_before_recording(

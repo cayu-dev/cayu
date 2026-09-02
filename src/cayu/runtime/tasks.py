@@ -1086,6 +1086,10 @@ class TaskCancellationReconciliationRequest(BaseModel):
 
     task_id: str
     original_worker_id: str
+    original_handoff_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     original_lease_expires_at: datetime
     cancellation_requested_at: datetime
     cancellation_idempotency_key: str
@@ -1101,6 +1105,13 @@ class TaskCancellationReconciliationRequest(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _validate_task_retry_reconciliation_identity(value, info.field_name)
+
+    @field_validator("original_handoff_id")
+    @classmethod
+    def validate_original_handoff_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "original_handoff_id")
 
     @field_validator("cancellation_idempotency_key", "reconciliation_idempotency_key")
     @classmethod
@@ -1168,6 +1179,10 @@ class TaskCancellationReconciliation(BaseModel):
     request_sha256: str
     task_id: str
     original_worker_id: str
+    original_handoff_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     original_lease_expires_at: datetime
     cancellation_requested_at: datetime
     cancellation_idempotency_key: str
@@ -1189,6 +1204,13 @@ class TaskCancellationReconciliation(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _validate_task_retry_reconciliation_identity(value, info.field_name)
+
+    @field_validator("original_handoff_id")
+    @classmethod
+    def validate_original_handoff_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "original_handoff_id")
 
     @field_validator("cancellation_idempotency_key", "reconciliation_idempotency_key")
     @classmethod
@@ -1433,6 +1455,7 @@ class Task(BaseModel):
     available_at: datetime | None = None
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
+    interrupted_handoff_id: str | None = None
     status_reason: str | None = None
     status_payload: dict[str, Any] | None = None
     input: dict[str, Any] = Field(default_factory=dict)
@@ -1486,6 +1509,7 @@ class Task(BaseModel):
         "parent_task_id",
         "assigned_agent_name",
         "worker_id",
+        "interrupted_handoff_id",
         "status_reason",
     )
     @classmethod
@@ -1523,6 +1547,12 @@ class Task(BaseModel):
     def validate_retry_and_work_contract_authority(self) -> Task:
         if self.session_instance_id is not None and self.session_id is None:
             raise ValueError("Task session-instance authority requires a session_id.")
+        if self.interrupted_handoff_id is not None and (
+            self.status is not TaskStatus.RUNNING
+            or self.session_id is None
+            or self.session_instance_id is None
+        ):
+            raise ValueError("Interrupted-handoff lineage requires an attached running task.")
         if self.retry_series is not None:
             _validate_task_retry_reconciliation_identity(self.id, "id")
             if self.worker_id is not None:
@@ -1713,6 +1743,10 @@ class TaskTerminalizationRequest(BaseModel):
 
     task_id: str
     worker_id: str
+    # Exact interrupted-continuation generation. ``None`` is the authority for
+    # ordinary task claims and direct attachments; recovered continuations must
+    # present the non-null generation returned by their claim.
+    handoff_id: str | None = None
     kind: TaskTerminalKind
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -1722,6 +1756,13 @@ class TaskTerminalizationRequest(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("handoff_id")
+    @classmethod
+    def validate_handoff_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "handoff_id")
 
     @field_validator("idempotency_key")
     @classmethod
@@ -1890,10 +1931,91 @@ class TaskInterruptedHandoffReceipt(BaseModel):
             or task.status is not TaskStatus.RUNNING
             or task.session_id != request.session_id
             or task.session_instance_id != request.session_instance_id
+            or task.interrupted_handoff_id != request.handoff_id
             or task.worker_id is not None
             or task.lease_expires_at is not None
         ):
             raise ValueError("Interrupted-task handoff receipt conflicts with its task.")
+        return self
+
+
+class InterruptedTaskContinuationClaimPage(BaseModel):
+    """One bounded continuation scan and its optional atomic task claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    task: Task | None = None
+    next_after: tuple[datetime, str] | None = None
+    scanned_candidates: StrictInt = Field(
+        ge=0,
+        le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    )
+    rejected_candidates: StrictInt = Field(
+        ge=0,
+        le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    )
+    filtered_candidates: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    )
+    replayed: StrictBool = False
+    exhausted: StrictBool
+
+    @field_validator("task", mode="before")
+    @classmethod
+    def copy_claimed_task(cls, value: Task | None) -> Task | None:
+        if value is None:
+            return None
+        if type(value) is not Task:
+            raise TypeError("task must be an exact Task instance.")
+        return copy_task(value)
+
+    @field_validator("next_after", mode="before")
+    @classmethod
+    def validate_next_after(
+        cls,
+        value: tuple[datetime, str] | None,
+    ) -> tuple[datetime, str] | None:
+        copied, _ = prepare_interrupted_task_continuation_claim_page(
+            after=value,
+            limit=1,
+        )
+        return copied
+
+    @model_validator(mode="after")
+    def validate_page(self) -> InterruptedTaskContinuationClaimPage:
+        skipped_candidates = self.rejected_candidates + self.filtered_candidates
+        if self.replayed:
+            if (
+                self.task is None
+                or self.scanned_candidates != 0
+                or skipped_candidates != 0
+                or self.next_after != (self.task.created_at, self.task.id)
+                or self.exhausted
+            ):
+                raise ValueError("A continuation claim replay requires exact live claim evidence.")
+            return self
+        if skipped_candidates > self.scanned_candidates:
+            raise ValueError("Rejected and filtered candidates cannot exceed scanned_candidates.")
+        if self.scanned_candidates == 0:
+            if self.next_after is not None or not self.exhausted:
+                raise ValueError("An empty continuation page must be exhausted without a cursor.")
+        elif self.next_after is None:
+            raise ValueError("A non-empty continuation page requires its last inspected cursor.")
+        if self.task is None:
+            if skipped_candidates != self.scanned_candidates:
+                raise ValueError(
+                    "An unclaimed continuation page must classify every inspected row."
+                )
+        else:
+            expected_cursor = (self.task.created_at, self.task.id)
+            if self.next_after != expected_cursor:
+                raise ValueError("A continuation claim cursor must identify its claimed task.")
+            if skipped_candidates >= self.scanned_candidates:
+                raise ValueError("A claimed continuation page must contain one accepted row.")
+        if not self.exhausted and self.next_after is None:
+            raise ValueError("A non-exhausted continuation page requires a cursor.")
         return self
 
 
@@ -1961,6 +2083,7 @@ class TaskCancellationReconciliationResult(BaseModel):
         terminalization = TaskTerminalizationRequest(
             task_id=reconciliation.task_id,
             worker_id=reconciliation.original_worker_id,
+            handoff_id=reconciliation.original_handoff_id,
             kind=TaskTerminalKind.CANCELLED,
             error=self.task.error,
             idempotency_key=reconciliation.cancellation_idempotency_key,
@@ -3283,6 +3406,53 @@ class TaskStore(ABC):
     async def load_task(self, task_id: str) -> Task | None:
         """Load a task by id."""
 
+    async def load_active_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        """Load exact active attached-worker authority using store time.
+
+        Stores that support worker-owned session resume must override this
+        projection. A stale or mismatched owner raises ``TaskClaimLost`` before
+        the session can admit provider or tool work.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support active attached-worker authority reads."
+        )
+
+    async def load_direct_attached_task_resume(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        """Load a direct workerless attachment with no recovery authority.
+
+        A committed interrupted-handoff generation is reserved for an elected
+        recovery owner and must reject an ordinary ownerless resume.
+        """
+
+        if self.supports_interrupted_task_handoffs:
+            raise NotImplementedError(
+                "Recovery-capable TaskStores must implement an atomic direct "
+                "attached-task resume read."
+            )
+        task = await self.load_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        _require_direct_attached_task_resume(
+            task,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+        return task
+
     @abstractmethod
     async def load_invocation_snapshot(
         self,
@@ -3348,23 +3518,35 @@ class TaskStore(ABC):
 
     @abstractmethod
     async def complete_task(
-        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         """Mark a pending or running task as completed.
 
         If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
-        worker still owns an active lease on the task, so a worker that lost its
-        lease cannot clobber a task another worker has since reclaimed.
+        worker still owns an active lease and exact continuation generation on
+        the task, so a worker that lost its lease cannot clobber a task another
+        worker has since reclaimed.
         """
 
     @abstractmethod
     async def fail_task(
-        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+        self,
+        task_id: str,
+        error: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         """Mark a pending or running task as failed.
 
         If ``worker_id`` is given, the update raises ``TaskClaimLost`` unless that
-        worker still owns an active lease on the task.
+        worker still owns an active lease and exact continuation generation on
+        the task.
         """
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -3427,6 +3609,34 @@ class TaskStore(ABC):
 
         raise NotImplementedError(
             "This TaskStore does not support interrupted-task handoff recovery."
+        )
+
+    async def claim_interrupted_task_continuation(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        handoff_id: str,
+        lease_seconds: int = 300,
+        after: tuple[datetime, str] | None = None,
+        scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    ) -> InterruptedTaskContinuationClaimPage:
+        """Scan one bounded page and lease its first authentic continuation.
+
+        ``handoff_id`` is a caller-generated, one-use claim generation. Supporting
+        stores must first replay an exact still-live claim with the same worker and
+        generation, making commit-before-ack loss recoverable without transferring
+        authority. Otherwise they select only running attached tasks whose current
+        one-use handoff generation names a fully validated committed receipt and
+        that have no live worker lease. Generation consumption and lease publication
+        are one atomic mutation so competing recovery owners cannot invoke the same
+        continuation concurrently. ``after`` and ``scan_limit`` bound a stable
+        creation-order scan. The result advances past rejected authority without
+        allowing one malformed candidate to block later independent work.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support interrupted-task continuation claims."
         )
 
     async def reconcile_task_cancellation(
@@ -3566,6 +3776,7 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
+        handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         """Extend a worker-owned active lease.
@@ -3616,6 +3827,8 @@ class InMemoryTaskStore(TaskStore):
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
         self._tasks: dict[str, Task] = {}
+        self._task_id_by_interrupted_handoff_id: dict[str, str] = {}
+        self._interrupted_continuation_claims: dict[str, tuple[str, str]] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
         self._interrupted_handoff_receipts: dict[
             tuple[str, str], TaskInterruptedHandoffReceipt
@@ -5000,6 +5213,51 @@ class InMemoryTaskStore(TaskStore):
                 return None
             return task.model_copy(deep=True)
 
+    async def load_active_attached_task_worker(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session_instance_id = require_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        async with self._lock:
+            task = self._require_task(task_id)
+            return _require_active_attached_task_worker(
+                task,
+                worker_id=worker_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+                now=datetime.now(UTC),
+            )
+
+    async def load_direct_attached_task_resume(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        session_id = require_clean_nonblank(session_id, "session_id")
+        session_instance_id = require_clean_nonblank(
+            session_instance_id,
+            "session_instance_id",
+        )
+        async with self._lock:
+            return _require_direct_attached_task_resume(
+                self._require_task(task_id),
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+
     async def load_invocation_snapshot(
         self,
         task_id: str,
@@ -5236,7 +5494,12 @@ class InMemoryTaskStore(TaskStore):
             return updated.model_copy(deep=True)
 
     async def complete_task(
-        self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
@@ -5247,10 +5510,16 @@ class InMemoryTaskStore(TaskStore):
                 result=result,
                 error=None,
                 worker_id=worker_id,
+                handoff_id=handoff_id,
             )
 
     async def fail_task(
-        self, task_id: str, error: dict[str, Any], *, worker_id: str | None = None
+        self,
+        task_id: str,
+        error: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
@@ -5261,6 +5530,7 @@ class InMemoryTaskStore(TaskStore):
                 result=None,
                 error=error,
                 worker_id=worker_id,
+                handoff_id=handoff_id,
             )
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -5294,6 +5564,7 @@ class InMemoryTaskStore(TaskStore):
                     "Task is terminal without the matching terminalization receipt."
                 )
             _ensure_owned_active_task_lease(task, request.worker_id)
+            _ensure_task_handoff_authority(task, request.handoff_id)
             _validate_ordinary_task_terminalization_against_cancellation(task, request)
             status = TaskStatus(request.kind.value)
             terminal_task = self._finish_task(
@@ -5302,6 +5573,7 @@ class InMemoryTaskStore(TaskStore):
                 result=request.result,
                 error=request.error,
                 worker_id=request.worker_id,
+                handoff_id=request.handoff_id,
             )
             self._terminalization_receipts[receipt_key] = TaskTerminalizationReceipt(
                 task_id=request.task_id,
@@ -5381,6 +5653,7 @@ class InMemoryTaskStore(TaskStore):
                 update={
                     "worker_id": None,
                     "lease_expires_at": None,
+                    "interrupted_handoff_id": request.handoff_id,
                     "updated_at": committed_at,
                 }
             )
@@ -5438,6 +5711,123 @@ class InMemoryTaskStore(TaskStore):
                 key=lambda task: (task.lease_expires_at, task.id),
             )
             return [copy_task(task) for task in islice(candidates, limit)]
+
+    async def claim_interrupted_task_continuation(
+        self,
+        worker_id: str,
+        query: TaskQuery | None = None,
+        *,
+        handoff_id: str,
+        lease_seconds: int = 300,
+        after: tuple[datetime, str] | None = None,
+        scan_limit: int = _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
+    ) -> InterruptedTaskContinuationClaimPage:
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
+        handoff_id_sha256 = _interrupted_task_continuation_handoff_id_sha256(handoff_id)
+        query = copy_task_query(query)
+        _ensure_claim_query_supported(query)
+        lease_seconds = _validate_positive_int(lease_seconds, "lease_seconds")
+        after, scan_limit = prepare_interrupted_task_continuation_claim_page(
+            after=after,
+            limit=scan_limit,
+        )
+        async with self._lock:
+            now = datetime.now(UTC)
+            prior_claim = self._interrupted_continuation_claims.get(handoff_id_sha256)
+            if prior_claim is not None:
+                existing = self._tasks.get(prior_claim[0])
+                if (
+                    existing is None
+                    or prior_claim[1] != worker_id
+                    or existing.interrupted_handoff_id != handoff_id
+                    or existing.worker_id != worker_id
+                    or existing.status is not TaskStatus.RUNNING
+                    or existing.session_id is None
+                    or existing.session_instance_id is None
+                    or existing.lease_expires_at is None
+                    or existing.lease_expires_at <= now
+                    or not _task_matches_claim_filter(existing, query)
+                ):
+                    raise TaskClaimLost(
+                        "Interrupted-task continuation claim generation is no longer live."
+                    )
+                return InterruptedTaskContinuationClaimPage(
+                    task=existing,
+                    next_after=(existing.created_at, existing.id),
+                    scanned_candidates=0,
+                    rejected_candidates=0,
+                    replayed=True,
+                    exhausted=False,
+                )
+            if handoff_id in self._task_id_by_interrupted_handoff_id:
+                raise TaskClaimLost(
+                    "Interrupted-task continuation claim generation is already in use."
+                )
+            if query.status is not None and query.status is not TaskStatus.RUNNING:
+                return InterruptedTaskContinuationClaimPage(
+                    scanned_candidates=0,
+                    rejected_candidates=0,
+                    exhausted=True,
+                )
+            candidates = [
+                task
+                for task in self._tasks.values()
+                if task.interrupted_handoff_id is not None
+                and task.status is TaskStatus.RUNNING
+                and task.session_id is not None
+                and task.session_instance_id is not None
+                and task.status_reason is None
+                and task.worker_id is None
+                and task.lease_expires_at is None
+                and (after is None or (task.created_at, task.id) > after)
+            ]
+            page = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[:scan_limit]
+            rejected = 0
+            filtered = 0
+            for index, task in enumerate(page):
+                if not _task_matches_claim_filter(task, query):
+                    filtered += 1
+                    continue
+                if self._latest_admission_id_by_task.get(task.id) is not None:
+                    rejected += 1
+                    continue
+                candidate_handoff_id = task.interrupted_handoff_id
+                if candidate_handoff_id is None:
+                    rejected += 1
+                    continue
+                receipt = self._interrupted_handoff_receipts.get((task.id, candidate_handoff_id))
+                if type(receipt) is not TaskInterruptedHandoffReceipt or receipt.task != task:
+                    rejected += 1
+                    continue
+                claimed = task.model_copy(
+                    update={
+                        "worker_id": worker_id,
+                        "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                        "interrupted_handoff_id": handoff_id,
+                        "updated_at": now,
+                    }
+                )
+                self._store_task(claimed)
+                self._interrupted_continuation_claims[handoff_id_sha256] = (
+                    claimed.id,
+                    worker_id,
+                )
+                return InterruptedTaskContinuationClaimPage(
+                    task=claimed,
+                    next_after=(task.created_at, task.id),
+                    scanned_candidates=index + 1,
+                    rejected_candidates=rejected,
+                    filtered_candidates=filtered,
+                    exhausted=index == len(page) - 1 and len(page) < scan_limit,
+                )
+            return InterruptedTaskContinuationClaimPage(
+                next_after=(page[-1].created_at, page[-1].id) if page else None,
+                scanned_candidates=len(page),
+                rejected_candidates=rejected,
+                filtered_candidates=filtered,
+                exhausted=len(page) < scan_limit,
+            )
 
     async def reconcile_task_cancellation(
         self,
@@ -5794,6 +6184,7 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
+        handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -5801,6 +6192,7 @@ class InMemoryTaskStore(TaskStore):
         extend_seconds = _validate_positive_int(extend_seconds, "extend_seconds")
         async with self._lock:
             task = self._require_owned_leased_task(task_id, worker_id)
+            _ensure_task_handoff_authority(task, handoff_id)
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
@@ -5864,6 +6256,10 @@ class InMemoryTaskStore(TaskStore):
                 raise ValueError(f"Task {task.id} is not running.")
             if task.session_id is None:
                 raise ValueError(f"Task {task.id} is not attached to a session.")
+            if task.interrupted_handoff_id is not None:
+                raise TaskInterruptedHandoffConflict(
+                    "Recovery-owned attached tasks must publish an interrupted handoff."
+                )
             if _task_cancellation_requested(task):
                 raise TaskTerminalizationConflict(
                     "Task cancellation is still draining under its current owner."
@@ -6326,6 +6722,7 @@ class InMemoryTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
         worker_id: str | None = None,
+        handoff_id: str | None = None,
         accepted_decision_id: str | None = None,
     ) -> Task:
         updated = self._prepare_finished_task(
@@ -6334,6 +6731,7 @@ class InMemoryTaskStore(TaskStore):
             result=result,
             error=error,
             worker_id=worker_id,
+            handoff_id=handoff_id,
             accepted_decision_id=accepted_decision_id,
             now=datetime.now(UTC),
         )
@@ -6348,6 +6746,7 @@ class InMemoryTaskStore(TaskStore):
         result: dict[str, Any] | None,
         error: dict[str, Any] | None,
         worker_id: str | None,
+        handoff_id: str | None = None,
         accepted_decision_id: str | None,
         now: datetime,
     ) -> Task:
@@ -6356,6 +6755,7 @@ class InMemoryTaskStore(TaskStore):
             if task.worker_id != worker_id:
                 raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
             _ensure_active_task_lease(task, worker_id, now=now)
+            _ensure_task_handoff_authority(task, handoff_id)
         admission_id = self._latest_admission_id_by_task.get(task_id)
         if admission_id is not None and accepted_decision_id is None:
             raise WorkAttemptExecutionClaimLost(
@@ -6423,6 +6823,7 @@ class InMemoryTaskStore(TaskStore):
                 "error": deepcopy(error),
                 "worker_id": None,
                 "lease_expires_at": None,
+                "interrupted_handoff_id": None,
                 "started_at": task.started_at or now,
                 "completed_at": now,
                 "updated_at": now,
@@ -6564,6 +6965,17 @@ class InMemoryTaskStore(TaskStore):
         if task.work_contract is not None:
             task = copy_task(task)
         prior = self._tasks.get(task.id)
+        prior_handoff_id = None if prior is None else prior.interrupted_handoff_id
+        next_handoff_id = task.interrupted_handoff_id
+        if next_handoff_id is not None:
+            indexed_task_id = self._task_id_by_interrupted_handoff_id.get(next_handoff_id)
+            if indexed_task_id is not None and indexed_task_id != task.id:
+                raise TaskClaimLost("Interrupted-task handoff generation is already in use.")
+        if prior_handoff_id != next_handoff_id:
+            if prior_handoff_id is not None:
+                self._task_id_by_interrupted_handoff_id.pop(prior_handoff_id, None)
+            if next_handoff_id is not None:
+                self._task_id_by_interrupted_handoff_id[next_handoff_id] = task.id
         if prior is not None and (
             prior.created_at,
             prior.session_id,
@@ -7054,6 +7466,7 @@ def copy_task(task: Task) -> Task:
         available_at=task.available_at,
         worker_id=task.worker_id,
         lease_expires_at=task.lease_expires_at,
+        interrupted_handoff_id=task.interrupted_handoff_id,
         status_reason=task.status_reason,
         status_payload=(
             None
@@ -7175,7 +7588,11 @@ def prepare_task_terminalization(
         )
     copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
     material = {
-        "schema": "cayu.task-terminalization.v1",
+        "schema": (
+            "cayu.task-terminalization.v1"
+            if copied.handoff_id is None
+            else "cayu.task-terminalization.v2"
+        ),
         "task_id": copied.task_id,
         "idempotency_key": copied.idempotency_key,
         "worker_id": copied.worker_id,
@@ -7183,6 +7600,8 @@ def prepare_task_terminalization(
         "result": copied.result,
         "error": copied.error,
     }
+    if copied.handoff_id is not None:
+        material["handoff_id"] = copied.handoff_id
     request_sha256 = sha256(
         canonical_durable_json_bytes(material, "task_terminalization")
     ).hexdigest()
@@ -7230,13 +7649,14 @@ def interrupted_task_handoff_request(
             "Task does not retain complete interrupted-handoff authority."
         )
     material = {
-        "schema": "cayu.task-interrupted-handoff-id.v1",
+        "schema": "cayu.task-interrupted-handoff-id.v2",
         "task_id": task.id,
         "worker_id": task.worker_id,
         "lease_expires_at": task.lease_expires_at.isoformat(),
         "session_id": task.session_id,
         "session_instance_id": task.session_instance_id,
         "session_run_epoch": session_run_epoch,
+        "prior_handoff_lineage_id": task.interrupted_handoff_id,
     }
     handoff_id = sha256(
         canonical_durable_json_bytes(material, "task_interrupted_handoff_id")
@@ -7281,6 +7701,34 @@ def prepare_interrupted_task_handoff_candidate_page(
             raise TypeError("Interrupted-task handoff cursor timestamp must be a datetime.")
         copied_after = (
             normalize_utc_datetime(lease_expires_at, "after lease_expires_at"),
+            require_clean_nonblank(task_id, "after task_id"),
+        )
+    return copied_after, limit
+
+
+def prepare_interrupted_task_continuation_claim_page(
+    *,
+    after: tuple[datetime, str] | None,
+    limit: int,
+) -> tuple[tuple[datetime, str] | None, int]:
+    """Validate and detach one stable bounded continuation-claim page."""
+
+    limit = _validate_positive_int(limit, "scan_limit")
+    if limit > _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE:
+        raise ValueError(
+            f"scan_limit must be <= {_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE}."
+        )
+    copied_after: tuple[datetime, str] | None = None
+    if after is not None:
+        if type(after) is not tuple or len(after) != 2:
+            raise TypeError(
+                "Interrupted-task continuation cursor must be a timestamp/task-id tuple."
+            )
+        created_at, task_id = after
+        if type(created_at) is not datetime:
+            raise TypeError("Interrupted-task continuation cursor timestamp must be a datetime.")
+        copied_after = (
+            normalize_utc_datetime(created_at, "after created_at"),
             require_clean_nonblank(task_id, "after task_id"),
         )
     return copied_after, limit
@@ -7419,7 +7867,11 @@ def prepare_task_cancellation_reconciliation(
     request_sha256 = sha256(
         canonical_durable_json_bytes(
             {
-                "schema": "cayu.task-cancellation-reconciliation.v1",
+                "schema": (
+                    "cayu.task-cancellation-reconciliation.v1"
+                    if copied.original_handoff_id is None
+                    else "cayu.task-cancellation-reconciliation.v2"
+                ),
                 **request_material,
             },
             "task_cancellation_reconciliation",
@@ -8142,6 +8594,7 @@ def _task_cancellation_terminalization_request(
     return TaskTerminalizationRequest(
         task_id=task.id,
         worker_id=worker_id,
+        handoff_id=task.interrupted_handoff_id,
         kind=TaskTerminalKind.CANCELLED,
         error=error,
         idempotency_key=key,
@@ -8214,6 +8667,7 @@ def _validated_task_cancellation(
     elif (
         task.id != request.task_id
         or task.worker_id != request.original_worker_id
+        or task.interrupted_handoff_id != request.original_handoff_id
         or task.lease_expires_at != request.original_lease_expires_at
         or payload["terminalization_idempotency_key"] != request.cancellation_idempotency_key
     ):
@@ -8295,6 +8749,7 @@ def _reconciled_task_cancellation(
         request_sha256=request_sha256,
         task_id=request.task_id,
         original_worker_id=request.original_worker_id,
+        original_handoff_id=request.original_handoff_id,
         original_lease_expires_at=request.original_lease_expires_at,
         cancellation_requested_at=request.cancellation_requested_at,
         cancellation_idempotency_key=request.cancellation_idempotency_key,
@@ -8330,6 +8785,7 @@ def _reconciled_task_cancellation(
             "error": copy_durable_json_object(terminalization.error, "error"),
             "worker_id": None,
             "lease_expires_at": None,
+            "interrupted_handoff_id": None,
             "started_at": task.started_at or committed_at,
             "completed_at": committed_at,
             "updated_at": committed_at,
@@ -9533,6 +9989,7 @@ async def _terminalize_claimed_task(
             request.task_id,
             request.result,
             worker_id=request.worker_id,
+            handoff_id=request.handoff_id,
         )
     if request.kind is TaskTerminalKind.CANCELLED:
         return await task_store.cancel_task(request.task_id, request.error)
@@ -9542,6 +9999,7 @@ async def _terminalize_claimed_task(
         request.task_id,
         request.error,
         worker_id=request.worker_id,
+        handoff_id=request.handoff_id,
     )
 
 
@@ -10212,6 +10670,75 @@ def _ensure_owned_active_task_lease(
     if task.worker_id != worker_id:
         raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
     _ensure_active_task_lease(task, worker_id, now=now)
+
+
+def _ensure_task_handoff_authority(task: Task, handoff_id: str | None) -> None:
+    """Fence a task mutation to the exact continuation generation.
+
+    A worker identifier is deliberately insufficient: an operator may reuse one
+    stable worker name after a lease handoff. Both ``None`` and non-null values
+    therefore compare exactly against the stored generation.
+    """
+
+    if task.interrupted_handoff_id != handoff_id:
+        raise TaskClaimLost(
+            f"Worker {task.worker_id} does not own task {task.id} handoff generation."
+        )
+
+
+def new_interrupted_task_continuation_handoff_id() -> str:
+    """Create caller-owned authority for one replayable continuation claim."""
+
+    return str(uuid4())
+
+
+def _interrupted_task_continuation_handoff_id_sha256(handoff_id: str) -> str:
+    """Hash one validated claim generation for permanent one-use registration."""
+
+    handoff_id = require_clean_nonblank(handoff_id, "handoff_id")
+    return sha256(handoff_id.encode("utf-8")).hexdigest()
+
+
+def _require_active_attached_task_worker(
+    task: Task,
+    *,
+    worker_id: str,
+    session_id: str,
+    session_instance_id: str,
+    now: datetime,
+) -> Task:
+    """Validate and detach one store-authoritative resume owner snapshot."""
+
+    _ensure_owned_active_task_lease(task, worker_id, now=now)
+    if (
+        task.status is not TaskStatus.RUNNING
+        or task.session_id != session_id
+        or task.session_instance_id != session_instance_id
+    ):
+        raise TaskClaimLost(f"Worker {worker_id} does not own the requested attached task session.")
+    return task.model_copy(deep=True)
+
+
+def _require_direct_attached_task_resume(
+    task: Task,
+    *,
+    session_id: str,
+    session_instance_id: str,
+) -> Task:
+    """Validate a workerless direct attachment with no handoff generation."""
+
+    if (
+        task.status is not TaskStatus.RUNNING
+        or task.session_id != session_id
+        or task.session_instance_id != session_instance_id
+        or task.worker_id is not None
+        or task.lease_expires_at is not None
+        or task.interrupted_handoff_id is not None
+    ):
+        raise TaskClaimLost(
+            "Ordinary resume does not own the requested direct attached task session."
+        )
+    return task.model_copy(deep=True)
 
 
 def _raise_task_claim_attach_error(

@@ -43,11 +43,13 @@ from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
+    TaskInterruptedHandoffRequest,
     TaskOrder,
     TaskRetrySeriesSnapshot,
     TaskStatus,
     TaskTopologyInconsistent,
     TaskTopologyNode,
+    prepare_interrupted_task_handoff,
 )
 from cayu.runtime.work_contracts import WorkContractRef
 from cayu.storage import _session_store_sql as session_store_sql
@@ -57,6 +59,8 @@ from cayu.storage.memory import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
     MAX_KNOWLEDGE_ENTRY_ID_BYTES,
 )
+
+_INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE = 256
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -3886,6 +3890,28 @@ _MIGRATION_STEPS: dict[int, str] = {
             )
         );
     """,
+    76: """
+        CREATE TABLE IF NOT EXISTS cayu_task_interrupted_continuation_claims (
+            handoff_id_sha256 TEXT COLLATE BINARY NOT NULL PRIMARY KEY CHECK (
+                length(handoff_id_sha256) = 64
+                AND handoff_id_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            task_id TEXT COLLATE BINARY NOT NULL,
+            worker_id TEXT COLLATE BINARY NOT NULL,
+            claimed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_interrupted_handoff_continuation
+            ON cayu_tasks(status, created_at, id)
+            WHERE worker_id IS NULL
+              AND lease_expires_at IS NULL
+              AND interrupted_handoff_id IS NOT NULL
+              AND session_id IS NOT NULL
+              AND session_instance_id IS NOT NULL
+              AND status_reason IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_tasks_interrupted_handoff_generation
+            ON cayu_tasks(interrupted_handoff_id)
+            WHERE interrupted_handoff_id IS NOT NULL;
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -4054,6 +4080,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "authored_suite_launch_lane BETWEEN 0 AND 63)",
         ),
     ),
+    76: (("cayu_tasks", "interrupted_handoff_id", "TEXT"),),
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
@@ -4983,6 +5010,123 @@ def _migrate_revision_sixty_two_payloads(connection: sqlite3.Connection) -> None
     _migrate_work_attempt_continuation_authority(connection)
 
 
+def _backfill_interrupted_handoff_generations(connection: sqlite3.Connection) -> None:
+    """Carry unambiguous revision-70 handoff authority into revision 76."""
+
+    cursor: tuple[str, str, str] | None = None
+    active_task_id: str | None = None
+    active_current_task: Task | None = None
+    active_matching_generations: list[str] = []
+
+    def finalize_active_task() -> None:
+        if active_task_id is None or not active_matching_generations:
+            return
+        if len(active_matching_generations) != 1:
+            raise RuntimeError(
+                "SQLite revision-76 migration cannot determine one interrupted-task "
+                f"handoff generation for task {active_task_id!r}. Resolve the ambiguous "
+                "recovery receipts before migrating."
+            )
+        connection.execute(
+            "UPDATE cayu_tasks SET interrupted_handoff_id = ? WHERE id = ?",
+            (active_matching_generations[0], active_task_id),
+        )
+
+    while True:
+        after_sql = ""
+        after_params: tuple[object, ...] = ()
+        if cursor is not None:
+            after_sql = "WHERE (task_id, committed_at, handoff_id) > (?, ?, ?)"
+            after_params = cursor
+        receipts = connection.execute(
+            f"""
+            SELECT task_id, handoff_id, request_sha256, request_json, task_json,
+                   committed_at
+            FROM cayu_task_interrupted_handoff_receipts
+            {after_sql}
+            ORDER BY task_id, committed_at, handoff_id
+            LIMIT ?
+            """,
+            (*after_params, _INTERRUPTED_HANDOFF_MIGRATION_BATCH_SIZE),
+        ).fetchall()
+        if not receipts:
+            break
+        task_ids = list(dict.fromkeys(str(row["task_id"]) for row in receipts))
+        placeholders = ", ".join("?" for _ in task_ids)
+        current_tasks = {
+            task.id: task
+            for task in (
+                task_from_row(row)
+                for row in connection.execute(
+                    f"SELECT * FROM cayu_tasks WHERE id IN ({placeholders})",
+                    task_ids,
+                )
+            )
+        }
+        receipt_updates: list[tuple[str, str, str]] = []
+        for receipt_row in receipts:
+            task_id = str(receipt_row["task_id"])
+            if task_id != active_task_id:
+                finalize_active_task()
+                active_task_id = task_id
+                active_current_task = current_tasks.get(task_id)
+                active_matching_generations = []
+            try:
+                request = TaskInterruptedHandoffRequest.model_validate(
+                    json.loads(receipt_row["request_json"])
+                )
+                request, request_sha256 = prepare_interrupted_task_handoff(request)
+                receipt_task = Task.model_validate(json.loads(receipt_row["task_json"]))
+                if (
+                    request.task_id != task_id
+                    or request.handoff_id != receipt_row["handoff_id"]
+                    or request_sha256 != receipt_row["request_sha256"]
+                    or receipt_task.id != request.task_id
+                    or receipt_task.status is not TaskStatus.RUNNING
+                    or receipt_task.session_id != request.session_id
+                    or receipt_task.session_instance_id != request.session_instance_id
+                    or receipt_task.worker_id is not None
+                    or receipt_task.lease_expires_at is not None
+                    or receipt_task.interrupted_handoff_id is not None
+                ):
+                    raise ValueError("receipt conflicts with its pre-76 handoff authority")
+            except Exception as exc:
+                raise RuntimeError(
+                    "SQLite revision-76 migration found malformed interrupted-task "
+                    f"handoff authority for task {task_id!r}. Restore the database "
+                    "from known-good recovery evidence."
+                ) from exc
+            upgraded_task = receipt_task.model_copy(
+                update={"interrupted_handoff_id": request.handoff_id},
+                deep=True,
+            )
+            upgraded_task = Task.model_validate(upgraded_task.model_dump(mode="python"))
+            receipt_updates.append(
+                (
+                    json_dumps(upgraded_task.model_dump(mode="json", warnings=False)),
+                    task_id,
+                    request.handoff_id,
+                )
+            )
+            if active_current_task == receipt_task:
+                active_matching_generations.append(request.handoff_id)
+        connection.executemany(
+            """
+            UPDATE cayu_task_interrupted_handoff_receipts
+            SET task_json = ?
+            WHERE task_id = ? AND handoff_id = ?
+            """,
+            receipt_updates,
+        )
+        last = receipts[-1]
+        cursor = (
+            str(last["task_id"]),
+            str(last["committed_at"]),
+            str(last["handoff_id"]),
+        )
+    finalize_active_task()
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -4995,6 +5139,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     37: _migrate_revision_thirty_seven_knowledge_fts,
     59: _backfill_session_instance_ids,
     62: _migrate_revision_sixty_two_payloads,
+    76: _backfill_interrupted_handoff_generations,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(
@@ -5549,6 +5694,8 @@ def reconcile_schema(
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
         _validate_interrupted_task_handoff_schema(connection)
+    if current.revision >= 76:
+        _validate_interrupted_handoff_generation_column(connection)
     if app_min_supported >= 39:
         _validate_task_invocation_column(connection)
     if app_min_supported >= 41:
@@ -7913,6 +8060,75 @@ def _validate_interrupted_task_handoff_schema(connection: sqlite3.Connection) ->
         )
 
 
+def _validate_interrupted_handoff_generation_column(connection: sqlite3.Connection) -> None:
+    task_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_tasks)")
+    }
+    index_name = "idx_cayu_tasks_interrupted_handoff_continuation"
+    index = connection.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index_name,),
+    ).fetchone()
+    index_columns = tuple(
+        str(row[2]) for row in connection.execute(f"PRAGMA index_info({index_name})")
+    )
+    normalized_index_sql = _normalize_sqlite_schema_sql(None if index is None else index[1])
+    generation_index_name = "idx_cayu_tasks_interrupted_handoff_generation"
+    generation_index = connection.execute(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (generation_index_name,),
+    ).fetchone()
+    generation_index_columns = tuple(
+        str(row[2]) for row in connection.execute(f"PRAGMA index_info({generation_index_name})")
+    )
+    normalized_generation_index_sql = _normalize_sqlite_schema_sql(
+        None if generation_index is None else generation_index[1]
+    )
+    claim_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(
+            "PRAGMA table_info(cayu_task_interrupted_continuation_claims)"
+        )
+    )
+    expected_claim_columns = (
+        ("handoff_id_sha256", "TEXT", 1, 1),
+        ("task_id", "TEXT", 1, 0),
+        ("worker_id", "TEXT", 1, 0),
+        ("claimed_at", "TEXT", 1, 0),
+    )
+    claim_foreign_keys = connection.execute(
+        "PRAGMA foreign_key_list(cayu_task_interrupted_continuation_claims)"
+    ).fetchall()
+    required_predicate_fragments = (
+        "where worker_id is null",
+        "lease_expires_at is null",
+        "interrupted_handoff_id is not null",
+        "session_id is not null",
+        "session_instance_id is not null",
+        "status_reason is null",
+    )
+    if (
+        task_columns.get("interrupted_handoff_id") != ("TEXT", 0)
+        or index is None
+        or index[0] != "cayu_tasks"
+        or index_columns != ("status", "created_at", "id")
+        or any(fragment not in normalized_index_sql for fragment in required_predicate_fragments)
+        or generation_index is None
+        or generation_index[0] != "cayu_tasks"
+        or generation_index_columns != ("interrupted_handoff_id",)
+        or "create unique index" not in normalized_generation_index_sql
+        or "where interrupted_handoff_id is not null" not in normalized_generation_index_sql
+        or claim_columns != expected_claim_columns
+        or claim_foreign_keys
+    ):
+        raise RuntimeError(
+            "SQLite task handoff generation or bounded continuation index conflicts with Cayu's "
+            "revision-76 durability contract. Run `cayu storage migrate` or restore "
+            "the database from a known-good backup."
+        )
+
+
 def _validate_task_invocation_column(connection: sqlite3.Connection) -> None:
     columns = {
         str(row[1]): (str(row[2]).upper(), int(row[3]))
@@ -9683,6 +9899,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_run_trial_checkpoint_schema(connection)
         if rev.revision == 75:
             _validate_revision_75_knowledge_activation_schema(connection)
+        if rev.revision == 76:
+            _validate_interrupted_handoff_generation_column(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
@@ -9869,6 +10087,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         format_optional_datetime(task.available_at),
         task.worker_id,
         format_optional_datetime(task.lease_expires_at),
+        task.interrupted_handoff_id,
         task.status_reason,
         None if task.status_payload is None else json_dumps(task.status_payload),
         json_dumps(task.input),
@@ -9910,6 +10129,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
         available_at=parse_optional_datetime(row["available_at"]),
         worker_id=row["worker_id"],
         lease_expires_at=parse_optional_datetime(row["lease_expires_at"]),
+        interrupted_handoff_id=row["interrupted_handoff_id"],
         status_reason=row["status_reason"],
         status_payload=(None if status_payload_json is None else json.loads(status_payload_json)),
         input=json.loads(row["input_json"]),

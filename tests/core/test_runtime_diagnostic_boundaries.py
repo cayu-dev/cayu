@@ -70,6 +70,7 @@ from cayu.runtime._binding_cleanup import (
     is_containable_cleanup_error,
     record_binding_cleanup_failure,
 )
+from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
 from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
 from cayu.runtime._environment_lifecycle import (
     FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES,
@@ -242,6 +243,38 @@ def _run_linked_task_failure(error: Exception) -> tuple[list[Event], object, obj
     return asyncio.run(run())
 
 
+def _assert_linked_runtime_task_failure(
+    *,
+    task: Any,
+    session: Any,
+    expected_task_diagnostic: dict[str, Any],
+    expected_session_diagnostic: dict[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the replay marker while keeping diagnostic assertions exact."""
+
+    assert task.error is not None
+    task_error = dict(task.error)
+    marker = task_error.pop("runtime_task_failure")
+    assert task_error == expected_task_diagnostic
+    identity = runtime_task_failure_identity_from_task(
+        task,
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+    )
+    assert identity is not None
+    assert marker["failure_id"] == identity.failure_id
+    assert marker["session_failure_payload"] == {
+        **expected_session_diagnostic,
+        "runtime_task_failure_id": identity.failure_id,
+    }
+    assert marker["turn_completed_payload"]["status"] == "failed"
+    assert marker["turn_completed_payload"]["interaction_ids"] == [identity.interaction_id]
+    return {
+        **marker["session_failure_payload"],
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: identity.execution_profile_fingerprint,
+    }
+
+
 def test_terminal_failure_ignores_provider_controlled_binding_payload_attribute() -> None:
     error = RuntimeError("actual extension failure")
     error.__dict__["_cayu_binding_finalize_safe_payload"] = {
@@ -259,18 +292,23 @@ def test_terminal_failure_ignores_provider_controlled_binding_payload_attribute(
 
     assert task is not None
     assert task.status is TaskStatus.FAILED
-    assert task.error == {
-        "message": "actual extension failure",
-        "type": "RuntimeError",
-        "session_id": "sess_nonportable_session_failure",
-    }
     assert session is not None
     assert session.status is SessionStatus.FAILED
+    expected_terminal_payload = _assert_linked_runtime_task_failure(
+        task=task,
+        session=session,
+        expected_task_diagnostic={
+            "message": "actual extension failure",
+            "type": "RuntimeError",
+            "session_id": "sess_nonportable_session_failure",
+        },
+        expected_session_diagnostic={
+            "error": "actual extension failure",
+            "error_type": "RuntimeError",
+        },
+    )
     terminal = next(event for event in events if event.type == EventType.SESSION_FAILED)
-    assert terminal.payload == {
-        "error": "actual extension failure",
-        "error_type": "RuntimeError",
-    }
+    assert terminal.payload == expected_terminal_payload
 
 
 def test_runtime_binding_payload_handoff_survives_cancellation_aggregation() -> None:
@@ -1178,25 +1216,30 @@ def test_session_failure_terminalizes_linked_task_with_nonportable_store_error(
 
     assert task is not None
     assert task.status is TaskStatus.FAILED
-    assert task.error == {
-        "message": "Operation failed with a non-portable diagnostic.",
-        "type": "RuntimeError",
-        "durable_value_error_code": error_code,
-        "durable_value_error_path": "$",
-        "session_id": "sess_nonportable_session_failure",
-    }
     assert session is not None
     assert session.status is SessionStatus.FAILED
+    expected_terminal_payload = _assert_linked_runtime_task_failure(
+        task=task,
+        session=session,
+        expected_task_diagnostic={
+            "message": "Operation failed with a non-portable diagnostic.",
+            "type": "RuntimeError",
+            "durable_value_error_code": error_code,
+            "durable_value_error_path": "$",
+            "session_id": "sess_nonportable_session_failure",
+        },
+        expected_session_diagnostic={
+            "error": "Operation failed with a non-portable diagnostic.",
+            "error_type": "RuntimeError",
+            "durable_value_error_code": error_code,
+            "durable_value_error_path": "$",
+        },
+    )
     task_failed = [event for event in events if event.type == EventType.TASK_FAILED]
     session_failed = [event for event in events if event.type == EventType.SESSION_FAILED]
     assert len(task_failed) == 1
     assert len(session_failed) == 1
-    assert session_failed[0].payload == {
-        "error": "Operation failed with a non-portable diagnostic.",
-        "error_type": "RuntimeError",
-        "durable_value_error_code": error_code,
-        "durable_value_error_path": "$",
-    }
+    assert session_failed[0].payload == expected_terminal_payload
 
 
 @pytest.mark.parametrize("rejected_name", ["bad\u0000hook", "bad\ud800hook"])
@@ -1376,6 +1419,8 @@ def test_terminal_hook_nonportable_failure_is_recorded_without_rewriting_session
     failed = next(event for event in events if event.type == EventType.HOOK_FAILED)
     assert failed.payload == {
         "hook_name": "FailingHook",
+        "hook_index": 0,
+        "hook_invocation_id": failed.payload["hook_invocation_id"],
         "scope": "app",
         "phase": "after_session_completed",
         "terminal_event_id": PRIVATE_EVENT_AUTHORITY,

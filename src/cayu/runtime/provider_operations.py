@@ -165,6 +165,8 @@ class ProviderOperationResolutionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     stage_id: str
     expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     action: ProviderOperationResolutionAction
@@ -176,6 +178,19 @@ class ProviderOperationResolutionRequest(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ProviderOperationResolutionRequest:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("reason")
     @classmethod
@@ -206,6 +221,8 @@ def copy_provider_operation_resolution_request(
         raise TypeError("request must be a ProviderOperationResolutionRequest.")
     return ProviderOperationResolutionRequest(
         session_id=request.session_id if session_id is None else session_id,
+        task_worker_id=request.task_worker_id,
+        task_handoff_id=request.task_handoff_id,
         stage_id=request.stage_id,
         expected_run_epoch=request.expected_run_epoch,
         action=request.action,
@@ -252,6 +269,7 @@ def prepare_provider_operation_resolution_request(
         )
     return ProviderOperationResolutionRequest(
         session_id=copied.session_id,
+        task_worker_id=copied.task_worker_id,
         stage_id=copied.stage_id,
         expected_run_epoch=copied.expected_run_epoch,
         action=copied.action,
@@ -325,10 +343,20 @@ class ProviderOperationPendingDisposition(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    execution_claimed: bool = False
+    execution_task_worker_id: str | None = None
+    execution_task_handoff_id: str | None = None
 
     @field_validator("session_id", "stage_id", "resolution_id", "logical_step_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("execution_task_worker_id", "execution_task_handoff_id")
+    @classmethod
+    def validate_execution_task_authority(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return require_durable_clean_nonblank(value, info.field_name)
 
     @model_validator(mode="after")
@@ -340,7 +368,54 @@ class ProviderOperationPendingDisposition(BaseModel):
                 )
         elif self.target_dispatch_ordinal is not None:
             raise ValueError("Fail provider-operation disposition cannot target a dispatch.")
+        if not self.execution_claimed and (
+            self.execution_task_worker_id is not None or self.execution_task_handoff_id is not None
+        ):
+            raise ValueError("Unclaimed provider-operation execution cannot name task authority.")
+        if self.execution_task_handoff_id is not None and self.execution_task_worker_id is None:
+            raise ValueError(
+                "Provider-operation execution handoff authority requires a task worker."
+            )
         return self
+
+
+def checkpoint_with_provider_operation_disposition_execution_owner(
+    checkpoint: dict[str, Any] | None,
+    *,
+    expected: ProviderOperationPendingDisposition,
+    task_worker_id: str | None,
+    task_handoff_id: str | None,
+) -> dict[str, Any]:
+    """Bind one pending disposition to its current execution owner by exact CAS."""
+
+    if type(expected) is not ProviderOperationPendingDisposition:
+        raise TypeError("expected must be a ProviderOperationPendingDisposition.")
+    if task_worker_id is not None:
+        task_worker_id = require_durable_clean_nonblank(task_worker_id, "task_worker_id")
+    if task_handoff_id is not None:
+        task_handoff_id = require_durable_clean_nonblank(
+            task_handoff_id,
+            "task_handoff_id",
+        )
+    if task_handoff_id is not None and task_worker_id is None:
+        raise ValueError("Provider-operation execution handoff authority requires a task worker.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    current = pending_provider_operation_disposition_from_checkpoint(updated)
+    if current is None or current != expected:
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation execution ownership changed before it was claimed."
+        )
+    claimed = current.model_copy(
+        update={
+            "execution_claimed": True,
+            "execution_task_worker_id": task_worker_id,
+            "execution_task_handoff_id": task_handoff_id,
+        }
+    )
+    updated[_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY] = claimed.model_dump(
+        mode="json"
+    )
+    return updated
 
 
 class ProviderOperationResolutionResult(BaseModel):
@@ -1442,7 +1517,12 @@ def provider_operation_started_event_id(start_id: str) -> str:
 
 def provider_operation_resolution_outcome_event_id(
     resolution_id: str,
-    outcome: Literal["model_error", "interaction_failed", "session_failed"],
+    outcome: Literal[
+        "model_error",
+        "task_failed",
+        "interaction_failed",
+        "session_failed",
+    ],
 ) -> str:
     """Return one stable event identity for fail-resolution terminalization."""
 
@@ -1594,7 +1674,10 @@ def provider_operation_resolution_request_digest(
 
     if type(request) is not ProviderOperationResolutionRequest:
         raise TypeError("request must be a ProviderOperationResolutionRequest.")
-    material = request.model_dump(mode="json", exclude={"resolved_by"})
+    material = request.model_dump(
+        mode="json",
+        exclude={"resolved_by", "task_worker_id"},
+    )
     material["resolved_by"] = resolution_actor_payload(request.resolved_by)
     return sha256(
         canonical_durable_json_bytes(material, "provider_operation_resolution_request")
@@ -2689,6 +2772,7 @@ __all__ = [
     "ProviderOperationUnavailableReason",
     "RecoverableProviderOperation",
     "RecoverableProviderOperationStart",
+    "checkpoint_with_provider_operation_disposition_execution_owner",
     "clear_pending_provider_operation_disposition",
     "copy_provider_operation_resolution_metadata",
     "copy_provider_operation_resolution_request",

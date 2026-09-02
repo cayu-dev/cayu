@@ -78,10 +78,16 @@ class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
         result: dict[str, Any],
         *,
         worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         if self._terminal_status is TaskStatus.COMPLETED:
             await self._await_concurrent_terminal_calls()
-        return await super().complete_task(task_id, result, worker_id=worker_id)
+        return await super().complete_task(
+            task_id,
+            result,
+            worker_id=worker_id,
+            handoff_id=handoff_id,
+        )
 
     async def fail_task(
         self,
@@ -89,10 +95,16 @@ class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
         error: dict[str, Any],
         *,
         worker_id: str | None = None,
+        handoff_id: str | None = None,
     ) -> Task:
         if self._terminal_status is TaskStatus.FAILED:
             await self._await_concurrent_terminal_calls()
-        return await super().fail_task(task_id, error, worker_id=worker_id)
+        return await super().fail_task(
+            task_id,
+            error,
+            worker_id=worker_id,
+            handoff_id=handoff_id,
+        )
 
     async def _await_concurrent_terminal_calls(self) -> None:
         self._terminal_calls += 1

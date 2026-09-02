@@ -336,6 +336,7 @@ async def _handle_with_heartbeat(
             worker_id,
             lease_seconds,
             stop_heartbeat,
+            handoff_id=task.interrupted_handoff_id,
             enforce_retry_deadline=(
                 task.retry_series is not None and task.retry_series.elapsed_deadline is not None
             ),
@@ -1608,6 +1609,7 @@ async def _heartbeat_until(
     lease_seconds: int,
     stop: asyncio.Event,
     *,
+    handoff_id: str | None = None,
     enforce_retry_deadline: bool = False,
 ) -> _TaskHeartbeatOutcome:
     interval = min(lease_seconds / 3, 1.0)
@@ -1618,6 +1620,7 @@ async def _heartbeat_until(
             updated = await task_store.heartbeat(
                 task_id,
                 worker_id,
+                handoff_id=handoff_id,
                 extend_seconds=lease_seconds,
             )
             if updated is not None and (

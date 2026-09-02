@@ -6894,6 +6894,30 @@
           "minLength": 1,
           "title": "Stage Id",
           "type": "string"
+        },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
         }
       },
       "required": [
@@ -7039,6 +7063,30 @@
               "type": "null"
             }
           ]
+        },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
         },
         "thinking": {
           "anyOf": [
@@ -7507,7 +7555,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "40",
+          "default": "42",
           "title": "Contract Version",
           "type": "string"
         },
@@ -9237,6 +9285,30 @@
             }
           ]
         },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
+        },
         "thinking": {
           "anyOf": [
             {
@@ -9400,6 +9472,30 @@
               "type": "null"
             }
           ]
+        },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
         },
         "thinking": {
           "anyOf": [
@@ -9836,6 +9932,30 @@
               "type": "null"
             }
           ]
+        },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
         },
         "thinking": {
           "anyOf": [
@@ -10945,6 +11065,30 @@
             }
           ]
         },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
+        },
         "thinking": {
           "anyOf": [
             {
@@ -11082,6 +11226,30 @@
             }
           ]
         },
+        "task_handoff_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Handoff Id"
+        },
+        "task_worker_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Worker Id"
+        },
         "thinking": {
           "anyOf": [
             {
@@ -11168,7 +11336,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "40",
+          "default": "42",
           "title": "Contract Version",
           "type": "string"
         }

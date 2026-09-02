@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
@@ -43,6 +43,8 @@ class ToolRoundRecoveryRequest(BaseModel):
     )
 
     session_id: str
+    task_worker_id: str | None = None
+    task_handoff_id: str | None = None
     round_id: str
     tool_call_id: str
     outcome: ToolApprovalRecoveryOutcome
@@ -67,6 +69,19 @@ class ToolRoundRecoveryRequest(BaseModel):
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("task_worker_id", "task_handoff_id")
+    @classmethod
+    def validate_task_worker_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task continuation authority")
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ToolRoundRecoveryRequest:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
     @field_validator("message")
     @classmethod
@@ -124,6 +139,8 @@ def copy_tool_round_recovery_request(
         raise TypeError("Tool round recovery requires a ToolRoundRecoveryRequest.")
     return ToolRoundRecoveryRequest(
         session_id=request.session_id,
+        task_worker_id=request.task_worker_id,
+        task_handoff_id=request.task_handoff_id,
         round_id=request.round_id,
         tool_call_id=request.tool_call_id,
         outcome=request.outcome,

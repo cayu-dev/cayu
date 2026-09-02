@@ -1824,6 +1824,8 @@ class ExecutionProfileAdoptionBody(BaseModel):
 
 class ResumeBody(_BoundedControlPlanePromptBody):
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     prompt: NonBlankString
     profile_adoption: ExecutionProfileAdoptionBody | None = None
     max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
@@ -1837,6 +1839,12 @@ class ResumeBody(_BoundedControlPlanePromptBody):
     @classmethod
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ResumeBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
 
 def _copy_control_plane_metadata(value: Any) -> dict[str, Any]:
@@ -2008,6 +2016,8 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
     """
 
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     approval_id: NonBlankString
     tool_round_id: NonBlankString
     tool_call_id: NonBlankString
@@ -2029,11 +2039,19 @@ class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
             return None
         return copy_request_budget_limits(value)
 
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ToolApprovalBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
+
 
 class ProviderOperationResolutionBody(_BoundedControlPlaneMetadataBody):
     """Explicit retry-or-fail disposition for unavailable provider work."""
 
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     stage_id: NonBlankString = Field(max_length=256)
     expected_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     action: ProviderOperationResolutionAction
@@ -2047,6 +2065,12 @@ class ProviderOperationResolutionBody(_BoundedControlPlaneMetadataBody):
         bounded = _copy_control_plane_metadata(value)
         return copy_provider_operation_resolution_metadata(bounded)
 
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ProviderOperationResolutionBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
+
 
 class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering an approved tool call with an unknown result.
@@ -2058,6 +2082,8 @@ class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
     """
 
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     approval_id: NonBlankString
     tool_round_id: NonBlankString
     tool_call_id: NonBlankString
@@ -2082,6 +2108,12 @@ class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
             return None
         return copy_request_budget_limits(value)
 
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ToolApprovalRecoveryBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
+
 
 class ToolRoundRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering a crashed ordinary tool call with an operator outcome.
@@ -2093,6 +2125,8 @@ class ToolRoundRecoveryBody(_BoundedControlPlaneMetadataBody):
     """
 
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     round_id: NonBlankString
     tool_call_id: NonBlankString
     outcome: ToolApprovalRecoveryOutcome
@@ -2116,6 +2150,12 @@ class ToolRoundRecoveryBody(_BoundedControlPlaneMetadataBody):
             return None
         return copy_request_budget_limits(value)
 
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> ToolRoundRecoveryBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
+
 
 class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
     """Body for answering a session paused by ``ask_user``.
@@ -2127,6 +2167,8 @@ class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
     """
 
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     input_id: NonBlankString
     answer: NonBlankString
     structured: dict[str, Any] | None = None
@@ -2147,6 +2189,12 @@ class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
             return None
         return copy_request_budget_limits(value)
 
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> UserInputResolveBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
+
 
 class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering a user-input round stuck on ``manual_recovery_required``.
@@ -2158,6 +2206,8 @@ class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
     """
 
     session_id: NonBlankString
+    task_worker_id: NonBlankString | None = None
+    task_handoff_id: NonBlankString | None = None
     input_id: NonBlankString
     answer: NonBlankString
     tool_call_id: NonBlankString
@@ -2181,6 +2231,12 @@ class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
         if value is None:
             return None
         return copy_request_budget_limits(value)
+
+    @model_validator(mode="after")
+    def validate_task_handoff_authority(self) -> UserInputRecoveryBody:
+        if self.task_handoff_id is not None and self.task_worker_id is None:
+            raise ValueError("task_handoff_id requires task_worker_id.")
+        return self
 
 
 def _request_actor(
@@ -9189,6 +9245,8 @@ def create_router(
 
         request = ResumeRequest(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             messages=[Message.text("user", body.prompt)],
             profile_adoption=profile_adoption,
             max_steps=body.max_steps,
@@ -9393,6 +9451,8 @@ def create_router(
             )
         request = ProviderOperationResolutionRequest(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             stage_id=body.stage_id,
             expected_run_epoch=body.expected_run_epoch,
             action=body.action,
@@ -9439,6 +9499,8 @@ def create_router(
 
         request = ToolApprovalRequest(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             approval_id=await _resolve_public_linkage(
                 session_id=session_id,
                 value=body.approval_id,
@@ -9506,6 +9568,8 @@ def create_router(
 
         request = ToolApprovalRecoveryRequest(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             approval_id=await _resolve_public_linkage(
                 session_id=session_id,
                 value=body.approval_id,
@@ -9576,6 +9640,8 @@ def create_router(
 
         request = ToolRoundRecoveryRequest(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             round_id=await _resolve_public_linkage(
                 session_id=session_id,
                 value=body.round_id,
@@ -9641,6 +9707,8 @@ def create_router(
 
         response = UserInputResponse(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             input_id=await _resolve_public_linkage(
                 session_id=session_id,
                 value=body.input_id,
@@ -9699,6 +9767,8 @@ def create_router(
 
         request = UserInputRecoveryRequest(
             session_id=body.session_id,
+            task_worker_id=body.task_worker_id,
+            task_handoff_id=body.task_handoff_id,
             input_id=await _resolve_public_linkage(
                 session_id=session_id,
                 value=body.input_id,

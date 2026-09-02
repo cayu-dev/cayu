@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Literal, NoReturn, TypeVar
+from typing import Any, Literal, NoReturn, TypeVar, cast
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -125,6 +125,23 @@ from cayu.runtime._binding_cleanup import binding_finalize_explicit_cancellation
 from cayu.runtime._child_session_identity import (
     ChildSessionKind,
     generate_child_session_id,
+)
+from cayu.runtime._continuation_task_failure import (
+    ApprovalTaskFailureIdentity,
+    RuntimeTaskFailureIdentity,
+    approval_task_failure_payload,
+    approval_task_failure_receipt_matches,
+    approval_task_terminalization_idempotency_key,
+    load_direct_runtime_task_failure_replay,
+    load_direct_task_failure_replay,
+    provider_operation_task_failure_payload,
+    runtime_task_failure_event_id,
+    runtime_task_failure_identity_from_task,
+    runtime_task_failure_payload,
+    runtime_task_failure_receipt_matches,
+    runtime_task_failure_session_payload,
+    runtime_task_failure_turn_payload,
+    runtime_task_terminalization_idempotency_key,
 )
 from cayu.runtime._diagnostics import (
     ExceptionDiagnostic,
@@ -624,6 +641,7 @@ from cayu.runtime.targeted_tool_projection import (
 )
 from cayu.runtime.tasks import (
     Task,
+    TaskClaimLost,
     TaskCompletionDecisionRequired,
     TaskQuery,
     TaskStatus,
@@ -634,6 +652,7 @@ from cayu.runtime.tasks import (
     _task_session_instance_for_attachment,
     _terminalize_claimed_task,
     copy_task,
+    prepare_task_terminalization,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_discovery import (
@@ -741,6 +760,25 @@ class _ExpiredIncompleteRecoveryClaim(Exception):
 
 class SessionCompactionAttemptSuperseded(RuntimeError):
     """A recovered compaction attempt owns the durable operation claim."""
+
+
+class _TerminalRuntimeHookClaimState(StrEnum):
+    CLAIMED = "claimed"
+    SETTLED = "settled"
+    IN_PROGRESS = "in_progress"
+
+
+@dataclass(frozen=True)
+class _TerminalRuntimeHookClaim:
+    state: _TerminalRuntimeHookClaimState
+    started_event: Event | None = None
+
+    def __post_init__(self) -> None:
+        if self.state is _TerminalRuntimeHookClaimState.CLAIMED:
+            if type(self.started_event) is not Event:
+                raise TypeError("A claimed terminal runtime hook requires its started event.")
+        elif self.started_event is not None:
+            raise ValueError("An unowned terminal runtime hook cannot expose a started event.")
 
 
 _RESUMABLE_SESSION_STATUSES = {
@@ -4198,6 +4236,186 @@ def _runtime_hook_event(
     )
 
 
+def _terminal_runtime_hook_event_id(
+    *,
+    session: Session,
+    terminal_event: Event,
+    phase: RuntimeHookPhase,
+    scope: str,
+    hook_index: int,
+    outcome: Literal["started", "completed", "failed"],
+) -> str:
+    """Return one content-addressed lifecycle identity for a terminal hook slot."""
+
+    if not isinstance(phase, RuntimeHookPhase):
+        raise TypeError("phase must be a RuntimeHookPhase.")
+    if type(hook_index) is not int or hook_index < 0:
+        raise ValueError("hook_index must be a non-negative integer.")
+    scope = require_clean_nonblank(scope, "runtime_hook.scope")
+    if scope not in {"app", "agent"}:
+        raise ValueError("Terminal runtime hook scope must be 'app' or 'agent'.")
+    material = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.terminal-runtime-hook.v1",
+            "session_id": require_clean_nonblank(session.id, "session.id"),
+            "terminal_event_id": require_clean_nonblank(
+                terminal_event.id,
+                "terminal_event.id",
+            ),
+            "terminal_event_type": str(terminal_event.type),
+            "phase": phase.value,
+            "scope": scope,
+            "hook_index": hook_index,
+        },
+        "terminal_runtime_hook_event_id",
+    )
+    digest = hashlib.sha256(material).hexdigest()
+    return f"terminal-runtime-hook:v1:{digest}:{outcome}"
+
+
+def _terminal_runtime_hook_event(
+    *,
+    event_type: EventType,
+    outcome: Literal["started", "completed", "failed"],
+    hook_invocation_id: str,
+    hook_index: int,
+    hook_name: str,
+    scope: str,
+    phase: RuntimeHookPhase,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+    terminal_event: Event,
+    payload: dict[str, Any],
+    execution_profile: ExecutionProfileIdentity | None = None,
+) -> Event:
+    """Build one claim-bound terminal-hook lifecycle event."""
+
+    expected_event_type = {
+        "started": EventType.HOOK_STARTED,
+        "completed": EventType.HOOK_COMPLETED,
+        "failed": EventType.HOOK_FAILED,
+    }[outcome]
+    if event_type != expected_event_type:
+        raise ValueError("Terminal runtime hook outcome does not match its event type.")
+    raw_hook_invocation_id = require_clean_nonblank(
+        hook_invocation_id,
+        "hook_invocation_id",
+    )
+    parsed_hook_invocation_id = UUID(raw_hook_invocation_id)
+    if (
+        parsed_hook_invocation_id.version != 4
+        or str(parsed_hook_invocation_id) != raw_hook_invocation_id
+    ):
+        raise ValueError("hook_invocation_id must be a canonical UUID4.")
+    if type(hook_index) is not int or hook_index < 0:
+        raise ValueError("hook_index must be a non-negative integer.")
+    event = _runtime_hook_event(
+        event_type=event_type,
+        hook_name=hook_name,
+        scope=scope,
+        phase=phase,
+        session=session,
+        registered_agent=registered_agent,
+        registered_environment=registered_environment,
+        terminal_event=terminal_event,
+        payload={
+            **payload,
+            "hook_index": hook_index,
+            "hook_invocation_id": raw_hook_invocation_id,
+        },
+        execution_profile=execution_profile,
+    ).model_copy(
+        update={
+            "id": _terminal_runtime_hook_event_id(
+                session=session,
+                terminal_event=terminal_event,
+                phase=phase,
+                scope=scope,
+                hook_index=hook_index,
+                outcome=outcome,
+            ),
+            # A terminal hook belongs to the terminal event's logical
+            # interaction, not to whichever concurrent continuation context won
+            # the durable reservation.
+            "interaction_id": terminal_event.interaction_id,
+        }
+    )
+    if event.interaction_id is not None:
+        event = event_with_runtime_envelope_authority(event, "interaction_id")
+    return event_with_runtime_payload_authority(
+        event_with_runtime_generated_id(event),
+        "hook_invocation_id",
+    )
+
+
+def _terminal_runtime_hook_invocation_id(event: Event) -> str:
+    raw = event.payload.get("hook_invocation_id")
+    if type(raw) is not str:
+        raise ValueError("hook_invocation_id must be a string.")
+    raw = require_clean_nonblank(raw, "hook_invocation_id")
+    parsed = UUID(raw)
+    if parsed.version != 4 or str(parsed) != raw:
+        raise ValueError("hook_invocation_id must be a canonical UUID4.")
+    return raw
+
+
+def _terminal_runtime_hook_started_matches(
+    existing: Event,
+    expected: Event,
+) -> bool:
+    """Accept the same hook slot while allowing only its claimant and timestamp to differ."""
+
+    if existing.type != EventType.HOOK_STARTED or expected.type != EventType.HOOK_STARTED:
+        return False
+    existing_envelope = existing.model_dump(mode="json", exclude={"payload", "timestamp"})
+    expected_envelope = expected.model_dump(mode="json", exclude={"payload", "timestamp"})
+    if existing_envelope != expected_envelope:
+        return False
+    existing_payload = dict(existing.payload)
+    expected_payload = dict(expected.payload)
+    try:
+        _terminal_runtime_hook_invocation_id(existing)
+        _terminal_runtime_hook_invocation_id(expected)
+    except (TypeError, ValueError):
+        return False
+    existing_payload.pop("hook_invocation_id", None)
+    expected_payload.pop("hook_invocation_id", None)
+    return existing_payload == expected_payload
+
+
+def _terminal_runtime_hook_outcome_matches(
+    outcome: Event,
+    *,
+    started: Event,
+    expected_event_id: str,
+    expected_type: EventType,
+) -> bool:
+    """Authenticate a completed/failed marker against its durable reservation."""
+
+    if outcome.id != expected_event_id or outcome.type != expected_type:
+        return False
+    if any(
+        getattr(outcome, field_name) != getattr(started, field_name)
+        for field_name in (
+            "session_id",
+            "interaction_id",
+            "agent_name",
+            "environment_name",
+            "workflow_name",
+            "tool_name",
+        )
+    ):
+        return False
+    try:
+        invocation_id = _terminal_runtime_hook_invocation_id(started)
+        if _terminal_runtime_hook_invocation_id(outcome) != invocation_id:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return all(outcome.payload.get(key) == value for key, value in started.payload.items())
+
+
 def _task_event(
     *,
     event_type: EventType,
@@ -4236,16 +4454,34 @@ def _task_terminalization_idempotency_key(
     session_id: str,
     kind: TaskTerminalKind,
 ) -> str:
-    material = canonical_durable_json_bytes(
-        {
-            "schema": "cayu.runtime-task-terminalization.v1",
-            "task_id": task_id,
-            "session_id": session_id,
-            "kind": kind.value,
-        },
-        "runtime_task_terminalization",
+    return runtime_task_terminalization_idempotency_key(
+        task_id=task_id,
+        session_id=session_id,
+        kind=kind,
     )
-    return f"runtime-task-terminal:v1:{hashlib.sha256(material).hexdigest()}"
+
+
+def _provider_operation_task_terminalization_request(
+    *,
+    task_id: str,
+    task_worker_id: str,
+    task_handoff_id: str | None,
+    session_id: str,
+) -> TaskTerminalizationRequest:
+    """Build the exact receipt-backed task failure used by first-run and replay."""
+
+    return TaskTerminalizationRequest(
+        task_id=task_id,
+        worker_id=task_worker_id,
+        handoff_id=task_handoff_id,
+        kind=TaskTerminalKind.FAILED,
+        error=provider_operation_task_failure_payload(session_id=session_id),
+        idempotency_key=_task_terminalization_idempotency_key(
+            task_id=task_id,
+            session_id=session_id,
+            kind=TaskTerminalKind.FAILED,
+        ),
+    )
 
 
 def _knowledge_store(
@@ -4923,6 +5159,7 @@ class SessionEngine:
         frozen_candidate_profile: ExecutionProfileIdentity | None = None,
         require_open_interaction: bool = True,
         additional_profile_fingerprints: tuple[str, ...] = (),
+        record_rejection: bool = True,
     ) -> ActiveInvocationExecutionProfile:
         """Resolve a recovery continuation against its durable invocation profile."""
 
@@ -5052,6 +5289,14 @@ class SessionEngine:
             if frozen_candidate_profile is not None:
                 return snapshot.model_copy(update={"profile": frozen_candidate_profile})
             return snapshot
+
+        if not record_rejection:
+            raise ExecutionProfileMismatchError(
+                session_id=session.id,
+                expected_profile_fingerprint=snapshot.profile.fingerprint,
+                candidate_profile_fingerprint=candidate.fingerprint,
+                changed_component_classes=changed,
+            )
 
         policy_identity = "cayu:active-invocation-profile:v1"
         decision = _execution_profile_decision_event(
@@ -7659,6 +7904,9 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile: ExecutionProfileIdentity,
+        task_id: str | None = None,
+        task_worker_id: str | None = None,
+        task_handoff_id: str | None = None,
         legacy_resolution_without_profile: bool = False,
         invocation_context: InvocationContext | None = None,
     ) -> AsyncIterator[Event]:
@@ -7677,6 +7925,12 @@ class SessionEngine:
             raise TypeError("Provider-operation failure requires a resolution event.")
         if resolution_event.session_id != session.id:
             raise ValueError("Provider-operation resolution belongs to another session.")
+        if task_worker_id is not None and task_id is None:
+            raise ValueError("Provider-operation task worker authority requires a task_id.")
+        if task_handoff_id is not None and task_worker_id is None:
+            raise ValueError("Provider-operation task handoff requires a task worker.")
+        if task_id is not None and self.task_store is None:
+            raise RuntimeError("task_store is required for attached provider failure.")
         resolution_id = resolution_event.payload.get("resolution_id")
         recovery_reason = resolution_event.payload.get("recovery_reason")
         if type(resolution_id) is not str or type(recovery_reason) is not str:
@@ -7762,6 +8016,50 @@ class SessionEngine:
             )
             yield await self._event_writer.emit(model_error)
 
+        if task_id is not None:
+            task = await self._fail_task(
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                session=session,
+                error=provider_operation_task_failure_payload(session_id=session.id),
+            )
+            task_failed_template = _task_event(
+                event_type=EventType.TASK_FAILED,
+                task=task,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            task_failed = task_failed_template.model_copy(
+                update={
+                    "id": provider_operation_resolution_outcome_event_id(
+                        resolution_id,
+                        "task_failed",
+                    ),
+                    "interaction_id": resolution_event.interaction_id,
+                    "timestamp": resolution_event.timestamp,
+                    "payload": {
+                        **task_failed_template.payload,
+                        "resolution_id": resolution_id,
+                        "stage_id": resolution_event.payload["stage_id"],
+                        "failure_type": "provider_operation_unavailable",
+                    },
+                }
+            )
+            task_failed = event_with_runtime_generated_id(
+                event_with_execution_profile_authority(
+                    event_with_runtime_payload_authority(
+                        task_failed,
+                        "resolution_id",
+                        "stage_id",
+                    ),
+                    execution_profile,
+                )
+            )
+            persisted_task_failed = await self._event_writer.persist_exact_replay(task_failed)
+            yield (await self._event_writer.fan_out_persisted([persisted_task_failed]))[0]
+
         interaction_failed_id = provider_operation_resolution_outcome_event_id(
             resolution_id,
             "interaction_failed",
@@ -7836,7 +8134,20 @@ class SessionEngine:
                 raise ProviderOperationEvidenceError(
                     "Provider-operation terminal failure conflicts with session status."
                 )
-            _deactivate_session_interaction(session.id)
+            try:
+                async for hook_event in self._replay_terminal_event_with_hooks(
+                    event=copy_event(terminal_records[0].event),
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                    session=transitioned_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    yield_terminal_event=False,
+                ):
+                    yield hook_event
+            finally:
+                _deactivate_session_interaction(session.id)
             return
         try:
             async for terminal_event in self._emit_terminal_event_with_hooks(
@@ -10351,6 +10662,7 @@ class SessionEngine:
             task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
+                task_handoff_id=None,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -10557,6 +10869,7 @@ class SessionEngine:
                 ),
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
+                task_handoff_id=None,
                 start_event_type=EventType.SESSION_STARTED,
                 start_event_payload={
                     "agent_name": registered_agent.spec.name,
@@ -10739,10 +11052,21 @@ class SessionEngine:
             redactor=self._secret_redactor,
             store_resolved_session_id=store_resolved_session_id,
         )
-        task_id = await self._linked_resume_task_id(request.session_id)
+        task_id, task_session_instance_id = await self._linked_resume_task_id(request)
+        replayed_failure, replay_events = await self._replay_runtime_task_failure_if_needed(
+            session_id=request.session_id,
+            task_id=task_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+        if replayed_failure:
+            for event in replay_events:
+                yield event
+            return
         session_stream = self._resume_session(
             request=request,
             task_id=task_id,
+            required_task_session_instance_id=task_session_instance_id,
             start_event_payload_extra={},
             start_task_on_enter=False,
         )
@@ -15564,6 +15888,7 @@ class SessionEngine:
         source_execution_profile: ExecutionProfileIdentity | None = None,
         required_execution_profile: ExecutionProfileIdentity | None = None,
         required_session_instance_fingerprint: str | None = None,
+        required_task_session_instance_id: str | None = None,
         run_operation_id: str | None = None,
         terminal_event_id: str | None = None,
         queue_task_id: str | None = None,
@@ -15638,6 +15963,13 @@ class SessionEngine:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        if (
+            required_task_session_instance_id is not None
+            and loaded_session.instance_id != required_task_session_instance_id
+        ):
+            raise TaskClaimLost(
+                "Attached task authority belongs to a different session incarnation."
+            )
         if (
             required_session_instance_fingerprint is not None
             and _queued_dispatch_session_instance_fingerprint(loaded_session)
@@ -16690,6 +17022,47 @@ class SessionEngine:
                 _deactivate_session_interaction(loaded_session.id)
             raise
         invocation_context = prepared_invocation_context.with_admitted_session(session)
+        if task_id is not None and required_task_session_instance_id is not None:
+            try:
+                await self._require_linked_continuation_task_authority(
+                    task_id=task_id,
+                    task_worker_id=request.task_worker_id,
+                    task_handoff_id=request.task_handoff_id,
+                    session_id=session.id,
+                    session_instance_id=required_task_session_instance_id,
+                )
+            except BaseException as authority_failure:
+                try:
+                    await _run_recovery_cleanup_steps(
+                        authoritative_failure=authority_failure,
+                        steps=(
+                            (
+                                "resume task-authority abandonment",
+                                lambda: self._recovery_coordinator.finalize_abandoned_session_by_id(
+                                    session.id,
+                                    registered_agent=registered_agent,
+                                    registered_environment=registered_environment,
+                                    execution_profile=invocation_profile,
+                                    invocation_context=invocation_context,
+                                    run_terminal_hooks=False,
+                                ),
+                            ),
+                            (
+                                "resume task-authority run-fence release",
+                                lambda: (
+                                    self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                        session_id=session.id,
+                                        execution_profile=invocation_profile,
+                                        invocation_context=invocation_context,
+                                    )
+                                ),
+                            ),
+                        ),
+                    )
+                finally:
+                    if continuing_recovery_boundary:
+                        _deactivate_session_interaction(session.id)
+                raise
         if not continuing_recovery_boundary:
             if interaction_id is None:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
@@ -17026,7 +17399,8 @@ class SessionEngine:
                 projection=targeted_tool_projection,
             ),
             task_id=task_id,
-            task_worker_id=None,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
             start_event_type=EventType.SESSION_RESUMED,
             start_event_payload={
                 "agent_name": registered_agent.spec.name,
@@ -18748,6 +19122,7 @@ class SessionEngine:
         targeted_tool_grants: TargetedToolGrantFootprint | None,
         task_id: str | None,
         task_worker_id: str | None,
+        task_handoff_id: str | None,
         start_event_type: EventType | None,
         start_event_payload: dict[str, Any],
         start_task_on_enter: bool = True,
@@ -20512,6 +20887,7 @@ class SessionEngine:
                 task = await self._complete_task(
                     task_id=task_id,
                     task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
@@ -21058,6 +21434,79 @@ class SessionEngine:
                 exc,
                 redactor=self._secret_redactor,
             )
+            runtime_failure_identity: RuntimeTaskFailureIdentity | None = None
+            failure_interaction_id = _current_session_interaction_id(session.id)
+            if (
+                task_id is not None
+                and failure_interaction_id is not None
+                and failure_interaction_observed_at is not None
+            ):
+                runtime_failure_identity = RuntimeTaskFailureIdentity(
+                    task_id=task_id,
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    run_epoch=session.run_epoch,
+                    interaction_id=failure_interaction_id,
+                    execution_profile_fingerprint=execution_profile.fingerprint,
+                    observed_at=failure_interaction_observed_at,
+                )
+
+            def build_session_failure_payload(
+                error: BaseException = exc,
+            ) -> dict[str, Any]:
+                failure_payload = exception_failure_payload(
+                    error,
+                    diagnostic=failure_diagnostic,
+                    redactor=self._secret_redactor,
+                )
+                provider_cleanup_failure = budget_provider_cleanup_failure(error)
+                if provider_cleanup_failure is not None:
+                    provider_cleanup_diagnostic = exception_diagnostic(
+                        provider_cleanup_failure,
+                        empty_message="provider iterator cleanup failed",
+                        nonportable_message=(
+                            "Provider iterator cleanup failed with a non-portable diagnostic."
+                        ),
+                        redactor=self._secret_redactor,
+                    )
+                    failure_payload["provider_cleanup_failure"] = {
+                        **provider_cleanup_diagnostic.payload_fields(),
+                        "phase": "provider_iterator_cleanup",
+                    }
+                transition_replay_failures = _interaction_transition_replay_failures(error)
+                if transition_replay_failures is not None:
+                    failure_payload["interaction_transition_failures"] = (
+                        _interaction_transition_failure_diagnostics(
+                            transition_replay_failures,
+                            redactor=self._secret_redactor,
+                        )
+                    )
+                if isinstance(error, resume_ledger.ToolCallEvidenceConflict):
+                    failure_payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
+                if runtime_failure_identity is not None:
+                    failure_payload["runtime_task_failure_id"] = runtime_failure_identity.failure_id
+                return failure_payload
+
+            payload = (
+                build_session_failure_payload() if runtime_failure_identity is not None else None
+            )
+            prepared_failure_turn_completed = (
+                None
+                if runtime_failure_identity is None
+                else await self._prepare_turn_completed_event(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    status=SessionStatus.FAILED,
+                    run_started_at=run_started_at,
+                    usage_tracker=turn_usage_tracker,
+                    event_id=runtime_task_failure_event_id(
+                        runtime_failure_identity,
+                        "turn_completed",
+                    ),
+                    timestamp=runtime_failure_identity.observed_at,
+                )
+            )
             await materialize_deferred_messages_after_failure()
             task_failure_error: Exception | None = None
             if (
@@ -21079,27 +21528,66 @@ class SessionEngine:
                 and self.task_store is not None
             ):
                 try:
+                    task_error = task_failure_payload_from_diagnostic(
+                        failure_diagnostic,
+                        session_id=session.id,
+                    )
+                    if runtime_failure_identity is not None:
+                        if payload is None:  # pragma: no cover - coupled above
+                            raise AssertionError("Runtime failure lost its terminal payload.")
+                        if prepared_failure_turn_completed is None:  # pragma: no cover - coupled
+                            raise AssertionError("Runtime failure lost its turn completion.")
+                        task_error = runtime_task_failure_payload(
+                            identity=runtime_failure_identity,
+                            diagnostic_payload=task_error,
+                            session_failure_payload=payload,
+                            turn_completed_payload=prepared_failure_turn_completed.payload,
+                        )
                     task = await self._fail_task(
                         task_id=task_id,
                         task_worker_id=task_worker_id,
+                        task_handoff_id=task_handoff_id,
                         session=session,
-                        error=task_failure_payload_from_diagnostic(
-                            failure_diagnostic,
-                            session_id=session.id,
-                        ),
+                        error=task_error,
                     )
                     task_finished = True
                     if active_run is not None:
                         active_run.task_finished = True
-                    yield await self._event_writer.emit(
-                        _task_event(
-                            event_type=EventType.TASK_FAILED,
-                            task=task,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                        )
+                    task_failed_event = _task_event(
+                        event_type=EventType.TASK_FAILED,
+                        task=task,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
                     )
+                    if runtime_failure_identity is not None:
+                        task_failed_event = event_with_runtime_generated_id(
+                            event_with_execution_profile_authority(
+                                event_with_runtime_payload_authority(
+                                    task_failed_event.model_copy(
+                                        update={
+                                            "id": runtime_task_failure_event_id(
+                                                runtime_failure_identity,
+                                                "task_failed",
+                                            ),
+                                            "interaction_id": (
+                                                runtime_failure_identity.interaction_id
+                                            ),
+                                            "timestamp": runtime_failure_identity.observed_at,
+                                            "payload": {
+                                                **task_failed_event.payload,
+                                                "runtime_task_failure_id": (
+                                                    runtime_failure_identity.failure_id
+                                                ),
+                                            },
+                                        }
+                                    ),
+                                    "runtime_task_failure_id",
+                                ),
+                                execution_profile,
+                            )
+                        )
+                    yield await self._event_writer.emit(task_failed_event)
                 except Exception as task_exc:
                     task_failure_error = task_exc
             try:
@@ -21115,6 +21603,14 @@ class SessionEngine:
                     environment_name=environment_name,
                     to_status=SessionStatus.FAILED,
                     observed_at=failure_interaction_observed_at,
+                    event_id=(
+                        None
+                        if runtime_failure_identity is None
+                        else runtime_task_failure_event_id(
+                            runtime_failure_identity,
+                            "interaction_failed",
+                        )
+                    ),
                     execution_profile=execution_profile,
                     model_completion_failure=exc,
                 )
@@ -21122,35 +21618,8 @@ class SessionEngine:
                 raise exc from accounting_pending
             if interaction_failed_event is not None:
                 yield interaction_failed_event
-            payload = exception_failure_payload(
-                exc,
-                diagnostic=failure_diagnostic,
-                redactor=self._secret_redactor,
-            )
-            provider_cleanup_failure = budget_provider_cleanup_failure(exc)
-            if provider_cleanup_failure is not None:
-                provider_cleanup_diagnostic = exception_diagnostic(
-                    provider_cleanup_failure,
-                    empty_message="provider iterator cleanup failed",
-                    nonportable_message=(
-                        "Provider iterator cleanup failed with a non-portable diagnostic."
-                    ),
-                    redactor=self._secret_redactor,
-                )
-                payload["provider_cleanup_failure"] = {
-                    **provider_cleanup_diagnostic.payload_fields(),
-                    "phase": "provider_iterator_cleanup",
-                }
-            transition_replay_failures = _interaction_transition_replay_failures(exc)
-            if transition_replay_failures is not None:
-                payload["interaction_transition_failures"] = (
-                    _interaction_transition_failure_diagnostics(
-                        transition_replay_failures,
-                        redactor=self._secret_redactor,
-                    )
-                )
-            if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
-                payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
+            if payload is None:
+                payload = build_session_failure_payload()
             if task_failure_error is not None:
                 payload.update(
                     task_update_error_payload(
@@ -21167,16 +21636,37 @@ class SessionEngine:
                 usage_tracker=turn_usage_tracker,
                 active_run=active_run,
                 invocation_context=invocation_context,
+                prepared_turn_completed=prepared_failure_turn_completed,
             ):
                 yield event
+            session_failed_event = Event(
+                type=EventType.SESSION_FAILED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=payload,
+            )
+            if runtime_failure_identity is not None:
+                session_failed_event = event_with_runtime_generated_id(
+                    event_with_execution_profile_authority(
+                        event_with_runtime_payload_authority(
+                            session_failed_event.model_copy(
+                                update={
+                                    "id": runtime_task_failure_event_id(
+                                        runtime_failure_identity,
+                                        "session_failed",
+                                    ),
+                                    "interaction_id": runtime_failure_identity.interaction_id,
+                                    "timestamp": runtime_failure_identity.observed_at,
+                                }
+                            ),
+                            "runtime_task_failure_id",
+                        ),
+                        execution_profile,
+                    )
+                )
             async for event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
-                ),
+                event=session_failed_event,
                 phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
                 session=session,
                 registered_agent=registered_agent,
@@ -21344,6 +21834,51 @@ class SessionEngine:
                             _clear_session_interaction_settlement(session.id)
                             _deactivate_session_interaction(session.id)
 
+    async def _prepare_turn_completed_event(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        status: SessionStatus,
+        run_started_at: float,
+        usage_tracker: SessionUsageTracker,
+        event_id: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> Event:
+        """Prepare one invocation summary before a crash-sensitive terminal boundary."""
+
+        usage_events = await usage_tracker.usage_events()
+        summary = session_usage_summary(session.id, usage_events)
+        duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
+        interaction_ids = _current_session_invocation_interaction_ids(session.id)
+        turn_completed = event_with_runtime_nested_payload_authority(
+            Event(
+                id=event_id or str(uuid4()),
+                type=EventType.TURN_COMPLETED,
+                session_id=session.id,
+                interaction_id=None,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                timestamp=datetime.now(UTC) if timestamp is None else timestamp,
+                payload={
+                    "status": status.value,
+                    "duration_ms": duration_ms,
+                    "step_count": summary.model_steps,
+                    "tool_call_count": summary.tool_calls,
+                    "token_usage": aggregate_usage_metrics_payload(summary.usage),
+                    "provider_names": summary.provider_names,
+                    "models": summary.models,
+                    "interaction_ids": list(interaction_ids),
+                },
+            ),
+            ("interaction_ids", "*"),
+        )
+        # Both the deterministic replay identity and the fresh UUID fallback are
+        # generated inside this runtime boundary. Preserve that provenance so a
+        # configured secret fragment cannot make Cayu reject its own event ID.
+        return event_with_runtime_generated_id(turn_completed)
+
     async def _emit_turn_completed(
         self,
         *,
@@ -21354,6 +21889,7 @@ class SessionEngine:
         run_started_at: float,
         usage_tracker: SessionUsageTracker,
         invocation_context: InvocationContext | None = None,
+        prepared_turn_completed: Event | None = None,
     ) -> tuple[Event, ...]:
         registered_environment = None
         execution_profile = None
@@ -21381,30 +21917,25 @@ class SessionEngine:
             )
         else:
             interaction_event = None
-        usage_events = await usage_tracker.usage_events()
-        summary = session_usage_summary(session.id, usage_events)
-        duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
-        interaction_ids = _current_session_invocation_interaction_ids(session.id)
-        turn_completed = event_with_runtime_nested_payload_authority(
-            Event(
-                type=EventType.TURN_COMPLETED,
-                session_id=session.id,
-                interaction_id=None,
-                agent_name=registered_agent.spec.name,
+        turn_completed = prepared_turn_completed
+        if turn_completed is None:
+            turn_completed = await self._prepare_turn_completed_event(
+                session=session,
+                registered_agent=registered_agent,
                 environment_name=environment_name,
-                payload={
-                    "status": status.value,
-                    "duration_ms": duration_ms,
-                    "step_count": summary.model_steps,
-                    "tool_call_count": summary.tool_calls,
-                    "token_usage": aggregate_usage_metrics_payload(summary.usage),
-                    "provider_names": summary.provider_names,
-                    "models": summary.models,
-                    "interaction_ids": list(interaction_ids),
-                },
-            ),
-            ("interaction_ids", "*"),
-        )
+                status=status,
+                run_started_at=run_started_at,
+                usage_tracker=usage_tracker,
+            )
+        elif (
+            turn_completed.type is not EventType.TURN_COMPLETED
+            or turn_completed.session_id != session.id
+            or turn_completed.interaction_id is not None
+            or turn_completed.agent_name != registered_agent.spec.name
+            or turn_completed.environment_name != environment_name
+            or turn_completed.payload.get("status") != status.value
+        ):
+            raise RuntimeError("Prepared turn completion conflicts with its invocation.")
         turn_completed_event = await self._event_writer.emit(turn_completed)
         if interaction_event is None:
             return (turn_completed_event,)
@@ -21421,6 +21952,7 @@ class SessionEngine:
         usage_tracker: SessionUsageTracker,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
         invocation_context: InvocationContext | None = None,
+        prepared_turn_completed: Event | None = None,
     ) -> tuple[Event, ...]:
         if active_run is None:
             return await self._emit_turn_completed(
@@ -21431,6 +21963,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=usage_tracker,
                 invocation_context=invocation_context,
+                prepared_turn_completed=prepared_turn_completed,
             )
         async with active_run.turn_completed_lock:
             if active_run.turn_completed_event is not None:
@@ -21443,6 +21976,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 usage_tracker=usage_tracker,
                 invocation_context=invocation_context,
+                prepared_turn_completed=prepared_turn_completed,
             )
             active_run.turn_completed_event = events[-1]
             return events
@@ -21525,6 +22059,7 @@ class SessionEngine:
         *,
         task_id: str | None,
         task_worker_id: str | None,
+        task_handoff_id: str | None,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -21558,6 +22093,7 @@ class SessionEngine:
             task = await self._fail_task(
                 task_id=task_id,
                 task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
                 session=session,
                 error=task_failure_payload_from_diagnostic(
                     diagnostic,
@@ -21579,15 +22115,450 @@ class SessionEngine:
         except Exception as task_error:
             return None, task_error
 
-    async def _linked_resume_task_id(self, session_id: str) -> str | None:
+    async def _replay_runtime_task_failure_if_needed(
+        self,
+        *,
+        session_id: str,
+        task_id: str | None,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+    ) -> tuple[bool, tuple[Event, ...]]:
+        """Converge a receipt-backed generic task failure without redispatching work."""
+
+        if task_id is None:
+            return False, ()
+        if self.task_store is None:  # pragma: no cover - guarded by task lookup
+            raise RuntimeError("task_store is required for task failure replay.")
+        session = await self.session_store.load(session_id)
+        task = await self.task_store.load_task(task_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}") from None
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}") from None
+        identity = runtime_task_failure_identity_from_task(
+            task,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+        )
+        if identity is None:
+            return False, ()
+        if identity.run_epoch != session.run_epoch:
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            released_failure_epoch = bool(
+                session.status is SessionStatus.FAILED
+                and active_profile is not None
+                and active_profile.run_epoch == identity.run_epoch
+                and active_profile.interaction_id == identity.interaction_id
+                and active_invocation_execution_profile_is_released(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+            )
+            if not released_failure_epoch:
+                raise TaskClaimLost(
+                    "Terminal task failure belongs to a stale session run epoch."
+                ) from None
+        await self._require_linked_continuation_task_authority(
+            task_id=task.id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+        )
+        failure_payload = runtime_task_failure_session_payload(task)
+        if failure_payload is None:
+            raise TaskClaimLost(
+                "Terminal task failure lost its durable session failure payload."
+            ) from None
+        if failure_payload.get("runtime_task_failure_id") != identity.failure_id:
+            raise TaskClaimLost(
+                "Terminal task failure has conflicting durable session evidence."
+            ) from None
+        turn_completed_payload = runtime_task_failure_turn_payload(task)
+        if turn_completed_payload is None:
+            raise TaskClaimLost(
+                "Terminal task failure lost its durable turn completion payload."
+            ) from None
+
+        def terminal_event_matches(event: Event) -> bool:
+            return bool(
+                event.type is EventType.SESSION_FAILED
+                and event.session_id == session.id
+                and event.interaction_id == identity.interaction_id
+                and event.agent_name == session.agent_name
+                and event.environment_name == session.environment_name
+                and event.timestamp == identity.observed_at
+                and event.payload.get("execution_profile_fingerprint")
+                == identity.execution_profile_fingerprint
+                and all(
+                    event.payload.get(field_name) == field_value
+                    for field_name, field_value in failure_payload.items()
+                )
+            )
+
+        def turn_completed_event_matches(event: Event) -> bool:
+            return bool(
+                event.type is EventType.TURN_COMPLETED
+                and event.session_id == session.id
+                and event.interaction_id is None
+                and event.agent_name == session.agent_name
+                and event.environment_name == session.environment_name
+                and event.timestamp == identity.observed_at
+                and event.payload == turn_completed_payload
+            )
+
+        terminal_event_id = runtime_task_failure_event_id(identity, "session_failed")
+        turn_completed_event_id = runtime_task_failure_event_id(identity, "turn_completed")
+        durable_terminal_event: Event | None = None
+        terminal_records = await self.session_store.query_events(
+            EventQuery(session_id=session.id, event_id=terminal_event_id, limit=2)
+        )
+        if terminal_records:
+            if len(terminal_records) != 1:
+                raise SessionRuntimePublicationConflict(
+                    "Runtime task failure has duplicate terminal session evidence."
+                )
+            terminal_event = terminal_records[0].event
+            if (
+                not terminal_event_matches(terminal_event)
+                or session.status is not SessionStatus.FAILED
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Runtime task failure terminal evidence conflicts with durable state."
+                )
+            turn_records = await self.session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_id=turn_completed_event_id,
+                    limit=2,
+                )
+            )
+            if len(turn_records) != 1 or not turn_completed_event_matches(turn_records[0].event):
+                raise SessionRuntimePublicationConflict(
+                    "Runtime task failure terminal evidence lost its turn completion."
+                )
+            durable_terminal_event = copy_event(terminal_event)
+
+        if session.status not in {
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+            SessionStatus.FAILED,
+        }:
+            raise SessionRuntimePublicationConflict(
+                "Runtime task failure conflicts with the session terminal outcome."
+            )
+        registered_agent = self._get_registered_agent(session.agent_name)
+        registered_provider = self._get_registered_provider(session.provider_name)
+        registered_environment = self._get_registered_environment_for_session(
+            session.environment_name
+        )
+        environment_name = _environment_name(registered_environment)
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        budget_policy = self._get_budget_policy()
+        execution_profile_snapshot = await self.validate_execution_profile_continuation(
+            session=session,
+            checkpoint=checkpoint,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            budget_policy=budget_policy,
+            require_open_interaction=False,
+            record_rejection=False,
+        )
+        if (
+            execution_profile_snapshot.interaction_id != identity.interaction_id
+            or execution_profile_snapshot.profile.fingerprint
+            != identity.execution_profile_fingerprint
+        ):
+            raise TaskClaimLost(
+                "Terminal task failure changed its invocation execution profile."
+            ) from None
+        replay_active_profile = execution_profile_snapshot.model_copy(
+            update={"run_epoch": session.run_epoch}
+        )
+        invocation_context = _authenticated_invocation_context(
+            active_profile=replay_active_profile,
+            binding=AdmittedInvocationBinding(
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                interaction_id=identity.interaction_id,
+                run_epoch=session.run_epoch,
+                agent_name=session.agent_name,
+                provider_name=session.provider_name,
+                model=session.model,
+                runtime_name=session.runtime_name,
+                runtime_version=session.runtime_version,
+                runtime_build_provenance=session.runtime_build_provenance,
+                environment_name=session.environment_name,
+            ),
+            validated_profile=replay_active_profile.profile,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            registered_environment=registered_environment,
+            runtime_hooks=self._runtime_hooks,
+            loop_policies=self._loop_policies,
+            request_loop_policies=(),
+            budget_policy=budget_policy,
+            tool_capability_ceiling=_session_tool_capability_ceiling(session),
+        )
+        execution_profile = invocation_context.profile
+        replay_events: list[Event] = []
+
+        if durable_terminal_event is not None:
+            try:
+                async for event in self._replay_terminal_event_with_hooks(
+                    event=durable_terminal_event,
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                ):
+                    replay_events.append(event)
+            finally:
+                _deactivate_session_interaction(session.id)
+            return True, tuple(replay_events)
+
+        task_failed_template = _task_event(
+            event_type=EventType.TASK_FAILED,
+            task=task,
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        )
+        task_failed = event_with_runtime_generated_id(
+            event_with_execution_profile_authority(
+                event_with_runtime_payload_authority(
+                    task_failed_template.model_copy(
+                        update={
+                            "id": runtime_task_failure_event_id(identity, "task_failed"),
+                            "interaction_id": identity.interaction_id,
+                            "timestamp": identity.observed_at,
+                            "payload": {
+                                **task_failed_template.payload,
+                                "runtime_task_failure_id": identity.failure_id,
+                            },
+                        }
+                    ),
+                    "runtime_task_failure_id",
+                ),
+                execution_profile,
+            )
+        )
+        persisted_task_failed = await self._event_writer.persist_exact_replay(task_failed)
+        replay_events.extend(await self._event_writer.fan_out_persisted([persisted_task_failed]))
+
+        if session.status is SessionStatus.FAILED:
+            interaction_records = await self.session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_id=runtime_task_failure_event_id(identity, "interaction_failed"),
+                    limit=2,
+                )
+            )
+            if (
+                len(interaction_records) != 1
+                or interaction_records[0].event.type is not EventType.INTERACTION_FAILED
+                or interaction_records[0].event.session_id != session.id
+                or interaction_records[0].event.interaction_id != identity.interaction_id
+                or interaction_records[0].event.timestamp != identity.observed_at
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Failed session lost its atomic runtime task interaction evidence."
+                )
+        else:
+            interaction_id = await self._activate_latest_open_interaction(session.id)
+            if interaction_id != identity.interaction_id:
+                raise SessionRuntimePublicationConflict(
+                    "Runtime task failure lost its open durable interaction."
+                )
+            interaction_event_id = runtime_task_failure_event_id(
+                identity,
+                "interaction_failed",
+            )
+            try:
+                session, interaction_failed, _ = await self._publish_sibling_interaction_transition(
+                    session=session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    to_status=SessionStatus.FAILED,
+                    observed_at=identity.observed_at,
+                    event_id=interaction_event_id,
+                    execution_profile=execution_profile,
+                    # Receipt evidence proves that the runtime observed a failure, but
+                    # cannot prove an already-dispatched provider had no effect.
+                    model_completion_failure=RuntimeError(
+                        "Recovered receipt-backed runtime task failure."
+                    ),
+                )
+            except Exception:
+                # A concurrent exact replay can calculate the same transition
+                # before its peer atomically settles the active model stage. The
+                # second calculated spec then differs only because that stage is
+                # already settled. Adopt the winner only from the deterministic
+                # event, terminal session state, and absence of active model work.
+                interaction_records = await self.session_store.query_events(
+                    EventQuery(
+                        session_id=session.id,
+                        event_id=interaction_event_id,
+                        limit=2,
+                    )
+                )
+                concurrent_session = await self.session_store.load(session.id)
+                active_model_completion = (
+                    await self.session_store.load_active_model_completion_stage(session.id)
+                )
+                if (
+                    len(interaction_records) != 1
+                    or interaction_records[0].event.type is not EventType.INTERACTION_FAILED
+                    or interaction_records[0].event.session_id != session.id
+                    or interaction_records[0].event.interaction_id != identity.interaction_id
+                    or interaction_records[0].event.timestamp != identity.observed_at
+                    or concurrent_session is None
+                    or concurrent_session.status is not SessionStatus.FAILED
+                    or active_model_completion is not None
+                ):
+                    raise
+                session = concurrent_session
+                interaction_failed = copy_event(interaction_records[0].event)
+            if interaction_failed is not None:
+                replay_events.append(interaction_failed)
+
+        turn_completed = event_with_runtime_generated_id(
+            event_with_runtime_nested_payload_authority(
+                Event(
+                    id=turn_completed_event_id,
+                    type=EventType.TURN_COMPLETED,
+                    session_id=session.id,
+                    interaction_id=None,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    timestamp=identity.observed_at,
+                    payload=turn_completed_payload,
+                ),
+                ("interaction_ids", "*"),
+            )
+        )
+        persisted_turn_completed = await self._event_writer.persist_exact_replay(turn_completed)
+        replay_events.extend(await self._event_writer.fan_out_persisted([persisted_turn_completed]))
+
+        session_failed = event_with_runtime_generated_id(
+            event_with_execution_profile_authority(
+                event_with_runtime_payload_authority(
+                    Event(
+                        id=terminal_event_id,
+                        type=EventType.SESSION_FAILED,
+                        session_id=session.id,
+                        interaction_id=identity.interaction_id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        timestamp=identity.observed_at,
+                        payload=failure_payload,
+                    ),
+                    "runtime_task_failure_id",
+                ),
+                execution_profile,
+            )
+        )
+        try:
+            try:
+                async for event in self._emit_terminal_event_with_hooks(
+                    event=session_failed,
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    expected_run_operation_epoch=identity.run_epoch,
+                ):
+                    replay_events.append(event)
+            except TerminalEventPublicationUncertain:
+                # A concurrent exact replay can clear the run-operation marker or
+                # finish environment cleanup before this caller prepares the same
+                # deterministic terminal ID. Accept only the already-durable
+                # receipt-backed failure outcome; all other conflicts stay uncertain.
+                concurrent_records = await self.session_store.query_events(
+                    EventQuery(
+                        session_id=session.id,
+                        event_id=terminal_event_id,
+                        limit=2,
+                    )
+                )
+                concurrent_session = await self.session_store.load(session.id)
+                if (
+                    len(concurrent_records) != 1
+                    or not terminal_event_matches(concurrent_records[0].event)
+                    or concurrent_session is None
+                    or concurrent_session.status is not SessionStatus.FAILED
+                ):
+                    raise
+                concurrent_terminal = concurrent_records[0].event
+                terminal_run_operation_id = concurrent_terminal.payload.get(
+                    _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+                )
+                if terminal_run_operation_id is not None:
+                    await self._clear_session_run_operation_after_terminal_event(
+                        session=session,
+                        terminal_event=concurrent_terminal,
+                    )
+                replay_events.append(copy_event(concurrent_terminal))
+        finally:
+            _deactivate_session_interaction(session.id)
+        return True, tuple(replay_events)
+
+    async def _linked_resume_task_id(
+        self,
+        request: ResumeRequest,
+    ) -> tuple[str | None, str | None]:
+        return await self._linked_continuation_task_id(
+            session_id=request.session_id,
+            task_worker_id=request.task_worker_id,
+            task_handoff_id=request.task_handoff_id,
+        )
+
+    async def _linked_continuation_task_id(
+        self,
+        *,
+        session_id: str,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> tuple[str | None, str | None]:
         """Find the running task that ordinary resume must terminalize.
 
         Contract authority is checked independently from the session identity at
         the shared resume boundary. This lookup retains the historical behavior of
-        re-associating the one running task for ordinary task terminalization.
+        re-associating the one running task for ordinary task terminalization. A
+        worker-owned task is admitted only after a store-time lease proof, before
+        session admission can dispatch provider or tool work.
         """
+        session_request_boundary.require_secret_free_session_authority(
+            task_worker_id,
+            field_name="task_worker_id",
+            redactor=self._secret_redactor,
+            authority_kind="task continuation authority",
+        )
+        session_request_boundary.require_secret_free_session_authority(
+            task_handoff_id,
+            field_name="task_handoff_id",
+            redactor=self._secret_redactor,
+            authority_kind="task continuation authority",
+        )
+        if task_handoff_id is not None and task_worker_id is None:
+            raise TaskClaimLost("Task handoff authority requires a continuation worker.")
         if self.task_store is None:
-            return None
+            if task_worker_id is not None:
+                raise RuntimeError("task_store is required when task_worker_id is set.")
+            return None, None
+        live_session = await self.session_store.load(session_id)
+        if live_session is None:
+            raise KeyError(f"Session not found: {session_id}")
         tasks = await self.task_store.list_tasks(
             TaskQuery(
                 status=TaskStatus.RUNNING,
@@ -21597,13 +22568,306 @@ class SessionEngine:
         )
         if len(tasks) > 1:
             raise RuntimeError(f"Session has multiple running tasks attached: {session_id}")
-        return tasks[0].id if tasks else None
+        if not tasks:
+            terminal_tasks = await self.task_store.list_tasks(
+                TaskQuery(
+                    status=TaskStatus.FAILED,
+                    session_id=session_id,
+                    limit=2,
+                )
+            )
+            if len(terminal_tasks) > 1:
+                raise RuntimeError(f"Session has multiple failed tasks attached: {session_id}")
+            if terminal_tasks:
+                task = terminal_tasks[0]
+                if task.session_instance_id is None:
+                    raise TaskClaimLost(
+                        "Attached task failure replay lost its session incarnation."
+                    )
+                await self._require_linked_continuation_task_authority(
+                    task_id=task.id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    session_id=session_id,
+                    session_instance_id=live_session.instance_id,
+                    allow_terminal_failure_replay=allow_terminal_failure_replay,
+                    approval_failure_identity=approval_failure_identity,
+                )
+                return task.id, live_session.instance_id
+            if task_worker_id is not None:
+                raise TaskClaimLost(
+                    "Continuation worker authority has no running task attached to the session."
+                )
+            return None, None
+        task = tasks[0]
+        if task.session_instance_id is None:
+            raise TaskClaimLost("Attached task continuation lost its session incarnation.")
+        if task.worker_id is None:
+            if task_worker_id is not None:
+                raise TaskClaimLost(
+                    "Continuation worker authority conflicts with a workerless attached task."
+                )
+            await self._require_linked_continuation_task_authority(
+                task_id=task.id,
+                task_worker_id=None,
+                task_handoff_id=None,
+                session_id=session_id,
+                session_instance_id=live_session.instance_id,
+            )
+            return task.id, live_session.instance_id
+        if task_worker_id is None:
+            raise TaskClaimLost(
+                "A worker-owned attached task requires exact continuation worker authority."
+            )
+        await self._require_linked_continuation_task_authority(
+            task_id=task.id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            session_instance_id=live_session.instance_id,
+        )
+        return task.id, live_session.instance_id
+
+    async def _require_linked_continuation_task_authority(
+        self,
+        *,
+        task_id: str,
+        task_worker_id: str | None,
+        task_handoff_id: str | None,
+        session_id: str,
+        session_instance_id: str,
+        allow_terminal_failure_replay: bool = False,
+        approval_failure_identity: ApprovalTaskFailureIdentity | None = None,
+    ) -> None:
+        if self.task_store is None:
+            raise RuntimeError("task_store is required for attached-task continuation authority.")
+        session_request_boundary.require_secret_free_session_authority(
+            task_worker_id,
+            field_name="task_worker_id",
+            redactor=self._secret_redactor,
+            authority_kind="task continuation authority",
+        )
+        session_request_boundary.require_secret_free_session_authority(
+            task_handoff_id,
+            field_name="task_handoff_id",
+            redactor=self._secret_redactor,
+            authority_kind="task continuation authority",
+        )
+        if task_worker_id is None:
+            direct_runtime_failure = await load_direct_runtime_task_failure_replay(
+                self.task_store,
+                task_id=task_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+            if direct_runtime_failure is not None:
+                return
+            if allow_terminal_failure_replay or approval_failure_identity is not None:
+                if approval_failure_identity is not None:
+                    expected_error = approval_task_failure_payload(
+                        session_id=session_id,
+                        identity=approval_failure_identity,
+                    )
+                    idempotency_key = approval_task_terminalization_idempotency_key(
+                        task_id=task_id,
+                        session_id=session_id,
+                        identity=approval_failure_identity,
+                    )
+                else:
+                    expected_error = provider_operation_task_failure_payload(session_id=session_id)
+                    idempotency_key = _task_terminalization_idempotency_key(
+                        task_id=task_id,
+                        session_id=session_id,
+                        kind=TaskTerminalKind.FAILED,
+                    )
+                direct_failure = await load_direct_task_failure_replay(
+                    self.task_store,
+                    task_id=task_id,
+                    session_id=session_id,
+                    session_instance_id=session_instance_id,
+                    expected_error=expected_error,
+                    claimed_terminalization_idempotency_key=idempotency_key,
+                )
+                if direct_failure is not None:
+                    return
+            if task_handoff_id is not None:
+                raise TaskClaimLost("Workerless continuation cannot own a handoff generation.")
+            await self.task_store.load_direct_attached_task_resume(
+                task_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+            return
+        if (
+            type(self.task_store).load_active_attached_task_worker
+            is TaskStore.load_active_attached_task_worker
+        ):
+            raise NotImplementedError(
+                "Worker-owned continuation requires a store-authoritative active lease read."
+            )
+        try:
+            active_task = await self.task_store.load_active_attached_task_worker(
+                task_id,
+                task_worker_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            )
+            if active_task.interrupted_handoff_id != task_handoff_id:
+                raise TaskClaimLost("Attached-task continuation handoff generation changed.")
+        except (KeyError, TaskClaimLost):
+            if await self._runtime_task_failure_receipt_is_durable(
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                session_id=session_id,
+                session_instance_id=session_instance_id,
+            ):
+                return
+            if approval_failure_identity is not None:
+                await self._require_approval_task_failure_replay(
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    session_id=session_id,
+                    session_instance_id=session_instance_id,
+                    identity=approval_failure_identity,
+                )
+                return
+            if allow_terminal_failure_replay:
+                await self._require_provider_operation_task_failure_replay(
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    session_id=session_id,
+                    session_instance_id=session_instance_id,
+                )
+                return
+            raise
+
+    async def _runtime_task_failure_receipt_is_durable(
+        self,
+        *,
+        task_id: str,
+        task_worker_id: str,
+        task_handoff_id: str | None,
+        session_id: str,
+        session_instance_id: str,
+    ) -> bool:
+        """Return whether one generic failure receipt proves exact worker authority."""
+
+        if self.task_store is None or not self.task_store.supports_idempotent_terminalization:
+            return False
+        receipt = await self.task_store.load_task_terminalization_receipt(
+            task_id,
+            _task_terminalization_idempotency_key(
+                task_id=task_id,
+                session_id=session_id,
+                kind=TaskTerminalKind.FAILED,
+            ),
+        )
+        task = await self.task_store.load_task(task_id)
+        return runtime_task_failure_receipt_matches(
+            receipt=receipt,
+            task=task,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+
+    async def _require_approval_task_failure_replay(
+        self,
+        *,
+        task_id: str,
+        task_worker_id: str,
+        task_handoff_id: str | None,
+        session_id: str,
+        session_instance_id: str,
+        identity: ApprovalTaskFailureIdentity,
+    ) -> None:
+        """Authenticate one closed-approval retry from its exact task receipt."""
+
+        if self.task_store is None:  # pragma: no cover - guarded by the caller
+            raise RuntimeError("task_store is required for task failure replay authority.")
+        if not self.task_store.supports_idempotent_terminalization:
+            raise TaskClaimLost(
+                "Terminal task failure replay requires receipt-backed terminalization."
+            )
+        receipt = await self.task_store.load_task_terminalization_receipt(
+            task_id,
+            approval_task_terminalization_idempotency_key(
+                task_id=task_id,
+                session_id=session_id,
+                identity=identity,
+            ),
+        )
+        task = await self.task_store.load_task(task_id)
+        if not approval_task_failure_receipt_matches(
+            receipt=receipt,
+            task=task,
+            task_id=task_id,
+            task_worker_id=task_worker_id,
+            task_handoff_id=task_handoff_id,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+            identity=identity,
+        ):
+            raise TaskClaimLost(
+                "Terminal approval failure does not prove exact continuation replay authority."
+            )
+
+    async def _require_provider_operation_task_failure_replay(
+        self,
+        *,
+        task_id: str,
+        task_worker_id: str,
+        task_handoff_id: str | None,
+        session_id: str,
+        session_instance_id: str,
+    ) -> None:
+        """Authenticate a terminal retry from exact immutable task-failure evidence."""
+
+        if self.task_store is None:  # pragma: no cover - guarded by the caller
+            raise RuntimeError("task_store is required for task failure replay authority.")
+        if not self.task_store.supports_idempotent_terminalization:
+            raise TaskClaimLost(
+                "Terminal task failure replay requires receipt-backed terminalization."
+            )
+        request, request_sha256 = prepare_task_terminalization(
+            _provider_operation_task_terminalization_request(
+                task_id=task_id,
+                task_worker_id=task_worker_id,
+                task_handoff_id=task_handoff_id,
+                session_id=session_id,
+            )
+        )
+        receipt = await self.task_store.load_task_terminalization_receipt(
+            task_id,
+            request.idempotency_key,
+        )
+        task = await self.task_store.load_task(task_id)
+        if (
+            receipt is None
+            or task is None
+            or receipt.task_id != task_id
+            or receipt.worker_id != task_worker_id
+            or receipt.kind is not TaskTerminalKind.FAILED
+            or receipt.request_sha256 != request_sha256
+            or receipt.task != task
+            or task.status is not TaskStatus.FAILED
+            or task.session_id != session_id
+            or task.session_instance_id != session_instance_id
+        ):
+            raise TaskClaimLost(
+                "Terminal task failure does not prove exact continuation replay authority."
+            )
 
     async def _complete_task(
         self,
         *,
         task_id: str,
         task_worker_id: str | None,
+        task_handoff_id: str | None,
         session: Session,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
@@ -21621,6 +22885,7 @@ class SessionEngine:
                 TaskTerminalizationRequest(
                     task_id=task_id,
                     worker_id=task_worker_id,
+                    handoff_id=task_handoff_id,
                     kind=TaskTerminalKind.COMPLETED,
                     result=result,
                     idempotency_key=_task_terminalization_idempotency_key(
@@ -21641,6 +22906,7 @@ class SessionEngine:
         *,
         task_id: str,
         task_worker_id: str | None,
+        task_handoff_id: str | None,
         session: Session,
         error: dict[str, Any],
     ) -> Task:
@@ -21652,6 +22918,7 @@ class SessionEngine:
                 TaskTerminalizationRequest(
                     task_id=task_id,
                     worker_id=task_worker_id,
+                    handoff_id=task_handoff_id,
                     kind=TaskTerminalKind.FAILED,
                     error=error,
                     idempotency_key=_task_terminalization_idempotency_key(
@@ -21661,6 +22928,20 @@ class SessionEngine:
                     ),
                 ),
             )
+        replayed = await load_direct_task_failure_replay(
+            self.task_store,
+            task_id=task_id,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            expected_error=error,
+            claimed_terminalization_idempotency_key=_task_terminalization_idempotency_key(
+                task_id=task_id,
+                session_id=session.id,
+                kind=TaskTerminalKind.FAILED,
+            ),
+        )
+        if replayed is not None:
+            return replayed
         return await self.task_store.fail_task(
             task_id,
             error,
@@ -23253,6 +24534,7 @@ class SessionEngine:
         interaction_transition_failures: tuple[dict[str, Any], ...] = (),
         provider_cancellation_failures: tuple[dict[str, Any], ...] = (),
         terminal_finalization_handoff_source_task: asyncio.Task[Any] | None = None,
+        run_terminal_hooks: bool = True,
     ) -> AsyncGenerator[Event, None]:
         clear_current_task_cancellation()
         current_task = asyncio.current_task()
@@ -23627,6 +24909,7 @@ class SessionEngine:
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
                     terminal_event_publisher=terminal_event_publisher,
+                    run_runtime_hooks=run_terminal_hooks,
                 )
                 terminal_prefix, interrupted_event = await _collect_through_event_type(
                     terminal_event_stream,
@@ -23785,12 +25068,21 @@ class SessionEngine:
         event: Event,
         *,
         session: Session,
+        expected_run_operation_epoch: int | None = None,
     ) -> Event:
         checkpoint = await self.session_store.load_checkpoint(session.id)
         run_operation = _session_run_operation_from_checkpoint(checkpoint)
         if run_operation is None:
             return event
-        if run_operation.run_epoch != session.run_epoch:
+        expected_run_epoch = session.run_epoch
+        if expected_run_operation_epoch is not None:
+            if session.status is not SessionStatus.FAILED or expected_run_operation_epoch not in {
+                session.run_epoch,
+                session.run_epoch - 1,
+            }:
+                raise RuntimeError("Terminal event cannot adopt an unrelated released run epoch.")
+            expected_run_epoch = expected_run_operation_epoch
+        if run_operation.run_epoch != expected_run_epoch:
             raise RuntimeError(
                 "Terminal event session run operation does not match the active run epoch."
             )
@@ -23825,6 +25117,35 @@ class SessionEngine:
             clear_operation,
         )
 
+    async def _clear_session_run_operation_after_terminal_event(
+        self,
+        *,
+        session: Session,
+        terminal_event: Event,
+    ) -> None:
+        """Best-effort trailing cleanup after authoritative terminal evidence."""
+
+        run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+        if run_operation_id is None:
+            return
+        try:
+            await self._clear_session_run_operation(
+                session_id=session.id,
+                operation_id=require_clean_nonblank(
+                    run_operation_id,
+                    "terminal event session_run_operation_id",
+                ),
+                terminal_evidence_durable=True,
+            )
+        except Exception as cleanup_failure:
+            logger.warning(
+                "Terminal evidence is durable but session run operation cleanup "
+                "remains pending: session_id=%s event_id=%s error_type=%s",
+                session.id,
+                terminal_event.id,
+                type(cleanup_failure).__name__,
+            )
+
     async def _reconcile_persisted_terminal_event(
         self,
         event: Event,
@@ -23856,6 +25177,8 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
         terminal_event_publisher: Callable[[Event], Awaitable[Event]] | None = None,
+        expected_run_operation_epoch: int | None = None,
+        run_runtime_hooks: bool = True,
     ) -> AsyncGenerator[Event, None]:
         if invocation_context is not None:
             if (
@@ -23873,6 +25196,7 @@ class SessionEngine:
         event = await self._bind_event_to_session_run_operation(
             event,
             session=session,
+            expected_run_operation_epoch=expected_run_operation_epoch,
         )
         finalize_result = await self._environment_lifecycle.finalize_terminal_event(
             event=event,
@@ -23928,50 +25252,23 @@ class SessionEngine:
             if event_id_is_runtime_generated(prepared_terminal_event):
                 terminal_event = event_with_runtime_generated_id(terminal_event)
             _mark_session_invocation_terminal_event(terminal_event)
-            run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
-            if run_operation_id is not None:
-                try:
-                    await self._clear_session_run_operation(
-                        session_id=session.id,
-                        operation_id=require_clean_nonblank(
-                            run_operation_id,
-                            "terminal event session_run_operation_id",
-                        ),
-                        terminal_evidence_durable=True,
-                    )
-                except Exception as cleanup_failure:
-                    logger.warning(
-                        "Terminal evidence is durable but session run operation cleanup "
-                        "remains pending: session_id=%s event_id=%s error_type=%s",
-                        session.id,
-                        terminal_event.id,
-                        type(cleanup_failure).__name__,
-                    )
+            await self._clear_session_run_operation_after_terminal_event(
+                session=session,
+                terminal_event=terminal_event,
+            )
             yield terminal_event
+            if not run_runtime_hooks:
+                return
             async for hook_event in self._run_runtime_hooks(
                 phase=phase,
                 session=session,
                 terminal_event=terminal_event,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                hooks=(
-                    self._runtime_hooks
-                    if invocation_context is None
-                    else invocation_context.runtime_hooks
+                hooks=self._ordered_terminal_runtime_hooks(
+                    registered_agent=registered_agent,
+                    invocation_context=invocation_context,
                 ),
-                scope="app",
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-            ):
-                yield hook_event
-            async for hook_event in self._run_runtime_hooks(
-                phase=phase,
-                session=session,
-                terminal_event=terminal_event,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                hooks=registered_agent.runtime_hooks,
-                scope="agent",
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
             ):
@@ -24013,6 +25310,382 @@ class SessionEngine:
                 )
             raise finalize_result.cancellation
 
+    def _ordered_terminal_runtime_hooks(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        invocation_context: InvocationContext | None,
+    ) -> tuple[tuple[runtime_records.RegisteredRuntimeHook, str, int], ...]:
+        app_hooks = (
+            self._runtime_hooks if invocation_context is None else invocation_context.runtime_hooks
+        )
+        return (
+            *((registered_hook, "app", index) for index, registered_hook in enumerate(app_hooks)),
+            *(
+                (registered_hook, "agent", index)
+                for index, registered_hook in enumerate(registered_agent.runtime_hooks)
+            ),
+        )
+
+    async def _replay_terminal_event_with_hooks(
+        self,
+        *,
+        event: Event,
+        phase: RuntimeHookPhase,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
+        run_runtime_hooks: bool = True,
+        yield_terminal_event: bool = True,
+    ) -> AsyncGenerator[Event, None]:
+        """Replay exact terminal evidence and converge any unclaimed hook slots."""
+
+        if invocation_context is not None:
+            if (
+                invocation_context.binding.session_id != session.id
+                or registered_agent is not invocation_context.registered_agent
+                or registered_environment is not invocation_context.registered_environment
+            ):
+                raise RuntimeError("Terminal replay substituted frozen invocation authority.")
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise RuntimeError("Terminal replay substituted its execution profile.")
+            execution_profile = invocation_context.profile
+        records = await self.session_store.query_events(
+            EventQuery(session_id=event.session_id, event_id=event.id, limit=2)
+        )
+        if len(records) != 1:
+            raise SessionRuntimePublicationConflict(
+                "Terminal replay requires exactly one durable terminal event."
+            )
+        durable_event = records[0].event
+        if durable_event.model_dump(mode="json") != event.model_dump(mode="json"):
+            raise SessionRuntimePublicationConflict(
+                "Terminal replay evidence conflicts with its durable event."
+            )
+        _mark_session_invocation_terminal_event(durable_event)
+        await self._clear_session_run_operation_after_terminal_event(
+            session=session,
+            terminal_event=durable_event,
+        )
+        if yield_terminal_event:
+            yield copy_event(durable_event)
+        if not run_runtime_hooks:
+            return
+        async for hook_event in self._run_runtime_hooks(
+            phase=phase,
+            session=session,
+            terminal_event=durable_event,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            hooks=self._ordered_terminal_runtime_hooks(
+                registered_agent=registered_agent,
+                invocation_context=invocation_context,
+            ),
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+        ):
+            yield hook_event
+
+    async def _load_terminal_runtime_hook_settlement(
+        self,
+        *,
+        started_event: Event,
+        completed_event_id: str,
+        failed_event_id: str,
+    ) -> bool:
+        """Return whether one exact reservation has one authenticated terminal marker."""
+
+        outcomes: list[tuple[Event, EventType, str]] = []
+        for event_id, event_type in (
+            (completed_event_id, EventType.HOOK_COMPLETED),
+            (failed_event_id, EventType.HOOK_FAILED),
+        ):
+            records = await self.session_store.query_events(
+                EventQuery(
+                    session_id=started_event.session_id,
+                    event_id=event_id,
+                    limit=2,
+                )
+            )
+            if len(records) > 1:
+                raise SessionRuntimePublicationConflict(
+                    "Terminal runtime hook has duplicate outcome evidence."
+                )
+            if records:
+                outcomes.append((records[0].event, event_type, event_id))
+        if not outcomes:
+            return False
+        if len(outcomes) != 1:
+            raise SessionRuntimePublicationConflict(
+                "Terminal runtime hook has conflicting completed and failed outcomes."
+            )
+        outcome, expected_type, expected_event_id = outcomes[0]
+        if not _terminal_runtime_hook_outcome_matches(
+            outcome,
+            started=started_event,
+            expected_event_id=expected_event_id,
+            expected_type=expected_type,
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Terminal runtime hook outcome conflicts with its durable reservation."
+            )
+        return True
+
+    async def _claim_terminal_runtime_hook(
+        self,
+        *,
+        started_event: Event,
+        completed_event_id: str,
+        failed_event_id: str,
+    ) -> _TerminalRuntimeHookClaim:
+        """Atomically reserve one terminal hook or classify its durable peer owner."""
+
+        prepared = self._event_writer.prepare(started_event)
+        requested_invocation_id = _terminal_runtime_hook_invocation_id(prepared)
+        try:
+            await self.session_store.append_event(prepared.session_id, prepared)
+        except Exception as append_failure:
+            try:
+                records = await self.session_store.query_events(
+                    EventQuery(
+                        session_id=prepared.session_id,
+                        event_id=prepared.id,
+                        limit=2,
+                    )
+                )
+            except Exception as verification_failure:
+                append_failure.add_note(
+                    "Terminal runtime hook reservation verification also failed: "
+                    f"{type(verification_failure).__name__}"
+                )
+                raise append_failure from verification_failure
+            if not records:
+                raise
+            if len(records) != 1:
+                raise SessionRuntimePublicationConflict(
+                    "Terminal runtime hook has duplicate reservation evidence."
+                ) from append_failure
+            persisted = records[0].event
+            if not _terminal_runtime_hook_started_matches(persisted, prepared):
+                raise SessionRuntimePublicationConflict(
+                    "Terminal runtime hook reservation identity is already used by "
+                    "different durable evidence."
+                ) from append_failure
+            persisted_invocation_id = _terminal_runtime_hook_invocation_id(persisted)
+            if persisted_invocation_id != requested_invocation_id:
+                settled = await self._load_terminal_runtime_hook_settlement(
+                    started_event=persisted,
+                    completed_event_id=completed_event_id,
+                    failed_event_id=failed_event_id,
+                )
+                return _TerminalRuntimeHookClaim(
+                    state=(
+                        _TerminalRuntimeHookClaimState.SETTLED
+                        if settled
+                        else _TerminalRuntimeHookClaimState.IN_PROGRESS
+                    )
+                )
+            if persisted.model_dump(mode="json") != prepared.model_dump(mode="json"):
+                raise SessionRuntimePublicationConflict(
+                    "Terminal runtime hook claimant has conflicting durable evidence."
+                ) from append_failure
+
+        return _TerminalRuntimeHookClaim(
+            state=_TerminalRuntimeHookClaimState.CLAIMED,
+            started_event=prepared,
+        )
+
+    async def _execute_terminal_runtime_hook_slot(
+        self,
+        *,
+        started_event: Event,
+        completed_event_id: str,
+        failed_event_id: str,
+        hook: RuntimeHook,
+        hook_name: str,
+        hook_index: int,
+        scope: str,
+        phase: RuntimeHookPhase,
+        session: Session,
+        terminal_event: Event,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None,
+        hook_entered: asyncio.Event,
+        hook_settled: asyncio.Event,
+        outcome_persisted: asyncio.Event,
+    ) -> tuple[Event, ...] | None:
+        """Claim, invoke, and durably settle one terminal-hook slot.
+
+        The caller shields this operation until the hook has entered. Once the
+        hook returns (or raises an ordinary exception), its outcome publication
+        is likewise protected from caller cancellation. Persisting both lifecycle
+        markers before fan-out leaves sink delivery independently recoverable.
+        """
+
+        claim = await self._claim_terminal_runtime_hook(
+            started_event=started_event,
+            completed_event_id=completed_event_id,
+            failed_event_id=failed_event_id,
+        )
+        if claim.state is _TerminalRuntimeHookClaimState.IN_PROGRESS:
+            return None
+        if claim.state is _TerminalRuntimeHookClaimState.SETTLED:
+            return ()
+        if claim.started_event is None:
+            raise AssertionError("Claimed terminal runtime hook lost its started event.")
+
+        context = RuntimeHookContext(
+            runtime=self._hook_runtime,
+            hook_name=hook_name,
+            phase=phase,
+            session=session,
+            terminal_event=terminal_event,
+            execution_profile=execution_profile,
+        )
+        hook_invocation_id = _terminal_runtime_hook_invocation_id(claim.started_event)
+        hook_entered.set()
+        try:
+            await _call_runtime_hook(hook=hook, phase=phase, context=context)
+        except Exception as exc:
+            diagnostic = exception_diagnostic(
+                exc,
+                empty_message="runtime hook failed",
+                nonportable_message="Runtime hook failed with a non-portable diagnostic.",
+                redactor=self._secret_redactor,
+            )
+            outcome_template = _terminal_runtime_hook_event(
+                event_type=EventType.HOOK_FAILED,
+                outcome="failed",
+                hook_invocation_id=hook_invocation_id,
+                hook_index=hook_index,
+                hook_name=hook_name,
+                scope=scope,
+                phase=phase,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                terminal_event=terminal_event,
+                execution_profile=execution_profile,
+                payload={
+                    **diagnostic.payload_fields(),
+                    **_runtime_hook_actions_payload(context),
+                },
+            )
+        else:
+            outcome_template = _terminal_runtime_hook_event(
+                event_type=EventType.HOOK_COMPLETED,
+                outcome="completed",
+                hook_invocation_id=hook_invocation_id,
+                hook_index=hook_index,
+                hook_name=hook_name,
+                scope=scope,
+                phase=phase,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                terminal_event=terminal_event,
+                execution_profile=execution_profile,
+                payload=_runtime_hook_actions_payload(context),
+            )
+        hook_settled.set()
+        persisted_outcome = await self._event_writer.persist_exact_replay(outcome_template)
+        outcome_persisted.set()
+        delivered = await self._event_writer.fan_out_persisted(
+            [claim.started_event, persisted_outcome]
+        )
+        return tuple(delivered)
+
+    async def _await_terminal_runtime_hook_slot(
+        self,
+        **kwargs: Any,
+    ) -> tuple[Event, ...] | None:
+        """Defer cancellation across the two unsafe hook protocol windows."""
+
+        hook_entered = asyncio.Event()
+        hook_settled = asyncio.Event()
+        outcome_persisted = asyncio.Event()
+        operation = asyncio.create_task(
+            self._execute_terminal_runtime_hook_slot(
+                **kwargs,
+                hook_entered=hook_entered,
+                hook_settled=hook_settled,
+                outcome_persisted=outcome_persisted,
+            )
+        )
+        cancellation: asyncio.CancelledError | None = None
+        cancellation_relay: asyncio.Task[None] | None = None
+
+        async def relay_cancellation_when_safe(exc: asyncio.CancelledError) -> None:
+            entered_wait = asyncio.create_task(hook_entered.wait())
+            persisted_wait = asyncio.create_task(outcome_persisted.wait())
+            try:
+                while not operation.done():
+                    if hook_entered.is_set() and not hook_settled.is_set():
+                        operation.cancel(*exc.args)
+                        return
+                    if outcome_persisted.is_set():
+                        operation.cancel(*exc.args)
+                        return
+                    waiters: set[asyncio.Task[Any]] = {operation}
+                    if not hook_entered.is_set():
+                        waiters.add(entered_wait)
+                    if not outcome_persisted.is_set():
+                        waiters.add(persisted_wait)
+                    await asyncio.wait(
+                        waiters,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+            finally:
+                for waiter in (entered_wait, persisted_wait):
+                    if not waiter.done():
+                        waiter.cancel()
+                await asyncio.gather(entered_wait, persisted_wait, return_exceptions=True)
+
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError as exc:
+                if operation.cancelled():
+                    break
+                if cancellation is None:
+                    cancellation = exc
+                    cancellation_relay = asyncio.create_task(relay_cancellation_when_safe(exc))
+
+        missing = object()
+        result: tuple[Event, ...] | None | object = missing
+        operation_failure: BaseException | None = None
+        try:
+            result = operation.result()
+        except BaseException as exc:
+            operation_failure = exc
+        if cancellation_relay is not None:
+            if not cancellation_relay.done():
+                cancellation_relay.cancel()
+            await asyncio.gather(cancellation_relay, return_exceptions=True)
+
+        if cancellation is not None:
+            if operation_failure is not None and not isinstance(
+                operation_failure,
+                asyncio.CancelledError,
+            ):
+                cancellation.add_note(
+                    "Terminal runtime hook settlement also failed after cancellation: "
+                    f"{type(operation_failure).__name__}."
+                )
+                raise cancellation from operation_failure
+            raise cancellation
+        if operation_failure is not None:
+            raise operation_failure
+        if result is missing:
+            raise RuntimeError("Terminal runtime hook operation returned no result.")
+        return cast("tuple[Event, ...] | None", result)
+
     async def _run_runtime_hooks(
         self,
         *,
@@ -24021,8 +25694,7 @@ class SessionEngine:
         terminal_event: Event,
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
-        hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
-        scope: str,
+        hooks: tuple[tuple[runtime_records.RegisteredRuntimeHook, str, int], ...],
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> AsyncGenerator[Event, None]:
@@ -24033,7 +25705,7 @@ class SessionEngine:
             or invocation_context.profile is not execution_profile
         ):
             raise RuntimeError("Runtime hook execution substituted frozen invocation authority.")
-        for registered_hook in hooks:
+        for registered_hook, scope, hook_index in hooks:
             hook = registered_hook.hook
             if not _runtime_hook_supports_phase(
                 hook=hook,
@@ -24041,69 +25713,164 @@ class SessionEngine:
             ):
                 continue
             hook_name = registered_hook.name
-            yield await self._event_writer.emit(
-                _runtime_hook_event(
-                    event_type=EventType.HOOK_STARTED,
-                    hook_name=hook_name,
-                    scope=scope,
-                    phase=phase,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    terminal_event=terminal_event,
-                    execution_profile=execution_profile,
-                    payload={},
-                )
-            )
-            context = RuntimeHookContext(
-                runtime=self._hook_runtime,
+            hook_invocation_id = str(uuid4())
+            started_event = _terminal_runtime_hook_event(
+                event_type=EventType.HOOK_STARTED,
+                outcome="started",
+                hook_invocation_id=hook_invocation_id,
+                hook_index=hook_index,
                 hook_name=hook_name,
+                scope=scope,
+                phase=phase,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                terminal_event=terminal_event,
+                execution_profile=execution_profile,
+                payload={},
+            )
+            completed_event_id = _terminal_runtime_hook_event_id(
+                session=session,
+                terminal_event=terminal_event,
+                phase=phase,
+                scope=scope,
+                hook_index=hook_index,
+                outcome="completed",
+            )
+            failed_event_id = _terminal_runtime_hook_event_id(
+                session=session,
+                terminal_event=terminal_event,
+                phase=phase,
+                scope=scope,
+                hook_index=hook_index,
+                outcome="failed",
+            )
+            hook_events = await self._await_terminal_runtime_hook_slot(
+                started_event=started_event,
+                completed_event_id=completed_event_id,
+                failed_event_id=failed_event_id,
+                hook=hook,
+                hook_name=hook_name,
+                hook_index=hook_index,
+                scope=scope,
                 phase=phase,
                 session=session,
                 terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 execution_profile=execution_profile,
             )
-            try:
-                await _call_runtime_hook(hook=hook, phase=phase, context=context)
-            except Exception as exc:
-                diagnostic = exception_diagnostic(
-                    exc,
-                    empty_message="runtime hook failed",
-                    nonportable_message="Runtime hook failed with a non-portable diagnostic.",
-                    redactor=self._secret_redactor,
-                )
-                yield await self._event_writer.emit(
-                    _runtime_hook_event(
-                        event_type=EventType.HOOK_FAILED,
-                        hook_name=hook_name,
-                        scope=scope,
-                        phase=phase,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        terminal_event=terminal_event,
-                        execution_profile=execution_profile,
-                        payload={
-                            **diagnostic.payload_fields(),
-                            **_runtime_hook_actions_payload(context),
-                        },
-                    )
-                )
+            if hook_events is None:
+                # Preserve app-before-agent and registration ordering. A peer may
+                # still own this slot, so a contender cannot skip to later hooks.
+                return
+            if not hook_events:
                 continue
-            yield await self._event_writer.emit(
-                _runtime_hook_event(
-                    event_type=EventType.HOOK_COMPLETED,
-                    hook_name=hook_name,
-                    scope=scope,
-                    phase=phase,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    terminal_event=terminal_event,
-                    execution_profile=execution_profile,
-                    payload=_runtime_hook_actions_payload(context),
+            for hook_event in hook_events:
+                yield hook_event
+
+    async def terminal_runtime_hooks_are_settled(
+        self,
+        *,
+        phase: RuntimeHookPhase,
+        session: Session,
+        terminal_event: Event,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        invocation_context: InvocationContext | None = None,
+    ) -> bool:
+        """Return whether every authenticated terminal-hook slot has settled."""
+
+        if invocation_context is not None:
+            if (
+                invocation_context.binding.session_id != session.id
+                or invocation_context.registered_agent is not registered_agent
+                or invocation_context.registered_environment is not registered_environment
+            ):
+                raise RuntimeError(
+                    "Terminal hook settlement inspection substituted frozen authority."
+                )
+            if (
+                execution_profile is not None
+                and execution_profile is not invocation_context.profile
+            ):
+                raise RuntimeError(
+                    "Terminal hook settlement inspection substituted its execution profile."
+                )
+            execution_profile = invocation_context.profile
+
+        for registered_hook, scope, hook_index in self._ordered_terminal_runtime_hooks(
+            registered_agent=registered_agent,
+            invocation_context=invocation_context,
+        ):
+            hook = registered_hook.hook
+            if not _runtime_hook_supports_phase(hook=hook, phase=phase):
+                continue
+            started_event_id = _terminal_runtime_hook_event_id(
+                session=session,
+                terminal_event=terminal_event,
+                phase=phase,
+                scope=scope,
+                hook_index=hook_index,
+                outcome="started",
+            )
+            records = await self.session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_id=started_event_id,
+                    limit=2,
                 )
             )
+            if not records:
+                return False
+            if len(records) != 1:
+                raise SessionRuntimePublicationConflict(
+                    "Terminal runtime hook has duplicate reservation evidence."
+                )
+            started = records[0].event
+            expected_started = _terminal_runtime_hook_event(
+                event_type=EventType.HOOK_STARTED,
+                outcome="started",
+                hook_invocation_id=_terminal_runtime_hook_invocation_id(started),
+                hook_index=hook_index,
+                hook_name=registered_hook.name,
+                scope=scope,
+                phase=phase,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                terminal_event=terminal_event,
+                execution_profile=execution_profile,
+                payload={},
+            )
+            if not _terminal_runtime_hook_started_matches(started, expected_started):
+                raise SessionRuntimePublicationConflict(
+                    "Terminal runtime hook reservation conflicts with frozen authority."
+                )
+            completed_event_id = _terminal_runtime_hook_event_id(
+                session=session,
+                terminal_event=terminal_event,
+                phase=phase,
+                scope=scope,
+                hook_index=hook_index,
+                outcome="completed",
+            )
+            failed_event_id = _terminal_runtime_hook_event_id(
+                session=session,
+                terminal_event=terminal_event,
+                phase=phase,
+                scope=scope,
+                hook_index=hook_index,
+                outcome="failed",
+            )
+            if not await self._load_terminal_runtime_hook_settlement(
+                started_event=started,
+                completed_event_id=completed_event_id,
+                failed_event_id=failed_event_id,
+            ):
+                return False
+        return True
 
     async def _run_before_stop_policies(
         self,

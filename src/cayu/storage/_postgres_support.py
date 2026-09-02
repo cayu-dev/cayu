@@ -773,6 +773,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         to_utc_optional(task.available_at),
         task.worker_id,
         to_utc_optional(task.lease_expires_at),
+        task.interrupted_handoff_id,
         task.status_reason,
         None if task.status_payload is None else _dumps(task.status_payload),
         _dumps(task.input),
@@ -795,9 +796,9 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
 
 TASK_COLUMNS = (
     "id, type, title, description, status, session_id, session_instance_id, parent_task_id, "
-    "assigned_agent_name, available_at, worker_id, lease_expires_at, status_reason, "
-    "status_payload, input, result, error, metadata, created_at, updated_at, started_at, "
-    "completed_at, invocation, retry_series, work_contract"
+    "assigned_agent_name, available_at, worker_id, lease_expires_at, interrupted_handoff_id, "
+    "status_reason, status_payload, input, result, error, metadata, created_at, updated_at, "
+    "started_at, completed_at, invocation, retry_series, work_contract"
 )
 
 
@@ -815,22 +816,23 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         available_at=to_utc_optional(row[9]),
         worker_id=row[10],
         lease_expires_at=to_utc_optional(row[11]),
-        status_reason=row[12],
-        status_payload=None if row[13] is None else _loads(row[13]),
-        input=_loads(row[14]),
-        result=None if row[15] is None else _loads(row[15]),
-        error=None if row[16] is None else _loads(row[16]),
-        metadata=_loads(row[17]),
-        created_at=to_utc(row[18]),
-        updated_at=to_utc(row[19]),
-        started_at=to_utc_optional(row[20]),
-        completed_at=to_utc_optional(row[21]),
-        invocation=TaskInvocation.model_validate(_loads(row[22])),
+        interrupted_handoff_id=row[12],
+        status_reason=row[13],
+        status_payload=None if row[14] is None else _loads(row[14]),
+        input=_loads(row[15]),
+        result=None if row[16] is None else _loads(row[16]),
+        error=None if row[17] is None else _loads(row[17]),
+        metadata=_loads(row[18]),
+        created_at=to_utc(row[19]),
+        updated_at=to_utc(row[20]),
+        started_at=to_utc_optional(row[21]),
+        completed_at=to_utc_optional(row[22]),
+        invocation=TaskInvocation.model_validate(_loads(row[23])),
         retry_series=(
-            None if row[23] is None else TaskRetrySeriesSnapshot.model_validate(_loads(row[23]))
+            None if row[24] is None else TaskRetrySeriesSnapshot.model_validate(_loads(row[24]))
         ),
         work_contract=(
-            None if row[24] is None else WorkContractRef.model_validate(_loads(row[24]))
+            None if row[25] is None else WorkContractRef.model_validate(_loads(row[25]))
         ),
     )
 

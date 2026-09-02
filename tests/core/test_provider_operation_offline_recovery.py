@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import pytest
 from tests.core._execution_profile_fixtures import (
@@ -29,7 +30,7 @@ from tests.core._session_operation_fault_harness import (
 )
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import SQLiteBudgetLedger, SQLiteSessionStore
+from cayu import SQLiteBudgetLedger, SQLiteSessionStore, SQLiteTaskStore
 from cayu.core import (
     AgentSpec,
     Event,
@@ -84,6 +85,7 @@ from cayu.runtime import (
     RunRequest,
     RuntimeHook,
     RuntimeHookContext,
+    RuntimeHookPhase,
     SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
@@ -148,6 +150,14 @@ from cayu.runtime.sessions import (
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
+)
+from cayu.runtime.tasks import (
+    InMemoryTaskStore,
+    TaskClaimLost,
+    TaskCreate,
+    TaskQuery,
+    TaskStatus,
+    interrupted_task_handoff_request,
 )
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
@@ -4020,18 +4030,367 @@ def test_concurrent_exact_fail_replay_observes_in_progress_terminalization(
         owner = asyncio.create_task(collect_resolution())
         await terminalization_started.wait()
         replay = await collect_resolution()
-        assert [event.type for event in replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
+        assert [event.type for event in replay] == [
+            EventType.PROVIDER_OPERATION_RESOLVED,
+            EventType.SESSION_FAILED,
+        ]
         assert not owner.done()
 
         release_terminalization.set()
         owner_events = await owner
-        assert EventType.SESSION_FAILED in {event.type for event in owner_events}
+        assert EventType.INTERACTION_FAILED in {event.type for event in owner_events}
         durable = await store.load_events(session_id)
         assert sum(event.type is EventType.MODEL_ERROR for event in durable) == 1
         assert sum(event.type is EventType.INTERACTION_FAILED for event in durable) == 1
         assert sum(event.type is EventType.SESSION_FAILED for event in durable) == 1
         assert await load_pending_provider_operation_disposition(store, session_id) is None
         assert provider.adapter.start_calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_provider_failure_replay_runs_hooks_before_retiring_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingFailureHook(RuntimeHook):
+        name = "provider-failure-replay-hook"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:provider-operation-offline-recovery:failure-replay-hook",
+                behavior_version="1",
+                implementation_version="1",
+            )
+
+        async def after_session_failed(self, context: RuntimeHookContext) -> None:
+            self.calls += 1
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        session_id = "provider-failure-terminal-hook-replay"
+        provider = _OfflineOperationProvider(ProviderOperationStatus.UNAVAILABLE)
+        hook = RecordingFailureHook()
+        await _stage_offline_operation(
+            store,
+            session_id=session_id,
+            provider=provider,
+            runtime_hooks=(hook,),
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            runtime_hooks=[hook],
+        )
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await store.load(session_id)
+        active = await store.load_active_model_completion_stage(session_id)
+        assert interrupted is not None
+        assert active is not None
+        request = ProviderOperationResolutionRequest(
+            session_id=session_id,
+            stage_id=active.stage.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+        original_runner = app._session_engine._run_runtime_hooks
+        process_lost = False
+
+        async def lose_before_hooks(**kwargs):
+            nonlocal process_lost
+            if kwargs["phase"] is RuntimeHookPhase.AFTER_SESSION_FAILED and not process_lost:
+                process_lost = True
+                raise _SimulatedProcessLoss("process lost after terminal event persistence")
+            async for event in original_runner(**kwargs):
+                yield event
+
+        monkeypatch.setattr(app._session_engine, "_run_runtime_hooks", lose_before_hooks)
+        with pytest.raises(_SimulatedProcessLoss):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+
+        failed = await store.load(session_id)
+        assert failed is not None
+        assert failed.status is SessionStatus.FAILED
+        assert hook.calls == 0
+        assert await load_pending_provider_operation_disposition(store, session_id) is not None
+        assert (
+            sum(
+                event.type is EventType.SESSION_FAILED
+                for event in await store.load_events(session_id)
+            )
+            == 1
+        )
+
+        monkeypatch.setattr(app._session_engine, "_run_runtime_hooks", original_runner)
+        replay = [event async for event in app.resolve_provider_operation(request)]
+
+        assert replay[0].type is EventType.PROVIDER_OPERATION_RESOLVED
+        assert {event.type for event in replay} >= {
+            EventType.HOOK_STARTED,
+            EventType.HOOK_COMPLETED,
+        }
+        assert hook.calls == 1
+        assert await load_pending_provider_operation_disposition(store, session_id) is None
+        exact_replay = [event async for event in app.resolve_provider_operation(request)]
+        assert [event.type for event in exact_replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
+        assert hook.calls == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+def test_same_worker_new_handoff_continues_fallback_after_owner_loss(
+    task_store_kind: str,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        task_store = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "fallback-successor-tasks.sqlite")
+        )
+        provider = _UnsupportedAmbiguousStartProvider()
+        app = CayuApp(task_store=task_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="fake-model"))
+
+        await task_store.create_task(TaskCreate(task_id="fallback-task", type="job"))
+        original = await task_store.claim_task("original-worker", lease_seconds=300)
+        assert original is not None
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="fallback-session",
+                    task_id=original.id,
+                    task_worker_id="original-worker",
+                    messages=[Message.text("user", "start ambiguous provider work")],
+                )
+            ):
+                pass
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="fallback-session",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        assert recovered.status is SessionStatus.INTERRUPTED
+        attached = await task_store.load_task("fallback-task")
+        interrupted = await app.session_store.load("fallback-session")
+        assert attached is not None
+        assert interrupted is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=interrupted.run_epoch,
+            )
+        )
+        first_owner = await task_store.claim_interrupted_task_continuation(
+            "continuation-worker-a", handoff_id=str(uuid4())
+        )
+        assert first_owner.task is not None
+        first_handoff_id = first_owner.task.interrupted_handoff_id
+        assert first_handoff_id is not None
+        inspection = await inspect_provider_operation(app.session_store, "fallback-session")
+        assert inspection.stage_id is not None
+        provider.adapter.start_events = (
+            ModelStreamEvent.text_delta("successor completed fallback"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        )
+        request = ProviderOperationResolutionRequest(
+            session_id="fallback-session",
+            task_worker_id="continuation-worker-a",
+            task_handoff_id=first_handoff_id,
+            stage_id=inspection.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FALLBACK_RETRY,
+        )
+        stream = app.resolve_provider_operation(request)
+        assert (await anext(stream)).type is EventType.PROVIDER_OPERATION_RESOLVED
+        assert (await anext(stream)).type is EventType.INTERACTION_RESUMED
+        await stream.aclose()
+
+        running = await app.session_store.load("fallback-session")
+        current_owner = await task_store.load_task("fallback-task")
+        assert running is not None and running.status is SessionStatus.RUNNING
+        assert current_owner is not None
+        assert provider.adapter.start_calls == 1
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                current_owner,
+                session_run_epoch=running.run_epoch,
+            )
+        )
+        successor = await task_store.claim_interrupted_task_continuation(
+            "continuation-worker-a", handoff_id=str(uuid4())
+        )
+        assert successor.task is not None
+        assert successor.task.interrupted_handoff_id != first_handoff_id
+
+        with pytest.raises(TaskClaimLost):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+        request = request.model_copy(
+            update={"task_handoff_id": successor.task.interrupted_handoff_id}
+        )
+        events = [event async for event in app.resolve_provider_operation(request)]
+        completed = await app.session_store.load("fallback-session")
+        completed_task = await task_store.load_task("fallback-task")
+        assert EventType.SESSION_COMPLETED in {event.type for event in events}
+        assert completed is not None and completed.status is SessionStatus.COMPLETED
+        assert completed_task is not None and completed_task.status is TaskStatus.COMPLETED
+        assert provider.adapter.start_calls == 2
+        assert (
+            await load_pending_provider_operation_disposition(
+                app.session_store,
+                "fallback-session",
+            )
+            is None
+        )
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+def test_same_worker_new_handoff_takes_over_pre_execution_failure_claim(
+    task_store_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        task_store = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "failure-claim-successor-tasks.sqlite")
+        )
+        provider = _UnsupportedAmbiguousStartProvider()
+        app = CayuApp(task_store=task_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="fake-model"))
+
+        await task_store.create_task(TaskCreate(task_id="failure-task", type="job"))
+        original = await task_store.claim_task("original-worker", lease_seconds=300)
+        assert original is not None
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="failure-session",
+                    task_id=original.id,
+                    task_worker_id="original-worker",
+                    messages=[Message.text("user", "start ambiguous provider work")],
+                )
+            ):
+                pass
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="failure-session",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        interrupted = await app.session_store.load("failure-session")
+        attached = await task_store.load_task("failure-task")
+        assert interrupted is not None and interrupted.status is SessionStatus.INTERRUPTED
+        assert attached is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=interrupted.run_epoch,
+            )
+        )
+        first_owner = await task_store.claim_interrupted_task_continuation(
+            "continuation-worker", handoff_id=str(uuid4())
+        )
+        assert first_owner.task is not None
+        first_handoff_id = first_owner.task.interrupted_handoff_id
+        assert first_handoff_id is not None
+
+        inspection = await inspect_provider_operation(app.session_store, "failure-session")
+        assert inspection.stage_id is not None
+        request = ProviderOperationResolutionRequest(
+            session_id="failure-session",
+            task_worker_id="continuation-worker",
+            task_handoff_id=first_handoff_id,
+            stage_id=inspection.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+        )
+        original_claim = app._recovery_coordinator._claim_provider_operation_disposition_execution
+
+        async def lose_after_execution_claim(**kwargs):
+            claimed = await original_claim(**kwargs)
+            assert claimed is True
+            raise _SimulatedProcessLoss("process lost after the execution claim")
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_claim_provider_operation_disposition_execution",
+            lose_after_execution_claim,
+        )
+        with pytest.raises(_SimulatedProcessLoss):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+
+        pending = await load_pending_provider_operation_disposition(
+            app.session_store,
+            "failure-session",
+        )
+        assert pending is not None
+        assert pending[0].execution_task_worker_id == "continuation-worker"
+        assert pending[0].execution_task_handoff_id == first_handoff_id
+        retained = await app.session_store.load("failure-session")
+        current_owner = await task_store.load_task("failure-task")
+        assert retained is not None and retained.status is SessionStatus.INTERRUPTED
+        assert current_owner is not None
+
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_claim_provider_operation_disposition_execution",
+            original_claim,
+        )
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                current_owner,
+                session_run_epoch=retained.run_epoch,
+            )
+        )
+        successor = await task_store.claim_interrupted_task_continuation(
+            "continuation-worker", handoff_id=str(uuid4())
+        )
+        assert successor.task is not None
+        assert successor.task.interrupted_handoff_id != first_handoff_id
+
+        with pytest.raises(TaskClaimLost):
+            _ = [event async for event in app.resolve_provider_operation(request)]
+        request = request.model_copy(
+            update={"task_handoff_id": successor.task.interrupted_handoff_id}
+        )
+        events = [event async for event in app.resolve_provider_operation(request)]
+        failed_session = await app.session_store.load("failure-session")
+        failed_task = await task_store.load_task("failure-task")
+        assert EventType.SESSION_FAILED in {event.type for event in events}
+        assert failed_session is not None and failed_session.status is SessionStatus.FAILED
+        assert failed_task is not None and failed_task.status is TaskStatus.FAILED
+        assert (
+            await load_pending_provider_operation_disposition(
+                app.session_store,
+                "failure-session",
+            )
+            is None
+        )
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
 
     asyncio.run(scenario())
 
@@ -5390,6 +5749,413 @@ def test_unsupported_start_process_loss_requires_explicit_resolution_after_resta
         finally:
             if isinstance(store, SQLiteSessionStore):
                 await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("continuation_owner", ["original", "elected"])
+@pytest.mark.parametrize(
+    "action",
+    [
+        ProviderOperationResolutionAction.FAIL,
+        ProviderOperationResolutionAction.FALLBACK_RETRY,
+    ],
+)
+def test_accepted_attached_task_provider_disposition_awaits_typed_continuation(
+    task_store_kind: str,
+    continuation_owner: str,
+    action: ProviderOperationResolutionAction,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        task_store = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / f"accepted-{action.value}-tasks.sqlite")
+        )
+        provider = _UnsupportedAmbiguousStartProvider()
+        app = CayuApp(task_store=task_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="fake-model"))
+
+        await task_store.create_task(TaskCreate(task_id="provider-task", type="job"))
+        claimed = await task_store.claim_task("prior-worker", lease_seconds=300)
+        assert claimed is not None
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="provider-task-session",
+                    task_id=claimed.id,
+                    task_worker_id="prior-worker",
+                    messages=[Message.text("user", "start ambiguous provider work")],
+                )
+            ):
+                pass
+
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="provider-task-session",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        assert recovered.status is SessionStatus.INTERRUPTED
+        interrupted = await app.session_store.load("provider-task-session")
+        attached = await task_store.load_task("provider-task")
+        assert interrupted is not None
+        assert attached is not None
+        continuation_worker = "prior-worker"
+        continuation_handoff_id = attached.interrupted_handoff_id
+        if continuation_owner == "elected":
+            await task_store.release_interrupted_task_worker(
+                interrupted_task_handoff_request(
+                    attached,
+                    session_run_epoch=interrupted.run_epoch,
+                )
+            )
+            continuation_worker = "elected-worker"
+            continuation = await task_store.claim_interrupted_task_continuation(
+                continuation_worker,
+                TaskQuery(type="job"),
+                handoff_id=str(uuid4()),
+            )
+            assert continuation.task is not None
+            continuation_handoff_id = continuation.task.interrupted_handoff_id
+
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "provider-task-session",
+        )
+        assert inspection.stage_id is not None
+        if action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+            provider.adapter.start_events = (
+                ModelStreamEvent.text_delta("fallback completed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            )
+        request = ProviderOperationResolutionRequest(
+            session_id="provider-task-session",
+            task_worker_id=continuation_worker,
+            task_handoff_id=continuation_handoff_id,
+            stage_id=inspection.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=action,
+            reason="operator selected the durable disposition",
+        )
+        stream = app.resolve_provider_operation(request)
+        assert (await anext(stream)).type is EventType.PROVIDER_OPERATION_RESOLVED
+        await stream.aclose()
+
+        generic_recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="provider-task-session",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        retained_session = await app.session_store.load("provider-task-session")
+        retained_task = await task_store.load_task("provider-task")
+        assert generic_recovery.status is SessionStatus.INTERRUPTED
+        assert retained_session is not None
+        assert retained_session.status is SessionStatus.INTERRUPTED
+        assert retained_task is not None
+        assert retained_task.status is TaskStatus.RUNNING
+        assert retained_task.worker_id == continuation_worker
+        assert (
+            await load_pending_provider_operation_disposition(
+                app.session_store,
+                "provider-task-session",
+            )
+            is not None
+        )
+
+        resolved = [event async for event in app.resolve_provider_operation(request)]
+        final_session = await app.session_store.load("provider-task-session")
+        final_task = await task_store.load_task("provider-task")
+        assert resolved[0].type is EventType.PROVIDER_OPERATION_RESOLVED
+        assert final_session is not None
+        assert final_task is not None
+        if action is ProviderOperationResolutionAction.FAIL:
+            assert resolved[-1].type is EventType.SESSION_FAILED
+            assert final_session.status is SessionStatus.FAILED
+            assert final_task.status is TaskStatus.FAILED
+        else:
+            assert resolved[-1].type is EventType.SESSION_COMPLETED
+            assert final_session.status is SessionStatus.COMPLETED
+            assert final_task.status is TaskStatus.COMPLETED
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+def test_attached_task_provider_failure_terminalizes_once_and_replays(
+    task_store_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        task_store = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / "provider-tasks.sqlite")
+        )
+        provider = _UnsupportedAmbiguousStartProvider()
+        app = CayuApp(task_store=task_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="fake-model"))
+
+        await task_store.create_task(TaskCreate(task_id="provider-task", type="job"))
+        claimed = await task_store.claim_task("prior-worker", lease_seconds=300)
+        assert claimed is not None
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="provider-task-session",
+                    task_id=claimed.id,
+                    task_worker_id="prior-worker",
+                    messages=[Message.text("user", "start ambiguous provider work")],
+                )
+            ):
+                pass
+
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="provider-task-session",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        assert recovered.status is SessionStatus.INTERRUPTED
+        interrupted = await app.session_store.load("provider-task-session")
+        attached = await task_store.load_task("provider-task")
+        assert interrupted is not None
+        assert attached is not None
+        await task_store.release_interrupted_task_worker(
+            interrupted_task_handoff_request(
+                attached,
+                session_run_epoch=interrupted.run_epoch,
+            )
+        )
+        continuation = await task_store.claim_interrupted_task_continuation(
+            "elected-worker",
+            TaskQuery(type="job"),
+            handoff_id=str(uuid4()),
+        )
+        assert continuation.task is not None
+
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "provider-task-session",
+        )
+        assert inspection.stage_id is not None
+        request = ProviderOperationResolutionRequest(
+            session_id="provider-task-session",
+            task_worker_id="elected-worker",
+            task_handoff_id=continuation.task.interrupted_handoff_id,
+            stage_id=inspection.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+            reason="operator selected the terminal disposition",
+        )
+        publish_transition = app._session_engine._publish_sibling_interaction_transition
+        injected_failure = False
+
+        async def lose_process_after_task_terminalization(*args, **kwargs):
+            nonlocal injected_failure
+            if kwargs.get("to_status") is SessionStatus.FAILED and not injected_failure:
+                injected_failure = True
+                raise _SimulatedProcessLoss(
+                    "process lost after task failure and before session failure"
+                )
+            return await publish_transition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_publish_sibling_interaction_transition",
+            lose_process_after_task_terminalization,
+        )
+        first_attempt: list[Event] = []
+        with pytest.raises(_SimulatedProcessLoss):
+            async for event in app.resolve_provider_operation(request):
+                first_attempt.append(event)
+
+        interrupted_after_loss = await app.session_store.load("provider-task-session")
+        failed_before_replay = await task_store.load_task("provider-task")
+        assert interrupted_after_loss is not None
+        assert interrupted_after_loss.status is SessionStatus.INTERRUPTED
+        assert failed_before_replay is not None
+        assert failed_before_replay.status is TaskStatus.FAILED
+        assert sum(event.type is EventType.TASK_FAILED for event in first_attempt) == 1
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_publish_sibling_interaction_transition",
+            publish_transition,
+        )
+        events = [event async for event in app.resolve_provider_operation(request)]
+
+        failed_session = await app.session_store.load("provider-task-session")
+        failed_task = await task_store.load_task("provider-task")
+        assert failed_session is not None
+        assert failed_session.status is SessionStatus.FAILED
+        assert failed_task is not None
+        assert failed_task.status is TaskStatus.FAILED
+        assert failed_task.worker_id is None
+        assert failed_task.error == {
+            "message": "Provider operation was explicitly failed after recovery.",
+            "type": "provider_operation_unavailable",
+            "session_id": "provider-task-session",
+        }
+        assert sum(event.type is EventType.TASK_FAILED for event in events) == 1
+        assert events[-1].type is EventType.SESSION_FAILED
+
+        replay = [event async for event in app.resolve_provider_operation(request)]
+        assert [event.type for event in replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
+        with pytest.raises(TaskClaimLost):
+            async for _event in app.resolve_provider_operation(
+                request.model_copy(update={"task_worker_id": "stale-worker"})
+            ):
+                pass
+        with pytest.raises(TaskClaimLost):
+            async for _event in app.resolve_provider_operation(
+                request.model_copy(update={"task_worker_id": None, "task_handoff_id": None})
+            ):
+                pass
+        assert await task_store.load_task("provider-task") == failed_task
+        stored = await app.session_store.load_events("provider-task-session")
+        assert sum(event.type is EventType.TASK_FAILED for event in stored) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("task_store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("replay_entrance", ["typed", "generic"])
+def test_workerless_provider_failure_replays_after_task_terminalization_loss(
+    task_store_kind: str,
+    replay_entrance: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        task_store = (
+            InMemoryTaskStore()
+            if task_store_kind == "memory"
+            else SQLiteTaskStore(tmp_path / f"workerless-{replay_entrance}-provider-tasks.sqlite")
+        )
+        provider = _UnsupportedAmbiguousStartProvider()
+        app = CayuApp(task_store=task_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="worker-agent", model="fake-model"))
+
+        await task_store.create_task(TaskCreate(task_id="workerless-provider-task", type="job"))
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="workerless-provider-session",
+                    task_id="workerless-provider-task",
+                    messages=[Message.text("user", "start ambiguous provider work")],
+                )
+            ):
+                pass
+
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="workerless-provider-session",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        assert recovered.status is SessionStatus.INTERRUPTED
+        interrupted = await app.session_store.load("workerless-provider-session")
+        attached = await task_store.load_task("workerless-provider-task")
+        assert interrupted is not None
+        assert attached is not None
+        assert attached.status is TaskStatus.RUNNING
+        assert attached.worker_id is None
+
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "workerless-provider-session",
+        )
+        assert inspection.stage_id is not None
+        request = ProviderOperationResolutionRequest(
+            session_id="workerless-provider-session",
+            stage_id=inspection.stage_id,
+            expected_run_epoch=interrupted.run_epoch,
+            action=ProviderOperationResolutionAction.FAIL,
+            reason="operator selected the terminal disposition",
+        )
+        publish_transition = app._session_engine._publish_sibling_interaction_transition
+        injected_failure = False
+
+        async def lose_process_after_task_terminalization(*args, **kwargs):
+            nonlocal injected_failure
+            if kwargs.get("to_status") is SessionStatus.FAILED and not injected_failure:
+                injected_failure = True
+                raise _SimulatedProcessLoss(
+                    "process lost after workerless task failure and before session failure"
+                )
+            return await publish_transition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_publish_sibling_interaction_transition",
+            lose_process_after_task_terminalization,
+        )
+        first_attempt: list[Event] = []
+        with pytest.raises(_SimulatedProcessLoss):
+            async for event in app.resolve_provider_operation(request):
+                first_attempt.append(event)
+
+        interrupted_after_loss = await app.session_store.load("workerless-provider-session")
+        failed_before_replay = await task_store.load_task("workerless-provider-task")
+        assert interrupted_after_loss is not None
+        assert interrupted_after_loss.status is SessionStatus.INTERRUPTED
+        assert failed_before_replay is not None
+        assert failed_before_replay.status is TaskStatus.FAILED
+        assert sum(event.type is EventType.TASK_FAILED for event in first_attempt) == 1
+
+        monkeypatch.setattr(
+            app._session_engine,
+            "_publish_sibling_interaction_transition",
+            publish_transition,
+        )
+        if replay_entrance == "typed":
+            replay_events = [event async for event in app.resolve_provider_operation(request)]
+        else:
+            replay_result = await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id="workerless-provider-session",
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+            assert replay_result.status is SessionStatus.FAILED
+            replay_events = list(replay_result.events)
+
+        failed_session = await app.session_store.load("workerless-provider-session")
+        failed_task = await task_store.load_task("workerless-provider-task")
+        assert failed_session is not None
+        assert failed_session.status is SessionStatus.FAILED
+        assert failed_task is not None
+        assert failed_task == failed_before_replay
+        assert EventType.TASK_FAILED in {event.type for event in replay_events}
+        assert EventType.SESSION_FAILED in {event.type for event in replay_events}
+
+        completed_replay = [event async for event in app.resolve_provider_operation(request)]
+        assert [event.type for event in completed_replay] == [EventType.PROVIDER_OPERATION_RESOLVED]
+        with pytest.raises(TaskClaimLost):
+            async for _event in app.resolve_provider_operation(
+                request.model_copy(update={"task_worker_id": "unrelated-worker"})
+            ):
+                pass
+        stored = await app.session_store.load_events("workerless-provider-session")
+        assert sum(event.type is EventType.TASK_FAILED for event in stored) == 1
+        assert sum(event.type is EventType.SESSION_FAILED for event in stored) == 1
+
+        if isinstance(task_store, SQLiteTaskStore):
+            await task_store.close()
 
     asyncio.run(scenario())
 

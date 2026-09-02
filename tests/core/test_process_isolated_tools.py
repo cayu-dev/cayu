@@ -4803,11 +4803,13 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
             task_id: str,
             worker_id: str,
             *,
+            handoff_id: str | None = None,
             extend_seconds: int = 300,
         ) -> Task:
             task = await super().heartbeat(
                 task_id,
                 worker_id,
+                handoff_id=handoff_id,
                 extend_seconds=extend_seconds,
             )
             self.heartbeat_count += 1
