@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,14 +47,16 @@ from cayu.core.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.core.runtime_authority import SessionRunFenced
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
     task_store_interrupted_handoff_capability_is_complete,
     task_store_mutation_is_cancellation_quiescent,
 )
-from cayu.runtime.sessions import SessionStatus
+from cayu.runtime.sessions import IncompleteSessionRecoveryRequest, SessionStatus
 from cayu.runtime.tasks import (
+    InterruptedTaskContinuationClaimPage,
     Task,
     TaskClaimLost,
     TaskInterruptedHandoffConflict,
@@ -78,6 +81,7 @@ from cayu.runtime.tasks import (
     _terminalize_claimed_task_or_detect_peer_winner,
     copy_task,
     interrupted_task_handoff_request,
+    new_interrupted_task_continuation_handoff_id,
     prepare_interrupted_task_handoff,
     settle_task_retry_attempt_with_retry,
 )
@@ -103,13 +107,19 @@ TaskHandler = Callable[
     ["CayuApp", Task, str],
     Awaitable[TaskHandlerOutcome | TaskRetryAttemptReport | None],
 ]
+RecoveredInterruptedTaskHandler = Callable[
+    ["CayuApp", Task, str],
+    Awaitable[TaskHandlerOutcome | None],
+]
 _MAX_TASK_FAILURE_MESSAGE_BYTES = 500
 _TASK_RETRY_HANDLER_CANCELLATION_GRACE_SECONDS = 1.0
 _INTERRUPTED_HANDOFF_MAX_ATTEMPTS = 3
 _INTERRUPTED_HANDOFF_INITIAL_BACKOFF_SECONDS = 0.05
 _INTERRUPTED_HANDOFF_MAX_BACKOFF_SECONDS = 1.0
-_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 100
+_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE = 10
 _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 class _TaskRetryElapsed(Exception):
@@ -154,6 +164,15 @@ class _TaskRetryQuiescence:
     report: TaskRetryAttemptReport | None
 
 
+@dataclass(frozen=True)
+class _InterruptedHandoffRecoveryPage:
+    """One scheduler-bounded expired-owner recovery turn."""
+
+    recovered: int
+    next_after: tuple[datetime, str] | None
+    exhausted: bool
+
+
 class _TaskRetryHandlerUnsettled(RuntimeError):
     """A handler remained live after its durable retry authority was lost."""
 
@@ -168,6 +187,9 @@ async def run_task_worker(
     lease_seconds: int = 300,
     poll_interval_s: float = 1.0,
     reclaim: bool = True,
+    recover_interrupted_handoffs: bool = True,
+    recovered_interrupted_task_handler: RecoveredInterruptedTaskHandler | None = None,
+    continuation_poll_interval_s: float | None = None,
     stop: asyncio.Event | None = None,
     max_tasks: int | None = None,
 ) -> int:
@@ -184,6 +206,13 @@ async def run_task_worker(
     - ``lease_seconds`` is the claim lease; the lease is re-extended at ~1/3 of it.
     - ``poll_interval_s`` is how long to wait when no task is available.
     - ``reclaim`` reclaims expired leases (from dead workers) before each claim.
+    - ``recover_interrupted_handoffs`` owns bounded recovery of expired attached
+      task workers. Elect one such scanner for each shared task store.
+    - ``recovered_interrupted_task_handler`` makes this worker available to claim
+      and continue receipt-backed workerless tasks. This execution capacity is
+      independent of expired-owner scanner election.
+    - ``continuation_poll_interval_s`` bounds rediscovery latency after an empty
+      continuation scan. It defaults to ``poll_interval_s``.
     - ``stop`` is an ``asyncio.Event`` for graceful shutdown.
     - ``max_tasks`` bounds the loop (useful for tests and one-shot drains).
     """
@@ -191,6 +220,12 @@ async def run_task_worker(
         raise ValueError("lease_seconds must be positive.")
     if not isfinite(poll_interval_s) or poll_interval_s <= 0:
         raise ValueError("poll_interval_s must be finite and positive.")
+    if type(recover_interrupted_handoffs) is not bool:
+        raise TypeError("recover_interrupted_handoffs must be a bool.")
+    if continuation_poll_interval_s is None:
+        continuation_poll_interval_s = poll_interval_s
+    elif not isfinite(continuation_poll_interval_s) or continuation_poll_interval_s <= 0:
+        raise ValueError("continuation_poll_interval_s must be finite and positive.")
     if max_tasks is not None and max_tasks < 0:
         raise ValueError("max_tasks must be non-negative.")
     worker_id = require_clean_nonblank(worker_id, "worker_id")
@@ -233,20 +268,98 @@ async def run_task_worker(
             "The interrupted-task handoff capability requires stable receipt/recovery "
             "methods and cancellation-quiescent ownership mutations."
         )
+    if recovered_interrupted_task_handler is not None and (
+        not interrupted_handoff_supported
+        or type(task_store).claim_interrupted_task_continuation
+        is TaskStore.claim_interrupted_task_continuation
+        or type(task_store).load_active_attached_task_worker
+        is TaskStore.load_active_attached_task_worker
+        or not task_store_mutation_is_cancellation_quiescent(
+            task_store,
+            "claim_interrupted_task_continuation",
+        )
+    ):
+        raise NotImplementedError(
+            "Recovered interrupted-task handlers require an atomic, "
+            "cancellation-quiescent continuation claim."
+        )
 
     handled = 0
+    expired_handoff_after: tuple[datetime, str] | None = None
+    continuation_after: tuple[datetime, str] | None = None
+    continuation_scan_scanned = 0
+    continuation_scan_rejected = 0
+    continuation_scan_filtered = 0
     next_interrupted_handoff_recovery_at = 0.0
+    next_interrupted_continuation_scan_at = 0.0
     while (max_tasks is None or handled < max_tasks) and not _is_stopped(stop):
         loop = asyncio.get_running_loop()
-        if interrupted_handoff_supported and loop.time() >= next_interrupted_handoff_recovery_at:
-            await _recover_expired_interrupted_task_handoffs(
+        if (
+            recover_interrupted_handoffs
+            and interrupted_handoff_supported
+            and loop.time() >= next_interrupted_handoff_recovery_at
+        ):
+            recovery_page = await _recover_expired_interrupted_task_handoffs(
                 app,
                 task_store,
+                after=expired_handoff_after,
                 limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
+                stop=stop,
             )
-            next_interrupted_handoff_recovery_at = (
-                loop.time() + _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS
+            if recovery_page.recovered:
+                next_interrupted_continuation_scan_at = 0.0
+            if recovery_page.exhausted:
+                expired_handoff_after = None
+                next_interrupted_handoff_recovery_at = (
+                    loop.time() + _INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS
+                )
+            else:
+                expired_handoff_after = recovery_page.next_after
+                next_interrupted_handoff_recovery_at = 0.0
+            if _is_stopped(stop):
+                break
+        continuation_activity = False
+        if (
+            recovered_interrupted_task_handler is not None
+            and loop.time() >= next_interrupted_continuation_scan_at
+        ):
+            continuation_page = await _run_recovered_interrupted_task_handler(
+                app,
+                task_store,
+                recovered_interrupted_task_handler,
+                worker_id=worker_id,
+                lease_seconds=lease_seconds,
+                query=query,
+                after=continuation_after,
             )
+            continuation_scan_scanned += continuation_page.scanned_candidates
+            continuation_scan_rejected += continuation_page.rejected_candidates
+            continuation_scan_filtered += continuation_page.filtered_candidates
+            continuation_activity = continuation_page.task is not None
+            if continuation_page.exhausted:
+                if continuation_scan_rejected:
+                    logger.warning(
+                        "Interrupted-task continuation scan rejected invalid authority: "
+                        "rejected_candidates=%d filtered_candidates=%d "
+                        "scanned_candidates=%d",
+                        continuation_scan_rejected,
+                        continuation_scan_filtered,
+                        continuation_scan_scanned,
+                    )
+                continuation_after = None
+                continuation_scan_scanned = 0
+                continuation_scan_rejected = 0
+                continuation_scan_filtered = 0
+                next_interrupted_continuation_scan_at = loop.time() + continuation_poll_interval_s
+            else:
+                continuation_after = continuation_page.next_after
+                next_interrupted_continuation_scan_at = 0.0
+            if continuation_activity:
+                handled += 1
+                if (max_tasks is not None and handled >= max_tasks) or _is_stopped(stop):
+                    break
+        if _is_stopped(stop):
+            break
         if reclaim:
             if materialized_work_contract_queue_supported:
                 reclaim_outcome = await capture_task_store_operation(
@@ -284,7 +397,28 @@ async def run_task_worker(
                 lease_seconds=lease_seconds,
             )
         if task is None:
-            if await _wait_or_stop(poll_interval_s, stop):
+            if continuation_activity and continuation_after is not None:
+                continue
+            idle_wait_s = poll_interval_s
+            if recovered_interrupted_task_handler is not None and continuation_after is None:
+                continuation_wait_s = max(
+                    next_interrupted_continuation_scan_at - loop.time(),
+                    0.0,
+                )
+                idle_wait_s = min(idle_wait_s, continuation_wait_s)
+            if (
+                recover_interrupted_handoffs
+                and interrupted_handoff_supported
+                and expired_handoff_after is None
+            ):
+                recovery_wait_s = max(
+                    next_interrupted_handoff_recovery_at - loop.time(),
+                    0.0,
+                )
+                idle_wait_s = min(idle_wait_s, recovery_wait_s)
+            if idle_wait_s == 0:
+                continue
+            if await _wait_or_stop(idle_wait_s, stop):
                 break
             continue
         task = copy_task(task)
@@ -313,6 +447,7 @@ async def run_task_worker(
             continue
         await _handle_with_heartbeat(app, task_store, task, handler, worker_id, lease_seconds)
         handled += 1
+        next_interrupted_continuation_scan_at = 0.0
     return handled
 
 
@@ -323,6 +458,8 @@ async def _handle_with_heartbeat(
     handler: TaskHandler,
     worker_id: str,
     lease_seconds: int,
+    *,
+    recover_interrupted_authority_loss: bool = False,
 ) -> None:
     owner_task = asyncio.current_task()
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
@@ -344,6 +481,7 @@ async def _handle_with_heartbeat(
     )
     handler_error: Exception | None = None
     handler_outcome: TaskHandlerOutcome | TaskRetryAttemptReport | None = None
+    interrupted_authority_loss = False
     retry_elapsed = False
     retry_cancellation_requested = False
     retry_elapsed_cancellation: asyncio.CancelledError | None = None
@@ -387,7 +525,13 @@ async def _handle_with_heartbeat(
                         "Task handler shutdown failed after heartbeat authority loss.",
                         [heartbeat_failure, exc],
                     ) from None
-            handler_error = exc
+            if recover_interrupted_authority_loss and isinstance(
+                exc,
+                (SessionRunFenced, TaskClaimLost),
+            ):
+                interrupted_authority_loss = True
+            else:
+                handler_error = exc
 
         if retry_elapsed or retry_cancellation_requested:
             terminalization_label = "cancellation" if retry_cancellation_requested else "deadline"
@@ -461,6 +605,15 @@ async def _handle_with_heartbeat(
             ownership_settled = True
             if retry_elapsed_cancellation is not None:
                 raise retry_elapsed_cancellation
+            return
+
+        if interrupted_authority_loss:
+            ownership_settled = await _settle_recovered_continuation_authority_loss(
+                app,
+                task_store,
+                task,
+                worker_id,
+            )
             return
 
         async def finalize_handler_outcome() -> None:
@@ -1544,62 +1697,237 @@ async def _recover_expired_interrupted_task_handoffs(
     app: CayuApp,
     task_store: TaskStore,
     *,
+    after: tuple[datetime, str] | None,
     limit: int,
-) -> int:
-    after: tuple[datetime, str] | None = None
+    stop: asyncio.Event | None,
+) -> _InterruptedHandoffRecoveryPage:
+    """Recover at most one store page before yielding to ordinary task work."""
+
+    candidates = await task_store.list_expired_interrupted_task_handoff_candidates(
+        after=after,
+        limit=limit,
+    )
     recovered = 0
-    while True:
-        candidates = await task_store.list_expired_interrupted_task_handoff_candidates(
-            after=after,
-            limit=limit,
-        )
-        for task in candidates:
-            if type(task) is not Task or task.session_id is None:
-                raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
+    next_after = after
+    for task in candidates:
+        if _is_stopped(stop):
+            return _InterruptedHandoffRecoveryPage(
+                recovered=recovered,
+                next_after=next_after,
+                exhausted=False,
+            )
+        if type(task) is not Task or task.session_id is None or task.lease_expires_at is None:
+            raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
+        next_after = (task.lease_expires_at, task.id)
+        session = await app.session_store.load(task.session_id)
+        if (
+            session is None
+            or task.session_instance_id is None
+            or session.instance_id != task.session_instance_id
+        ):
+            continue
+        if session.status in {
+            SessionStatus.PENDING,
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        }:
+            try:
+                await app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session.id,
+                        inactive_before=task.lease_expires_at,
+                        reason="expired_attached_task_owner",
+                        metadata={"recovery_scope": "attached_task"},
+                    )
+                )
+            except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                diagnostic = app.redact_exception_diagnostic(
+                    exc,
+                    empty_message="attached-session recovery failed",
+                    nonportable_message=(
+                        "Attached-session recovery failed with a non-portable diagnostic."
+                    ),
+                )
+                logger.warning(
+                    "Attached-session recovery failed before task handoff: "
+                    "task_id=%s session_id=%s error_type=%s error=%s",
+                    app.redact_json(task.id),
+                    app.redact_json(session.id),
+                    type(exc).__name__,
+                    diagnostic.message,
+                )
+                continue
             session = await app.session_store.load(task.session_id)
+            if session is None or session.instance_id != task.session_instance_id:
+                continue
+        if session.status is not SessionStatus.INTERRUPTED:
+            continue
+        request = interrupted_task_handoff_request(
+            task,
+            session_run_epoch=session.run_epoch,
+        )
+        try:
+            await _settle_interrupted_task_handoff_with_retry(
+                app,
+                task_store,
+                request,
+                recover_expired=True,
+            )
+        except TaskInterruptedHandoffConflict:
+            current = await task_store.load_task(task.id)
             if (
-                session is None
-                or task.session_instance_id is None
-                or session.instance_id != task.session_instance_id
-                or session.status is not SessionStatus.INTERRUPTED
+                current is None
+                or current.status
+                in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }
+                or _task_cancellation_requested(current)
+                or _task_retry_cancellation_requested(current)
+                or current.worker_id is None
+                or current.worker_id != request.worker_id
+                or current.lease_expires_at != request.lease_expires_at
             ):
                 continue
-            request = interrupted_task_handoff_request(
-                task,
-                session_run_epoch=session.run_epoch,
-            )
-            try:
-                await _settle_interrupted_task_handoff_with_retry(
-                    app,
-                    task_store,
-                    request,
-                    recover_expired=True,
-                )
-            except TaskInterruptedHandoffConflict:
-                current = await task_store.load_task(task.id)
-                if (
-                    current is None
-                    or current.status
-                    in {
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
-                    }
-                    or _task_cancellation_requested(current)
-                    or _task_retry_cancellation_requested(current)
-                    or current.worker_id is None
-                    or current.worker_id != request.worker_id
-                    or current.lease_expires_at != request.lease_expires_at
-                ):
-                    continue
-                raise
-            recovered += 1
-        if len(candidates) < limit:
-            return recovered
-        last_candidate = candidates[-1]
-        if type(last_candidate) is not Task or last_candidate.lease_expires_at is None:
-            raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
-        after = (last_candidate.lease_expires_at, last_candidate.id)
+            raise
+        recovered += 1
+    return _InterruptedHandoffRecoveryPage(
+        recovered=recovered,
+        next_after=next_after,
+        exhausted=len(candidates) < limit,
+    )
+
+
+async def _run_recovered_interrupted_task_handler(
+    app: CayuApp,
+    task_store: TaskStore,
+    handler: RecoveredInterruptedTaskHandler,
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    query: TaskQuery | None,
+    after: tuple[datetime, str] | None,
+) -> InterruptedTaskContinuationClaimPage:
+    """Scan one bounded page and supervise its optional continuation claim."""
+
+    handoff_id = new_interrupted_task_continuation_handoff_id()
+    claim_outcome = await capture_task_store_operation(
+        lambda: task_store.claim_interrupted_task_continuation(
+            worker_id,
+            query,
+            handoff_id=handoff_id,
+            lease_seconds=lease_seconds,
+            after=after,
+            scan_limit=_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE,
+        ),
+        operation_name="Interrupted-task continuation claim",
+        redactor=app._secret_redactor,
+        mutation_store=task_store,
+        mutation_method_name="claim_interrupted_task_continuation",
+    )
+    if claim_outcome.failure is not None:
+        failure = claim_outcome.failure
+        del claim_outcome
+        raise_task_store_operation_failure(failure)
+    page = claim_outcome.result
+    del claim_outcome
+    if type(page) is not InterruptedTaskContinuationClaimPage:
+        raise RuntimeError("Interrupted-task continuation claim returned an invalid bounded page.")
+    task = page.task
+    if task is None:
+        return page
+    task = copy_task(task)
+    if (
+        task.status is not TaskStatus.RUNNING
+        or task.worker_id != worker_id
+        or task.lease_expires_at is None
+        or task.session_id is None
+        or task.session_instance_id is None
+    ):
+        raise RuntimeError(
+            "Interrupted-task continuation claim returned invalid ownership authority."
+        )
+    session = await app.session_store.load(task.session_id)
+    if (
+        session is None
+        or session.instance_id != task.session_instance_id
+        or session.status is not SessionStatus.INTERRUPTED
+    ):
+        logger.warning(
+            "Interrupted-task continuation session changed after claim; "
+            "the durable lease remains available for owner-loss recovery: "
+            "task_id=%s session_id=%s",
+            app.redact_json(task.id),
+            app.redact_json(task.session_id),
+        )
+        return page
+    await _handle_with_heartbeat(
+        app,
+        task_store,
+        task,
+        handler,
+        worker_id,
+        lease_seconds,
+        recover_interrupted_authority_loss=True,
+    )
+    return page
+
+
+async def _settle_recovered_continuation_authority_loss(
+    app: CayuApp,
+    task_store: TaskStore,
+    claimed: Task,
+    worker_id: str,
+) -> bool:
+    """Release a still-interrupted continuation or defer it to lease recovery."""
+
+    current = await task_store.load_task(claimed.id)
+    if current is None or current.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return True
+    if (
+        current.status is not TaskStatus.RUNNING
+        or current.worker_id != worker_id
+        or current.lease_expires_at is None
+        or current.interrupted_handoff_id != claimed.interrupted_handoff_id
+        or current.session_id is None
+        or current.session_instance_id is None
+    ):
+        # A peer changed task authority. This worker must not publish a competing
+        # terminal or handoff disposition from its stale snapshot.
+        return True
+
+    session = await app.session_store.load(current.session_id)
+    if (
+        session is not None
+        and session.instance_id == current.session_instance_id
+        and session.status is SessionStatus.INTERRUPTED
+    ):
+        await _handoff_interrupted_session(
+            app,
+            task_store,
+            current.id,
+            worker_id,
+        )
+        return True
+
+    # A different session epoch may still be settling the task. Stop renewing
+    # this worker's lease instead of converting that session fence into a task
+    # failure. If no peer settles it, the exact lease expiry re-enters the
+    # existing interrupted-owner recovery path.
+    logger.warning(
+        "Recovered continuation lost session authority; deferring task ownership "
+        "to lease-expiry recovery: task_id=%s session_id=%s",
+        app.redact_json(current.id),
+        app.redact_json(current.session_id),
+    )
+    return False
 
 
 async def _heartbeat_until(

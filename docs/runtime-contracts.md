@@ -4409,12 +4409,14 @@ backoff. After each ambiguous failure the worker reads the exact receipt before
 dispatching another mutation, so commit-then-acknowledgement loss does not
 double-release ownership. Exhaustion raises a recovery-needed error without
 rewriting the task as failed. The exact worker and lease remain attached until
-their store-authoritative expiry; a later worker startup scans a bounded page of
-expired candidates and calls `recover_interrupted_task_worker(...)`. Startup
-walks stable `(lease_expires_at, task_id)` pages before claiming fresh work, so
-ineligible earlier candidates cannot starve a valid interrupted handoff even for
-a one-shot worker, while each individual store read remains bounded to at most
-100 tasks. Terminal,
+their store-authoritative expiry. A `run_task_worker(...)` with
+`recover_interrupted_handoffs=True` scans one stable
+`(lease_expires_at, task_id)` page and calls
+`recover_interrupted_task_worker(...)`. Shared worker pools should elect one
+scanner for a task store and leave the flag false on the other workers. Each
+scheduler turn examines at most ten candidates, retains its cursor, and then
+yields to ordinary task claiming; it never drains an unbounded recovery backlog
+before fresh work or after the worker's stop or `max_tasks` boundary. Terminal,
 cancel-draining, admitted-work, wrong-owner, different-incarnation, and
 unrecoverable session states are not released by this recovery path. A live
 `pending`, `running`, or `interrupting` session is first fenced through
@@ -4441,6 +4443,21 @@ mismatch is counted as filtered instead of being reported as invalid durable
 authority. Callers retain the cursor and interleave pages fairly with their
 other work rather than draining an unbounded backlog in one scheduling turn.
 
+`recovered_interrupted_task_handler` integrates that bounded claim with the
+ordinary worker heartbeat, terminalization, and interrupted-handoff lifecycle.
+It is deliberately independent of `recover_interrupted_handoffs`: scanner
+election controls only expired-owner settlement, while every worker configured
+with the handler remains continuation execution capacity. A continuation counts
+toward `max_tasks`; if capacity remains, the loop still attempts ordinary fresh
+work after the continuation so either backlog cannot monopolize the worker.
+Fully rejected pages retain their cursor and interleave with ordinary claims and
+idle waits. Only malformed durable authority contributes to the content-free
+rejection warning; normal query mismatches retain their separate filtered count.
+After an exhausted scan, `continuation_poll_interval_s` defines the rediscovery
+objective and defaults to the ordinary worker poll interval. A continuation
+claimed concurrently by another worker is simply absent from the next atomic
+claim; notifications and list observations never grant execution authority.
+
 Only a `running`, attached, workerless task whose exact released version is
 backed by a committed interrupted-handoff receipt and the same durable
 `interrupted_handoff_id` is eligible. Claim consumes that one-use generation by
@@ -4462,6 +4479,14 @@ direct task/session link is never adopted. Recovery code passes its worker id
 and returned generation as `ResumeRequest.task_worker_id` and
 `ResumeRequest.task_handoff_id`, and must supervise the lease, terminalization,
 and any later interrupted handoff just as it would for an ordinary claimed task.
+If a recovered handler loses session-epoch or task-claim authority, the worker
+does not classify that fence as a generic task failure. When the exact session
+remains interrupted, it publishes a new authenticated handoff immediately so
+another continuation generation can claim it. When a peer has already advanced
+the session, it stops renewing the task lease and defers to the existing
+expired-owner recovery path if that peer does not terminalize the task. A stale
+recovery handler therefore cannot strand an indefinitely heartbeated owner or
+overwrite the peer with failed task evidence.
 Before session admission, resume calls
 `load_active_attached_task_worker(...)` to reject a missing, expired, stale, or
 mismatched worker lease. The same authority and live Session incarnation are

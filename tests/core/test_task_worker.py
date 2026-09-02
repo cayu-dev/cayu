@@ -32,6 +32,7 @@ from cayu import (
     ExecutionProfileMismatchError,
     InMemorySessionStore,
     InMemoryTaskStore,
+    InterruptedTaskContinuationClaimPage,
     Message,
     ModelStreamEvent,
     PendingActionQuery,
@@ -42,6 +43,7 @@ from cayu import (
     RuntimeHook,
     RuntimeHookContext,
     ScriptedModelProvider,
+    SessionRunFenced,
     SQLiteSessionStore,
     SQLiteTaskStore,
     Task,
@@ -137,6 +139,41 @@ async def _seed_interrupted_worker_handoff(
         ),
     )
     await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+
+async def _seed_receipt_backed_continuation(
+    app: CayuApp,
+    task_store: TaskStore,
+    *,
+    task_id: str,
+    session_id: str,
+) -> None:
+    await _seed_interrupted_worker_handoff(
+        app,
+        task_store,
+        task_id=task_id,
+        session_id=session_id,
+    )
+    worker_id = f"prior-{task_id}"
+    claimed = await task_store.claim_task(worker_id, TaskQuery(type="job"))
+    assert claimed is not None and claimed.id == task_id
+    attached = await task_store.attach_task(
+        task_id,
+        session_id=session_id,
+        session_invocation=await stored_session_invocation(
+            app.session_store,
+            session_id,
+        ),
+        worker_id=worker_id,
+    )
+    session = await app.session_store.load(session_id)
+    assert session is not None
+    await task_store.release_interrupted_task_worker(
+        interrupted_task_handoff_request(
+            attached,
+            session_run_epoch=session.run_epoch,
+        )
+    )
 
 
 def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
@@ -1719,7 +1756,7 @@ def test_interrupted_handoff_exhaustion_recovers_and_resumes_original_task(
     ]
 
 
-def test_interrupted_handoff_recovery_pages_past_ineligible_candidates(
+def test_interrupted_handoff_recovery_yields_to_fresh_work_between_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(task_worker_module, "_INTERRUPTED_HANDOFF_RECOVERY_BATCH_SIZE", 2)
@@ -1760,7 +1797,7 @@ def test_interrupted_handoff_recovery_pages_past_ineligible_candidates(
     ) -> None:
         await task_store.complete_task(task.id, worker_id=worker_id, result={"ok": True})
 
-    async def scenario() -> tuple[Task | None, list[Task | None]]:
+    async def scenario() -> tuple[Task | None, Task | None, Task | None]:
         await attach_expiring_task(
             task_id="stale-ineligible-a",
             session_id="session-ineligible-a",
@@ -1790,19 +1827,738 @@ def test_interrupted_handoff_recovery_pages_past_ineligible_candidates(
             reclaim=False,
         )
         assert handled == 1
+        before_next_page = await task_store.load_task("stale-interrupted")
+        fresh = await task_store.load_task("trigger-a")
+
+        stop = asyncio.Event()
+
+        async def stop_worker() -> None:
+            await asyncio.sleep(0.05)
+            stop.set()
+
+        await asyncio.gather(
+            run_task_worker(
+                app,
+                task_store,
+                handler,
+                worker_id="recovery-worker",
+                query=TaskQuery(type="trigger"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                stop=stop,
+            ),
+            stop_worker(),
+        )
         return (
             await task_store.load_task("stale-interrupted"),
-            [
-                await task_store.load_task("stale-ineligible-a"),
-                await task_store.load_task("stale-ineligible-b"),
-            ],
+            before_next_page,
+            fresh,
         )
 
-    recovered, ineligible = asyncio.run(scenario())
+    recovered, before_next_page, fresh = asyncio.run(scenario())
+    assert before_next_page is not None
+    assert before_next_page.worker_id == "expired-worker"
+    assert fresh is not None and fresh.status is TaskStatus.COMPLETED
     assert recovered is not None
     assert recovered.worker_id is None
     assert recovered.lease_expires_at is None
-    assert all(task is not None and task.worker_id == "expired-worker" for task in ineligible)
+
+
+def test_interrupted_handoff_recovery_stops_between_candidates() -> None:
+    stop = asyncio.Event()
+
+    class StoppingSessionStore(InMemorySessionStore):
+        armed = False
+        recovery_loads = 0
+
+        async def load(self, session_id: str):
+            session = await super().load(session_id)
+            if self.armed:
+                self.recovery_loads += 1
+                stop.set()
+            return session
+
+    session_store = StoppingSessionStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        enable_logging=False,
+    )
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    fresh_calls: list[str] = []
+
+    async def fresh_handler(
+        _app: CayuApp,
+        task: Task,
+        _worker_id: str,
+    ) -> None:
+        fresh_calls.append(task.id)
+
+    async def seed(task_id: str) -> None:
+        session_id = f"session-{task_id}"
+        await _seed_interrupted_worker_handoff(
+            app,
+            task_store,
+            task_id=task_id,
+            session_id=session_id,
+        )
+        claimed = await task_store.claim_task("expired-worker", lease_seconds=1)
+        assert claimed is not None and claimed.id == task_id
+        await task_store.attach_task(
+            task_id,
+            session_id=session_id,
+            session_invocation=await stored_session_invocation(
+                session_store,
+                session_id,
+            ),
+            worker_id="expired-worker",
+        )
+
+    async def scenario() -> int:
+        await seed("stop-recovery-a")
+        await seed("stop-recovery-b")
+        await task_store.create_task(TaskCreate(task_id="fresh-after-stop", type="fresh"))
+        await asyncio.sleep(1.05)
+        session_store.armed = True
+        return await run_task_worker(
+            app,
+            task_store,
+            fresh_handler,
+            worker_id="recovery-worker",
+            query=TaskQuery(type="fresh"),
+            poll_interval_s=0.01,
+            reclaim=False,
+            stop=stop,
+        )
+
+    assert asyncio.run(scenario()) == 0
+    assert session_store.recovery_loads == 1
+    assert fresh_calls == []
+
+
+def test_continuation_execution_is_independent_of_recovery_scanner_election() -> None:
+    class CountingRecoveryStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.recovery_scans = 0
+
+        async def list_expired_interrupted_task_handoff_candidates(
+            self,
+            *,
+            after: tuple[datetime, str] | None = None,
+            limit: int = 100,
+        ) -> list[Task]:
+            self.recovery_scans += 1
+            return await super().list_expired_interrupted_task_handoff_candidates(
+                after=after,
+                limit=limit,
+            )
+
+    task_store = CountingRecoveryStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    continued: list[str] = []
+
+    async def fresh_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def continuation_handler(
+        _app: CayuApp,
+        task: Task,
+        _worker_id: str,
+    ) -> TaskHandlerOutcome:
+        continued.append(task.id)
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> int:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="executor-without-scanner",
+            session_id="executor-without-scanner-session",
+        )
+        return await run_task_worker(
+            app,
+            task_store,
+            fresh_handler,
+            worker_id="continuation-executor",
+            query=TaskQuery(type="job"),
+            poll_interval_s=0.01,
+            reclaim=False,
+            recover_interrupted_handoffs=False,
+            recovered_interrupted_task_handler=continuation_handler,
+            max_tasks=1,
+        )
+
+    assert asyncio.run(scenario()) == 1
+    assert continued == ["executor-without-scanner"]
+    assert task_store.recovery_scans == 0
+
+
+def test_all_configured_continuation_executors_can_run_concurrently() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    all_started = asyncio.Event()
+    started: list[tuple[str, str]] = []
+
+    async def fresh_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def continuation_handler(
+        _app: CayuApp,
+        task: Task,
+        worker_id: str,
+    ) -> TaskHandlerOutcome:
+        started.append((task.id, worker_id))
+        if len(started) == 2:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=2)
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> list[int]:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="concurrent-continuation-a",
+            session_id="concurrent-continuation-session-a",
+        )
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="concurrent-continuation-b",
+            session_id="concurrent-continuation-session-b",
+        )
+        return await asyncio.gather(
+            run_task_worker(
+                app,
+                task_store,
+                fresh_handler,
+                worker_id="continuation-executor-a",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                recovered_interrupted_task_handler=continuation_handler,
+                max_tasks=1,
+            ),
+            run_task_worker(
+                app,
+                task_store,
+                fresh_handler,
+                worker_id="continuation-executor-b",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                recovered_interrupted_task_handler=continuation_handler,
+                max_tasks=1,
+            ),
+        )
+
+    assert asyncio.run(scenario()) == [1, 1]
+    assert {task_id for task_id, _worker_id in started} == {
+        "concurrent-continuation-a",
+        "concurrent-continuation-b",
+    }
+    assert {worker_id for _task_id, worker_id in started} == {
+        "continuation-executor-a",
+        "continuation-executor-b",
+    }
+
+
+@pytest.mark.parametrize("authority_error", [SessionRunFenced, TaskClaimLost])
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_recovered_continuation_authority_loss_releases_for_retry(
+    tmp_path: Path,
+    authority_error: type[Exception],
+    backend: str,
+) -> None:
+    task_store: TaskStore = (
+        InMemoryTaskStore()
+        if backend == "memory"
+        else SQLiteTaskStore(tmp_path / f"continuation-{authority_error.__name__}.sqlite")
+    )
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def fresh_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def fenced_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise authority_error("Recovered continuation lost durable authority.")
+
+    async def scenario() -> tuple[int, Task | None, InterruptedTaskContinuationClaimPage]:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="fenced-recovered-continuation",
+            session_id="fenced-recovered-continuation-session",
+        )
+        handled = await run_task_worker(
+            app,
+            task_store,
+            fresh_handler,
+            worker_id="recovery-worker",
+            query=TaskQuery(type="job"),
+            poll_interval_s=0.01,
+            reclaim=False,
+            recover_interrupted_handoffs=False,
+            recovered_interrupted_task_handler=fenced_handler,
+            max_tasks=1,
+        )
+        released = await task_store.load_task("fenced-recovered-continuation")
+        reclaimed = await task_store.claim_interrupted_task_continuation(
+            "retry-worker",
+            TaskQuery(type="job"),
+            handoff_id=str(uuid4()),
+        )
+        return handled, released, reclaimed
+
+    handled, released, reclaimed = asyncio.run(scenario())
+    assert handled == 1
+    assert released is not None
+    assert released.status is TaskStatus.RUNNING
+    assert released.worker_id is None
+    assert released.lease_expires_at is None
+    assert released.interrupted_handoff_id is not None
+    assert released.error is None
+    assert reclaimed.task is not None
+    assert reclaimed.task.id == released.id
+    assert reclaimed.task.worker_id == "retry-worker"
+    assert reclaimed.task.interrupted_handoff_id is not None
+    assert reclaimed.task.interrupted_handoff_id != released.interrupted_handoff_id
+
+
+def test_recovered_continuation_session_fence_defers_to_expired_owner_recovery() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def fresh_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def peer_won_session_handler(
+        recovery_app: CayuApp,
+        task: Task,
+        _worker_id: str,
+    ) -> None:
+        assert task.session_id is not None
+        await recovery_app.session_store.update_status(
+            task.session_id,
+            SessionStatus.RUNNING,
+        )
+        raise SessionRunFenced("A peer session epoch won continuation admission.")
+
+    async def scenario() -> tuple[Task | None, Task | None]:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="peer-fenced-recovered-continuation",
+            session_id="peer-fenced-recovered-continuation-session",
+        )
+        handled = await run_task_worker(
+            app,
+            task_store,
+            fresh_handler,
+            worker_id="recovery-worker",
+            query=TaskQuery(type="job"),
+            lease_seconds=1,
+            poll_interval_s=0.01,
+            reclaim=False,
+            recover_interrupted_handoffs=False,
+            recovered_interrupted_task_handler=peer_won_session_handler,
+            max_tasks=1,
+        )
+        assert handled == 1
+        deferred = await task_store.load_task("peer-fenced-recovered-continuation")
+        assert deferred is not None
+        assert deferred.worker_id == "recovery-worker"
+        assert deferred.lease_expires_at is not None
+        await asyncio.sleep(1.05)
+        recovery = await task_worker_module._recover_expired_interrupted_task_handoffs(
+            app,
+            task_store,
+            after=None,
+            limit=10,
+            stop=None,
+        )
+        assert recovery.recovered == 1
+        reclaimed = await task_store.claim_interrupted_task_continuation(
+            "retry-worker",
+            TaskQuery(type="job"),
+            handoff_id=str(uuid4()),
+        )
+        return deferred, reclaimed.task
+
+    deferred, reclaimed = asyncio.run(scenario())
+    assert deferred is not None
+    assert reclaimed is not None
+    assert reclaimed.id == deferred.id
+    assert reclaimed.worker_id == "retry-worker"
+    assert reclaimed.interrupted_handoff_id is not None
+    assert reclaimed.interrupted_handoff_id != deferred.interrupted_handoff_id
+
+
+def test_recovered_continuation_respects_worker_limit_before_fresh_claim() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    fresh_calls: list[str] = []
+
+    async def fresh_handler(
+        _app: CayuApp,
+        task: Task,
+        _worker_id: str,
+    ) -> None:
+        fresh_calls.append(task.id)
+
+    async def continuation_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> TaskHandlerOutcome:
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> tuple[int, Task | None]:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="limit-continuation",
+            session_id="limit-continuation-session",
+        )
+        await task_store.create_task(TaskCreate(task_id="fresh-after-limit", type="job"))
+        handled = await run_task_worker(
+            app,
+            task_store,
+            fresh_handler,
+            worker_id="limit-worker",
+            query=TaskQuery(type="job"),
+            poll_interval_s=0.01,
+            reclaim=False,
+            recover_interrupted_handoffs=False,
+            recovered_interrupted_task_handler=continuation_handler,
+            max_tasks=1,
+        )
+        return handled, await task_store.load_task("fresh-after-limit")
+
+    handled, fresh = asyncio.run(scenario())
+    assert handled == 1
+    assert fresh_calls == []
+    assert fresh is not None and fresh.status is TaskStatus.PENDING
+
+
+def test_continuation_rediscovery_uses_configured_poll_objective() -> None:
+    first_scan = asyncio.Event()
+
+    class DelayedContinuationStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.continuation_scans = 0
+
+        async def claim_interrupted_task_continuation(
+            self,
+            worker_id: str,
+            query: TaskQuery | None = None,
+            *,
+            handoff_id: str,
+            lease_seconds: int = 300,
+            after: tuple[datetime, str] | None = None,
+            scan_limit: int = 100,
+        ) -> InterruptedTaskContinuationClaimPage:
+            self.continuation_scans += 1
+            if self.continuation_scans == 1:
+                first_scan.set()
+                return InterruptedTaskContinuationClaimPage(
+                    scanned_candidates=0,
+                    rejected_candidates=0,
+                    exhausted=True,
+                )
+            return await super().claim_interrupted_task_continuation(
+                worker_id,
+                query,
+                handoff_id=handoff_id,
+                lease_seconds=lease_seconds,
+                after=after,
+                scan_limit=scan_limit,
+            )
+
+    task_store = DelayedContinuationStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+
+    async def fresh_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise AssertionError("A continuation must not enter the fresh queue.")
+
+    async def continuation_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> TaskHandlerOutcome:
+        return TaskHandlerOutcome.SESSION_INTERRUPTED
+
+    async def scenario() -> int:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="poll-objective-continuation",
+            session_id="poll-objective-session",
+        )
+        return await asyncio.wait_for(
+            run_task_worker(
+                app,
+                task_store,
+                fresh_handler,
+                worker_id="poll-objective-worker",
+                query=TaskQuery(type="job"),
+                poll_interval_s=1.0,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                recovered_interrupted_task_handler=continuation_handler,
+                continuation_poll_interval_s=0.02,
+                max_tasks=1,
+            ),
+            timeout=0.5,
+        )
+
+    assert asyncio.run(scenario()) == 1
+    assert first_scan.is_set()
+    assert task_store.continuation_scans == 2
+
+
+def test_expired_attached_session_is_recovered_handed_off_and_resumed() -> None:
+    task_store = InMemoryTaskStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("resumed"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    resumed: list[str] = []
+
+    async def fresh_handler(
+        _app: CayuApp,
+        _task: Task,
+        _worker_id: str,
+    ) -> None:
+        raise AssertionError("An attached task must not re-enter the fresh queue.")
+
+    async def resume_handler(
+        recovery_app: CayuApp,
+        task: Task,
+        recovery_worker_id: str,
+    ) -> None:
+        assert task.session_id is not None
+        resumed.append(task.id)
+        async for _event in recovery_app.resume(
+            ResumeRequest(
+                session_id=task.session_id,
+                task_worker_id=recovery_worker_id,
+                task_handoff_id=task.interrupted_handoff_id,
+                messages=[Message.text("user", "Continue the attached task.")],
+            )
+        ):
+            pass
+
+    async def scenario() -> tuple[int, Task | None, SessionStatus]:
+        created = await task_store.create_task(
+            TaskCreate(task_id="expired-attached-task", type="job")
+        )
+        await app.session_store.create(
+            run_request_with_task_invocation(
+                RunRequest(
+                    agent_name="worker-agent",
+                    session_id="expired-attached-session",
+                    task_id=created.id,
+                    messages=[Message.text("user", "Original task")],
+                    tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                ),
+                TaskInvocationSnapshot(
+                    id=created.id,
+                    session_id=created.session_id,
+                    invocation=created.invocation,
+                ),
+            ),
+            identity=profiled_session_identity(
+                provider_name=provider.name,
+                model="scripted-model",
+                agent_name="worker-agent",
+                app=app,
+            ),
+        )
+        await admit_test_invocation(
+            app.session_store,
+            "expired-attached-session",
+            interaction_started_event=runtime_interaction_started_event(
+                app,
+                session_id="expired-attached-session",
+                interaction_id="expired-attached-interaction",
+                agent_name="worker-agent",
+            ),
+            interaction_source_messages=(Message.text("user", "Original task"),),
+        )
+        claimed = await task_store.claim_task("dead-worker", lease_seconds=1)
+        assert claimed is not None
+        await task_store.attach_task(
+            claimed.id,
+            session_id="expired-attached-session",
+            session_invocation=await stored_session_invocation(
+                app.session_store,
+                "expired-attached-session",
+            ),
+            worker_id="dead-worker",
+        )
+        await asyncio.sleep(1.05)
+
+        handled = await asyncio.wait_for(
+            run_task_worker(
+                app,
+                task_store,
+                fresh_handler,
+                worker_id="recovery-worker",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.01,
+                reclaim=False,
+                recovered_interrupted_task_handler=resume_handler,
+                max_tasks=1,
+            ),
+            timeout=5,
+        )
+        task = await task_store.load_task("expired-attached-task")
+        session = await app.session_store.load("expired-attached-session")
+        assert session is not None
+        return handled, task, session.status
+
+    handled, task, session_status = asyncio.run(scenario())
+    assert handled == 1
+    assert resumed == ["expired-attached-task"]
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+    assert task.worker_id is None
+    assert task.lease_expires_at is None
+    assert session_status is SessionStatus.COMPLETED
+
+
+def test_continuation_session_race_isolated_with_claimed_lease(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class SessionRacingStore(InMemoryTaskStore):
+        supports_interrupted_task_handoffs = True
+        verified_work_mutations_are_cancellation_quiescent = True
+        app: CayuApp
+
+        async def claim_interrupted_task_continuation(
+            self,
+            worker_id: str,
+            query: TaskQuery | None = None,
+            *,
+            handoff_id: str,
+            lease_seconds: int = 300,
+            after: tuple[datetime, str] | None = None,
+            scan_limit: int = 100,
+        ) -> InterruptedTaskContinuationClaimPage:
+            page = await super().claim_interrupted_task_continuation(
+                worker_id,
+                query,
+                handoff_id=handoff_id,
+                lease_seconds=lease_seconds,
+                after=after,
+                scan_limit=scan_limit,
+            )
+            claimed = page.task
+            if claimed is not None:
+                assert claimed.session_id is not None
+                await self.app.session_store.update_status(
+                    claimed.session_id,
+                    SessionStatus.RUNNING,
+                )
+            return page
+
+    task_store = SessionRacingStore()
+    app = CayuApp(task_store=task_store, enable_logging=False)
+    task_store.app = app
+    app.register_provider(ScriptedModelProvider([]), default=True)
+    app.register_agent(AgentSpec(name="worker-agent", model="scripted-model"))
+    handler_calls: list[str] = []
+
+    async def unexpected_handler(
+        _app: CayuApp,
+        task: Task,
+        _worker_id: str,
+    ) -> None:
+        handler_calls.append(task.id)
+
+    async def scenario() -> tuple[int, Task | None]:
+        await _seed_receipt_backed_continuation(
+            app,
+            task_store,
+            task_id="session-race-continuation",
+            session_id="session-race-continuation-session",
+        )
+        handled = await run_task_worker(
+            app,
+            task_store,
+            unexpected_handler,
+            worker_id="recovery-owner",
+            query=TaskQuery(type="job"),
+            poll_interval_s=0.01,
+            reclaim=False,
+            recover_interrupted_handoffs=False,
+            recovered_interrupted_task_handler=unexpected_handler,
+            max_tasks=1,
+        )
+        return handled, await task_store.load_task("session-race-continuation")
+
+    handled, task = asyncio.run(scenario())
+    assert handled == 1
+    assert handler_calls == []
+    assert task is not None
+    assert task.worker_id == "recovery-owner"
+    assert task.lease_expires_at is not None
+    assert "continuation session changed after claim" in caplog.text
 
 
 def test_interrupted_handoff_recovery_skips_new_cancellation_request() -> None:
