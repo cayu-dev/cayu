@@ -498,6 +498,10 @@ _SESSION_RUN_FENCES: ContextVar[dict[str, int] | None] = ContextVar(
     "cayu_session_run_fence",
     default=None,
 )
+_SESSION_RUN_FENCE_OWNERS: ContextVar[dict[str, _SessionRunFenceOwnership] | None] = ContextVar(
+    "cayu_session_run_fence_owners",
+    default=None,
+)
 _SESSION_INTERACTION_IDS: ContextVar[dict[str, str] | None] = ContextVar(
     "cayu_session_interaction_ids",
     default=None,
@@ -779,6 +783,8 @@ class _SessionRunFenceContext:
     def __init__(self) -> None:
         fences = _SESSION_RUN_FENCES.get()
         self._fences = None if fences is None else dict(fences)
+        fence_owners = _SESSION_RUN_FENCE_OWNERS.get()
+        self._fence_owners = None if fence_owners is None else dict(fence_owners)
         interaction_ids = _SESSION_INTERACTION_IDS.get()
         self._interaction_ids = None if interaction_ids is None else dict(interaction_ids)
         interaction_started_at = _SESSION_INTERACTION_STARTED_AT.get()
@@ -825,6 +831,8 @@ class _SessionRunFenceContext:
             return
         fences = None if self._fences is None else dict(self._fences)
         fence_token = _SESSION_RUN_FENCES.set(fences)
+        fence_owners = None if self._fence_owners is None else dict(self._fence_owners)
+        fence_owner_token = _SESSION_RUN_FENCE_OWNERS.set(fence_owners)
         interaction_ids = None if self._interaction_ids is None else dict(self._interaction_ids)
         interaction_id_token = _SESSION_INTERACTION_IDS.set(interaction_ids)
         interaction_started_at = (
@@ -867,6 +875,10 @@ class _SessionRunFenceContext:
         finally:
             current = _SESSION_RUN_FENCES.get()
             self._fences = None if current is None else dict(current)
+            current_fence_owners = _SESSION_RUN_FENCE_OWNERS.get()
+            self._fence_owners = (
+                None if current_fence_owners is None else dict(current_fence_owners)
+            )
             current_interaction_ids = _SESSION_INTERACTION_IDS.get()
             self._interaction_ids = (
                 None if current_interaction_ids is None else dict(current_interaction_ids)
@@ -913,7 +925,66 @@ class _SessionRunFenceContext:
             _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.reset(recovered_active_through_token)
             _SESSION_INTERACTION_STARTED_AT.reset(interaction_started_at_token)
             _SESSION_INTERACTION_IDS.reset(interaction_id_token)
+            _SESSION_RUN_FENCE_OWNERS.reset(fence_owner_token)
             _SESSION_RUN_FENCES.reset(fence_token)
+
+
+class _SessionRunFenceOwnership:
+    """One transferable, exactly retired process-local run-fence owner."""
+
+    __slots__ = ("_retired", "run_epoch", "session_id")
+
+    def __init__(self, *, session_id: str, run_epoch: int) -> None:
+        self.session_id = session_id
+        self.run_epoch = run_epoch
+        self._retired = False
+
+    @property
+    def retired(self) -> bool:
+        return self._retired
+
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        """Install this exact owner while an independent supervisor finalizes it."""
+
+        if self._retired:
+            raise RuntimeError("A retired session run-fence owner cannot be reactivated.")
+        fences = _SESSION_RUN_FENCES.get()
+        owners = _SESSION_RUN_FENCE_OWNERS.get()
+        current_owner = None if owners is None else owners.get(self.session_id)
+        current_epoch = None if fences is None else fences.get(self.session_id)
+        if current_owner is self and current_epoch == self.run_epoch:
+            yield
+            return
+        updated_fences = dict(fences or {})
+        updated_fences[self.session_id] = self.run_epoch
+        fence_token = _SESSION_RUN_FENCES.set(updated_fences)
+        updated_owners = dict(owners or {})
+        updated_owners[self.session_id] = self
+        owner_token = _SESSION_RUN_FENCE_OWNERS.set(updated_owners)
+        try:
+            yield
+        finally:
+            _SESSION_RUN_FENCE_OWNERS.reset(owner_token)
+            _SESSION_RUN_FENCES.reset(fence_token)
+
+    def retire(self) -> bool:
+        """Retire this owner in every copied context and detach the current copy."""
+
+        if self._retired:
+            return False
+        self._retired = True
+        owners = _SESSION_RUN_FENCE_OWNERS.get()
+        fences = _SESSION_RUN_FENCES.get()
+        if owners is not None and owners.get(self.session_id) is self:
+            remaining_owners = dict(owners)
+            remaining_owners.pop(self.session_id)
+            _SESSION_RUN_FENCE_OWNERS.set(remaining_owners or None)
+            if fences is not None and fences.get(self.session_id) == self.run_epoch:
+                remaining_fences = dict(fences)
+                remaining_fences.pop(self.session_id)
+                _SESSION_RUN_FENCES.set(remaining_fences or None)
+        return True
 
 
 _ACTIVE_SESSION_RUN_FENCE_CONTEXT: ContextVar[
@@ -926,22 +997,58 @@ _ACTIVE_SESSION_RUN_FENCE_CONTEXT: ContextVar[
 
 def _current_session_run_epoch(session_id: str) -> int | None:
     fences = _SESSION_RUN_FENCES.get()
-    return None if fences is None else fences.get(session_id)
+    run_epoch = None if fences is None else fences.get(session_id)
+    if run_epoch is None:
+        return None
+    owners = _SESSION_RUN_FENCE_OWNERS.get()
+    ownership = None if owners is None else owners.get(session_id)
+    if ownership is not None and ownership.retired and ownership.run_epoch == run_epoch:
+        assert fences is not None
+        assert owners is not None
+        remaining_fences = dict(fences)
+        remaining_fences.pop(session_id)
+        _SESSION_RUN_FENCES.set(remaining_fences or None)
+        remaining_owners = dict(owners)
+        remaining_owners.pop(session_id)
+        _SESSION_RUN_FENCE_OWNERS.set(remaining_owners or None)
+        return None
+    return run_epoch
 
 
 def _activate_session_run_fence(session: Session) -> None:
     fences = dict(_SESSION_RUN_FENCES.get() or {})
     fences[session.id] = session.run_epoch
     _SESSION_RUN_FENCES.set(fences)
+    owners = _SESSION_RUN_FENCE_OWNERS.get()
+    if owners is not None and session.id in owners:
+        remaining_owners = dict(owners)
+        remaining_owners.pop(session.id)
+        _SESSION_RUN_FENCE_OWNERS.set(remaining_owners or None)
+
+
+def _activate_owned_session_run_fence(session: Session) -> _SessionRunFenceOwnership:
+    _activate_session_run_fence(session)
+    ownership = _SessionRunFenceOwnership(
+        session_id=session.id,
+        run_epoch=session.run_epoch,
+    )
+    owners = dict(_SESSION_RUN_FENCE_OWNERS.get() or {})
+    owners[session.id] = ownership
+    _SESSION_RUN_FENCE_OWNERS.set(owners)
+    return ownership
 
 
 def _deactivate_session_run_fence(session_id: str) -> None:
     fences = _SESSION_RUN_FENCES.get()
-    if fences is None or session_id not in fences:
-        return
-    remaining = dict(fences)
-    remaining.pop(session_id)
-    _SESSION_RUN_FENCES.set(remaining or None)
+    if fences is not None and session_id in fences:
+        remaining = dict(fences)
+        remaining.pop(session_id)
+        _SESSION_RUN_FENCES.set(remaining or None)
+    owners = _SESSION_RUN_FENCE_OWNERS.get()
+    if owners is not None and session_id in owners:
+        remaining_owners = dict(owners)
+        remaining_owners.pop(session_id)
+        _SESSION_RUN_FENCE_OWNERS.set(remaining_owners or None)
 
 
 def _assert_session_run_epoch(session_id: str, session: Session) -> None:

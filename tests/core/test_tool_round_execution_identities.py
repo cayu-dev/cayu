@@ -747,8 +747,7 @@ def test_pending_round_recovery_supplies_bounded_durable_tool_authority() -> Non
             ]
         finally:
             await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
-                session_id=session_id,
-                claim_id=claim.claim_id,
+                authority=claim.require_authority(),
                 authoritative_failure=None,
             )
 
@@ -890,8 +889,7 @@ def test_pending_round_recovery_calls_apply_patch_with_runtime_authority() -> No
             ]
         finally:
             await app._recovery_coordinator._cleanup_incomplete_recovery_claim(
-                session_id=session_id,
-                claim_id=claim.claim_id,
+                authority=claim.require_authority(),
                 authoritative_failure=None,
             )
 

@@ -308,11 +308,11 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    _activate_owned_session_run_fence,
     _activate_session_interaction,
     _activate_session_run_fence,
     _checkpoint_after_session_run_operation_cleanup,
     _checkpoint_with_session_run_operation,
-    _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
@@ -320,6 +320,7 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_interaction_id,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
+    _SessionRunFenceOwnership,
     _SessionRunOperation,
     _workspace_observation_authority_mutation_scope,
     copy_interaction_transition_spec,
@@ -1318,6 +1319,67 @@ class RecoveryAbandonedSessionRequest:
     run_terminal_hooks: bool = True
 
 
+class _IncompleteRecoveryClaimAuthority:
+    """Exact durable claim and transferable process-local fence authority."""
+
+    __slots__ = (
+        "_finalization_lock",
+        "_finalized",
+        "claim_id",
+        "run_fence",
+        "session_id",
+    )
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        claim_id: str,
+        run_fence: _SessionRunFenceOwnership,
+    ) -> None:
+        if run_fence.session_id != session_id:
+            raise ValueError("Recovery claim and run-fence session identities differ.")
+        self.session_id = session_id
+        self.claim_id = claim_id
+        self.run_fence = run_fence
+        self._finalization_lock = asyncio.Lock()
+        self._finalized = False
+
+    @property
+    def run_epoch(self) -> int:
+        return self.run_fence.run_epoch
+
+    def retire(self) -> bool:
+        """Idempotently invalidate this exact process-local owner in all tasks."""
+
+        return self.run_fence.retire()
+
+    async def begin_finalization(self) -> bool:
+        """Elect one finalizer; waiters retry an abort and ignore a finished owner."""
+
+        await self._finalization_lock.acquire()
+        if self._finalized:
+            self._finalization_lock.release()
+            return False
+        return True
+
+    def finish_finalization(self) -> None:
+        """Publish finalization and release every waiter after local retirement."""
+
+        if not self._finalization_lock.locked():
+            raise RuntimeError("Recovery claim finalization was not acquired.")
+        self._finalized = True
+        self.retire()
+        self._finalization_lock.release()
+
+    def abort_finalization(self) -> None:
+        """Release the finalizer election while retaining retryable authority."""
+
+        if not self._finalization_lock.locked():
+            raise RuntimeError("Recovery claim finalization was not acquired.")
+        self._finalization_lock.release()
+
+
 @dataclass(frozen=True)
 class _IncompleteRecoveryClaim:
     claim_id: str
@@ -1326,6 +1388,22 @@ class _IncompleteRecoveryClaim:
     session: Session
     run_operation: _SessionRunOperation | None = None
     invocation_context: InvocationContext | None = None
+    authority: _IncompleteRecoveryClaimAuthority | None = None
+
+    def __post_init__(self) -> None:
+        if self.authority is None:
+            return
+        if (
+            self.authority.claim_id != self.claim_id
+            or self.authority.session_id != self.session.id
+            or self.authority.run_epoch != self.session.run_epoch
+        ):
+            raise ValueError("Recovery claim authority does not match the claimed session.")
+
+    def require_authority(self) -> _IncompleteRecoveryClaimAuthority:
+        if self.authority is None:
+            raise RuntimeError("Recovery claim has no run-fence authority.")
+        return self.authority
 
 
 @dataclass(frozen=True)
@@ -1436,6 +1514,15 @@ class _ManualRecoveryInterruptionFence:
     claim_id: str
     error: BaseException | None
     invocation_context: InvocationContext
+    authority: _IncompleteRecoveryClaimAuthority
+
+    def __post_init__(self) -> None:
+        if (
+            self.authority.session_id != self.session.id
+            or self.authority.claim_id != self.claim_id
+            or self.authority.run_epoch != self.session.run_epoch
+        ):
+            raise ValueError("Interrupted recovery authority does not match its session.")
 
 
 @dataclass(frozen=True)
@@ -9880,8 +9967,7 @@ class RecoveryCoordinator:
         finally:
             if claim is not None:
                 await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim.claim_id,
+                    authority=claim.require_authority(),
                     authoritative_failure=authoritative_failure,
                 )
 
@@ -10745,6 +10831,52 @@ class RecoveryCoordinator:
         claimed_run_operation_id: str | None = None
         session_before_fence: Session | None = None
 
+        async def reconstruct_claim_invocation_context(
+            claimed_session: Session,
+            authority: _IncompleteRecoveryClaimAuthority,
+        ) -> InvocationContext:
+            try:
+                return self._reconstruct_invocation_context(
+                    session=claimed_session,
+                    execution_profile_snapshot=execution_profile_snapshot,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    registered_environment=registered_environment,
+                    budget_policy=budget_policy,
+                    request_loop_policies=request_loop_policies,
+                )
+            except BaseException as reconstruction_failure:
+                failure = reconstruction_failure
+                # Claiming is durable before invocation reconstruction. If
+                # corrupt metadata or a runtime mismatch prevents rebuilding
+                # the context, explicitly abandon or transfer that ownership
+                # instead of leaving the caller's exact epoch stranded.
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=failure,
+                    steps=(
+                        (
+                            "abandoned manual recovery reconstruction finalization",
+                            lambda: self.finalize_abandoned_session_by_id(
+                                claimed_session.id,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile_snapshot.profile,
+                                run_terminal_hooks=False,
+                            ),
+                        ),
+                        (
+                            "manual recovery reconstruction claim cleanup",
+                            lambda: self._cleanup_incomplete_recovery_claim(
+                                authority=authority,
+                                authoritative_failure=failure,
+                                execution_profile=execution_profile_snapshot.profile,
+                                claim_has_not_dispatched_work=True,
+                            ),
+                        ),
+                    ),
+                )
+                raise
+
         def require_matching_pending_call(checkpoint: dict[str, Any] | None) -> None:
             self._reject_approval_owned_tool_round_recovery(checkpoint)
             current_round = tool_round_recovery.pending_tool_round_from_checkpoint(
@@ -11060,21 +11192,22 @@ class RecoveryCoordinator:
                     raise RuntimeError(
                         "Interrupted manual recovery fence returned an unexpected run epoch."
                     )
-                _activate_session_run_fence(fenced_session)
-                invocation_context = self._reconstruct_invocation_context(
-                    session=fenced_session,
-                    execution_profile_snapshot=execution_profile_snapshot,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    registered_environment=registered_environment,
-                    budget_policy=budget_policy,
-                    request_loop_policies=request_loop_policies,
+                run_fence = _activate_owned_session_run_fence(fenced_session)
+                authority = _IncompleteRecoveryClaimAuthority(
+                    session_id=fenced_session.id,
+                    claim_id=claim_id,
+                    run_fence=run_fence,
+                )
+                invocation_context = await reconstruct_claim_invocation_context(
+                    fenced_session,
+                    authority,
                 )
                 return _ManualRecoveryInterruptionFence(
                     session=fenced_session,
                     claim_id=claim_id,
                     error=interruption_error,
                     invocation_context=invocation_context,
+                    authority=authority,
                 )
 
             reconciliation_outcome = await await_shielded_task_outcome(
@@ -11104,15 +11237,15 @@ class RecoveryCoordinator:
                 )
             elif reconciliation_outcome.result is not None:
                 reconciled_session = reconciliation_outcome.result
-                _activate_session_run_fence(reconciled_session)
-                invocation_context = self._reconstruct_invocation_context(
-                    session=reconciled_session,
-                    execution_profile_snapshot=execution_profile_snapshot,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    registered_environment=registered_environment,
-                    budget_policy=budget_policy,
-                    request_loop_policies=request_loop_policies,
+                run_fence = _activate_owned_session_run_fence(reconciled_session)
+                authority = _IncompleteRecoveryClaimAuthority(
+                    session_id=reconciled_session.id,
+                    claim_id=claim_id,
+                    run_fence=run_fence,
+                )
+                invocation_context = await reconstruct_claim_invocation_context(
+                    reconciled_session,
+                    authority,
                 )
                 await _run_recovery_cleanup_steps(
                     authoritative_failure=authoritative_failure,
@@ -11130,8 +11263,7 @@ class RecoveryCoordinator:
                         (
                             "ambiguous manual recovery claim cleanup",
                             lambda: self._cleanup_incomplete_recovery_claim(
-                                session_id=reconciled_session.id,
-                                claim_id=claim_id,
+                                authority=authority,
                                 authoritative_failure=authoritative_failure,
                                 execution_profile=execution_profile_snapshot.profile,
                                 invocation_context=invocation_context,
@@ -11153,15 +11285,15 @@ class RecoveryCoordinator:
 
         # The durable transition ran in a shielded child task. Bind its epoch to
         # the caller that will perform recovery writes and eventual cleanup.
-        _activate_session_run_fence(claimed_session)
-        invocation_context = self._reconstruct_invocation_context(
-            session=claimed_session,
-            execution_profile_snapshot=execution_profile_snapshot,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            budget_policy=budget_policy,
-            request_loop_policies=request_loop_policies,
+        run_fence = _activate_owned_session_run_fence(claimed_session)
+        authority = _IncompleteRecoveryClaimAuthority(
+            session_id=claimed_session.id,
+            claim_id=claim_id,
+            run_fence=run_fence,
+        )
+        invocation_context = await reconstruct_claim_invocation_context(
+            claimed_session,
+            authority,
         )
         if (
             claim_expires_at is None
@@ -11189,8 +11321,7 @@ class RecoveryCoordinator:
                     (
                         "manual recovery claim cleanup",
                         lambda: self._cleanup_incomplete_recovery_claim(
-                            session_id=claimed_session.id,
-                            claim_id=claim_id,
+                            authority=authority,
                             authoritative_failure=invariant_failure,
                             execution_profile=execution_profile_snapshot.profile,
                             invocation_context=invocation_context,
@@ -11211,6 +11342,7 @@ class RecoveryCoordinator:
                 run_epoch=claimed_session.run_epoch,
             ),
             invocation_context=invocation_context,
+            authority=authority,
         )
         if after_admission is not None:
             try:
@@ -11234,8 +11366,7 @@ class RecoveryCoordinator:
                         (
                             "manual recovery claim cleanup",
                             lambda: self._cleanup_incomplete_recovery_claim(
-                                session_id=claimed_session.id,
-                                claim_id=claim.claim_id,
+                                authority=authority,
                                 authoritative_failure=failure,
                                 execution_profile=execution_profile_snapshot.profile,
                                 invocation_context=invocation_context,
@@ -11264,8 +11395,7 @@ class RecoveryCoordinator:
                 (
                     "manual recovery claim cleanup",
                     lambda: self._cleanup_incomplete_recovery_claim(
-                        session_id=claimed_session.id,
-                        claim_id=claim.claim_id,
+                        authority=authority,
                         authoritative_failure=outcome.cancellation,
                         execution_profile=execution_profile_snapshot.profile,
                         invocation_context=invocation_context,
@@ -11358,8 +11488,7 @@ class RecoveryCoordinator:
                         (
                             "interrupted manual recovery claim release",
                             lambda: self._cleanup_incomplete_recovery_claim(
-                                session_id=claim.session.id,
-                                claim_id=claim.claim_id,
+                                authority=claim.authority,
                                 authoritative_failure=authoritative_failure,
                                 execution_profile=execution_profile_snapshot.profile,
                                 invocation_context=invocation_context,
@@ -11575,8 +11704,7 @@ class RecoveryCoordinator:
                             (
                                 "manual tool-round recovery claim release",
                                 lambda: self._cleanup_incomplete_recovery_claim(
-                                    session_id=claim.session.id,
-                                    claim_id=claim.claim_id,
+                                    authority=claim.require_authority(),
                                     authoritative_failure=authoritative_failure,
                                     execution_profile=execution_profile_snapshot.profile,
                                     invocation_context=invocation_context,
@@ -15263,8 +15391,7 @@ class RecoveryCoordinator:
         finally:
             if claim is not None:
                 await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim.claim_id,
+                    authority=claim.require_authority(),
                     authoritative_failure=authoritative_failure,
                     release_environment_cleanup=(
                         pending_provider_disposition is not None
@@ -15323,8 +15450,7 @@ class RecoveryCoordinator:
         finally:
             if claim is not None:
                 await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim.claim_id,
+                    authority=claim.require_authority(),
                     authoritative_failure=authoritative_failure,
                 )
 
@@ -15611,8 +15737,7 @@ class RecoveryCoordinator:
         finally:
             if claim is not None:
                 await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim.claim_id,
+                    authority=claim.require_authority(),
                     authoritative_failure=authoritative_failure,
                 )
 
@@ -15916,8 +16041,7 @@ class RecoveryCoordinator:
     async def _cleanup_incomplete_recovery_claim(
         self,
         *,
-        session_id: str,
-        claim_id: str,
+        authority: _IncompleteRecoveryClaimAuthority,
         authoritative_failure: BaseException | None,
         release_environment_cleanup: bool = False,
         execution_profile: ExecutionProfileIdentity | None = None,
@@ -15927,13 +16051,38 @@ class RecoveryCoordinator:
         claim_has_not_dispatched_work: bool = False,
         recovery_work_quiescent: bool = False,
     ) -> None:
-        recovery_run_epoch = _current_session_run_epoch(session_id)
+        if not await authority.begin_finalization():
+            return
+        session_id = authority.session_id
+        claim_id = authority.claim_id
+        recovery_run_epoch = authority.run_epoch
 
-        async def release_recovery_run_fence() -> None:
+        async def release_owned_recovery_run_fence() -> None:
             checkpoint = await self._session_store.load_checkpoint(session_id)
             active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            session = await self._require_session(session_id)
+            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            owns_durable_claim = (
+                persisted_claim is not None
+                and persisted_claim[0] == claim_id
+                and session.run_epoch == authority.run_epoch
+            )
+            if not owns_durable_claim:
+                if (
+                    active_profile is not None
+                    and invocation_context is not None
+                    and session.run_epoch > invocation_context.binding.run_epoch
+                ):
+                    # A successor owns the session, but the environment cleanup
+                    # owner may still need to retire this claim's exact epoch.
+                    await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                        session_id=session_id,
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    )
+                authority.retire()
+                return
             if active_profile is not None:
-                session = await self._require_session(session_id)
                 if invocation_context is not None:
                     if invocation_context.binding.session_instance_id != session.instance_id:
                         raise RuntimeError(
@@ -15944,18 +16093,7 @@ class RecoveryCoordinator:
                             "Recovery cleanup context is ahead of durable authority."
                         )
                     if session.run_epoch > invocation_context.binding.run_epoch:
-                        # A successor has already fenced this recovery owner.
-                        # Delegate to the cleanup owner, which positively
-                        # verifies the stale epoch and leaves successor
-                        # authority untouched.
-                        await (
-                            self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                                session_id=session_id,
-                                execution_profile=execution_profile,
-                                invocation_context=invocation_context,
-                            )
-                        )
-                        return
+                        raise RuntimeError("Recovery cleanup context is behind durable authority.")
                     if invocation_context.active_profile != active_profile:
                         raise RuntimeError(
                             "Recovery cleanup lost exact active invocation authority."
@@ -16047,6 +16185,89 @@ class RecoveryCoordinator:
                     repaired_run_epoch=recovery_run_epoch,
                 )
 
+        async def release_recovery_run_fence() -> None:
+            # The finalizer can run in a supervisor with an empty or unrelated
+            # ContextVar state. Install only this exact owner for store and
+            # environment adapters that still consult task-local authority.
+            if authority.run_fence.retired:
+                return
+            with authority.run_fence.activate():
+                await release_owned_recovery_run_fence()
+
+        claim_release_completed = False
+
+        async def exact_recovery_claim_is_still_persisted() -> bool:
+            checkpoint = await self._session_store.load_checkpoint(session_id)
+            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            return persisted_claim is not None and persisted_claim[0] == claim_id
+
+        async def release_recovery_claim() -> None:
+            nonlocal claim_release_completed
+            try:
+                await self._release_incomplete_recovery_claim(session_id, claim_id)
+            except BaseException as release_failure:
+                release_cancellation = (
+                    release_failure if isinstance(release_failure, asyncio.CancelledError) else None
+                )
+                reconciliation = await await_shielded_task_outcome(
+                    asyncio.create_task(exact_recovery_claim_is_still_persisted()),
+                    cancellation=release_cancellation,
+                )
+                cancellation = reconciliation.cancellation
+                reconciliation_failure = reconciliation.error
+                if isinstance(reconciliation_failure, asyncio.CancelledError) and (
+                    cancellation is None
+                ):
+                    reconciliation_failure = unexpected_child_cancellation_error(
+                        reconciliation_failure,
+                        operation="Incomplete recovery claim release reconciliation",
+                    )
+                if reconciliation_failure is not None:
+                    if cancellation is not None:
+                        cancellation.add_note(
+                            "Incomplete recovery claim release reconciliation also failed: "
+                            f"{type(reconciliation_failure).__name__}."
+                        )
+                        if cancellation is release_failure:
+                            _prepend_exception_cause(cancellation, reconciliation_failure)
+                        else:
+                            _prepend_exception_cause(
+                                cancellation,
+                                BaseExceptionGroup(
+                                    "Incomplete recovery claim release failures",
+                                    [release_failure, reconciliation_failure],
+                                ),
+                            )
+                        restore_task_cancellation_requests(
+                            reconciliation.cancellation_requests_consumed,
+                            cancellation=cancellation,
+                        )
+                        raise cancellation from exception_cause(cancellation)
+                    if not isinstance(reconciliation_failure, Exception):
+                        raise reconciliation_failure from release_failure
+                    release_failure.add_note(
+                        "Incomplete recovery claim release reconciliation failed: "
+                        f"{type(reconciliation_failure).__name__}."
+                    )
+                    raise release_failure from reconciliation_failure
+
+                claim_release_completed = reconciliation.result is False
+                if cancellation is not None:
+                    if cancellation is not release_failure:
+                        cancellation.add_note(
+                            "Incomplete recovery claim release also failed: "
+                            f"{type(release_failure).__name__}."
+                        )
+                        _prepend_exception_cause(cancellation, release_failure)
+                    restore_task_cancellation_requests(
+                        reconciliation.cancellation_requests_consumed,
+                        cancellation=cancellation,
+                    )
+                    raise cancellation from exception_cause(cancellation)
+                raise
+            else:
+                claim_release_completed = True
+
         try:
             await _run_recovery_cleanup_steps(
                 authoritative_failure=authoritative_failure,
@@ -16057,15 +16278,22 @@ class RecoveryCoordinator:
                     ),
                     (
                         "incomplete recovery claim release",
-                        lambda: self._release_incomplete_recovery_claim(
-                            session_id,
-                            claim_id,
-                        ),
+                        release_recovery_claim,
                     ),
                 ),
             )
         finally:
-            _deactivate_session_run_fence(session_id)
+            if claim_release_completed:
+                # A successful exact marker removal confirms either release or
+                # transfer to ordinary incomplete-session recovery. It remains
+                # safe to retire this owner even if fence release itself failed.
+                authority.finish_finalization()
+            else:
+                # The marker may still name this owner (including after a lost
+                # acknowledgement). Keep finalization electable so this or a
+                # waiting finalizer can reconcile and complete exact cleanup;
+                # a durable successor may already have retired the old fence.
+                authority.abort_finalization()
 
     async def _load_owned_incomplete_recovery_claim(
         self,
@@ -16608,195 +16836,27 @@ class RecoveryCoordinator:
                 required_expired_claim_id,
                 "required_expired_claim_id",
             )
+        replacing_expired_owner = required_expired_claim_id is not None
+        operation_label = (
+            "expired recovery takeover"
+            if replacing_expired_owner
+            else "incomplete-session recovery claim"
+        )
+        operation_label_title = (
+            "Expired recovery takeover"
+            if replacing_expired_owner
+            else "Incomplete-session recovery claim"
+        )
+        rejection_note = (
+            "Expired recovery takeover was rejected while cancellation was pending."
+            if replacing_expired_owner
+            else ("Incomplete-session recovery claim was rejected while cancellation was pending.")
+        )
         claim_id = str(uuid4())
         claim_expires_at: datetime | None = None
         claim_run_epoch: int | None = None
-
-        if required_expired_claim_id is not None:
-            session_before_fence: Session | None = None
-
-            def replace_expired_claim(
-                current_session: Session,
-                checkpoint: dict[str, Any] | None,
-            ) -> dict[str, Any]:
-                nonlocal claim_expires_at, claim_run_epoch, session_before_fence
-                claimed_at = self._clock()
-                _require_aware_datetime(claimed_at, "recovery claim clock")
-                if (
-                    active_provider_operation_cancellation_claim_from_checkpoint(
-                        checkpoint,
-                        now=datetime.now(UTC),
-                    )
-                    is not None
-                ):
-                    raise _IncompleteRecoveryClaimLost(
-                        "Provider-operation cancellation still owns the session epoch."
-                    )
-                existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-                if (
-                    existing is None
-                    or existing[0] != required_expired_claim_id
-                    or existing[1] > claimed_at
-                ):
-                    raise _IncompleteRecoveryClaimLost(
-                        "Expired incomplete-session recovery ownership changed."
-                    )
-                claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
-                next_run_epoch = current_session.run_epoch + 1
-                claim_run_epoch = next_run_epoch
-                session_before_fence = current_session.model_copy(deep=True)
-                updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
-                current_profile = active_invocation_execution_profile_from_checkpoint(updated)
-                if execution_profile_snapshot is not None and (
-                    current_profile != execution_profile_snapshot
-                ):
-                    raise _IncompleteRecoveryClaimLost(
-                        "Active invocation profile changed before recovery takeover."
-                    )
-                if current_profile is not None:
-                    updated = checkpoint_with_active_invocation_execution_profile(
-                        updated,
-                        session_id=current_session.id,
-                        interaction_id=current_profile.interaction_id,
-                        run_epoch=next_run_epoch,
-                        profile=current_profile.profile,
-                        expected=current_profile,
-                    )
-                updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
-                    "version": 1,
-                    "claim_id": claim_id,
-                    "claimed_at": claimed_at.isoformat(),
-                    "claim_expires_at": claim_expires_at.isoformat(),
-                }
-                return _checkpoint_with_rebased_session_run_operation(
-                    updated,
-                    previous_run_epoch=current_session.run_epoch,
-                    run_epoch=next_run_epoch,
-                )
-
-            fence_task = asyncio.create_task(
-                self._fence_or_rebind_active_invocation(
-                    session.id,
-                    statuses={session.status},
-                    checkpoint_transform=replace_expired_claim,
-                )
-            )
-            outcome = await await_shielded_task_outcome(fence_task)
-            if isinstance(
-                outcome.error,
-                _IncompleteRecoveryClaimLost
-                | InvocationLifecycleCommandConflict
-                | SessionStatusConflict,
-            ):
-                if outcome.cancellation is not None:
-                    outcome.cancellation.add_note(
-                        "Expired recovery takeover was rejected while cancellation was pending."
-                    )
-                    raise outcome.cancellation from outcome.error
-                return None
-
-            authoritative_failure = outcome.cancellation or outcome.error
-            fenced = outcome.result
-            if outcome.error is not None:
-                reconciliation_outcome = await await_shielded_task_outcome(
-                    asyncio.create_task(
-                        self._load_owned_incomplete_recovery_claim(
-                            session.id,
-                            claim_id,
-                            expected_run_epoch=claim_run_epoch,
-                        )
-                    ),
-                    cancellation=outcome.cancellation,
-                )
-                reconciliation_cancellation = reconciliation_outcome.cancellation
-                reconciliation_failure = reconciliation_outcome.error
-                if reconciliation_cancellation is None and isinstance(
-                    reconciliation_failure,
-                    asyncio.CancelledError,
-                ):
-                    reconciliation_cancellation = reconciliation_failure
-                authoritative_failure = (
-                    reconciliation_cancellation or outcome.cancellation or outcome.error
-                )
-                if reconciliation_failure is not None:
-                    if not isinstance(
-                        reconciliation_failure,
-                        Exception | asyncio.CancelledError,
-                    ):
-                        raise reconciliation_failure from outcome.error
-                    authoritative_failure.add_note(
-                        "Could not reconcile whether the expired recovery takeover "
-                        f"committed: {type(reconciliation_failure).__name__}."
-                    )
-                    if reconciliation_cancellation is not None:
-                        reconciliation_cancellation.add_note(
-                            "Expired recovery takeover also failed: "
-                            f"{type(outcome.error).__name__}."
-                        )
-                        raise reconciliation_cancellation from outcome.error
-                    raise outcome.error
-                fenced = reconciliation_outcome.result
-                if fenced is None:
-                    if reconciliation_cancellation is not None:
-                        reconciliation_cancellation.add_note(
-                            "Expired recovery takeover also failed: "
-                            f"{type(outcome.error).__name__}."
-                        )
-                        raise reconciliation_cancellation from outcome.error
-                    raise outcome.error
-
-            if fenced is None:
-                raise RuntimeError("Expired recovery takeover returned no session.")
-            _activate_session_run_fence(fenced)
-            if (
-                claim_expires_at is None
-                or claim_run_epoch is None
-                or session_before_fence is None
-                or fenced.run_epoch != claim_run_epoch
-            ):
-                invariant_failure = RuntimeError(
-                    "Expired recovery takeover did not persist its claim."
-                )
-                await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim_id,
-                    authoritative_failure=invariant_failure,
-                    execution_profile=(
-                        None
-                        if execution_profile_snapshot is None
-                        else execution_profile_snapshot.profile
-                    ),
-                    claim_has_not_dispatched_work=True,
-                )
-                raise invariant_failure
-            claim = _IncompleteRecoveryClaim(
-                claim_id=claim_id,
-                claim_expires_at=claim_expires_at,
-                session_before_fence=session_before_fence,
-                session=fenced,
-            )
-            if authoritative_failure is None:
-                return claim
-            await self._cleanup_incomplete_recovery_claim(
-                session_id=session.id,
-                claim_id=claim_id,
-                authoritative_failure=authoritative_failure,
-                execution_profile=(
-                    None
-                    if execution_profile_snapshot is None
-                    else execution_profile_snapshot.profile
-                ),
-                claim_has_not_dispatched_work=True,
-            )
-            if outcome.cancellation is not None:
-                if outcome.error is not None:
-                    outcome.cancellation.add_note(
-                        f"Expired recovery takeover also failed: {type(outcome.error).__name__}."
-                    )
-                raise outcome.cancellation from outcome.error
-            raise outcome.error
-
         session_before_fence: Session | None = None
+        authority: _IncompleteRecoveryClaimAuthority | None = None
 
         def claim_checkpoint(
             current_session: Session,
@@ -16815,8 +16875,18 @@ class RecoveryCoordinator:
                 raise _IncompleteRecoveryClaimLost(
                     "Provider-operation cancellation still owns the session epoch."
                 )
+
             existing = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-            if (
+            if replacing_expired_owner:
+                if (
+                    existing is None
+                    or existing[0] != required_expired_claim_id
+                    or existing[1] > claimed_at
+                ):
+                    raise _IncompleteRecoveryClaimLost(
+                        "Expired incomplete-session recovery ownership changed."
+                    )
+            elif (
                 current_session.status != session.status
                 or (
                     inactive_before is not None
@@ -16827,6 +16897,7 @@ class RecoveryCoordinator:
                 raise _IncompleteRecoveryClaimLost(
                     "Incomplete-session recovery ownership changed before it was claimed."
                 )
+
             claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
             next_run_epoch = current_session.run_epoch + 1
             claim_run_epoch = next_run_epoch
@@ -16837,7 +16908,9 @@ class RecoveryCoordinator:
                 current_profile != execution_profile_snapshot
             ):
                 raise _IncompleteRecoveryClaimLost(
-                    "Active invocation profile changed before recovery was claimed."
+                    "Active invocation profile changed before recovery takeover."
+                    if replacing_expired_owner
+                    else "Active invocation profile changed before recovery was claimed."
                 )
             if current_profile is not None:
                 updated = checkpoint_with_active_invocation_execution_profile(
@@ -16854,7 +16927,7 @@ class RecoveryCoordinator:
                 "claimed_at": claimed_at.isoformat(),
                 "claim_expires_at": claim_expires_at.isoformat(),
             }
-            if checkpoint_transform is not None:
+            if not replacing_expired_owner and checkpoint_transform is not None:
                 transformed = checkpoint_transform(current_session, updated)
                 if transformed is None:
                     raise _IncompleteRecoveryClaimLost(
@@ -16867,7 +16940,6 @@ class RecoveryCoordinator:
                 run_epoch=next_run_epoch,
             )
 
-        fence_claimed = False
         try:
             fence_task = asyncio.create_task(
                 self._fence_or_rebind_active_invocation(
@@ -16884,10 +16956,7 @@ class RecoveryCoordinator:
                 | SessionStatusConflict,
             ):
                 if outcome.cancellation is not None:
-                    outcome.cancellation.add_note(
-                        "Incomplete-session recovery claim was rejected while cancellation "
-                        "was pending."
-                    )
+                    outcome.cancellation.add_note(rejection_note)
                     raise outcome.cancellation from outcome.error
                 return None
 
@@ -16921,13 +16990,12 @@ class RecoveryCoordinator:
                     ):
                         raise reconciliation_failure from outcome.error
                     authoritative_failure.add_note(
-                        "Could not reconcile whether the incomplete-session recovery claim "
-                        f"committed: {type(reconciliation_failure).__name__}."
+                        f"Could not reconcile whether the {operation_label} committed: "
+                        f"{type(reconciliation_failure).__name__}."
                     )
                     if reconciliation_cancellation is not None:
                         reconciliation_cancellation.add_note(
-                            "Incomplete-session recovery claim also failed: "
-                            f"{type(outcome.error).__name__}."
+                            f"{operation_label_title} also failed: {type(outcome.error).__name__}."
                         )
                         raise reconciliation_cancellation from outcome.error
                     raise outcome.error
@@ -16935,16 +17003,19 @@ class RecoveryCoordinator:
                 if fenced is None:
                     if reconciliation_cancellation is not None:
                         reconciliation_cancellation.add_note(
-                            "Incomplete-session recovery claim also failed: "
-                            f"{type(outcome.error).__name__}."
+                            f"{operation_label_title} also failed: {type(outcome.error).__name__}."
                         )
                         raise reconciliation_cancellation from outcome.error
                     raise outcome.error
 
             if fenced is None:
-                raise RuntimeError("Incomplete-session recovery claim returned no session.")
-            _activate_session_run_fence(fenced)
-            fence_claimed = True
+                raise RuntimeError(f"{operation_label_title} returned no session.")
+            run_fence = _activate_owned_session_run_fence(fenced)
+            authority = _IncompleteRecoveryClaimAuthority(
+                session_id=fenced.id,
+                claim_id=claim_id,
+                run_fence=run_fence,
+            )
             if (
                 claim_expires_at is None
                 or claim_run_epoch is None
@@ -16952,50 +17023,50 @@ class RecoveryCoordinator:
                 or fenced.run_epoch != claim_run_epoch
             ):
                 raise RuntimeError(
-                    "Incomplete-session recovery claim was not persisted atomically."
+                    "Expired recovery takeover did not persist its claim."
+                    if replacing_expired_owner
+                    else ("Incomplete-session recovery claim was not persisted atomically.")
                 )
             if authoritative_failure is not None:
                 if outcome.cancellation is not None:
                     if outcome.error is not None:
                         outcome.cancellation.add_note(
-                            "Incomplete-session recovery claim also failed: "
-                            f"{type(outcome.error).__name__}."
+                            f"{operation_label_title} also failed: {type(outcome.error).__name__}."
                         )
                     raise outcome.cancellation from outcome.error
                 raise outcome.error
 
-            try:
-                renewed_until = await self._renew_incomplete_recovery_claim(
-                    session.id,
-                    claim_id,
-                )
-            except SessionRunFenced:
-                await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim_id,
-                    authoritative_failure=None,
-                )
-                fence_claimed = False
-                return None
-            if renewed_until is None:
-                await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim_id,
-                    authoritative_failure=None,
-                )
-                fence_claimed = False
-                return None
+            if not replacing_expired_owner:
+                try:
+                    renewed_until = await self._renew_incomplete_recovery_claim(
+                        session.id,
+                        claim_id,
+                    )
+                except SessionRunFenced:
+                    await self._cleanup_incomplete_recovery_claim(
+                        authority=authority,
+                        authoritative_failure=None,
+                    )
+                    return None
+                if renewed_until is None:
+                    await self._cleanup_incomplete_recovery_claim(
+                        authority=authority,
+                        authoritative_failure=None,
+                    )
+                    return None
+                claim_expires_at = renewed_until
+
             return _IncompleteRecoveryClaim(
                 claim_id=claim_id,
-                claim_expires_at=renewed_until,
+                claim_expires_at=claim_expires_at,
                 session_before_fence=session_before_fence,
                 session=fenced,
+                authority=authority,
             )
         except BaseException as exc:
-            if fence_claimed:
+            if authority is not None:
                 await self._cleanup_incomplete_recovery_claim(
-                    session_id=session.id,
-                    claim_id=claim_id,
+                    authority=authority,
                     authoritative_failure=exc,
                     execution_profile=(
                         None
@@ -17004,7 +17075,7 @@ class RecoveryCoordinator:
                     ),
                     claim_has_not_dispatched_work=True,
                 )
-            else:
+            elif not replacing_expired_owner:
                 await _run_recovery_cleanup_steps(
                     authoritative_failure=exc,
                     steps=(
