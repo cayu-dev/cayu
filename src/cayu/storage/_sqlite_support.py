@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, NoReturn, cast
 from urllib.parse import quote
@@ -3960,6 +3961,266 @@ _MIGRATION_STEPS: dict[int, str] = {
             )
         );
     """,
+    79: """
+        CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
+            child_session_id TEXT COLLATE BINARY PRIMARY KEY
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            parent_session_id TEXT COLLATE BINARY NOT NULL
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            priority INTEGER NOT NULL CHECK (priority IN (0, 1, 2)),
+            sort_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_child_lifecycle_candidates_page
+            ON cayu_child_session_lifecycle_candidates(
+                parent_session_id, priority, sort_at, child_session_id
+            );
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_child_lifecycle
+            ON cayu_events(session_id, event_type, sequence DESC)
+            WHERE event_type IN (
+                'session.started', 'session.resumed', 'session.forked',
+                'session.completed', 'session.failed', 'session.interrupted'
+            );
+        CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_role_order
+            ON cayu_transcript_messages(session_id, role, session_order DESC);
+
+        CREATE VIEW IF NOT EXISTS cayu_child_session_lifecycle_canonical AS
+        WITH boundaries AS (
+            SELECT
+                child.id AS child_session_id,
+                child.parent_session_id,
+                child.instance_id,
+                child.status,
+                child.created_at,
+                (
+                    SELECT event.sequence
+                    FROM cayu_events AS event
+                    WHERE event.session_id = child.id
+                      AND event.event_type IN (
+                          'session.started', 'session.resumed', 'session.forked',
+                          'session.completed', 'session.failed', 'session.interrupted'
+                      )
+                    ORDER BY event.sequence DESC
+                    LIMIT 1
+                ) AS latest_lifecycle_sequence,
+                EXISTS (
+                    SELECT 1
+                    FROM cayu_events AS event
+                    WHERE event.session_id = child.id
+                      AND event.event_type IN (
+                          'session.started', 'session.resumed',
+                          'session.completed', 'session.failed', 'session.interrupted'
+                      )
+                ) AS pending_has_forbidden_event
+            FROM cayu_sessions AS child
+            WHERE child.parent_session_id IS NOT NULL
+        ), canonical AS (
+            SELECT
+                boundary.*,
+                latest.event_id AS latest_event_id,
+                latest.event_type AS latest_event_type,
+                latest.timestamp AS latest_event_at,
+                CASE
+                    WHEN boundary.status = 'pending' THEN
+                        NOT boundary.pending_has_forbidden_event
+                    WHEN boundary.status IN ('running', 'interrupting') THEN
+                        latest.event_type IN (
+                            'session.started', 'session.resumed', 'session.forked'
+                        )
+                    WHEN boundary.status = 'completed' THEN
+                        latest.event_type = 'session.completed'
+                    WHEN boundary.status = 'failed' THEN
+                        latest.event_type = 'session.failed'
+                    WHEN boundary.status = 'interrupted' THEN
+                        latest.event_type = 'session.interrupted'
+                    ELSE 0
+                END AS is_available
+            FROM boundaries AS boundary
+            LEFT JOIN cayu_events AS latest
+              ON latest.sequence = boundary.latest_lifecycle_sequence
+        )
+        SELECT
+            canonical.child_session_id,
+            canonical.parent_session_id,
+            CASE
+                WHEN canonical.is_available
+                 AND canonical.status IN ('completed', 'failed', 'interrupted')
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM cayu_session_operations AS consumption
+                     WHERE consumption.session_id = canonical.parent_session_id
+                       AND consumption.idempotency_key =
+                           '__cayu_child_session_notification_v1__:' ||
+                           length(canonical.instance_id) || ':' ||
+                           canonical.instance_id || canonical.latest_event_id
+                 ) THEN 0
+                WHEN canonical.is_available
+                 AND canonical.status IN ('completed', 'failed', 'interrupted') THEN 2
+                ELSE 1
+            END AS priority,
+            CASE
+                WHEN canonical.is_available
+                 AND canonical.latest_event_at IS NOT NULL
+                    THEN canonical.latest_event_at
+                ELSE canonical.created_at
+            END AS sort_at
+        FROM canonical;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_session_insert
+        AFTER INSERT ON cayu_sessions
+        FOR EACH ROW
+        WHEN NEW.parent_session_id IS NOT NULL
+        BEGIN
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id = NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_session_update
+        AFTER UPDATE OF parent_session_id, instance_id, status, created_at ON cayu_sessions
+        FOR EACH ROW
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id = NEW.id;
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id = NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_event_insert
+        AFTER INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN NEW.event_type IN (
+            'session.started', 'session.resumed', 'session.forked',
+            'session.completed', 'session.failed', 'session.interrupted'
+        )
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id = NEW.session_id;
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_event_delete
+        AFTER DELETE ON cayu_events
+        FOR EACH ROW
+        WHEN OLD.event_type IN (
+            'session.started', 'session.resumed', 'session.forked',
+            'session.completed', 'session.failed', 'session.interrupted'
+        )
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id = OLD.session_id;
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id = OLD.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_event_update
+        AFTER UPDATE OF session_id, event_id, event_type, sequence, timestamp ON cayu_events
+        FOR EACH ROW
+        WHEN OLD.event_type IN (
+            'session.started', 'session.resumed', 'session.forked',
+            'session.completed', 'session.failed', 'session.interrupted'
+        ) OR NEW.event_type IN (
+            'session.started', 'session.resumed', 'session.forked',
+            'session.completed', 'session.failed', 'session.interrupted'
+        )
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id IN (OLD.session_id, NEW.session_id);
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id IN (OLD.session_id, NEW.session_id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_consumption
+        AFTER INSERT ON cayu_session_operations
+        FOR EACH ROW
+        WHEN json_extract(NEW.record_json, '$.record_type') =
+             'cayu.child-session-notification-consumption'
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id = json_extract(NEW.record_json, '$.child_session_id');
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id = json_extract(
+                NEW.record_json, '$.child_session_id'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_consumption_delete
+        AFTER DELETE ON cayu_session_operations
+        FOR EACH ROW
+        WHEN json_extract(OLD.record_json, '$.record_type') =
+             'cayu.child-session-notification-consumption'
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id = json_extract(OLD.record_json, '$.child_session_id');
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id = json_extract(
+                OLD.record_json, '$.child_session_id'
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_index_child_lifecycle_consumption_update
+        AFTER UPDATE OF session_id, idempotency_key, record_json
+        ON cayu_session_operations
+        FOR EACH ROW
+        WHEN json_extract(OLD.record_json, '$.record_type') =
+                 'cayu.child-session-notification-consumption'
+          OR json_extract(NEW.record_json, '$.record_type') =
+                 'cayu.child-session-notification-consumption'
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id IN (
+                json_extract(OLD.record_json, '$.child_session_id'),
+                json_extract(NEW.record_json, '$.child_session_id')
+            );
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            SELECT child_session_id, parent_session_id, priority, sort_at
+            FROM cayu_child_session_lifecycle_canonical
+            WHERE child_session_id IN (
+                json_extract(OLD.record_json, '$.child_session_id'),
+                json_extract(NEW.record_json, '$.child_session_id')
+            );
+        END;
+
+        INSERT INTO cayu_child_session_lifecycle_candidates (
+            child_session_id, parent_session_id, priority, sort_at
+        )
+        SELECT child_session_id, parent_session_id, priority, sort_at
+        FROM cayu_child_session_lifecycle_canonical
+        WHERE 1
+        ON CONFLICT(child_session_id) DO UPDATE SET
+            parent_session_id = excluded.parent_session_id,
+            priority = excluded.priority,
+            sort_at = excluded.sort_at;
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -5742,6 +6003,8 @@ def reconcile_schema(
         _validate_revision_77_knowledge_maintenance_governance_schema(connection)
     if current.revision >= 78:
         _validate_revision_78_knowledge_semantic_watch_schema(connection)
+    if current.revision >= 79:
+        _validate_revision_79_child_lifecycle_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 70:
@@ -7985,6 +8248,153 @@ def _validate_revision_78_knowledge_semantic_watch_schema(
         )
 
 
+def _validate_revision_79_child_lifecycle_schema(connection: sqlite3.Connection) -> None:
+    table = "cayu_child_session_lifecycle_candidates"
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    )
+    expected_foreign_keys = {
+        ("cayu_sessions", ("child_session_id",), ("id",), "CASCADE"),
+        ("cayu_sessions", ("parent_session_id",), ("id",), "CASCADE"),
+    }
+    if (
+        columns
+        != (
+            ("child_session_id", "TEXT", 0, 1),
+            ("parent_session_id", "TEXT", 1, 0),
+            ("priority", "INTEGER", 1, 0),
+            ("sort_at", "TEXT", 1, 0),
+        )
+        or _sqlite_foreign_key_groups(connection, table) != expected_foreign_keys
+    ):
+        _raise_revision_79_child_lifecycle_schema_error(table)
+    # These hashes bind the normalized SQL installed by revision 79. Checking
+    # names and columns alone is unsafe here: IF NOT EXISTS would otherwise
+    # accept a same-named view, trigger, or index with different semantics.
+    expected_objects = {
+        table: (
+            "table",
+            table,
+            "72ae90b389f12b0ef9e50d17589552bfc638ea17238c668049d77ab980c6bb62",
+        ),
+        "cayu_child_session_lifecycle_canonical": (
+            "view",
+            "cayu_child_session_lifecycle_canonical",
+            "a8e1d479280bd9c5396a2098a242410a76c0ce767d737287c41d4c12b3964ddf",
+        ),
+        "cayu_index_child_lifecycle_session_insert": (
+            "trigger",
+            "cayu_sessions",
+            "36c3d0aa69d7598b2bf6b8bc5f0b8421a105803176ad540ce8438f30ced6b077",
+        ),
+        "cayu_index_child_lifecycle_session_update": (
+            "trigger",
+            "cayu_sessions",
+            "8a35cda77227a94beb8fb8116044b133bcb7272461ebb88fb5960375b8afd9e2",
+        ),
+        "cayu_index_child_lifecycle_event_insert": (
+            "trigger",
+            "cayu_events",
+            "6694b0f3885709f2204bb42e81051b9abafd86931d93e19b64ab7534e0887c23",
+        ),
+        "cayu_index_child_lifecycle_event_delete": (
+            "trigger",
+            "cayu_events",
+            "eceae14afdb0aebdbceff8ea3007fa2bb65af73a53370dae33b5193e4e3cd00e",
+        ),
+        "cayu_index_child_lifecycle_event_update": (
+            "trigger",
+            "cayu_events",
+            "71643cc73a086c8f2787428ccbf4b40acfaa73b376c4af7b83889ca3537709b3",
+        ),
+        "cayu_index_child_lifecycle_consumption": (
+            "trigger",
+            "cayu_session_operations",
+            "8162e6e0f5fab3987cb574fae8f21e14ffa3f1971c8d1e1c047aabb4c7aa5aff",
+        ),
+        "cayu_index_child_lifecycle_consumption_delete": (
+            "trigger",
+            "cayu_session_operations",
+            "1ae3c9c751ebda820bb0ec04ab508ed74cde0756375fcda80e92c00863a8b6e3",
+        ),
+        "cayu_index_child_lifecycle_consumption_update": (
+            "trigger",
+            "cayu_session_operations",
+            "85547f6faa7802c004277b0f36dc5ec5c1895f219c4f5fb1239aead9e211a85d",
+        ),
+    }
+    for name, expected in expected_objects.items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (name,),
+        ).fetchone()
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[2])
+        actual = (
+            None
+            if row is None
+            else (str(row[0]), str(row[1]), sha256(normalized.encode("utf-8")).hexdigest())
+        )
+        if actual != expected:
+            _raise_revision_79_child_lifecycle_schema_error(name)
+    expected_indexes = {
+        "idx_cayu_child_lifecycle_candidates_page": (
+            "cayu_child_session_lifecycle_candidates",
+            (
+                ("parent_session_id", 0, "BINARY"),
+                ("priority", 0, "BINARY"),
+                ("sort_at", 0, "BINARY"),
+                ("child_session_id", 0, "BINARY"),
+            ),
+            "37fb6e7aea8b228a2427048a2e38cab0e7f7d108a3745fb125b829456be980d6",
+        ),
+        "idx_cayu_events_child_lifecycle": (
+            "cayu_events",
+            (
+                ("session_id", 0, "BINARY"),
+                ("event_type", 0, "BINARY"),
+                ("sequence", 1, "BINARY"),
+            ),
+            "b7efb7c9b58d8bd832053808aee296c2c8ed3bde173fb3b1f8575f98393d92a6",
+        ),
+        "idx_cayu_transcript_messages_session_role_order": (
+            "cayu_transcript_messages",
+            (
+                ("session_id", 0, "BINARY"),
+                ("role", 0, "BINARY"),
+                ("session_order", 1, "BINARY"),
+            ),
+            "6ccc9d35738eac56087c1b9a34816a1796f24417260ae6bcb005e2b744b945e3",
+        ),
+    }
+    for index, (expected_table, expected_keys, expected_digest) in expected_indexes.items():
+        row = connection.execute(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        keys = tuple(
+            (str(index_row[2]), int(index_row[3]), str(index_row[4]).upper())
+            for index_row in connection.execute(f"PRAGMA index_xinfo({index})")
+            if int(index_row[5]) == 1
+        )
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[1])
+        if (
+            row is None
+            or str(row[0]) != expected_table
+            or keys != expected_keys
+            or sha256(normalized.encode("utf-8")).hexdigest() != expected_digest
+        ):
+            _raise_revision_79_child_lifecycle_schema_error(index)
+
+
+def _raise_revision_79_child_lifecycle_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's bounded child-lifecycle projection. "
+        "Run schema_mode=MIGRATE to install revision 79 or recreate the database."
+    )
+
+
 def _validate_revision_44_knowledge_schema(connection: sqlite3.Connection) -> None:
     expected_columns = {
         "cayu_knowledge_index_readiness_events": (
@@ -10067,6 +10477,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_77_knowledge_maintenance_governance_schema(connection)
         if rev.revision == 78:
             _validate_revision_78_knowledge_semantic_watch_schema(connection)
+        if rev.revision == 79:
+            _validate_revision_79_child_lifecycle_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

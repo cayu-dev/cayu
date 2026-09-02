@@ -33,7 +33,7 @@ from cayu.core.events import (
     EventType,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import Message
+from cayu.core.messages import Message, MessageRole
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.memory_evidence import (
@@ -61,6 +61,14 @@ from cayu.memory_evidence import (
     require_memory_evidence_session_id,
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
+)
+from cayu.runtime._child_session_notifications import (
+    ChildSessionLifecycleOccurrence,
+    ChildSessionLifecycleOccurrenceSource,
+    ChildSessionLifecyclePage,
+    ChildSessionLifecycleQuery,
+    child_session_notification_stage_binding,
+    child_session_notification_storage_key,
 )
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
@@ -121,6 +129,9 @@ from cayu.runtime.sessions import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INHERIT_INTERACTION,
+    LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
+    LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
+    LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
@@ -229,6 +240,7 @@ from cayu.runtime.sessions import (
     TranscriptSearchQuery,
     TranscriptSearchResult,
     TranscriptSnapshot,
+    TranscriptTextReadLimitExceeded,
     UsageRollupQuery,
     _activate_session_run_fence,
     _active_model_completion_stage_record,
@@ -243,6 +255,11 @@ from cayu.runtime.sessions import (
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _child_session_lifecycle_entry,
+    _child_session_lifecycle_entry_sort_key,
+    _child_session_lifecycle_occurrence,
+    _child_session_notification_consumption_record,
+    _child_session_notification_consumption_replays,
     _classify_terminal_session_evidence_records,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
@@ -1659,6 +1676,7 @@ class SQLiteSessionStore(SessionStore):
     supports_targeted_tool_grants: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
+    child_session_notification_version: ClassVar[int | None] = 1
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
@@ -7809,6 +7827,7 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         *,
         stage: ModelCompletionStage,
+        consume_child_session_notifications: bool,
     ) -> ModelCompletionStageDispatch:
         _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
             session_id,
@@ -7852,7 +7871,8 @@ class SQLiteSessionStore(SessionStore):
                 )
                 published_at = _next_runtime_publication_timestamp(loaded)
                 dispatch_record = records.get(dispatch_key)
-                if dispatch_record is None:
+                dispatch_is_new = dispatch_record is None
+                if dispatch_is_new:
                     dispatch_record = _model_completion_stage_dispatch_record(
                         stage,
                         dispatched_at=published_at,
@@ -7868,6 +7888,7 @@ class SQLiteSessionStore(SessionStore):
                             sqlite_support.format_datetime(published_at),
                         ),
                     )
+                assert dispatch_record is not None
                 dispatch = _reconstruct_model_completion_stage_dispatch(
                     dispatch_record,
                     session_id=session_id,
@@ -7875,6 +7896,78 @@ class SQLiteSessionStore(SessionStore):
                     storage_key=dispatch_key,
                 )
                 _validate_model_completion_stage_dispatch(dispatch, stage)
+                binding = child_session_notification_stage_binding(stage.intent)
+                if binding is not None:
+                    for claim in binding.claims:
+                        child = _load_session(connection, claim.child_session_id)
+                        event_row = (
+                            None
+                            if child is None
+                            else connection.execute(
+                                "SELECT * FROM cayu_events "
+                                "WHERE session_id = ? "
+                                "AND event_type IN (?, ?, ?, ?, ?, ?) "
+                                "ORDER BY sequence DESC LIMIT 1",
+                                (
+                                    claim.child_session_id,
+                                    str(EventType.SESSION_STARTED),
+                                    str(EventType.SESSION_RESUMED),
+                                    str(EventType.SESSION_FORKED),
+                                    str(EventType.SESSION_COMPLETED),
+                                    str(EventType.SESSION_FAILED),
+                                    str(EventType.SESSION_INTERRUPTED),
+                                ),
+                            ).fetchone()
+                        )
+                        event_record = _event_record_from_row(event_row)
+                        if child is None or event_record is None:
+                            raise SessionModelCompletionStageConflict(
+                                "Child-session notification occurrence is no longer canonical."
+                            )
+                        occurrence = ChildSessionLifecycleOccurrence(
+                            source=ChildSessionLifecycleOccurrenceSource.EVENT,
+                            source_id=event_record.event.id,
+                            source_sequence=event_record.sequence,
+                            source_type=str(event_record.event.type),
+                            occurred_at=event_record.event.timestamp,
+                        )
+                        consumption = _child_session_notification_consumption_record(
+                            parent=loaded,
+                            child=child,
+                            occurrence=occurrence,
+                            stage=stage,
+                            consumed_at=published_at,
+                        )
+                        consumption_key = child_session_notification_storage_key(
+                            child.instance_id, occurrence.source_id
+                        )
+                        consumption_row = connection.execute(
+                            "SELECT record_json FROM cayu_session_operations "
+                            "WHERE session_id = ? AND idempotency_key = ?",
+                            (session_id, consumption_key),
+                        ).fetchone()
+                        material = consumption.model_dump(mode="json")
+                        if consumption_row is not None:
+                            if not _child_session_notification_consumption_replays(
+                                json.loads(consumption_row["record_json"]),
+                                consumption,
+                            ):
+                                raise SessionModelCompletionStageConflict(
+                                    "Child-session terminal notification was consumed by "
+                                    "another stage."
+                                )
+                        elif consume_child_session_notifications:
+                            connection.execute(
+                                "INSERT INTO cayu_session_operations "
+                                "(session_id, idempotency_key, record_json, updated_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    session_id,
+                                    consumption_key,
+                                    sqlite_support.json_dumps(material),
+                                    sqlite_support.format_datetime(published_at),
+                                ),
+                            )
                 formatted_at = sqlite_support.format_datetime(published_at)
                 cursor = connection.execute(
                     "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?",
@@ -10942,6 +11035,144 @@ class SQLiteSessionStore(SessionStore):
 
         return await self._run_read(read_lineage)
 
+    async def query_child_session_lifecycle(
+        self,
+        query: ChildSessionLifecycleQuery,
+    ) -> ChildSessionLifecyclePage:
+        query = ChildSessionLifecycleQuery.model_validate(query)
+
+        def read_snapshot(connection: sqlite3.Connection) -> ChildSessionLifecyclePage:
+            parent = _load_session(connection, query.parent_session_id)
+            if parent is None:
+                raise KeyError(f"Session not found: {query.parent_session_id}")
+            rows = connection.execute(
+                "SELECT child_session_id FROM cayu_child_session_lifecycle_candidates "
+                "WHERE parent_session_id = ? "
+                "ORDER BY priority, sort_at, child_session_id "
+                "LIMIT ?",
+                (parent.id, query.max_children_inspected + 1),
+            ).fetchall()
+            retained_rows = rows[: query.max_children_inspected]
+            retained_ids = [str(row["child_session_id"]) for row in retained_rows]
+            entries = []
+            unavailable_count = 0
+            lifecycle_types = (
+                str(EventType.SESSION_STARTED),
+                str(EventType.SESSION_RESUMED),
+                str(EventType.SESSION_FORKED),
+                str(EventType.SESSION_COMPLETED),
+                str(EventType.SESSION_FAILED),
+                str(EventType.SESSION_INTERRUPTED),
+            )
+            children_by_id: dict[str, Session] = {}
+            records_by_child: dict[str, dict[EventType, EventRecord]] = {
+                child_id: {} for child_id in retained_ids
+            }
+            if retained_ids:
+                placeholders = ", ".join("?" for _child_id in retained_ids)
+                child_rows = connection.execute(
+                    "SELECT id, instance_id, agent_name, provider_name, model, "
+                    "parent_session_id, causal_budget_id, runtime_name, runtime_version, "
+                    "environment_name, status, created_at, updated_at, last_activity_at, "
+                    "run_epoch, invocation_json, metadata_json FROM cayu_sessions "
+                    f"WHERE id IN ({placeholders})",
+                    retained_ids,
+                ).fetchall()
+                children_by_id = {
+                    str(child_row["id"]): sqlite_support.session_from_row(
+                        child_row,
+                        labels={},
+                    )
+                    for child_row in child_rows
+                }
+                event_rows = connection.execute(
+                    """
+                    SELECT event.*
+                    FROM cayu_events AS event
+                    JOIN (
+                        SELECT session_id, event_type, MAX(sequence) AS sequence
+                        FROM cayu_events
+                        WHERE session_id IN ("""
+                    + placeholders
+                    + """)
+                          AND event_type IN (?, ?, ?, ?, ?, ?)
+                        GROUP BY session_id, event_type
+                    ) AS latest ON latest.sequence = event.sequence
+                    ORDER BY event.session_id, event.sequence ASC
+                    """,
+                    (*retained_ids, *lifecycle_types),
+                ).fetchall()
+                for event_row in event_rows:
+                    event_record = _event_record_from_row(event_row)
+                    if event_record is None:  # pragma: no cover - row is present
+                        raise RuntimeError("SQLite lifecycle event row disappeared.")
+                    records_by_child[str(event_row["session_id"])][
+                        EventType(event_row["event_type"])
+                    ] = event_record
+
+            consumption_key_by_child: dict[str, str] = {}
+            for child_id in retained_ids:
+                child = children_by_id.get(child_id)
+                if child is None or child.parent_session_id != parent.id:
+                    raise RuntimeError("SQLite child-session lifecycle index is inconsistent.")
+                occurrence_source = _child_session_lifecycle_occurrence(
+                    child,
+                    records_by_child[child_id],
+                )
+                if occurrence_source is not None:
+                    _relationship, occurrence = occurrence_source
+                    consumption_key_by_child[child_id] = child_session_notification_storage_key(
+                        child.instance_id,
+                        occurrence.source_id,
+                    )
+            consumption_by_key: dict[str, dict[str, Any]] = {}
+            if consumption_key_by_child:
+                consumption_keys = tuple(consumption_key_by_child.values())
+                placeholders = ", ".join("?" for _key in consumption_keys)
+                operation_rows = connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                    f"WHERE session_id = ? AND idempotency_key IN ({placeholders})",
+                    (parent.id, *consumption_keys),
+                ).fetchall()
+                consumption_by_key = {
+                    str(operation_row["idempotency_key"]): json.loads(operation_row["record_json"])
+                    for operation_row in operation_rows
+                }
+
+            for child_id in retained_ids:
+                child = children_by_id[child_id]
+                consumption_key = consumption_key_by_child.get(child_id)
+                entry = _child_session_lifecycle_entry(
+                    parent=parent,
+                    child=child,
+                    records_by_type=records_by_child[child_id],
+                    consumption_record=(
+                        None if consumption_key is None else consumption_by_key.get(consumption_key)
+                    ),
+                )
+                if entry is None:
+                    unavailable_count += 1
+                else:
+                    entries.append(entry)
+            entries.sort(key=_child_session_lifecycle_entry_sort_key)
+            return ChildSessionLifecyclePage(
+                parent_session_id=parent.id,
+                parent_session_instance_id=parent.instance_id,
+                entries=tuple(entries),
+                inspected_child_count=len(retained_rows),
+                unavailable_child_count=unavailable_count,
+                has_more=len(rows) > len(retained_rows),
+            )
+
+        def read(connection: sqlite3.Connection) -> ChildSessionLifecyclePage:
+            connection.execute("BEGIN")
+            try:
+                return read_snapshot(connection)
+            finally:
+                connection.rollback()
+
+        return await self._run_read(read)
+
     async def aggregate_operational_snapshot(
         self,
         filters: SessionAggregateFilter | None = None,
@@ -12532,6 +12763,149 @@ class SQLiteSessionStore(SessionStore):
             return _transcript_cursor(connection, session_id)
 
         return await self._run_read(query)
+
+    async def load_latest_transcript_message(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+    ) -> TranscriptRecord | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+
+        def query_latest(connection: sqlite3.Connection) -> TranscriptRecord | None:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            row = connection.execute(
+                "SELECT session_order - 1 AS transcript_index, interaction_id, message_json "
+                "FROM cayu_transcript_messages "
+                "WHERE session_id = ? AND role = ? "
+                "ORDER BY session_order DESC LIMIT 1",
+                (session_id, str(role)),
+            ).fetchone()
+            if row is None:
+                return None
+            return TranscriptRecord(
+                index=row["transcript_index"],
+                interaction_id=row["interaction_id"],
+                message=Message(**json.loads(row["message_json"])),
+            )
+
+        return await self._run_read(query_latest)
+
+    async def load_latest_transcript_text(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+        max_chars: int,
+    ) -> tuple[str, bool] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        if type(max_chars) is not int:
+            raise TypeError("max_chars must be an integer.")
+        if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
+            raise ValueError(
+                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
+            )
+
+        def query_latest(connection: sqlite3.Connection) -> tuple[str, bool] | None:
+            row = connection.execute(
+                """
+                SELECT session.id,
+                       transcript.sequence,
+                       length(CAST(transcript.message_json AS BLOB))
+                FROM cayu_sessions AS session
+                LEFT JOIN cayu_transcript_messages AS transcript
+                  ON transcript.sequence = (
+                      SELECT candidate.sequence
+                      FROM cayu_transcript_messages AS candidate
+                      WHERE candidate.session_id = session.id
+                        AND candidate.role = ?
+                      ORDER BY candidate.session_order DESC
+                      LIMIT 1
+                  )
+                WHERE session.id = ?
+                """,
+                (str(role), session_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            sequence = row[1]
+            if sequence is None:
+                return None
+            if int(row[2]) > LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES:
+                raise TranscriptTextReadLimitExceeded(
+                    "Transcript message exceeds the bounded serialized-source limit."
+                )
+            projection = connection.execute(
+                """
+                WITH RECURSIVE
+                source(message_json, part_count) AS (
+                    SELECT
+                        message_json,
+                        json_array_length(message_json, '$.content')
+                    FROM cayu_transcript_messages
+                    WHERE sequence = ?
+                ),
+                prefix(part_index, text_value, part_count) AS (
+                    SELECT 0, '', part_count
+                    FROM source
+                    UNION ALL
+                    SELECT
+                        prefix.part_index + 1,
+                        substr(
+                            prefix.text_value ||
+                            CASE
+                                WHEN json_extract(
+                                    source.message_json,
+                                    '$.content[' || prefix.part_index || '].type'
+                                ) = 'text'
+                                THEN COALESCE(
+                                    json_extract(
+                                        source.message_json,
+                                        '$.content[' || prefix.part_index || '].text'
+                                    ),
+                                    ''
+                                )
+                                ELSE ''
+                            END,
+                            1,
+                            ?
+                        ),
+                        prefix.part_count
+                    FROM prefix
+                    CROSS JOIN source
+                    WHERE prefix.part_index < prefix.part_count
+                      AND prefix.part_index < ?
+                      AND length(prefix.text_value) <= ?
+                )
+                SELECT text_value, part_index, part_count
+                FROM prefix
+                ORDER BY part_index DESC
+                LIMIT 1
+                """,
+                (
+                    int(sequence),
+                    max_chars + 1,
+                    LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
+                    max_chars,
+                ),
+            ).fetchone()
+            if projection is None:
+                raise TranscriptTextReadLimitExceeded(
+                    "Transcript message changed during its bounded text projection."
+                )
+            text_value = str(projection[0])
+            if int(projection[1]) < int(projection[2]) and len(text_value) <= max_chars:
+                raise TranscriptTextReadLimitExceeded(
+                    "Transcript message exceeds the bounded content-part inspection limit."
+                )
+            return text_value[:max_chars], len(text_value) > max_chars
+
+        return await self._run_read(query_latest)
 
     async def load_transcript_window(
         self,

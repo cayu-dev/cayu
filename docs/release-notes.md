@@ -267,6 +267,36 @@ owner independently of immediate parent lineage. Multi-generation forks created
 before intermediate execution therefore allocate for the running descendant
 without adopting an ancestor resource, including after ancestor deletion.
 
+### Parent models can discover independently completing children
+
+Agents can opt into `ChildSessionContextContributor`, which recomputes bounded
+direct-child lifecycle state immediately before each ordinary provider request.
+It projects public identities and exact admitted, running, completed, failed, or
+interrupted occurrences without embedding child output or persisting synthetic
+transcript messages. Fresh terminal occurrences carry a parent-scoped reference
+for `ChildSessionResultTool`; each occurrence is consumed atomically at the final
+provider-start transition, after any provider-backed token count, and remains
+replay-safe across retries, restarts, resumes, and recovery. One child can be
+consumed while siblings keep running—there is no replacement group or cohort
+abstraction.
+
+Built-in in-memory, SQLite, and PostgreSQL session stores provide the same v1
+query and consumption contract. Selection prioritizes fresh terminals, then
+current children, then consumed terminals under explicit child, entry, byte,
+reference, and work bounds. Dispatch revalidates the exact current terminal
+event and parent/run authority, so stale owners and superseded occurrences fail
+closed. Coverage reports typed truncation or unavailability. Transcript history,
+current lifecycle state, terminal notification, bounded result retrieval, and
+durable user steering remain separate contracts.
+
+Breaking storage revision 79 installs the SQLite/PostgreSQL canonical
+child-lifecycle candidate projection, its bounded page index, and database
+maintenance triggers. Migration rebuilds only this derived index from existing
+session, lifecycle-event, and notification-consumption truth. Reads select the
+bounded candidate page first and reconstruct it with constant-count batched
+queries; they do not rank or hydrate the complete parent branch. Stop pre-79
+session writers before migration.
+
 ### Evaluated knowledge maintenance gains application-owned automatic authority
 
 Applications may now pass an already-persisted and independently evaluated maintenance

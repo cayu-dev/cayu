@@ -424,6 +424,10 @@ REVISIONS: tuple[Revision, ...] = (
     # authority. Historical observations are intentionally not evaluated or
     # inferred, and older writers do not maintain the receipt invariant.
     Revision(revision=78, kind=RevisionKind.BREAKING, compatible_from=78),
+    # Direct-child lifecycle composition now reads a database-maintained
+    # canonical priority projection. Every session/event writer must maintain
+    # that projection, so pre-79 workers cannot safely share the database.
+    Revision(revision=79, kind=RevisionKind.BREAKING, compatible_from=79),
 )
 
 #: The revision an empty database is initialized to.

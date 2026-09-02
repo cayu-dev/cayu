@@ -150,7 +150,13 @@ class _StageDispatchReceiptFailingSessionStore(_CountingSessionStore):
         super().__init__()
         self._terminal_transition_failures_remaining = 2
 
-    async def mark_model_completion_stage_dispatched(self, session_id, *, stage):
+    async def mark_model_completion_stage_dispatched(
+        self,
+        session_id,
+        *,
+        stage,
+        consume_child_session_notifications=True,
+    ):
         del session_id, stage
         raise RuntimeError("model dispatch receipt persistence failed")
 

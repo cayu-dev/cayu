@@ -209,12 +209,19 @@ class _RejectFirstModelStageDispatchReceipt(InMemorySessionStore):
         super().__init__()
         self.reject_dispatch_receipt = True
 
-    async def mark_model_completion_stage_dispatched(self, session_id, *, stage):
+    async def mark_model_completion_stage_dispatched(
+        self,
+        session_id,
+        *,
+        stage,
+        consume_child_session_notifications=True,
+    ):
         if self.reject_dispatch_receipt:
             raise RuntimeError("model-stage dispatch receipt rejected before commit")
         return await super().mark_model_completion_stage_dispatched(
             session_id,
             stage=stage,
+            consume_child_session_notifications=consume_child_session_notifications,
         )
 
 

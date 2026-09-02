@@ -246,6 +246,7 @@ from cayu.runtime.budgets import (
     copy_budget_policy,
 )
 from cayu.runtime.build_provenance import current_runtime_build_provenance
+from cayu.runtime.child_session_context import ChildSessionContextContributor
 from cayu.runtime.completion_result_resolvers import (
     CompletionResultResolutionRequest,
     CompletionResultResolver,
@@ -2251,6 +2252,7 @@ class CayuApp:
         hosted_tools: Iterable[OpenAIWebSearch] | None = None,
         context_policy: ContextPolicy | None = None,
         context_overflow_policy: ContextPolicy | None = None,
+        child_session_context: ChildSessionContextContributor | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
         targeted_tool_mode: TargetedToolMode | str | None = None,
         tool_discovery_mode: ToolDiscoveryMode | str | None = None,
@@ -2276,6 +2278,23 @@ class CayuApp:
             stored_context_overflow_policy = context_overflow_policy
         else:
             raise TypeError("context_overflow_policy must be a ContextPolicy.")
+        if child_session_context is None:
+            stored_child_session_context = None
+        elif type(child_session_context) is ChildSessionContextContributor:
+            if (
+                self.session_store.child_session_notification_version != 1
+                or not self.session_store.supports_public_authority_aliases
+                or self.session_store.public_authority_alias_codec is None
+            ):
+                raise RuntimeError(
+                    "child_session_context requires a v1 child-notification SessionStore "
+                    "with configured public authority aliases."
+                )
+            stored_child_session_context = child_session_context
+        else:
+            raise TypeError(
+                "child_session_context must be a ChildSessionContextContributor or None."
+            )
         stored_tool_discovery_mode = (
             None if tool_discovery_mode is None else copy_tool_discovery_mode(tool_discovery_mode)
         )
@@ -2515,6 +2534,7 @@ class CayuApp:
             ),
             registration_source=registration_source,
             registration_symbol=registration_symbol,
+            child_session_context_contributor=stored_child_session_context,
         )
         newly_claimed_static: list[McpToolset] = []
         newly_claimed_refreshable: list[McpToolset] = []

@@ -131,6 +131,21 @@ from cayu.memory_evidence import (
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
 )
+from cayu.runtime._child_session_notifications import (
+    CHILD_SESSION_ADMISSION_OCCURRENCE_TYPE,
+    CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX,
+    ChildSessionLifecycleEntry,
+    ChildSessionLifecycleOccurrence,
+    ChildSessionLifecycleOccurrenceSource,
+    ChildSessionLifecyclePage,
+    ChildSessionLifecycleQuery,
+    ChildSessionLifecycleState,
+    ChildSessionNotificationConsumption,
+    ChildSessionNotificationFreshness,
+    ChildSessionRelationship,
+    child_session_notification_stage_binding,
+    child_session_notification_storage_key,
+)
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
@@ -7522,6 +7537,41 @@ class TranscriptRecord(BaseModel):
         return copy_message(value)
 
 
+LATEST_TRANSCRIPT_TEXT_MAX_CHARS = 32_000
+LATEST_TRANSCRIPT_TEXT_MAX_PARTS = 4_096
+LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES = 2 * 1024 * 1024
+
+
+class TranscriptTextReadLimitExceeded(RuntimeError):
+    """A bounded text projection cannot safely inspect its source message."""
+
+
+def _bounded_transcript_message_text(
+    message: Message,
+    *,
+    max_chars: int,
+) -> tuple[str, bool]:
+    """Project text with bounded part visits and at most one look-ahead character."""
+
+    pieces: list[str] = []
+    retained_chars = 0
+    for part_index, part in enumerate(message.content):
+        if part_index >= LATEST_TRANSCRIPT_TEXT_MAX_PARTS:
+            raise TranscriptTextReadLimitExceeded(
+                "Transcript message exceeds the bounded content-part inspection limit."
+            )
+        if type(part) is not TextPart:
+            continue
+        remaining = max_chars + 1 - retained_chars
+        if remaining <= 0:
+            break
+        piece = part.text[:remaining]
+        pieces.append(piece)
+        retained_chars += len(piece)
+    text = "".join(pieces)
+    return text[:max_chars], len(text) > max_chars
+
+
 TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS = 10_000
 TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS = 5_000
 TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES = 1024 * 1024
@@ -9064,6 +9114,7 @@ class SessionStore(ABC):
     supports_mcp_manifest_history: ClassVar[bool] = False
     supports_session_topology: ClassVar[bool] = False
     supports_session_lineage: ClassVar[bool] = False
+    child_session_notification_version: ClassVar[int | None] = None
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_targeted_tool_grants: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
@@ -10460,11 +10511,14 @@ class SessionStore(ABC):
         session_id: str,
         *,
         stage: ModelCompletionStage,
+        consume_child_session_notifications: bool = True,
     ) -> ModelCompletionStageDispatch:
         """Durably cross the last local fence before entering provider-controlled code."""
 
         if type(stage) is not ModelCompletionStage:
             raise TypeError("stage must be a ModelCompletionStage.")
+        if type(consume_child_session_notifications) is not bool:
+            raise TypeError("consume_child_session_notifications must be a boolean.")
         copied_stage = stage.model_copy(deep=True)
         session_id = require_clean_nonblank(session_id, "session_id")
         if copied_stage.session_id != session_id:
@@ -10475,6 +10529,7 @@ class SessionStore(ABC):
             return await self._mark_model_completion_stage_dispatched_atomic(
                 session_id,
                 stage=copied_stage,
+                consume_child_session_notifications=consume_child_session_notifications,
             )
         except Exception:
             reconciled = await self.load_model_completion_stage_dispatch(
@@ -10487,6 +10542,15 @@ class SessionStore(ABC):
             if active is None or active.stage != copied_stage:
                 raise
             _validate_model_completion_stage_dispatch(reconciled, copied_stage)
+            if (
+                consume_child_session_notifications
+                and child_session_notification_stage_binding(copied_stage.intent) is not None
+            ):
+                return await self._mark_model_completion_stage_dispatched_atomic(
+                    session_id,
+                    stage=copied_stage,
+                    consume_child_session_notifications=True,
+                )
             return reconciled
 
     async def prepare_model_completion_stage(
@@ -10623,6 +10687,7 @@ class SessionStore(ABC):
         session_id: str,
         *,
         stage: ModelCompletionStage,
+        consume_child_session_notifications: bool,
     ) -> ModelCompletionStageDispatch:
         """Backend hook that validates active authority and inserts one dispatch receipt."""
 
@@ -11092,6 +11157,22 @@ class SessionStore(ABC):
             "This SessionStore does not support bounded session lineage queries."
         )
 
+    async def query_child_session_lifecycle(
+        self,
+        query: ChildSessionLifecycleQuery,
+    ) -> ChildSessionLifecyclePage:
+        """Read bounded canonical direct-child state and notification freshness.
+
+        Implementations advertising ``child_session_notification_version == 1``
+        must resolve session state, its exact lifecycle occurrence, and any
+        dispatch-fenced terminal consumption in one stable snapshot.
+        """
+
+        del query
+        raise NotImplementedError(
+            "This SessionStore does not support child-session lifecycle projections."
+        )
+
     async def aggregate_operational_snapshot(
         self,
         filters: SessionAggregateFilter | None = None,
@@ -11321,6 +11402,48 @@ class SessionStore(ABC):
             cursor=snapshot.cursor,
         )
 
+    async def load_latest_transcript_message(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+    ) -> TranscriptRecord | None:
+        """Load one latest role-matched record without requiring full history.
+
+        Stores must override this method with a reverse-indexed read. There is
+        deliberately no OFFSET-based fallback because its work grows with the
+        transcript and would make callers' bounded-read guarantees dishonest.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support reverse-indexed transcript reads."
+        )
+
+    async def load_latest_transcript_text(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+        max_chars: int,
+    ) -> tuple[str, bool] | None:
+        """Load a bounded text projection without hydrating the source message."""
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        if type(max_chars) is not int:
+            raise TypeError("max_chars must be an integer.")
+        if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
+            raise ValueError(
+                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
+            )
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support bounded transcript-text reads."
+        )
+
     @abstractmethod
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         """Query provider-neutral transcript messages with stable message indexes.
@@ -11501,6 +11624,7 @@ class InMemorySessionStore(SessionStore):
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
+    child_session_notification_version: ClassVar[int | None] = 1
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_targeted_tool_grants: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
@@ -11564,6 +11688,21 @@ class InMemorySessionStore(SessionStore):
         # pages can therefore seek one parent branch without scanning the complete
         # in-memory session registry.
         self._child_session_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
+        # Canonical priority indexes keep child-context inspection bounded. Each
+        # child has exactly one key derived from its session status, latest
+        # lifecycle occurrence, and exact durable notification consumption.
+        self._child_lifecycle_candidate_keys_by_parent: dict[
+            str,
+            dict[int, list[tuple[datetime, str]]],
+        ] = {}
+        self._child_lifecycle_candidate_key_by_child: dict[
+            str,
+            tuple[str, int, tuple[datetime, str]],
+        ] = {}
+        self._child_lifecycle_event_records: dict[
+            str,
+            dict[EventType, EventRecord],
+        ] = {}
         self._events: dict[str, list[Event]] = {}
         self._event_records: list[EventRecord] = []
         # Secondary indexes over ``_event_records`` (same EventRecord objects, kept in
@@ -11632,6 +11771,7 @@ class InMemorySessionStore(SessionStore):
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
         self._transcript_interaction_ids: dict[str, list[str | None]] = {}
+        self._latest_transcript_indexes_by_role: dict[str, dict[MessageRole, int]] = {}
         self._transcript_indices_by_interaction: dict[str, dict[str | None, list[int]]] = {}
         self._transcript_search_documents: dict[str, list[tuple[MessageRole, str]]] = {}
         self._transcript_search_postings: dict[tuple[str, MessageRole], dict[str, list[int]]] = {}
@@ -11704,6 +11844,63 @@ class InMemorySessionStore(SessionStore):
             raise RuntimeError("Duplicate in-memory session topology index entry.")
         keys.insert(index, key)
 
+    def _remove_child_lifecycle_candidate_unlocked(self, child_session_id: str) -> None:
+        indexed = self._child_lifecycle_candidate_key_by_child.pop(child_session_id, None)
+        if indexed is None:
+            return
+        parent_session_id, priority, key = indexed
+        priorities = self._child_lifecycle_candidate_keys_by_parent.get(parent_session_id)
+        if priorities is None:
+            raise RuntimeError("Missing in-memory child lifecycle candidate branch.")
+        keys = priorities.get(priority)
+        if keys is None:
+            raise RuntimeError("Missing in-memory child lifecycle candidate priority.")
+        index = bisect_left(keys, key)
+        if index >= len(keys) or keys[index] != key:
+            raise RuntimeError("Missing in-memory child lifecycle candidate key.")
+        keys.pop(index)
+        if not keys:
+            del priorities[priority]
+        if not priorities:
+            del self._child_lifecycle_candidate_keys_by_parent[parent_session_id]
+
+    def _refresh_child_lifecycle_candidate_unlocked(self, child: Session) -> None:
+        self._remove_child_lifecycle_candidate_unlocked(child.id)
+        parent_session_id = child.parent_session_id
+        if parent_session_id is None:
+            return
+        occurrence_source = _child_session_lifecycle_occurrence(
+            child,
+            self._child_lifecycle_event_records.get(child.id, {}),
+        )
+        priority = 1
+        sort_at = child.created_at
+        if occurrence_source is not None:
+            _relationship, occurrence = occurrence_source
+            sort_at = occurrence.occurred_at
+            if _child_session_lifecycle_state(child.status).terminal:
+                consumption_key = child_session_notification_storage_key(
+                    child.instance_id,
+                    occurrence.source_id,
+                )
+                parent_operations = self._session_operation_records.get(parent_session_id, {})
+                priority = 2 if consumption_key in parent_operations else 0
+        key = (sort_at, child.id)
+        priorities = self._child_lifecycle_candidate_keys_by_parent.setdefault(
+            parent_session_id,
+            {},
+        )
+        keys = priorities.setdefault(priority, [])
+        index = bisect_left(keys, key)
+        if index < len(keys) and keys[index] == key:
+            raise RuntimeError("Duplicate in-memory child lifecycle candidate key.")
+        keys.insert(index, key)
+        self._child_lifecycle_candidate_key_by_child[child.id] = (
+            parent_session_id,
+            priority,
+            key,
+        )
+
     def _remove_session_parent_index_unlocked(self, session: Session) -> None:
         parent_session_id = session.parent_session_id
         if parent_session_id is None:
@@ -11718,6 +11915,7 @@ class InMemorySessionStore(SessionStore):
         keys.pop(index)
         if not keys:
             del self._child_session_keys_by_parent[parent_session_id]
+        self._remove_child_lifecycle_candidate_unlocked(session.id)
 
     def _prepare_checkpoint_store_unlocked(
         self,
@@ -11922,11 +12120,23 @@ class InMemorySessionStore(SessionStore):
         stored = self._transcript_interaction_ids[session_id]
         start = len(stored)
         stored.extend(interaction_ids)
+        messages = self._transcripts[session_id]
+        if len(messages) != len(stored):
+            raise RuntimeError("In-memory transcript attribution is inconsistent.")
+        latest_by_role = self._latest_transcript_indexes_by_role.setdefault(session_id, {})
+        for index in range(start, len(messages)):
+            latest_by_role[messages[index].role] = index
         projection = self._transcript_indices_by_interaction.get(session_id)
         if projection is None:
             return
         for offset, interaction_id in enumerate(interaction_ids):
             projection.setdefault(interaction_id, []).append(start + offset)
+
+    def _replace_latest_transcript_role_indexes_unlocked(self, session_id: str) -> None:
+        latest_by_role: dict[MessageRole, int] = {}
+        for index, message in enumerate(self._transcripts.get(session_id, ())):
+            latest_by_role[message.role] = index
+        self._latest_transcript_indexes_by_role[session_id] = latest_by_role
 
     def _transcript_interaction_projection_unlocked(
         self,
@@ -13085,6 +13295,7 @@ class InMemorySessionStore(SessionStore):
             self._events[session.id] = []
             self._event_ids[session.id] = set()
             self._session_event_records[session.id] = []
+            self._child_lifecycle_event_records[session.id] = {}
             self._interaction_event_records[session.id] = {}
             self._latest_interaction_event_records[session.id] = {}
             self._latest_interaction_event_records_by_sequence[session.id] = []
@@ -13092,7 +13303,9 @@ class InMemorySessionStore(SessionStore):
             self._session_operation_records[session.id] = initial_operation_records
             self._transcripts[session.id] = []
             self._transcript_interaction_ids[session.id] = []
+            self._latest_transcript_indexes_by_role[session.id] = {}
             self._transcript_search_documents[session.id] = []
+            self._refresh_child_lifecycle_candidate_unlocked(session)
             if prepared_admission_events is not None:
                 assert admission is not None
                 started_event, source_messages = admission
@@ -13365,12 +13578,14 @@ class InMemorySessionStore(SessionStore):
             self._events[fork.id] = []
             self._event_ids[fork.id] = set()
             self._session_event_records[fork.id] = []
+            self._child_lifecycle_event_records[fork.id] = {}
             self._interaction_event_records[fork.id] = {}
             self._latest_interaction_event_records[fork.id] = {}
             self._latest_interaction_event_records_by_sequence[fork.id] = []
             self._pending_action_event_records[fork.id] = {}
             self._session_operation_records[fork.id] = initial_operation_records
             self._transcripts[fork.id] = copied_transcript
+            self._replace_latest_transcript_role_indexes_unlocked(fork.id)
             self._replace_transcript_search_session_unlocked(fork.id, copied_transcript)
             # Historical attribution remains tied to the source session's
             # interactions; new child work receives new child interaction IDs.
@@ -13390,6 +13605,8 @@ class InMemorySessionStore(SessionStore):
                     self._sessions[fork.id],
                     events,
                 )
+            else:
+                self._refresh_child_lifecycle_candidate_unlocked(self._sessions[fork.id])
             return self._sessions[fork.id].model_copy(deep=True)
 
     async def load(self, session_id: str) -> Session | None:
@@ -13655,7 +13872,9 @@ class InMemorySessionStore(SessionStore):
             self._remove_transcript_search_session_unlocked(session_id)
             self._transcripts.pop(session_id, None)
             self._transcript_interaction_ids.pop(session_id, None)
+            self._latest_transcript_indexes_by_role.pop(session_id, None)
             self._transcript_indices_by_interaction.pop(session_id, None)
+            self._child_lifecycle_event_records.pop(session_id, None)
             self._deferred_interaction_inputs.pop(session_id, None)
             self._refresh_queued_dispatch_terminal_receipts_unlocked(session_id, None)
             self._checkpoints.pop(session_id, None)
@@ -13748,6 +13967,17 @@ class InMemorySessionStore(SessionStore):
             # cleared. The branch index makes this proportional to the deleted
             # session's direct children rather than the complete registry.
             child_keys = self._child_session_keys_by_parent.pop(session_id, [])
+            candidate_priorities = self._child_lifecycle_candidate_keys_by_parent.pop(
+                session_id,
+                {},
+            )
+            indexed_candidate_ids = {
+                child_id for keys in candidate_priorities.values() for _sort_at, child_id in keys
+            }
+            if indexed_candidate_ids != {child_id for _created_at, child_id in child_keys}:
+                raise RuntimeError("Inconsistent in-memory child lifecycle candidate branch.")
+            for child_id in indexed_candidate_ids:
+                self._child_lifecycle_candidate_key_by_child.pop(child_id, None)
             for _, child_id in child_keys:
                 child = self._sessions.get(child_id)
                 if child is None or child.parent_session_id != session_id:
@@ -13833,6 +14063,7 @@ class InMemorySessionStore(SessionStore):
                 }
             )
             self._sessions[session_id] = updated
+            self._refresh_child_lifecycle_candidate_unlocked(updated)
             result = updated.model_copy(deep=True)
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(result)
@@ -14102,6 +14333,7 @@ class InMemorySessionStore(SessionStore):
             )
 
             self._sessions[session_id] = updated
+            self._refresh_child_lifecycle_candidate_unlocked(updated)
             if prepared_checkpoint is not None:
                 self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
             if admission is not None:
@@ -14166,6 +14398,7 @@ class InMemorySessionStore(SessionStore):
                 }
             )
             self._sessions[session_id] = updated
+            self._refresh_child_lifecycle_candidate_unlocked(updated)
             result = updated.model_copy(deep=True)
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(result)
@@ -14375,6 +14608,7 @@ class InMemorySessionStore(SessionStore):
             if applied != updated:
                 raise RuntimeError("Prepared interaction transition result changed during commit.")
             self._sessions[session_id] = updated
+            self._refresh_child_lifecycle_candidate_unlocked(updated)
             if settlement_record is not None and settlement_storage_key is not None:
                 operation_records[settlement_storage_key] = settlement_record
                 del operation_records[MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY]
@@ -14988,6 +15222,7 @@ class InMemorySessionStore(SessionStore):
         from cayu.runtime.interactions import INTERACTION_LIFECYCLE_EVENT_TYPES
 
         lifecycle_types = {str(event_type) for event_type in INTERACTION_LIFECYCLE_EVENT_TYPES}
+        child_lifecycle_changed = False
         for prepared_event in prepared.events:
             record = prepared_event.record
             event_type = prepared_event.event_type
@@ -14999,6 +15234,19 @@ class InMemorySessionStore(SessionStore):
             self._event_records.append(record)
             self._event_records_by_id[(session_id, stored_event.id)] = record
             session_records.append(record)
+            if session.parent_session_id is not None and stored_event.type in {
+                EventType.SESSION_STARTED,
+                EventType.SESSION_RESUMED,
+                EventType.SESSION_FORKED,
+                EventType.SESSION_COMPLETED,
+                EventType.SESSION_FAILED,
+                EventType.SESSION_INTERRUPTED,
+            }:
+                lifecycle_event_type = EventType(stored_event.type)
+                self._child_lifecycle_event_records.setdefault(session_id, {})[
+                    lifecycle_event_type
+                ] = record
+                child_lifecycle_changed = True
             if stored_event.type is EventType.SESSION_INTERRUPTED:
                 supersession = stored_event.payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
                 superseded_input_id = (
@@ -15142,9 +15390,12 @@ class InMemorySessionStore(SessionStore):
         )
         if not prepared.events:
             return session
-        return session.model_copy(
+        updated = session.model_copy(
             update={"last_activity_at": activity_at or self._ownership_clock()}
         )
+        if child_lifecycle_changed:
+            self._refresh_child_lifecycle_candidate_unlocked(updated)
+        return updated
 
     def _append_events_unlocked(
         self,
@@ -16260,6 +16511,7 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         *,
         stage: ModelCompletionStage,
+        consume_child_session_notifications: bool,
     ) -> ModelCompletionStageDispatch:
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -16282,15 +16534,16 @@ class InMemorySessionStore(SessionStore):
                 settlement_record=records.get(settlement_key),
             )
             dispatch_record = records.get(dispatch_key)
-            if dispatch_record is None:
+            dispatch_is_new = dispatch_record is None
+            if dispatch_is_new:
                 published_at = _next_runtime_publication_timestamp(session)
                 dispatch_record = _model_completion_stage_dispatch_record(
                     stage,
                     dispatched_at=published_at,
                 )
-                records[dispatch_key] = dispatch_record
             else:
                 published_at = _next_runtime_publication_timestamp(session)
+            assert dispatch_record is not None
             dispatch = _reconstruct_model_completion_stage_dispatch(
                 dispatch_record,
                 session_id=session_id,
@@ -16298,6 +16551,59 @@ class InMemorySessionStore(SessionStore):
                 storage_key=dispatch_key,
             )
             _validate_model_completion_stage_dispatch(dispatch, stage)
+            binding = child_session_notification_stage_binding(stage.intent)
+            prepared_consumptions: list[tuple[str, dict[str, Any], str, str]] = []
+            if binding is not None:
+                for claim in binding.claims:
+                    child = self._sessions.get(claim.child_session_id)
+                    if child is None:
+                        raise SessionModelCompletionStageConflict(
+                            "Child-session notification occurrence is no longer canonical."
+                        )
+                    occurrence_source = _child_session_lifecycle_occurrence(
+                        child,
+                        self._child_lifecycle_event_records.get(child.id, {}),
+                    )
+                    if occurrence_source is None:
+                        raise SessionModelCompletionStageConflict(
+                            "Child-session notification occurrence is no longer canonical."
+                        )
+                    _relationship, occurrence = occurrence_source
+                    consumption = _child_session_notification_consumption_record(
+                        parent=session,
+                        child=child,
+                        occurrence=occurrence,
+                        stage=stage,
+                        consumed_at=published_at,
+                    )
+                    storage_key = child_session_notification_storage_key(
+                        child.instance_id,
+                        occurrence.source_id,
+                    )
+                    durable = records.get(storage_key)
+                    material = consumption.model_dump(mode="json")
+                    if durable is not None and not _child_session_notification_consumption_replays(
+                        durable,
+                        consumption,
+                    ):
+                        raise SessionModelCompletionStageConflict(
+                            "Child-session terminal notification was consumed by another stage."
+                        )
+                    prepared_consumptions.append(
+                        (storage_key, material, child.id, occurrence.source_id)
+                    )
+            if dispatch_is_new:
+                records[dispatch_key] = dispatch_record
+            if consume_child_session_notifications:
+                for storage_key, material, _child_id, _occurrence_id in prepared_consumptions:
+                    records.setdefault(storage_key, material)
+            for _storage_key, _material, child_id, _occurrence_id in (
+                prepared_consumptions if consume_child_session_notifications else ()
+            ):
+                child = self._sessions.get(child_id)
+                if child is None:
+                    raise RuntimeError("Consumed child-session notification disappeared.")
+                self._refresh_child_lifecycle_candidate_unlocked(child)
             self._sessions[session_id] = session.model_copy(
                 update={"updated_at": published_at, "last_activity_at": published_at},
                 deep=True,
@@ -17512,6 +17818,71 @@ class InMemorySessionStore(SessionStore):
                 has_more=has_more,
             )
 
+    async def query_child_session_lifecycle(
+        self,
+        query: ChildSessionLifecycleQuery,
+    ) -> ChildSessionLifecyclePage:
+        query = ChildSessionLifecycleQuery.model_validate(query)
+        async with self._lock:
+            parent = self._sessions.get(query.parent_session_id)
+            if parent is None:
+                raise KeyError(f"Session not found: {query.parent_session_id}")
+            child_keys = self._child_session_keys_by_parent.get(parent.id, ())
+            candidate_limit = query.max_children_inspected + 1
+            candidate_ids: list[str] = []
+            priorities = self._child_lifecycle_candidate_keys_by_parent.get(parent.id, {})
+            for priority in (0, 1, 2):
+                for _sort_at, child_id in priorities.get(priority, ()):
+                    if len(candidate_ids) >= candidate_limit:
+                        break
+                    candidate_ids.append(child_id)
+                if len(candidate_ids) >= candidate_limit:
+                    break
+            if sum(len(keys) for keys in priorities.values()) != len(child_keys):
+                raise RuntimeError("In-memory child lifecycle candidate index is inconsistent.")
+            retained_ids = candidate_ids[: query.max_children_inspected]
+            has_more = len(child_keys) > len(retained_ids)
+            entries: list[ChildSessionLifecycleEntry] = []
+            unavailable_count = 0
+            operation_records = self._session_operation_records[parent.id]
+            for child_id in retained_ids:
+                child = self._sessions.get(child_id)
+                if child is None:
+                    raise RuntimeError("In-memory child-session index is inconsistent.")
+                records_by_type = self._child_lifecycle_event_records.get(child_id, {})
+                occurrence_source = _child_session_lifecycle_occurrence(
+                    child,
+                    records_by_type,
+                )
+                consumption_record = None
+                if occurrence_source is not None:
+                    _relationship, occurrence = occurrence_source
+                    consumption_record = operation_records.get(
+                        child_session_notification_storage_key(
+                            child.instance_id,
+                            occurrence.source_id,
+                        )
+                    )
+                entry = _child_session_lifecycle_entry(
+                    parent=parent,
+                    child=child,
+                    records_by_type=records_by_type,
+                    consumption_record=consumption_record,
+                )
+                if entry is None:
+                    unavailable_count += 1
+                else:
+                    entries.append(entry)
+            entries.sort(key=_child_session_lifecycle_entry_sort_key)
+            return ChildSessionLifecyclePage(
+                parent_session_id=parent.id,
+                parent_session_instance_id=parent.instance_id,
+                entries=tuple(entries),
+                inspected_child_count=len(retained_ids),
+                unavailable_child_count=unavailable_count,
+                has_more=has_more,
+            )
+
     async def aggregate_operational_snapshot(
         self,
         filters: SessionAggregateFilter | None = None,
@@ -18012,6 +18383,7 @@ class InMemorySessionStore(SessionStore):
                 interaction_id=interaction_id,
             )
             self._transcripts[session_id] = replacement
+            self._replace_latest_transcript_role_indexes_unlocked(session_id)
             self._replace_transcript_search_session_unlocked(session_id, replacement)
             self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
                 interaction_id
@@ -18154,6 +18526,56 @@ class InMemorySessionStore(SessionStore):
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return len(self._transcripts.get(session_id, []))
+
+    async def load_latest_transcript_message(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+    ) -> TranscriptRecord | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            messages = self._transcripts.get(session_id, [])
+            interaction_ids = self._transcript_interaction_ids.get(session_id, [])
+            index = self._latest_transcript_indexes_by_role.get(session_id, {}).get(role)
+            if index is None:
+                return None
+            return TranscriptRecord(
+                index=index,
+                interaction_id=interaction_ids[index],
+                message=detach_message(messages[index]),
+            )
+
+    async def load_latest_transcript_text(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+        max_chars: int,
+    ) -> tuple[str, bool] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        if type(max_chars) is not int:
+            raise TypeError("max_chars must be an integer.")
+        if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
+            raise ValueError(
+                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
+            )
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            index = self._latest_transcript_indexes_by_role.get(session_id, {}).get(role)
+            if index is None:
+                return None
+            return _bounded_transcript_message_text(
+                self._transcripts[session_id][index],
+                max_chars=max_chars,
+            )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)
@@ -21148,6 +21570,8 @@ def _reject_reserved_runtime_publication_key(value: str, field_name: str) -> str
         raise ValueError(f"{field_name} cannot use the reserved terminal-event namespace.")
     if value.startswith(MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved model-completion stage namespace.")
+    if value.startswith(CHILD_SESSION_NOTIFICATION_OPERATION_KEY_PREFIX):
+        raise ValueError(f"{field_name} cannot use the reserved child-notification namespace.")
     return value
 
 
@@ -23620,6 +24044,251 @@ def _model_completion_stage_provider_effect_id(stage: ModelCompletionStage) -> s
             "Model-completion stage request fingerprint is malformed."
         ) from exc
     return f"request:{request_fingerprint}"
+
+
+_CHILD_LIFECYCLE_EVENT_TYPE_BY_TERMINAL_STATUS = {
+    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+    SessionStatus.FAILED: EventType.SESSION_FAILED,
+    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+}
+
+
+def _child_session_lifecycle_state(status: SessionStatus) -> ChildSessionLifecycleState:
+    if status is SessionStatus.PENDING:
+        return ChildSessionLifecycleState.ADMITTED
+    if status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+        return ChildSessionLifecycleState.RUNNING
+    return {
+        SessionStatus.COMPLETED: ChildSessionLifecycleState.COMPLETED,
+        SessionStatus.FAILED: ChildSessionLifecycleState.FAILED,
+        SessionStatus.INTERRUPTED: ChildSessionLifecycleState.INTERRUPTED,
+    }[status]
+
+
+def _child_session_lifecycle_occurrence(
+    child: Session,
+    records_by_type: Mapping[EventType, EventRecord],
+) -> tuple[ChildSessionRelationship, ChildSessionLifecycleOccurrence] | None:
+    fork_record = records_by_type.get(EventType.SESSION_FORKED)
+    relationship = (
+        ChildSessionRelationship.SESSION_FORK
+        if fork_record is not None
+        else ChildSessionRelationship.DIRECT_CHILD
+    )
+    started_record = records_by_type.get(EventType.SESSION_STARTED)
+    resumed_record = records_by_type.get(EventType.SESSION_RESUMED)
+    activation_record = max(
+        (record for record in (started_record, resumed_record, fork_record) if record is not None),
+        key=lambda record: record.sequence,
+        default=None,
+    )
+    terminal_record = max(
+        (
+            record
+            for event_type in _CHILD_LIFECYCLE_EVENT_TYPE_BY_TERMINAL_STATUS.values()
+            if (record := records_by_type.get(event_type)) is not None
+        ),
+        key=lambda record: record.sequence,
+        default=None,
+    )
+    latest_lifecycle_record = max(
+        (record for record in (activation_record, terminal_record) if record is not None),
+        key=lambda record: record.sequence,
+        default=None,
+    )
+    terminal_type = _CHILD_LIFECYCLE_EVENT_TYPE_BY_TERMINAL_STATUS.get(child.status)
+    if terminal_type is not None:
+        record = latest_lifecycle_record
+        if record is None or record.event.type is not terminal_type:
+            return None
+    elif child.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
+        if latest_lifecycle_record is None or latest_lifecycle_record is not activation_record:
+            return None
+        record = latest_lifecycle_record
+    else:
+        if started_record is not None or resumed_record is not None or terminal_record is not None:
+            return None
+        record = fork_record
+    if record is None:
+        if child.status is SessionStatus.PENDING:
+            return relationship, ChildSessionLifecycleOccurrence(
+                source=ChildSessionLifecycleOccurrenceSource.SESSION,
+                source_id=child.instance_id,
+                source_type=CHILD_SESSION_ADMISSION_OCCURRENCE_TYPE,
+                occurred_at=child.created_at,
+            )
+        return None
+    return relationship, ChildSessionLifecycleOccurrence(
+        source=ChildSessionLifecycleOccurrenceSource.EVENT,
+        source_id=record.event.id,
+        source_sequence=record.sequence,
+        source_type=str(record.event.type),
+        occurred_at=record.event.timestamp,
+    )
+
+
+def _child_session_notification_consumption(
+    record: Mapping[str, Any] | None,
+    *,
+    parent: Session,
+    child: Session,
+    occurrence: ChildSessionLifecycleOccurrence,
+) -> ChildSessionNotificationConsumption | None:
+    if record is None:
+        return None
+    try:
+        consumption = ChildSessionNotificationConsumption.model_validate(record)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Child-session notification consumption is malformed.") from exc
+    if (
+        consumption.parent_session_id != parent.id
+        or consumption.parent_session_instance_id != parent.instance_id
+        or consumption.child_session_id != child.id
+        or consumption.child_session_instance_id != child.instance_id
+        or consumption.occurrence != occurrence
+    ):
+        raise RuntimeError("Child-session notification consumption changed its authority.")
+    return consumption
+
+
+def _child_session_lifecycle_entry(
+    *,
+    parent: Session,
+    child: Session,
+    records_by_type: Mapping[EventType, EventRecord],
+    consumption_record: Mapping[str, Any] | None,
+) -> ChildSessionLifecycleEntry | None:
+    if child.parent_session_id != parent.id:
+        raise RuntimeError("Child-session lifecycle candidate changed its parent authority.")
+    source = _child_session_lifecycle_occurrence(child, records_by_type)
+    if source is None:
+        return None
+    relationship, occurrence = source
+    state = _child_session_lifecycle_state(child.status)
+    consumption = (
+        _child_session_notification_consumption(
+            consumption_record,
+            parent=parent,
+            child=child,
+            occurrence=occurrence,
+        )
+        if state.terminal
+        else None
+    )
+    return ChildSessionLifecycleEntry(
+        parent_session_id=parent.id,
+        parent_session_instance_id=parent.instance_id,
+        child_session_id=child.id,
+        child_session_instance_id=child.instance_id,
+        relationship=relationship,
+        state=state,
+        occurrence=occurrence,
+        freshness=(
+            ChildSessionNotificationFreshness.CURRENT
+            if not state.terminal
+            else ChildSessionNotificationFreshness.FRESH
+            if consumption is None
+            else ChildSessionNotificationFreshness.CONSUMED
+        ),
+        consumed_by_stage_id=None if consumption is None else consumption.stage_id,
+        created_at=child.created_at,
+        updated_at=child.updated_at,
+    )
+
+
+def _child_session_lifecycle_entry_sort_key(
+    entry: ChildSessionLifecycleEntry,
+) -> tuple[int, datetime, str]:
+    priority = (
+        0
+        if entry.freshness is ChildSessionNotificationFreshness.FRESH
+        else 1
+        if entry.freshness is ChildSessionNotificationFreshness.CURRENT
+        else 2
+    )
+    return priority, entry.occurrence.occurred_at, entry.child_session_id
+
+
+def _child_session_notification_consumption_record(
+    *,
+    parent: Session,
+    child: Session,
+    occurrence: ChildSessionLifecycleOccurrence,
+    stage: ModelCompletionStage,
+    consumed_at: datetime,
+) -> ChildSessionNotificationConsumption:
+    binding = child_session_notification_stage_binding(stage.intent)
+    if binding is None:
+        raise ValueError("Model stage has no child-session notification binding.")
+    if (
+        binding.parent_session_id != parent.id
+        or binding.parent_session_instance_id != parent.instance_id
+        or stage.session_id != parent.id
+    ):
+        raise SessionModelCompletionStageConflict(
+            "Child-session notification binding changed its parent authority."
+        )
+    claim = next(
+        (
+            candidate
+            for candidate in binding.claims
+            if candidate.child_session_id == child.id
+            and candidate.occurrence.source_id == occurrence.source_id
+        ),
+        None,
+    )
+    if (
+        claim is None
+        or claim.child_session_instance_id != child.instance_id
+        or claim.occurrence != occurrence
+        or child.parent_session_id != parent.id
+        or not _child_session_lifecycle_state(child.status).terminal
+        or occurrence.source is not ChildSessionLifecycleOccurrenceSource.EVENT
+        or occurrence.source_type
+        != str(_CHILD_LIFECYCLE_EVENT_TYPE_BY_TERMINAL_STATUS.get(child.status))
+    ):
+        raise SessionModelCompletionStageConflict(
+            "Child-session notification claim no longer matches canonical terminal state."
+        )
+    model_step_id = stage.intent.get("model_step_id")
+    model_attempt_id = stage.intent.get("model_attempt_id")
+    if type(model_step_id) is not str or type(model_attempt_id) is not str:
+        raise SessionModelCompletionStageConflict(
+            "Child-session notification binding lost its model-attempt identity."
+        )
+    return ChildSessionNotificationConsumption(
+        parent_session_id=parent.id,
+        parent_session_instance_id=parent.instance_id,
+        child_session_id=child.id,
+        child_session_instance_id=child.instance_id,
+        occurrence=occurrence,
+        stage_id=stage.stage_id,
+        model_step_id=model_step_id,
+        model_attempt_id=model_attempt_id,
+        source_run_epoch=stage.source_run_epoch,
+        consumed_at=consumed_at,
+    )
+
+
+def _child_session_notification_consumption_replays(
+    existing: Mapping[str, Any],
+    requested: ChildSessionNotificationConsumption,
+) -> bool:
+    """Allow transport retries only within the same logical model step."""
+
+    try:
+        durable = ChildSessionNotificationConsumption.model_validate(existing)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Child-session notification consumption is malformed.") from exc
+    return (
+        durable.parent_session_id == requested.parent_session_id
+        and durable.parent_session_instance_id == requested.parent_session_instance_id
+        and durable.child_session_id == requested.child_session_id
+        and durable.child_session_instance_id == requested.child_session_instance_id
+        and durable.occurrence == requested.occurrence
+        and durable.model_step_id == requested.model_step_id
+        and durable.source_run_epoch == requested.source_run_epoch
+    )
 
 
 def _model_completion_stage_execution_profile_fingerprint(

@@ -154,6 +154,11 @@ from cayu.providers.base import (
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+from cayu.runtime._child_session_notifications import (
+    CHILD_SESSION_NOTIFICATION_INTENT_KEY,
+    ChildSessionNotificationStageBinding,
+    child_session_notification_stage_binding,
+)
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -1231,6 +1236,7 @@ class ModelCompletionDispatch:
     stage: ModelCompletionStage
     request_fingerprint: str
     context_exposure: ContextExposure | None = None
+    child_session_notifications_consumed: bool = True
 
     def __post_init__(self) -> None:
         stage = _copy_model_completion_stage(self.stage)
@@ -1254,9 +1260,24 @@ class ModelCompletionDispatch:
             if stage.intent.get("context_exposure") != context_exposure_identity_payload(exposure):
                 raise ValueError("Completion-stage intent does not match its context exposure.")
             validate_context_exposure_stage_scope(exposure, stage.intent)
+        notifications_consumed = self.child_session_notifications_consumed
+        if type(notifications_consumed) is not bool:
+            raise TypeError("child_session_notifications_consumed must be a boolean.")
+        if (
+            not notifications_consumed
+            and child_session_notification_stage_binding(stage.intent) is None
+        ):
+            raise ValueError(
+                "An unconsumed dispatch must bind child-session notifications."
+            )
         object.__setattr__(self, "stage", stage)
         object.__setattr__(self, "request_fingerprint", request_fingerprint)
         object.__setattr__(self, "context_exposure", exposure)
+        object.__setattr__(
+            self,
+            "child_session_notifications_consumed",
+            notifications_consumed,
+        )
 
     @property
     def stage_id(self) -> str:
@@ -1299,7 +1320,15 @@ class ModelCompletionPublicationRequest:
             stage=self.dispatch.stage,
             request_fingerprint=self.dispatch.request_fingerprint,
             context_exposure=self.dispatch.context_exposure,
+            child_session_notifications_consumed=(
+                self.dispatch.child_session_notifications_consumed
+            ),
         )
+        if not dispatch.child_session_notifications_consumed:
+            raise ValueError(
+                "A model completion cannot be published before child notifications "
+                "cross the provider-start fence."
+            )
         result = (
             None
             if self.assistant_step_result is None
@@ -1468,6 +1497,7 @@ def _model_completion_stage_intent(
     recovery_context: ModelCompletionRecoveryContext | None,
     provider_operation_start: dict[str, Any] | None = None,
     context_exposure: dict[str, str] | None = None,
+    child_session_notifications: ChildSessionNotificationStageBinding | None = None,
 ) -> dict[str, Any]:
     model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
     if (
@@ -1500,6 +1530,10 @@ def _model_completion_stage_intent(
         intent["context_exposure"] = copy_durable_json_object(
             context_exposure,
             "context_exposure",
+        )
+    if child_session_notifications is not None:
+        intent[CHILD_SESSION_NOTIFICATION_INTENT_KEY] = child_session_notifications.model_dump(
+            mode="json"
         )
     return intent
 
@@ -5401,7 +5435,12 @@ class ModelStepExecutor:
         billing_identity: BillingIdentity | None = None,
         structured_output: StructuredOutputSpec | None = None,
         prepare_model_completion_dispatch: Callable[
-            [ModelRequest, MemoryEvidenceReference | None],
+            [
+                ModelRequest,
+                MemoryEvidenceReference | None,
+                ChildSessionNotificationStageBinding | None,
+                bool,
+            ],
             Awaitable[ModelCompletionDispatch],
         ]
         | None = None,
@@ -5414,6 +5453,7 @@ class ModelStepExecutor:
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
         native_tool_grant_ids: Mapping[str, str] | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
+        child_session_notification_binding: ChildSessionNotificationStageBinding | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -5615,8 +5655,8 @@ class ModelStepExecutor:
             pre_count_completion_dispatch: ModelCompletionDispatch | None = None
             if (
                 memory_evidence_reference is not None
-                and self._context_counting.mode is not ContextCountingMode.OFF
-            ):
+                or child_session_notification_binding is not None
+            ) and self._context_counting.mode is not ContextCountingMode.OFF:
                 if prepare_model_completion_dispatch is None:
                     raise RuntimeError(
                         "Automatic recall requires durable model-completion staging before "
@@ -5630,6 +5670,8 @@ class ModelStepExecutor:
                 pre_count_completion_dispatch = await prepare_model_completion_dispatch(
                     attempt_model_request,
                     memory_evidence_reference,
+                    child_session_notification_binding,
+                    False,
                 )
             context_count_observation, context_count_event = await self._observe_context_count(
                 provider=provider,
@@ -5714,6 +5756,7 @@ class ModelStepExecutor:
                 targeted_tool_gateway=targeted_tool_gateway,
                 native_tool_grant_ids=native_grant_ids,
                 memory_evidence_reference=memory_evidence_reference,
+                child_session_notification_binding=child_session_notification_binding,
                 prepared_model_completion_dispatch=pre_count_completion_dispatch,
             )
             try:
@@ -6136,7 +6179,12 @@ class ModelStepExecutor:
         structured_output: StructuredOutputSpec | None,
         context_pressure_estimate: ContextPressureEstimate | None,
         prepare_model_completion_dispatch: Callable[
-            [ModelRequest, MemoryEvidenceReference | None],
+            [
+                ModelRequest,
+                MemoryEvidenceReference | None,
+                ChildSessionNotificationStageBinding | None,
+                bool,
+            ],
             Awaitable[ModelCompletionDispatch],
         ]
         | None,
@@ -6147,6 +6195,7 @@ class ModelStepExecutor:
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
         native_tool_grant_ids: Mapping[str, str],
         memory_evidence_reference: MemoryEvidenceReference | None,
+        child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
@@ -6177,6 +6226,9 @@ class ModelStepExecutor:
                 stage=prepared_model_completion_dispatch.stage,
                 request_fingerprint=prepared_model_completion_dispatch.request_fingerprint,
                 context_exposure=prepared_model_completion_dispatch.context_exposure,
+                child_session_notifications_consumed=(
+                    prepared_model_completion_dispatch.child_session_notifications_consumed
+                ),
             )
         )
         model_completed = False
@@ -6221,6 +6273,8 @@ class ModelStepExecutor:
             completion_dispatch = await prepare_model_completion_dispatch(
                 model_request,
                 memory_evidence_reference,
+                child_session_notification_binding,
+                True,
             )
         context_exposure = (
             None if completion_dispatch is None else completion_dispatch.context_exposure
@@ -6254,6 +6308,25 @@ class ModelStepExecutor:
                 else completion_dispatch.stage_id
             )
             return f"model-stage:{stage_ref}:{suffix}"
+
+        async def consume_child_session_notifications() -> None:
+            nonlocal completion_dispatch
+            if (
+                completion_dispatch is None
+                or completion_dispatch.child_session_notifications_consumed
+            ):
+                return
+            await self._session_store.mark_model_completion_stage_dispatched(
+                session.id,
+                stage=completion_dispatch.stage,
+                consume_child_session_notifications=True,
+            )
+            completion_dispatch = ModelCompletionDispatch(
+                stage=completion_dispatch.stage,
+                request_fingerprint=completion_dispatch.request_fingerprint,
+                context_exposure=completion_dispatch.context_exposure,
+                child_session_notifications_consumed=True,
+            )
 
         async def refresh_context_exposure() -> None:
             nonlocal context_exposure
@@ -6358,6 +6431,7 @@ class ModelStepExecutor:
                     "ModelProvider.provider_operation_mode must return a ProviderOperationMode."
                 )
             if provider_operation_mode is ProviderOperationMode.SYNCHRONOUS:
+                await consume_child_session_notifications()
                 provider_events = _owned_model_provider_events(
                     lambda: provider.stream(model_request),
                     cancellation_baseline=provider_cancellation_baseline,
@@ -6430,6 +6504,7 @@ class ModelStepExecutor:
                     # Durable staging and event publication above can yield to
                     # application code. Recheck at the last pre-dispatch seam.
                     validate_live_model_semantics()
+                    await consume_child_session_notifications()
                     return await provider_operation_adapter.start(
                         ProviderOperationStartRequest(
                             request=model_request,
@@ -8811,6 +8886,17 @@ class ModelStepRun:
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
 
+        child_session_notification_binding = None
+        child_session_contributor = self._registered_agent.child_session_context_contributor
+        if child_session_contributor is not None:
+            child_session_contribution = await child_session_contributor.build(
+                session_store=self._executor._session_store,
+                session=self._session,
+            )
+            if child_session_contribution.message is not None:
+                context_messages.append(child_session_contribution.message.model_copy(deep=True))
+            child_session_notification_binding = child_session_contribution.stage_binding
+
         model_request = await self._executor.build_request(
             session=self._session,
             registered_agent=self._registered_agent,
@@ -8860,6 +8946,7 @@ class ModelStepRun:
             tool_exposure=tool_exposure,
             tool_exposure_evidence=tool_exposure_evidence,
             memory_evidence_reference=memory_evidence_reference,
+            child_session_notification_binding=child_session_notification_binding,
             memory_evidence_key=evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
             native_tool_grant_ids=native_grant_ids,
@@ -8882,15 +8969,18 @@ class ModelStepRun:
         tool_exposure: ResolvedToolExposure | None = None,
         tool_exposure_evidence: ToolExposure | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
+        child_session_notification_binding: ChildSessionNotificationStageBinding | None = None,
         memory_evidence_key: MemoryEvidenceKey | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
         native_tool_grant_ids: Mapping[str, str] | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         native_grant_ids = {} if native_tool_grant_ids is None else dict(native_tool_grant_ids)
-        if memory_evidence_reference is not None and self._model_completion_publisher is None:
+        if (
+            memory_evidence_reference is not None or child_session_notification_binding is not None
+        ) and self._model_completion_publisher is None:
             raise RuntimeError(
-                "Automatic recall dispatch requires durable model-completion publication."
+                "Runtime context contributors require durable model-completion publication."
             )
         tool_exposure = (
             _all_registered_tool_exposure(self._registered_agent)
@@ -9141,6 +9231,8 @@ class ModelStepRun:
         async def prepare_model_completion_dispatch(
             attempt_model_request: ModelRequest,
             evidence_reference: MemoryEvidenceReference | None,
+            child_notification_binding: ChildSessionNotificationStageBinding | None,
+            consume_child_session_notifications: bool,
         ) -> ModelCompletionDispatch:
             nonlocal next_dispatch_ordinal
             request_fingerprint = _model_request_fingerprint(
@@ -9283,6 +9375,7 @@ class ModelStepRun:
                             if context_exposure is None
                             else context_exposure_identity_payload(context_exposure)
                         ),
+                        child_session_notifications=child_notification_binding,
                     )
                     prepared = await self._executor._session_store.prepare_model_completion_stage(
                         self._session.id,
@@ -9348,11 +9441,18 @@ class ModelStepRun:
                     await self._executor._session_store.mark_model_completion_stage_dispatched(
                         self._session.id,
                         stage=prepared.stage,
+                        consume_child_session_notifications=(
+                            consume_child_session_notifications
+                        ),
                     )
                     dispatch = ModelCompletionDispatch(
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
                         context_exposure=context_exposure,
+                        child_session_notifications_consumed=(
+                            child_notification_binding is None
+                            or consume_child_session_notifications
+                        ),
                     )
                     lifecycle.mark_provider_dispatch(pending_model_attempt_identity)
                     if deferred_dispatch_failure is not None:
@@ -9424,6 +9524,7 @@ class ModelStepRun:
             tool_exposure=tool_exposure,
             tool_exposure_evidence=tool_exposure_evidence,
             memory_evidence_reference=memory_evidence_reference,
+            child_session_notification_binding=child_session_notification_binding,
             memory_evidence_key=memory_evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
             native_tool_grant_ids=native_grant_ids,
@@ -9606,7 +9707,12 @@ class ModelStepRun:
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
         prepare_model_completion_dispatch: Callable[
-            [ModelRequest, MemoryEvidenceReference | None],
+            [
+                ModelRequest,
+                MemoryEvidenceReference | None,
+                ChildSessionNotificationStageBinding | None,
+                bool,
+            ],
             Awaitable[ModelCompletionDispatch],
         ]
         | None,
@@ -9614,6 +9720,7 @@ class ModelStepRun:
         tool_exposure: ResolvedToolExposure,
         tool_exposure_evidence: ToolExposure,
         memory_evidence_reference: MemoryEvidenceReference | None,
+        child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         memory_evidence_key: MemoryEvidenceKey | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
         native_tool_grant_ids: Mapping[str, str],
@@ -9652,6 +9759,7 @@ class ModelStepRun:
             request: ModelRequest,
             *,
             evidence_reference: MemoryEvidenceReference | None,
+            child_notification_binding: ChildSessionNotificationStageBinding | None,
             initial_identity: ModelAttemptIdentity | None = None,
             attempt_variant: RequestVariant,
         ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
@@ -9689,11 +9797,13 @@ class ModelStepRun:
                 targeted_tool_gateway=targeted_tool_gateway,
                 native_tool_grant_ids=request_native_grant_ids,
                 memory_evidence_reference=evidence_reference,
+                child_session_notification_binding=child_notification_binding,
             )
 
         attempt_events = run_attempt(
             model_request,
             evidence_reference=memory_evidence_reference,
+            child_notification_binding=child_session_notification_binding,
             initial_identity=initial_model_attempt_identity,
             attempt_variant=request_variant,
         )
@@ -10001,6 +10111,19 @@ class ModelStepRun:
                 yield None, ModelStepFlowOutcome(stop_session=True)
                 return
 
+        recovery_child_notification_binding = None
+        child_session_contributor = self._registered_agent.child_session_context_contributor
+        if child_session_contributor is not None:
+            child_session_contribution = await child_session_contributor.build(
+                session_store=self._executor._session_store,
+                session=self._session,
+            )
+            if child_session_contribution.message is not None:
+                recovery_context_messages.append(
+                    child_session_contribution.message.model_copy(deep=True)
+                )
+            recovery_child_notification_binding = child_session_contribution.stage_binding
+
         recovery_request = await self._executor.build_request(
             session=self._session,
             registered_agent=self._registered_agent,
@@ -10052,6 +10175,7 @@ class ModelStepRun:
         recovery_events = run_attempt(
             recovery_request,
             evidence_reference=recovery_memory_evidence_reference,
+            child_notification_binding=recovery_child_notification_binding,
             attempt_variant=RequestVariant.CONTEXT_OVERFLOW_RECOVERY,
         )
         try:

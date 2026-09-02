@@ -275,6 +275,7 @@ def test_sqlite_revision_twenty_six_rejects_populated_session_database(
             """
             DROP TRIGGER cayu_reject_explicit_transcript_order;
             DROP TRIGGER cayu_assign_transcript_order;
+            DROP INDEX idx_cayu_transcript_messages_session_role_order;
             DROP INDEX idx_cayu_transcript_interaction_order;
             DROP INDEX idx_cayu_transcript_session_order;
             ALTER TABLE cayu_transcript_messages DROP COLUMN session_order;
@@ -3329,6 +3330,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (75, 75),
         (76, 76),
         (77, 77),
+        (78, 78),
+        (79, 79),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

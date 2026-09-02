@@ -36,6 +36,7 @@ from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
 
 if TYPE_CHECKING:
     from cayu.mcp import McpToolset
+    from cayu.runtime.child_session_context import ChildSessionContextContributor
     from cayu.runtime.loop_policies import LoopPolicy
     from cayu.runtime.tool_catalogue import ToolCatalogSnapshot
     from cayu.runtime.tool_exposure import (
@@ -81,6 +82,7 @@ class RegisteredAgentState:
     mcp_toolsets: tuple[McpToolset, ...] = ()
     registration_source: str | None = None
     registration_symbol: str | None = None
+    child_session_context_contributor: ChildSessionContextContributor | None = None
 
     def executable_tool(self, name: str) -> RegisteredTool | None:
         """Resolve an application or runtime-owned executable without merging catalogues."""

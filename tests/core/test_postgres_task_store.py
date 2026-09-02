@@ -198,6 +198,7 @@ _TABLES = (
     "cayu_knowledge_entries",
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
+    "cayu_child_session_lifecycle_candidates",
     "cayu_events",
     "cayu_targeted_tool_grant_uses",
     "cayu_targeted_tool_grants",

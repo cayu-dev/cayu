@@ -3205,6 +3205,92 @@ Transcript-copying remains the job of `ForkSessionRequest`; future subagent
 context modes can compose with fork when a child truly needs inherited
 conversation state.
 
+### Independent child lifecycle context
+
+An agent may opt into bounded direct-child discovery by registering
+`ChildSessionContextContributor` as `child_session_context`. Immediately before
+each ordinary provider request, after the configured context policy and its
+post-compaction gate have finished, Cayu recomputes a canonical projection of
+that parent session's independently running children. No group, cohort, join,
+or sibling barrier exists: one completed child can be discovered and consumed
+while any number of siblings remain admitted or running.
+
+```python
+from cayu import AgentSpec, ChildSessionContextContributor
+from cayu.tools import ChildSessionResultTool
+
+app.register_agent(
+    AgentSpec(name="coordinator", model="provider/model"),
+    tools=[ChildSessionResultTool(app.session_store)],
+    child_session_context=ChildSessionContextContributor(
+        max_children_inspected=64,
+        max_entries=16,
+        max_projection_bytes=16 * 1024,
+    ),
+)
+```
+
+The model-facing message is runtime-only. It is never appended to the parent
+transcript and never contains child output. It contains public aliases,
+`admitted`/`running`/`completed`/`failed`/`interrupted` state, the exact durable
+session-or-event occurrence, freshness, bounded coverage, and—for a fresh
+terminal occurrence only—a structured result reference. `ChildSessionResultTool`
+accepts that complete reference and resolves only the current terminal
+occurrence under the calling parent's direct-parent authority. The reference is
+a locator, not a capability; another parent or sibling receives a generic
+unavailable result. Retrieval reads only the last assistant transcript message
+through a reverse role/order index and projects at most the requested text plus
+one look-ahead character. Serialized source bytes and content-part visits also
+have hard ceilings, so a pathological message fails unavailable instead of
+turning a bounded result read into unbounded database or reconstruction work.
+Failed and interrupted results remain typed terminal outcomes rather than being
+presented as successful completion.
+
+These are deliberately separate contracts:
+
+- the transcript is durable conversation history selected by `ContextPolicy`;
+- child lifecycle context is a recomputed level view of canonical session and
+  lifecycle-event state;
+- a fresh terminal entry is an edge notification consumed at the final
+  provider-start fence, not when context is merely composed or exposed to an
+  optional provider-backed token counter;
+- the result tool is an explicit, separately authorized bounded read and does
+  not make child output part of every prompt; and
+- queued session messages remain durable user steering with their own delivery,
+  eligibility, and consumption rules. Child notifications neither impersonate
+  user steering nor acknowledge it.
+
+Provider retries within the same logical model step retain the same terminal
+claim. A later model step omits an occurrence once its dispatch consumption is
+durable. Recomposition after restart, recovery, resume, or context-overflow
+handling reads the store again; no process-local notification list is
+authoritative. Dispatch atomically revalidates the parent incarnation and run
+epoch, the direct-child relationship, the child incarnation, and the exact
+current terminal event before recording consumption. A stale run owner or a
+stage naming a superseded terminal event fails closed. Public lifecycle query
+APIs remain level-triggered and may report that the current terminal occurrence
+was consumed, including the consuming stage id.
+
+Inspection, rendered entries, UTF-8 projection bytes, retrieval references,
+and result characters all have hard limits. Fresh terminal entries are selected
+before current children, and current children before consumed terminals, so an
+older unconsumed completion cannot be hidden indefinitely by newer consumed
+children. Coverage is explicit as `complete`, `truncated`, or `unavailable`,
+with typed reasons for child-inspection, entry, byte, and missing-occurrence
+limits. In-memory maintains the same canonical priority keys as lifecycle state
+changes. Breaking storage revision 79 gives SQLite and PostgreSQL a
+database-maintained priority projection ordered by exact lifecycle occurrence;
+their reads apply the indexed candidate limit before constant-count batched
+reconstruction. A status/event disagreement is unavailable rather than being
+projected from an older matching event. In-memory, SQLite, and PostgreSQL stores
+implement v1. A custom
+`SessionStore` must advertise `child_session_notification_version = 1`, provide
+durable public-authority aliases, implement the bounded lifecycle query, and
+implement the reverse-indexed, source-bounded transcript-text read. It must also
+support replay-safe dispatch staging followed by atomic terminal-claim
+consumption at the provider-start transition before registration can enable the
+contributor.
+
 `RuntimeHook` provides lifecycle automation around durable runtime boundaries. Hook names must be portable, clean, nonblank text; Cayu validates and freezes each name at registration, so later mutation of a hook's `name` property cannot change its runtime identity or break durable publication. Terminal session phases are `after_session_completed`, `after_session_failed`, and `after_session_interrupted`. These hooks run only after the terminal session status and terminal event have already been persisted. A hook failure does not rewrite the terminal session status; Cayu records `hook.failed` and continues to later hooks. Successful hooks emit `hook.started` and `hook.completed`, including the hook scope, registration index, invocation id, terminal event id/type, and JSON-safe action summaries. Before invoking a terminal hook, Cayu inserts its content-addressed `hook.started` event as an at-most-once reservation for that terminal event, phase, app/agent scope, and registration index; the frozen hook name remains exact payload evidence, so a changed registration conflicts instead of inheriting the slot. Its random `hook_invocation_id` distinguishes the durable winner: an acknowledgement-lost winner can recognize and continue its own exact reservation, while another process cannot re-enter the same hook. The owning async stream does not yield that reservation until the hook invocation has returned and its `hook.completed` or `hook.failed` outcome is durable, so closing the stream after observing `hook.started` cannot create a never-entered invocation. `hook.completed` and `hook.failed` use deterministic outcome identities and bind that claimant. A contender may advance past a positively settled earlier slot, but an unmatched `hook.started` remains conservatively in progress: the contender neither invokes it again nor skips ahead to later app or agent hooks, because a process can still disappear while an arbitrary hook effect is executing. This preserves registration and app-before-agent ordering without assuming arbitrary hook effects are idempotent. Receipt-authenticated approval and attached-task failure replay first revalidates the retained execution profile, then converges any missing terminal-hook slots without republishing the terminal event or redispatching provider/tool work. `RuntimeHookContext` exposes copied session/event data plus controlled helpers for `fork_session`, `create_task`, `dispatch`, `dispatch_inline`, and custom event emission. `RuntimeHookContext`, `BeforeToolCallHookContext`, and `ToolCallHookContext` also expose `execution_profile`: the exact immutable `ExecutionProfileIdentity` frozen for the admitted invocation. One process-local invocation passes the same profile object through before-tool, after-tool, recovery-owned terminal, and ordinary terminal hooks; internal paths with no admitted invocation expose `None`.
 
 `before_tool_call` runs after `ToolPolicy` authorizes a call and before the tool executes — policy is the security gate, this phase is the transform layer. It receives `BeforeToolCallHookContext` (copied session data, tool name/id, copied private arguments, optional task id, and the same controlled helpers as terminal hooks) and may return a `BeforeToolCallDecision`: `proceed` (or `None`) runs the tool unchanged, `proceed_modified` runs it with replaced `modified_arguments`, `short_circuit` skips the tool and uses a `synthetic_result`, and `block` skips the tool and returns an error result carrying `block_reason` as `tool.call.blocked`. Before- and after-tool hook contexts validate and copy arguments through the portable durable JSON contract before a hook can observe them; `modified_arguments` crosses the same boundary when its decision is constructed. Hooks compose in app-then-agent registration order, each seeing the prior hook's modified arguments; the first `short_circuit`/`block` stops the chain. When a hook replaces the arguments (`proceed_modified`), the effective arguments are **re-authorized by `ToolPolicy`** before the tool runs, so the gate always vets what actually executes — a hook cannot slip modified arguments past policy. A re-authorization that returns `deny` blocks the call; `require_approval` on hook-modified arguments also blocks (fail-safe) rather than re-entering approval, which is unsupported in v1. In dynamic or legacy/unknown multi-call rounds, before-hook telemetry omits argument-derived actions and uses fixed failure diagnostics; block and short-circuit results enter the same private staged-terminal boundary as ordinary results. The executed (effective) arguments are what `after_tool_call` receives. Terminal event and transcript argument evidence follows the finalized/unavailable publication contract above; `tool.call.started` retains only the quarantine marker. A hook-modified call is therefore authorized twice — once on the original arguments, once on the effective arguments; the re-authorization request carries `metadata[TOOL_POLICY_REAUTHORIZATION_METADATA_KEY] = True`, so a stateful policy (rate limiter, counter, audit sink) can re-verify the effective arguments while incrementing/logging only once.

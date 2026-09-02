@@ -69,7 +69,7 @@ from cayu.core.events import (
     EventType,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import Message
+from cayu.core.messages import Message, MessageRole
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.embeddings import (
@@ -102,6 +102,14 @@ from cayu.memory_evidence import (
     require_memory_evidence_session_id,
     validate_context_exposure_receipt_scope,
     validate_new_context_exposure,
+)
+from cayu.runtime._child_session_notifications import (
+    ChildSessionLifecycleOccurrence,
+    ChildSessionLifecycleOccurrenceSource,
+    ChildSessionLifecyclePage,
+    ChildSessionLifecycleQuery,
+    child_session_notification_stage_binding,
+    child_session_notification_storage_key,
 )
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
@@ -201,6 +209,9 @@ from cayu.runtime.sessions import (
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INHERIT_INTERACTION,
+    LATEST_TRANSCRIPT_TEXT_MAX_CHARS,
+    LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
+    LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES,
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
     MAX_PENDING_ACTION_TOOL_CALLS,
@@ -305,6 +316,7 @@ from cayu.runtime.sessions import (
     TranscriptSearchQuery,
     TranscriptSearchResult,
     TranscriptSnapshot,
+    TranscriptTextReadLimitExceeded,
     UsageRollupQuery,
     _activate_session_run_fence,
     _active_model_completion_stage_record,
@@ -319,6 +331,11 @@ from cayu.runtime.sessions import (
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _child_session_lifecycle_entry,
+    _child_session_lifecycle_entry_sort_key,
+    _child_session_lifecycle_occurrence,
+    _child_session_notification_consumption_record,
+    _child_session_notification_consumption_replays,
     _classify_terminal_session_evidence_records,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
@@ -2959,6 +2976,259 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
                 AND jsonb_typeof(access_scope) = 'object'
             )
         )
+        """,
+    ),
+    79: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_child_session_lifecycle_candidates (
+            child_session_id TEXT COLLATE "C" PRIMARY KEY
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            parent_session_id TEXT COLLATE "C" NOT NULL
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            priority INTEGER NOT NULL CHECK (priority IN (0, 1, 2)),
+            sort_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_child_lifecycle_candidates_page
+            ON cayu_child_session_lifecycle_candidates(
+                parent_session_id, priority, sort_at, child_session_id COLLATE "C"
+            )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_child_lifecycle
+            ON cayu_events(session_id, event_type, sequence DESC)
+            WHERE event_type IN (
+                'session.started', 'session.resumed', 'session.forked',
+                'session.completed', 'session.failed', 'session.interrupted'
+            )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_role_order
+            ON cayu_transcript_messages(
+                session_id, (message ->> 'role'), session_order DESC
+            )
+        """,
+        """
+        CREATE OR REPLACE FUNCTION cayu_refresh_child_session_lifecycle(
+            target_child_session_id TEXT
+        ) RETURNS VOID AS $$
+        BEGIN
+            DELETE FROM cayu_child_session_lifecycle_candidates
+            WHERE child_session_id = target_child_session_id;
+            INSERT INTO cayu_child_session_lifecycle_candidates (
+                child_session_id, parent_session_id, priority, sort_at
+            )
+            WITH canonical AS (
+                SELECT
+                    child.id AS child_session_id,
+                    child.parent_session_id,
+                    child.instance_id,
+                    child.status,
+                    child.created_at,
+                    latest.event_id AS latest_event_id,
+                    latest.event_type AS latest_event_type,
+                    latest.timestamp AS latest_event_at,
+                    CASE
+                        WHEN child.status = 'pending' THEN NOT EXISTS (
+                            SELECT 1
+                            FROM cayu_events AS pending_event
+                            WHERE pending_event.session_id = child.id
+                              AND pending_event.event_type = ANY(ARRAY[
+                                  'session.started', 'session.resumed',
+                                  'session.completed', 'session.failed',
+                                  'session.interrupted'
+                              ])
+                        )
+                        WHEN child.status IN ('running', 'interrupting') THEN
+                            latest.event_type = ANY(ARRAY[
+                                'session.started', 'session.resumed', 'session.forked'
+                            ])
+                        WHEN child.status = 'completed' THEN
+                            latest.event_type = 'session.completed'
+                        WHEN child.status = 'failed' THEN
+                            latest.event_type = 'session.failed'
+                        WHEN child.status = 'interrupted' THEN
+                            latest.event_type = 'session.interrupted'
+                        ELSE FALSE
+                    END AS is_available
+                FROM cayu_sessions AS child
+                LEFT JOIN LATERAL (
+                    SELECT event.event_id, event.event_type, event.timestamp
+                    FROM cayu_events AS event
+                    WHERE event.session_id = child.id
+                      AND event.event_type = ANY(ARRAY[
+                          'session.started', 'session.resumed', 'session.forked',
+                          'session.completed', 'session.failed', 'session.interrupted'
+                      ])
+                    ORDER BY event.sequence DESC
+                    LIMIT 1
+                ) AS latest ON TRUE
+                WHERE child.id = target_child_session_id
+                  AND child.parent_session_id IS NOT NULL
+            )
+            SELECT
+                canonical.child_session_id,
+                canonical.parent_session_id,
+                CASE
+                    WHEN canonical.is_available
+                     AND canonical.status IN ('completed', 'failed', 'interrupted')
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM cayu_session_operations AS consumption
+                         WHERE consumption.session_id = canonical.parent_session_id
+                           AND consumption.idempotency_key =
+                               '__cayu_child_session_notification_v1__:' ||
+                               char_length(canonical.instance_id)::text || ':' ||
+                               canonical.instance_id || canonical.latest_event_id
+                     ) THEN 0
+                    WHEN canonical.is_available
+                     AND canonical.status IN ('completed', 'failed', 'interrupted') THEN 2
+                    ELSE 1
+                END AS priority,
+                CASE
+                    WHEN canonical.is_available
+                     AND canonical.latest_event_at IS NOT NULL
+                        THEN canonical.latest_event_at
+                    ELSE canonical.created_at
+                END AS sort_at
+            FROM canonical;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        """
+        CREATE OR REPLACE FUNCTION cayu_index_child_lifecycle_session()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            PERFORM cayu_refresh_child_session_lifecycle(NEW.id);
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_session ON cayu_sessions",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_session
+        AFTER INSERT OR UPDATE OF parent_session_id, instance_id, status, created_at
+        ON cayu_sessions
+        FOR EACH ROW EXECUTE FUNCTION cayu_index_child_lifecycle_session()
+        """,
+        """
+        CREATE OR REPLACE FUNCTION cayu_index_child_lifecycle_event()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                PERFORM cayu_refresh_child_session_lifecycle(OLD.session_id);
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'UPDATE' AND OLD.session_id <> NEW.session_id THEN
+                PERFORM cayu_refresh_child_session_lifecycle(OLD.session_id);
+            END IF;
+            PERFORM cayu_refresh_child_session_lifecycle(NEW.session_id);
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_event_insert ON cayu_events",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_event_insert
+        AFTER INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN (NEW.event_type IN (
+            'session.started', 'session.resumed', 'session.forked',
+            'session.completed', 'session.failed', 'session.interrupted'
+        ))
+        EXECUTE FUNCTION cayu_index_child_lifecycle_event()
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_event_delete ON cayu_events",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_event_delete
+        AFTER DELETE ON cayu_events
+        FOR EACH ROW
+        WHEN (OLD.event_type IN (
+            'session.started', 'session.resumed', 'session.forked',
+            'session.completed', 'session.failed', 'session.interrupted'
+        ))
+        EXECUTE FUNCTION cayu_index_child_lifecycle_event()
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_event_update ON cayu_events",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_event_update
+        AFTER UPDATE OF session_id, event_id, event_type, sequence, timestamp ON cayu_events
+        FOR EACH ROW
+        WHEN (
+            OLD.event_type IN (
+                'session.started', 'session.resumed', 'session.forked',
+                'session.completed', 'session.failed', 'session.interrupted'
+            ) OR NEW.event_type IN (
+                'session.started', 'session.resumed', 'session.forked',
+                'session.completed', 'session.failed', 'session.interrupted'
+            )
+        )
+        EXECUTE FUNCTION cayu_index_child_lifecycle_event()
+        """,
+        """
+        CREATE OR REPLACE FUNCTION cayu_index_child_lifecycle_consumption()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                IF OLD.record ->> 'record_type' =
+                   'cayu.child-session-notification-consumption' THEN
+                    PERFORM cayu_refresh_child_session_lifecycle(
+                        OLD.record ->> 'child_session_id'
+                    );
+                END IF;
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'UPDATE'
+               AND OLD.record ->> 'record_type' =
+                   'cayu.child-session-notification-consumption'
+               AND (
+                   NEW.record ->> 'record_type' IS DISTINCT FROM
+                       'cayu.child-session-notification-consumption'
+                   OR OLD.record ->> 'child_session_id' IS DISTINCT FROM
+                       NEW.record ->> 'child_session_id'
+               ) THEN
+                PERFORM cayu_refresh_child_session_lifecycle(
+                    OLD.record ->> 'child_session_id'
+                );
+            END IF;
+            IF NEW.record ->> 'record_type' =
+               'cayu.child-session-notification-consumption' THEN
+                PERFORM cayu_refresh_child_session_lifecycle(
+                    NEW.record ->> 'child_session_id'
+                );
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_consumption_insert "
+        "ON cayu_session_operations",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_consumption_insert
+        AFTER INSERT ON cayu_session_operations
+        FOR EACH ROW EXECUTE FUNCTION cayu_index_child_lifecycle_consumption()
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_consumption_delete "
+        "ON cayu_session_operations",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_consumption_delete
+        AFTER DELETE ON cayu_session_operations
+        FOR EACH ROW EXECUTE FUNCTION cayu_index_child_lifecycle_consumption()
+        """,
+        "DROP TRIGGER IF EXISTS cayu_index_child_lifecycle_consumption_update "
+        "ON cayu_session_operations",
+        """
+        CREATE TRIGGER cayu_index_child_lifecycle_consumption_update
+        AFTER UPDATE OF session_id, idempotency_key, record
+        ON cayu_session_operations
+        FOR EACH ROW EXECUTE FUNCTION cayu_index_child_lifecycle_consumption()
+        """,
+        """
+        SELECT cayu_refresh_child_session_lifecycle(child.id)
+        FROM cayu_sessions AS child
+        WHERE child.parent_session_id IS NOT NULL
+        ORDER BY child.id COLLATE "C"
         """,
     ),
     58: (
@@ -6053,6 +6323,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_maintenance_governance_schema(cur)
         if self._min_required_revision >= 78:
             await self._validate_knowledge_semantic_watch_schema(cur)
+        if self._min_required_revision >= 79:
+            await self._validate_child_session_lifecycle_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -6208,6 +6480,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_maintenance_governance_schema(cur)
         if revision.revision == 78:
             await self._validate_knowledge_semantic_watch_schema(cur)
+        if revision.revision == 79:
+            await self._validate_child_session_lifecycle_schema(cur)
 
     async def _validate_knowledge_activation_schema(self, cur: Any) -> None:
         table = "cayu_knowledge_activation_receipts"
@@ -6620,6 +6894,135 @@ class _PostgresStoreBase:
             "Postgres schema object "
             f"{name!r} conflicts with Cayu's semantic-watch receipt contract. "
             "Run `cayu storage migrate` to install revision 78 or recreate the database."
+        )
+
+    async def _validate_child_session_lifecycle_schema(self, cur: Any) -> None:
+        table = "cayu_child_session_lifecycle_candidates"
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable, collation_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_child_session_lifecycle_candidates'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("child_session_id", "text", "NO", "C"),
+            ("parent_session_id", "text", "NO", "C"),
+            ("priority", "integer", "NO", None),
+            ("sort_at", "timestamp with time zone", "NO", None),
+        ):
+            self._raise_child_session_lifecycle_schema_error(table)
+        await cur.execute(
+            """
+            SELECT constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_child_session_lifecycle_candidates'
+            """
+        )
+        constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        )
+        required_constraints = (
+            ("p", ("primary key (child_session_id)",)),
+            ("c", ("priority", "0", "1", "2")),
+            ("f", ("foreign key (child_session_id)", "cayu_sessions(id)", "on delete cascade")),
+            (
+                "f",
+                ("foreign key (parent_session_id)", "cayu_sessions(id)", "on delete cascade"),
+            ),
+        )
+        if any(
+            not any(
+                actual_kind == expected_kind
+                and all(fragment in definition for fragment in fragments)
+                for actual_kind, definition in constraints
+            )
+            for expected_kind, fragments in required_constraints
+        ):
+            self._raise_child_session_lifecycle_schema_error(table)
+        await cur.execute(
+            """
+            SELECT indexname, indexdef
+            FROM pg_catalog.pg_indexes
+            WHERE schemaname = current_schema()
+              AND indexname = ANY(%s)
+            """,
+            (
+                [
+                    "idx_cayu_child_lifecycle_candidates_page",
+                    "idx_cayu_events_child_lifecycle",
+                    "idx_cayu_transcript_messages_session_role_order",
+                ],
+            ),
+        )
+        indexes = {
+            str(name): " ".join(str(definition).lower().split())
+            for name, definition in await cur.fetchall()
+        }
+        if (
+            "parent_session_id, priority, sort_at, child_session_id"
+            not in indexes.get(
+                "idx_cayu_child_lifecycle_candidates_page",
+                "",
+            )
+            or "session_id, event_type, sequence desc"
+            not in indexes.get(
+                "idx_cayu_events_child_lifecycle",
+                "",
+            )
+            or "where" not in indexes.get("idx_cayu_events_child_lifecycle", "")
+            or not all(
+                fragment
+                in indexes.get("idx_cayu_transcript_messages_session_role_order", "")
+                for fragment in (
+                    "session_id",
+                    "message ->> 'role'::text",
+                    "session_order desc",
+                )
+            )
+        ):
+            self._raise_child_session_lifecycle_schema_error("candidate indexes")
+        expected_triggers = {
+            "cayu_index_child_lifecycle_session",
+            "cayu_index_child_lifecycle_event_insert",
+            "cayu_index_child_lifecycle_event_delete",
+            "cayu_index_child_lifecycle_event_update",
+            "cayu_index_child_lifecycle_consumption_insert",
+            "cayu_index_child_lifecycle_consumption_delete",
+            "cayu_index_child_lifecycle_consumption_update",
+        }
+        await cur.execute(
+            """
+            SELECT trigger_record.tgname
+            FROM pg_catalog.pg_trigger AS trigger_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = trigger_record.tgrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND NOT trigger_record.tgisinternal
+              AND trigger_record.tgname = ANY(%s)
+            """,
+            (list(expected_triggers),),
+        )
+        if {str(row[0]) for row in await cur.fetchall()} != expected_triggers:
+            self._raise_child_session_lifecycle_schema_error("maintenance triggers")
+
+    @staticmethod
+    def _raise_child_session_lifecycle_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's bounded child-lifecycle projection. "
+            "Run `cayu storage migrate` to install revision 79 or recreate the database."
         )
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
@@ -23770,6 +24173,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_targeted_tool_grants: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
+    child_session_notification_version: ClassVar[int | None] = 1
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
@@ -30319,6 +30723,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         *,
         stage: ModelCompletionStage,
+        consume_child_session_notifications: bool,
     ) -> ModelCompletionStageDispatch:
         _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
             session_id,
@@ -30362,7 +30767,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     published_at = _next_runtime_publication_timestamp(loaded)
                     dispatch_record = records.get(dispatch_key)
-                    if dispatch_record is None:
+                    dispatch_is_new = dispatch_record is None
+                    if dispatch_is_new:
                         dispatch_record = _model_completion_stage_dispatch_record(
                             stage,
                             dispatched_at=published_at,
@@ -30378,6 +30784,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 published_at,
                             ),
                         )
+                    assert dispatch_record is not None
                     dispatch = _reconstruct_model_completion_stage_dispatch(
                         dispatch_record,
                         session_id=session_id,
@@ -30385,6 +30792,87 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         storage_key=dispatch_key,
                     )
                     _validate_model_completion_stage_dispatch(dispatch, stage)
+                    binding = child_session_notification_stage_binding(stage.intent)
+                    if binding is not None:
+                        for claim in binding.claims:
+                            # Serialize canonical occurrence selection with child
+                            # status changes and event appends, both of which
+                            # update the child session row.
+                            await cur.execute(
+                                "SELECT 1 FROM cayu_sessions WHERE id = %s FOR SHARE",
+                                (claim.child_session_id,),
+                            )
+                            child_exists = await cur.fetchone()
+                            child = await self._load(cur, claim.child_session_id)
+                            event_row = None
+                            if child is not None:
+                                await cur.execute(
+                                    "SELECT sequence, event FROM cayu_events "
+                                    "WHERE session_id = %s AND event_type = ANY(%s) "
+                                    "ORDER BY sequence DESC LIMIT 1 FOR SHARE",
+                                    (
+                                        claim.child_session_id,
+                                        [
+                                            str(EventType.SESSION_STARTED),
+                                            str(EventType.SESSION_RESUMED),
+                                            str(EventType.SESSION_FORKED),
+                                            str(EventType.SESSION_COMPLETED),
+                                            str(EventType.SESSION_FAILED),
+                                            str(EventType.SESSION_INTERRUPTED),
+                                        ],
+                                    ),
+                                )
+                                event_row = await cur.fetchone()
+                            if child_exists is None or child is None or event_row is None:
+                                raise SessionModelCompletionStageConflict(
+                                    "Child-session notification occurrence is no longer canonical."
+                                )
+                            event = Event(**_json_obj(event_row[1]))
+                            occurrence = ChildSessionLifecycleOccurrence(
+                                source=ChildSessionLifecycleOccurrenceSource.EVENT,
+                                source_id=event.id,
+                                source_sequence=event_row[0],
+                                source_type=str(event.type),
+                                occurred_at=event.timestamp,
+                            )
+                            consumption = _child_session_notification_consumption_record(
+                                parent=loaded,
+                                child=child,
+                                occurrence=occurrence,
+                                stage=stage,
+                                consumed_at=published_at,
+                            )
+                            consumption_key = child_session_notification_storage_key(
+                                child.instance_id, occurrence.source_id
+                            )
+                            await cur.execute(
+                                "SELECT record FROM cayu_session_operations "
+                                "WHERE session_id = %s AND idempotency_key = %s FOR UPDATE",
+                                (session_id, consumption_key),
+                            )
+                            consumption_row = await cur.fetchone()
+                            material = consumption.model_dump(mode="json")
+                            if consumption_row is not None:
+                                if not _child_session_notification_consumption_replays(
+                                    _json_obj(consumption_row[0]),
+                                    consumption,
+                                ):
+                                    raise SessionModelCompletionStageConflict(
+                                        "Child-session terminal notification was consumed by "
+                                        "another stage."
+                                    )
+                            elif consume_child_session_notifications:
+                                await cur.execute(
+                                    "INSERT INTO cayu_session_operations "
+                                    "(session_id, idempotency_key, record, updated_at) "
+                                    "VALUES (%s, %s, %s, %s)",
+                                    (
+                                        session_id,
+                                        consumption_key,
+                                        _dumps(material),
+                                        published_at,
+                                    ),
+                                )
                     await cur.execute(
                         "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
                         "WHERE id = %s",
@@ -33320,6 +33808,146 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 raise
         return result
 
+    async def query_child_session_lifecycle(
+        self,
+        query: ChildSessionLifecycleQuery,
+    ) -> ChildSessionLifecyclePage:
+        query = ChildSessionLifecycleQuery.model_validate(query)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    parent = await self._load(cur, query.parent_session_id)
+                    if parent is None:
+                        raise KeyError(f"Session not found: {query.parent_session_id}")
+                    await cur.execute(
+                        """
+                        SELECT child_session_id
+                        FROM cayu_child_session_lifecycle_candidates
+                        WHERE parent_session_id = %s
+                        ORDER BY priority, sort_at, child_session_id COLLATE "C"
+                        LIMIT %s
+                        """,
+                        (
+                            parent.id,
+                            query.max_children_inspected + 1,
+                        ),
+                    )
+                    rows = await cur.fetchall()
+                    retained_rows = rows[: query.max_children_inspected]
+                    retained_ids = [str(row[0]) for row in retained_rows]
+                    entries = []
+                    unavailable_count = 0
+                    lifecycle_types = [
+                        str(EventType.SESSION_STARTED),
+                        str(EventType.SESSION_RESUMED),
+                        str(EventType.SESSION_FORKED),
+                        str(EventType.SESSION_COMPLETED),
+                        str(EventType.SESSION_FAILED),
+                        str(EventType.SESSION_INTERRUPTED),
+                    ]
+                    children_by_id: dict[str, Session] = {}
+                    records_by_child: dict[str, dict[EventType, EventRecord]] = {
+                        child_id: {} for child_id in retained_ids
+                    }
+                    if retained_ids:
+                        await cur.execute(
+                            f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions "
+                            "WHERE id = ANY(%s)",
+                            (retained_ids,),
+                        )
+                        children_by_id = {
+                            str(child_row[0]): pg_support.session_from_row(
+                                child_row,
+                                labels={},
+                            )
+                            for child_row in await cur.fetchall()
+                        }
+                        await cur.execute(
+                            """
+                            SELECT latest.session_id, latest.sequence, latest.event
+                            FROM (
+                                SELECT DISTINCT ON (session_id, event_type)
+                                       session_id, event_type, sequence, event
+                                FROM cayu_events
+                                WHERE session_id = ANY(%s)
+                                  AND event_type = ANY(%s)
+                                ORDER BY session_id, event_type, sequence DESC
+                            ) AS latest
+                            ORDER BY latest.session_id, latest.sequence ASC
+                            """,
+                            (retained_ids, lifecycle_types),
+                        )
+                        for event_row in await cur.fetchall():
+                            event = Event(**_json_obj(event_row[2]))
+                            records_by_child[str(event_row[0])][EventType(event.type)] = (
+                                EventRecord(sequence=event_row[1], event=event)
+                            )
+
+                    consumption_key_by_child: dict[str, str] = {}
+                    for child_id in retained_ids:
+                        child = children_by_id.get(child_id)
+                        if child is None or child.parent_session_id != parent.id:
+                            raise RuntimeError(
+                                "Postgres child-session lifecycle index is inconsistent."
+                            )
+                        occurrence_source = _child_session_lifecycle_occurrence(
+                            child,
+                            records_by_child[child_id],
+                        )
+                        if occurrence_source is not None:
+                            _relationship, occurrence = occurrence_source
+                            consumption_key_by_child[child_id] = (
+                                child_session_notification_storage_key(
+                                    child.instance_id,
+                                    occurrence.source_id,
+                                )
+                            )
+                    consumption_by_key: dict[str, dict[str, Any]] = {}
+                    if consumption_key_by_child:
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (parent.id, list(consumption_key_by_child.values())),
+                        )
+                        consumption_by_key = {
+                            str(operation_row[0]): _json_obj(operation_row[1])
+                            for operation_row in await cur.fetchall()
+                        }
+
+                    for child_id in retained_ids:
+                        child = children_by_id[child_id]
+                        consumption_key = consumption_key_by_child.get(child_id)
+                        entry = _child_session_lifecycle_entry(
+                            parent=parent,
+                            child=child,
+                            records_by_type=records_by_child[child_id],
+                            consumption_record=(
+                                None
+                                if consumption_key is None
+                                else consumption_by_key.get(consumption_key)
+                            ),
+                        )
+                        if entry is None:
+                            unavailable_count += 1
+                        else:
+                            entries.append(entry)
+                    entries.sort(key=_child_session_lifecycle_entry_sort_key)
+                    result = ChildSessionLifecyclePage(
+                        parent_session_id=parent.id,
+                        parent_session_instance_id=parent.instance_id,
+                        entries=tuple(entries),
+                        inspected_child_count=len(retained_rows),
+                        unavailable_child_count=unavailable_count,
+                        has_more=len(rows) > len(retained_rows),
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return result
+
     async def aggregate_operational_snapshot(
         self,
         filters: SessionAggregateFilter | None = None,
@@ -34710,6 +35338,151 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             if row is None:
                 raise KeyError(f"Session not found: {session_id}")
             return int(row[0])
+
+    async def load_latest_transcript_message(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+    ) -> TranscriptRecord | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT session.id,
+                       transcript.session_order - 1,
+                       transcript.interaction_id,
+                       transcript.message
+                FROM cayu_sessions AS session
+                LEFT JOIN LATERAL (
+                    SELECT session_order, interaction_id, message
+                    FROM cayu_transcript_messages
+                    WHERE session_id = session.id
+                      AND message ->> 'role' = %s
+                    ORDER BY session_order DESC
+                    LIMIT 1
+                ) AS transcript ON TRUE
+                WHERE session.id = %s
+                """,
+                (str(role), session_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if row[1] is None:
+                return None
+            return TranscriptRecord(
+                index=row[1],
+                interaction_id=row[2],
+                message=Message(**_json_obj(row[3])),
+            )
+
+    async def load_latest_transcript_text(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+        max_chars: int,
+    ) -> tuple[str, bool] | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if not isinstance(role, MessageRole):
+            raise TypeError("role must be a MessageRole.")
+        if type(max_chars) is not int:
+            raise TypeError("max_chars must be an integer.")
+        if not 1 <= max_chars <= LATEST_TRANSCRIPT_TEXT_MAX_CHARS:
+            raise ValueError(
+                f"max_chars must be between 1 and {LATEST_TRANSCRIPT_TEXT_MAX_CHARS}."
+            )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT session.id,
+                       transcript.sequence,
+                       pg_column_size(transcript.message)
+                FROM cayu_sessions AS session
+                LEFT JOIN LATERAL (
+                    SELECT sequence, message
+                    FROM cayu_transcript_messages
+                    WHERE session_id = session.id
+                      AND message ->> 'role' = %s
+                    ORDER BY session_order DESC
+                    LIMIT 1
+                ) AS transcript ON TRUE
+                WHERE session.id = %s
+                """,
+                (str(role), session_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            sequence = row[1]
+            if sequence is None:
+                return None
+            if int(row[2]) > LATEST_TRANSCRIPT_TEXT_MAX_SOURCE_BYTES:
+                raise TranscriptTextReadLimitExceeded(
+                    "Transcript message exceeds the bounded serialized-source limit."
+                )
+            await cur.execute(
+                """
+                WITH RECURSIVE
+                source(message, part_count) AS (
+                    SELECT message, jsonb_array_length(message -> 'content')
+                    FROM cayu_transcript_messages
+                    WHERE sequence = %s
+                ),
+                prefix(part_index, text_value, part_count) AS (
+                    SELECT 0, ''::text, part_count
+                    FROM source
+                    UNION ALL
+                    SELECT
+                        prefix.part_index + 1,
+                        left(
+                            prefix.text_value ||
+                            CASE
+                                WHEN source.message -> 'content' -> prefix.part_index
+                                     ->> 'type' = 'text'
+                                THEN COALESCE(
+                                    source.message -> 'content' -> prefix.part_index ->> 'text',
+                                    ''
+                                )
+                                ELSE ''
+                            END,
+                            %s
+                        ),
+                        prefix.part_count
+                    FROM prefix
+                    CROSS JOIN source
+                    WHERE prefix.part_index < prefix.part_count
+                      AND prefix.part_index < %s
+                      AND length(prefix.text_value) <= %s
+                )
+                SELECT text_value, part_index, part_count
+                FROM prefix
+                ORDER BY part_index DESC
+                LIMIT 1
+                """,
+                (
+                    int(sequence),
+                    max_chars + 1,
+                    LATEST_TRANSCRIPT_TEXT_MAX_PARTS,
+                    max_chars,
+                ),
+            )
+            projection = await cur.fetchone()
+            if projection is None:
+                raise TranscriptTextReadLimitExceeded(
+                    "Transcript message changed during its bounded text projection."
+                )
+            text_value = str(projection[0])
+            if int(projection[1]) < int(projection[2]) and len(text_value) <= max_chars:
+                raise TranscriptTextReadLimitExceeded(
+                    "Transcript message exceeds the bounded content-part inspection limit."
+                )
+            return text_value[:max_chars], len(text_value) > max_chars
 
     async def load_transcript_window(
         self,

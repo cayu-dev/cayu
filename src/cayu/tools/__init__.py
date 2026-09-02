@@ -17,6 +17,7 @@ from cayu.tools.browser_session import (
     BROWSER_SESSION_WORKER_VERSION,
     BrowserSessionTool,
 )
+from cayu.tools.child_sessions import ChildSessionResultTool
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (
     CommandPolicy,
@@ -165,6 +166,7 @@ __all__ = [
     "BackgroundSubagentTaskRegistry",
     "BrowserSessionTool",
     "BrowserWebFetchAdapter",
+    "ChildSessionResultTool",
     "CommandPolicy",
     "CommandPolicyDecision",
     "CommandPolicyResult",

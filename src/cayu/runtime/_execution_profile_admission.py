@@ -1144,8 +1144,15 @@ def _context_component_materials(
             slot="context-overflow-policy",
             redactor=redactor,
         )
+    selection = {
+        "primary": primary.selection,
+        "overflow": overflow.selection,
+    }
+    child_session_context = registered_agent.child_session_context_contributor
+    if child_session_context is not None:
+        selection["child_session_context"] = child_session_context.configuration_material()
     return _ContextComponentMaterials(
-        selection={"primary": primary.selection, "overflow": overflow.selection},
+        selection=selection,
         recall={"primary": primary.recall, "overflow": overflow.recall},
         compaction={"primary": primary.compaction, "overflow": overflow.compaction},
         selection_process_local=(

@@ -132,6 +132,7 @@ from cayu.runtime import (
     AllowAllToolPolicy,
     CayuApp,
     CheckpointCompactionContextPolicy,
+    ChildSessionContextContributor,
     CompactionRequest,
     CompactionResult,
     CompactSessionRequest,
@@ -233,6 +234,11 @@ from cayu.runtime import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._child_session_notifications import (
+    CHILD_SESSION_NOTIFICATION_INTENT_KEY,
+    ChildSessionLifecycleQuery,
+    ChildSessionNotificationFreshness,
+)
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     REDACTED_CUSTOM_EVENT_TYPE,
@@ -386,6 +392,7 @@ _POSTGRES_TABLES = (
     "cayu_budget_settlements",
     "cayu_budget_reservations",
     "cayu_budget_reservation_identities",
+    "cayu_child_session_lifecycle_candidates",
     "cayu_events",
     "cayu_session_labels",
     "cayu_transcript_search_configuration",
@@ -18557,6 +18564,674 @@ def test_session_store_conformance_records_exact_model_stage_dispatch(
                 )
                 == dispatch
             )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_dispatch_consumes_child_terminal_notification(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            parent_id = "child-notification-parent"
+            child_id = "child-notification-child"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=parent_id, messages=[]),
+                identity=_identity(),
+            )
+            parent = await store.transition_status(
+                parent_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=child_id,
+                    parent_session_id=parent_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await store.transition_status(
+                child_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.append_event(
+                child_id,
+                Event(
+                    id="child-notification-started",
+                    type=EventType.SESSION_STARTED,
+                    session_id=child_id,
+                ),
+            )
+            expected_child_result = Message.text(
+                MessageRole.ASSISTANT,
+                "latest bounded child result",
+            )
+            await store.append_transcript_messages(
+                child_id,
+                [
+                    Message.text(MessageRole.ASSISTANT, "older child result"),
+                    expected_child_result,
+                    Message.text(MessageRole.USER, "trailing child input"),
+                ],
+            )
+            latest_child_result = await store.load_latest_transcript_message(
+                child_id,
+                role=MessageRole.ASSISTANT,
+            )
+            assert latest_child_result is not None
+            assert latest_child_result.index == 1
+            assert latest_child_result.message == expected_child_result
+            assert await store.load_latest_transcript_text(
+                child_id,
+                role=MessageRole.ASSISTANT,
+                max_chars=6,
+            ) == ("latest", True)
+            assert await store.load_latest_transcript_text(
+                child_id,
+                role=MessageRole.ASSISTANT,
+                max_chars=len("latest bounded child result"),
+            ) == ("latest bounded child result", False)
+            await store.append_event(
+                child_id,
+                Event(
+                    id="child-notification-terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=child_id,
+                ),
+            )
+            await store.transition_status(
+                child_id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+            contributor = ChildSessionContextContributor()
+            contribution = await contributor.build(session_store=store, session=parent)
+            assert contribution.stage_binding is not None
+            consumption_key = sessions_module.child_session_notification_storage_key(
+                contribution.stage_binding.claims[0].child_session_instance_id,
+                "child-notification-terminal",
+            )
+            with pytest.raises(ValueError, match="reserved child-notification namespace"):
+                await store.load_session_operation(parent_id, consumption_key)
+            with pytest.raises(ValueError, match="reserved child-notification namespace"):
+                await store.publish_session_operation(
+                    parent_id,
+                    idempotency_key="caller-owned-child-notification-collision",
+                    operation_transform=lambda _session, checkpoint, _record: (
+                        SessionOperationPublication(
+                            checkpoint={} if checkpoint is None else checkpoint,
+                            operation_records={consumption_key: {"owner": "caller"}},
+                        )
+                    ),
+                    events=[],
+                )
+            prepared = await store.prepare_model_completion_stage(
+                parent_id,
+                request=ModelCompletionStageRequest(
+                    stage_id="mstep_child_notification:dispatch:0",
+                    logical_step_id="mstep_child_notification",
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": "interaction-child-notification",
+                        "model_step_id": "mstep_child_notification",
+                        "model_attempt_id": "matt_child_notification",
+                        "request_fingerprint": "c" * 64,
+                        CHILD_SESSION_NOTIFICATION_INTENT_KEY: (
+                            contribution.stage_binding.model_dump(mode="json")
+                        ),
+                    },
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=parent.run_epoch,
+                expected_transcript_cursor=0,
+            )
+
+            await store.mark_model_completion_stage_dispatched(
+                parent_id,
+                stage=prepared.stage,
+                consume_child_session_notifications=False,
+            )
+            store = await _reopen_store(session_store_case, store)
+            pre_count_lifecycle = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=parent_id,
+                    max_children_inspected=8,
+                )
+            )
+            assert pre_count_lifecycle.entries[0].freshness is (
+                ChildSessionNotificationFreshness.FRESH
+            )
+            await store.mark_model_completion_stage_dispatched(
+                parent_id,
+                stage=prepared.stage,
+                consume_child_session_notifications=True,
+            )
+            store = await _reopen_store(session_store_case, store)
+            lifecycle = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=parent_id,
+                    max_children_inspected=8,
+                )
+            )
+            assert len(lifecycle.entries) == 1
+            assert lifecycle.entries[0].freshness is (ChildSessionNotificationFreshness.CONSUMED)
+            recovered_parent = await store.load(parent_id)
+            assert recovered_parent is not None
+            assert (
+                await contributor.build(
+                    session_store=store,
+                    session=recovered_parent,
+                )
+            ).projection is None
+
+            original_child = await store.load(child_id)
+            assert original_child is not None
+            await store.delete_session(child_id)
+
+            async def recreate_child() -> Session:
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=child_id,
+                        parent_session_id=parent_id,
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                )
+                await store.transition_status(
+                    child_id,
+                    from_statuses={SessionStatus.PENDING},
+                    to_status=SessionStatus.RUNNING,
+                )
+                await store.append_event(
+                    child_id,
+                    Event(
+                        id="child-notification-started",
+                        type=EventType.SESSION_STARTED,
+                        session_id=child_id,
+                    ),
+                )
+                await store.append_event(
+                    child_id,
+                    Event(
+                        id="child-notification-terminal",
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=child_id,
+                    ),
+                )
+                return await store.transition_status(
+                    child_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+
+            def recreate_child_task() -> asyncio.Task[Session]:
+                return asyncio.create_task(recreate_child())
+
+            replacement_child = await contextvars.Context().run(recreate_child_task)
+            assert replacement_child.instance_id != original_child.instance_id
+            replacement = await contributor.build(
+                session_store=store,
+                session=recovered_parent,
+            )
+            assert replacement.projection is not None
+            assert replacement.projection.entries[0].freshness == "fresh"
+            assert replacement.stage_binding is not None
+            assert replacement.stage_binding.claims[0].child_session_instance_id == (
+                replacement_child.instance_id
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_child_notification_priority_and_occurrence_fence(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+
+            async def create_running_child(parent_id: str, child_id: str) -> Session:
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=child_id,
+                        parent_session_id=parent_id,
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                )
+                child = await store.transition_status(
+                    child_id,
+                    from_statuses={SessionStatus.PENDING},
+                    to_status=SessionStatus.RUNNING,
+                )
+                await store.append_event(
+                    child_id,
+                    Event(
+                        id=f"{child_id}-started",
+                        type=EventType.SESSION_STARTED,
+                        session_id=child_id,
+                    ),
+                )
+                return child
+
+            async def complete_child(child_id: str, event_id: str) -> None:
+                await store.append_event(
+                    child_id,
+                    Event(
+                        id=event_id,
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=child_id,
+                    ),
+                )
+                await store.transition_status(
+                    child_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+
+            priority_parent_id = "child-notification-priority-parent"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=priority_parent_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            priority_parent = await store.transition_status(
+                priority_parent_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            old_child = await create_running_child(
+                priority_parent.id,
+                "child-notification-old-fresh",
+            )
+            newer_child = await create_running_child(
+                priority_parent.id,
+                "child-notification-newer-consumed",
+            )
+            await complete_child(newer_child.id, "newer-child-terminal")
+            contributor = ChildSessionContextContributor(max_children_inspected=8)
+            newer_contribution = await contributor.build(
+                session_store=store,
+                session=priority_parent,
+            )
+            assert newer_contribution.stage_binding is not None
+            prepared = await store.prepare_model_completion_stage(
+                priority_parent.id,
+                request=ModelCompletionStageRequest(
+                    stage_id="mstep_child_priority:dispatch:0",
+                    logical_step_id="mstep_child_priority",
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": "interaction-child-priority",
+                        "model_step_id": "mstep_child_priority",
+                        "model_attempt_id": "matt_child_priority",
+                        "request_fingerprint": "d" * 64,
+                        CHILD_SESSION_NOTIFICATION_INTENT_KEY: (
+                            newer_contribution.stage_binding.model_dump(mode="json")
+                        ),
+                    },
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=priority_parent.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            await store.mark_model_completion_stage_dispatched(
+                priority_parent.id,
+                stage=prepared.stage,
+            )
+            await complete_child(old_child.id, "old-child-terminal")
+            priority_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=priority_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert priority_page.has_more is True
+            assert len(priority_page.entries) == 1
+            assert priority_page.entries[0].child_session_id == old_child.id
+            assert priority_page.entries[0].freshness is (ChildSessionNotificationFreshness.FRESH)
+
+            fence_parent_id = "child-notification-occurrence-parent"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=fence_parent_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            fence_parent = await store.transition_status(
+                fence_parent_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            fenced_child = await create_running_child(
+                fence_parent.id,
+                "child-notification-occurrence-child",
+            )
+            await complete_child(fenced_child.id, "child-terminal-original")
+            fenced_contribution = await contributor.build(
+                session_store=store,
+                session=fence_parent,
+            )
+            assert fenced_contribution.stage_binding is not None
+            fenced_stage = await store.prepare_model_completion_stage(
+                fence_parent.id,
+                request=ModelCompletionStageRequest(
+                    stage_id="mstep_child_occurrence:dispatch:0",
+                    logical_step_id="mstep_child_occurrence",
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": "interaction-child-occurrence",
+                        "model_step_id": "mstep_child_occurrence",
+                        "model_attempt_id": "matt_child_occurrence",
+                        "request_fingerprint": "e" * 64,
+                        CHILD_SESSION_NOTIFICATION_INTENT_KEY: (
+                            fenced_contribution.stage_binding.model_dump(mode="json")
+                        ),
+                    },
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=fence_parent.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            await store.transition_status(
+                fenced_child.id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.append_event(
+                fenced_child.id,
+                Event(
+                    id="child-invocation-resumed",
+                    type=EventType.SESSION_RESUMED,
+                    session_id=fenced_child.id,
+                ),
+            )
+            await store.transition_status(
+                fenced_child.id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+            )
+            with pytest.raises(SessionModelCompletionStageConflict):
+                await store.mark_model_completion_stage_dispatched(
+                    fence_parent.id,
+                    stage=fenced_stage.stage,
+                )
+            fence_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=fence_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert fence_page.entries == ()
+            assert fence_page.unavailable_child_count == 1
+
+            await store.append_event(
+                fenced_child.id,
+                Event(
+                    id="child-terminal-replacement",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=fenced_child.id,
+                ),
+            )
+            fence_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=fence_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert fence_page.entries[0].occurrence.source_id == ("child-terminal-replacement")
+            assert fence_page.entries[0].freshness is (ChildSessionNotificationFreshness.FRESH)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_child_lifecycle_is_canonical_and_store_deterministic(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+
+            async def create_running_child(parent_id: str, child_id: str) -> Session:
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=child_id,
+                        parent_session_id=parent_id,
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                )
+                child = await store.transition_status(
+                    child_id,
+                    from_statuses={SessionStatus.PENDING},
+                    to_status=SessionStatus.RUNNING,
+                )
+                await store.append_event(
+                    child_id,
+                    Event(
+                        id=f"{child_id}-started",
+                        type=EventType.SESSION_STARTED,
+                        session_id=child_id,
+                    ),
+                )
+                return child
+
+            async def complete_child(
+                child_id: str,
+                event_id: str,
+                *,
+                timestamp: datetime,
+            ) -> None:
+                await store.append_event(
+                    child_id,
+                    Event(
+                        id=event_id,
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=child_id,
+                        timestamp=timestamp,
+                    ),
+                )
+                await store.transition_status(
+                    child_id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.COMPLETED,
+                )
+
+            ordering_parent = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="child-lifecycle-ordering-parent",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            first_created = await create_running_child(
+                ordering_parent.id,
+                "child-lifecycle-first-created",
+            )
+            second_created = await create_running_child(
+                ordering_parent.id,
+                "child-lifecycle-second-created",
+            )
+            ordering_time = datetime(2030, 1, 1, tzinfo=UTC)
+            await complete_child(
+                second_created.id,
+                "child-lifecycle-second-terminal",
+                timestamp=ordering_time,
+            )
+            await complete_child(
+                first_created.id,
+                "child-lifecycle-first-terminal",
+                timestamp=ordering_time + timedelta(seconds=1),
+            )
+            ordering_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=ordering_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert ordering_page.has_more is True
+            assert [entry.child_session_id for entry in ordering_page.entries] == [
+                second_created.id
+            ]
+
+            transient_parent = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="child-lifecycle-transient-parent",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            mismatched = await create_running_child(
+                transient_parent.id,
+                "child-lifecycle-transient-mismatch",
+            )
+            fresh = await create_running_child(
+                transient_parent.id,
+                "child-lifecycle-transient-fresh",
+            )
+            await store.append_event(
+                mismatched.id,
+                Event(
+                    id="child-lifecycle-uncommitted-terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=mismatched.id,
+                ),
+            )
+            await complete_child(
+                fresh.id,
+                "child-lifecycle-fresh-terminal",
+                timestamp=ordering_time + timedelta(seconds=2),
+            )
+            transient_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=transient_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert [entry.child_session_id for entry in transient_page.entries] == [fresh.id]
+            assert transient_page.entries[0].freshness is (ChildSessionNotificationFreshness.FRESH)
+
+            conflict_parent = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="child-lifecycle-conflict-parent",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            conflict_parent = await store.transition_status(
+                conflict_parent.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            conflicting = await create_running_child(
+                conflict_parent.id,
+                "child-lifecycle-conflicting-child",
+            )
+            await complete_child(
+                conflicting.id,
+                "child-lifecycle-completed",
+                timestamp=ordering_time + timedelta(seconds=3),
+            )
+            contribution = await ChildSessionContextContributor().build(
+                session_store=store,
+                session=conflict_parent,
+            )
+            assert contribution.stage_binding is not None
+            prepared = await store.prepare_model_completion_stage(
+                conflict_parent.id,
+                request=ModelCompletionStageRequest(
+                    stage_id="mstep_child_conflict:dispatch:0",
+                    logical_step_id="mstep_child_conflict",
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": "interaction-child-conflict",
+                        "model_step_id": "mstep_child_conflict",
+                        "model_attempt_id": "matt_child_conflict",
+                        "request_fingerprint": "f" * 64,
+                        CHILD_SESSION_NOTIFICATION_INTENT_KEY: (
+                            contribution.stage_binding.model_dump(mode="json")
+                        ),
+                    },
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=conflict_parent.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            await store.append_event(
+                conflicting.id,
+                Event(
+                    id="child-lifecycle-later-failure",
+                    type=EventType.SESSION_FAILED,
+                    session_id=conflicting.id,
+                    timestamp=ordering_time + timedelta(seconds=4),
+                ),
+            )
+            conflict_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=conflict_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert conflict_page.entries == ()
+            assert conflict_page.unavailable_child_count == 1
+            with pytest.raises(SessionModelCompletionStageConflict):
+                await store.mark_model_completion_stage_dispatched(
+                    conflict_parent.id,
+                    stage=prepared.stage,
+                )
+
+            await store.transition_status(
+                conflicting.id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+            still_unavailable = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=conflict_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert still_unavailable.entries == ()
+            assert still_unavailable.unavailable_child_count == 1
+            await store.append_event(
+                conflicting.id,
+                Event(
+                    id="child-lifecycle-resumed",
+                    type=EventType.SESSION_RESUMED,
+                    session_id=conflicting.id,
+                    timestamp=ordering_time + timedelta(seconds=5),
+                ),
+            )
+            resumed_page = await store.query_child_session_lifecycle(
+                ChildSessionLifecycleQuery(
+                    parent_session_id=conflict_parent.id,
+                    max_children_inspected=1,
+                )
+            )
+            assert resumed_page.entries[0].state.value == "running"
+            assert resumed_page.entries[0].occurrence.source_id == "child-lifecycle-resumed"
         finally:
             await _close_store(store)
 

@@ -58,6 +58,17 @@ task-backed sessions inherit the immutable root origin automatically.
 | Continue one specific session by id | `ResumeRequest` / `ForkSessionRequest` / `InterruptSessionRequest` | Resume appends messages; fork branches without mutating the source; interrupt stops a pending/running session. |
 | Start independent durable work from one exact session checkpoint | `snapshot_fork_source(...)` + `fork_session(ForkSessionRequest(...))` + `dispatch(DispatchRequest(...))` | Bind the snapshot, exact first invocation, and one matching `initial_dispatch_id` to each child, then let ordinary workers run them. Application code consumes results independently and owns any join or evaluation policy. |
 
+For a coordinator model that must notice independently completing children,
+register `ChildSessionContextContributor` on that parent agent and expose
+`ChildSessionResultTool`. Cayu recomputes a bounded lifecycle projection before
+each model request, marks a terminal occurrence consumed only when that request
+crosses the final provider-start transition after optional provider-backed token
+counting, and retrieves output separately through the parent-authorized
+reference. It does not wait for siblings or recreate a group abstraction.
+Application code should still use session queries or event watchers for
+control-plane orchestration; the projection is model context, not a durable
+workflow join or a user-steering channel.
+
 ## The two worker loops
 
 Both claim durable work with leases, but they cover different shapes:
