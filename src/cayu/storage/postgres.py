@@ -15,6 +15,7 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, NoReturn, cast
 from uuid import uuid4
+from weakref import ReferenceType, ref
 
 if TYPE_CHECKING:
     from cayu.knowledge_maintenance_governance import (
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     )
 
 try:
-    from psycopg import sql
+    from psycopg import AsyncConnection, sql
     from psycopg.errors import (
         DeadlockDetected,
         DuplicateTable,
@@ -105,6 +106,7 @@ from cayu.memory_evidence import (
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
+from cayu.runtime._task_admission_wakeup import TaskAdmissionWakeup
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
@@ -1151,6 +1153,9 @@ _KNOWLEDGE_SEARCH_TOKEN_RE = re.compile(r"\w+")
 _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS = 2000
 _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER = 8
 logger = logging.getLogger(__name__)
+_TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
+_TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
+_TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
 _PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7665_6374 & 0x7FFF_FFFF_FFFF_FFFF
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
@@ -35014,6 +35019,148 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         )
         self._clock = utc_clock(clock)
         self._clock_is_injected = clock is not None
+        self._enable_task_admission_wakeups()
+        self._task_admission_listener_task: asyncio.Task[None] | None = None
+        self._task_admission_listener_first_attempt: asyncio.Event | None = None
+        self._task_admission_listener_connection: Any | None = None
+        self._task_admission_listener_closing = False
+        self._task_admission_notification_senders: dict[int, tuple[ReferenceType[Any], int]] = {}
+
+    async def _task_admission_wakeup(
+        self,
+        queries: Iterable[TaskQuery | None],
+    ) -> TaskAdmissionWakeup | None:
+        self._ensure_task_admission_listener()
+        return await TaskStore._task_admission_wakeup(self, queries)
+
+    def _ensure_task_admission_listener(self) -> None:
+        """Start one empty-payload LISTEN connection when this store owns a DSN."""
+
+        if self._conninfo is None or self._task_admission_listener_closing:
+            return
+        listener = self._task_admission_listener_task
+        if listener is None or listener.done():
+            first_attempt = asyncio.Event()
+            self._task_admission_listener_first_attempt = first_attempt
+            listener = asyncio.create_task(
+                self._run_task_admission_listener(first_attempt),
+                name="cayu-postgres-task-admission-listener",
+            )
+            self._task_admission_listener_task = listener
+
+    async def _run_task_admission_listener(self, first_attempt: asyncio.Event) -> None:
+        conninfo = self._conninfo
+        if conninfo is None:
+            first_attempt.set()
+            return
+        reconnect_delay = _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S
+        while not self._task_admission_listener_closing:
+            connection: Any | None = None
+            try:
+                connection = await AsyncConnection.connect(
+                    conninfo,
+                    autocommit=True,
+                )
+                connection.prepare_threshold = None
+                await connection.execute(
+                    sql.SQL("LISTEN {}").format(sql.Identifier(_TASK_ADMISSION_NOTIFY_CHANNEL))
+                )
+                self._task_admission_listener_connection = connection
+                first_attempt.set()
+                reconnect_delay = _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S
+                async for notification in connection.notifies():
+                    if (
+                        notification.channel == _TASK_ADMISSION_NOTIFY_CHANNEL
+                        and notification.payload == ""
+                        and not self._task_admission_notification_is_self(notification.pid)
+                    ):
+                        self._publish_task_admission_broadcast()
+                    if self._task_admission_listener_closing:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Notifications are an optimization. Do not surface listener
+                # failures into worker authority; bounded claim polling remains.
+                first_attempt.set()
+            finally:
+                if self._task_admission_listener_connection is connection:
+                    self._task_admission_listener_connection = None
+                if connection is not None:
+                    with suppress(Exception):
+                        await connection.close()
+            if not self._task_admission_listener_closing:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(
+                    reconnect_delay * 2,
+                    _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S,
+                )
+
+    async def close(self) -> None:
+        self._task_admission_listener_closing = True
+        listener = self._task_admission_listener_task
+        if listener is not None and not listener.done():
+            listener.cancel()
+            with suppress(asyncio.CancelledError):
+                await listener
+        self._task_admission_listener_task = None
+        self._task_admission_listener_connection = None
+        self._task_admission_notification_senders.clear()
+        await super().close()
+
+    def _register_task_admission_notification_sender(self, connection: Any) -> int | None:
+        """Count one content-free NOTIFY expected from this store's connection."""
+
+        sender_pid = connection.info.backend_pid
+        if type(sender_pid) is not int or sender_pid <= 0:
+            return None
+        existing = self._task_admission_notification_senders.get(sender_pid)
+        count = 0
+        if existing is not None and existing[0]() is connection:
+            count = existing[1]
+        self._task_admission_notification_senders[sender_pid] = (ref(connection), count + 1)
+        return sender_pid
+
+    def _discard_task_admission_notification_sender(
+        self,
+        sender_pid: int,
+        connection: Any,
+    ) -> None:
+        existing = self._task_admission_notification_senders.get(sender_pid)
+        if existing is None or existing[0]() is not connection:
+            return
+        if existing[1] > 1:
+            self._task_admission_notification_senders[sender_pid] = (
+                existing[0],
+                existing[1] - 1,
+            )
+        else:
+            self._task_admission_notification_senders.pop(sender_pid, None)
+
+    def _task_admission_notification_is_self(self, sender_pid: int) -> bool:
+        existing = self._task_admission_notification_senders.get(sender_pid)
+        if existing is None:
+            return False
+        connection_ref, count = existing
+        connection = connection_ref()
+        if connection is None or connection.closed:
+            self._task_admission_notification_senders.pop(sender_pid, None)
+            return False
+        try:
+            is_self = connection.info.backend_pid == sender_pid
+        except Exception:
+            is_self = False
+        if not is_self:
+            self._task_admission_notification_senders.pop(sender_pid, None)
+            return False
+        if count > 1:
+            self._task_admission_notification_senders[sender_pid] = (
+                connection_ref,
+                count - 1,
+            )
+        else:
+            self._task_admission_notification_senders.pop(sender_pid, None)
+        return True
 
     async def _ensure_ready(self) -> None:
         # Re-authenticate before every store entrance so private configuration
@@ -35445,9 +35592,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         session_invocation: SessionInvocationBinding | None = None,
     ) -> Task:
         task_id = request.task_id or str(uuid4())
+        notification_sender_pid: int | None = None
+        notification_sender_connection: Any | None = None
 
-        async def operation(conn: Any, cur: Any) -> Task:
-            del conn
+        async def operation(conn: Any, cur: Any) -> tuple[Task, bool]:
+            nonlocal notification_sender_connection, notification_sender_pid
             await self._lock_verified_work_task(cur, task_id)
             retry_started_at = await self._verified_now(cur)
             parent: TaskInvocationSnapshot | None = None
@@ -35524,12 +35673,35 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 """,
                 pg_support.task_insert_values(task),
             )
-            return task
+            publish_admission_wakeup = not running and (
+                task.available_at is None or task.available_at <= retry_started_at
+            )
+            if publish_admission_wakeup:
+                notification_sender_connection = conn
+                notification_sender_pid = self._register_task_admission_notification_sender(conn)
+                await cur.execute(
+                    "SELECT pg_notify(%s, %s)",
+                    (_TASK_ADMISSION_NOTIFY_CHANNEL, ""),
+                )
+            return task, publish_admission_wakeup
 
         try:
-            return await self._run_verified_work_mutation(operation)
-        except UniqueViolation as exc:
-            raise ValueError(f"Task already exists: {task_id}") from exc
+            task, publish_admission_wakeup = await self._run_verified_work_mutation(operation)
+        except BaseException as exc:
+            if notification_sender_pid is not None:
+                self._discard_task_admission_notification_sender(
+                    notification_sender_pid,
+                    notification_sender_connection,
+                )
+            if isinstance(exc, UniqueViolation):
+                raise ValueError(f"Task already exists: {task_id}") from exc
+            raise
+        if publish_admission_wakeup:
+            self._publish_task_admission_wakeup(
+                task,
+                now=task.available_at or task.created_at,
+            )
+        return task
 
     async def load_task(self, task_id: str) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -36949,6 +37121,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     ) -> TaskRetrySettlementResult:
         request, request_sha256 = prepare_task_retry_settlement(request)
         await self._ensure_ready()
+        notification_sender_pid: int | None = None
+        notification_sender_connection: Any | None = None
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
@@ -37033,6 +37207,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             """,
                             pg_support.task_insert_values(successor),
                         )
+                        if successor.available_at is None or successor.available_at <= series_now:
+                            notification_sender_connection = conn
+                            notification_sender_pid = (
+                                self._register_task_admission_notification_sender(conn)
+                            )
+                            await cur.execute(
+                                "SELECT pg_notify(%s, %s)",
+                                (_TASK_ADMISSION_NOTIFY_CHANNEL, ""),
+                            )
                     receipt = TaskRetrySettlementResult(
                         task_id=request.task_id,
                         idempotency_key=request.idempotency_key,
@@ -37055,10 +37238,18 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         ),
                     )
                 await conn.commit()
-                return receipt.model_copy(deep=True)
+                committed = receipt.model_copy(deep=True)
             except BaseException:
+                if notification_sender_pid is not None:
+                    self._discard_task_admission_notification_sender(
+                        notification_sender_pid,
+                        notification_sender_connection,
+                    )
                 await conn.rollback()
                 raise
+        if successor is not None:
+            self._publish_task_admission_wakeup(successor, now=series_now)
+        return committed
 
     async def load_task_retry_settlement(
         self,

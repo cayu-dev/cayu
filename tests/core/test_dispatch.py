@@ -5776,6 +5776,59 @@ def test_run_worker_drains_queue_until_stopped() -> None:
     asyncio.run(scenario())
 
 
+def test_run_worker_wakes_for_matching_submission_before_long_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("first answer"), _batch("dispatch answer")])
+    _create_resumable_session(h.app, "sess_wake")
+    original_process_next = h.dispatcher.process_next
+
+    async def scenario() -> None:
+        idle = asyncio.Event()
+        processed = asyncio.Event()
+
+        async def observe_process_next(runtime, *, worker_id):
+            handle = await original_process_next(runtime, worker_id=worker_id)
+            if handle is None:
+                idle.set()
+            else:
+                processed.set()
+            return handle
+
+        monkeypatch.setattr(h.dispatcher, "process_next", observe_process_next)
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="wake-worker",
+                stop=stop,
+                poll_interval_s=10.0,
+                reconcile_terminal_receipts=False,
+                reclaim_expired_leases=False,
+            )
+        )
+        try:
+            await asyncio.wait_for(idle.wait(), timeout=1)
+            assert h.tasks._task_admission_wakeup_broker.subscriber_count == 1
+            started_at = asyncio.get_running_loop().time()
+            handle = await h.app.dispatch(_dispatch_request("sess_wake", "d_wake"))
+            async with asyncio.timeout(0.5):
+                while True:
+                    task = await h.tasks.load_task(handle.metadata["queue_task_id"])
+                    if task is not None and task.status is not TaskStatus.PENDING:
+                        break
+                    await asyncio.sleep(0)
+            assert asyncio.get_running_loop().time() - started_at < 0.5
+            await asyncio.wait_for(processed.wait(), timeout=5)
+            task = await h.tasks.load_task(handle.metadata["queue_task_id"])
+            assert task is not None and task.status is TaskStatus.COMPLETED
+        finally:
+            stop.set()
+            await asyncio.wait_for(worker, timeout=1)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     (
         "reconcile_terminal_receipts",

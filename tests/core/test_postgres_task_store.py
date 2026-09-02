@@ -5160,3 +5160,303 @@ def test_postgres_task_store_rejects_stale_cross_pool_transitions(postgres_dsn):
             await second.close()
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_task_admission_notification_is_content_free_and_cross_store(
+    postgres_dsn,
+):
+    async def run() -> None:
+        import psycopg
+
+        from cayu.storage.postgres import _TASK_ADMISSION_NOTIFY_CHANNEL
+
+        await _truncate(postgres_dsn)
+        producer = _new_store(postgres_dsn)
+        consumer = _new_store(postgres_dsn)
+        observer = await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True)
+        wakeup = None
+        try:
+            await observer.execute(f'LISTEN "{_TASK_ADMISSION_NOTIFY_CHANNEL}"')
+            wakeup = await consumer._task_admission_wakeup((TaskQuery(type="job"),))
+            assert wakeup is not None
+            first_attempt = consumer._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+
+            async def receive_notification():
+                async for notification in observer.notifies(timeout=1, stop_after=1):
+                    return notification
+                raise TimeoutError("Postgres task-admission notification was not received.")
+
+            hinted = asyncio.create_task(wakeup.wait(10.0, None))
+            notification = asyncio.create_task(receive_notification())
+            await asyncio.sleep(0)
+            await producer.create_task(
+                TaskCreate(
+                    task_id="remote-job",
+                    type="job",
+                    input={"private": "must-not-enter-notification"},
+                )
+            )
+
+            assert await asyncio.wait_for(hinted, timeout=1) is False
+            received = await asyncio.wait_for(notification, timeout=1)
+            assert received.channel == _TASK_ADMISSION_NOTIFY_CHANNEL
+            assert received.payload == ""
+            claimed = await consumer.claim_task("remote-worker", TaskQuery(type="job"))
+            assert claimed is not None and claimed.id == "remote-job"
+        finally:
+            if wakeup is not None:
+                wakeup.close()
+            await observer.close()
+            await producer.close()
+            await consumer.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_same_store_admission_wakes_only_one_waiter(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        wakeups = []
+        waits = []
+        try:
+            for _ in range(2):
+                wakeup = await store._task_admission_wakeup((TaskQuery(type="job"),))
+                assert wakeup is not None
+                wakeups.append(wakeup)
+            first_attempt = store._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            assert store._task_admission_listener_connection is not None
+
+            waits = [asyncio.create_task(wakeup.wait(10.0, None)) for wakeup in wakeups]
+            await asyncio.sleep(0)
+            await store.create_task(TaskCreate(task_id="same-store-job", type="job"))
+
+            async with asyncio.timeout(1):
+                while not any(wait.done() for wait in waits):
+                    await asyncio.sleep(0)
+            async with asyncio.timeout(1):
+                while store._task_admission_notification_senders:
+                    await asyncio.sleep(0)
+            assert sum(wait.done() for wait in waits) == 1
+        finally:
+            for wait in waits:
+                wait.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+            for wakeup in wakeups:
+                wakeup.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_same_store_uses_local_hint_before_listener_is_active(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        wakeup = None
+        try:
+            store._ensure_task_admission_listener = MethodType(lambda self: None, store)
+            wakeup = await store._task_admission_wakeup((TaskQuery(type="job"),))
+            assert wakeup is not None
+            hinted = asyncio.create_task(wakeup.wait(10.0, None))
+            await asyncio.sleep(0)
+
+            await store.create_task(TaskCreate(task_id="startup-fallback", type="job"))
+
+            assert await asyncio.wait_for(hinted, timeout=1) is False
+        finally:
+            if wakeup is not None:
+                wakeup.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_listener_start_during_admission_does_not_duplicate_wake(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        original_ensure_listener = store._ensure_task_admission_listener
+        original_run_mutation = store._run_verified_work_mutation
+        mutation_ready = asyncio.Event()
+        allow_commit = asyncio.Event()
+        wakeups = []
+        waits = []
+        creation = None
+        try:
+            store._ensure_task_admission_listener = MethodType(lambda self: None, store)
+            for _ in range(2):
+                wakeup = await store._task_admission_wakeup((TaskQuery(type="job"),))
+                assert wakeup is not None
+                wakeups.append(wakeup)
+
+            async def pause_before_commit(self, operation):
+                del self
+
+                async def paused_operation(conn, cur):
+                    result = await operation(conn, cur)
+                    mutation_ready.set()
+                    await allow_commit.wait()
+                    return result
+
+                return await original_run_mutation(paused_operation)
+
+            store._run_verified_work_mutation = MethodType(pause_before_commit, store)
+            waits = [asyncio.create_task(wakeup.wait(10.0, None)) for wakeup in wakeups]
+            await asyncio.sleep(0)
+            creation = asyncio.create_task(
+                store.create_task(TaskCreate(task_id="listener-start-race", type="job"))
+            )
+            await asyncio.wait_for(mutation_ready.wait(), timeout=1)
+
+            store._ensure_task_admission_listener = original_ensure_listener
+            original_ensure_listener()
+            first_attempt = store._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            allow_commit.set()
+            await asyncio.wait_for(creation, timeout=1)
+
+            async with asyncio.timeout(1):
+                while store._task_admission_notification_senders:
+                    await asyncio.sleep(0)
+            assert sum(wait.done() for wait in waits) == 1
+        finally:
+            allow_commit.set()
+            if creation is not None and not creation.done():
+                creation.cancel()
+                await asyncio.gather(creation, return_exceptions=True)
+            for wait in waits:
+                wait.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+            for wakeup in wakeups:
+                wakeup.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_lost_notification_converges_at_bounded_poll(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        producer = _new_store(postgres_dsn)
+        consumer = _new_store(postgres_dsn)
+        wakeup = None
+        try:
+            wakeup = await consumer._task_admission_wakeup((TaskQuery(type="job"),))
+            assert wakeup is not None
+            first_attempt = consumer._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            listener = consumer._task_admission_listener_task
+            assert listener is not None
+            listener.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await listener
+
+            await producer.create_task(TaskCreate(task_id="poll-fallback", type="job"))
+            assert await wakeup.wait(0.02, None) is False
+            claimed = await consumer.claim_task("fallback-worker", TaskQuery(type="job"))
+            assert claimed is not None and claimed.id == "poll-fallback"
+        finally:
+            if wakeup is not None:
+                wakeup.close()
+            await producer.close()
+            await consumer.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_admission_listener_reconnects_after_disconnect(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        producer = _new_store(postgres_dsn)
+        consumer = _new_store(postgres_dsn)
+        wakeup = None
+        try:
+            wakeup = await consumer._task_admission_wakeup((TaskQuery(type="job"),))
+            assert wakeup is not None
+            first_attempt = consumer._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            first_connection = consumer._task_admission_listener_connection
+            assert first_connection is not None
+
+            await first_connection.close()
+            async with asyncio.timeout(2):
+                while True:
+                    reconnected = consumer._task_admission_listener_connection
+                    if reconnected is not None and reconnected is not first_connection:
+                        break
+                    await asyncio.sleep(0.01)
+
+            hinted = asyncio.create_task(wakeup.wait(10.0, None))
+            await asyncio.sleep(0)
+            await producer.create_task(TaskCreate(task_id="after-reconnect", type="job"))
+            assert await asyncio.wait_for(hinted, timeout=1) is False
+        finally:
+            if wakeup is not None:
+                wakeup.close()
+            await producer.close()
+            await consumer.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_immediate_retry_successor_notifies_remote_waiter(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        producer = _new_store(postgres_dsn)
+        consumer = _new_store(postgres_dsn)
+        wakeup = None
+        try:
+            await producer.create_task(
+                TaskCreate(
+                    task_id="retry-notification-first",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(
+                        max_attempts=2,
+                        initial_backoff_seconds=0,
+                    ),
+                )
+            )
+            claimed = await producer.claim_task("retry-producer", TaskQuery(type="job"))
+            assert claimed is not None and claimed.retry_series is not None
+            wakeup = await consumer._task_admission_wakeup((TaskQuery(type="job"),))
+            assert wakeup is not None
+            first_attempt = consumer._task_admission_listener_first_attempt
+            assert first_attempt is not None
+            await asyncio.wait_for(first_attempt.wait(), timeout=1)
+            hinted = asyncio.create_task(wakeup.wait(10.0, None))
+            await asyncio.sleep(0)
+
+            receipt = await producer.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id=claimed.id,
+                    worker_id="retry-producer",
+                    idempotency_key="retry-notification",
+                    causal_budget_id=claimed.retry_series.causal_budget_id,
+                    disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                    error={"code": "temporary"},
+                )
+            )
+
+            assert receipt.successor is not None
+            assert await asyncio.wait_for(hinted, timeout=1) is False
+            claimed_successor = await consumer.claim_task(
+                "retry-consumer",
+                TaskQuery(type="job"),
+            )
+            assert claimed_successor is not None
+            assert claimed_successor.id == receipt.successor.id
+        finally:
+            if wakeup is not None:
+                wakeup.close()
+            await producer.close()
+            await consumer.close()
+
+    asyncio.run(run())

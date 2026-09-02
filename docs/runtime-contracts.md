@@ -2915,6 +2915,35 @@ task mutation remains store-fenced by the exact worker lease, so an evicted
 worker cannot publish a late disposition. New worker-loop timing, wakeup,
 reclaim-cadence, or heartbeat mechanics must be implemented at the shared seam
 rather than copied into both adapters.
+
+Built-in task stores publish a loss-tolerant admission hint only after an
+immediately eligible task creation or retry-successor settlement commits;
+settlement replay does not republish it. `TaskStoreDispatcher.run_worker(...)`
+and `run_task_worker(...)` subscribe before their first authoritative claim and
+let the shared worker wait end on a compatible hint, graceful stop, an adapter
+deadline, or the configured poll interval. An in-process hint is matched against
+the worker's claim type, parent, and assigned-agent filters and wakes at most one
+compatible waiter; pending edges coalesce per waiter. PostgreSQL stores created
+from a DSN also issue `NOTIFY cayu_task_admission_v1` with an empty payload in the
+task transaction and retain one reconnecting `LISTEN` connection per store. A
+DSN-backed store recognizes notifications from its own retained pool connection,
+suppresses that listener echo, and publishes the exact local edge after commit;
+the same local path remains available before the listener connects. A remote
+PostgreSQL edge deliberately carries no matching values, so it wakes one waiter
+as a conservative superset. Stores built around a caller-owned pool, or a
+deployment proxy that does not preserve session-level `LISTEN`, retain the same
+process-local hint and bounded polling behavior. SQLite and in-memory hints are
+process-local to the exact store instance; reconstruction and separate processes
+converge through polling.
+
+Hints contain no task, query, payload, prompt, result, secret, session identity,
+or label value and never grant authority. Every wake performs the ordinary
+store-atomic claim, so missed, duplicated, reordered, spurious, or disconnected
+notifications cannot lose or duplicate work. Future `available_at` tasks do not
+publish an immediate-admission hint. Worker shutdown and cancellation unregister
+the process-local waiter in the same `finally` boundary that owns the shared
+loop. PostgreSQL listener failure is isolated from task authority and retries
+with bounded backoff while ordinary polling remains the correctness audit.
 `TaskStoreDispatcher.run_worker(...)` exposes terminal-receipt reconciliation
 and expired-lease reclaim as independent recovery roles. In a shared worker
 pool, applications may elect one or more bounded owners for each role with

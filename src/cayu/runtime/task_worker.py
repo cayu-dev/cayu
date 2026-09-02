@@ -479,13 +479,21 @@ async def run_task_worker(
             continue_immediately=True,
         )
 
-    return await run_durable_worker_loop(
-        run_step,
-        poll_interval_s=poll_interval_s,
-        stop=stop,
-        max_handled=max_tasks,
-        wait=_wait_or_stop,
+    subscribe_to_admissions = getattr(task_store, "_task_admission_wakeup", None)
+    admission_wakeup = (
+        None if not callable(subscribe_to_admissions) else await subscribe_to_admissions((query,))
     )
+    try:
+        return await run_durable_worker_loop(
+            run_step,
+            poll_interval_s=poll_interval_s,
+            stop=stop,
+            max_handled=max_tasks,
+            wait=(_wait_or_stop if admission_wakeup is None else admission_wakeup.wait),
+        )
+    finally:
+        if admission_wakeup is not None:
+            admission_wakeup.close()
 
 
 async def _handle_with_heartbeat(

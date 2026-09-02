@@ -12773,6 +12773,7 @@ class SQLiteTaskStore(TaskStore):
         self.path = db_path
         self._schema_mode = schema_mode
         self._clock = utc_clock(clock)
+        self._enable_task_admission_wakeups()
         self._lock = asyncio.Lock()
         self._connection = self._connect(db_path)
         self._initialize_schema()
@@ -15147,15 +15148,18 @@ class SQLiteTaskStore(TaskStore):
                             request.session_id,
                             "contracted",
                         )
+                admission_now = self._clock()
                 task = _task_from_create(
                     request,
                     task_id=task_id,
                     parent_task=parent,
-                    retry_started_at=self._clock(),
+                    retry_started_at=admission_now,
                     supports_verified_work_contracts=True,
                 )
                 self._insert_task_unlocked(task)
-                return task.model_copy(deep=True)
+                created = task.model_copy(deep=True)
+        self._publish_task_admission_wakeup(task, now=admission_now)
+        return created
 
     async def create_running_task(
         self,
@@ -16489,11 +16493,12 @@ class SQLiteTaskStore(TaskStore):
                 task = self._require_task_unlocked(request.task_id)
                 now = datetime.now(UTC)
                 _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+                series_now = self._clock()
                 settled, successor = _settled_task_retry_attempt(
                     task,
                     request,
                     now=now,
-                    series_now=self._clock(),
+                    series_now=series_now,
                 )
                 assert settled.retry_series is not None
                 cursor = self._connection.execute(
@@ -16570,10 +16575,13 @@ class SQLiteTaskStore(TaskStore):
                     ),
                 )
                 self._connection.commit()
-                return receipt.model_copy(deep=True)
+                committed = receipt.model_copy(deep=True)
             except BaseException:
                 self._connection.rollback()
                 raise
+        if successor is not None:
+            self._publish_task_admission_wakeup(successor, now=series_now)
+        return committed
 
     async def load_task_retry_settlement(
         self,

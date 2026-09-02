@@ -40,6 +40,7 @@ from cayu.runtime._durable_worker_loop import (
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
     validate_worker_interval,
+    wait_or_stop,
 )
 from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
@@ -1781,11 +1782,19 @@ class TaskStoreDispatcher(Dispatcher):
                 next_wake_at=min(wake_deadlines) if wake_deadlines else None,
             )
 
-        await run_durable_worker_loop(
-            run_step,
-            poll_interval_s=poll_interval_s,
-            stop=stop,
+        admission_wakeup = await self._tasks._task_admission_wakeup(
+            tuple(TaskQuery(type=task_type) for task_type in self._claim_task_types())
         )
+        try:
+            await run_durable_worker_loop(
+                run_step,
+                poll_interval_s=poll_interval_s,
+                stop=stop,
+                wait=(wait_or_stop if admission_wakeup is None else admission_wakeup.wait),
+            )
+        finally:
+            if admission_wakeup is not None:
+                admission_wakeup.close()
 
     async def _acknowledge_terminal_task(
         self,

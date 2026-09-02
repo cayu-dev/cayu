@@ -41,6 +41,10 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
+from cayu.runtime._task_admission_wakeup import (
+    TaskAdmissionWakeup,
+    TaskAdmissionWakeupBroker,
+)
 from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
 from cayu.runtime.approvals import (
     ResolutionActor,
@@ -3132,6 +3136,83 @@ class TaskStore(ABC):
     # subclass must redeclare the proof even when the public mutation is
     # inherited, because subclass helpers and wrappers can change its behavior.
 
+    def _enable_task_admission_wakeups(self) -> None:
+        """Enable the built-in process-local, content-free wakeup optimization."""
+
+        self._task_admission_wakeup_broker = TaskAdmissionWakeupBroker()
+
+    async def _task_admission_wakeup(
+        self,
+        queries: Iterable[TaskQuery | None],
+    ) -> TaskAdmissionWakeup | None:
+        """Subscribe one worker to a conservative union of claim filters.
+
+        Custom stores inherit a polling-only fallback unless they explicitly
+        enable the built-in broker. The returned edge is never claim authority.
+        """
+
+        broker = getattr(self, "_task_admission_wakeup_broker", None)
+        if not isinstance(broker, TaskAdmissionWakeupBroker):
+            return None
+        copied_queries = tuple(copy_task_query(query) for query in queries)
+        if not copied_queries:
+            raise ValueError("Task admission wakeups require at least one claim query.")
+        for query in copied_queries:
+            _ensure_claim_query_supported(query)
+
+        def matches(admitted: object) -> bool:
+            if type(admitted) is not Task:
+                return False
+            task = admitted
+            if task.status is not TaskStatus.PENDING or task.session_id is not None:
+                return False
+            return any(
+                (query.status is None or query.status is TaskStatus.PENDING)
+                and _task_matches_claim_filter(task, query)
+                for query in copied_queries
+            )
+
+        return broker.subscribe(matches)
+
+    def _publish_task_admission_wakeup(
+        self,
+        task: Task,
+        *,
+        now: datetime,
+    ) -> None:
+        """Publish an edge after one immediately claimable task is committed."""
+
+        if type(task) is not Task:
+            return
+        try:
+            now = normalize_utc_datetime(now, "now")
+        except (TypeError, ValueError):
+            return
+        if (
+            task.status is not TaskStatus.PENDING
+            or task.session_id is not None
+            or (task.available_at is not None and task.available_at > now)
+        ):
+            return
+        broker = getattr(self, "_task_admission_wakeup_broker", None)
+        if isinstance(broker, TaskAdmissionWakeupBroker):
+            try:
+                broker.publish(task)
+            except Exception:
+                # A process-local optimization cannot turn a committed task
+                # creation into an apparent publication failure.
+                return
+
+    def _publish_task_admission_broadcast(self) -> None:
+        """Publish one content-free conservative edge from a backend notifier."""
+
+        broker = getattr(self, "_task_admission_wakeup_broker", None)
+        if isinstance(broker, TaskAdmissionWakeupBroker):
+            try:
+                broker.publish()
+            except Exception:
+                return
+
     async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
         """Publish one immutable version or replay its exact canonical content."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
@@ -3824,6 +3905,7 @@ class InMemoryTaskStore(TaskStore):
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+        self._enable_task_admission_wakeups()
         self._lock = asyncio.Lock()
         self._clock = utc_clock(clock)
         self._tasks: dict[str, Task] = {}
@@ -5163,17 +5245,20 @@ class InMemoryTaskStore(TaskStore):
                     request.work_contract,
                     request.session_id,
                 )
+            admission_now = self._clock()
             task = _task_from_create(
                 request,
                 task_id=task_id,
                 parent_task=parent,
-                retry_started_at=self._clock(),
+                retry_started_at=admission_now,
                 supports_verified_work_contracts=True,
             )
             if task.id in self._tasks:
                 raise ValueError(f"Task already exists: {task.id}")
             self._store_task(task)
-            return task.model_copy(deep=True)
+            created = task.model_copy(deep=True)
+        self._publish_task_admission_wakeup(task, now=admission_now)
+        return created
 
     async def create_running_task(
         self,
@@ -5906,11 +5991,12 @@ class InMemoryTaskStore(TaskStore):
             _ensure_owned_active_task_lease(task, request.worker_id, now=now)
             if task.retry_series is None:
                 raise ValueError("Task does not belong to a retry series.")
+            series_now = self._clock()
             settled, successor = _settled_task_retry_attempt(
                 task,
                 request,
                 now=now,
-                series_now=self._clock(),
+                series_now=series_now,
             )
             if successor is not None and successor.id in self._tasks:
                 raise TaskTerminalizationConflict(
@@ -5929,7 +6015,10 @@ class InMemoryTaskStore(TaskStore):
                 committed_at=now,
             )
             self._retry_settlements[receipt_key] = receipt
-            return receipt.model_copy(deep=True)
+            committed = receipt.model_copy(deep=True)
+        if successor is not None:
+            self._publish_task_admission_wakeup(successor, now=series_now)
+        return committed
 
     async def enforce_task_retry_deadline(
         self,
