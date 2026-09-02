@@ -1,0 +1,92 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_empty_poll_p95_ms": 10.0,
+    "memory_enqueue_p95_ms": 50.0,
+    "memory_processing_p95_ms": 100.0,
+    "memory_replay_p95_ms": 50.0,
+    "sqlite_empty_poll_p95_ms": 25.0,
+    "sqlite_enqueue_p95_ms": 150.0,
+    "sqlite_processing_p95_ms": 250.0,
+    "sqlite_replay_p95_ms": 150.0,
+    "sqlite_storage_bytes_per_job": 262144.0
+  },
+  "correctness": {
+    "acknowledgement_loss_reconciled": true,
+    "exact_replay_component_calls": 0,
+    "preparation_write_failure_did_not_redispatch_semantics": true,
+    "provider_calls": 0,
+    "worker_loss_recovered_after_store_reopen_and_lease_expiry": true
+  },
+  "environment": {
+    "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+    "python": "3.14.2"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "control_storage_bytes": null,
+      "empty_poll_latency": {
+        "p50_ms": 0.048042,
+        "p95_ms": 0.062792
+      },
+      "enqueue_latency": {
+        "p50_ms": 8.151812,
+        "p95_ms": 8.708542
+      },
+      "evaluator_calls": 20,
+      "exact_replay_latency": {
+        "p50_ms": 7.0515,
+        "p95_ms": 7.456167
+      },
+      "fresh_store_reopen_before_processing": false,
+      "generator_calls": 20,
+      "max_job_result_json_bytes": 3632,
+      "operation_count": 20,
+      "populated_storage_bytes": null,
+      "processing_latency": {
+        "p50_ms": 66.029416,
+        "p95_ms": 68.803542
+      },
+      "replay_evaluator_calls": 0,
+      "replay_generator_calls": 0,
+      "storage_bytes_per_job": null
+    },
+    {
+      "backend": "sqlite",
+      "control_storage_bytes": 3563520,
+      "empty_poll_latency": {
+        "p50_ms": 0.068062,
+        "p95_ms": 0.091375
+      },
+      "enqueue_latency": {
+        "p50_ms": 8.3265,
+        "p95_ms": 8.578916
+      },
+      "evaluator_calls": 20,
+      "exact_replay_latency": {
+        "p50_ms": 8.032458,
+        "p95_ms": 8.360375
+      },
+      "fresh_store_reopen_before_processing": true,
+      "generator_calls": 20,
+      "max_job_result_json_bytes": 3632,
+      "operation_count": 20,
+      "populated_storage_bytes": 4464640,
+      "processing_latency": {
+        "p50_ms": 79.767187,
+        "p95_ms": 104.491792
+      },
+      "replay_evaluator_calls": 0,
+      "replay_generator_calls": 0,
+      "storage_bytes_per_job": 45056.0
+    }
+  ],
+  "schema_version": "cayu.knowledge_enrichment_jobs_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "candidate_count_per_operation": 1,
+    "operation_count_per_backend": 20,
+    "provider_calls": 0
+  }
+}

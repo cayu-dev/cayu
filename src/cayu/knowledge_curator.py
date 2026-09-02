@@ -1121,6 +1121,89 @@ class _EvaluationState(_CuratorModel):
     decision: LearningDecision | None = None
 
 
+class _PreparedPublicationExpectation(_CuratorModel):
+    operation_id: StrictStr
+    entry_id: StrictStr
+    entry_revision: StrictInt
+    expected_revision: StrictInt | None = None
+    request_sha256: StrictStr
+    entry_created_at: datetime
+    entry_updated_at: datetime
+
+
+class _PreparedCandidatePublication(_CuratorModel):
+    candidate: LearningCandidate
+    decision: LearningDecision
+    proposal_fingerprint: StrictStr
+    entry: KnowledgeEntry
+    chunks: tuple[KnowledgeChunk, ...]
+    evidence: tuple[KnowledgeEvidence, ...]
+    activation_authority: KnowledgeActivationAuthority
+    expectation: _PreparedPublicationExpectation
+
+
+class _PreparedCandidate(_CuratorModel):
+    result: LearningCandidateResult | None = None
+    publication: _PreparedCandidatePublication | None = None
+
+    @model_validator(mode="after")
+    def validate_prepared_candidate(self) -> _PreparedCandidate:
+        if (self.result is None) == (self.publication is None):
+            raise ValueError(
+                "A prepared candidate requires exactly one terminal or publication path."
+            )
+        return self
+
+
+class _PreparedLearningBatch(_CuratorModel):
+    batch: LearningBatch
+    configuration_fingerprint: StrictStr
+    processed_at: datetime
+    candidates: tuple[LearningCandidate, ...] = Field(
+        default=(),
+        max_length=MAX_LEARNING_CANDIDATES,
+    )
+    prepared_candidates: tuple[_PreparedCandidate, ...] = Field(
+        default=(),
+        max_length=MAX_LEARNING_CANDIDATES,
+    )
+    terminal_result: LearningBatchResult | None = None
+
+    @model_validator(mode="after")
+    def validate_preparation(self) -> _PreparedLearningBatch:
+        if self.terminal_result is not None:
+            if self.candidates or self.prepared_candidates:
+                raise ValueError("A terminal preparation cannot carry candidate work.")
+            if (
+                self.terminal_result.batch_id != self.batch.id
+                or self.terminal_result.batch_fingerprint != self.batch.fingerprint
+                or self.terminal_result.configuration_fingerprint != self.configuration_fingerprint
+                or self.terminal_result.scope != self.batch.scope
+                or self.terminal_result.processed_at != self.processed_at
+            ):
+                raise ValueError("A terminal preparation conflicts with its batch.")
+            return self
+        if len(self.candidates) != len(self.prepared_candidates):
+            raise ValueError("Prepared candidate work must match generated candidates.")
+        for candidate, prepared in zip(
+            self.candidates,
+            self.prepared_candidates,
+            strict=True,
+        ):
+            if prepared.result is not None:
+                identity = prepared.result.proposal_key
+                if prepared.result.candidate_fingerprint != candidate.fingerprint:
+                    raise ValueError("Prepared candidate result conflicts with its candidate.")
+            else:
+                assert prepared.publication is not None
+                identity = prepared.publication.candidate.proposal_key
+                if prepared.publication.candidate != candidate:
+                    raise ValueError("Prepared publication conflicts with its candidate.")
+            if identity != candidate.proposal_key:
+                raise ValueError("Prepared candidate work conflicts with candidate order.")
+        return self
+
+
 @dataclass(frozen=True)
 class _PublicationExpectation:
     operation_id: str
@@ -1203,6 +1286,12 @@ class KnowledgeCurator:
     def config(self) -> KnowledgeCuratorConfig:
         return KnowledgeCuratorConfig.model_validate(self._config.model_dump(mode="python"))
 
+    @property
+    def access_scope(self) -> KnowledgeAccessScope:
+        """Return the exact copied access boundary enforced by this curator."""
+
+        return copy_knowledge_access_scope(self._access_scope)
+
     async def aclose(self, *, timeout_s: float = 10.0) -> bool:
         """Seal and drain publications retained beyond their curation callers."""
 
@@ -1217,6 +1306,15 @@ class KnowledgeCurator:
     async def curate(self, batch: LearningBatch) -> LearningBatchResult:
         """Generate, independently evaluate, govern, and persist knowledge."""
 
+        prepared = await self._prepare_curation(batch)
+        return await self._commit_prepared_curation(
+            prepared,
+            validate_publications=False,
+        )
+
+    async def _prepare_curation(self, batch: LearningBatch) -> _PreparedLearningBatch:
+        """Complete semantic work and publication planning without writing knowledge."""
+
         if type(batch) is not LearningBatch:
             raise TypeError("batch must be a LearningBatch.")
         copied_batch = LearningBatch.model_validate(batch.model_dump(mode="python"))
@@ -1228,81 +1326,173 @@ class KnowledgeCurator:
                     LearningBatch.model_validate(copied_batch.model_dump(mode="python"))
                 )
         except TimeoutError:
-            return self._batch_failure(
+            result = self._batch_failure(
                 copied_batch,
                 processed_at=processed_at,
                 outcome=LearningBatchOutcome.GENERATOR_TIMED_OUT,
                 code="candidate_generator_timed_out",
             )
+            return _terminal_preparation(copied_batch, result)
         except asyncio.CancelledError:
             raise
         except Exception:
-            return self._batch_failure(
+            result = self._batch_failure(
                 copied_batch,
                 processed_at=processed_at,
                 outcome=LearningBatchOutcome.GENERATOR_FAILED,
                 code="candidate_generator_failed",
             )
+            return _terminal_preparation(copied_batch, result)
         try:
             candidates = self._validate_generated_candidates(copied_batch, raw_candidates)
         except (TypeError, ValueError):
-            return self._batch_failure(
+            result = self._batch_failure(
                 copied_batch,
                 processed_at=processed_at,
                 outcome=LearningBatchOutcome.GENERATOR_INVALID,
                 code="candidate_generator_output_invalid",
             )
+            return _terminal_preparation(copied_batch, result)
         evaluated = await self._evaluate_candidates(copied_batch, candidates)
-        results: list[LearningCandidateResult] = []
+        prepared_candidates: list[_PreparedCandidate] = []
         for state in evaluated:
             if state.result is not None:
-                results.append(state.result)
+                prepared_candidates.append(_PreparedCandidate(result=state.result))
                 continue
             if state.decision is None:  # pragma: no cover - internal invariant
                 raise RuntimeError("Accepted curation candidate is missing its decision.")
+            candidate_preparation = await self._prepare_candidate_publication(
+                copied_batch,
+                state.candidate,
+                state.decision,
+                processed_at=processed_at,
+            )
+            prepared_candidates.append(
+                _PreparedCandidate(
+                    result=(
+                        candidate_preparation
+                        if type(candidate_preparation) is LearningCandidateResult
+                        else None
+                    ),
+                    publication=(
+                        candidate_preparation
+                        if type(candidate_preparation) is _PreparedCandidatePublication
+                        else None
+                    ),
+                )
+            )
+        return _PreparedLearningBatch(
+            batch=copied_batch,
+            configuration_fingerprint=self._config.fingerprint,
+            processed_at=processed_at,
+            candidates=tuple(state.candidate for state in evaluated),
+            prepared_candidates=tuple(prepared_candidates),
+        )
+
+    async def _commit_prepared_curation(
+        self,
+        prepared: _PreparedLearningBatch,
+        *,
+        replay_stable: bool = False,
+        validate_publications: bool = True,
+    ) -> LearningBatchResult:
+        """Publish one validated preparation without re-running semantic components."""
+
+        if type(prepared) is not _PreparedLearningBatch:
+            raise TypeError("prepared must be a _PreparedLearningBatch.")
+        copied = prepared
+        if copied.configuration_fingerprint != self._config.fingerprint:
+            raise ValueError("Prepared curation uses another curator configuration.")
+        self._validate_batch_bounds(copied.batch)
+        if copied.terminal_result is not None:
+            return LearningBatchResult.model_validate(
+                copied.terminal_result.model_dump(mode="python")
+            )
+        if validate_publications:
+            validated_candidates = self._validate_generated_candidates(
+                copied.batch,
+                list(copied.candidates),
+            )
+            if validated_candidates != copied.candidates:
+                raise ValueError("Prepared candidates do not match their validated projection.")
+        results: list[LearningCandidateResult] = []
+        for item in copied.prepared_candidates:
+            if item.result is not None:
+                results.append(item.result)
+                continue
+            assert item.publication is not None
+            if validate_publications:
+                self._validate_prepared_candidate_publication(copied.batch, item.publication)
             results.append(
-                await self._persist_candidate(
-                    copied_batch,
-                    state.candidate,
-                    state.decision,
-                    processed_at=processed_at,
+                await self._publish_prepared_candidate(
+                    item.publication,
+                    replay_stable=replay_stable,
                 )
             )
         return LearningBatchResult(
-            batch_id=copied_batch.id,
-            batch_fingerprint=copied_batch.fingerprint,
+            batch_id=copied.batch.id,
+            batch_fingerprint=copied.batch.fingerprint,
             configuration_fingerprint=self._config.fingerprint,
-            scope=copied_batch.scope,
+            scope=copied.batch.scope,
             outcome=LearningBatchOutcome.COMPLETED,
             code="completed",
-            signal_count=len(copied_batch.signals),
+            signal_count=len(copied.batch.signals),
             candidate_count=len(results),
-            signals=_completed_signal_results(copied_batch, candidates),
+            signals=_completed_signal_results(copied.batch, copied.candidates),
             candidates=tuple(results),
-            processed_at=processed_at,
+            processed_at=copied.processed_at,
         )
 
-    def _validate_batch_bounds(self, batch: LearningBatch) -> None:
-        if len(batch.signals) > self._config.max_signals:
-            raise ValueError(f"Learning batch exceeds max_signals={self._config.max_signals}.")
-        batch_bytes = len(canonical_durable_json_bytes(batch.model_dump(mode="json"), "batch"))
-        if batch_bytes > self._config.max_batch_bytes:
-            raise ValueError("Learning batch exceeds its configured byte limit.")
-        for signal in batch.signals:
-            signal_bytes = len(
-                canonical_durable_json_bytes(signal.model_dump(mode="json"), "signal")
+    def _validate_prepared_candidate_publication(
+        self,
+        batch: LearningBatch,
+        prepared: _PreparedCandidatePublication,
+    ) -> None:
+        candidate = prepared.candidate
+        decision = prepared.decision
+        if decision.verdict is not LearningVerdict.ACCEPTED:
+            raise ValueError("Prepared publication requires an accepted evaluator decision.")
+        signal_map = {signal.id: signal for signal in batch.signals}
+        signals = tuple(signal_map[signal_id] for signal_id in candidate.signal_ids)
+        if prepared.proposal_fingerprint != _proposal_fingerprint(
+            candidate,
+            decision,
+            signals=signals,
+            config=self._config,
+        ):
+            raise ValueError("Prepared publication proposal fingerprint conflicts.")
+        expectation = prepared.expectation
+        expected_operation_id = _curation_operation_id(candidate.proposal_key, self._config)
+        expected_entry_id = _curated_entry_id(candidate.proposal_key, self._config)
+        try:
+            operation_id, entry, chunks, evidence, request_sha256 = prepare_knowledge_publication(
+                prepared.entry,
+                list(prepared.chunks),
+                evidence=list(prepared.evidence),
+                operation_id=expected_operation_id,
+                expected_revision=None,
+                activation_authority=prepared.activation_authority,
             )
-            if signal_bytes > self._config.max_signal_bytes:
-                raise ValueError("Learning signal exceeds its configured byte limit.")
-            if len(signal.source_references) > self._config.max_source_references_per_signal:
-                raise ValueError("Learning signal exceeds its source-reference limit.")
-            for reference in signal.source_references:
-                self._validate_source_reference_bounds(reference)
-            if (
-                len(canonical_durable_json_bytes(signal.metadata, "signal metadata"))
-                > self._config.max_metadata_bytes
-            ):
-                raise ValueError("Learning signal metadata exceeds its configured byte limit.")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Prepared publication material is invalid.") from exc
+        if (
+            operation_id != expectation.operation_id
+            or operation_id != expected_operation_id
+            or entry != prepared.entry
+            or entry.id != expected_entry_id
+            or chunks != list(prepared.chunks)
+            or evidence != list(prepared.evidence)
+            or expectation.entry_id != entry.id
+            or expectation.entry_revision != entry.revision
+            or expectation.expected_revision is not None
+            or expectation.request_sha256 != request_sha256
+            or expectation.entry_created_at != entry.created_at
+            or expectation.entry_updated_at != entry.updated_at
+        ):
+            raise ValueError("Prepared publication conflicts with its governed material.")
+
+    def _validate_batch_bounds(self, batch: LearningBatch) -> None:
+        validate_learning_batch(batch, config=self._config)
 
     def _validate_generated_candidates(
         self,
@@ -1368,19 +1558,7 @@ class KnowledgeCurator:
             raise ValueError("Learning candidate metadata exceeds its configured byte limit.")
 
     def _validate_source_reference_bounds(self, reference: LearningSourceReference) -> None:
-        reference_bytes = len(
-            canonical_durable_json_bytes(reference.model_dump(mode="json"), "source reference")
-        )
-        if reference_bytes > self._config.max_source_reference_bytes:
-            raise ValueError("Learning source reference exceeds its configured byte limit.")
-        for field_name, value in (("locator", reference.locator), ("metadata", reference.metadata)):
-            if (
-                len(canonical_durable_json_bytes(value, f"source reference {field_name}"))
-                > self._config.max_metadata_bytes
-            ):
-                raise ValueError(
-                    f"Learning source reference {field_name} exceeds its configured byte limit."
-                )
+        _validate_learning_source_reference_bounds(reference, config=self._config)
 
     def _validate_primary_source_access(self, reference: LearningSourceReference) -> None:
         allowed_source_types = self._access_scope.allowed_source_types
@@ -1707,14 +1885,14 @@ class KnowledgeCurator:
             return None, None, "published_material_conflict"
         return historical, current, None
 
-    async def _persist_candidate(
+    async def _prepare_candidate_publication(
         self,
         batch: LearningBatch,
         candidate: LearningCandidate,
         decision: LearningDecision,
         *,
         processed_at: datetime,
-    ) -> LearningCandidateResult:
+    ) -> LearningCandidateResult | _PreparedCandidatePublication:
         signal_map = {signal.id: signal for signal in batch.signals}
         signals = tuple(signal_map[signal_id] for signal_id in candidate.signal_ids)
         proposal_fingerprint = _proposal_fingerprint(
@@ -1883,22 +2061,46 @@ class KnowledgeCurator:
                 code="candidate_publication_invalid",
                 decision=decision,
             )
-        expectation = _PublicationExpectation(
-            operation_id=operation_id,
-            entry_id=publication_entry.id,
-            entry_revision=publication_entry.revision,
-            expected_revision=None,
-            request_sha256=request_sha256,
-            entry_created_at=publication_entry.created_at,
-            entry_updated_at=publication_entry.updated_at,
+        return _PreparedCandidatePublication(
+            candidate=candidate,
+            decision=decision,
+            proposal_fingerprint=proposal_fingerprint,
+            entry=publication_entry,
+            chunks=tuple(publication_chunks),
+            evidence=tuple(publication_evidence),
+            activation_authority=activation_authority,
+            expectation=_PreparedPublicationExpectation(
+                operation_id=operation_id,
+                entry_id=publication_entry.id,
+                entry_revision=publication_entry.revision,
+                expected_revision=None,
+                request_sha256=request_sha256,
+                entry_created_at=publication_entry.created_at,
+                entry_updated_at=publication_entry.updated_at,
+            ),
         )
+
+    async def _publish_prepared_candidate(
+        self,
+        prepared: _PreparedCandidatePublication,
+        *,
+        replay_stable: bool,
+    ) -> LearningCandidateResult:
+        candidate = prepared.candidate
+        decision = prepared.decision
+        proposal_fingerprint = prepared.proposal_fingerprint
+        publication_entry = prepared.entry
+        activation_authority = prepared.activation_authority
+        expectation = _PublicationExpectation(**prepared.expectation.model_dump(mode="python"))
+        operation_id = expectation.operation_id
+        entry_id = expectation.entry_id
         try:
             receipt = await self._publish_owned(
                 operation_id=operation_id,
                 proposal_fingerprint=proposal_fingerprint,
                 entry=publication_entry,
-                chunks=publication_chunks,
-                evidence=publication_evidence,
+                chunks=list(prepared.chunks),
+                evidence=list(prepared.evidence),
                 activation_authority=activation_authority,
             )
         except asyncio.CancelledError:
@@ -1925,7 +2127,7 @@ class KnowledgeCurator:
                 decision=decision,
             )
         except (KnowledgePublicationConflict, KnowledgeRevisionConflict):
-            return await self._reconcile_after_publication_error(
+            result = await self._reconcile_after_publication_error(
                 candidate,
                 decision=decision,
                 operation_id=operation_id,
@@ -1934,8 +2136,9 @@ class KnowledgeCurator:
                 expectation=expectation,
                 conflict=True,
             )
+            return _stable_publication_result(result) if replay_stable else result
         except Exception:
-            return await self._reconcile_after_publication_error(
+            result = await self._reconcile_after_publication_error(
                 candidate,
                 decision=decision,
                 operation_id=operation_id,
@@ -1945,8 +2148,9 @@ class KnowledgeCurator:
                 expected_activation_authority=activation_authority,
                 conflict=False,
             )
+            return _stable_publication_result(result) if replay_stable else result
         if not _publication_receipt_matches_expectation(receipt, expectation):
-            return await self._reconcile_after_publication_error(
+            result = await self._reconcile_after_publication_error(
                 candidate,
                 decision=decision,
                 operation_id=operation_id,
@@ -1956,6 +2160,7 @@ class KnowledgeCurator:
                 expected_activation_authority=activation_authority,
                 conflict=False,
             )
+            return _stable_publication_result(result) if replay_stable else result
         activation, activation_error = await self._load_bound_activation_receipt(receipt)
         if activation_error is not None:
             return _candidate_result(
@@ -1976,7 +2181,7 @@ class KnowledgeCurator:
                 code="activation_receipt_conflict",
                 decision=decision,
             )
-        if receipt.replayed:
+        if receipt.replayed and not replay_stable:
             outcome = _existing_candidate_outcome(publication_entry.status)
         else:
             outcome = (
@@ -2566,6 +2771,40 @@ def _candidate_result(
     )
 
 
+def _terminal_preparation(
+    batch: LearningBatch,
+    result: LearningBatchResult,
+) -> _PreparedLearningBatch:
+    return _PreparedLearningBatch(
+        batch=batch,
+        configuration_fingerprint=result.configuration_fingerprint,
+        processed_at=result.processed_at,
+        terminal_result=result,
+    )
+
+
+def _stable_publication_result(result: LearningCandidateResult) -> LearningCandidateResult:
+    """Project a durable job's owned publication identically after replay."""
+
+    outcome = {
+        LearningCandidateOutcome.EXISTING_ACTIVE: LearningCandidateOutcome.ACTIVE_PERSISTED,
+        LearningCandidateOutcome.EXISTING_PENDING: LearningCandidateOutcome.PENDING_PERSISTED,
+    }.get(result.outcome, result.outcome)
+    code = outcome.value if outcome is not result.outcome else result.code
+    warning_code = (
+        None
+        if outcome
+        in {
+            LearningCandidateOutcome.ACTIVE_PERSISTED,
+            LearningCandidateOutcome.PENDING_PERSISTED,
+        }
+        else result.warning_code
+    )
+    return result.model_copy(
+        update={"outcome": outcome, "code": code, "warning_code": warning_code}
+    )
+
+
 def _completed_signal_results(
     batch: LearningBatch,
     candidates: tuple[LearningCandidate, ...],
@@ -2628,6 +2867,68 @@ def _validate_curator_store(store: object) -> None:
             raise TypeError("store must implement the knowledge curator store methods.")
 
 
+def validate_learning_batch(
+    batch: LearningBatch,
+    *,
+    config: KnowledgeCuratorConfig,
+) -> LearningBatch:
+    """Copy and validate a batch against one curator's pre-provider bounds.
+
+    Durable job producers use the same boundary as ``KnowledgeCurator`` before
+    enqueueing work, so an oversized request cannot consume queue storage and
+    fail only after a worker has claimed it.
+    """
+
+    if type(batch) is not LearningBatch:
+        raise TypeError("batch must be a LearningBatch.")
+    if type(config) is not KnowledgeCuratorConfig:
+        raise TypeError("config must be a KnowledgeCuratorConfig.")
+    copied_batch = LearningBatch.model_validate(batch.model_dump(mode="python"))
+    copied_config = KnowledgeCuratorConfig.model_validate(config.model_dump(mode="python"))
+    if len(copied_batch.signals) > copied_config.max_signals:
+        raise ValueError(f"Learning batch exceeds max_signals={copied_config.max_signals}.")
+    batch_bytes = len(canonical_durable_json_bytes(copied_batch.model_dump(mode="json"), "batch"))
+    if batch_bytes > copied_config.max_batch_bytes:
+        raise ValueError("Learning batch exceeds its configured byte limit.")
+    for signal in copied_batch.signals:
+        signal_bytes = len(canonical_durable_json_bytes(signal.model_dump(mode="json"), "signal"))
+        if signal_bytes > copied_config.max_signal_bytes:
+            raise ValueError("Learning signal exceeds its configured byte limit.")
+        if len(signal.source_references) > copied_config.max_source_references_per_signal:
+            raise ValueError("Learning signal exceeds its source-reference limit.")
+        for reference in signal.source_references:
+            _validate_learning_source_reference_bounds(reference, config=copied_config)
+        if (
+            len(canonical_durable_json_bytes(signal.metadata, "signal metadata"))
+            > copied_config.max_metadata_bytes
+        ):
+            raise ValueError("Learning signal metadata exceeds its configured byte limit.")
+    return copied_batch
+
+
+def _validate_learning_source_reference_bounds(
+    reference: LearningSourceReference,
+    *,
+    config: KnowledgeCuratorConfig,
+) -> None:
+    reference_bytes = len(
+        canonical_durable_json_bytes(
+            reference.model_dump(mode="json"),
+            "source reference",
+        )
+    )
+    if reference_bytes > config.max_source_reference_bytes:
+        raise ValueError("Learning source reference exceeds its configured byte limit.")
+    for field_name, value in (("locator", reference.locator), ("metadata", reference.metadata)):
+        if (
+            len(canonical_durable_json_bytes(value, f"source reference {field_name}"))
+            > config.max_metadata_bytes
+        ):
+            raise ValueError(
+                f"Learning source reference {field_name} exceeds its configured byte limit."
+            )
+
+
 def _validate_curator_access_scope(
     config: KnowledgeCuratorConfig,
     access_scope: KnowledgeAccessScope,
@@ -2674,4 +2975,5 @@ __all__ = [
     "LearningSourceReference",
     "LearningVerdict",
     "group_learning_signals",
+    "validate_learning_batch",
 ]

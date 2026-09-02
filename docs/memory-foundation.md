@@ -1528,6 +1528,143 @@ separate decision about what active memory enters model context. See the credent
 [`reviewed_knowledge_curator.py`](../examples/reviewed_knowledge_curator.py) example for a
 completed-session-to-pending-to-approved-to-later-recall path.
 
+## Durable opt-in knowledge enrichment
+
+`KnowledgeEnrichmentQueue` is the explicit durable boundary around that same curator. It is
+for applications that have already selected and authorized a bounded `LearningBatch`, but do
+not want the foreground interaction or domain request to remain open while generation,
+evaluation, governance, and publication run. Constructing a queue or worker starts nothing:
+the application calls `submit(...)`, then runs `KnowledgeEnrichmentWorker.process_next(...)`
+or its bounded polling loop in infrastructure it owns.
+
+The queue uses the existing `TaskStore` retry-series transaction as the one owner of job truth.
+It requires retry-series settlement, delayed availability, and idempotent terminalization so
+retry successors, non-claimable preparation records, and malformed-route rejection all retain
+durable authority. Unsupported stores are rejected when the queue is constructed, before any
+semantic component can run.
+It does not introduce a second queue, scheduler, knowledge store, or model-facing tool.
+`InMemoryTaskStore` supports local development; `SQLiteTaskStore` provides single-database
+durability; and `PostgresTaskStore` provides the shared multi-process boundary. A deterministic
+execution domain derives the effective worker route and task identity from the configured task
+type, complete curator/access profile, and behavior-bearing queue configuration. Exact concurrent
+submission within that domain converges on one task, while the same application operation ID in
+another profile or queue configuration is isolated instead of being claimed and failed by the
+wrong worker. Changed request content under the same domain identity fails closed. Each retained
+request also binds the complete curator configuration fingerprint,
+generator and evaluator identities, governance/activation policy identity, knowledge access
+scope digest, invocation provenance, retry policy, and queue byte/work ceilings. A worker with
+a different profile cannot claim semantic authority from payload contents.
+
+The durable request contains the bounded batch, exact trigger frontier, and no transcript or
+tool history. `KnowledgeEnrichmentTrigger.completed_interaction(...)` only constructs provenance
+from application-supplied identifiers; it does not read a session. If an application declares
+that selected evidence includes recalled or model-visible knowledge, it must also provide
+`KnowledgeEnrichmentFeedbackAuthorization` naming its stable policy and independently
+attributable source fingerprints from the batch. This is a fail-closed declaration boundary,
+not a claim that Cayu can detect undeclared copied text.
+
+```python
+queue = KnowledgeEnrichmentQueue(
+    task_store,
+    curator_config=curator.config,
+    access_scope=curator.access_scope,
+)
+request = KnowledgeEnrichmentRequest(
+    operation_id="deployment-42-enrichment",
+    batch=LearningBatch(id="deployment-42", signals=(signal,)),
+    trigger=KnowledgeEnrichmentTrigger.completed_interaction(
+        session_id="deployment-session-42",
+        interaction_id="deployment-interaction-42",
+        terminal_event_id="terminal-event-7",
+        occurred_at=terminal_event_time,
+    ),
+    profile=queue.profile,
+    submitted_at=terminal_event_time,
+)
+submitted = await queue.submit(request)
+
+# Run explicitly in application-owned worker infrastructure, possibly later
+# and in a fresh process configured with the exact same profile.
+settled = await KnowledgeEnrichmentWorker(queue, curator).process_next(
+    worker_id="knowledge-worker-1",
+    lease_seconds=300,
+)
+```
+
+`pending`, `processing`, `retry_scheduled`, `completed`, `failed`, and `cancelled` are
+projections of the complete bounded task retry series. A successful job retains the exact
+`LearningBatchResult`; semantic no-candidate, evaluator rejection, policy rejection, and
+candidate publication failures remain inside that result instead of being mislabeled as worker
+crashes. Escaped infrastructure failures use a content-safe typed classification and retry only
+when the built-in or application-supplied classifier explicitly says so. Raw exception messages
+are not persisted. Attempt exhaustion remains visible separately from the per-attempt retryable
+diagnostic.
+
+Cancellation is intentionally conservative. Cancelling the local worker awaitable does not
+release its lease while `KnowledgeCurator` may still own a publication; the worker keeps the
+claim alive, settles the resulting durable outcome, and then redelivers caller cancellation.
+An operator cancellation recorded by `TaskStore.cancel_task(...)` wins atomically if it races
+normal settlement. Before invoking candidate generation, the worker first stores a deterministic,
+non-claimable semantic-dispatch fence with one opaque process-local dispatch identity. Only the
+process that durably admitted that identity may invoke the generator, candidate policy, evaluator,
+or activation policy. It then stores the bounded immutable preparation in a separate deterministic,
+non-claimable task record before any knowledge publication. After publication, that preparation
+record is completed with the exact curation result before the root job settles. A hard process loss
+after publication but before job settlement therefore reloads the preparation and replays only
+idempotent publication; it does not invoke those semantic components again or invent another
+proposal. Publication/activation receipts reconcile a knowledge commit whose acknowledgement was
+lost, and the task retry settlement receipt separately reconciles a job-result acknowledgement
+loss. A stale task worker can never write a terminal job result after losing its lease. As with
+every remote write, process death cannot prove that an in-flight external transaction had no
+effect; the preparation, completed curation result, and receipts establish the truth on replay. If
+the dispatch fence exists but no preparation can be recovered, retries report the content-safe,
+typed `semantic_outcome_unknown` failure and never redispatch semantic components. That uncertainty
+remains retryable while another fenced process may still publish the preparation, then becomes a
+terminal attempts-exhausted result under the job's finite retry policy.
+
+`process_next(...)` returns `None` only when its execution-domain route is idle. If application
+code inserts a malformed task directly on that private route, including a task without retry-series
+evidence, the worker uses claim-fenced idempotent terminalization to durably fail it and
+raises `KnowledgeEnrichmentJobRejected`; callers must not interpret handled invalid work as an
+empty queue. `run(...)` counts that terminalized task and continues its bounded worker loop.
+
+The default queue accepts at most 512 KiB for the complete task envelope. Its exact
+curation-result envelope has a fixed 32 MiB ceiling. The same ceiling bounds the immutable
+semantic-preparation task before publication: callers cannot lower the limit and risk publishing
+knowledge before discovering that either durable recovery record does not fit. Before enqueue,
+the queue conservatively combines the actual batch's signal fan-out with the curator's maximum
+candidate batch, candidate count, evaluator-note, and metadata bounds. It rejects a request if
+any result allowed by those limits could exceed the durable ceiling, and repeats that check on
+load in a fresh worker. The batch is independently revalidated against the curator's signal,
+source-reference, metadata, and byte limits before enqueue and again before execution. Retry
+attempts are finite, one worker executes one
+curation at a time, reclaim work is capped at 100 records per poll, leases are limited to
+1–86400 seconds, and polling delay is greater than zero and at most 300 seconds. An empty
+poll performs no generator, evaluator, policy, knowledge-store, or model call.
+The enrichment retry policy accepts attempt and backoff bounds, but rejects cumulative
+elapsed/token/cost fields it cannot truthfully account. Generator, evaluator, and policy
+timeouts remain in `KnowledgeCuratorConfig`; any provider budget remains at the
+application's actual provider-dispatch boundary. This avoids presenting a task counter as
+hard authority over opaque application component calls.
+
+The bounded request, semantic-dispatch fence, semantic preparation, and terminal result remain
+ordinary task payloads. Their versioned envelopes reject unknown keys rather than silently
+accepting changed durable content. They are not a new raw evidence archive. Access to them is
+governed by the application's
+task-store/database boundary,
+while source authorization and redaction happen before submission. Applications that require a
+shorter retention period should place enrichment tasks in an app-owned task-store lifecycle and
+delete the root, retry-attempt, semantic-dispatch, and preparation records according to their policy
+only after no replay/audit dependence remains.
+Cayu does not silently prune records and this slice does not add per-job hard deletion to the
+generic `TaskStore` contract. Reusing an operation ID after external deletion is the
+application's explicit responsibility and no longer has Cayu's prior replay evidence.
+
+See [`durable_knowledge_enrichment.py`](../examples/durable_knowledge_enrichment.py) for a
+credential-free SQLite producer, fresh worker process, and durable pending-knowledge result.
+Provider-free lifecycle and latency evidence is recorded in
+[`knowledge-enrichment-jobs-performance-v1.json`](../benchmarks/memory/knowledge-enrichment-jobs-performance-v1.json).
+
 ## End-to-end reviewed-maintenance evaluation
 
 The provider-free `run_knowledge_maintenance_evaluation(...)` contract connects the

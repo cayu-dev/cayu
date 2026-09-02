@@ -113,6 +113,28 @@ active-to-retained-to-continuation transitions for the whole configured grace
 period. The application manifest and generator plan advance from schema version
 14 to 15, and the manifest fingerprints the complete cleanup policy.
 
+### Durable knowledge enrichment keeps curation off the foreground path
+
+Applications can now submit an already-authorized, bounded `LearningBatch` to
+`KnowledgeEnrichmentQueue` and process it explicitly in a fresh
+`KnowledgeEnrichmentWorker` process. The job reuses Cayu's task retry-series,
+`KnowledgeCurator`, governance, publication receipts, and knowledge store; it
+does not start a scheduler, scan transcripts, select a provider, or create a
+parallel source of job truth. Exact operation replay returns the durable result
+without rerunning semantic components. A durable process-bound dispatch fence is
+committed before semantic work, and a bounded immutable semantic preparation is
+committed before publication. Retries therefore reconcile without redispatching
+the generator or evaluator; a missing preparation after dispatch is exposed as
+typed `semantic_outcome_unknown` evidence. Profile- and queue-derived worker routes
+prevent one configured worker from claiming another domain's jobs, and
+`process_next(...)` distinguishes idle queues from durably rejected malformed
+work. Profile drift, changed payloads, stale leases, feedback without
+independent-source policy evidence, and
+oversized requests fail closed. In-memory, SQLite, and PostgreSQL task stores
+share the same contract. See the credential-free
+[`durable_knowledge_enrichment.py`](../examples/durable_knowledge_enrichment.py)
+fresh-process example.
+
 ### Task continuations retain elected worker authority across recovery entrances
 
 An interrupted task claimed with `claim_interrupted_task_continuation(...)` now

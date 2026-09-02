@@ -5038,6 +5038,43 @@ task payload is rewritten and no historical rejection is inferred.
 and proves that the same series continues and no worker can claim work after its
 successful attempt.
 
+`KnowledgeEnrichmentQueue` is a narrow public adapter over this retry-series
+authority for explicit `LearningBatch` work. It stores no parallel job store and
+requires `supports_task_retry_series`, `supports_delayed_availability`, and
+`supports_idempotent_terminalization`; its deterministic root task, every retry
+successor, invocation provenance, queue configuration fingerprint, curator/access
+profile, semantic-dispatch fence, semantic preparation, and terminal result are checked on every
+load. Unknown keys in its versioned request, preparation, result, and failure envelopes fail
+closed. The
+profile and behavior-bearing queue configuration derive the effective task route and
+root identity, so workers sharing a `TaskStore` cannot claim another execution
+domain's enrichment jobs. `KnowledgeEnrichmentWorker`
+reuses the runtime's shared durable worker cadence and lease-heartbeat mechanics, but keeps
+task-specific claim and settlement authority. It is deliberately specialized instead of
+pretending `KnowledgeCurator` is an ordinary quiescent task handler: curator cancellation may retain an already-dispatched
+knowledge publication for receipt reconciliation. Local worker cancellation therefore
+keeps heartbeating and settles that outcome before redelivering cancellation. A
+durable operator cancellation is reconstructed from the task store's exact request
+and wins the same settlement transaction. This preserves the generic retry-series
+fences without releasing a claim while a publication may still commit. Before invoking any
+semantic component, the worker persists a deterministic, non-claimable dispatch fence bound to an
+opaque process-local identity. Only that admitted process may run semantic preparation. Before its
+first publication, the worker then persists an immutable, non-claimable preparation containing the
+completed generator, candidate-policy, evaluator, activation-policy, and publication
+planning outputs. It completes that record with the exact curation result before settling
+the root job. Recovery after publication and before either settlement replays that plan
+without redispatching semantic components, while recovery after preparation completion
+loads the exact result. If only the dispatch fence survives, finite retries reconcile the
+preparation without semantic redispatch and expose typed `semantic_outcome_unknown` evidence. A
+malformed task explicitly inserted on
+the effective route is terminalized and raises `KnowledgeEnrichmentJobRejected` from
+`process_next(...)`; `None` means the route was actually idle. See
+[Durable opt-in knowledge enrichment](memory-foundation.md#durable-opt-in-knowledge-enrichment).
+The queue's 32 MiB terminal-result ceiling also bounds the preparation task and cannot be lowered. Before enqueue and again on
+load, a conservative admission check combines the actual signal fan-out with the configured
+candidate-batch, candidate-count, evaluator-note, and metadata maxima. Requests whose allowed
+result could exceed that ceiling fail before a curator can publish knowledge.
+
 The explicit outcome is fail-closed. A handler that returns it for an unattached
 task, a missing session, or a session in any state other than `interrupted` does
 not release ownership; the ordinary bounded worker failure path applies while

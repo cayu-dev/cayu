@@ -218,6 +218,30 @@ receipt replay, bounded receipt JSON, and steady-state SQLite bytes. In-memory a
 provide the credential-free timing matrix; PostgreSQL runs shared behavior, concurrency,
 reopen, migration, malformed-storage, and cancellation/failure tests.
 
+## Durable knowledge-enrichment job overhead
+
+`knowledge-enrichment-jobs-performance-v1.json` is the provider-free baseline for
+twenty explicit bounded jobs on in-memory and SQLite task/knowledge stores. Regenerate
+its p50/p95 and steady-state storage evidence, including a SQLite close/reopen boundary,
+with:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_enrichment_performance.py \
+  --output benchmarks/memory/knowledge-enrichment-jobs-performance-v1.json \
+  --check
+```
+
+The measured lanes cover enqueue, semantic preparation plus pending publication, exact
+terminal replay, and the default reclaim-enabled empty poll. Replay and empty polling must add zero generator,
+evaluator, or provider calls. Separate deterministic probes cover task-settlement
+acknowledgement loss, preparation-write failure after semantic dispatch, recovery after knowledge
+publication, SQLite task/knowledge-store reopen, and lease expiry without repeating generator or
+evaluator work. The
+SQLite storage metric subtracts current-schema empty task and knowledge stores; it is
+not a historical pre-feature binary comparison. PostgreSQL behavior and concurrent
+submission are covered by the integration suite rather than an environment-sensitive
+latency claim.
+
 ## Reviewed knowledge-maintenance reference evaluation
 
 `knowledge-maintenance-corpus-v1.json` and
