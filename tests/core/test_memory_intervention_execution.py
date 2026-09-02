@@ -246,6 +246,11 @@ def _snapshot(
                 fingerprint=_digest("provider-target"),
                 availability="available",
             ),
+            AgentSnapshotExecutionProfileComponent(
+                name="runtime",
+                fingerprint=_digest("runtime"),
+                availability="available",
+            ),
         ),
     )
     memory = MemoryStateRef.create(

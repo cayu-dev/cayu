@@ -1378,7 +1378,7 @@ async def _run_compiled_corpus_suite(
                 raise EvalExecutionProfileChangedError(
                     "CorpusTarget application manifest changed before fresh eval execution."
                 )
-        return validated_target.app._run_private(
+        return validated_target.app._run_with_public_projection(
             request,
             expected_execution_profile=expected_execution_profile,
         )

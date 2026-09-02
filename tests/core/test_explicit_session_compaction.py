@@ -5558,7 +5558,7 @@ def test_compact_session_claim_heartbeat_cannot_revive_an_expired_lease(monkeypa
         task = asyncio.create_task(collect())
         await asyncio.wait_for(provider.started.wait(), timeout=5)
         now["value"] = accepted_at + timedelta(minutes=6)
-        with pytest.raises(RuntimeError, match="expired before reconciliation"):
+        with pytest.raises(RuntimeError, match="expired before renewal"):
             await asyncio.wait_for(task, timeout=5)
 
         assert provider.calls == 1

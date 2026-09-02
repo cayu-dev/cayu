@@ -35,7 +35,9 @@ from cayu.workspaces import (
     WorkspaceBranchRequest,
     WorkspaceBranchResourceExhaustedError,
     WorkspaceListResult,
+    WorkspaceMoveUnsupportedError,
     WorkspaceMutationResult,
+    WorkspacePreconditionUnsupportedError,
     WorkspaceReadResult,
 )
 from cayu.workspaces._local_branch import LocalWorkspaceBranch
@@ -422,6 +424,14 @@ def test_local_branch_passes_ordinary_workspace_conformance(tmp_path: Path) -> N
         await verify_relative_path_safety(branch)
         await verify_bounded_reads_and_result_isolation(branch)
         await verify_paging_and_conditional_mutations(branch)
+        with pytest.raises(WorkspacePreconditionUnsupportedError):
+            await branch.require_absent("unsupported-absence-check.txt")
+        with pytest.raises(WorkspaceMoveUnsupportedError):
+            await branch.move_if_revision(
+                "unsupported-source.txt",
+                "unsupported-destination.txt",
+                expected_source_revision="sha256:" + ("0" * 64),
+            )
         await branch.rollback()
 
     asyncio.run(scenario())

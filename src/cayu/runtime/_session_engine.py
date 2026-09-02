@@ -15517,12 +15517,43 @@ class SessionEngine:
                     raise KeyError(f"Session not found: {loaded_session.id}") from None
                 if reloaded_session.status in INTERRUPT_REQUESTED_SESSION_STATUSES:
                     self._session_control.signal_interrupt(reloaded_session.id)
-                    existing_interrupt_event = (
-                        await self._session_control.wait_for_active_interrupted_event(
+                    persisted_interrupt_payload = (
+                        await self._load_pending_session_interrupt_payload(
                             reloaded_session.id,
-                            interruption_request_id=interruption_request_id,
+                            default={},
                         )
                     )
+                    persisted_interruption_request_id = interruption_request_id_from_payload(
+                        persisted_interrupt_payload
+                    )
+                    if persisted_interruption_request_id is not None:
+                        existing_interrupt_event = (
+                            await self._session_control.wait_for_active_interrupted_event(
+                                reloaded_session.id,
+                                interruption_request_id=persisted_interruption_request_id,
+                            )
+                        )
+                        if existing_interrupt_event is not None:
+                            require_interruption_event_matches_pending_marker(
+                                existing_interrupt_event,
+                                persisted_interrupt_payload,
+                            )
+                    elif reloaded_session.status is SessionStatus.INTERRUPTED:
+                        reloaded_checkpoint = await self.session_store.load_checkpoint(
+                            reloaded_session.id
+                        )
+                        terminal_inspection = (
+                            await self._recovery_coordinator._inspect_terminal_evidence(
+                                session=reloaded_session,
+                                checkpoint=reloaded_checkpoint,
+                            )
+                        )
+                        existing_interrupt_event = terminal_inspection.event
+                    else:
+                        raise SessionRuntimePublicationConflict(
+                            "Concurrent interruption transition retained no durable request "
+                            "identity."
+                        ) from None
                     if existing_interrupt_event is not None:
                         if not interruption_cascade_suppressed():
                             self._schedule_background_interruption_cascade(
@@ -21845,7 +21876,6 @@ class SessionEngine:
                                         runtime_failure_identity,
                                         "session_failed",
                                     ),
-                                    "interaction_id": runtime_failure_identity.interaction_id,
                                     "timestamp": runtime_failure_identity.observed_at,
                                 }
                             ),
@@ -22375,7 +22405,7 @@ class SessionEngine:
             return bool(
                 event.type is EventType.SESSION_FAILED
                 and event.session_id == session.id
-                and event.interaction_id == identity.interaction_id
+                and event.interaction_id is None
                 and event.agent_name == session.agent_name
                 and event.environment_name == session.environment_name
                 and event.timestamp == identity.observed_at
@@ -22642,7 +22672,6 @@ class SessionEngine:
                         id=terminal_event_id,
                         type=EventType.SESSION_FAILED,
                         session_id=session.id,
-                        interaction_id=identity.interaction_id,
                         agent_name=registered_agent.spec.name,
                         environment_name=environment_name,
                         timestamp=identity.observed_at,

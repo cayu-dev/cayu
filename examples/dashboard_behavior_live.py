@@ -75,6 +75,7 @@ from cayu.runtime import (
     InMemorySessionStore,
     SessionIdentity,
     SessionStatus,
+    current_runtime_build_provenance,
 )
 from cayu.runtime import (
     _execution_profile_admission as execution_profile_admission,
@@ -248,10 +249,28 @@ class DashboardContractProvider(ModelProvider):
                     name="dashboard_eval_search",
                     arguments={"query": "cayu", "limit": 5},
                 )
-                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                yield ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "tool_calls",
+                        "usage": {
+                            "input_tokens": 80,
+                            "output_tokens": 10,
+                            "total_tokens": 90,
+                        },
+                    }
+                )
                 return
             yield ModelStreamEvent.text_delta("dashboard authored evaluation output")
-            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            yield ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 12,
+                        "total_tokens": 112,
+                    },
+                }
+            )
             return
         if "recover after" not in request_text:
             if "seed the dashboard approval" in request_text.lower() and not self._approval_seeded:
@@ -443,6 +462,7 @@ def _profiled_session_identity(
     """Build the exact profile used by low-level resumable dashboard fixtures."""
 
     runtime_version = version("cayu")
+    runtime_build_provenance = current_runtime_build_provenance()
     registered_agent = app._agents[AGENT_NAME]
     engine = app._session_engine
     return SessionIdentity(
@@ -450,6 +470,7 @@ def _profiled_session_identity(
         model=model,
         runtime_name="cayu",
         runtime_version=runtime_version,
+        runtime_build_provenance=runtime_build_provenance,
         execution_profile=execution_profile_admission.resolve_execution_profile_identity(
             registered_agent=registered_agent,
             runtime_name="cayu",
@@ -468,6 +489,7 @@ def _profiled_session_identity(
                 limits=RunLimits(),
                 retry_policy=RetryPolicy(),
             ),
+            runtime_build_provenance=runtime_build_provenance,
         ),
     )
 
@@ -2279,7 +2301,9 @@ async def _exercise_captured_evaluation(
         release_scenario_preview.set()
         await page.unroute(authored_scenario_preview_path, delay_clean_scenario_preview)
 
-    revised_scenario_input = revised_scenario.get_by_test_id("scenario-event-0").locator("textarea")
+    revised_scenario_input = (
+        revised_scenario.get_by_test_id("scenario-event-0").locator("textarea").first
+    )
     await revised_scenario_input.fill(
         "Exercise revised Control Plane-authored multi-stage behavior."
     )

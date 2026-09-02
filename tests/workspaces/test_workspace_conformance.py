@@ -21,6 +21,7 @@ from tests.workspaces.conformance import (
     WorkspaceConformanceRegistration,
     WorkspaceHarness,
     verify_bounded_reads_and_result_isolation,
+    verify_conditional_moves,
     verify_listing_contract,
     verify_paging_and_conditional_mutations,
     verify_relative_path_safety,
@@ -517,6 +518,7 @@ def test_workspace_paging_and_conditional_mutation_conformance(
 ) -> None:
     async def scenario(harness: WorkspaceHarness) -> None:
         await verify_paging_and_conditional_mutations(harness.workspace)
+        await verify_conditional_moves(harness.workspace)
 
     _run_scenario(registration, tmp_path, monkeypatch, scenario)
 

@@ -275,8 +275,11 @@ def test_trials_average_the_per_assertion_score():
     )
     result = asyncio.run(run_eval_case(_app(), case, suite_id="s", trials=4))
     assert result.status == EvalStatus.PASSED
-    # mean of the four trial scores.
-    assert result.assertions[0].score == pytest.approx(0.9)
+    # The assertion aggregate score is the passing-trial fraction. The
+    # stochastic score mean remains explicit in its aggregate metadata and in
+    # the case score.
+    assert result.assertions[0].score == pytest.approx(1.0)
+    assert result.assertions[0].metadata["mean_trial_score"] == pytest.approx(0.9)
     assert result.score == pytest.approx(0.9)
     assert [trial.score for trial in result.trials] == pytest.approx([1.0, 0.8, 1.0, 0.8])
     trial_session_ids = [trial.session_id for trial in result.trials]
@@ -483,9 +486,12 @@ def test_trials_mean_below_threshold_fails():
         assertions=[_SequenceScoreAssertion([0.2, 0.4], threshold=0.5)],
     )
     result = asyncio.run(run_eval_case(_app(), case, suite_id="s", trials=2))
-    # mean 0.3 < threshold 0.5 -> the aggregated assertion fails.
+    # Both trials miss the threshold, while their numeric-score mean remains
+    # available separately for diagnostics and case-level scoring.
     assert result.status == EvalStatus.FAILED
-    assert result.assertions[0].score == pytest.approx(0.3)
+    assert result.assertions[0].score == pytest.approx(0.0)
+    assert result.assertions[0].metadata["mean_trial_score"] == pytest.approx(0.3)
+    assert result.score == pytest.approx(0.3)
 
 
 def test_trials_preserve_partial_execution_errors():

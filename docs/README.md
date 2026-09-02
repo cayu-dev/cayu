@@ -13,6 +13,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Console](console.md)
 - [Control plane](control-plane.md)
 - [Cost optimization](cost-optimization.md)
+- [Docker coding toolchains](docker-coding-toolchains.md)
 - [Environment factories](environment-factories.md)
 - Evals: [first evaluation](../src/cayu/guides/evals-first.md), [AI quality](../src/cayu/guides/evals-ai-quality.md), [production sessions and scenarios](../src/cayu/guides/evals-production.md), and the complete [reference](evals.md)
 - [Memory foundation](memory-foundation.md)
@@ -36,6 +37,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Nightly verification](nightly-verification.md)
 - [Release notes](release-notes.md)
 - [Releasing](releasing.md)
+- [Session-operation fault harness](session-operation-fault-harness.md)
 
 ## Architecture and implemented design records
 

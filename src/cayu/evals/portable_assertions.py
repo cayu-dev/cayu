@@ -16,6 +16,7 @@ from cayu.evals.corpus import (
     JudgePrivacyPolicyV1,
     JudgeProfileIdentityV1,
     MaxEstimatedCostAssertionSpec,
+    MemoryAttributionAssertionSpec,
     ModelJudgeAssertionSpec,
     PricingProfileIdentityV1,
     PrivateJudgeReferenceV1,
@@ -51,11 +52,15 @@ from cayu.evals.judges import (
     _isolated_structured_judge_app,
     _render_transcript,
 )
-from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
+from cayu.evals.memory_attribution import (
+    EvalMemoryAttributionEvidenceV1,
+    eval_memory_attribution_limitations,
+)
 from cayu.evals.models import (
     ArtifactProbeRequirement,
     EvalAssertionResult,
     EvalContext,
+    EvalOutcome,
     ProbeRequirements,
 )
 from cayu.evals.portable_evaluation import _evaluate_validated_assertion_spec
@@ -378,6 +383,61 @@ class _CompiledPortableAssertion(EvalAssertion):
             evidence,
             known_revision=self._assertion_revision,
         )
+
+
+def _blocked_portable_assertion_result(
+    assertion: EvalAssertion,
+    outcome: EvalOutcome,
+    message: str,
+    *,
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1,
+) -> EvalAssertionResult | None:
+    """Build blocked results that retain each portable publication contract."""
+
+    if type(memory_attribution_evidence) is not EvalMemoryAttributionEvidenceV1:
+        raise TypeError(
+            "memory_attribution_evidence must be an exact EvalMemoryAttributionEvidenceV1."
+        )
+    if type(assertion) is _CompiledPortableAssertion:
+        metadata: dict[str, object] = {}
+        if type(assertion._spec) is MemoryAttributionAssertionSpec:
+            metadata = {
+                "evidence_area": "memory attribution",
+                "evidence_state": memory_attribution_evidence.completeness.value,
+                "evidence_revision": memory_attribution_evidence.revision,
+                "limitations": [
+                    limitation.value
+                    for limitation in eval_memory_attribution_limitations(
+                        memory_attribution_evidence
+                    )
+                ],
+            }
+        return EvalAssertionResult(
+            name=assertion.name,
+            assertion_revision=assertion.assertion_revision,
+            outcome=outcome,
+            message=message,
+            metadata=metadata,
+        )
+    if type(assertion) is _CompiledModelJudgeAssertion:
+        return assertion._with_public_contract(
+            EvalAssertionResult(
+                name=assertion.name,
+                assertion_revision=assertion.assertion_revision,
+                outcome=outcome,
+                message=message,
+            )
+        )
+    if type(assertion) is _CompiledStructuredModelJudgeAssertion:
+        return assertion._with_public_contract(
+            EvalAssertionResult(
+                name=assertion.name,
+                assertion_revision=assertion.assertion_revision,
+                outcome=outcome,
+                message=message,
+            )
+        )
+    return None
 
 
 class _CompiledModelJudgeAssertion(EvalAssertion):

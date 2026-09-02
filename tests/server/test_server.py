@@ -121,6 +121,7 @@ from cayu.runtime import (
     TerminalEventPublicationUncertain,
     TranscriptDigestCompactor,
 )
+from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     REDACTED_CUSTOM_EVENT_TYPE,
@@ -900,11 +901,23 @@ def test_server_run_binding_failure_terminalizes_prestarted_task() -> None:
     assert len(tasks) == 1
     assert tasks[0].status is TaskStatus.FAILED
     assert tasks[0].session_id == session_id
-    assert tasks[0].error == {
+    assert tasks[0].error is not None
+    task_error = dict(tasks[0].error)
+    task_error.pop("runtime_task_failure")
+    assert task_error == {
         "message": "binding failed",
         "type": "RuntimeError",
         "session_id": session_id,
     }
+    session = asyncio.run(app.session_store.load(session_id))
+    assert session is not None
+    failure_identity = runtime_task_failure_identity_from_task(
+        tasks[0],
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+    )
+    assert failure_identity is not None
+    assert events[-1]["payload"]["runtime_task_failure_id"] == failure_identity.failure_id
 
 
 def test_environment_capability_projection_preserves_controls_and_redacts_detail(
@@ -4767,7 +4780,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         events: list[Event],
         checkpoint: dict[str, object] | None = None,
     ) -> None:
-        await app.session_store.create(
+        created = await app.session_store.create(
             RunRequest(
                 agent_name="assistant",
                 session_id=session_id,
@@ -4778,6 +4791,19 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         await app.session_store.update_status(session_id, status)
         await app.session_store.append_events(session_id, events)
         if checkpoint is not None:
+            pending_user_input = checkpoint.get("pending_user_input")
+            if type(pending_user_input) is dict:
+                pending_user_input.setdefault("session_id", session_id)
+                pending_user_input.setdefault("session_instance_id", created.instance_id)
+                pending_user_input.setdefault(
+                    "source_interaction_id",
+                    f"interaction:{session_id}",
+                )
+                pending_user_input.setdefault("source_run_epoch", created.run_epoch)
+                pending_user_input.setdefault(
+                    "execution_profile_fingerprint",
+                    "e" * 64,
+                )
             await app.session_store.checkpoint(session_id, checkpoint)
 
     async def seed() -> None:

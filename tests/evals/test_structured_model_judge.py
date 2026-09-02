@@ -19,6 +19,7 @@ from cayu import (
     EvalCaseSpec,
     EvalCorpusDocument,
     EvalJudgeEvidenceSelectionV1,
+    EvalOutcome,
     EvalSuiteDraftV1,
     EvalSuiteSpec,
     EvaluationEvidencePolicySpec,
@@ -54,7 +55,10 @@ from cayu import (
     render_corpus_execution_html,
     run_corpus_suite,
 )
+from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
+from cayu.evals.published import PublishedStructuredModelJudgeDetail, _published_detail
 from cayu.evals.result_presentation import present_eval_result
+from cayu.evals.runner import _blocked_assertion_results
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import InMemorySessionStore, SessionStore
 
@@ -1134,6 +1138,32 @@ def test_same_model_judging_requires_explicit_permission_and_is_labeled():
     detail = result.run.cases[0].trials[0].assertions[0].detail
     assert detail.candidate_route_relation == "same_model"
     assert detail.judge_profile.same_model_use == "allowed_and_labeled"
+
+
+@pytest.mark.parametrize("outcome", [EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE])
+def test_blocked_structured_judge_retains_its_publication_contract(outcome):
+    judge, _ = _judge(_judgment())
+    target, _ = _target(judge)
+    corpus = _corpus(judge)
+    compiled = compile_corpus_suite(corpus, target, "quality-suite")
+
+    (result,) = _blocked_assertion_results(
+        compiled.suite.cases[0].assertions,
+        outcome,
+        "candidate execution did not produce evaluable evidence",
+        memory_attribution_evidence=EvalMemoryAttributionEvidenceV1.unavailable(),
+    )
+    detail = _published_detail(corpus.cases[0].assertions[0], result)
+
+    assert type(detail) is PublishedStructuredModelJudgeDetail
+    assert detail.diagnostic == (
+        "evaluator_error" if outcome is EvalOutcome.ERROR else "evidence_unavailable"
+    )
+    assert detail.judge_profile == model_judge_profile(judge)
+    assert detail.criteria == ()
+    assert detail.aggregate_score is None
+    assert detail.usage is None
+    assert detail.cost is None
 
 
 def test_same_model_route_changes_make_results_incomparable():

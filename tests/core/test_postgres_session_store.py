@@ -56,6 +56,7 @@ from cayu.runtime import (
     EventQuery,
     InvocationOriginClaim,
     InvocationOriginTrust,
+    PendingUserInput,
     RunLimits,
     RunRequest,
     Session,
@@ -1435,6 +1436,32 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             ),
             identity=_identity(),
         )
+        pending_user_input = PendingUserInput(
+            session_id=user_session.id,
+            session_instance_id=user_session.instance_id,
+            source_interaction_id="interaction_pending_input_pg",
+            source_run_epoch=user_session.run_epoch,
+            input_id="input_pg",
+            **_tool_round_identity_payload(),
+            tool_call_id="call_input_pg",
+            tool_name="ask_user",
+            question="Deploy now?",
+            options=["yes", "no"],
+            arguments={},
+            agent_name="assistant",
+            execution_profile_fingerprint="e" * 64,
+            tool_calls=[
+                {
+                    "tool_call_id": "call_input_pg",
+                    "tool_name": "ask_user",
+                    "arguments": {},
+                    "policy_decision": None,
+                    "reason": None,
+                    "metadata": {},
+                    "active_taint_labels": [],
+                }
+            ],
+        )
         await store.append_event(
             user_session.id,
             Event(
@@ -1452,29 +1479,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
         )
         await store.checkpoint(
             user_session.id,
-            {
-                "pending_user_input": {
-                    "input_id": "input_pg",
-                    **_tool_round_identity_payload(),
-                    "tool_call_id": "call_input_pg",
-                    "tool_name": "ask_user",
-                    "question": "Deploy now?",
-                    "options": ["yes", "no"],
-                    "arguments": {},
-                    "agent_name": "assistant",
-                    "tool_calls": [
-                        {
-                            "tool_call_id": "call_input_pg",
-                            "tool_name": "ask_user",
-                            "arguments": {},
-                            "policy_decision": None,
-                            "reason": None,
-                            "metadata": {},
-                            "active_taint_labels": [],
-                        }
-                    ],
-                }
-            },
+            {"pending_user_input": pending_user_input.model_dump(mode="json")},
         )
         await store.update_status(user_session.id, SessionStatus.INTERRUPTED)
 
@@ -1847,7 +1852,12 @@ def test_postgres_session_store_persists_sessions_events_and_checkpoints(postgre
         assert loaded.agent_name == "assistant"
         assert loaded.environment_name == "local-dev"
         assert loaded.status == SessionStatus.RUNNING
-        assert loaded.metadata == {"project_id": 123}
+        assert {
+            key: value
+            for key, value in loaded.metadata.items()
+            if key != "cayu:runtime_build_provenance"
+        } == {"project_id": 123}
+        assert loaded.runtime_build_provenance.fingerprint is None
         assert [event.type for event in events] == [
             EventType.SESSION_STARTED,
             EventType.MODEL_COMPLETED,
@@ -3520,11 +3530,16 @@ def test_postgres_session_store_update_metadata_replaces(postgres_dsn):
         before_edit = await store.load("sess_meta")
         assert before_edit is not None
         updated = await store.update_metadata("sess_meta", {"b": [1, 2]})
-        assert updated.metadata == {
+        assert {
+            key: value
+            for key, value in updated.metadata.items()
+            if key != "cayu:runtime_build_provenance"
+        } == {
             "b": [1, 2],
             "subagent": {"mode": "background"},
             "cayu:taint_labels": ["untrusted"],
         }
+        assert updated.runtime_build_provenance == before_edit.runtime_build_provenance
         assert updated.updated_at >= before_edit.updated_at
         assert updated.last_activity_at == before_edit.last_activity_at
         assert updated.status == SessionStatus.COMPLETED

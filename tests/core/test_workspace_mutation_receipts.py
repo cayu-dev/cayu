@@ -2876,9 +2876,10 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
     assert first_recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
     assert second_recovery.status is SessionStatus.INTERRUPTED
     assert second_recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
-    assert terminal_evidence_recovery.actions == (
-        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
-    )
+    # The interrupted-session repair now publishes terminal evidence in the
+    # same recovery that archives the abandoned round. A later recovery must
+    # recognize that exact evidence instead of emitting a duplicate terminal.
+    assert terminal_evidence_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
     assert repeated_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
     assert first_recovered_checkpoint is not None
     assert second_checkpoint is not None

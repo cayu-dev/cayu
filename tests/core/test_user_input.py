@@ -3810,7 +3810,7 @@ def test_recover_user_input_task_cancellation_finalizes_continuation() -> None:
         try:
             await recovery_task
         except asyncio.CancelledError as cancellation:
-            assert cancellation.args == ("cancel user-input recovery",)
+            assert cancellation.args == ("Provider operation cancelled",)
         else:
             pytest.fail("User-input recovery did not preserve task cancellation.")
 

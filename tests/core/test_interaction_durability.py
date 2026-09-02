@@ -887,13 +887,9 @@ def test_backward_clock_task_cancellation_preserves_cancellation_and_live_state(
             await consumer
         assert consumer.cancelled() is True
         assert consumer.cancelling() == 1
-        assert raised.value.__cause__ is not None
-        assert (
-            sum(
-                isinstance(error, InteractionLifecyclePublicationRejected)
-                for error in iter_exception_tree(raised.value.__cause__)
-            )
-            == 1
+        assert type(raised.value.__cause__) is RuntimeError
+        assert str(raised.value.__cause__) == (
+            "Session interruption finalization failed after provider cancellation."
         )
 
         session = await store.load(session_id)
@@ -4031,6 +4027,9 @@ def test_unassociated_runtime_event_allowlist_is_exhaustive() -> None:
                 EventType.SESSION_COMPLETED,
                 EventType.SESSION_FAILED,
                 EventType.SESSION_INTERRUPTED,
+                EventType.HOOK_STARTED,
+                EventType.HOOK_COMPLETED,
+                EventType.HOOK_FAILED,
                 EventType.TASK_INTERRUPTED_HANDOFF,
                 EventType.TASK_COMPLETION_RESULT_RESOLVED,
                 EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED,

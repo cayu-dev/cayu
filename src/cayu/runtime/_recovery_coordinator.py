@@ -9291,12 +9291,13 @@ class RecoveryCoordinator:
 
             if not pending_approval_cleared:
                 try:
-                    pending_approval_cleared = await self._exact_approval_close_receipt_exists(
+                    clear_event = await self._load_exact_approval_close_event(
                         session_id=session.id,
                         approval=pending_approval,
                         requested_decision=original_resolution_decision,
                         resolution_request_digest=resolution_request_digest,
                     )
+                    pending_approval_cleared = clear_event is not None
                 except Exception as receipt_error:
                     exc.add_note(
                         "Exact approval-close receipt reconciliation failed; the approval "
@@ -9363,22 +9364,22 @@ class RecoveryCoordinator:
             ):
                 yield event
 
-    async def _exact_approval_close_receipt_exists(
+    async def _load_exact_approval_close_event(
         self,
         *,
         session_id: str,
         approval: PendingToolApproval,
         requested_decision: ToolApprovalDecision,
         resolution_request_digest: str,
-    ) -> bool:
-        """Prove that this exact resolution crossed its atomic close boundary."""
+    ) -> Event | None:
+        """Load the exact closure event after proving its atomic receipt."""
 
         receipt = await self._session_store.load_runtime_publication_receipt(
             session_id,
             f"approval-close:{approval.approval_id}",
         )
         if receipt is None:
-            return False
+            return None
         expected_identity = {
             "approval_id": approval.approval_id,
             "tool_call_id": approval.tool_call_id,
@@ -9392,11 +9393,39 @@ class RecoveryCoordinator:
             raise SessionRuntimePublicationConflict(
                 "Approval-close receipt conflicts with the claimed resolution request."
             )
-        if len(receipt.appended_event_ids) != 1:
+        if len(receipt.appended_event_ids) != 1 or receipt.intent.get("event_ids") != list(
+            receipt.appended_event_ids
+        ):
             raise SessionRuntimePublicationConflict(
                 "Approval-close receipt has invalid event evidence."
             )
-        return True
+        event_id = receipt.appended_event_ids[0]
+        records = await self._session_store.query_events(
+            EventQuery(session_id=session_id, event_id=event_id, limit=2)
+        )
+        if len(records) != 1 or records[0].event.id != event_id:
+            raise SessionRuntimePublicationConflict(
+                "Approval-close receipt is missing its exact durable event."
+            )
+        event = records[0].event
+        expected_payload = {
+            "model_step_id": approval.model_step_id,
+            "model_attempt_id": approval.model_attempt_id,
+            "tool_round_id": approval.tool_round_id,
+            "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+            "approval_id": approval.approval_id,
+            "tool_call_id": approval.tool_call_id,
+            "cleared": True,
+        }
+        if (
+            event.type is not EventType.SESSION_CHECKPOINTED
+            or event.session_id != session_id
+            or any(event.payload.get(key) != value for key, value in expected_payload.items())
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Approval-close event conflicts with its durable receipt."
+            )
+        return copy_event(event)
 
     async def _approval_task_failure_receipt_is_durable(
         self,
@@ -9484,6 +9513,7 @@ class RecoveryCoordinator:
         if (
             event.type is not EventType.SESSION_FAILED
             or event.session_id != session.id
+            or event.interaction_id is not None
             or event.payload.get("error") != expected_payload["message"]
             or event.payload.get("error_type") != expected_payload["type"]
             or any(
@@ -9632,7 +9662,6 @@ class RecoveryCoordinator:
                     id=approval_failure_event_id(identity, "session_failed"),
                     type=EventType.SESSION_FAILED,
                     session_id=session.id,
-                    interaction_id=closure_event.interaction_id,
                     agent_name=registered_agent.spec.name,
                     environment_name=_environment_name(registered_environment),
                     timestamp=closure_event.timestamp,

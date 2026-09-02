@@ -709,6 +709,7 @@ def _require_bounds(trajectory: Trajectory, bounds: RuntimeReplayBounds) -> None
 def _available_identity(value: RequestFingerprint) -> RuntimeReplayFingerprintIdentity:
     if (
         value.availability is not RequestFingerprintAvailability.AVAILABLE
+        or value.algorithm is None
         or value.key_id is None
         or value.value is None
     ):

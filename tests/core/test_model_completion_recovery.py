@@ -64,6 +64,7 @@ from cayu.runtime.budgets import (
     budget_reservation_authority_sha256,
     budget_settlement_id,
 )
+from cayu.runtime.build_provenance import current_runtime_build_provenance
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -225,6 +226,7 @@ def _test_execution_profile(
         provider_name=provider_name,
         model="fake-model",
         durable_system_prompt=None,
+        runtime_build_provenance=current_runtime_build_provenance(),
         redactor=profile_app._secret_redactor,
         process_identity=profile_app._execution_profile_process_identity,
         registered_provider=profile_app._providers[provider_name],

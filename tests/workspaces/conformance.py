@@ -246,6 +246,28 @@ async def verify_paging_and_conditional_mutations(workspace: Workspace) -> None:
     with pytest.raises(FileNotFoundError):
         await workspace.read_bytes("created.txt")
 
+    await workspace.write_bytes("race.txt", b"base")
+    race_revision = (await workspace.read_bytes("race.txt")).revision
+
+    async def contender(content: bytes) -> str:
+        try:
+            await workspace.replace_bytes(
+                "race.txt",
+                content,
+                expected_revision=race_revision,
+            )
+        except WorkspaceRevisionMismatchError:
+            return "stale"
+        return "replaced"
+
+    outcomes = await asyncio.gather(contender(b"first"), contender(b"second"))
+    assert sorted(outcomes) == ["replaced", "stale"]
+    assert (await workspace.read_bytes("race.txt")).content in {b"first", b"second"}
+
+
+async def verify_conditional_moves(workspace: Workspace) -> None:
+    """Verify optional authoritative absence and conditional-move support."""
+
     await workspace.require_absent("move-destination.txt")
     await workspace.create_bytes("move-source.txt", b"move-source")
     move_source = await workspace.read_bytes("move-source.txt")
@@ -281,24 +303,6 @@ async def verify_paging_and_conditional_mutations(workspace: Workspace) -> None:
         )
     assert (await workspace.read_bytes("blocked-move-source.txt")).content == b"source"
     assert (await workspace.read_bytes("move-destination.txt")).content == b"move-source"
-
-    await workspace.write_bytes("race.txt", b"base")
-    race_revision = (await workspace.read_bytes("race.txt")).revision
-
-    async def contender(content: bytes) -> str:
-        try:
-            await workspace.replace_bytes(
-                "race.txt",
-                content,
-                expected_revision=race_revision,
-            )
-        except WorkspaceRevisionMismatchError:
-            return "stale"
-        return "replaced"
-
-    outcomes = await asyncio.gather(contender(b"first"), contender(b"second"))
-    assert sorted(outcomes) == ["replaced", "stale"]
-    assert (await workspace.read_bytes("race.txt")).content in {b"first", b"second"}
 
 
 async def verify_listing_contract(workspace: Workspace) -> None:

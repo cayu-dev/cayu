@@ -114,6 +114,11 @@ def _snapshot(recall_policy: AutomaticRecallPolicy | None = None) -> AgentSnapsh
                 fingerprint=_digest("profile:recall"),
                 availability="available",
             ),
+            AgentSnapshotExecutionProfileComponent(
+                name="runtime",
+                fingerprint=_digest("profile:runtime"),
+                availability="available",
+            ),
         ),
     )
     memory = MemoryStateRef.create(

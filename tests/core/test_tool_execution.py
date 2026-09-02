@@ -117,7 +117,15 @@ class _StalledKnowledgePublicationStore(_TestKnowledgeStore):
         self.operation_id: str | None = None
         self.publish_calls = 0
 
-    async def publish_entry_revision(self, entry, chunks, *, operation_id, expected_revision=None):
+    async def publish_entry_revision(
+        self,
+        entry,
+        chunks,
+        *,
+        operation_id,
+        expected_revision=None,
+        activation_authority=None,
+    ):
         self.publish_calls += 1
         self.operation_id = operation_id
         self.dispatched.set()
@@ -127,6 +135,7 @@ class _StalledKnowledgePublicationStore(_TestKnowledgeStore):
             chunks,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
         self.settled.set()
         return receipt
@@ -162,13 +171,22 @@ class _CancellationResistantKnowledgeReadStore(_TestKnowledgeStore):
             await self._stall()
         return await super().get_entry(entry_id)
 
-    async def publish_entry_revision(self, entry, chunks, *, operation_id, expected_revision=None):
+    async def publish_entry_revision(
+        self,
+        entry,
+        chunks,
+        *,
+        operation_id,
+        expected_revision=None,
+        activation_authority=None,
+    ):
         self.publish_calls += 1
         return await super().publish_entry_revision(
             entry,
             chunks,
             operation_id=operation_id,
             expected_revision=expected_revision,
+            activation_authority=activation_authority,
         )
 
 
@@ -299,8 +317,15 @@ def test_remember_knowledge_ambiguous_failure_event_is_bounded_and_content_free(
 
     class AmbiguousKnowledgeStore(_TestKnowledgeStore):
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
+            del activation_authority
             raise RuntimeError(f"{exception_canary}: {knowledge_canary}")
 
     async def run():
@@ -609,6 +634,7 @@ def test_app_shutdown_seals_and_bounds_registered_knowledge_publications() -> No
             *,
             operation_id,
             expected_revision=None,
+            activation_authority=None,
         ):
             try:
                 return await super().publish_entry_revision(
@@ -616,6 +642,7 @@ def test_app_shutdown_seals_and_bounds_registered_knowledge_publications() -> No
                     chunks,
                     operation_id=operation_id,
                     expected_revision=expected_revision,
+                    activation_authority=activation_authority,
                 )
             finally:
                 self.stopped.set()
@@ -883,9 +910,15 @@ def test_remember_knowledge_detaches_hostile_conflict_classification_at_runtime(
 
     class HostileConflictStore(_TestKnowledgeStore):
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
-            del entry, chunks, operation_id
+            del entry, chunks, operation_id, activation_authority
             raise failure
 
     async def run():
@@ -967,9 +1000,15 @@ def test_remember_knowledge_omits_unconfirmed_receipt_id_from_failure_evidence(
             return receipt
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
-            del entry, chunks, operation_id
+            del entry, chunks, operation_id, activation_authority
             self.publish_calls += 1
             raise AssertionError("A prior receipt must prevent publication dispatch.")
 
@@ -1017,7 +1056,7 @@ def test_remember_knowledge_omits_unconfirmed_receipt_id_from_failure_evidence(
     for failure in (public_failure, private_failure):
         assert failure.payload["result"]["structured"] == {
             "error": "knowledge_write_failed",
-            "outcome": "receipt_conflict",
+            "outcome": "activation_receipt_missing",
             "cleanup": "not_attempted_unowned",
         }
     rendered = repr(
@@ -1503,7 +1542,13 @@ def test_remember_knowledge_contains_store_output_cancellation_during_validation
             ).model_copy(update={"committed_at": hostile_datetime()})
 
         async def publish_entry_revision(
-            self, entry, chunks, *, operation_id, expected_revision=None
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+            activation_authority=None,
         ):
             self.publish_calls += 1
             receipt = await super().publish_entry_revision(
@@ -1511,6 +1556,7 @@ def test_remember_knowledge_contains_store_output_cancellation_during_validation
                 chunks,
                 operation_id=operation_id,
                 expected_revision=expected_revision,
+                activation_authority=activation_authority,
             )
             if output_phase != "publication":
                 return receipt

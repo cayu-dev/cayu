@@ -4021,7 +4021,7 @@ def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
         assert task.cancelling() == 1
         with pytest.raises(
             asyncio.CancelledError,
-            match="Chat Completions provider request cancelled",
+            match="Provider operation cancelled",
         ):
             await task
         return await store.load_events(session_id), await store.load_transcript(session_id), task

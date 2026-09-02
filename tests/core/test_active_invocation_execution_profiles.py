@@ -67,6 +67,7 @@ from cayu import (
     RetryPolicy,
     RunLimits,
     RunRequest,
+    RuntimeBuildProvenance,
     RuntimeHook,
     RuntimeHookContext,
     ScriptedModelProvider,
@@ -549,6 +550,7 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
             request_metadata={},
             task_id=None,
             task_worker_id=None,
+            task_handoff_id=None,
             start_event_type=None,
             start_event_payload={},
             start_task_on_enter=False,
@@ -2165,7 +2167,11 @@ def test_fork_current_child_rejects_unavailable_identity_before_child_creation(
         )
         app.register_provider(ScriptedModelProvider([], name="fake"), default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
-        monkeypatch.setattr(session_engine_module, "_runtime_version", lambda: None)
+        monkeypatch.setattr(
+            session_engine_module,
+            "current_runtime_build_provenance",
+            lambda: RuntimeBuildProvenance.unavailable("test_unavailable"),
+        )
 
         with pytest.raises(
             RuntimeError,
@@ -4310,7 +4316,7 @@ def test_cancelled_run_finalization_keeps_process_local_runtime_after_registrati
         try:
             await run_task
         except asyncio.CancelledError as cancellation:
-            assert cancellation.args == ("cancel frozen-profile run",)
+            assert cancellation.args == ("Provider operation cancelled",)
         else:
             pytest.fail("Run cancellation did not propagate.")
         assert run_task.cancelled() is True

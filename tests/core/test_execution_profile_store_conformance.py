@@ -34,6 +34,11 @@ from cayu.runtime._invocation_lifecycle import (
     _release_invocation_command_with_cleanup_authority,
     invocation_checkpoint_state_sha256,
 )
+from cayu.runtime.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
 from cayu.runtime.execution_profiles import (
     ActiveInvocationExecutionProfile,
     ExecutionProfileComponentClass,
@@ -51,6 +56,11 @@ def _profile(*, tool_name: str) -> ExecutionProfileIdentity:
         runtime_version="test",
         provider_name="fake",
         model="fake-model",
+        runtime_build_provenance=RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="a" * 64,
+        ),
         durable_system_prompt="durable instructions",
         direct_tools=[
             {

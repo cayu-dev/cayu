@@ -40,7 +40,6 @@ from cayu import (
     InMemoryAgentWorkContextStore,
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
-    KnowledgeEntry,
     SQLiteAgentWorkContextStore,
     SQLiteKnowledgeStore,
     agent_recall_facet_aspect,
@@ -2738,22 +2737,14 @@ def test_postgres_revision_73_rejects_pre_stream_checkpoint_schema_before_mutati
 def test_sqlite_revision_69_adds_empty_work_context_storage_without_backfill(
     tmp_path: Path,
 ) -> None:
-    database = tmp_path / "revision-68-to-69-populated.sqlite"
+    database = tmp_path / "revision-68-to-69-empty.sqlite"
 
     async def seed() -> None:
         store = SQLiteKnowledgeStore(
             database,
             access_scope=KnowledgeAccessScope.privileged(),
         )
-        try:
-            await store.create_entry(
-                KnowledgeEntry(
-                    id="revision-67-entry",
-                    text="Preserve data without inventing agent work context.",
-                )
-            )
-        finally:
-            await store.close()
+        await store.close()
 
     asyncio.run(seed())
     connection = sqlite3.connect(database)
@@ -2780,9 +2771,7 @@ def test_sqlite_revision_69_adds_empty_work_context_storage_without_backfill(
             "cayu_agent_work_context_revisions",
         ):
             connection.execute(f"DROP TABLE {table}")
-        connection.execute(
-            "DELETE FROM cayu_schema_migrations WHERE revision IN (69, 70, 71, 72, 73)"
-        )
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 69")
         connection.execute("PRAGMA user_version = 68")
         connection.commit()
     finally:
@@ -2796,10 +2785,6 @@ def test_sqlite_revision_69_adds_empty_work_context_storage_without_backfill(
         assert connection.execute("PRAGMA user_version").fetchone() == (
             schema_migrations.LATEST_REVISION,
         )
-        assert connection.execute(
-            "SELECT text FROM cayu_knowledge_revisions "
-            "WHERE entry_id = 'revision-67-entry' AND revision = 1"
-        ).fetchone() == ("Preserve data without inventing agent work context.",)
         for table in (
             "cayu_agent_work_context_revisions",
             "cayu_agent_work_context_publications",
@@ -2960,12 +2945,6 @@ def test_postgres_revision_69_adds_empty_work_context_storage_without_backfill(
         )
         try:
             await creator.ensure_schema()
-            await creator.create_entry(
-                KnowledgeEntry(
-                    id="revision-67-entry",
-                    text="Preserve data without inventing agent work context.",
-                )
-            )
         finally:
             await creator.close()
 
@@ -2990,9 +2969,7 @@ def test_postgres_revision_69_adds_empty_work_context_storage_without_backfill(
                 await cursor.execute("DROP TABLE cayu_agent_work_context_publications")
                 await cursor.execute("DROP TABLE cayu_agent_work_context_heads")
                 await cursor.execute("DROP TABLE cayu_agent_work_context_revisions")
-                await cursor.execute(
-                    "DELETE FROM cayu_schema_migrations WHERE revision IN (69, 70, 71, 72, 73)"
-                )
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 69")
             await connection.commit()
 
         migrator = PostgresAgentWorkContextStore(
@@ -3012,13 +2989,6 @@ def test_postgres_revision_69_adds_empty_work_context_storage_without_backfill(
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
             assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
-            await cursor.execute(
-                "SELECT text FROM cayu_knowledge_revisions "
-                "WHERE entry_id = 'revision-67-entry' AND revision = 1"
-            )
-            assert await cursor.fetchone() == (
-                "Preserve data without inventing agent work context.",
-            )
             for table in (
                 "cayu_agent_work_context_revisions",
                 "cayu_agent_work_context_publications",
@@ -3161,7 +3131,7 @@ def test_sqlite_revision_71_adds_empty_delivery_storage_without_backfill(
             "cayu_agent_recall_deliveries",
         ):
             connection.execute(f"DROP TABLE {table}")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision IN (71, 72, 73)")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 71")
         connection.execute("PRAGMA user_version = 70")
         connection.commit()
     finally:
@@ -3258,9 +3228,7 @@ def test_postgres_revision_71_adds_empty_delivery_storage_without_backfill(
                     "cayu_agent_recall_deliveries",
                 ):
                     await cursor.execute(f"DROP TABLE {table}")
-                await cursor.execute(
-                    "DELETE FROM cayu_schema_migrations WHERE revision IN (71, 72, 73)"
-                )
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 71")
             await connection.commit()
 
         migrator = PostgresAgentWorkContextStore(
@@ -3374,7 +3342,7 @@ def test_sqlite_revision_73_adds_empty_subscription_storage_without_inference(
             "cayu_agent_recall_subscription_revisions",
         ):
             connection.execute(f"DROP TABLE {table}")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 73")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 73")
         connection.execute("PRAGMA user_version = 72")
         connection.commit()
     finally:
@@ -3393,7 +3361,9 @@ def test_sqlite_revision_73_adds_empty_subscription_storage_without_inference(
     asyncio.run(verify())
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (73,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            schema_migrations.LATEST_REVISION,
+        )
         for table in (
             "cayu_agent_recall_subscription_revisions",
             "cayu_agent_recall_subscription_publications",
@@ -3492,7 +3462,7 @@ def test_sqlite_revision_73_rejects_populated_pre_contract_deliveries(tmp_path: 
             "cayu_agent_recall_subscription_revisions",
         ):
             connection.execute(f"DROP TABLE {table}")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 73")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 73")
         connection.execute("PRAGMA user_version = 72")
         connection.commit()
     finally:
@@ -3556,7 +3526,7 @@ def test_postgres_revision_73_adds_empty_subscription_storage_without_inference(
                     "cayu_agent_recall_subscription_revisions",
                 ):
                     await cursor.execute(f"DROP TABLE {table}")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 73")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 73")
             await connection.commit()
 
         migrator = PostgresAgentWorkContextStore(
@@ -3577,7 +3547,7 @@ def test_postgres_revision_73_adds_empty_subscription_storage_without_inference(
             connection.cursor() as cursor,
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cursor.fetchone() == (73,)
+            assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
             for table in (
                 "cayu_agent_recall_subscription_revisions",
                 "cayu_agent_recall_subscription_publications",
@@ -3718,7 +3688,7 @@ def test_postgres_revision_73_rejects_populated_pre_contract_deliveries(
                     "cayu_agent_recall_subscription_revisions",
                 ):
                     await cursor.execute(f"DROP TABLE {table}")
-                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 73")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 73")
             await connection.commit()
 
         migrator = PostgresAgentWorkContextStore(

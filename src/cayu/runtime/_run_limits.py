@@ -37,6 +37,7 @@ from cayu.core.events import (
     event_with_runtime_payload_authority,
 )
 from cayu.providers import ModelProviderError
+from cayu.providers._credential_boundary import provider_cancellation_failures
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limit_accounting import RunBudgetAccountingAuthority
 from cayu.runtime._session_queries import query_all_event_records
@@ -650,6 +651,10 @@ class ModelCompletionBudgetSettlementPending(RuntimeError):
     """Raised while a model stage still owns reservations without durable settlement."""
 
 
+class ProviderIteratorCleanupError(RuntimeError):
+    """Credential-free evidence that a cancelled provider iterator did not stop cleanly."""
+
+
 _PROVIDER_CLEANUP_FAILURE_ATTRIBUTE = "_cayu_budget_provider_cleanup_failure"
 _PROVIDER_CLEANUP_FAILURE_TOKEN = object()
 
@@ -697,6 +702,17 @@ def budget_provider_cleanup_failure(
     ):
         return None
     return handoff.failure
+
+
+def _safe_provider_stream_cleanup_failure(
+    cancellation: asyncio.CancelledError,
+) -> ProviderIteratorCleanupError | None:
+    """Reconstruct only authenticated, credential-free cleanup evidence."""
+
+    failures = provider_cancellation_failures(cancellation)
+    if not failures:
+        return None
+    return ProviderIteratorCleanupError(failures[0]["error"])
 
 
 class BudgetDispatchReservationFailed(RuntimeError):
@@ -3107,15 +3123,17 @@ class RunLimitController:
                         next_item_task.cancel()
                         try:
                             await next_item_task
-                        except asyncio.CancelledError:
-                            pass
+                        except asyncio.CancelledError as cancellation:
+                            provider_failure = _safe_provider_stream_cleanup_failure(cancellation)
                         except Exception as exc:
                             provider_failure = exc
                     else:
                         try:
                             completed_item = next_item_task.result()
-                        except (StopAsyncIteration, asyncio.CancelledError):
+                        except StopAsyncIteration:
                             pass
+                        except asyncio.CancelledError as cancellation:
+                            provider_failure = _safe_provider_stream_cleanup_failure(cancellation)
                         except Exception as exc:
                             provider_failure = exc
                     if provider_failure is not None:

@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from pydantic import SecretStr
 
 from cayu.core.agents import AgentSpec
@@ -15,6 +16,7 @@ from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.evals import runtime_replay as runtime_replay_module
 from cayu.evals.models import Trajectory, _trajectory_promotion_capture_sha256
 from cayu.evals.runtime_replay import (
     RuntimeReplayBoundaryKind,
@@ -31,6 +33,10 @@ from cayu.providers import ModelStreamEvent
 from cayu.runtime import CayuApp, RequestFootprintConfig, RunRequest
 from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.request_footprints import (
+    RequestFingerprint,
+    RequestFingerprintAvailability,
+)
 from cayu.runtime.sessions import ModelTarget
 from cayu.runtime.tool_policy import StaticToolPolicy
 
@@ -973,6 +979,22 @@ def test_runtime_contract_replay_fails_closed_when_footprint_evidence_is_missing
 
     assert report.disposition is RuntimeReplayDisposition.UNAVAILABLE
     assert report.reason is RuntimeReplayReason.SOURCE_REQUEST_FOOTPRINT_UNAVAILABLE
+
+
+def test_runtime_contract_replay_rejects_incomplete_available_fingerprint() -> None:
+    malformed = RequestFingerprint.model_construct(
+        availability=RequestFingerprintAvailability.AVAILABLE,
+        value="a" * 64,
+        algorithm=None,
+        key_id="test-key",
+        canonicalization_version=1,
+        unavailable_reason=None,
+    )
+
+    with pytest.raises(runtime_replay_module._ReplayUnavailable) as exc_info:
+        runtime_replay_module._available_identity(malformed)
+
+    assert exc_info.value.reason is RuntimeReplayReason.SOURCE_REQUEST_FOOTPRINT_UNAVAILABLE
 
 
 def test_runtime_contract_replay_rejects_detached_trajectory_without_input_authority() -> None:

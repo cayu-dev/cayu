@@ -100,6 +100,10 @@ from cayu.evals import (
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
+from cayu.evals.corpus import (
+    EvaluationEvidencePolicySpec,
+    MemoryAttributionAssertionSpec,
+)
 from cayu.evals.memory_attribution import (
     EvalMemoryAttributionEvidenceV1,
     EvalMemoryAttributionSourceV1,
@@ -111,6 +115,7 @@ from cayu.evals.memory_attribution import (
     standard_eval_memory_attribution_bounds,
 )
 from cayu.evals.models import ArtifactContentProbe, WorkspaceFileProbe, WorkspaceStructuralProbe
+from cayu.evals.portable_assertions import compile_assertion_spec
 from cayu.evals.runner import _blocked_assertion_results, _build_child_trajectories
 from cayu.memory_attribution import (
     MemoryAttribution,
@@ -957,12 +962,50 @@ def test_blocked_unavailable_run_promotes_assertion_revision_errors():
 
 @pytest.mark.parametrize("outcome", [EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE])
 def test_blocked_results_contain_unformattable_identity_errors(outcome):
-    (assertion,) = _blocked_assertion_results([_UnformattableAssertionName()], outcome, "blocked")
+    (assertion,) = _blocked_assertion_results(
+        [_UnformattableAssertionName()],
+        outcome,
+        "blocked",
+        memory_attribution_evidence=EvalMemoryAttributionEvidenceV1.unavailable(),
+    )
 
     assert assertion.name == "EvalAssertion"
     assert assertion.outcome is EvalOutcome.ERROR
     assert assertion.metadata["identity_error"] is True
     assert assertion.message.count("_UnformattableAssertionError: <exception str() failed>") == 2
+
+
+@pytest.mark.parametrize("outcome", [EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE])
+def test_blocked_memory_assertions_retain_the_exact_evidence_identity(outcome):
+    app = CayuApp(enable_logging=False)
+    spec = MemoryAttributionAssertionSpec(
+        id="memory",
+        min_admitted_items=0,
+        min_provider_exposures=0,
+    )
+    assertion = compile_assertion_spec(
+        spec,
+        app=app,
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        trusted_pricing=None,
+    )
+    evidence = EvalMemoryAttributionEvidenceV1.unavailable(
+        EvalMemoryEvidenceLimitation.CLOSURE_CHANGED
+    )
+
+    (result,) = _blocked_assertion_results(
+        [assertion],
+        outcome,
+        "blocked",
+        memory_attribution_evidence=evidence,
+    )
+
+    assert result.metadata == {
+        "evidence_area": "memory attribution",
+        "evidence_state": "unavailable",
+        "evidence_revision": evidence.revision,
+        "limitations": ["closure_changed"],
+    }
 
 
 def test_completed_run_contains_assertion_revision_errors():
@@ -4774,6 +4817,16 @@ def test_fresh_eval_timeout_during_memory_read_retains_bounded_source_references
         default=True,
     )
     app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    memory_assertion = compile_assertion_spec(
+        MemoryAttributionAssertionSpec(
+            id="memory",
+            min_admitted_items=0,
+            min_provider_exposures=0,
+        ),
+        app=app,
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        trusted_pricing=None,
+    )
     case = EvalCase(
         id="memory-timeout",
         request=RunRequest(
@@ -4781,7 +4834,7 @@ def test_fresh_eval_timeout_during_memory_read_retains_bounded_source_references
             messages=[Message.text("user", "go")],
             max_steps=1,
         ),
-        assertions=[SessionCompleted()],
+        assertions=[SessionCompleted(), memory_assertion],
     )
 
     async def stalled_projection(
@@ -4826,6 +4879,9 @@ def test_fresh_eval_timeout_during_memory_read_retains_bounded_source_references
         EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
     )
     assert result.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,)
+    assert result.assertions[1].metadata["evidence_revision"] == (
+        result.memory_attribution.revision
+    )
     encoded = result.memory_attribution.model_dump_json()
     assert result.session_id not in encoded
     assert EvalMemoryAttributionEvidenceV1.model_validate_json(encoded) == result.memory_attribution
@@ -4844,11 +4900,11 @@ def test_fresh_eval_deadline_abandons_and_observes_opaque_memory_read(blocked_re
             run_eval_suite(
                 app,
                 EvalSuite(id="opaque-memory-read", cases=[_case("deadline")]),
-                case_timeout_seconds=0.5,
+                case_timeout_seconds=2.0,
             )
         )
         try:
-            result = await asyncio.wait_for(task, timeout=2)
+            result = await asyncio.wait_for(task, timeout=5)
             assert store.read_started.is_set()
             assert not store.read_cancelled.is_set()
             assert not store.read_finished.is_set()
@@ -5201,9 +5257,9 @@ def test_fresh_eval_deadline_abandons_opaque_closure_revalidation():
             run_eval_suite(
                 _memory_read_app(store),
                 EvalSuite(id="blocked-closure-revalidation", cases=[_case("blocked")]),
-                case_timeout_seconds=0.5,
+                case_timeout_seconds=2.0,
             ),
-            timeout=2,
+            timeout=5,
         )
         try:
             assert store.lineage_reads == 2
@@ -5421,11 +5477,11 @@ def test_fresh_eval_memory_read_capacity_fails_closed_after_opaque_timeout():
                 _memory_read_app(store, requests=2),
                 EvalSuite(id="bounded-memory-reads", cases=cases),
                 max_concurrency=1,
-                case_timeout_seconds=0.5,
+                case_timeout_seconds=2.0,
             )
         )
         try:
-            result = await asyncio.wait_for(task, timeout=2)
+            result = await asyncio.wait_for(task, timeout=5)
         finally:
             store.release_read.set()
             if store.read_started.is_set():

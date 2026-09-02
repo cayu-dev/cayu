@@ -4650,6 +4650,7 @@ def test_generic_continuation_failure_replays_after_task_terminalization_loss(
             EventType.HOOK_STARTED,
             EventType.HOOK_COMPLETED,
         ]
+        assert all(event.interaction_id is None for event in terminal_hook_events)
         assert (
             terminal_hook_events[0].payload["hook_invocation_id"]
             == terminal_hook_events[1].payload["hook_invocation_id"]

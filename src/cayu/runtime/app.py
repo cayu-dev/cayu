@@ -3319,7 +3319,24 @@ class CayuApp:
         return copy_retry_policy(self._default_retry_policy)
 
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
-        stream = self._run_private(request)
+        stream = self._run_with_public_projection(request)
+        del request
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
+
+    async def _run_with_public_projection(
+        self,
+        request: RunRequest,
+        *,
+        expected_execution_profile: ExecutionProfileIdentity | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        """Run with pinned authority while retaining the public event contract."""
+
+        stream = self._run_private(
+            request,
+            expected_execution_profile=expected_execution_profile,
+        )
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -7067,12 +7084,16 @@ class CayuApp:
                 task_handoff_id=task_handoff_id,
                 admit_session=True,
             ),
-            after_admission=lambda: self._require_continuation_task_authority(
-                session_id=session_id,
-                session_instance_id=task_session_instance_id,
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
             ),
         )
         del response
@@ -7149,12 +7170,16 @@ class CayuApp:
                 task_handoff_id=task_handoff_id,
                 admit_session=True,
             ),
-            after_admission=lambda: self._require_continuation_task_authority(
-                session_id=session_id,
-                session_instance_id=task_session_instance_id,
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
             ),
         )
         del request
@@ -7242,13 +7267,17 @@ class CayuApp:
                 task_handoff_id=task_handoff_id,
                 allow_terminal_failure_replay=allow_terminal_failure_replay,
             ),
-            after_admission=lambda: self._require_continuation_task_authority(
-                session_id=session_id,
-                session_instance_id=task_session_instance_id,
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
-                allow_terminal_failure_replay=allow_terminal_failure_replay,
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    allow_terminal_failure_replay=allow_terminal_failure_replay,
+                )
             ),
         )
         del request
@@ -7300,13 +7329,17 @@ class CayuApp:
                 admit_session=True,
                 approval_failure_identity=approval_failure_identity,
             ),
-            after_admission=lambda: self._require_continuation_task_authority(
-                session_id=session_id,
-                session_instance_id=task_session_instance_id,
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
-                approval_failure_identity=approval_failure_identity,
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                    approval_failure_identity=approval_failure_identity,
+                )
             ),
         )
         del request
@@ -7380,12 +7413,16 @@ class CayuApp:
                 task_handoff_id=task_handoff_id,
                 admit_session=True,
             ),
-            after_admission=lambda: self._require_continuation_task_authority(
-                session_id=session_id,
-                session_instance_id=task_session_instance_id,
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
             ),
         )
         del request
@@ -7475,12 +7512,16 @@ class CayuApp:
                 task_handoff_id=task_handoff_id,
                 admit_session=True,
             ),
-            after_admission=lambda: self._require_continuation_task_authority(
-                session_id=session_id,
-                session_instance_id=task_session_instance_id,
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
+            after_admission=(
+                None
+                if task_id is None
+                else lambda: self._require_continuation_task_authority(
+                    session_id=session_id,
+                    session_instance_id=task_session_instance_id,
+                    task_id=task_id,
+                    task_worker_id=task_worker_id,
+                    task_handoff_id=task_handoff_id,
+                )
             ),
         )
         del request

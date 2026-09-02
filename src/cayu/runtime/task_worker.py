@@ -1379,7 +1379,12 @@ async def _settle_interrupted_task_handoff_once(
         owner_secondary_failure: RuntimeError | None = None
         child_cancellation_failure: RuntimeError | None = None
         try:
-            receipt = await asyncio.shield(operation_task)
+            # Wait on the owned task directly without an ``asyncio.shield``
+            # proxy. Cancelling a shield proxy before the store settles can
+            # make asyncio log the store's later raw exception even when this
+            # owner subsequently observes and redacts it.
+            await asyncio.wait((operation_task,))
+            receipt = operation_task.result()
         except asyncio.CancelledError as exc:
             if owner_task.cancelling() > cancellation_baseline:
                 cancellation_baseline = owner_task.cancelling()

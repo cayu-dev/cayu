@@ -24,10 +24,13 @@ from cayu.core import (
 from cayu.runtime import (
     InteractionStatus,
     InteractionSummaryEvidence,
+    PendingToolApproval,
     RunRequest,
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime.approvals import PendingToolCallApproval
+from cayu.runtime.user_input import PendingUserInput
 
 
 def _budget_limit_id(value: int) -> str:
@@ -1088,22 +1091,19 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
         "tool_round_id": f"tround_{'3' * 32}",
     }
 
-    def pending_call(call_id: str, tool_name: str) -> dict[str, object]:
-        return {
-            "tool_call_id": call_id,
-            "tool_name": tool_name,
-            "arguments": {},
-            "policy_decision": None,
-            "reason": None,
-            "metadata": {},
-            "active_taint_labels": [],
-        }
+    def pending_call(call_id: str, tool_name: str) -> PendingToolCallApproval:
+        return PendingToolCallApproval(
+            tool_call_id=call_id,
+            tool_name=tool_name,
+            arguments={},
+        )
 
     async def seed() -> None:
         store = SQLiteSessionStore(database)
         try:
+            created_sessions = {}
             for session_id in ("sess_approval", "sess_input"):
-                await store.create(
+                created_sessions[session_id] = await store.create(
                     RunRequest(
                         agent_name="operator",
                         session_id=session_id,
@@ -1111,6 +1111,18 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                     ),
                     identity=SessionIdentity(provider_name="fake", model="model"),
                 )
+
+            approval_call = pending_call("call-approval", "deploy")
+            approval = PendingToolApproval(
+                **execution_identity,
+                approval_id="approval-1",
+                tool_call_id=approval_call.tool_call_id,
+                tool_name=approval_call.tool_name,
+                arguments=approval_call.arguments,
+                agent_name="operator",
+                publish_arguments=True,
+                tool_calls=[approval_call],
+            )
 
             await store.append_event(
                 "sess_approval",
@@ -1123,34 +1135,34 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                         **execution_identity,
                         "approval_id": "approval-1",
                         "tool_call_id": "call-approval",
-                        "approval": {
-                            **execution_identity,
-                            "approval_id": "approval-1",
-                            "tool_call_id": "call-approval",
-                            "tool_name": "deploy",
-                            "arguments": {},
-                            "agent_name": "operator",
-                            "tool_calls": [pending_call("call-approval", "deploy")],
-                        },
+                        "approval": approval.model_dump(mode="json"),
                     },
                 ),
             )
             await store.checkpoint(
                 "sess_approval",
-                {
-                    "pending_tool_approval": {
-                        **execution_identity,
-                        "approval_id": "approval-1",
-                        "tool_call_id": "call-approval",
-                        "tool_name": "deploy",
-                        "arguments": {},
-                        "agent_name": "operator",
-                        "publish_arguments": True,
-                        "tool_calls": [pending_call("call-approval", "deploy")],
-                    }
-                },
+                {"pending_tool_approval": approval.model_dump(mode="json")},
             )
             await store.update_status("sess_approval", SessionStatus.INTERRUPTED)
+
+            input_call = pending_call("call-input", "ask_user")
+            input_session = created_sessions["sess_input"]
+            pending_input = PendingUserInput(
+                **execution_identity,
+                session_id=input_session.id,
+                session_instance_id="session-instance-input",
+                source_interaction_id="interaction-input-source",
+                source_run_epoch=input_session.run_epoch,
+                input_id="input-1",
+                tool_call_id=input_call.tool_call_id,
+                tool_name=input_call.tool_name,
+                question="Deploy?",
+                options=["yes", "no"],
+                arguments=input_call.arguments,
+                agent_name="operator",
+                execution_profile_fingerprint="e" * 64,
+                tool_calls=[input_call],
+            )
 
             await store.append_event(
                 "sess_input",
@@ -1169,19 +1181,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
             )
             await store.checkpoint(
                 "sess_input",
-                {
-                    "pending_user_input": {
-                        **execution_identity,
-                        "input_id": "input-1",
-                        "tool_call_id": "call-input",
-                        "tool_name": "ask_user",
-                        "question": "Deploy?",
-                        "options": ["yes", "no"],
-                        "arguments": {},
-                        "agent_name": "operator",
-                        "tool_calls": [pending_call("call-input", "ask_user")],
-                    }
-                },
+                {"pending_user_input": pending_input.model_dump(mode="json")},
             )
             await store.update_status("sess_input", SessionStatus.INTERRUPTED)
         finally:

@@ -1653,7 +1653,12 @@ async def _run_case_once_with_public_projection(
 
             if run_error is not None:
                 assertion_results = list(
-                    _blocked_assertion_results(case.assertions, EvalOutcome.ERROR, run_error)
+                    _blocked_assertion_results(
+                        case.assertions,
+                        EvalOutcome.ERROR,
+                        run_error,
+                        memory_attribution_evidence=memory_attribution,
+                    )
                 )
             elif unavailable_reason is not None:
                 assertion_results = list(
@@ -1661,6 +1666,7 @@ async def _run_case_once_with_public_projection(
                         case.assertions,
                         EvalOutcome.UNAVAILABLE,
                         unavailable_reason,
+                        memory_attribution_evidence=memory_attribution,
                     )
                 )
                 identity_error = _assertion_diagnostic(
@@ -1716,10 +1722,6 @@ async def _run_case_once_with_public_projection(
         # that evaluation itself did not finish. Earlier lifecycle timeouts have
         # no completed trajectory and remain evidence-incomplete.
         evidence_complete = trajectory is not None and not trajectory.children_incomplete
-        # Never expose a partially evaluated assertion prefix after cancellation.
-        assertion_results = list(
-            _blocked_assertion_results(case.assertions, EvalOutcome.ERROR, run_error)
-        )
         if (
             memory_attribution.completeness.value == "unavailable"
             and not memory_attribution.sources
@@ -1744,6 +1746,17 @@ async def _run_case_once_with_public_projection(
                     unavailable_reason=EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
                 )
             )
+        # Never expose a partially evaluated assertion prefix after cancellation. Bind
+        # blocked portable assertions to the final retained deadline evidence, not the
+        # pre-timeout snapshot that may have been replaced above.
+        assertion_results = list(
+            _blocked_assertion_results(
+                case.assertions,
+                EvalOutcome.ERROR,
+                run_error,
+                memory_attribution_evidence=memory_attribution,
+            )
+        )
 
     # A yielded runtime event proves the session was created before a deadline interrupted
     # evidence capture. Do not perform any store I/O after the deadline; without an event, the
@@ -2024,18 +2037,29 @@ def _blocked_assertion_results(
     assertions: Sequence[EvalAssertion],
     outcome: EvalOutcome,
     message: str,
+    *,
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1,
 ) -> tuple[EvalAssertionResult, ...]:
     if outcome not in (EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE):
         raise ValueError("Blocked assertions require an error or unavailable outcome.")
     results: list[EvalAssertionResult] = []
+    from cayu.evals.portable_assertions import _blocked_portable_assertion_result
+
     for assertion in assertions:
         try:
-            result = EvalAssertionResult(
-                name=assertion.name,
-                assertion_revision=assertion.assertion_revision,
-                outcome=outcome,
-                message=message,
+            result = _blocked_portable_assertion_result(
+                assertion,
+                outcome,
+                message,
+                memory_attribution_evidence=memory_attribution_evidence,
             )
+            if result is None:
+                result = EvalAssertionResult(
+                    name=assertion.name,
+                    assertion_revision=assertion.assertion_revision,
+                    outcome=outcome,
+                    message=message,
+                )
         except Exception as exc:
             result = _assertion_error_result(
                 assertion,

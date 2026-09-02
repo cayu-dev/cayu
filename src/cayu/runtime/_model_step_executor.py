@@ -38,6 +38,7 @@ from cayu._exception_groups import (
 from cayu._task_wait import (
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
+    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -710,7 +711,7 @@ async def _cancel_provider_operation_after_definite_absence(
     failure: BaseException,
     cancellation: asyncio.CancelledError | None = None,
     ownership_lost: asyncio.Event | None = None,
-) -> tuple[asyncio.CancelledError | None, ProviderOperationSnapshot | None]:
+) -> tuple[asyncio.CancelledError | None, ProviderOperationSnapshot | None, int]:
     async def cancel():
         return await adapter.cancel(copy_provider_operation_state(state))
 
@@ -745,6 +746,7 @@ async def _cancel_provider_operation_after_definite_absence(
         cancellation=cancellation,
         timeout_s=_PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS,
     )
+    cancellation_requests_consumed = outcome.cancellation_requests_consumed
     if outcome.timed_out:
         cleanup_task.cancel()
         drain_outcome = await await_shielded_task_outcome(
@@ -752,13 +754,14 @@ async def _cancel_provider_operation_after_definite_absence(
             cancellation=outcome.cancellation,
             timeout_s=_PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS,
         )
+        cancellation_requests_consumed += drain_outcome.cancellation_requests_consumed
         if drain_outcome.timed_out:
             cleanup_task.add_done_callback(_consume_detached_task_outcome)
             failure.add_note(
                 "Provider operation cancellation remained in flight after local task "
                 "cancellation; ownership was released with uncertain cleanup evidence."
             )
-            return drain_outcome.cancellation, None
+            return drain_outcome.cancellation, None, cancellation_requests_consumed
         cleanup_error = drain_outcome.error
         if isinstance(cleanup_error, asyncio.CancelledError):
             cleanup_error = None
@@ -768,7 +771,7 @@ async def _cancel_provider_operation_after_definite_absence(
         )
         if cleanup_error is not None:
             _attach_provider_operation_cleanup_failure(failure, cleanup_error)
-        return drain_outcome.cancellation, None
+        return drain_outcome.cancellation, None, cancellation_requests_consumed
     cleanup_error = outcome.error
     if isinstance(cleanup_error, asyncio.CancelledError) and outcome.cancellation is None:
         cleanup_error = unexpected_child_cancellation_error(
@@ -781,7 +784,7 @@ async def _cancel_provider_operation_after_definite_absence(
             "Provider operation cleanup after start-evidence failure also failed: "
             f"{type(cleanup_error).__name__}."
         )
-        return outcome.cancellation, None
+        return outcome.cancellation, None, cancellation_requests_consumed
     try:
         if outcome.result is None:
             raise RuntimeError("Provider operation cancellation returned no snapshot.")
@@ -796,8 +799,8 @@ async def _cancel_provider_operation_after_definite_absence(
             "Provider operation cleanup after start-evidence failure also failed: "
             f"{type(cleanup_error).__name__}."
         )
-        return outcome.cancellation, None
-    return outcome.cancellation, cancellation_snapshot
+        return outcome.cancellation, None, cancellation_requests_consumed
+    return outcome.cancellation, cancellation_snapshot, cancellation_requests_consumed
 
 
 class ModelAttemptFailed(Exception):
@@ -2326,10 +2329,17 @@ async def _owned_model_provider_events(
                         cancellation_baseline=cancellation_baseline,
                     )
                 task = asyncio.current_task()
-                if task is not None and task.cancelling() > cancellation_baseline:
+                if (
+                    task is not None
+                    and task.cancelling() > cancellation_baseline
+                    and event.type is not ModelStreamEventType.COMPLETED
+                ):
                     # A provider may catch the injected CancelledError and return a
                     # value instead. Task state remains the positive caller-owned
-                    # authority, so do not let that value resume ordinary execution.
+                    # authority, so do not let nonterminal output resume ordinary
+                    # execution. A validated completion is different: runtime must
+                    # durably publish terminal provider evidence that won the race,
+                    # then restore the same caller cancellation.
                     raise credential_safe_provider_cancellation(
                         "Provider operation cancelled",
                         preserve_empty_artifacts=False,
@@ -3052,7 +3062,11 @@ class ModelStepExecutor:
             )
             failure.__dict__["provider_operation_accounting_pending"] = True
             return None
-        cancellation, snapshot = await _cancel_provider_operation_after_definite_absence(
+        (
+            cancellation,
+            snapshot,
+            cancellation_requests_consumed,
+        ) = await _cancel_provider_operation_after_definite_absence(
             adapter=adapter,
             state=state,
             failure=failure,
@@ -3060,6 +3074,10 @@ class ModelStepExecutor:
             ownership_lost=cancellation_ownership_lost,
         )
         if cancellation is not None and cancellation is not failure:
+            restore_task_cancellation_requests(
+                cancellation_requests_consumed,
+                cancellation=cancellation,
+            )
             raise cancellation from failure
         if snapshot is None:
             await require_cancellation_owner()
@@ -6278,6 +6296,27 @@ class ModelStepExecutor:
                         _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS
                     ),
                 )
+
+                def raise_start_cancellation(
+                    cause: BaseException | None = None,
+                    *,
+                    additional_requests_consumed: int = 0,
+                ) -> Never:
+                    cancellation = start_outcome.cancellation
+                    if cancellation is None:
+                        raise RuntimeError("Provider start has no caller cancellation.")
+                    if start_outcome.cancellation_requests_consumed < 1:
+                        raise RuntimeError(
+                            "Provider start cancellation lost its consumed request count."
+                        ) from cancellation
+                    restore_task_cancellation_requests(
+                        start_outcome.cancellation_requests_consumed + additional_requests_consumed,
+                        cancellation=cancellation,
+                    )
+                    if cause is None:
+                        raise cancellation
+                    raise cancellation from cause
+
                 if start_outcome.timed_out:
                     start_task.cancel()
                     start_cancellation = start_outcome.cancellation
@@ -6298,8 +6337,9 @@ class ModelStepExecutor:
                         raise
                     try:
                         (
-                            _,
+                            late_cleanup_cancellation,
                             cancellation_snapshot,
+                            late_cleanup_cancellation_requests_consumed,
                         ) = await _cancel_provider_operation_after_definite_absence(
                             adapter=provider_operation_adapter,
                             state=late_operation.state,
@@ -6307,6 +6347,12 @@ class ModelStepExecutor:
                                 "Caller cancellation preceded provider start acknowledgement."
                             ),
                         )
+                        if late_cleanup_cancellation is not None:
+                            restore_task_cancellation_requests(
+                                late_cleanup_cancellation_requests_consumed,
+                                cancellation=late_cleanup_cancellation,
+                            )
+                            raise late_cleanup_cancellation
                         reconciled_status = (
                             late_operation.status
                             if cancellation_snapshot is None
@@ -6390,7 +6436,7 @@ class ModelStepExecutor:
                         "Provider operation start remained in flight after bounded cancellation "
                         "settlement; durable starting evidence prevents automatic retry."
                     )
-                    raise start_cancellation
+                    raise_start_cancellation()
 
                 start_error = start_outcome.error
                 if (
@@ -6403,7 +6449,7 @@ class ModelStepExecutor:
                     )
                 if start_error is not None:
                     if start_outcome.cancellation is not None:
-                        raise start_outcome.cancellation from start_error
+                        raise_start_cancellation(start_error)
                     if not isinstance(start_error, Exception):
                         raise start_error
                     raise _ambiguous_provider_operation_start_error(
@@ -6425,7 +6471,7 @@ class ModelStepExecutor:
                         raise
                 except Exception as start_validation_error:
                     if start_outcome.cancellation is not None:
-                        raise start_outcome.cancellation from start_validation_error
+                        raise_start_cancellation(start_validation_error)
                     raise _ambiguous_provider_operation_start_error(
                         provider_name=registered_provider.name,
                         cause=start_validation_error,
@@ -6443,6 +6489,7 @@ class ModelStepExecutor:
                     (
                         cleanup_cancellation,
                         _,
+                        cleanup_cancellation_requests_consumed,
                     ) = await _cancel_provider_operation_after_definite_absence(
                         adapter=provider_operation_adapter,
                         state=operation_state,
@@ -6451,6 +6498,17 @@ class ModelStepExecutor:
                     )
                     provider_operation_state = None
                     if cleanup_cancellation is not None:
+                        if cleanup_cancellation is start_outcome.cancellation:
+                            raise_start_cancellation(
+                                preparation_error,
+                                additional_requests_consumed=(
+                                    cleanup_cancellation_requests_consumed
+                                ),
+                            )
+                        restore_task_cancellation_requests(
+                            cleanup_cancellation_requests_consumed,
+                            cancellation=cleanup_cancellation,
+                        )
                         raise cleanup_cancellation from preparation_error
                     if isinstance(
                         preparation_error,
@@ -6478,9 +6536,11 @@ class ModelStepExecutor:
                             f"{type(verification_error).__name__}."
                         )
                         if start_outcome.cancellation is not None:
-                            raise start_outcome.cancellation from BaseExceptionGroup(
-                                "Provider operation publication and readback both failed.",
-                                [persistence_error, verification_error],
+                            raise_start_cancellation(
+                                BaseExceptionGroup(
+                                    "Provider operation publication and readback both failed.",
+                                    [persistence_error, verification_error],
+                                )
                             )
                         if isinstance(
                             verification_error,
@@ -6502,6 +6562,7 @@ class ModelStepExecutor:
                         (
                             cleanup_cancellation,
                             _,
+                            cleanup_cancellation_requests_consumed,
                         ) = await _cancel_provider_operation_after_definite_absence(
                             adapter=provider_operation_adapter,
                             state=operation_state,
@@ -6510,9 +6571,20 @@ class ModelStepExecutor:
                         )
                         provider_operation_state = None
                         if cleanup_cancellation is not None:
+                            if cleanup_cancellation is start_outcome.cancellation:
+                                raise_start_cancellation(
+                                    persistence_error,
+                                    additional_requests_consumed=(
+                                        cleanup_cancellation_requests_consumed
+                                    ),
+                                )
+                            restore_task_cancellation_requests(
+                                cleanup_cancellation_requests_consumed,
+                                cancellation=cleanup_cancellation,
+                            )
                             raise cleanup_cancellation from persistence_error
                     if start_outcome.cancellation is not None:
-                        raise start_outcome.cancellation from persistence_error
+                        raise_start_cancellation(persistence_error)
                     if isinstance(
                         persistence_error,
                         SessionInterruptedByRequest | SessionRunFenced,
@@ -6530,7 +6602,7 @@ class ModelStepExecutor:
                     )
                 except BaseException as delivery_error:
                     if start_outcome.cancellation is not None:
-                        raise start_outcome.cancellation from delivery_error
+                        raise_start_cancellation(delivery_error)
                     if isinstance(
                         delivery_error,
                         SessionInterruptedByRequest | SessionRunFenced,
@@ -6550,7 +6622,7 @@ class ModelStepExecutor:
                     provider_request_id=provider_operation_state.operation_id,
                 )
                 if start_outcome.cancellation is not None:
-                    raise start_outcome.cancellation
+                    raise_start_cancellation()
                 yield emitted_operation_event, None
             async for raw_stream_event in provider_events:
                 boundary_value = _validate_stream_event(

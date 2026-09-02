@@ -262,6 +262,7 @@ from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
     record_binding_cleanup_failure,
 )
+from cayu.runtime._continuation_task_failure import runtime_task_failure_identity_from_task
 from cayu.runtime._event_projection import (
     PRIVATE_EVENT_AUTHORITY,
     public_event_id,
@@ -11195,8 +11196,8 @@ def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -
     assert events[-1].payload["error_type"] == "BudgetReservationLeaseLost"
     assert events[-1].payload["error"].startswith("Budget reservation lease was lost:")
     assert events[-1].payload["provider_cleanup_failure"] == {
-        "error": f"provider cancellation cleanup failed: {REDACTED_SECRET}",
-        "error_type": "RuntimeError",
+        "error": "Model provider stream failed before cancellation.",
+        "error_type": "ProviderIteratorCleanupError",
         "phase": "provider_iterator_cleanup",
     }
     assert "provider-cleanup-secret-canary" not in repr(events[-1].payload)
@@ -15272,7 +15273,7 @@ def test_model_compactor_drops_custom_billing_hook_cancellation_credentials(
         ]
     )
 
-    with pytest.raises(asyncio.CancelledError) as exc_info:
+    with pytest.raises(ModelProviderError) as exc_info:
         asyncio.run(
             ModelCompactor(provider=provider, model="summary-model").compact(
                 CompactionRequest(
@@ -15284,10 +15285,11 @@ def test_model_compactor_drops_custom_billing_hook_cancellation_credentials(
         )
 
     retained = str(exc_info.value) + repr(exc_info.value) + repr(vars(exc_info.value))
-    assert retained == (
-        "Model provider billing identity resolution cancelled"
-        "CancelledError('Model provider billing identity resolution cancelled'){}"
-    )
+    assert str(exc_info.value) == "Model provider billing identity resolution failed"
+    assert exc_info.value.provider == "fake"
+    assert exc_info.value.error_type == "BillingIdentityResolutionError"
+    assert exc_info.value.error_code == "billing_identity_resolution_failed"
+    assert exc_info.value.retryable is False
     assert canary not in retained
     captured = traceback.TracebackException.from_exception(
         exc_info.value,
@@ -16279,12 +16281,12 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None
             await task
 
         assert provider.cancelled.is_set()
-        assert exc_info.value.__notes__ == [
-            "Budget settlement also failed: RuntimeError: budget ledger unavailable",
-            "Continuation recovery cleanup failed during cancelled session finalization: "
-            "ModelCompletionBudgetSettlementPending. The original failure remains "
-            "authoritative.",
-        ]
+        assert exc_info.value.args == ("Provider operation cancelled",)
+        assert type(exc_info.value.__cause__) is RuntimeError
+        assert str(exc_info.value.__cause__) == (
+            "Session interruption finalization failed after provider cancellation."
+        )
+        assert exc_info.value.__context__ is None
         session = await store.load(session_id)
         active_stage = await store.load_active_model_completion_stage(session_id)
         assert session is not None and session.status == SessionStatus.RUNNING
@@ -23364,6 +23366,13 @@ def test_cayu_app_runtime_hooks_run_app_scope_before_agent_scope():
         ("app_hook", "app"),
         ("agent_hook", "agent"),
     ]
+    terminal_hook_events = [
+        event
+        for event in events
+        if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED, EventType.HOOK_FAILED}
+    ]
+    assert terminal_hook_events
+    assert all(event.interaction_id is None for event in terminal_hook_events)
 
 
 def test_terminal_runtime_hook_started_ack_loss_recovers_only_its_claimant():
@@ -23949,9 +23958,18 @@ def test_cayu_app_after_tool_call_hook_observes_tool_result_and_emits_events():
     hook_completed = next(
         event for event in stored_events if event.type == EventType.HOOK_COMPLETED
     )
+    tool_completed = next(
+        event for event in stored_events if event.type == EventType.TOOL_CALL_COMPLETED
+    )
     assert hook_completed.payload["tool_name"] == "echo"
     assert hook_completed.payload["tool_call_id"] == "call_echo"
     assert hook_completed.payload["phase"] == "after_tool_call"
+    assert tool_completed.interaction_id is not None
+    assert all(
+        event.interaction_id == tool_completed.interaction_id
+        for event in stored_events
+        if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED}
+    )
 
     transcript = asyncio.run(store.load_transcript("sess_tool_hook"))
     tool_result = transcript[2].content[0]
@@ -24091,9 +24109,18 @@ def test_before_tool_call_hook_modifies_arguments():
     assert tool.calls == [{"text": "modified"}]
     transcript = asyncio.run(store.load_transcript("sess_before_mod"))
     assert transcript[2].content[0].structured == {"echoed": "modified"}
-    assert [event.payload["phase"] for event in events if event.type == EventType.HOOK_STARTED] == [
-        "before_tool_call"
+    hook_events = [
+        event
+        for event in events
+        if event.type in {EventType.HOOK_STARTED, EventType.HOOK_COMPLETED}
+        and event.payload["phase"] == "before_tool_call"
     ]
+    assert [event.type for event in hook_events] == [
+        EventType.HOOK_STARTED,
+        EventType.HOOK_COMPLETED,
+    ]
+    assert hook_events[0].interaction_id is not None
+    assert all(event.interaction_id == hook_events[0].interaction_id for event in hook_events)
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
@@ -25972,16 +25999,28 @@ def test_cayu_app_fails_task_when_run_fails():
     assert task is not None
     assert task.status == TaskStatus.FAILED
     assert task.session_id == "sess_task_failure"
-    assert task.error == {
+    assert session is not None
+    assert task.error is not None
+    task_error = dict(task.error)
+    task_error.pop("runtime_task_failure")
+    assert task_error == {
         "message": "provider down",
         "type": "RuntimeError",
         "session_id": "sess_task_failure",
     }
-    assert session is not None
+    failure_identity = runtime_task_failure_identity_from_task(
+        task,
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+    )
+    assert failure_identity is not None
     assert session.status == SessionStatus.FAILED
+    assert events[-1].interaction_id is None
     assert events[-1].payload == {
         "error": "provider down",
         "error_type": "RuntimeError",
+        "runtime_task_failure_id": failure_identity.failure_id,
+        EXECUTION_PROFILE_FINGERPRINT_FIELD: failure_identity.execution_profile_fingerprint,
     }
 
 
@@ -26733,6 +26772,27 @@ def test_cayu_app_does_not_emit_model_error_for_non_retryable_contract_failure()
     ]
 
 
+def _assert_unattached_task_failure_payload(
+    event: Event,
+    session: Session,
+    expected_diagnostic: dict[str, str],
+) -> None:
+    terminal_payload = dict(event.payload)
+    runtime_task_failure_id = terminal_payload.pop("runtime_task_failure_id")
+    execution_profile_fingerprint = terminal_payload.pop(EXECUTION_PROFILE_FINGERPRINT_FIELD)
+    assert terminal_payload == expected_diagnostic
+    assert runtime_task_failure_id.startswith("runtime-task-failure:v2:")
+    assert re.fullmatch(
+        r"[0-9a-f]{64}",
+        runtime_task_failure_id.removeprefix("runtime-task-failure:v2:"),
+    )
+    assert execution_profile_fingerprint == (
+        execution_profiles_module.execution_profile_from_session_metadata(
+            session.metadata
+        ).fingerprint
+    )
+
+
 def test_cayu_app_fails_session_clearly_when_task_store_is_missing():
     store = InMemorySessionStore()
     provider = FakeProvider(
@@ -26763,11 +26823,15 @@ def test_cayu_app_fails_session_clearly_when_task_store_is_missing():
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    assert events[-1].payload == {
-        "error": "task_store is required when RunRequest.task_id is set.",
-        "error_type": "RuntimeError",
-    }
     assert session is not None
+    _assert_unattached_task_failure_payload(
+        events[-1],
+        session,
+        {
+            "error": "task_store is required when RunRequest.task_id is set.",
+            "error_type": "RuntimeError",
+        },
+    )
     assert session.status == SessionStatus.FAILED
     assert provider.requests == []
 
@@ -26782,7 +26846,7 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
         ]
     )
 
-    async def run_task_session() -> tuple[list[Event], object]:
+    async def run_task_session() -> tuple[list[Event], object, object]:
         await task_store.create_task(TaskCreate(task_id="task_claimed_elsewhere", type="respond"))
         await task_store.start_task(
             "task_claimed_elsewhere",
@@ -26807,9 +26871,10 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
             ),
         )
         task = await task_store.load_task("task_claimed_elsewhere")
-        return events, task
+        session = await session_store.load("sess_task_claim_conflict")
+        return events, task, session
 
-    events, task = asyncio.run(run_task_session())
+    events, task, session = asyncio.run(run_task_session())
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -26819,10 +26884,15 @@ def test_cayu_app_does_not_fail_task_it_could_not_start():
     assert task is not None
     assert task.status == TaskStatus.RUNNING
     assert task.session_id == "other_session"
-    assert events[-1].payload == {
-        "error": ("Task task_claimed_elsewhere cannot transition to running from running"),
-        "error_type": "ValueError",
-    }
+    assert session is not None
+    _assert_unattached_task_failure_payload(
+        events[-1],
+        session,
+        {
+            "error": ("Task task_claimed_elsewhere cannot transition to running from running"),
+            "error_type": "ValueError",
+        },
+    )
     assert provider.requests == []
 
 
@@ -34688,6 +34758,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
         "reason": "Tool denied by policy: side_effect",
         "metadata": {},
         "arguments_state": "unavailable",
+        "arguments_exact": False,
         EXECUTION_PROFILE_FINGERPRINT_FIELD: private_blocked.payload[
             EXECUTION_PROFILE_FINGERPRINT_FIELD
         ],
@@ -37627,7 +37698,7 @@ def test_tool_approval_recovery_task_cancellation_finalizes_continuation():
         try:
             await recovery_task
         except asyncio.CancelledError as cancellation:
-            assert cancellation.args == ("cancel tool approval recovery",)
+            assert cancellation.args == ("Provider operation cancelled",)
         else:
             pytest.fail("Tool approval recovery did not preserve task cancellation.")
 
@@ -56925,6 +56996,7 @@ def test_in_memory_session_store_revalidates_constructed_events_on_append():
 def test_in_memory_session_store_isolates_request_metadata():
     store = InMemorySessionStore()
     metadata = {"nested": {"value": "original"}}
+    identity = _test_session_identity()
     request = RunRequest(
         agent_name="assistant",
         session_id="sess_metadata_isolation",
@@ -56932,12 +57004,17 @@ def test_in_memory_session_store_isolates_request_metadata():
         metadata=metadata,
     )
 
-    asyncio.run(store.create(request, identity=_test_session_identity()))
+    asyncio.run(store.create(request, identity=identity))
     metadata["nested"]["value"] = "mutated"
     session = asyncio.run(store.load("sess_metadata_isolation"))
 
     assert session is not None
-    assert session.metadata == {"nested": {"value": "original"}}
+    assert {
+        key: value
+        for key, value in session.metadata.items()
+        if key != "cayu:runtime_build_provenance"
+    } == {"nested": {"value": "original"}}
+    assert session.runtime_build_provenance == identity.runtime_build_provenance
 
 
 @pytest.mark.parametrize("status", ["bad", "completed", 123])
@@ -59362,7 +59439,10 @@ def test_repeated_interrupt_waits_for_active_interruption_terminal_event():
     assert stored_event_types.count(EventType.SESSION_INTERRUPTED) == 1
 
 
-def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
+@pytest.mark.parametrize("loser_observes_cleared_marker", [False, True])
+def test_concurrent_interrupt_transition_loser_waits_for_terminal_event(
+    loser_observes_cleared_marker: bool,
+):
     class BlockingProvider(ModelProvider):
         name = "fake"
 
@@ -59403,6 +59483,34 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
                 if self.transition_waiters >= 2:
                     self.transition_barrier.set()
                 await self.transition_barrier.wait()
+                try:
+                    return await super().transition_status_and_checkpoint(
+                        session_id,
+                        from_statuses=from_statuses,
+                        to_status=to_status,
+                        checkpoint_transform=checkpoint_transform,
+                        result_checkpoint_transform=result_checkpoint_transform,
+                    )
+                except ValueError:
+                    if loser_observes_cleared_marker:
+                        for _attempt in range(1000):
+                            current = await self.load(session_id)
+                            checkpoint = await self.load_checkpoint(session_id)
+                            if (
+                                current is not None
+                                and current.status is SessionStatus.INTERRUPTED
+                                and (
+                                    checkpoint is None
+                                    or "pending_session_interrupt" not in checkpoint
+                                )
+                            ):
+                                break
+                            await asyncio.sleep(0)
+                        else:
+                            raise AssertionError(
+                                "Winning interruption did not clear its durable marker."
+                            )
+                    raise
             return await super().transition_status_and_checkpoint(
                 session_id,
                 from_statuses=from_statuses,

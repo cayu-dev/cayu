@@ -18,6 +18,7 @@ from cayu import (
     Environment,
     EnvironmentSpec,
     EvalExecutionCapacity,
+    EvalOutcome,
     EvalTrialDiagnosticCode,
     InMemorySessionStore,
     LocalWorkspace,
@@ -86,9 +87,15 @@ from cayu.evals.execution_reporting import (
     render_corpus_execution_html,
     write_corpus_execution_result,
 )
+from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
+from cayu.evals.published import (
+    PublishedModelJudgeDetail,
+    PublishedRootStatusDetail,
+    _published_detail,
+)
 from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
 from cayu.evals.result_presentation import present_eval_result
-from cayu.evals.runner import EvalPlan, run_eval_plan
+from cayu.evals.runner import EvalPlan, _blocked_assertion_results, run_eval_plan
 from cayu.evals.trial_policy import EvalSuiteTrialPolicyV1
 from cayu.memory import AutomaticRecallPolicy
 from cayu.memory_evidence import ContextExposureState
@@ -102,6 +109,7 @@ from cayu.retrieval import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.runtime.app import CayuApp
+from cayu.runtime.budgets import BudgetLimit
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.memory_context import (
     AutomaticRecallContextPolicy,
@@ -558,6 +566,58 @@ def test_compile_corpus_suite_uses_only_trusted_bootstrap_then_corpus_user_input
     assert request.task_worker_id is None
 
 
+def test_profile_pinned_corpus_execution_retains_interrupted_event_identity():
+    provider = ScriptedModelProvider(
+        [
+            (
+                ModelStreamEvent.text_delta("Approved"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            )
+        ]
+    )
+    pricing = _price_book()
+    target = _target(provider, price_book=pricing)
+    target = target.model_copy(
+        update={
+            "request_base": target.request_base.model_copy(
+                update={
+                    "budget_limits": (
+                        BudgetLimit(
+                            scope="run",
+                            max_estimated_cost=Decimal("0.1"),
+                            pricing=pricing,
+                            allow_unpriced=False,
+                            action="interrupt",
+                        ),
+                    )
+                }
+            )
+        }
+    )
+    corpus = _corpus(trials=1)
+    compiled = compile_corpus_suite(corpus, target, "refund-regressions")
+
+    result = asyncio.run(
+        _run_compiled_corpus_suite(
+            target,
+            compiled,
+            max_concurrency=1,
+            expected_app_manifest_fingerprint=(
+                evaluation_target_identity(target).app_manifest_fingerprint
+            ),
+        )
+    )
+
+    trial = result.run.cases[0].trials[0]
+    assert len(provider.requests) == 1
+    assert trial.evidence_complete is True
+    assert trial.status == "failed"
+    assert trial.code is EvalTrialDiagnosticCode.ASSERTION_FAILED
+    detail = trial.assertions[0].detail
+    assert type(detail) is PublishedRootStatusDetail
+    assert detail.actual == "interrupted"
+
+
 def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
     provider = _provider()
     target = _target(provider)
@@ -808,6 +868,30 @@ def test_run_corpus_suite_resolves_trusted_model_judge_and_publishes_its_contrac
     assert "rationale" not in published
     assert len(candidate_provider.requests) == 1
     assert len(judge_provider.requests) == 1
+
+
+@pytest.mark.parametrize("outcome", [EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE])
+def test_blocked_model_judge_retains_its_publication_contract(outcome):
+    judge, _ = _model_judge_target()
+    target = _target(_provider(trials=1), model_judges=(judge,))
+    corpus = _model_judge_corpus(judge)
+    compiled = compile_corpus_suite(corpus, target, "refund-regressions")
+
+    (result,) = _blocked_assertion_results(
+        compiled.suite.cases[0].assertions,
+        outcome,
+        "candidate execution did not produce evaluable evidence",
+        memory_attribution_evidence=EvalMemoryAttributionEvidenceV1.unavailable(),
+    )
+    detail = _published_detail(corpus.cases[0].assertions[0], result)
+
+    assert type(detail) is PublishedModelJudgeDetail
+    assert detail.diagnostic == (
+        "evaluator_error" if outcome is EvalOutcome.ERROR else "evidence_unavailable"
+    )
+    assert detail.judge_profile == model_judge_profile(judge)
+    assert detail.usage is None
+    assert detail.cost is None
 
 
 def test_portable_model_judge_publishes_exact_priced_accounting():

@@ -11,6 +11,11 @@ from cayu.egress import (
     build_egress_authority_identity,
     compare_egress_authority,
 )
+from cayu.runtime.build_provenance import (
+    RuntimeBuildArtifactKind,
+    RuntimeBuildProvenance,
+    RuntimeBuildProvenanceOrigin,
+)
 from cayu.runtime.egress import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.runtime.execution_profiles import (
     ExecutionProfileComponentClass,
@@ -79,6 +84,11 @@ def _profile(authority=None):
     return build_execution_profile_identity(
         runtime_name="cayu",
         runtime_version="test",
+        runtime_build_provenance=RuntimeBuildProvenance.from_artifact_digest(
+            origin=RuntimeBuildProvenanceOrigin.EXPLICIT_MANIFEST,
+            artifact_kind=RuntimeBuildArtifactKind.OTHER,
+            artifact_digest="a" * 64,
+        ),
         provider_name="fake",
         model="fake-model",
         durable_system_prompt="system",

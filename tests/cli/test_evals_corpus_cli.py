@@ -110,7 +110,16 @@ def _model_judge_eval_plan_and_corpus() -> tuple[EvalPlan, EvalCorpusDocument]:
         ScriptedModelProvider(
             [
                 ModelStreamEvent.text_delta("Approved"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
             ]
         ),
         default=True,
@@ -121,7 +130,16 @@ def _model_judge_eval_plan_and_corpus() -> tuple[EvalPlan, EvalCorpusDocument]:
         ScriptedModelProvider(
             [
                 ModelStreamEvent.text_delta('{"score": 0.9, "rationale": "correct"}'),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
             ]
         ),
         default=True,

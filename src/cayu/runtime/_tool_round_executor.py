@@ -160,6 +160,7 @@ from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
+    INHERIT_INTERACTION,
     EventQuery,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
@@ -173,6 +174,7 @@ from cayu.runtime.sessions import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
     _McpManifestBaselineEvidenceInvalid,
+    resolve_interaction_attribution,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -10201,18 +10203,31 @@ def _runtime_hook_event(
     payload: dict[str, Any],
     execution_profile: ExecutionProfileIdentity | None = None,
 ) -> Event:
+    event = _build_runtime_hook_event(
+        event_type=event_type,
+        hook_name=hook_name,
+        scope=scope,
+        phase=phase,
+        session=session,
+        terminal_event=terminal_event,
+        agent_name=registered_agent.spec.name,
+        environment_name=_environment_name(registered_environment),
+        payload=payload,
+    )
+    # Tool hooks belong to their tool event's interaction. A result event can
+    # still be unpublished here, so fall back to the active tool-round owner.
+    # Keep this scoped: terminal hooks use deterministic replay identities and
+    # must preserve the terminal event's explicit attribution instead.
+    interaction_id = terminal_event.interaction_id
+    if interaction_id is None:
+        interaction_id = resolve_interaction_attribution(session.id, INHERIT_INTERACTION)
+    if interaction_id is not None:
+        event = event_with_runtime_envelope_authority(
+            event.model_copy(update={"interaction_id": interaction_id}),
+            "interaction_id",
+        )
     return event_with_execution_profile_authority(
-        _build_runtime_hook_event(
-            event_type=event_type,
-            hook_name=hook_name,
-            scope=scope,
-            phase=phase,
-            session=session,
-            terminal_event=terminal_event,
-            agent_name=registered_agent.spec.name,
-            environment_name=_environment_name(registered_environment),
-            payload=payload,
-        ),
+        event,
         execution_profile,
     )
 

@@ -90,6 +90,7 @@ from cayu.runtime import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
     ToolCapabilityCeiling,
+    current_runtime_build_provenance,
 )
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
@@ -3452,6 +3453,7 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
     recovery_profile = build_execution_profile_identity(
         runtime_name="cayu",
         runtime_version="queued-recovery-profile",
+        runtime_build_provenance=current_runtime_build_provenance(),
         provider_name="fake",
         model="fake-model",
         durable_system_prompt=None,
@@ -3898,7 +3900,7 @@ def test_worker_cancellation_redelivery_replays_without_provider_redispatch() ->
         )
         await asyncio.wait_for(blocking_provider.started.wait(), timeout=2)
         processing.cancel("worker shutdown")
-        with pytest.raises(asyncio.CancelledError, match="worker shutdown"):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await processing
         await tasks.release_task(
             submitted.metadata["queue_task_id"],

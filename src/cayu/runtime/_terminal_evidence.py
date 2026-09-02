@@ -89,6 +89,8 @@ def classify_current_terminal_evidence(
     for event in events_after_lifecycle:
         if event.type != expected_event_type:
             break
+        if event.interaction_id is not None:
+            continue
         candidate_events.append(event)
 
     terminal_events: list[Event] = []
@@ -115,6 +117,7 @@ def classify_current_terminal_evidence(
                 event
                 for event in events_after_lifecycle
                 if event.type in TERMINAL_EVENT_TYPES
+                and event.interaction_id is None
                 and event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY) == run_operation_id
             ),
             latest_lifecycle_event_type=latest_lifecycle_event_type,

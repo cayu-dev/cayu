@@ -1114,6 +1114,30 @@ def test_terminal_evidence_preserves_strict_current_operation_classification() -
     assert multiple_operations.events == (current,)
 
 
+def test_terminal_evidence_ignores_interaction_scoped_status_events() -> None:
+    operation_id = "current-operation"
+    interaction_terminal = _event_record(
+        6,
+        EventType.SESSION_INTERRUPTED,
+        interaction_id="current-interaction",
+        operation_id=operation_id,
+    ).event
+    session_terminal = _event_record(
+        5,
+        EventType.SESSION_INTERRUPTED,
+        operation_id=operation_id,
+    ).event
+
+    classification = classify_current_terminal_evidence(
+        evidence_events=(interaction_terminal, session_terminal),
+        expected_event_type=EventType.SESSION_INTERRUPTED,
+        run_operation_id=operation_id,
+        interruption_request_id=None,
+    )
+
+    assert classification.events == (session_terminal,)
+
+
 def test_terminal_evidence_rejects_input_beyond_the_store_query_bound() -> None:
     events = tuple(
         _event_record(sequence, EventType.SESSION_COMPLETED).event

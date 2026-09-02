@@ -1666,7 +1666,7 @@ def test_cancellation_during_provider_start_waits_for_identity_before_releasing_
         await asyncio.sleep(0)
         assert not task.done()
         adapter.start_release.set()
-        with pytest.raises(asyncio.CancelledError, match="cancel after provider dispatch"):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await task
         inspection = await inspect_provider_operation(
             app.session_store,
@@ -1708,7 +1708,7 @@ def test_cancellation_during_provider_start_is_raised_before_started_event_yield
         await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
         task.cancel("cancel before started event delivery")
         adapter.start_release.set()
-        with pytest.raises(asyncio.CancelledError, match="cancel before started event delivery"):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await task
         return task.cancelled(), seen
 
@@ -1744,7 +1744,7 @@ def test_cancellation_during_unsettled_provider_start_is_bounded(
         )
         await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
         task.cancel("cancel unsettled provider start")
-        with pytest.raises(asyncio.CancelledError, match="cancel unsettled provider start"):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await asyncio.wait_for(task, timeout=1)
         await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
         inspection = await inspect_provider_operation(
@@ -1992,27 +1992,29 @@ def test_late_start_cancellation_failure_preserves_exact_in_progress_identity(
     assert operation_id == "response_late"
 
 
-def test_cancellation_during_started_identity_publication_still_attempts_cleanup() -> None:
+def test_store_cancellation_during_started_identity_publication_fails_closed() -> None:
     store = _CancelOnEventStore(EventType.PROVIDER_OPERATION_STARTED)
     provider = _ReconnectableProvider(background=True)
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            _collect_run_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="cancelled_started_publication",
-                    messages=[Message.text("user", "hello")],
-                ),
-            )
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="cancelled_started_publication",
+                messages=[Message.text("user", "hello")],
+            ),
         )
+    )
 
     assert provider.adapter.start_calls == 1
     assert provider.adapter.cancel_calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    interrupted = next(event for event in events if event.type == EventType.SESSION_INTERRUPTED)
+    assert interrupted.payload["recovery_reason"] == "ambiguous_submission"
 
 
 def test_started_identity_timeout_without_commit_cleans_up_and_never_retries() -> None:
@@ -2169,7 +2171,7 @@ def test_unavailable_started_identity_readback_never_cancels_or_retries() -> Non
     assert EventType.MODEL_RETRY not in {event.type for event in events}
 
 
-def test_cancellation_during_started_identity_readback_propagates() -> None:
+def test_store_cancellation_during_started_identity_readback_fails_closed() -> None:
     store = _CancelOuterStartedReadbackStore()
     provider = _ReconnectableProvider(background=True)
     app = CayuApp(
@@ -2180,20 +2182,22 @@ def test_cancellation_during_started_identity_readback_propagates() -> None:
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            _collect_run_events(
-                app,
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="cancelled_started_readback",
-                    messages=[Message.text("user", "hello")],
-                ),
-            )
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="cancelled_started_readback",
+                messages=[Message.text("user", "hello")],
+            ),
         )
+    )
 
     assert provider.adapter.start_calls == 1
     assert provider.adapter.cancel_calls == 0
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    interrupted = next(event for event in events if event.type == EventType.SESSION_INTERRUPTED)
+    assert interrupted.payload["recovery_reason"] == "ambiguous_submission"
 
 
 def test_cancellation_during_definite_absence_cleanup_propagates() -> None:
@@ -2222,8 +2226,9 @@ def test_cancellation_during_definite_absence_cleanup_propagates() -> None:
         await asyncio.wait_for(blocking_adapter.cancel_entered.wait(), timeout=1)
         run_task.cancel("caller cancelled during provider cleanup")
         blocking_adapter.cancel_release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError, match="Provider operation cancelled"):
             await run_task
+        assert run_task.cancelled()
         return blocking_adapter.start_calls, blocking_adapter.cancel_calls
 
     start_calls, cancel_calls = asyncio.run(scenario())
