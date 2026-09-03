@@ -48,6 +48,8 @@ from cayu.runtime._durable_subagents import (
 )
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerCadence,
+    DurableWorkerDemandPolicy,
+    DurableWorkerPoller,
     DurableWorkerStep,
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
@@ -122,6 +124,10 @@ logger = logging.getLogger(__name__)
 _DISPATCH_DIAGNOSTIC_MAX_BYTES = 4096
 _RUN_WORKER_RECONCILIATION_DISPATCHER: ContextVar[object | None] = ContextVar(
     "cayu_dispatch_worker_reconciliation_dispatcher",
+    default=None,
+)
+_RUN_WORKER_DEMAND_POLLER: ContextVar[tuple[object, DurableWorkerPoller] | None] = ContextVar(
+    "cayu_dispatch_worker_demand_poller",
     default=None,
 )
 _PROCESS_CONTROL_SIGNALS = (GeneratorExit, KeyboardInterrupt, SystemExit)
@@ -795,6 +801,7 @@ class TaskStoreDispatcher(Dispatcher):
         self._terminal_receipt_reconciliation_task: asyncio.Task[bool] | None = None
         self._terminal_receipt_reconciliation_task_generation: int | None = None
         self._terminal_receipt_reconciliation_generation = 0
+        self._terminal_receipt_reconciliation_settled_count = 0
         self._startup_terminal_receipt_reconciliation_pending = True
 
     @property
@@ -1122,26 +1129,27 @@ class TaskStoreDispatcher(Dispatcher):
                     or reconciliation_generation != self._terminal_receipt_reconciliation_generation
                 )
         claim_task_types = self._claim_task_types()
-        task = None
-        lease_authority: _DispatchLeaseAuthority | None = None
-        claim_deadline_monotonic: float | None = None
         loop = asyncio.get_running_loop()
-        claimed_task_type = claim_task_types[self._next_claim_task_type_index]
-        for offset in range(len(claim_task_types)):
-            candidate_index = (self._next_claim_task_type_index + offset) % len(claim_task_types)
-            candidate_task_type = claim_task_types[candidate_index]
-            claim_started_monotonic = loop.time()
-            task = await self._tasks.claim_task(
-                worker_id,
-                # Each namespace remains FIFO. Alternate successful claims so a
-                # continuously busy queue cannot starve the other protocol.
-                TaskQuery(type=candidate_task_type, order_by=TaskOrder.CREATED_AT_ASC),
-                lease_seconds=self._lease_seconds,
-            )
-            if task is not None:
-                if task.lease_expires_at is None:  # pragma: no cover - claim contract
+
+        async def claim_next_task() -> tuple[Task, str, _DispatchLeaseAuthority, float] | None:
+            for offset in range(len(claim_task_types)):
+                candidate_index = (self._next_claim_task_type_index + offset) % len(
+                    claim_task_types
+                )
+                candidate_task_type = claim_task_types[candidate_index]
+                claim_started_monotonic = loop.time()
+                candidate = await self._tasks.claim_task(
+                    worker_id,
+                    # Each namespace remains FIFO. Alternate successful claims so a
+                    # continuously busy queue cannot starve the other protocol.
+                    TaskQuery(type=candidate_task_type, order_by=TaskOrder.CREATED_AT_ASC),
+                    lease_seconds=self._lease_seconds,
+                )
+                if candidate is None:
+                    continue
+                if candidate.lease_expires_at is None:  # pragma: no cover - claim contract
                     raise TaskClaimLost("Queued dispatch claim has no worker lease.")
-                lease_authority = _DispatchLeaseAuthority(task.lease_expires_at)
+                lease_authority = _DispatchLeaseAuthority(candidate.lease_expires_at)
                 claim_deadline_monotonic = _conservative_dispatch_lease_deadline(
                     claim_started_monotonic,
                     self._lease_seconds,
@@ -1149,20 +1157,32 @@ class TaskStoreDispatcher(Dispatcher):
                 if loop.time() >= claim_deadline_monotonic:
                     with contextlib.suppress(TaskClaimLost):
                         await self._release_claimed_task(
-                            task.id,
+                            candidate.id,
                             worker_id,
                             lease_authority,
                         )
                     return None
-                claimed_task_type = candidate_task_type
                 self._next_claim_task_type_index = (candidate_index + 1) % len(claim_task_types)
-                break
-        if task is None:
+                return (
+                    candidate,
+                    candidate_task_type,
+                    lease_authority,
+                    claim_deadline_monotonic,
+                )
             return None
-        if claim_deadline_monotonic is None:  # pragma: no cover - claim loop invariant
-            raise RuntimeError("Queued dispatch claim has no local lease deadline.")
-        if lease_authority is None:  # pragma: no cover - claim loop invariant
-            raise RuntimeError("Queued dispatch claim has no lease authority.")
+
+        poller_context = _RUN_WORKER_DEMAND_POLLER.get()
+        if poller_context is not None and poller_context[0] is self:
+            claim = await poller_context[1].claim(
+                claim_next_task,
+                maximum_active_s=self._lease_seconds,
+            )
+            claimed = claim.value
+        else:
+            claimed = await claim_next_task()
+        if claimed is None:
+            return None
+        task, claimed_task_type, lease_authority, claim_deadline_monotonic = claimed
         # Fail malformed or unauthenticated queue authority terminally rather than letting
         # the task be reclaimed and re-run forever. Only the immutable task row is consulted
         # in this phase: store-backed session authority remains operational and retryable.
@@ -2454,14 +2474,25 @@ class TaskStoreDispatcher(Dispatcher):
         worker_id: str,
         stop: asyncio.Event,
         poll_interval_s: float = 1.0,
+        minimum_idle_delay_s: float | None = None,
+        maximum_idle_delay_s: float | None = None,
+        idle_backoff_multiplier: float = 2.0,
+        idle_jitter_ratio: float = 0.1,
         reconcile_terminal_receipts: bool = True,
         reconciliation_every_s: float = 60.0,
         reclaim_expired_leases: bool = True,
         reclaim_every_s: float = 60.0,
     ) -> None:
-        """Claim and run until stopped with independently elected recovery roles."""
+        """Claim and run with bounded adaptive demand and independent maintenance."""
 
         validate_worker_interval(poll_interval_s, "poll_interval_s")
+        demand_policy = DurableWorkerDemandPolicy(
+            dispatch_latency_s=poll_interval_s,
+            minimum_idle_delay_s=minimum_idle_delay_s,
+            maximum_idle_delay_s=maximum_idle_delay_s,
+            backoff_multiplier=idle_backoff_multiplier,
+            jitter_ratio=idle_jitter_ratio,
+        )
         if type(reconcile_terminal_receipts) is not bool:
             raise TypeError("reconcile_terminal_receipts must be a bool.")
         validate_worker_interval(reconciliation_every_s, "reconciliation_every_s")
@@ -2470,10 +2501,17 @@ class TaskStoreDispatcher(Dispatcher):
         validate_worker_interval(reclaim_every_s, "reclaim_every_s")
         durable_runtime = _require_profiled_dispatch_runtime(runtime)
         loop = asyncio.get_running_loop()
+        claim_queries = tuple(TaskQuery(type=task_type) for task_type in self._claim_task_types())
+        poller = self._tasks._durable_worker_poller(
+            claim_queries,
+            demand_policy,
+            clock=loop.time,
+        )
         reconciliation_cadence = DurableWorkerCadence(reconciliation_every_s)
         reclaim_cadence = DurableWorkerCadence(reclaim_every_s)
 
-        async def reconcile() -> None:
+        async def reconcile() -> bool:
+            settled_before = self._terminal_receipt_reconciliation_settled_count
             reconciliation_generation = self._terminal_receipt_reconciliation_generation
             try:
                 reconciliation_complete = await self._reconcile_terminal_acknowledgements(
@@ -2489,11 +2527,14 @@ class TaskStoreDispatcher(Dispatcher):
                     type(exc).__name__,
                     _safe_runtime_text(durable_runtime, str(exc)),
                 )
+            return self._terminal_receipt_reconciliation_settled_count > settled_before
 
-        async def reclaim() -> None:
+        async def reclaim() -> bool:
+            reclaimed_any = False
             for task_type in self._claim_task_types():
                 try:
-                    await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
+                    reclaimed = await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
+                    reclaimed_any = reclaimed_any or bool(reclaimed)
                 except Exception as exc:
                     logger.warning(
                         "dispatch reclaim_expired failed: task_type=%s error_type=%s error=%s",
@@ -2501,28 +2542,47 @@ class TaskStoreDispatcher(Dispatcher):
                         type(exc).__name__,
                         _safe_runtime_text(durable_runtime, str(exc)),
                     )
+            return reclaimed_any
 
         async def run_step(_now: float, _handled: int) -> DurableWorkerStep:
+            meaningful_activity = False
             if reconcile_terminal_receipts:
-                await reconciliation_cadence.run_if_due(
+                _, reconciled = await reconciliation_cadence.run_if_due(
                     reconcile,
                     now=loop.time(),
                     clock=loop.time,
                 )
+                meaningful_activity = meaningful_activity or bool(reconciled)
             if reclaim_expired_leases:
-                await reclaim_cadence.run_if_due(
+                _, reclaimed = await reclaim_cadence.run_if_due(
                     reclaim,
                     now=loop.time(),
                     clock=loop.time,
                 )
+                meaningful_activity = meaningful_activity or bool(reclaimed)
             if stop.is_set():
-                return DurableWorkerStep(stop=True)
+                return DurableWorkerStep(stop=True, activity=meaningful_activity)
             reconciliation_generation_before_process = (
                 self._terminal_receipt_reconciliation_generation
             )
+            process_next = self.process_next
+            uses_base_claim_boundary = (
+                getattr(process_next, "__self__", None) is self
+                and getattr(process_next, "__func__", None) is TaskStoreDispatcher.process_next
+            )
             suppression_token = _RUN_WORKER_RECONCILIATION_DISPATCHER.set(self)
+            poller_token = (
+                _RUN_WORKER_DEMAND_POLLER.set((self, poller)) if uses_base_claim_boundary else None
+            )
             try:
-                handle = await self.process_next(runtime, worker_id=worker_id)
+                if uses_base_claim_boundary:
+                    handle = await process_next(runtime, worker_id=worker_id)
+                else:
+                    override_turn = await poller.claim(
+                        lambda: process_next(runtime, worker_id=worker_id),
+                        maximum_active_s=self._lease_seconds,
+                    )
+                    handle = override_turn.value
             except Exception as exc:
                 # A transient store error on one task must not kill the durable worker loop.
                 logger.error(
@@ -2532,7 +2592,10 @@ class TaskStoreDispatcher(Dispatcher):
                 )
                 handle = None
             finally:
+                if poller_token is not None:
+                    _RUN_WORKER_DEMAND_POLLER.reset(poller_token)
                 _RUN_WORKER_RECONCILIATION_DISPATCHER.reset(suppression_token)
+            meaningful_activity = meaningful_activity or poller.last_claimed
             if (
                 reconcile_terminal_receipts
                 and self._startup_terminal_receipt_reconciliation_pending
@@ -2552,6 +2615,7 @@ class TaskStoreDispatcher(Dispatcher):
                 return DurableWorkerStep(
                     handled=1,
                     continue_immediately=True,
+                    activity=True,
                 )
             wake_deadlines: list[float] = []
             if reconcile_terminal_receipts and reconciliation_cadence.next_run_at is not None:
@@ -2562,21 +2626,26 @@ class TaskStoreDispatcher(Dispatcher):
                 handled=0 if handle is None else 1,
                 idle=True,
                 next_wake_at=min(wake_deadlines) if wake_deadlines else None,
+                activity=meaningful_activity,
             )
 
-        admission_wakeup = await self._tasks._task_admission_wakeup(
-            tuple(TaskQuery(type=task_type) for task_type in self._claim_task_types())
-        )
+        admission_wakeup = None
         try:
+            admission_wakeup = await self._tasks._task_admission_wakeup(claim_queries)
             await run_durable_worker_loop(
                 run_step,
                 poll_interval_s=poll_interval_s,
                 stop=stop,
-                wait=(wait_or_stop if admission_wakeup is None else admission_wakeup.wait),
+                wait=(
+                    wait_or_stop if admission_wakeup is None else admission_wakeup.wait_for_worker
+                ),
+                demand_policy=demand_policy,
+                poller=poller,
             )
         finally:
             if admission_wakeup is not None:
                 admission_wakeup.close()
+            poller.close()
 
     async def _acknowledge_terminal_task(
         self,
@@ -2790,6 +2859,7 @@ class TaskStoreDispatcher(Dispatcher):
                         envelope,
                         receipt=receipt,
                     )
+                    self._terminal_receipt_reconciliation_settled_count += 1
                 except Exception as exc:
                     all_receipts_settled = False
                     logger.warning(

@@ -6,7 +6,10 @@ import pytest
 
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerCadence,
+    DurableWorkerDemandPolicy,
+    DurableWorkerPollerGroup,
     DurableWorkerStep,
+    DurableWorkerWaitResult,
     lease_heartbeat_interval,
     run_durable_lease_heartbeat,
     run_durable_worker_loop,
@@ -76,6 +79,11 @@ def test_shared_worker_loop_honors_adapter_deadline_and_stop() -> None:
             poll_interval_s=10.0,
             stop=stop,
             wait=wait,
+            demand_policy=DurableWorkerDemandPolicy(
+                dispatch_latency_s=10.0,
+                minimum_idle_delay_s=1.0,
+                jitter_ratio=0.0,
+            ),
         )
 
     assert asyncio.run(scenario()) == 0
@@ -188,6 +196,187 @@ def test_shared_worker_cadence_owns_timed_and_every_cycle_reclaim_policy() -> No
     asyncio.run(scenario())
     assert timed_runs == [0.0, 5.0]
     assert every_cycle_runs == [5.0, 5.0]
+
+
+def test_worker_polling_backoff_jitters_within_bounds_and_resets_on_claim() -> None:
+    now = 0.0
+    samples = iter((1.0, 0.0, 0.5))
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=4.0,
+        minimum_idle_delay_s=1.0,
+        maximum_idle_delay_s=4.0,
+        backoff_multiplier=2.0,
+        jitter_ratio=0.25,
+    )
+    poller = DurableWorkerPollerGroup().subscribe(
+        policy,
+        clock=lambda: now,
+        random_source=lambda: next(samples),
+    )
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def empty() -> None:
+            return None
+
+        async def task() -> str:
+            return "task-a"
+
+        poller.begin_step()
+        assert (await poller.claim(empty)).attempted is True
+        assert poller.next_wake_at() == pytest.approx(1.25)
+
+        now = 1.25
+        poller.begin_step()
+        assert (await poller.claim(empty)).attempted is True
+        assert poller.next_wake_at() == pytest.approx(2.75)
+
+        now = 2.75
+        poller.begin_step()
+        assert (await poller.claim(task)).value == "task-a"
+        assert poller.next_wake_at() == pytest.approx(2.75)
+
+        poller.begin_step()
+        assert (await poller.claim(empty)).attempted is True
+        assert poller.next_wake_at() == pytest.approx(3.75)
+
+    asyncio.run(scenario())
+
+
+def test_hundred_worker_empty_cohort_has_one_fair_authoritative_poller() -> None:
+    now = 0.0
+    attempts: list[int] = []
+    group = DurableWorkerPollerGroup()
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=8.0,
+        minimum_idle_delay_s=1.0,
+        maximum_idle_delay_s=8.0,
+        jitter_ratio=0.0,
+    )
+    pollers = [group.subscribe(policy, clock=lambda: now) for _ in range(100)]
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def empty(index: int) -> None:
+            attempts.append(index)
+            assert group.active_poller_count == 1
+            await asyncio.sleep(0)
+            return None
+
+        for _ in range(5):
+            for poller in pollers:
+                poller.begin_step()
+            outcomes = await asyncio.gather(
+                *(
+                    poller.claim(lambda index=index: empty(index))
+                    for index, poller in enumerate(pollers)
+                )
+            )
+            assert sum(outcome.attempted for outcome in outcomes) == 1
+            now = min(poller.next_wake_at() for poller in pollers)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        for poller in pollers:
+            poller.close()
+    assert attempts == [0, 1, 2, 3, 4]
+    assert group.subscriber_count == 0
+
+
+def test_stalled_claim_gate_expires_for_a_successor_audit() -> None:
+    now = 0.0
+    group = DurableWorkerPollerGroup()
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=1.0,
+        minimum_idle_delay_s=0.1,
+        maximum_idle_delay_s=1.0,
+        jitter_ratio=0.0,
+    )
+    first = group.subscribe(policy, clock=lambda: now)
+    second = group.subscribe(policy, clock=lambda: now)
+
+    async def scenario() -> None:
+        nonlocal now
+        claim_started = asyncio.Event()
+        release_acknowledgement = asyncio.Event()
+
+        async def stalled_claim() -> str:
+            claim_started.set()
+            await release_acknowledgement.wait()
+            return "stale-task"
+
+        async def successor_claim() -> str:
+            return "replacement-task"
+
+        stale = asyncio.create_task(first.claim(stalled_claim, maximum_active_s=1.0))
+        await claim_started.wait()
+        now = 2.0
+        replacement = await second.claim(successor_claim, maximum_active_s=1.0)
+        assert replacement.value == "replacement-task"
+        release_acknowledgement.set()
+        assert (await stale).value == "stale-task"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        first.close()
+        second.close()
+    assert group.active_poller_count == 0
+
+
+def test_matching_hint_interrupts_max_backoff_and_forces_a_prompt_audit() -> None:
+    now = 0.0
+    attempt_times: list[float] = []
+    observed_waits: list[float] = []
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=4.0,
+        minimum_idle_delay_s=1.0,
+        maximum_idle_delay_s=4.0,
+        jitter_ratio=0.0,
+    )
+    poller = DurableWorkerPollerGroup().subscribe(policy, clock=lambda: now)
+
+    async def scenario() -> int:
+        nonlocal now
+
+        async def empty() -> None:
+            attempt_times.append(now)
+            return None
+
+        async def step(_step_now: float, _handled: int) -> DurableWorkerStep:
+            await poller.claim(empty)
+            if len(attempt_times) == 4:
+                return DurableWorkerStep(stop=True)
+            return DurableWorkerStep(idle=True)
+
+        async def wait(
+            seconds: float,
+            _stop: asyncio.Event | None,
+        ) -> DurableWorkerWaitResult:
+            nonlocal now
+            observed_waits.append(seconds)
+            if len(observed_waits) == 3:
+                return DurableWorkerWaitResult.HINT
+            now += seconds
+            return DurableWorkerWaitResult.TIMEOUT
+
+        return await run_durable_worker_loop(
+            step,
+            poll_interval_s=4.0,
+            stop=None,
+            wait=wait,
+            demand_policy=policy,
+            poller=poller,
+            clock=lambda: now,
+        )
+
+    assert asyncio.run(scenario()) == 0
+    assert observed_waits == [1.0, 2.0, 4.0]
+    assert attempt_times == [0.0, 1.0, 3.0, 3.0]
+    poller.close()
 
 
 def test_shared_heartbeat_uses_one_third_lease_with_optional_ceiling() -> None:

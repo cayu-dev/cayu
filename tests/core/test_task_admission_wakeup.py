@@ -134,6 +134,55 @@ async def test_matching_admission_wakes_idle_task_worker_before_long_poll() -> N
 
 
 @pytest.mark.anyio
+async def test_hundred_idle_task_workers_share_bounded_store_polling() -> None:
+    store = _ObservedInMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+    stop = asyncio.Event()
+    handled = asyncio.Event()
+
+    async def handler(app: CayuApp, task: Task, worker_id: str) -> None:
+        await _complete_handler(app, task, worker_id)
+        handled.set()
+
+    workers = [
+        asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id=f"pooled-worker-{index}",
+                query=TaskQuery(type="job"),
+                poll_interval_s=0.05,
+                minimum_idle_delay_s=0.01,
+                idle_jitter_ratio=0.0,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                stop=stop,
+                max_tasks=1,
+            )
+        )
+        for index in range(100)
+    ]
+    try:
+        await _wait_for_subscribers(store, 100)
+        await asyncio.wait_for(store.empty_claim.wait(), timeout=1)
+        await asyncio.sleep(0.15)
+
+        assert 2 <= store.claim_calls <= 10
+
+        await store.create_task(TaskCreate(task_id="pooled-job", type="job"))
+        await asyncio.wait_for(handled.wait(), timeout=0.5)
+    finally:
+        stop.set()
+        handled_counts = await asyncio.gather(*workers)
+
+    assert sum(handled_counts) == 1
+    assert store._task_admission_wakeup_broker.subscriber_count == 0
+    groups = store._durable_worker_poller_groups
+    assert groups == {}
+
+
+@pytest.mark.anyio
 async def test_admission_between_empty_claim_and_wait_is_not_lost() -> None:
     class RacingStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True

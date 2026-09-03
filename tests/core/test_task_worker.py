@@ -201,6 +201,139 @@ def test_run_task_worker_rejects_nan_poll_interval(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        ({"minimum_idle_delay_s": 0.0}, "minimum_idle_delay_s"),
+        ({"maximum_idle_delay_s": 2.0}, "maximum_idle_delay_s"),
+        ({"idle_backoff_multiplier": 0.5}, "backoff_multiplier"),
+        ({"idle_jitter_ratio": 1.1}, "jitter_ratio"),
+        ({"reclaim_every_s": 0.0}, "reclaim_every_s"),
+        (
+            {"interrupted_handoff_recovery_every_s": 0.0},
+            "interrupted_handoff_recovery_every_s",
+        ),
+    ),
+)
+def test_run_task_worker_validates_demand_economics(
+    overrides: dict[str, float],
+    match: str,
+) -> None:
+    store = InMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        return None
+
+    async def scenario() -> None:
+        with pytest.raises(ValueError, match=match):
+            await run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="economics-worker",
+                max_tasks=0,
+                **overrides,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_interrupted_handoff_recovery_has_an_independent_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryTaskStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+    stop = asyncio.Event()
+    recovery_calls = 0
+
+    async def recover(*_args, **_kwargs):
+        nonlocal recovery_calls
+        recovery_calls += 1
+        if recovery_calls == 2:
+            stop.set()
+        return task_worker_module._InterruptedHandoffRecoveryPage(
+            recovered=0,
+            next_after=None,
+            exhausted=True,
+        )
+
+    monkeypatch.setattr(
+        task_worker_module,
+        "_recover_expired_interrupted_task_handoffs",
+        recover,
+    )
+
+    async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise AssertionError("The empty recovery-cadence test cannot claim a task.")
+
+    async def scenario() -> int:
+        return await run_task_worker(
+            app,
+            store,
+            handler,
+            worker_id="recovery-cadence-worker",
+            poll_interval_s=0.2,
+            minimum_idle_delay_s=0.2,
+            idle_jitter_ratio=0.0,
+            reclaim=False,
+            interrupted_handoff_recovery_every_s=0.02,
+            stop=stop,
+        )
+
+    assert asyncio.run(scenario()) == 0
+    assert recovery_calls == 2
+
+
+def test_reclaim_cadence_can_wake_before_claim_poll() -> None:
+    stop = asyncio.Event()
+
+    class ObservedStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.reclaim_calls = 0
+
+        async def reclaim_expired(self, *, query=None, max_reclaims=100):
+            self.reclaim_calls += 1
+            reclaimed = await super().reclaim_expired(
+                query=query,
+                max_reclaims=max_reclaims,
+            )
+            if self.reclaim_calls == 2:
+                stop.set()
+            return reclaimed
+
+    store = ObservedStore()
+    app = CayuApp(task_store=store, enable_logging=False)
+
+    async def handler(_app: CayuApp, _task: Task, _worker_id: str) -> None:
+        raise AssertionError("The empty reclaim-cadence test cannot claim a task.")
+
+    async def scenario() -> int:
+        return await asyncio.wait_for(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="reclaim-cadence-worker",
+                poll_interval_s=10.0,
+                minimum_idle_delay_s=10.0,
+                maximum_idle_delay_s=10.0,
+                idle_jitter_ratio=0.0,
+                reclaim=True,
+                reclaim_every_s=0.02,
+                recover_interrupted_handoffs=False,
+                stop=stop,
+            ),
+            timeout=0.5,
+        )
+
+    assert asyncio.run(scenario()) == 0
+    assert store.reclaim_calls == 2
+
+
 def test_run_task_worker_rejects_incomplete_interrupted_handoff_capability() -> None:
     class IncompleteHandoffStore(InMemoryTaskStore):
         supports_interrupted_task_handoffs = True

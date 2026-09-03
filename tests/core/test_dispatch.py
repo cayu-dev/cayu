@@ -6392,6 +6392,58 @@ def test_run_worker_wakes_for_matching_submission_before_long_poll(
     asyncio.run(scenario())
 
 
+def test_hundred_idle_dispatch_workers_share_bounded_store_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("unused")])
+    claim_calls = 0
+    original_claim = h.tasks.claim_task
+
+    async def count_claims(worker_id, query=None, *, lease_seconds=300):
+        nonlocal claim_calls
+        claim_calls += 1
+        return await original_claim(
+            worker_id,
+            query,
+            lease_seconds=lease_seconds,
+        )
+
+    monkeypatch.setattr(h.tasks, "claim_task", count_claims)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        workers = [
+            asyncio.create_task(
+                h.dispatcher.run_worker(
+                    h.app,
+                    worker_id=f"pooled-dispatch-worker-{index}",
+                    stop=stop,
+                    poll_interval_s=0.05,
+                    minimum_idle_delay_s=0.01,
+                    idle_jitter_ratio=0.0,
+                    reconcile_terminal_receipts=False,
+                    reclaim_expired_leases=False,
+                )
+            )
+            for index in range(100)
+        ]
+        try:
+            async with asyncio.timeout(1):
+                while h.tasks._task_admission_wakeup_broker.subscriber_count != 100:
+                    await asyncio.sleep(0)
+            await asyncio.sleep(0.15)
+            assert 8 <= claim_calls <= 40
+        finally:
+            stop.set()
+            await asyncio.gather(*workers)
+
+        assert h.tasks._task_admission_wakeup_broker.subscriber_count == 0
+        groups = h.tasks._durable_worker_poller_groups
+        assert groups == {}
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     (
         "reconcile_terminal_receipts",
@@ -6503,6 +6555,7 @@ def test_run_worker_recovery_cadence_can_wake_before_claim_poll(
 def test_run_worker_preserves_process_next_override_signature() -> None:
     h = _build([_batch("unused")])
     stop = asyncio.Event()
+    call_times: list[float] = []
 
     class OverrideDispatcher(TaskStoreDispatcher):
         calls = 0
@@ -6510,7 +6563,9 @@ def test_run_worker_preserves_process_next_override_signature() -> None:
         async def process_next(self, runtime, *, worker_id):
             del runtime, worker_id
             self.calls += 1
-            stop.set()
+            call_times.append(asyncio.get_running_loop().time())
+            if self.calls == 2:
+                stop.set()
             return None
 
     dispatcher = OverrideDispatcher(h.tasks)
@@ -6520,13 +6575,68 @@ def test_run_worker_preserves_process_next_override_signature() -> None:
             h.app,
             worker_id="override-worker",
             stop=stop,
-            poll_interval_s=0.01,
+            poll_interval_s=0.05,
+            minimum_idle_delay_s=0.05,
+            maximum_idle_delay_s=0.05,
+            idle_jitter_ratio=0.0,
             reconcile_terminal_receipts=False,
             reclaim_expired_leases=False,
         )
 
     asyncio.run(scenario())
-    assert dispatcher.calls == 1
+    assert dispatcher.calls == 2
+    assert call_times[1] - call_times[0] >= 0.04
+
+
+def test_run_worker_demand_gates_process_next_overrides() -> None:
+    h = _build([_batch("unused")])
+    stop = asyncio.Event()
+
+    class OverrideDispatcher(TaskStoreDispatcher):
+        calls = 0
+        active_calls = 0
+        maximum_active_calls = 0
+
+        async def process_next(self, runtime, *, worker_id):
+            del runtime, worker_id
+            self.calls += 1
+            self.active_calls += 1
+            self.maximum_active_calls = max(
+                self.maximum_active_calls,
+                self.active_calls,
+            )
+            try:
+                if self.calls == 4:
+                    stop.set()
+                await asyncio.sleep(0.01)
+                return None
+            finally:
+                self.active_calls -= 1
+
+    dispatcher = OverrideDispatcher(h.tasks)
+
+    async def scenario() -> None:
+        workers = [
+            asyncio.create_task(
+                dispatcher.run_worker(
+                    h.app,
+                    worker_id=f"override-worker-{index}",
+                    stop=stop,
+                    poll_interval_s=0.01,
+                    minimum_idle_delay_s=0.01,
+                    maximum_idle_delay_s=0.01,
+                    idle_jitter_ratio=0.0,
+                    reconcile_terminal_receipts=False,
+                    reclaim_expired_leases=False,
+                )
+            )
+            for index in range(2)
+        ]
+        await asyncio.wait_for(asyncio.gather(*workers), timeout=1.0)
+
+    asyncio.run(scenario())
+    assert dispatcher.calls == 4
+    assert dispatcher.maximum_active_calls == 1
 
 
 def test_run_worker_suppression_is_scoped_to_its_dispatcher(
@@ -6574,6 +6684,10 @@ def test_run_worker_suppression_is_scoped_to_its_dispatcher(
     ("overrides", "error_type", "match"),
     (
         ({"poll_interval_s": float("nan")}, ValueError, "poll_interval_s"),
+        ({"minimum_idle_delay_s": 0.0}, ValueError, "minimum_idle_delay_s"),
+        ({"maximum_idle_delay_s": 2.0}, ValueError, "maximum_idle_delay_s"),
+        ({"idle_backoff_multiplier": 0.5}, ValueError, "backoff_multiplier"),
+        ({"idle_jitter_ratio": 1.1}, ValueError, "jitter_ratio"),
         (
             {"reconcile_terminal_receipts": 1},
             TypeError,

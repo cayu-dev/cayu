@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
 from threading import Lock
 from typing import Any
+
+from cayu.runtime._durable_worker_loop import DurableWorkerWaitResult
 
 _BROADCAST = object()
 _AdmissionMatcher = Callable[[object], bool]
@@ -46,7 +47,17 @@ class TaskAdmissionWakeup:
         perform another authoritative store claim.
         """
 
-        return await self._broker.wait(self._subscriber, seconds, stop)
+        result = await self.wait_for_worker(seconds, stop)
+        return result is DurableWorkerWaitResult.STOP
+
+    async def wait_for_worker(
+        self,
+        seconds: float,
+        stop: asyncio.Event | None,
+    ) -> DurableWorkerWaitResult:
+        """Return whether a hint, audit timeout, or shutdown ended the wait."""
+
+        return await self._broker.wait_for_worker(self._subscriber, seconds, stop)
 
     def close(self) -> None:
         """Unregister this worker without retaining query or task data."""
@@ -123,14 +134,25 @@ class TaskAdmissionWakeupBroker:
         seconds: float,
         stop: asyncio.Event | None,
     ) -> bool:
-        """Consume one coalesced edge or finish the bounded fallback wait."""
+        """Consume one coalesced edge while preserving the legacy bool result."""
+
+        result = await self.wait_for_worker(subscriber, seconds, stop)
+        return result is DurableWorkerWaitResult.STOP
+
+    async def wait_for_worker(
+        self,
+        subscriber: _TaskAdmissionSubscriber,
+        seconds: float,
+        stop: asyncio.Event | None,
+    ) -> DurableWorkerWaitResult:
+        """Consume one edge and report what ended the bounded fallback wait."""
 
         if not isinstance(seconds, int | float) or not isfinite(seconds) or seconds < 0:
             raise ValueError("Task admission wait duration must be finite and non-negative.")
         if asyncio.get_running_loop() is not subscriber.loop:
             raise RuntimeError("Task admission wakeups must be awaited on their subscribing loop.")
         if stop is not None and stop.is_set():
-            return True
+            return DurableWorkerWaitResult.STOP
 
         with self._lock:
             if subscriber.closed:
@@ -142,7 +164,11 @@ class TaskAdmissionWakeupBroker:
                 subscriber.waiting = False
         if pending:
             subscriber.event.clear()
-            return stop is not None and stop.is_set()
+            return (
+                DurableWorkerWaitResult.STOP
+                if stop is not None and stop.is_set()
+                else DurableWorkerWaitResult.HINT
+            )
 
         try:
             return await _wait_for_hint_or_stop(subscriber.event, float(seconds), stop)
@@ -184,18 +210,28 @@ async def _wait_for_hint_or_stop(
     hint: asyncio.Event,
     seconds: float,
     stop: asyncio.Event | None,
-) -> bool:
+) -> DurableWorkerWaitResult:
     if stop is None:
-        with suppress(TimeoutError):
+        try:
             await asyncio.wait_for(hint.wait(), timeout=seconds)
-        return False
+        except TimeoutError:
+            return DurableWorkerWaitResult.TIMEOUT
+        return DurableWorkerWaitResult.HINT
 
     hint_wait = asyncio.create_task(hint.wait(), name="cayu-task-admission-hint")
     stop_wait = asyncio.create_task(stop.wait(), name="cayu-task-worker-stop")
     waits: tuple[asyncio.Task[Any], ...] = (hint_wait, stop_wait)
     try:
-        await asyncio.wait(waits, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
-        return stop.is_set()
+        done, _ = await asyncio.wait(
+            waits,
+            timeout=seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_wait in done and stop.is_set():
+            return DurableWorkerWaitResult.STOP
+        if hint_wait in done and hint.is_set():
+            return DurableWorkerWaitResult.HINT
+        return DurableWorkerWaitResult.TIMEOUT
     finally:
         for wait in waits:
             if not wait.done():

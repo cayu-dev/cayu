@@ -13,6 +13,7 @@ from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from itertools import islice
+from threading import Lock
 from typing import Any, ClassVar, Literal, cast
 from uuid import uuid4
 
@@ -40,6 +41,11 @@ from cayu._validation import (
 )
 from cayu._validation import (
     require_durable_nonblank as require_nonblank,
+)
+from cayu.runtime._durable_worker_loop import (
+    DurableWorkerDemandPolicy,
+    DurableWorkerPoller,
+    DurableWorkerPollerGroup,
 )
 from cayu.runtime._task_admission_wakeup import (
     TaskAdmissionWakeup,
@@ -162,6 +168,7 @@ from cayu.runtime.work_contracts import (
     work_attempt_request_sha256,
 )
 
+_DURABLE_WORKER_POLLER_REGISTRY_LOCK = Lock()
 _TASK_RETRY_COST_MAX_DIGITS = 64
 _TASK_RETRY_TOTAL_COST_MAX_DIGITS = 128
 _TASK_RETRY_COST_MAX_DECIMAL_PLACES = 64
@@ -3171,6 +3178,64 @@ class TaskStore(ABC):
         """Enable the built-in process-local, content-free wakeup optimization."""
 
         self._task_admission_wakeup_broker = TaskAdmissionWakeupBroker()
+
+    def _durable_worker_poller(
+        self,
+        queries: Iterable[TaskQuery | None],
+        policy: DurableWorkerDemandPolicy,
+        *,
+        clock: Callable[[], float],
+    ) -> DurableWorkerPoller:
+        """Join the fair active-poller group for one exact claim-filter cohort."""
+
+        copied_queries = tuple(copy_task_query(query) for query in queries)
+        if not copied_queries:
+            raise ValueError("Durable worker pollers require at least one claim query.")
+        for query in copied_queries:
+            _ensure_claim_query_supported(query)
+        cohort_key = (
+            policy,
+            tuple(
+                sorted(
+                    {
+                        (
+                            "" if query.status is None else query.status.value,
+                            "" if query.type is None else query.type,
+                            "" if query.parent_task_id is None else query.parent_task_id,
+                            (
+                                ""
+                                if query.assigned_agent_name is None
+                                else query.assigned_agent_name
+                            ),
+                        )
+                        for query in copied_queries
+                    }
+                )
+            ),
+        )
+        with _DURABLE_WORKER_POLLER_REGISTRY_LOCK:
+            groups = getattr(self, "_durable_worker_poller_groups", None)
+            if groups is None:
+                groups = {}
+                self._durable_worker_poller_groups = groups
+            if type(groups) is not dict:
+                raise RuntimeError("TaskStore durable worker poller state is invalid.")
+            group = groups.get(cohort_key)
+            if group is None:
+
+                def remove_empty_group(empty_group: DurableWorkerPollerGroup) -> None:
+                    with _DURABLE_WORKER_POLLER_REGISTRY_LOCK:
+                        if (
+                            groups.get(cohort_key) is empty_group
+                            and empty_group.subscriber_count == 0
+                        ):
+                            del groups[cohort_key]
+
+                group = DurableWorkerPollerGroup(on_empty=remove_empty_group)
+                groups[cohort_key] = group
+            if not isinstance(group, DurableWorkerPollerGroup):
+                raise RuntimeError("TaskStore durable worker poller cohort is invalid.")
+        return group.subscribe(policy, clock=clock)
 
     async def _task_admission_wakeup(
         self,

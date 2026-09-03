@@ -2968,12 +2968,41 @@ newer invocation does not become the settlement gate for an older receipt or
 for an exact retry of an already acknowledged terminal dispatch.
 `TaskStoreDispatcher.run_worker(...)` and `run_task_worker(...)` are adapters
 over one Runtime-owned durable worker scheduler. The shared scheduler owns
-positive poll-interval validation, stop and maximum-work boundaries, immediate
-continuation versus idle disposition, and waiting until the earliest
-adapter-supplied recovery deadline. Runtime-owned worker cadences implement both
-fixed-period dispatcher recovery and the generic task worker's every-cycle
-reclaim policy. Adapters own only their task-specific claim, authority
-validation, handling, and durable settlement rules. A shared lease-heartbeat
+positive dispatch-latency and idle-bound validation, stop and maximum-work
+boundaries, immediate continuation versus idle disposition, and waiting until
+the earliest adapter-supplied recovery deadline. `poll_interval_s` remains the
+public dispatch-latency objective. `minimum_idle_delay_s` and
+`maximum_idle_delay_s` bound exponentially increasing empty-claim delays, and
+`idle_backoff_multiplier` plus `idle_jitter_ratio` configure the increase and
+bounded jitter. The maximum idle delay cannot exceed the dispatch-latency
+objective. Defaults begin at the smaller of 50 milliseconds and the objective,
+double after each empty authoritative claim, add up to 10 percent jitter, and
+remain capped by the objective.
+
+Workers with the same store, demand policy, and exact union of claim filters
+join one process-local poller cohort. Only one member may perform the cohort's
+authoritative empty claim at a time, and the preferred member rotates after
+each attempt so a configured 100-worker capacity does not create 100 concurrent
+empty store polls. This coordination is an efficiency boundary, not durable
+authority: separate processes still converge through bounded store polling. An
+active poller gate expires after the requested claim lease so a committed claim
+whose acknowledgement stalls cannot prevent a successor from re-auditing after
+that authority expires; the ordinary store-atomic claim remains the winner.
+Successful claims and non-empty reclaim/recovery/reconciliation work reset the
+cohort to its minimum delay. Empty maintenance scans, skipped turns, and ordinary
+timeouts do not. A compatible content-free admission hint resets the delay and
+makes its selected worker immediately eligible, but that worker must still win
+the ordinary atomic store claim.
+
+Runtime-owned worker cadences keep claim polling, expired-lease reclaim,
+interrupted-task recovery, terminal-receipt reconciliation, and lease heartbeat
+independent. Both adapters expose `reclaim_every_s`; the generic worker now
+defaults to a 60-second reclaim cadence instead of scanning before every claim.
+Its exhausted attached-session recovery scan has a separate
+`interrupted_handoff_recovery_every_s` setting (30 seconds by default), and its
+workerless continuation rediscovery retains `continuation_poll_interval_s`.
+Adapters own only their task-specific claim, authority validation, handling,
+and durable settlement rules. A shared lease-heartbeat
 driver calculates the one-third-lease cadence, performs stop-aware waits, and
 delegates successful-update inspection or ambiguous failure reconciliation to
 the adapter. The task-worker adapter applies a one-second maximum heartbeat
@@ -3018,8 +3047,11 @@ pool, applications may elect one or more bounded owners for each role with
 `reconcile_terminal_receipts` and `reclaim_expired_leases`; a non-owner passes
 both as false and performs neither recovery scan through its internal
 `process_next(...)` call. The worker loop uses a task-local suppression boundary,
-so custom dispatcher overrides retain the existing public method signature. The
-roles also have independent
+so custom dispatcher overrides retain the existing public method signature.
+Because only the base implementation exposes its exact store-claim boundary, a
+custom override is conservatively admitted as one complete demand-poller turn;
+an empty result advances the same bounded idle backoff instead of spinning or
+bypassing the cohort gate. The roles also have independent
 `reconciliation_every_s` and `reclaim_every_s` cadences. Idle waiting wakes for
 the earliest enabled recovery deadline even when the ordinary claim poll
 interval is longer. A worker that arms new terminal handoff evidence makes its
