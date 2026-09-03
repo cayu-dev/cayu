@@ -855,6 +855,49 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             ),
             ("bounded_input",): frozenset({True, False}),
             ("compaction_failed",): frozenset({True, False}),
+            **(
+                {
+                    ("phase",): frozenset(
+                        {
+                            "start_publication",
+                            "budget_admission",
+                            "budget_reservation",
+                            "request_footprint_publication",
+                            "model_start_publication",
+                            "provider_dispatch",
+                            "completion_publication",
+                            "checkpoint_installation",
+                        }
+                    ),
+                    ("reason",): frozenset(
+                        {
+                            "publication_timeout",
+                            "publication_failed",
+                            "admission_rejected",
+                            "reservation_failed",
+                            "provider_failed",
+                            "checkpoint_failed",
+                            "cancelled",
+                            "internal_failed",
+                        }
+                    ),
+                    ("retryable",): frozenset({True, False}),
+                    ("provider_dispatch_disposition",): frozenset(
+                        {"not_dispatched", "dispatched", "unknown"}
+                    ),
+                    ("recovery_action",): frozenset(
+                        {
+                            "retry_publication",
+                            "resume_session",
+                            "stop_session",
+                            "reconcile_completion",
+                            "fail_closed",
+                        }
+                    ),
+                }
+                if event_type == EventType.CONTEXT_COMPACTION_FAILED
+                else {}
+            ),
         }
         for event_type in {
             EventType.CONTEXT_COMPACTION_STARTED,
@@ -2907,13 +2950,17 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_FAILED] = _observed_policy(
         "approval_id binding_cleanup durable_value_error_code durable_value_error_path "
-        "error error_type interaction_transition_failures interruption_type "
+        "compaction_failure error error_type interaction_transition_failures interruption_type "
         "manual_recovery_required model_attempt_id model_step_id tool_call_id "
         f"tool_name tool_round_id {terminal_finalization_keys}",
         owned_nested_paths=terminal_finalization_owned_paths,
         authority_keys={"session_run_operation_id"},
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
-        untrusted_container_keys={"binding_cleanup", "interaction_transition_failures"}
+        untrusted_container_keys={
+            "binding_cleanup",
+            "compaction_failure",
+            "interaction_transition_failures",
+        }
         | terminal_finalization_containers,
     )
     policies[EventType.SESSION_INTERRUPTED] = _observed_policy(
@@ -3305,10 +3352,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     compaction_policy = _observed_policy(
         "actor attempt_id bounded_input checkpoint chunk_count chunk_mode "
         "compacted_transcript_cursor compaction_failed compactor coverage_mode error_type "
-        "execution_profile_fingerprint "
+        "elapsed_ms execution_profile_fingerprint "
         "instruction_digest instruction_present mode model_step_id "
         "newly_compacted_message_count operation_id previous_compacted_transcript_cursor "
-        "reason recent_message_count represented_message_count represented_source_end "
+        "phase provider_dispatch_disposition reason recent_message_count recovery_action "
+        "represented_message_count represented_source_end retryable "
         "represented_source_start request_id requested_source_end requested_source_start "
         "result_transcript_cursor source_run_epoch source_transcript_cursor summary_chars",
         authority_keys={"execution_profile_fingerprint"},
@@ -5821,6 +5869,15 @@ def _restore_declared_fixed_controls(
         return
     specs = _DECLARED_FIXED_CONTROLS.get(event_type, {})
     for path, allowed_values in specs.items():
+        if (
+            event_type == EventType.CONTEXT_COMPACTION_FAILED
+            and path == ("reason",)
+            and type(event.payload.get("operation_id")) is str
+        ):
+            # Explicit compaction keeps the application's bounded request reason
+            # on every lifecycle event. Automatic failures have no operation ID
+            # and use the runtime-owned failure-reason vocabulary instead.
+            continue
         allowed_types = {type(value) for value in allowed_values}
         _restore_fixed_control_path(
             original=event.payload,

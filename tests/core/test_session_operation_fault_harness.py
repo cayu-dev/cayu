@@ -17,6 +17,7 @@ from tests.core._session_operation_fault_harness import (
     PauseBeforeCommit,
     PauseBeforeTransform,
     PublicationBarrier,
+    PublicationBoundary,
     PublicationFaultActionKind,
     PublicationFaultOutcome,
     SessionOperationFaultHarness,
@@ -91,6 +92,73 @@ def test_session_operation_fault_harness_store_conformance(
                 store,
                 session_id_prefix=store_kind,
             )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_event_append_fault_boundary_distinguishes_precommit_from_lost_ack(
+    store_kind: str,
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store: SessionStore
+        if store_kind == "memory":
+            store = InMemorySessionStore()
+        else:
+            store = SQLiteSessionStore(tmp_path / "event-append-faults.sqlite")
+        session_id = f"event-append-{store_kind}"
+        await _create_session(store, session_id)
+        precommit = Event(
+            id=f"event-append-precommit-{store_kind}",
+            type=EventType.TURN_COMPLETED,
+            session_id=session_id,
+        )
+        lost_ack = Event(
+            id=f"event-append-lost-ack-{store_kind}",
+            type=EventType.TURN_COMPLETED,
+            session_id=session_id,
+        )
+        try:
+            precommit_rule = SessionOperationFaultRule(
+                rule_id="event-precommit",
+                selector=SessionOperationSelector(event_types=frozenset({precommit.type})),
+                actions=(FailBeforeTransform(),),
+                on_exhausted=MatchPolicy.DELEGATE,
+            )
+            async with SessionOperationFaultHarness(
+                store,
+                rules=(precommit_rule,),
+                boundary=PublicationBoundary.EVENT_APPEND,
+            ) as precommit_faults:
+                with pytest.raises(ConnectionError, match="before append"):
+                    await store.append_event(session_id, precommit)
+                assert await store.load_events(session_id) == []
+                await store.append_event(session_id, precommit)
+
+            lost_ack_rule = SessionOperationFaultRule(
+                rule_id="event-lost-ack",
+                selector=SessionOperationSelector(event_types=frozenset({lost_ack.type})),
+                actions=(CommitThenRaise(),),
+            )
+            async with SessionOperationFaultHarness(
+                store,
+                rules=(lost_ack_rule,),
+                boundary=PublicationBoundary.EVENT_APPEND,
+            ) as lost_ack_faults:
+                with pytest.raises(ConnectionError, match="lost after commit"):
+                    await store.append_event(session_id, lost_ack)
+
+            assert [event.id for event in await store.load_events(session_id)] == [
+                precommit.id,
+                lost_ack.id,
+            ]
+            assert precommit_faults.trace[0].committed is CommitEvidence.NO
+            assert precommit_faults.trace[1].committed is CommitEvidence.YES
+            assert lost_ack_faults.trace[0].committed is CommitEvidence.YES
+            assert lost_ack_faults.trace[0].acknowledgement_returned is False
         finally:
             await _close_store(store)
 

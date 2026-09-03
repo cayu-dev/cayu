@@ -2350,6 +2350,38 @@ def test_custom_session_checkpoint_names_remain_untrusted_extensible_values() ->
     ).payload == {"checkpoint": REDACTED_SECRET, "calls": 1}
 
 
+def test_explicit_compaction_failure_reason_remains_untrusted_and_extensible() -> None:
+    prepared = prepare_new_runtime_event(
+        Event(
+            type=EventType.CONTEXT_COMPACTION_FAILED,
+            session_id="session",
+            payload={
+                "operation_id": "operation",
+                "reason": "application_requested",
+                "compaction_failed": True,
+            },
+        ),
+        redactor=SecretRedactor("application_requested"),
+    )
+
+    assert prepared.payload["reason"] == REDACTED_SECRET
+
+
+def test_automatic_compaction_failure_rejects_unknown_runtime_reason() -> None:
+    with pytest.raises(ValueError, match="event.payload.reason"):
+        prepare_new_runtime_event(
+            Event(
+                type=EventType.CONTEXT_COMPACTION_FAILED,
+                session_id="session",
+                payload={
+                    "reason": "application_requested",
+                    "compaction_failed": True,
+                },
+            ),
+            redactor=SecretRedactor(),
+        )
+
+
 def test_custom_session_checkpoint_name_requires_a_string() -> None:
     event = Event(
         type=EventType.SESSION_CHECKPOINTED,

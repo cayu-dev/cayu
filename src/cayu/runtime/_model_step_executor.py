@@ -243,8 +243,14 @@ from cayu.runtime.context import (
     ContextRequest,
     ContextUsageState,
     RuntimeManagedContextPolicy,
+    _attach_automatic_compaction_failure_disposition,
     _automatic_compaction_dispatch_runner_scope,
     _automatic_compaction_runner_scope,
+    _AutomaticCompactionDispatchDisposition,
+    _AutomaticCompactionFailureDisposition,
+    _AutomaticCompactionFailureReason,
+    _AutomaticCompactionLifecyclePhase,
+    _AutomaticCompactionRecoveryAction,
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
     _compaction_model_attempt_identity_scope,
@@ -252,6 +258,7 @@ from cayu.runtime.context import (
     _context_secret_redactor_scope,
     _ContextCountAuthorityError,
     _defer_billing_identity_cancellation_scope,
+    automatic_compaction_failure_disposition_payload,
     context_build_termination_compaction_telemetry,
     copy_context_messages,
     copy_context_pressure_estimate,
@@ -1267,9 +1274,7 @@ class ModelCompletionDispatch:
             not notifications_consumed
             and child_session_notification_stage_binding(stage.intent) is None
         ):
-            raise ValueError(
-                "An unconsumed dispatch must bind child-session notifications."
-            )
+            raise ValueError("An unconsumed dispatch must bind child-session notifications.")
         object.__setattr__(self, "stage", stage)
         object.__setattr__(self, "request_fingerprint", request_fingerprint)
         object.__setattr__(self, "context_exposure", exposure)
@@ -2597,6 +2602,9 @@ class ModelStepFlowOutcome:
 
 _CONTEXT_TERMINATION_PERSIST_TIMEOUT_S = 5.0
 _CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S = 5.0
+_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S = 60.0
+_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S = 5.0
+_AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS = 3
 _CONTEXT_USAGE_AUXILIARY_PAGE_SIZE = 100
 
 
@@ -2605,6 +2613,66 @@ def _consume_detached_task_outcome(task: asyncio.Task[Any]) -> None:
 
     with contextlib.suppress(asyncio.CancelledError):
         task.exception()
+
+
+@dataclass
+class _AutomaticCompactionLifecycle:
+    """In-process phase evidence for one automatic compaction attempt."""
+
+    started_at: float = field(default_factory=time.monotonic)
+    provider_dispatch_disposition: _AutomaticCompactionDispatchDisposition = (
+        _AutomaticCompactionDispatchDisposition.NOT_DISPATCHED
+    )
+
+    def failure_disposition(
+        self,
+        *,
+        phase: _AutomaticCompactionLifecyclePhase,
+        reason: _AutomaticCompactionFailureReason,
+        retryable: bool,
+        recovery_action: _AutomaticCompactionRecoveryAction,
+    ) -> _AutomaticCompactionFailureDisposition:
+        return _AutomaticCompactionFailureDisposition(
+            phase=phase,
+            reason=reason,
+            elapsed_ms=max(0, int((time.monotonic() - self.started_at) * 1000)),
+            retryable=retryable,
+            provider_dispatch_disposition=self.provider_dispatch_disposition,
+            recovery_action=recovery_action,
+        )
+
+    def attach_failure(
+        self,
+        error: BaseException,
+        *,
+        phase: _AutomaticCompactionLifecyclePhase,
+        reason: _AutomaticCompactionFailureReason,
+        retryable: bool,
+        recovery_action: _AutomaticCompactionRecoveryAction,
+    ) -> None:
+        _attach_automatic_compaction_failure_disposition(
+            error,
+            self.failure_disposition(
+                phase=phase,
+                reason=reason,
+                retryable=retryable,
+                recovery_action=recovery_action,
+            ),
+        )
+
+
+def _automatic_compaction_publication_failure_reason(
+    error: BaseException,
+) -> _AutomaticCompactionFailureReason:
+    if isinstance(error, asyncio.CancelledError):
+        return _AutomaticCompactionFailureReason.CANCELLED
+    if isinstance(error, TimeoutError):
+        return _AutomaticCompactionFailureReason.PUBLICATION_TIMEOUT
+    return _AutomaticCompactionFailureReason.PUBLICATION_FAILED
+
+
+def _automatic_compaction_publication_is_retryable(error: BaseException) -> bool:
+    return isinstance(error, Exception) and not isinstance(error, (TypeError, ValueError))
 
 
 @dataclass(frozen=True)
@@ -8657,6 +8725,7 @@ class ModelStepRun:
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
+        automatic_compaction_lifecycle = _AutomaticCompactionLifecycle()
 
         async def publish_recall_telemetry(
             telemetry: ContextRecallTelemetry,
@@ -8678,20 +8747,31 @@ class ModelStepRun:
             execute: Callable[[], Awaitable[CompactionResult]],
             completed_payloads: Callable[[], list[dict[str, Any]]],
         ) -> CompactionResult:
-            await self._persist_automatic_compaction_started(
+            await self._persist_automatic_compaction_start_with_retry(
                 compaction_started,
                 published_events=context_operation_events,
                 start_events=compaction_start_events,
                 model_step_identity=model_step_identity,
+                lifecycle=automatic_compaction_lifecycle,
             )
 
             async def publish_completions(payloads: list[dict[str, Any]]) -> None:
-                await self._persist_automatic_compaction_completions(
-                    compaction_identity_ledger.identify_payloads(payloads),
-                    published_attempt_ids=published_compaction_attempt_ids,
-                    published_events=context_operation_events,
-                    completion_events=compaction_completion_events,
-                )
+                try:
+                    await self._persist_automatic_compaction_completions(
+                        compaction_identity_ledger.identify_payloads(payloads),
+                        published_attempt_ids=published_compaction_attempt_ids,
+                        published_events=context_operation_events,
+                        completion_events=compaction_completion_events,
+                    )
+                except BaseException as error:
+                    automatic_compaction_lifecycle.attach_failure(
+                        error,
+                        phase=_AutomaticCompactionLifecyclePhase.COMPLETION_PUBLICATION,
+                        reason=_automatic_compaction_publication_failure_reason(error),
+                        retryable=False,
+                        recovery_action=(_AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION),
+                    )
+                    raise
 
             async def run() -> CompactionResult:
                 return await self._run_automatic_compaction_with_budget(
@@ -8704,6 +8784,7 @@ class ModelStepRun:
                     step=step,
                     model_step_identity=model_step_identity,
                     compaction_identity_ledger=compaction_identity_ledger,
+                    lifecycle=automatic_compaction_lifecycle,
                 )
 
             with _compaction_completion_publisher_scope(publish_completions):
@@ -8858,6 +8939,23 @@ class ModelStepRun:
                 for event in context_operation_events
             ),
         )
+        if context_success_persistence is not None and any(
+            telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED
+            for telemetry in context_compaction_telemetry
+        ):
+            automatic_compaction_lifecycle.attach_failure(
+                context_success_persistence,
+                phase=_AutomaticCompactionLifecyclePhase.CHECKPOINT_INSTALLATION,
+                reason=_AutomaticCompactionFailureReason.CHECKPOINT_FAILED,
+                retryable=False,
+                recovery_action=_AutomaticCompactionRecoveryAction.FAIL_CLOSED,
+            )
+            checkpoint_failure_event = await self._persist_automatic_compaction_checkpoint_failure(
+                context_success_persistence,
+                model_step_identity=model_step_identity,
+            )
+            if checkpoint_failure_event is not None:
+                context_success_events.append(checkpoint_failure_event)
         for event in context_operation_events:
             yield event, None
         for event in context_success_events:
@@ -9441,9 +9539,7 @@ class ModelStepRun:
                     await self._executor._session_store.mark_model_completion_stage_dispatched(
                         self._session.id,
                         stage=prepared.stage,
-                        consume_child_session_notifications=(
-                            consume_child_session_notifications
-                        ),
+                        consume_child_session_notifications=(consume_child_session_notifications),
                     )
                     dispatch = ModelCompletionDispatch(
                         stage=prepared.stage,
@@ -9736,6 +9832,7 @@ class ModelStepRun:
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
+        automatic_compaction_lifecycle = _AutomaticCompactionLifecycle()
         latest_model_attempt_identity: ModelAttemptIdentity | None = None
 
         async def publish_recall_telemetry(
@@ -9855,20 +9952,31 @@ class ModelStepRun:
             execute: Callable[[], Awaitable[CompactionResult]],
             completed_payloads: Callable[[], list[dict[str, Any]]],
         ) -> CompactionResult:
-            await self._persist_automatic_compaction_started(
+            await self._persist_automatic_compaction_start_with_retry(
                 compaction_started,
                 published_events=context_operation_events,
                 start_events=compaction_start_events,
                 model_step_identity=model_step_identity,
+                lifecycle=automatic_compaction_lifecycle,
             )
 
             async def publish_completions(payloads: list[dict[str, Any]]) -> None:
-                await self._persist_automatic_compaction_completions(
-                    compaction_identity_ledger.identify_payloads(payloads),
-                    published_attempt_ids=published_compaction_attempt_ids,
-                    published_events=context_operation_events,
-                    completion_events=compaction_completion_events,
-                )
+                try:
+                    await self._persist_automatic_compaction_completions(
+                        compaction_identity_ledger.identify_payloads(payloads),
+                        published_attempt_ids=published_compaction_attempt_ids,
+                        published_events=context_operation_events,
+                        completion_events=compaction_completion_events,
+                    )
+                except BaseException as error:
+                    automatic_compaction_lifecycle.attach_failure(
+                        error,
+                        phase=_AutomaticCompactionLifecyclePhase.COMPLETION_PUBLICATION,
+                        reason=_automatic_compaction_publication_failure_reason(error),
+                        retryable=False,
+                        recovery_action=(_AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION),
+                    )
+                    raise
 
             async def run() -> CompactionResult:
                 return await self._run_automatic_compaction_with_budget(
@@ -9881,6 +9989,7 @@ class ModelStepRun:
                     step=step,
                     model_step_identity=model_step_identity,
                     compaction_identity_ledger=compaction_identity_ledger,
+                    lifecycle=automatic_compaction_lifecycle,
                 )
 
             with _compaction_completion_publisher_scope(publish_completions):
@@ -10079,6 +10188,23 @@ class ModelStepRun:
                 for event in context_operation_events
             ),
         )
+        if context_success_persistence is not None and any(
+            telemetry.event_type == EventType.CONTEXT_COMPACTION_COMPLETED
+            for telemetry in compaction_telemetry
+        ):
+            automatic_compaction_lifecycle.attach_failure(
+                context_success_persistence,
+                phase=_AutomaticCompactionLifecyclePhase.CHECKPOINT_INSTALLATION,
+                reason=_AutomaticCompactionFailureReason.CHECKPOINT_FAILED,
+                retryable=False,
+                recovery_action=_AutomaticCompactionRecoveryAction.FAIL_CLOSED,
+            )
+            checkpoint_failure_event = await self._persist_automatic_compaction_checkpoint_failure(
+                context_success_persistence,
+                model_step_identity=model_step_identity,
+            )
+            if checkpoint_failure_event is not None:
+                context_success_events.append(checkpoint_failure_event)
         for event in context_operation_events:
             yield event, None
         for event in context_success_events:
@@ -10281,6 +10407,7 @@ class ModelStepRun:
             reconciliation_task,
             cancellation=cancellation,
             timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+            timeout_after_cancellation_s=(_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S),
         )
         if outcome.timed_out:
             reconciliation_task.cancel()
@@ -10314,6 +10441,7 @@ class ModelStepRun:
             fan_out_task,
             cancellation=cancellation,
             timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+            timeout_after_cancellation_s=(_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S),
         )
         if outcome.timed_out:
             fan_out_task.cancel()
@@ -10332,6 +10460,233 @@ class ModelStepRun:
                 operation=f"{operation} side-effect delivery",
             )
         return error, outcome.cancellation
+
+    async def _persist_automatic_compaction_predispatch_event(
+        self,
+        event: Event,
+        *,
+        phase: _AutomaticCompactionLifecyclePhase,
+        lifecycle: _AutomaticCompactionLifecycle,
+    ) -> Event:
+        """Publish one stable pre-dispatch event with bounded exact retries."""
+
+        prepared = self._executor._event_writer.prepare(event)
+        last_error: BaseException | None = None
+        for attempt in range(1, _AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS + 1):
+            persistence_task = asyncio.create_task(
+                self._executor._event_writer.persist_exact_replay(prepared)
+            )
+            outcome = await await_shielded_task_outcome(
+                persistence_task,
+                timeout_s=_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S,
+                timeout_after_cancellation_s=(
+                    _CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S
+                ),
+            )
+            cancellation = outcome.cancellation
+            if outcome.timed_out:
+                persistence_task.cancel()
+                persistence_task.add_done_callback(_consume_detached_task_outcome)
+                publication_error: BaseException | None = TimeoutError(
+                    "Automatic compaction pre-dispatch publication exceeded "
+                    f"{_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S:g} "
+                    "seconds."
+                )
+            else:
+                publication_error = outcome.error
+            if isinstance(publication_error, asyncio.CancelledError) and cancellation is None:
+                publication_error = unexpected_child_cancellation_error(
+                    publication_error,
+                    operation="Automatic compaction pre-dispatch publication",
+                )
+            if publication_error is None and outcome.result is None:
+                publication_error = RuntimeError(
+                    "Automatic compaction pre-dispatch publication returned no result."
+                )
+            if publication_error is None:
+                persisted = outcome.result
+                assert persisted is not None
+                fan_out_task = asyncio.create_task(
+                    self._executor._event_writer.fan_out_persisted([persisted])
+                )
+                fan_out_outcome = await await_shielded_task_outcome(
+                    fan_out_task,
+                    cancellation=cancellation,
+                    timeout_s=(_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S),
+                    timeout_after_cancellation_s=(
+                        _CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S
+                    ),
+                )
+                cancellation = fan_out_outcome.cancellation
+                if fan_out_outcome.timed_out:
+                    fan_out_task.cancel()
+                    fan_out_task.add_done_callback(_consume_detached_task_outcome)
+                    publication_error = TimeoutError(
+                        "Automatic compaction pre-dispatch side-effect delivery exceeded "
+                        f"{_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S:g} "
+                        "seconds."
+                    )
+                else:
+                    publication_error = fan_out_outcome.error
+                if isinstance(publication_error, asyncio.CancelledError) and cancellation is None:
+                    publication_error = unexpected_child_cancellation_error(
+                        publication_error,
+                        operation=("Automatic compaction pre-dispatch side-effect delivery"),
+                    )
+                if publication_error is None and fan_out_outcome.result is None:
+                    publication_error = RuntimeError(
+                        "Automatic compaction pre-dispatch side-effect delivery returned no result."
+                    )
+                if publication_error is None:
+                    delivered = fan_out_outcome.result
+                    assert delivered is not None
+                    if cancellation is not None:
+                        raise cancellation
+                    return delivered[0]
+            if cancellation is not None:
+                lifecycle.attach_failure(
+                    cancellation,
+                    phase=phase,
+                    reason=_AutomaticCompactionFailureReason.CANCELLED,
+                    retryable=False,
+                    recovery_action=(
+                        _AutomaticCompactionRecoveryAction.FAIL_CLOSED
+                        if lifecycle.provider_dispatch_disposition
+                        == _AutomaticCompactionDispatchDisposition.NOT_DISPATCHED
+                        else _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                    ),
+                )
+                if publication_error is not None:
+                    raise cancellation from publication_error
+                raise cancellation
+            assert publication_error is not None
+            last_error = publication_error
+            publication_retryable = _automatic_compaction_publication_is_retryable(
+                publication_error
+            )
+            safe_to_resume = (
+                lifecycle.provider_dispatch_disposition
+                == _AutomaticCompactionDispatchDisposition.NOT_DISPATCHED
+            )
+            retryable = publication_retryable and safe_to_resume
+            if (
+                not publication_retryable
+                or attempt == _AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS
+            ):
+                lifecycle.attach_failure(
+                    publication_error,
+                    phase=phase,
+                    reason=_automatic_compaction_publication_failure_reason(publication_error),
+                    retryable=retryable,
+                    recovery_action=(
+                        _AutomaticCompactionRecoveryAction.RESUME_SESSION
+                        if retryable
+                        else (
+                            _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                            if not safe_to_resume
+                            else _AutomaticCompactionRecoveryAction.FAIL_CLOSED
+                        )
+                    ),
+                )
+                raise publication_error
+            await asyncio.sleep(0)
+        raise AssertionError("Automatic compaction publication retry loop did not finish.") from (
+            last_error
+        )
+
+    async def _persist_automatic_compaction_checkpoint_failure(
+        self,
+        error: BaseException,
+        *,
+        model_step_identity: ModelStepIdentity,
+    ) -> Event | None:
+        """Publish bounded checkpoint-installation evidence before terminalization."""
+
+        disposition = automatic_compaction_failure_disposition_payload(error)
+        if disposition is None:
+            return None
+        failure_event = _context_compaction_telemetry_event(
+            telemetry=ContextCompactionTelemetry(
+                event_type=EventType.CONTEXT_COMPACTION_FAILED,
+                payload={
+                    "error_type": type(error).__name__,
+                    "coverage_mode": "failed",
+                    "compaction_failed": True,
+                    **disposition,
+                },
+            ),
+            session=self._session,
+            registered_agent=self._registered_agent,
+            environment_name=self._environment_name,
+            execution_identity=model_step_identity,
+            execution_profile=self._execution_profile,
+        )
+        try:
+            return await self._executor._event_writer.emit(failure_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as publication_error:
+            error.add_note(
+                "Checkpoint-installation failure evidence publication also failed: "
+                f"{type(publication_error).__name__}."
+            )
+            return None
+
+    async def _persist_automatic_compaction_start_with_retry(
+        self,
+        telemetry: ContextCompactionTelemetry,
+        *,
+        published_events: list[Event],
+        start_events: list[Event],
+        model_step_identity: ModelStepIdentity,
+        lifecycle: _AutomaticCompactionLifecycle,
+    ) -> None:
+        last_error: BaseException | None = None
+        for attempt in range(1, _AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS + 1):
+            try:
+                await self._persist_automatic_compaction_started(
+                    telemetry,
+                    published_events=published_events,
+                    start_events=start_events,
+                    model_step_identity=model_step_identity,
+                )
+                return
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    lifecycle.attach_failure(
+                        error,
+                        phase=_AutomaticCompactionLifecyclePhase.START_PUBLICATION,
+                        reason=_AutomaticCompactionFailureReason.CANCELLED,
+                        retryable=False,
+                        recovery_action=_AutomaticCompactionRecoveryAction.FAIL_CLOSED,
+                    )
+                    raise
+                if any(
+                    event.type == EventType.CONTEXT_COMPACTION_STARTED for event in published_events
+                ):
+                    return
+                retryable = _automatic_compaction_publication_is_retryable(error)
+                if (
+                    not retryable
+                    or attempt == _AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS
+                ):
+                    lifecycle.attach_failure(
+                        error,
+                        phase=_AutomaticCompactionLifecyclePhase.START_PUBLICATION,
+                        reason=_automatic_compaction_publication_failure_reason(error),
+                        retryable=retryable,
+                        recovery_action=(
+                            _AutomaticCompactionRecoveryAction.RESUME_SESSION
+                            if retryable
+                            else _AutomaticCompactionRecoveryAction.FAIL_CLOSED
+                        ),
+                    )
+                    raise
+                last_error = error
+                await asyncio.sleep(0)
+        raise AssertionError("Compaction start publication retry loop did not finish.") from (
+            last_error
+        )
 
     async def _persist_automatic_compaction_started(
         self,
@@ -10364,7 +10719,8 @@ class ModelStepRun:
         )
         outcome = await await_shielded_task_outcome(
             persistence_task,
-            timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+            timeout_s=_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S,
+            timeout_after_cancellation_s=(_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S),
         )
         cancellation = outcome.cancellation
         if outcome.timed_out:
@@ -10372,7 +10728,7 @@ class ModelStepRun:
             persistence_task.add_done_callback(_consume_detached_task_outcome)
             publication_error: BaseException = TimeoutError(
                 "Compaction start publication exceeded "
-                f"{_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
+                f"{_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S:g} seconds."
             )
         else:
             publication_error = outcome.error
@@ -10507,6 +10863,7 @@ class ModelStepRun:
         outcome = await await_shielded_task_outcome(
             persistence_task,
             timeout_s=_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S,
+            timeout_after_cancellation_s=(_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S),
         )
         cancellation = outcome.cancellation
         if outcome.timed_out:
@@ -11370,11 +11727,14 @@ class ModelStepRun:
         step: int,
         model_step_identity: ModelStepIdentity,
         compaction_identity_ledger: _CompactionExecutionIdentityLedger,
+        lifecycle: _AutomaticCompactionLifecycle,
     ) -> CompactionResult:
         del messages
         model_step_identity = copy_model_step_identity(model_step_identity)
         if compaction_identity_ledger.model_step_identity != model_step_identity:
             raise ValueError("Compaction identity ledger belongs to a different model step.")
+        if type(lifecycle) is not _AutomaticCompactionLifecycle:
+            raise TypeError("lifecycle must be an _AutomaticCompactionLifecycle.")
         controller = self._executor._run_limit_controller
         all_limits = controller.provider_budget_limits(
             session=self._session,
@@ -11425,7 +11785,7 @@ class ModelStepRun:
                     ),
                 )
                 budget_events.append(
-                    await self._executor._event_writer.emit(
+                    await self._persist_automatic_compaction_predispatch_event(
                         event_with_execution_profile_authority(
                             _context_observation_event(
                                 Event(
@@ -11437,11 +11797,13 @@ class ModelStepRun:
                                 )
                             ),
                             self._execution_profile,
-                        )
+                        ),
+                        phase=(_AutomaticCompactionLifecyclePhase.REQUEST_FOOTPRINT_PUBLICATION),
+                        lifecycle=lifecycle,
                     )
                 )
             budget_events.append(
-                await self._executor._event_writer.emit(
+                await self._persist_automatic_compaction_predispatch_event(
                     event_with_execution_profile_authority(
                         _event_with_model_identity_authority(
                             Event(
@@ -11462,7 +11824,9 @@ class ModelStepRun:
                             model_attempt_identity,
                         ),
                         self._execution_profile,
-                    )
+                    ),
+                    phase=_AutomaticCompactionLifecyclePhase.MODEL_START_PUBLICATION,
+                    lifecycle=lifecycle,
                 )
             )
 
@@ -11498,10 +11862,56 @@ class ModelStepRun:
                     model_attempt_identity=model_attempt_identity,
                 )
                 self._validate_live_model_semantics()
-                with _compaction_model_attempt_identity_scope(model_attempt_identity):
-                    return await dispatch()
+                lifecycle.provider_dispatch_disposition = (
+                    _AutomaticCompactionDispatchDisposition.UNKNOWN
+                )
+                try:
+                    with _compaction_model_attempt_identity_scope(model_attempt_identity):
+                        result = await dispatch()
+                except BaseException as error:
+                    if automatic_compaction_failure_disposition_payload(error) is None:
+                        lifecycle.attach_failure(
+                            error,
+                            phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
+                            reason=(
+                                _AutomaticCompactionFailureReason.CANCELLED
+                                if isinstance(error, asyncio.CancelledError)
+                                else _AutomaticCompactionFailureReason.PROVIDER_FAILED
+                            ),
+                            retryable=False,
+                            recovery_action=(
+                                _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                            ),
+                        )
+                    raise
+                lifecycle.provider_dispatch_disposition = (
+                    _AutomaticCompactionDispatchDisposition.DISPATCHED
+                )
+                return result
             finally:
                 compaction_identity_ledger.end_dispatch(model_attempt_identity)
+
+        async def execute_with_post_dispatch_failure_disposition() -> CompactionResult:
+            try:
+                return await execute()
+            except BaseException as error:
+                if (
+                    lifecycle.provider_dispatch_disposition
+                    != _AutomaticCompactionDispatchDisposition.NOT_DISPATCHED
+                    and automatic_compaction_failure_disposition_payload(error) is None
+                ):
+                    lifecycle.attach_failure(
+                        error,
+                        phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
+                        reason=(
+                            _AutomaticCompactionFailureReason.CANCELLED
+                            if isinstance(error, asyncio.CancelledError)
+                            else _AutomaticCompactionFailureReason.INTERNAL_FAILED
+                        ),
+                        retryable=False,
+                        recovery_action=(_AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION),
+                    )
+                raise
 
         try:
             identity = compactor._provider_budget_identity_for_request(compaction_request)
@@ -11515,7 +11925,7 @@ class ModelStepRun:
                 ) from exc
             if not has_accounting_limits:
                 with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
-                    return await execute()
+                    return await execute_with_post_dispatch_failure_disposition()
             raise RuntimeError(
                 "Automatic provider-backed compaction under run or budget limits requires the "
                 "ContextCompactor to declare provider_budget_identity(session), "
@@ -11531,7 +11941,7 @@ class ModelStepRun:
                     "identity under run or cost limits."
                 )
             with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
-                return await execute()
+                return await execute_with_post_dispatch_failure_disposition()
         if type(identity) is not tuple or len(identity) != 2:
             raise TypeError(
                 "ContextCompactor.provider_budget_identity must return a "
@@ -11622,8 +12032,32 @@ class ModelStepRun:
 
                 async def identified_dispatch() -> tuple[str, dict[str, Any]]:
                     self._validate_live_model_semantics()
-                    with _compaction_model_attempt_identity_scope(model_attempt_identity):
-                        return await dispatch()
+                    lifecycle.provider_dispatch_disposition = (
+                        _AutomaticCompactionDispatchDisposition.UNKNOWN
+                    )
+                    try:
+                        with _compaction_model_attempt_identity_scope(model_attempt_identity):
+                            result = await dispatch()
+                    except BaseException as error:
+                        if automatic_compaction_failure_disposition_payload(error) is None:
+                            lifecycle.attach_failure(
+                                error,
+                                phase=_AutomaticCompactionLifecyclePhase.PROVIDER_DISPATCH,
+                                reason=(
+                                    _AutomaticCompactionFailureReason.CANCELLED
+                                    if isinstance(error, asyncio.CancelledError)
+                                    else _AutomaticCompactionFailureReason.PROVIDER_FAILED
+                                ),
+                                retryable=False,
+                                recovery_action=(
+                                    _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                                ),
+                            )
+                        raise
+                    lifecycle.provider_dispatch_disposition = (
+                        _AutomaticCompactionDispatchDisposition.DISPATCHED
+                    )
+                    return result
 
                 def completion_events(payloads: list[dict[str, Any]]) -> list[Event]:
                     identified = compaction_identity_ledger.identify_payloads(
@@ -11660,7 +12094,17 @@ class ModelStepRun:
                     execution_identity=model_attempt_identity,
                 )
                 if budget_evaluation.check is not None:
-                    raise _AutomaticCompactionAdmissionStopped(budget_evaluation=budget_evaluation)
+                    stopped = _AutomaticCompactionAdmissionStopped(
+                        budget_evaluation=budget_evaluation
+                    )
+                    lifecycle.attach_failure(
+                        stopped,
+                        phase=_AutomaticCompactionLifecyclePhase.BUDGET_ADMISSION,
+                        reason=_AutomaticCompactionFailureReason.ADMISSION_REJECTED,
+                        retryable=False,
+                        recovery_action=_AutomaticCompactionRecoveryAction.STOP_SESSION,
+                    )
+                    raise stopped
                 budget_events.extend(budget_evaluation.events)
                 limit_evaluation = await self._limit_gate.evaluate_limits(
                     billing_identity_state=billing_identity_state,
@@ -11671,7 +12115,17 @@ class ModelStepRun:
                     execution_identity=model_attempt_identity,
                 )
                 if limit_evaluation.decision is not None:
-                    raise _AutomaticCompactionAdmissionStopped(limit_evaluation=limit_evaluation)
+                    stopped = _AutomaticCompactionAdmissionStopped(
+                        limit_evaluation=limit_evaluation
+                    )
+                    lifecycle.attach_failure(
+                        stopped,
+                        phase=_AutomaticCompactionLifecyclePhase.BUDGET_ADMISSION,
+                        reason=_AutomaticCompactionFailureReason.ADMISSION_REJECTED,
+                        retryable=False,
+                        recovery_action=_AutomaticCompactionRecoveryAction.STOP_SESSION,
+                    )
+                    raise stopped
                 budget_events.extend(limit_evaluation.events)
                 if not limits:
                     self._validate_live_model_semantics()
@@ -11723,7 +12177,38 @@ class ModelStepRun:
                 if isinstance(outcome, BudgetedOperationSucceeded):
                     return cast("tuple[str, dict[str, Any]]", outcome.result)
                 if isinstance(outcome, BudgetedOperationRejected):
-                    raise _AutomaticCompactionBudgetReservationFailed(outcome.failure)
+                    reservation_failed = _AutomaticCompactionBudgetReservationFailed(
+                        outcome.failure
+                    )
+                    lifecycle.attach_failure(
+                        reservation_failed,
+                        phase=_AutomaticCompactionLifecyclePhase.BUDGET_RESERVATION,
+                        reason=_AutomaticCompactionFailureReason.RESERVATION_FAILED,
+                        retryable=False,
+                        recovery_action=_AutomaticCompactionRecoveryAction.STOP_SESSION,
+                    )
+                    raise reservation_failed
+                if automatic_compaction_failure_disposition_payload(outcome.error) is None:
+                    lifecycle.attach_failure(
+                        outcome.error,
+                        phase=_AutomaticCompactionLifecyclePhase.BUDGET_RESERVATION,
+                        reason=(
+                            _AutomaticCompactionFailureReason.CANCELLED
+                            if isinstance(outcome.error, asyncio.CancelledError)
+                            else _AutomaticCompactionFailureReason.RESERVATION_FAILED
+                        ),
+                        retryable=(
+                            lifecycle.provider_dispatch_disposition
+                            == _AutomaticCompactionDispatchDisposition.NOT_DISPATCHED
+                            and isinstance(outcome.error, Exception)
+                        ),
+                        recovery_action=(
+                            _AutomaticCompactionRecoveryAction.RESUME_SESSION
+                            if lifecycle.provider_dispatch_disposition
+                            == _AutomaticCompactionDispatchDisposition.NOT_DISPATCHED
+                            else _AutomaticCompactionRecoveryAction.RECONCILE_COMPLETION
+                        ),
+                    )
                 if outcome.cause is not None:
                     raise outcome.error from outcome.cause
                 raise outcome.error
@@ -11731,7 +12216,7 @@ class ModelStepRun:
                 compaction_identity_ledger.end_dispatch(model_attempt_identity)
 
         with _automatic_compaction_dispatch_runner_scope(run_provider_dispatch):
-            return await execute()
+            return await execute_with_post_dispatch_failure_disposition()
 
 
 def _session_agent_spec(

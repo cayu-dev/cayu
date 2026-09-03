@@ -62,6 +62,11 @@ class CommitEvidence(StrEnum):
     UNKNOWN = "unknown"
 
 
+class PublicationBoundary(StrEnum):
+    SESSION_OPERATION = "session_operation"
+    EVENT_APPEND = "event_append"
+
+
 class PublicationFaultActionKind(StrEnum):
     UNMATCHED_DELEGATE = "unmatched_delegate"
     EXHAUSTED_DELEGATE = "exhausted_delegate"
@@ -519,6 +524,7 @@ class SessionOperationFaultHarness:
         store: SessionStore,
         *,
         rules: Sequence[SessionOperationFaultRule],
+        boundary: PublicationBoundary = PublicationBoundary.SESSION_OPERATION,
         on_unmatched: MatchPolicy = MatchPolicy.DELEGATE,
         trace_limit: int = _DEFAULT_TRACE_LIMIT,
     ) -> None:
@@ -534,6 +540,16 @@ class SessionOperationFaultHarness:
             raise ValueError("rule identifiers must be unique")
         if type(on_unmatched) is not MatchPolicy:
             raise TypeError("on_unmatched must be a MatchPolicy")
+        if type(boundary) is not PublicationBoundary:
+            raise TypeError("boundary must be a PublicationBoundary")
+        if boundary is PublicationBoundary.EVENT_APPEND and any(
+            isinstance(action, (FailBeforeCommit, PauseBeforeCommit))
+            for rule in copied_rules
+            for action in rule.actions
+        ):
+            raise ValueError(
+                "event_append does not expose a safe between-validation-and-commit seam"
+            )
         self._trace_limit = _require_exact_positive_int(
             trace_limit,
             "trace_limit",
@@ -570,6 +586,12 @@ class SessionOperationFaultHarness:
                     barriers.append(action.barrier)
 
         self._store = store
+        self._boundary = boundary
+        self._method_name = (
+            "publish_session_operation"
+            if boundary is PublicationBoundary.SESSION_OPERATION
+            else "append_events"
+        )
         self._rule_states = tuple(states)
         self._barriers = tuple(barriers)
         self._on_unmatched = on_unmatched
@@ -616,12 +638,12 @@ class SessionOperationFaultHarness:
                 "The publication fault harness is already installed."
             )
         loop = asyncio.get_running_loop()
-        current_publish = self._store.publish_session_operation
+        current_publish = getattr(self._store, self._method_name)
         if getattr(current_publish, "__cayu_session_operation_fault_harness__", False):
             raise SessionOperationFaultScheduleError(
                 "A publication fault harness is already installed on this store."
             )
-        if any(
+        if self._boundary is PublicationBoundary.SESSION_OPERATION and any(
             isinstance(scheduled.action, (FailBeforeCommit, PauseBeforeCommit))
             for state in self._rule_states
             for scheduled in state.actions
@@ -645,37 +667,50 @@ class SessionOperationFaultHarness:
                 "The selected store does not support instance-local interception."
             )
         self._original_instance_value = store_dict.get(
-            "publish_session_operation",
+            self._method_name,
             _MISSING,
         )
         self._original_publish = current_publish
-        self._original_publish_guarded = self._store.publish_session_operation_guarded
+        self._original_publish_guarded = (
+            self._store.publish_session_operation_guarded
+            if self._boundary is PublicationBoundary.SESSION_OPERATION
+            else None
+        )
         self._loop = loop
         self._active_zero = asyncio.Event()
         self._active_zero.set()
 
-        async def intercepted_publish(
-            session_id: str,
-            *,
-            idempotency_key: str,
-            operation_transform: SessionOperationTransform,
-            events: list[Event],
-            expected_statuses: set[SessionStatus] | None = None,
-            expected_run_epoch: int | None = None,
-            expected_transcript_cursor: int | None = None,
-        ) -> Session:
-            return await self._intercept(
-                session_id,
-                idempotency_key=idempotency_key,
-                operation_transform=operation_transform,
-                events=events,
-                expected_statuses=expected_statuses,
-                expected_run_epoch=expected_run_epoch,
-                expected_transcript_cursor=expected_transcript_cursor,
-            )
+        if self._boundary is PublicationBoundary.SESSION_OPERATION:
 
-        intercepted_publish.__dict__["__cayu_session_operation_fault_harness__"] = True
-        self._store.__dict__["publish_session_operation"] = intercepted_publish
+            async def intercepted_publish(
+                session_id: str,
+                *,
+                idempotency_key: str,
+                operation_transform: SessionOperationTransform,
+                events: list[Event],
+                expected_statuses: set[SessionStatus] | None = None,
+                expected_run_epoch: int | None = None,
+                expected_transcript_cursor: int | None = None,
+            ) -> Session:
+                return await self._intercept(
+                    session_id,
+                    idempotency_key=idempotency_key,
+                    operation_transform=operation_transform,
+                    events=events,
+                    expected_statuses=expected_statuses,
+                    expected_run_epoch=expected_run_epoch,
+                    expected_transcript_cursor=expected_transcript_cursor,
+                )
+
+            intercepted_publish.__dict__["__cayu_session_operation_fault_harness__"] = True
+            self._store.__dict__[self._method_name] = intercepted_publish
+        else:
+
+            async def intercepted_append(session_id: str, events: list[Event]) -> None:
+                await self._intercept_event_append(session_id, events=events)
+
+            intercepted_append.__dict__["__cayu_session_operation_fault_harness__"] = True
+            self._store.__dict__[self._method_name] = intercepted_append
         self._installed = True
         return self
 
@@ -776,9 +811,9 @@ class SessionOperationFaultHarness:
             return
         try:
             if self._original_instance_value is _MISSING:
-                self._store.__dict__.pop("publish_session_operation", None)
+                self._store.__dict__.pop(self._method_name, None)
             else:
-                self._store.__dict__["publish_session_operation"] = self._original_instance_value
+                self._store.__dict__[self._method_name] = self._original_instance_value
         except BaseException as error:
             raise SessionOperationFaultCleanupError(
                 "The publication fault harness could not restore the store method."
@@ -1102,6 +1137,115 @@ class SessionOperationFaultHarness:
             _, transform_started, _, committed, _ = evidence.snapshot()
             if not transform_started and committed is CommitEvidence.UNKNOWN:
                 evidence.mark_committed(CommitEvidence.NO)
+            outcome = PublicationFaultOutcome.DELEGATE_FAILURE
+            raise
+        finally:
+            (
+                action_reached,
+                transform_started,
+                transform_completed,
+                committed,
+                acknowledgement_returned,
+            ) = evidence.snapshot()
+            matched_rule_id = (
+                None if decision.rule_state is None else decision.rule_state.rule.rule_id
+            )
+            self._finish_invocation(
+                PublicationFaultTrace(
+                    sequence=sequence,
+                    matched_rule_id=matched_rule_id,
+                    action=decision.kind,
+                    outcome=outcome,
+                    action_reached=action_reached,
+                    transform_started=transform_started,
+                    transform_completed=transform_completed,
+                    committed=committed,
+                    acknowledgement_returned=acknowledgement_returned,
+                ),
+                scheduled=decision.scheduled_action is not None,
+            )
+
+    async def _intercept_event_append(
+        self,
+        session_id: str,
+        *,
+        events: list[Event],
+    ) -> None:
+        """Apply the shared fault vocabulary to a direct event append."""
+
+        if asyncio.get_running_loop() is not self._loop:
+            raise SessionOperationFaultScheduleError(
+                "An event append was attempted from a foreign event loop."
+            )
+        sequence = self._begin_invocation()
+        evidence = _InvocationEvidence()
+        decision = _Decision(
+            rule_state=None,
+            scheduled_action=None,
+            action=None,
+            kind=PublicationFaultActionKind.SCHEDULE_REJECTED,
+        )
+        outcome = PublicationFaultOutcome.SCHEDULE_REJECTED
+        try:
+            decision = self._select(
+                session_id=session_id,
+                idempotency_key=None,
+                events=events,
+            )
+            action = decision.action
+            if isinstance(action, FailBeforeTransform):
+                evidence.mark_action_reached()
+                evidence.mark_committed(CommitEvidence.NO)
+                self._mark_action_reached(decision)
+                raise InjectedSessionOperationPublicationError(
+                    "Event publication failed before append."
+                )
+            if isinstance(action, PauseBeforeTransform):
+                evidence.mark_action_reached()
+                self._mark_action_reached(decision)
+                try:
+                    await action.barrier._enter_async()
+                except BaseException:
+                    evidence.mark_committed(CommitEvidence.NO)
+                    raise
+                if action.then is ReleaseDisposition.RAISE:
+                    evidence.mark_committed(CommitEvidence.NO)
+                    raise InjectedSessionOperationPublicationError(
+                        "Event publication failed before append."
+                    )
+            if isinstance(action, Delegate):
+                evidence.mark_action_reached()
+                self._mark_action_reached(decision)
+            await self._original_publish(session_id, events)
+            evidence.mark_committed(CommitEvidence.YES)
+            if isinstance(action, CommitThenRaise):
+                evidence.mark_action_reached()
+                self._mark_action_reached(decision)
+                raise InjectedSessionOperationPublicationError(
+                    "Event publication acknowledgement was lost after commit."
+                )
+            if isinstance(action, PauseAfterCommit):
+                evidence.mark_action_reached()
+                self._mark_action_reached(decision)
+                await action.barrier._enter_async()
+                if action.then is ReleaseDisposition.RAISE:
+                    raise InjectedSessionOperationPublicationError(
+                        "Event publication acknowledgement was lost after commit."
+                    )
+            evidence.mark_acknowledged()
+            outcome = PublicationFaultOutcome.RETURNED
+        except asyncio.CancelledError:
+            outcome = PublicationFaultOutcome.CANCELLED
+            raise
+        except InjectedSessionOperationPublicationError:
+            outcome = PublicationFaultOutcome.INJECTED_FAILURE
+            raise
+        except SessionOperationFaultScheduleError:
+            if decision.kind is PublicationFaultActionKind.SCHEDULE_REJECTED:
+                evidence.mark_committed(CommitEvidence.NO)
+            outcome = PublicationFaultOutcome.SCHEDULE_REJECTED
+            raise
+        except BaseException:
             outcome = PublicationFaultOutcome.DELEGATE_FAILURE
             raise
         finally:

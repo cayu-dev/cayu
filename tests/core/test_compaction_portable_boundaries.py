@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -25,6 +26,7 @@ from tests.core.test_runtime import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
 from cayu.core import (
     AgentSpec,
+    Event,
     EventType,
     Message,
     MessageRole,
@@ -56,6 +58,26 @@ from cayu.runtime import (
     RunRequest,
     Session,
 )
+
+
+def _assert_internal_post_dispatch_compaction_failure(
+    failed: Event,
+    terminal: Event,
+    *,
+    provider_dispatch_disposition: str = "unknown",
+) -> dict[str, Any]:
+    expected = {
+        "phase": "provider_dispatch",
+        "reason": "internal_failed",
+        "retryable": False,
+        "provider_dispatch_disposition": provider_dispatch_disposition,
+        "recovery_action": "reconcile_completion",
+    }
+    assert {key: failed.payload[key] for key in expected} == expected
+    assert type(failed.payload["elapsed_ms"]) is int
+    compaction_failure = {**expected, "elapsed_ms": failed.payload["elapsed_ms"]}
+    assert terminal.payload["compaction_failure"] == compaction_failure
+    return compaction_failure
 
 
 @pytest.mark.parametrize("compactor_kind", ["model", "prompt_cache"])
@@ -473,11 +495,16 @@ def test_cayu_app_does_not_redispatch_compaction_when_derived_usage_overflows():
     assert failed.payload["error_type"] == "DurableValueError"
     assert "error" not in failed.payload
     assert events[-1].type == EventType.SESSION_FAILED
+    compaction_failure = _assert_internal_post_dispatch_compaction_failure(
+        failed,
+        events[-1],
+    )
     assert events[-1].payload == {
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
         "durable_value_error_code": "integer_out_of_range",
         "durable_value_error_path": "$",
+        "compaction_failure": compaction_failure,
     }
 
 
@@ -1547,11 +1574,13 @@ def test_cayu_app_rejects_non_portable_compaction_error_before_retry_or_publicat
     assert "usage_metrics" not in attempt.payload
     assert failed.payload["error_type"] == "DurableValueError"
     assert "error" not in failed.payload
+    compaction_failure = _assert_internal_post_dispatch_compaction_failure(failed, terminal)
     assert terminal.payload == {
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
         "durable_value_error_code": "nul_character",
         "durable_value_error_path": "$/#0",
+        "compaction_failure": compaction_failure,
     }
     rendered = json.dumps(
         [event.model_dump(mode="json") for event in events],
@@ -1706,11 +1735,13 @@ def test_cayu_app_does_not_publish_forged_compaction_durable_value_diagnostics(
     assert "error" not in failed.payload
     terminal = events[-1]
     assert terminal.type == EventType.SESSION_FAILED
+    compaction_failure = _assert_internal_post_dispatch_compaction_failure(failed, terminal)
     assert terminal.payload == {
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
         "durable_value_error_code": "invalid_json_type",
         "durable_value_error_path": "$",
+        "compaction_failure": compaction_failure,
     }
     rendered = json.dumps([event.model_dump(mode="json") for event in events])
     assert "workload-secret" not in rendered

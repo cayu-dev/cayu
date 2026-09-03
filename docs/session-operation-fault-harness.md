@@ -1,9 +1,12 @@
-# Session operation publication fault harness
+# SessionStore publication fault harness
 
 Cayu's repository tests use
 `tests.core._session_operation_fault_harness.SessionOperationFaultHarness` to
 exercise durable `SessionStore.publish_session_operation()` failures without
 replacing the store's transform, compare-and-set, validation, or transaction.
+The optional `PublicationBoundary.EVENT_APPEND` target wraps the same store's
+`append_events()` entry point for runtime event publications that do not carry a
+session-operation transform. The default remains `SESSION_OPERATION`.
 The helper is repository-private test infrastructure. It is not part of the
 installed `cayu.testing` API and must not be imported by production code.
 
@@ -23,6 +26,12 @@ Every rule combines a bounded semantic selector with an ordered action schedule:
 - `PauseBeforeTransform`, `PauseBeforeCommit`, and `PauseAfterCommit` expose
   explicit one-shot barriers at those same boundaries. Their release disposition
   decides whether the call delegates, commits/returns, or raises.
+
+For `EVENT_APPEND`, `FailBeforeTransform` and `PauseBeforeTransform` mean before
+the store receives the append batch. `CommitThenRaise` and `PauseAfterCommit`
+retain their ordinary acknowledgement-loss meaning. The harness rejects
+`FailBeforeCommit` and `PauseBeforeCommit` for this target because the public
+append contract does not expose a safe seam inside the backend transaction.
 
 Failure and delegate actions accept a positive bounded `count`. A rule's
 `on_exhausted` policy determines what happens after those occurrences. Use
@@ -121,7 +130,8 @@ only when the rule explicitly selects that policy.
 
 1. Identify the complete production operation tuple and the exact durable record,
    event, and checkpoint evidence that distinguishes commit from rollback.
-2. Choose a semantic selector and one explicit fault boundary. Never select by a
+2. Choose the `SESSION_OPERATION` or `EVENT_APPEND` publication target, then a
+   semantic selector and one explicit fault boundary. Never select by a
    process-global call ordinal.
 3. Run the real workflow or store transform. Assert both the raised/returned shape
    and all durable representations before retry.

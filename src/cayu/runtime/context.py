@@ -837,6 +837,98 @@ class ContextCompactionTelemetry(BaseModel):
         return copy_json_value(value, "payload")
 
 
+class _AutomaticCompactionLifecyclePhase(StrEnum):
+    START_PUBLICATION = "start_publication"
+    BUDGET_ADMISSION = "budget_admission"
+    BUDGET_RESERVATION = "budget_reservation"
+    REQUEST_FOOTPRINT_PUBLICATION = "request_footprint_publication"
+    MODEL_START_PUBLICATION = "model_start_publication"
+    PROVIDER_DISPATCH = "provider_dispatch"
+    COMPLETION_PUBLICATION = "completion_publication"
+    CHECKPOINT_INSTALLATION = "checkpoint_installation"
+
+
+class _AutomaticCompactionFailureReason(StrEnum):
+    PUBLICATION_TIMEOUT = "publication_timeout"
+    PUBLICATION_FAILED = "publication_failed"
+    ADMISSION_REJECTED = "admission_rejected"
+    RESERVATION_FAILED = "reservation_failed"
+    PROVIDER_FAILED = "provider_failed"
+    CHECKPOINT_FAILED = "checkpoint_failed"
+    CANCELLED = "cancelled"
+    INTERNAL_FAILED = "internal_failed"
+
+
+class _AutomaticCompactionDispatchDisposition(StrEnum):
+    NOT_DISPATCHED = "not_dispatched"
+    DISPATCHED = "dispatched"
+    UNKNOWN = "unknown"
+
+
+class _AutomaticCompactionRecoveryAction(StrEnum):
+    RETRY_PUBLICATION = "retry_publication"
+    RESUME_SESSION = "resume_session"
+    STOP_SESSION = "stop_session"
+    RECONCILE_COMPLETION = "reconcile_completion"
+    FAIL_CLOSED = "fail_closed"
+
+
+class _AutomaticCompactionFailureDisposition(BaseModel):
+    """Bounded runtime-owned classification for automatic compaction failures."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase: _AutomaticCompactionLifecyclePhase
+    reason: _AutomaticCompactionFailureReason
+    elapsed_ms: int = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    retryable: StrictBool
+    provider_dispatch_disposition: _AutomaticCompactionDispatchDisposition
+    recovery_action: _AutomaticCompactionRecoveryAction
+
+
+_AUTOMATIC_COMPACTION_FAILURE_DISPOSITION_KEY = "_cayu_automatic_compaction_failure_disposition"
+
+
+def _attach_automatic_compaction_failure_disposition(
+    error: BaseException,
+    disposition: _AutomaticCompactionFailureDisposition,
+) -> None:
+    """Attach only bounded runtime-owned evidence to an arbitrary failure."""
+
+    if not isinstance(error, BaseException):
+        raise TypeError("error must be a BaseException.")
+    if type(disposition) is not _AutomaticCompactionFailureDisposition:
+        raise TypeError("disposition must be an _AutomaticCompactionFailureDisposition.")
+    error.__dict__[_AUTOMATIC_COMPACTION_FAILURE_DISPOSITION_KEY] = disposition.model_copy(
+        deep=True
+    )
+
+
+def automatic_compaction_failure_disposition_payload(
+    error: BaseException,
+) -> dict[str, Any] | None:
+    """Return detached lifecycle evidence carried by a compaction failure."""
+
+    if not isinstance(error, BaseException):
+        raise TypeError("error must be a BaseException.")
+    candidate: BaseException | None = error
+    seen: set[int] = set()
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        disposition = candidate.__dict__.get(_AUTOMATIC_COMPACTION_FAILURE_DISPOSITION_KEY)
+        if type(disposition) is _AutomaticCompactionFailureDisposition:
+            return copy_durable_json_object(
+                disposition.model_dump(mode="json"),
+                "automatic_compaction_failure_disposition",
+            )
+        if isinstance(candidate, ContextBuildError):
+            candidate = candidate.cause
+        else:
+            cause = candidate.__cause__
+            candidate = cause if isinstance(cause, BaseException) else None
+    return None
+
+
 _COMPACTION_EVENT_TEXT_MAX_BYTES = 512
 _COMPACTION_EVENT_INTEGER_MAX = 9_223_372_036_854_775_807
 _COMPACTION_COVERAGE_MODES = frozenset(
@@ -1180,6 +1272,29 @@ def sanitize_context_compaction_telemetry(
             value = _compaction_event_bool(source.get(key))
             if value is not None:
                 payload[key] = value
+        if telemetry.event_type == EventType.CONTEXT_COMPACTION_FAILED:
+            phase = _compaction_event_text(source.get("phase"))
+            if phase in {item.value for item in _AutomaticCompactionLifecyclePhase}:
+                payload["phase"] = phase
+            reason = _compaction_event_text(source.get("reason"))
+            if reason in {item.value for item in _AutomaticCompactionFailureReason}:
+                payload["reason"] = reason
+            elapsed_ms = _compaction_event_integer(source.get("elapsed_ms"))
+            if elapsed_ms is not None:
+                payload["elapsed_ms"] = elapsed_ms
+            retryable = _compaction_event_bool(source.get("retryable"))
+            if retryable is not None:
+                payload["retryable"] = retryable
+            dispatch_disposition = _compaction_event_text(
+                source.get("provider_dispatch_disposition")
+            )
+            if dispatch_disposition in {
+                item.value for item in _AutomaticCompactionDispatchDisposition
+            }:
+                payload["provider_dispatch_disposition"] = dispatch_disposition
+            recovery_action = _compaction_event_text(source.get("recovery_action"))
+            if recovery_action in {item.value for item in _AutomaticCompactionRecoveryAction}:
+                payload["recovery_action"] = recovery_action
     return ContextCompactionTelemetry(event_type=telemetry.event_type, payload=payload)
 
 
@@ -4615,6 +4730,16 @@ async def _run_compaction_model(
                     except Exception as publication_error:
                         if isinstance(failure, ModelProviderError):
                             failure.retryable = False
+                        publication_disposition = automatic_compaction_failure_disposition_payload(
+                            publication_error
+                        )
+                        if publication_disposition is not None:
+                            _attach_automatic_compaction_failure_disposition(
+                                failure,
+                                _AutomaticCompactionFailureDisposition.model_validate(
+                                    publication_disposition
+                                ),
+                            )
                         failure.add_note(
                             "Compaction provider failure evidence publication also failed: "
                             f"{type(publication_error).__name__}: {publication_error}"
@@ -5530,6 +5655,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                 finally:
                     _COMPACTION_COMPLETION_LEDGER.reset(completion_ledger_token)
             except BaseException as exc:
+                failure_disposition = automatic_compaction_failure_disposition_payload(exc)
                 failure_telemetry = [
                     ContextCompactionTelemetry(
                         event_type=EventType.MODEL_COMPLETED,
@@ -5560,6 +5686,7 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
                                 if attempt_bounded_input is not None
                                 else {}
                             ),
+                            **(failure_disposition if failure_disposition is not None else {}),
                             "compaction_failed": True,
                         },
                     )

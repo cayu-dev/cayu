@@ -365,6 +365,7 @@ from cayu.runtime.context import (
     _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
     _runtime_authored_user_message_checkpoint_transform,
+    automatic_compaction_failure_disposition_payload,
     context_build_termination_compaction_telemetry,
     project_compaction_invocation_checkpoint,
     sanitize_context_build_error_checkpoint,
@@ -21918,6 +21919,9 @@ class SessionEngine:
                     )
                 if isinstance(error, resume_ledger.ToolCallEvidenceConflict):
                     failure_payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
+                compaction_failure = automatic_compaction_failure_disposition_payload(error)
+                if compaction_failure is not None:
+                    failure_payload["compaction_failure"] = compaction_failure
                 if runtime_failure_identity is not None:
                     failure_payload["runtime_task_failure_id"] = runtime_failure_identity.failure_id
                 return failure_payload
@@ -21963,9 +21967,15 @@ class SessionEngine:
                 and self.task_store is not None
             ):
                 try:
+                    compaction_failure = automatic_compaction_failure_disposition_payload(exc)
                     task_error = task_failure_payload_from_diagnostic(
                         failure_diagnostic,
                         session_id=session.id,
+                        additional_fields=(
+                            {"compaction_failure": compaction_failure}
+                            if compaction_failure is not None
+                            else None
+                        ),
                     )
                     if runtime_failure_identity is not None:
                         if payload is None:  # pragma: no cover - coupled above

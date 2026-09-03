@@ -31,6 +31,17 @@ from tests.core._execution_profile_fixtures import (
     tool_capability_ceiling_for_app,
 )
 from tests.core._execution_unit_fixtures import model_attempt_identity
+from tests.core._session_operation_fault_harness import (
+    CommitEvidence,
+    FailBeforeTransform,
+    MatchPolicy,
+    PublicationBoundary,
+    PublicationFaultActionKind,
+    PublicationFaultOutcome,
+    SessionOperationFaultHarness,
+    SessionOperationFaultRule,
+    SessionOperationSelector,
+)
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.core.task_invocation_fixtures import task_backed_session_invocation
 from tests.provider_traceback_assertions import is_cayu_source_filename
@@ -15562,10 +15573,28 @@ def test_cayu_app_drops_automatic_compaction_billing_cancellation_credentials(
     assert canary not in retained
     assert events[-1].type is EventType.SESSION_FAILED
     assert EventType.SESSION_INTERRUPTED not in {event.type for event in events}
-    assert events[-1].payload == {
+    expected_terminal: dict[str, Any] = {
         "error": "Model provider billing identity resolution failed",
         "error_type": "ModelProviderError",
     }
+    if stage == "completion":
+        failure = next(
+            event for event in events if event.type == EventType.CONTEXT_COMPACTION_FAILED
+        )
+        expected_disposition = {
+            "phase": "provider_dispatch",
+            "reason": "internal_failed",
+            "retryable": False,
+            "provider_dispatch_disposition": "unknown",
+            "recovery_action": "reconcile_completion",
+        }
+        assert {key: failure.payload[key] for key in expected_disposition} == expected_disposition
+        assert type(failure.payload["elapsed_ms"]) is int
+        expected_terminal["compaction_failure"] = {
+            **expected_disposition,
+            "elapsed_ms": failure.payload["elapsed_ms"],
+        }
+    assert events[-1].payload == expected_terminal
 
 
 def test_cayu_app_detaches_grouped_compaction_billing_cancellation_credentials() -> None:
@@ -37988,7 +38017,7 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
     async def run() -> None:
         monkeypatch.setattr(
             model_step_executor_module,
-            "_CONTEXT_EVENT_STORE_WAIT_TIMEOUT_S",
+            "_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S",
             0.01,
         )
         store = DelayedStartStore()
@@ -38014,16 +38043,15 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
             nonlocal stale_start_checks
             persisted = await original_is_persisted(event)
             if (
-                stale_start_checks < 2
+                stale_start_checks < 1
                 and event.type == EventType.CONTEXT_COMPACTION_STARTED
                 and not persisted
             ):
                 stale_start_checks += 1
-                if stale_start_checks == 2:
-                    store.release.set()
-                    await store.committed.wait()
-                # Both reconciliation reads are stale; the original physical
-                # write commits immediately before the fallback batch.
+                store.release.set()
+                await store.committed.wait()
+                # The reconciliation read is stale; the original physical
+                # write commits immediately before the exact replay.
                 return False
             return persisted
 
@@ -38041,15 +38069,15 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
             ),
         )
 
-        assert events[-1].type == EventType.SESSION_FAILED
-        assert stale_start_checks == 2
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert stale_start_checks == 1
         assert store.committed.is_set()
         assert store.cancellations >= 1
-        assert compaction_provider.calls == 0
+        assert compaction_provider.calls == 1
         durable = await store.load_events("sess_automatic_late_start_commit")
         starts = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_STARTED]
         assert [event.id for event in starts] == [store.original_event_id]
-        assert EventType.CONTEXT_COMPACTION_FAILED in {event.type for event in durable}
+        assert EventType.CONTEXT_COMPACTION_FAILED not in {event.type for event in durable}
         sink_starts = [
             event for event in sink.events if event.type == EventType.CONTEXT_COMPACTION_STARTED
         ]
@@ -38065,7 +38093,7 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
     asyncio.run(run())
 
 
-def test_automatic_compaction_failed_start_publication_reuses_causal_event() -> None:
+def test_automatic_compaction_retries_start_publication_with_causal_event() -> None:
     class CountingCompactionProvider(ModelProvider):
         name = "automatic-failed-start-provider"
 
@@ -38121,14 +38149,312 @@ def test_automatic_compaction_failed_start_publication_reuses_causal_event() -> 
             ),
         )
 
-        assert events[-1].type == EventType.SESSION_FAILED
-        assert compaction_provider.calls == 0
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert compaction_provider.calls == 1
         durable = await store.load_events("sess_automatic_failed_start_publication")
         starts = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_STARTED]
         failures = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_FAILED]
         assert [event.id for event in starts] == [rejected_start_id]
-        assert len(failures) == 1
-        assert durable.index(starts[0]) < durable.index(failures[0])
+        assert failures == []
+
+    asyncio.run(run())
+
+
+def test_automatic_compaction_exhausted_start_publication_is_typed_and_resumable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingCompactionProvider(ModelProvider):
+        name = "automatic-exhausted-start-provider"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            self.calls += 1
+            yield ModelStreamEvent.completed({})
+
+    async def run() -> None:
+        session_id = "sess_automatic_exhausted_start_publication"
+        store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        compaction_provider = CountingCompactionProvider()
+        await task_store.create_task(
+            TaskCreate(
+                task_id="task_automatic_exhausted_start_publication",
+                type="compaction-recovery",
+                assigned_agent_name="assistant",
+            )
+        )
+        app = CayuApp(
+            session_store=store,
+            task_store=task_store,
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        attempts = 0
+        original_emit_many = app._event_writer.emit_many
+
+        async def reject_start(session_id: str, events: list[Event]) -> list[Event]:
+            nonlocal attempts
+            if all(event.type == EventType.CONTEXT_COMPACTION_STARTED for event in events):
+                attempts += 1
+                raise TimeoutError("start publication timed out before commit")
+            return await original_emit_many(session_id, events)
+
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS",
+            2,
+        )
+        monkeypatch.setattr(app._event_writer, "emit_many", reject_start)
+        returned = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                task_id="task_automatic_exhausted_start_publication",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+
+        assert attempts == 2
+        assert compaction_provider.calls == 0
+        failure = next(
+            event for event in returned if event.type == EventType.CONTEXT_COMPACTION_FAILED
+        )
+        expected = {
+            "phase": "start_publication",
+            "reason": "publication_timeout",
+            "retryable": True,
+            "provider_dispatch_disposition": "not_dispatched",
+            "recovery_action": "resume_session",
+        }
+        assert {key: failure.payload[key] for key in expected} == expected
+        assert type(failure.payload["elapsed_ms"]) is int
+        terminal = returned[-1]
+        assert terminal.type == EventType.SESSION_FAILED
+        assert terminal.payload["compaction_failure"] == {
+            **expected,
+            "elapsed_ms": failure.payload["elapsed_ms"],
+        }
+        task = await task_store.load_task("task_automatic_exhausted_start_publication")
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert task.error is not None
+        assert task.error["compaction_failure"] == terminal.payload["compaction_failure"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "publication_type",
+    [EventType.REQUEST_FOOTPRINT_RECORDED, EventType.MODEL_STARTED],
+)
+def test_automatic_compaction_retries_predispatch_publication_without_duplicate_provider_call(
+    publication_type: EventType,
+    request_footprint_session_store,
+) -> None:
+    class CompactionProvider(ModelProvider):
+        name = "predispatch-publication-compactor"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed({"model": request.model})
+
+    async def run() -> None:
+        session_id = f"sess_automatic_{publication_type.value.replace('.', '_')}"
+        compaction_provider = CompactionProvider()
+        app = CayuApp(
+            session_store=request_footprint_session_store,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="compaction-publication-key",
+                fingerprint_key=SecretStr("p" * 32),
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        rule = SessionOperationFaultRule(
+            rule_id="compaction-predispatch",
+            selector=SessionOperationSelector(
+                session_id=session_id,
+                event_types=frozenset({publication_type}),
+            ),
+            actions=(FailBeforeTransform(),),
+            on_exhausted=MatchPolicy.DELEGATE,
+        )
+        async with SessionOperationFaultHarness(
+            request_footprint_session_store,
+            rules=(rule,),
+            boundary=PublicationBoundary.EVENT_APPEND,
+        ) as faults:
+            returned = await collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[
+                        Message.text("user", "old"),
+                        Message.text("assistant", "old answer"),
+                        Message.text("user", "current"),
+                    ],
+                ),
+            )
+
+        assert returned[-1].type == EventType.SESSION_COMPLETED
+        assert compaction_provider.calls == 1
+        injected = [
+            trace for trace in faults.trace if trace.matched_rule_id == "compaction-predispatch"
+        ]
+        assert len(injected) >= 2
+        assert injected[0].action is PublicationFaultActionKind.FAIL_BEFORE_TRANSFORM
+        assert injected[0].outcome is PublicationFaultOutcome.INJECTED_FAILURE
+        assert injected[0].committed is CommitEvidence.NO
+        assert injected[1].action is PublicationFaultActionKind.EXHAUSTED_DELEGATE
+        assert injected[1].outcome is PublicationFaultOutcome.RETURNED
+        assert injected[1].committed is CommitEvidence.YES
+        durable = await request_footprint_session_store.load_events(session_id)
+        target_events = [event for event in durable if event.type == publication_type]
+        if publication_type == EventType.REQUEST_FOOTPRINT_RECORDED:
+            target_events = [
+                event
+                for event in target_events
+                if event.payload.get("request_variant") == "context_compaction"
+            ]
+        else:
+            target_events = [
+                event
+                for event in target_events
+                if event.payload.get("purpose") == "context_compaction"
+            ]
+        assert len(target_events) == 1
+
+    asyncio.run(run())
+
+
+def test_automatic_hierarchy_exhausted_next_start_requires_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingHierarchyProvider(ModelProvider):
+        name = "automatic-hierarchy-publication-provider"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.text_delta(f"summary-{len(self.requests)}")
+            yield ModelStreamEvent.completed({"model": request.model})
+
+    async def run() -> None:
+        session_id = "sess_automatic_hierarchy_next_start_failure"
+        store = InMemorySessionStore()
+        compaction_provider = CountingHierarchyProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(FakeProvider([ModelStreamEvent.completed({})]), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                    max_input_chars=1000,
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        original_persist_exact_replay = app._event_writer.persist_exact_replay
+        model_start_publications = 0
+
+        async def fail_second_compactor_start(event: Event) -> Event:
+            nonlocal model_start_publications
+            if (
+                event.type == EventType.MODEL_STARTED
+                and event.payload.get("purpose") == "context_compaction"
+            ):
+                model_start_publications += 1
+                if model_start_publications >= 2:
+                    raise TimeoutError("next hierarchy model-start publication unavailable")
+            return await original_persist_exact_replay(event)
+
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_AUTOMATIC_COMPACTION_PREDISPATCH_PUBLICATION_ATTEMPTS",
+            3,
+        )
+        monkeypatch.setattr(
+            app._event_writer,
+            "persist_exact_replay",
+            fail_second_compactor_start,
+        )
+        returned = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[
+                    Message.text("user", "oversized " + "x" * 5000),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+        durable = await store.load_events(session_id)
+
+        assert returned[-1].type == EventType.SESSION_FAILED
+        assert len(compaction_provider.requests) == 1
+        assert (
+            sum(
+                event.type == EventType.MODEL_COMPLETED
+                and event.payload.get("purpose") == "context_compaction"
+                for event in durable
+            )
+            == 1
+        )
+        failure = next(
+            event for event in durable if event.type == EventType.CONTEXT_COMPACTION_FAILED
+        )
+        expected = {
+            "phase": "model_start_publication",
+            "reason": "publication_timeout",
+            "retryable": False,
+            "provider_dispatch_disposition": "dispatched",
+            "recovery_action": "reconcile_completion",
+        }
+        assert {key: failure.payload[key] for key in expected} == expected
+        assert {
+            key: returned[-1].payload["compaction_failure"][key] for key in expected
+        } == expected
 
     asyncio.run(run())
 
@@ -47755,8 +48081,20 @@ def test_automatic_compaction_lost_completion_ack_fails_closed_without_retry() -
         ]
         assert len(completions) == 1
         assert completions[0].payload["compaction_outcome"] == "provider_error"
-        assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in durable) == 1
+        failures = [event for event in durable if event.type == EventType.CONTEXT_COMPACTION_FAILED]
+        assert len(failures) == 1
+        expected = {
+            "phase": "completion_publication",
+            "reason": "publication_failed",
+            "retryable": False,
+            "provider_dispatch_disposition": "unknown",
+            "recovery_action": "reconcile_completion",
+        }
+        assert {key: failures[0].payload[key] for key in expected} == expected
         assert returned[-1].type == EventType.SESSION_FAILED
+        assert {
+            key: returned[-1].payload["compaction_failure"][key] for key in expected
+        } == expected
 
     asyncio.run(run())
 
@@ -52625,6 +52963,16 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
     expected_error_code: str | None,
 ):
     store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    asyncio.run(
+        task_store.create_task(
+            TaskCreate(
+                task_id="task_invalid_compaction_summary",
+                type="compaction-recovery",
+                assigned_agent_name="assistant",
+            )
+        )
+    )
     budget_store = InMemoryBudgetStore()
     compactor_provider = FakeProvider(
         [
@@ -52643,7 +52991,11 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             ModelStreamEvent.completed({"finish_reason": "stop"}),
         ]
     )
-    app = CayuApp(session_store=store, budget_store=budget_store)
+    app = CayuApp(
+        session_store=store,
+        task_store=task_store,
+        budget_store=budget_store,
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -52664,6 +53016,7 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
                 agent_name="assistant",
                 session_id="sess_invalid_compaction_summary",
                 causal_budget_id="job_invalid_compaction_summary",
+                task_id="task_invalid_compaction_summary",
                 messages=[
                     Message.text("user", "old"),
                     Message.text("assistant", "old answer"),
@@ -52675,14 +53028,16 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
+        EventType.TASK_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
+        EventType.TASK_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    completed = events[3]
+    completed = events[4]
     assert completed.payload["purpose"] == "context_compaction"
     assert completed.payload["compactor"] == "ModelCompactor"
     assert completed.payload["compaction_outcome"] == "invalid_summary"
@@ -52705,23 +53060,41 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             "uncached_input_tokens": 100,
         },
     }
-    assert events[4].payload["error_type"] == expected_error_type
-    assert "error" not in events[4].payload
-    assert events[5].payload["step_count"] == 1
-    assert events[5].payload["token_usage"]["input_tokens"] == 100
+    failure = events[5]
+    assert failure.payload["error_type"] == expected_error_type
+    assert "error" not in failure.payload
+    expected_disposition = {
+        "phase": "provider_dispatch",
+        "reason": "internal_failed",
+        "retryable": False,
+        "provider_dispatch_disposition": "dispatched",
+        "recovery_action": "reconcile_completion",
+    }
+    assert {key: failure.payload[key] for key in expected_disposition} == expected_disposition
+    assert type(failure.payload["elapsed_ms"]) is int
+    compaction_failure = {
+        **expected_disposition,
+        "elapsed_ms": failure.payload["elapsed_ms"],
+    }
+    assert events[7].payload["step_count"] == 1
+    assert events[7].payload["token_usage"]["input_tokens"] == 100
+    terminal = events[8]
+    assert terminal.payload["error_type"] == expected_error_type
+    assert terminal.payload["compaction_failure"] == compaction_failure
+    assert type(terminal.payload["execution_profile_fingerprint"]) is str
+    assert type(terminal.payload["runtime_task_failure_id"]) is str
     if expected_error_type == "DurableValueError":
         assert expected_error_code is not None
-        assert events[6].payload == {
-            "error": "Operation failed with a non-portable diagnostic.",
-            "error_type": expected_error_type,
-            "durable_value_error_code": expected_error_code,
-            "durable_value_error_path": "$",
-        }
+        assert terminal.payload["error"] == "Operation failed with a non-portable diagnostic."
+        assert terminal.payload["durable_value_error_code"] == expected_error_code
+        assert terminal.payload["durable_value_error_path"] == "$"
     else:
-        assert events[6].payload == {
-            "error": expected_error,
-            "error_type": expected_error_type,
-        }
+        assert terminal.payload["error"] == expected_error
+    task = asyncio.run(task_store.load_task("task_invalid_compaction_summary"))
+    assert task is not None
+    assert task.status == TaskStatus.FAILED
+    assert task.error is not None
+    assert task.error["compaction_failure"] == compaction_failure
     assert runtime_provider.requests == []
     assert checkpoint_without_active_invocation_profile(
         asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary"))
@@ -53440,15 +53813,28 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
+        EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert EventType.CONTEXT_COMPACTION_COMPLETED not in {event.type for event in events}
     assert EventType.SESSION_CHECKPOINTED not in {event.type for event in events}
-    assert events[5].payload == {
-        "error": "checkpoint unavailable",
-        "error_type": "RuntimeError",
+    expected_disposition = {
+        "phase": "checkpoint_installation",
+        "reason": "checkpoint_failed",
+        "retryable": False,
+        "provider_dispatch_disposition": "dispatched",
+        "recovery_action": "fail_closed",
     }
+    failure = events[4]
+    assert {key: failure.payload[key] for key in expected_disposition} == expected_disposition
+    assert type(failure.payload["elapsed_ms"]) is int
+    assert failure.payload["compaction_failed"] is True
+    assert events[6].payload["error"] == "checkpoint unavailable"
+    assert events[6].payload["error_type"] == "RuntimeError"
+    assert {
+        key: events[6].payload["compaction_failure"][key] for key in expected_disposition
+    } == expected_disposition
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
 

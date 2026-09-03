@@ -510,6 +510,21 @@ publishes its own `model.completed` evidence before another provider dispatch
 may begin. An attempt that reached provider-controlled execution but returned
 no authoritative completion usage is recorded as usage-unavailable and makes a
 strict event-backed budget fail closed on retry and after process restart.
+A transient automatic-compaction publication failure before provider dispatch
+retries a stable event identity through the durable event handoff. The bounded
+wait tolerates queued SQLite and PostgreSQL writers; exact replay prevents a
+late acknowledgement from duplicating request-footprint or `model.started`
+evidence. Exhausted failures report allowlisted `phase`, `reason`, `elapsed_ms`,
+`retryable`, `provider_dispatch_disposition`, and `recovery_action` fields on
+`context.compaction.failed` and copy that disposition into terminal session and
+linked-task evidence. `not_dispatched` is asserted only while Cayu still owns a
+pre-dispatch callback that has not returned. Once provider execution may have
+started, the disposition is `unknown` or `dispatched`, recovery reconciles the
+existing completion and settlement authority, and no publication retry can
+authorize another provider call. In a hierarchical compaction, a later
+pre-dispatch publication failure retains that post-dispatch disposition once
+an earlier provider attempt completed; it cannot advertise blind session
+resume that would repeat the completed request.
 A dispatched compaction without authoritative priced usage is charged at its
 reserved amount; mixed known and uncertain completions retain the known cost and
 add one reserved amount for each uncertain completion. Failures before a built-in

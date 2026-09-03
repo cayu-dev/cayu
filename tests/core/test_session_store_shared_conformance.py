@@ -21,6 +21,17 @@ from tests.core._execution_profile_fixtures import (
     interrupt_and_release_test_invocation,
     profiled_session_identity,
 )
+from tests.core._session_operation_fault_harness import (
+    MatchPolicy,
+    PauseBeforeTransform,
+    PublicationBarrier,
+    PublicationBoundary,
+    PublicationFaultActionKind,
+    PublicationFaultOutcome,
+    SessionOperationFaultHarness,
+    SessionOperationFaultRule,
+    SessionOperationSelector,
+)
 from tests.core._workload_secret_support import FakeProvider
 from tests.core.completion_result_resolver_conformance import (
     assert_completion_result_resolver_session_publication_conformance,
@@ -1587,6 +1598,125 @@ def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
         yield postgres_dsn
     finally:
         asyncio.run(_reset_postgres_data(postgres_dsn))
+
+
+def test_automatic_compaction_publication_contention_conformance(
+    session_store_case,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ConcurrentProvider(ModelProvider):
+        name = "concurrent-store-compactor"
+
+        def __init__(self, *, summary: bool) -> None:
+            self.summary = summary
+            self.calls = 0
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.summary:
+                yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed({"model": request.model})
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        compaction_provider = ConcurrentProvider(summary=True)
+        runtime_provider = ConcurrentProvider(summary=False)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(runtime_provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="runtime-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=ModelCompactor(
+                    provider=compaction_provider,
+                    model="summary-model",
+                ),
+                max_user_turns=1,
+                compact_after_messages=1,
+            ),
+        )
+        barriers = [PublicationBarrier() for _index in range(6)]
+        rules = tuple(
+            SessionOperationFaultRule(
+                rule_id=f"compaction-model-start-{index}",
+                selector=SessionOperationSelector(
+                    session_id=(f"sess_compaction_contention_{session_store_case[0]}_{index}"),
+                    event_types=frozenset({EventType.MODEL_STARTED}),
+                ),
+                actions=(PauseBeforeTransform(barrier),),
+                on_exhausted=MatchPolicy.DELEGATE,
+            )
+            for index, barrier in enumerate(barriers)
+        )
+
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_AUTOMATIC_COMPACTION_PREDISPATCH_EVENT_STORE_WAIT_TIMEOUT_S",
+            0.5,
+        )
+        monkeypatch.setattr(
+            model_step_executor_module,
+            "_CONTEXT_EVENT_STORE_WAIT_AFTER_CANCELLATION_TIMEOUT_S",
+            0.5,
+        )
+        try:
+            async with SessionOperationFaultHarness(
+                store,
+                rules=rules,
+                boundary=PublicationBoundary.EVENT_APPEND,
+            ) as faults:
+                results = await asyncio.gather(
+                    *(
+                        _collect_events(
+                            app.run(
+                                RunRequest(
+                                    agent_name="assistant",
+                                    session_id=(
+                                        "sess_compaction_contention_"
+                                        f"{session_store_case[0]}_{index}"
+                                    ),
+                                    messages=[
+                                        Message.text("user", "old"),
+                                        Message.text("assistant", "old answer"),
+                                        Message.text("user", "current"),
+                                    ],
+                                )
+                            )
+                        )
+                        for index in range(6)
+                    )
+                )
+            terminal_summaries = [(events[-1].type, events[-1].payload) for events in results]
+            assert all(
+                event_type == EventType.SESSION_COMPLETED
+                for event_type, _payload in terminal_summaries
+            ), terminal_summaries
+            assert compaction_provider.calls == 6
+            assert runtime_provider.calls == 6
+            scheduled = [trace for trace in faults.trace if trace.matched_rule_id is not None]
+            paused = [
+                trace
+                for trace in scheduled
+                if trace.action is PublicationFaultActionKind.PAUSE_BEFORE_TRANSFORM
+            ]
+            assert len(paused) == 6
+            assert all(trace.outcome is PublicationFaultOutcome.CANCELLED for trace in paused)
+            assert faults.dropped_trace_entries == 0
+            for index in range(6):
+                durable = await store.load_events(
+                    f"sess_compaction_contention_{session_store_case[0]}_{index}"
+                )
+                assert (
+                    sum(
+                        event.type == EventType.MODEL_STARTED
+                        and event.payload.get("purpose") == "context_compaction"
+                        for event in durable
+                    )
+                    == 1
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_persists_provider_cancellation_diagnostics(
