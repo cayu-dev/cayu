@@ -285,6 +285,7 @@ __all__ = [
     "SQLiteAgentWorkContextStore",
     "SQLiteBudgetLedger",
     "SQLiteEvalStore",
+    "SQLiteEvalWriterContentionPolicy",
     "SQLiteEventWatcherStore",
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
@@ -304,10 +305,16 @@ __all__ = [
 def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so the base package import does not depend on psycopg.
-    if name == "SQLiteEvalStore":
-        from cayu.storage.evals_sqlite import SQLiteEvalStore
+    if name in {"SQLiteEvalStore", "SQLiteEvalWriterContentionPolicy"}:
+        from cayu.storage.evals_sqlite import (
+            SQLiteEvalStore,
+            SQLiteEvalWriterContentionPolicy,
+        )
 
-        return SQLiteEvalStore
+        return {
+            "SQLiteEvalStore": SQLiteEvalStore,
+            "SQLiteEvalWriterContentionPolicy": SQLiteEvalWriterContentionPolicy,
+        }[name]
     if name in {
         "PostgresBudgetLedger",
         "PostgresAgentWorkContextStore",

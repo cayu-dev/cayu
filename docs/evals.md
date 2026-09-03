@@ -2348,6 +2348,30 @@ still-owned work so another process or restart can claim it; an unclean stop
 remains recoverable after lease expiry. No partial run is ever represented as
 passed.
 
+Claim monitoring uses `EvalStore.load_run_observation(...)`, a bounded projection
+of only run ID, status, attempt count, update time, and public ownership epoch and
+lease expiry. Built-in in-memory, SQLite, and PostgreSQL stores implement that
+projection without loading or parsing the immutable invocation, execution
+profile, or scenario progress. Full `load_run(...)` validation remains in the
+admission, explicit reconstruction, and publication paths where the complete
+contract is required. The coordinator also uses
+`heartbeat_run_observation(...)`; the existing full-record `heartbeat_run(...)`
+API remains available to callers that need it. File-backed SQLite observations
+use a dedicated read-only WAL connection, so status reads do not queue behind
+that store instance's writer executor.
+
+`EvalStore.wait_for_run_terminal(...)` is the application-facing bounded wait.
+Each call is limited to at most 300 seconds, returns `None` immediately for an
+unknown run, returns an `EvalRunObservation` for a terminal run, and raises
+`TimeoutError` when its deadline expires. Its adaptive polling starts no faster
+than 50 ms and backs off to a caller-selected ceiling of at most one second; the
+default ceiling therefore bounds transition-observation latency to one second
+plus one status-read operation. The coordinator applies the same exponential
+backoff between heartbeats. A configured polling interval slower than one second
+remains an explicit operator choice and is also the resulting observation-latency
+bound. Callers load the immutable result once after observing `completed` instead
+of repeatedly loading both the result and full run record.
+
 The fence covers publication, not external side effects. If a lease is lost
 after a model request began, recovery may execute the candidate and judge calls
 again; Cayu does not claim exactly-once model calls. Only the current fenced
@@ -2360,6 +2384,47 @@ SQLite is the embedded single-database choice. PostgreSQL permits multiple
 server processes to compete safely for the same target's queued work through
 fenced claims. This is not an arbitrary target registry, generic queue, remote
 worker protocol, or hosted eval service.
+
+One process may construct several `SQLiteEvalStore` instances over that embedded
+database. Claim-heartbeat, trial-checkpoint, and terminal-result commits therefore
+use an explicit `SQLiteEvalWriterContentionPolicy` instead of accidentally
+inheriting the generic five-second SQLite timeout. The default gives each database
+lock attempt 250 ms, retries with cancellation-aware exponential backoff from
+10 ms through 250 ms, and stops after a cumulative 60 seconds. That cumulative
+budget begins before a caller enters the store instance's writer queue, so local
+queueing cannot multiply the bound. Applications may pass a narrower policy to
+`SQLiteEvalStore(writer_contention_policy=...)`; every duration must be finite and
+positive.
+
+Each retry begins a fresh transaction. Claim ID, ownership epoch, lease expiry,
+and run status are checked only after `BEGIN IMMEDIATE` acquires the writer lock,
+so waiting never lets stale authority publish. Cancellation settles the current
+lock attempt and rolls back before it is delivered. If the total contention
+budget expires, the store raises `EvalStoreTransientContention`. The embedded
+coordinator keeps a completed trial attached to its current execution and retries
+that exact checkpoint after bounded, cancellation-aware pauses; it does not make
+the run claimable while the completed result exists only in memory. A deferred
+final-result publication may release the run for recovery because all of its trial
+checkpoints are already durable. Neither case is marked `execution_failed`, while
+a contended heartbeat keeps the current execution attached and retries. A competing claim cannot be published
+while that SQLite writer lock is held; after the lock is acquired, the transaction
+either renews the still-live exact claim or reports authoritative claim/lease loss.
+Already committed trial checkpoints remain available, and a deferred final-result
+publication can rebuild from them without rerunning those trials. Process loss
+before a completed trial checkpoint commits still requires the target's normal
+durable idempotency or reconciliation boundary, as described above; live contention
+exhaustion alone does not manufacture that redispatch boundary.
+
+Structured `cayu.storage.evals_sqlite` log records expose
+`cayu_eval_store_event` values for `sqlite_writer.lock_wait`,
+`sqlite_writer.retry`, `sqlite_writer.contention_exhausted`,
+`sqlite_writer.claim_lost`, and `sqlite_writer.permanent_storage_failure`.
+Records also carry the operation, bounded run ID, attempt count, accumulated
+wait, and next retry delay. Other SQLite eval mutations retain the shared
+five-second policy. Debug-level structured records separately identify
+`run_status_read`, `full_run_rehydration`, `checkpoint_write`, and
+`result_publication`; each includes elapsed duration, while worker-originated
+checkpoint and publication records work consistently across store backends.
 
 ### First-class dashboard Evals area
 

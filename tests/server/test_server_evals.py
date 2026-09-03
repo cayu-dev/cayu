@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -58,6 +60,7 @@ from cayu.evals.store import (
     EvalRunInvocation,
     EvalRunRequest,
     EvalRunStatus,
+    EvalStoreTransientContention,
     InMemoryEvalStore,
 )
 from cayu.evals.suite_authoring import (
@@ -93,7 +96,7 @@ from cayu.server.contracts import (
     EvalRunCreateRequest,
 )
 from cayu.server.evals_registry import explicit_eval_target_registry, target_for_eval_invocation
-from cayu.storage.evals_sqlite import SQLiteEvalStore
+from cayu.storage.evals_sqlite import SQLiteEvalStore, SQLiteEvalWriterContentionPolicy
 from cayu.storage.migrations import SchemaMode
 
 _AUTH_HEADERS = {"Authorization": "Bearer valid"}
@@ -2024,6 +2027,198 @@ def test_result_publication_heartbeats_until_the_terminal_commit(
         asyncio.run(store.close())
 
 
+def test_transient_result_store_contention_requeues_without_terminal_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        target = _target(_provider(trials=1))
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            target,
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        store = SQLiteEvalStore(tmp_path / "result.db")
+        try:
+            await store.save_corpus(corpus, redact_json=target.app.redact_json)
+            await store.admit_run(
+                EvalRunRequest(
+                    run_id="result-contention",
+                    idempotency_key="sha256:" + "9" * 64,
+                    corpus_revision=corpus.revision,
+                    target_key=corpus.target_key,
+                    suite_id=corpus.suites[0].id,
+                    suite_revision=corpus.suites[0].revision,
+                    max_concurrency=1,
+                ),
+                redact_json=target.app.redact_json,
+            )
+            lease = await store.claim_run(target_key=target.key)
+            assert lease is not None
+            coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(target, store))
+
+            async def execution_outcome():
+                return result
+
+            async def contended_result_publication(*_args, **_kwargs):
+                raise EvalStoreTransientContention("result publication deferred")
+
+            monkeypatch.setattr(store, "publish_result", contended_result_publication)
+            execution = asyncio.create_task(execution_outcome())
+            await asyncio.wait({execution})
+            await coordinator._publish_execution_outcome(lease.claim, target, execution)
+
+            requeued = await store.load_run(lease.claim.run_id)
+            assert requeued is not None
+            assert requeued.status is EvalRunStatus.QUEUED
+            assert requeued.failure_code is None
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_checkpoint_contention_exhaustion_retries_without_trial_redispatch(
+    tmp_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    async def exercise() -> None:
+        provider = _provider(trials=1)
+        target = _target(provider)
+        corpus = _corpus(trials=1)
+        path = tmp_path / "checkpoint-retry.db"
+        store = SQLiteEvalStore(
+            path,
+            writer_contention_policy=SQLiteEvalWriterContentionPolicy(
+                max_wait_seconds=0.08,
+                lock_attempt_seconds=0.02,
+                initial_backoff_seconds=0.005,
+                max_backoff_seconds=0.02,
+            ),
+        )
+        blocker = sqlite3.connect(path)
+        release_blocker = None
+        checkpoint_attempts = 0
+        original_save = store.save_trial_checkpoint
+
+        async def release_after_exhaustion() -> None:
+            await asyncio.sleep(0.15)
+            blocker.commit()
+
+        async def contend_first_checkpoint(*args, **kwargs):
+            nonlocal checkpoint_attempts, release_blocker
+            checkpoint_attempts += 1
+            if checkpoint_attempts == 1:
+                blocker.execute("BEGIN IMMEDIATE")
+                release_blocker = asyncio.create_task(release_after_exhaustion())
+            return await original_save(*args, **kwargs)
+
+        monkeypatch.setattr(store, "save_trial_checkpoint", contend_first_checkpoint)
+        try:
+            await store.save_corpus(corpus, redact_json=target.app.redact_json)
+            await store.admit_run(
+                EvalRunRequest(
+                    run_id="checkpoint-contention-retry",
+                    idempotency_key="sha256:" + "7" * 64,
+                    corpus_revision=corpus.revision,
+                    target_key=target.key,
+                    suite_id=corpus.suites[0].id,
+                    suite_revision=corpus.suites[0].revision,
+                    max_concurrency=1,
+                    invocation=await _bound_eval_invocation(target),
+                ),
+                redact_json=target.app.redact_json,
+            )
+            lease = await store.claim_run(target_key=target.key, lease_seconds=5)
+            assert lease is not None
+            coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(target, store))
+
+            await coordinator._run_lease(lease)
+
+            completed = await store.load_run(lease.run.id)
+            assert completed is not None
+            assert completed.status is EvalRunStatus.COMPLETED
+            assert completed.attempt_count == 1
+            assert checkpoint_attempts >= 2
+            assert len(provider.requests) == 1
+        finally:
+            blocker.rollback()
+            if release_blocker is not None:
+                await asyncio.gather(release_blocker, return_exceptions=True)
+            blocker.close()
+            await store.close()
+
+    caplog.set_level(logging.INFO, logger=evals_sqlite_module.__name__)
+    asyncio.run(exercise())
+    assert "sqlite_writer.contention_exhausted" in {
+        getattr(record, "cayu_eval_store_event", None) for record in caplog.records
+    }
+
+
+def test_claim_monitor_retries_transient_heartbeat_contention(tmp_path) -> None:
+    async def exercise() -> None:
+        target = _target(_provider(trials=1))
+        corpus = _corpus(trials=1)
+        store = SQLiteEvalStore(
+            tmp_path / "heartbeat-contention.db",
+            writer_contention_policy=SQLiteEvalWriterContentionPolicy(
+                max_wait_seconds=0.08,
+                lock_attempt_seconds=0.02,
+                initial_backoff_seconds=0.005,
+                max_backoff_seconds=0.02,
+            ),
+        )
+        blocker = sqlite3.connect(store.path)
+        monitor = None
+        try:
+            await store.save_corpus(corpus, redact_json=target.app.redact_json)
+            await store.admit_run(
+                EvalRunRequest(
+                    run_id="heartbeat-contention",
+                    idempotency_key="sha256:" + "8" * 64,
+                    corpus_revision=corpus.revision,
+                    target_key=corpus.target_key,
+                    suite_id=corpus.suites[0].id,
+                    suite_revision=corpus.suites[0].revision,
+                    max_concurrency=1,
+                ),
+                redact_json=target.app.redact_json,
+            )
+            lease = await store.claim_run(lease_seconds=2)
+            assert lease is not None
+            await store._run(lambda connection: connection.execute("PRAGMA busy_timeout = 50"))
+            coordinator = evals_worker_module.EvalRunCoordinator(
+                _evals_config(
+                    target,
+                    store,
+                    lease_seconds=2,
+                    poll_interval_seconds=0.01,
+                )
+            )
+            blocker.execute("BEGIN IMMEDIATE")
+            monitor = asyncio.create_task(coordinator._monitor_claim(lease.claim))
+            await asyncio.sleep(0.75)
+            assert not monitor.done()
+
+            blocker.commit()
+            await store.request_cancel(lease.run.id)
+            outcome = await asyncio.wait_for(monitor, timeout=1.5)
+            assert outcome is evals_worker_module._ClaimMonitorOutcome.CANCELLING
+            await store.finish_cancel(lease.claim)
+        finally:
+            if monitor is not None and not monitor.done():
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
+            blocker.rollback()
+            blocker.close()
+            await store.close()
+
+    asyncio.run(exercise())
+
+
 def test_result_projection_cannot_expire_a_completed_provider_lease(
     tmp_path,
     monkeypatch,
@@ -2259,6 +2454,103 @@ def test_eval_preflight_rechecks_ownership_before_provider_dispatch(
             asyncio.run(competing_store.release_run(competing_lease.claim))
         asyncio.run(competing_store.close())
         asyncio.run(store.close())
+
+
+def test_claim_monitor_uses_adaptive_lightweight_observations(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        target = _target(_provider(trials=1))
+        corpus = _corpus(trials=1)
+        suite = corpus.suites[0]
+        path = tmp_path / "evals.db"
+        store = SQLiteEvalStore(path)
+        competing_store = SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+        calls = {
+            "full_load": 0,
+            "observation_load": 0,
+            "full_heartbeat": 0,
+            "observation_heartbeat": 0,
+        }
+        original_load_run = store.load_run
+        original_load_observation = store.load_run_observation
+        original_heartbeat = store.heartbeat_run
+        original_heartbeat_observation = store.heartbeat_run_observation
+        monitor = None
+
+        async def counted_load_run(run_id):
+            calls["full_load"] += 1
+            return await original_load_run(run_id)
+
+        async def counted_load_observation(run_id):
+            calls["observation_load"] += 1
+            return await original_load_observation(run_id)
+
+        async def counted_heartbeat(claim, *, extend_seconds=300):
+            calls["full_heartbeat"] += 1
+            return await original_heartbeat(claim, extend_seconds=extend_seconds)
+
+        async def counted_heartbeat_observation(claim, *, extend_seconds=300):
+            calls["observation_heartbeat"] += 1
+            return await original_heartbeat_observation(
+                claim,
+                extend_seconds=extend_seconds,
+            )
+
+        monkeypatch.setattr(store, "load_run", counted_load_run)
+        monkeypatch.setattr(store, "load_run_observation", counted_load_observation)
+        monkeypatch.setattr(store, "heartbeat_run", counted_heartbeat)
+        monkeypatch.setattr(
+            store,
+            "heartbeat_run_observation",
+            counted_heartbeat_observation,
+        )
+        try:
+            await store.save_corpus(corpus, redact_json=target.app.redact_json)
+            await store.admit_run(
+                EvalRunRequest(
+                    run_id="lightweight-monitor",
+                    idempotency_key="sha256:" + "1" * 64,
+                    corpus_revision=corpus.revision,
+                    target_key=corpus.target_key,
+                    suite_id=suite.id,
+                    suite_revision=suite.revision,
+                    max_concurrency=1,
+                ),
+                redact_json=target.app.redact_json,
+            )
+            lease = await store.claim_run(lease_seconds=1)
+            assert lease is not None
+            coordinator = evals_worker_module.EvalRunCoordinator(
+                _evals_config(
+                    target,
+                    store,
+                    lease_seconds=1,
+                    poll_interval_seconds=0.01,
+                )
+            )
+            monitor = asyncio.create_task(coordinator._monitor_claim(lease.claim))
+            await asyncio.sleep(0.8)
+            assert calls["full_load"] == 0
+            assert calls["full_heartbeat"] == 0
+            assert 2 <= calls["observation_load"] <= 5
+            assert calls["observation_heartbeat"] >= 2
+
+            cancellation_started_at = asyncio.get_running_loop().time()
+            await competing_store.request_cancel(lease.run.id)
+            outcome = await asyncio.wait_for(monitor, timeout=0.4)
+            assert asyncio.get_running_loop().time() - cancellation_started_at < 0.4
+            assert outcome is evals_worker_module._ClaimMonitorOutcome.CANCELLING
+            await store.finish_cancel(lease.claim)
+        finally:
+            if monitor is not None and not monitor.done():
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
+            await competing_store.close()
+            await store.close()
+
+    asyncio.run(exercise())
 
 
 def test_shutdown_releases_owned_eval_for_restart_recovery(tmp_path) -> None:

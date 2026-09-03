@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -122,6 +123,39 @@ def _request(corpus, *, run_id: str = "run-1", key: str = "request-1") -> EvalRu
         suite_revision=suite.revision,
         max_concurrency=2,
     )
+
+
+def test_terminal_wait_is_bounded_and_clamps_busy_polling() -> None:
+    class CountingEvalStore(InMemoryEvalStore):
+        observation_count = 0
+
+        async def load_run_observation(self, run_id):
+            self.observation_count += 1
+            return await super().load_run_observation(run_id)
+
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        store = CountingEvalStore()
+        await _save_corpus(store, corpus)
+        await _admit_run(store, _request(corpus, run_id="bounded-wait"))
+
+        started_at = time.monotonic()
+        with pytest.raises(TimeoutError, match="bounded-wait"):
+            await store.wait_for_run_terminal(
+                "bounded-wait",
+                timeout_seconds=0.13,
+                poll_interval_seconds=0.001,
+                max_poll_interval_seconds=0.05,
+            )
+        elapsed = time.monotonic() - started_at
+        assert 0.11 <= elapsed < 0.5
+        assert 2 <= store.observation_count <= 4
+
+        assert await store.wait_for_run_terminal("missing-run", timeout_seconds=0.1) is None
+        with pytest.raises(ValueError, match="cannot exceed 300"):
+            await store.wait_for_run_terminal("bounded-wait", timeout_seconds=301)
+
+    asyncio.run(exercise())
 
 
 def test_memory_store_catalog_is_immutable_bounded_and_keyset_paginated() -> None:

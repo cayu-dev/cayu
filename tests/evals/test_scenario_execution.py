@@ -21,6 +21,7 @@ from cayu import (
     EvalScenarioRunInvocation,
     EvalScenarioTrialFailureCode,
     EvalScenarioTrialPhase,
+    EvalStoreTransientContention,
     ExecutionProfileBehaviorIdentity,
     InMemoryEvalStore,
     Message,
@@ -435,6 +436,82 @@ def test_scenario_execution_partitions_memory_limits_before_trial_dispatch() -> 
         assert all(
             trial.memory_attribution.effective_max_bytes == expected_max_bytes for trial in trials
         )
+
+    asyncio.run(exercise())
+
+
+def test_scenario_checkpoint_contention_retries_without_trial_redispatch() -> None:
+    class ContendedCheckpointStore(InMemoryEvalStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checkpoint_attempts = 0
+
+        async def save_trial_checkpoint(self, *args, **kwargs) -> None:
+            self.checkpoint_attempts += 1
+            if self.checkpoint_attempts == 1:
+                raise EvalStoreTransientContention("checkpoint publication deferred")
+            await super().save_trial_checkpoint(*args, **kwargs)
+
+    async def exercise() -> None:
+        provider = _ApprovalProvider(request_approval=False)
+        target = _approval_target(provider, max_trials=1)
+        scenario = _scenario()
+        preflight = await preflight_eval_scenario(
+            scenario,
+            target,
+            ScenarioLaunchSettingsV2(
+                trials=1,
+                max_concurrency=1,
+                timeout_seconds=30,
+            ),
+            actor_authorized=True,
+        )
+        assert preflight.binding is not None
+        binding = preflight.binding
+        corpus = corpus_for_eval_scenario(scenario, binding, target)
+        compiled = compile_corpus_suite(corpus, target, "scenario")
+        store = ContendedCheckpointStore()
+        await store.save_scenario(scenario, redact_json=target.app.redact_json)
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        request = EvalRunRequest(
+            run_id="scenario-checkpoint-contention",
+            idempotency_key="sha256:" + "7" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id="scenario",
+            suite_revision=compiled.run_contract.suite_revision,
+            max_concurrency=1,
+            invocation=EvalRunInvocation(
+                max_steps=binding.max_steps,
+                limits=binding.operator_run_limits,
+                cost_budget=binding.cost_budget,
+                scenario=EvalScenarioRunInvocation(
+                    scenario_revision=scenario.revision,
+                    binding_revision=binding.revision,
+                    environment_name=binding.environment_name,
+                    trials=binding.trials,
+                    timeout_seconds=binding.timeout_seconds,
+                ),
+            ),
+        )
+        await store.admit_run(request, redact_json=target.app.redact_json)
+        claimed = await store.claim_run(target_key=target.key, lease_seconds=30)
+        assert claimed is not None
+
+        result = await run_compiled_eval_scenario(
+            target,
+            compiled,
+            scenario,
+            binding,
+            store=store,
+            claim=claimed.claim,
+            max_concurrency=1,
+            poll_seconds=0.001,
+        )
+
+        assert len(result.run.cases[0].trials) == 1
+        assert store.checkpoint_attempts == 2
+        assert provider.request_count == 1
 
     asyncio.run(exercise())
 

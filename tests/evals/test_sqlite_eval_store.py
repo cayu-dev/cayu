@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import suppress
@@ -31,20 +32,28 @@ from tests.evals.test_judge_calibration import _calibration_report
 import cayu.storage.evals_sqlite as evals_sqlite_module
 from cayu.evals.capacity import EVAL_MAX_CONCURRENCY
 from cayu.evals.corpus import EvalCorpusDocument
-from cayu.evals.execution import CorpusExecutionResult, run_corpus_suite
+from cayu.evals.execution import (
+    CorpusExecutionResult,
+    _run_compiled_corpus_suite,
+    compile_corpus_suite,
+    run_corpus_suite,
+)
 from cayu.evals.store import (
     EvalBaselineKey,
     EvalBaselineUpdate,
     EvalRunClaim,
+    EvalRunClaimLost,
     EvalRunFailureCode,
     EvalRunInvocation,
     EvalRunRecord,
     EvalRunRequest,
     EvalRunStatus,
+    EvalRunTrialCheckpoint,
+    EvalStoreTransientContention,
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
-from cayu.storage.evals_sqlite import SQLiteEvalStore
+from cayu.storage.evals_sqlite import SQLiteEvalStore, SQLiteEvalWriterContentionPolicy
 from cayu.storage.migrations import SchemaMode, SchemaTooOld
 from cayu.vaults.redaction import SecretRedactor
 
@@ -109,6 +118,456 @@ def test_sqlite_eval_store_durably_admits_operator_selected_concurrency(tmp_path
     asyncio.run(exercise())
     with pytest.raises(ValidationError, match="less than or equal"):
         _request(_corpus(trials=1), max_concurrency=EVAL_MAX_CONCURRENCY + 1)
+
+
+def _fast_contention_policy(*, max_wait_seconds: float = 2.0):
+    return SQLiteEvalWriterContentionPolicy(
+        max_wait_seconds=max_wait_seconds,
+        lock_attempt_seconds=0.02,
+        initial_backoff_seconds=0.005,
+        max_backoff_seconds=0.02,
+    )
+
+
+async def _result_with_checkpoint(corpus):
+    target = _target(_provider(trials=1))
+    retained = []
+
+    async def capture(case_id, result, public_data) -> None:
+        retained.append(
+            EvalRunTrialCheckpoint(
+                case_id=case_id,
+                result=result,
+                public_data=public_data,
+            )
+        )
+
+    result = await _run_compiled_corpus_suite(
+        target,
+        compile_corpus_suite(corpus, target, corpus.suites[0].id),
+        max_concurrency=1,
+        trial_completed=capture,
+    )
+    assert len(retained) == 1
+    return result, retained[0]
+
+
+def test_sqlite_run_observation_bypasses_full_rehydration_and_writer_queue(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        store = SQLiteEvalStore(tmp_path / "evals.db")
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        writer = None
+
+        def occupy_writer(_connection) -> None:
+            writer_started.set()
+            if not release_writer.wait(timeout=5):
+                raise AssertionError("Timed out releasing the SQLite eval writer.")
+
+        def reject_invocation_rehydration(_source: str):
+            raise AssertionError("immutable invocation was rehydrated")
+
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run()
+            assert lease is not None
+            monkeypatch.setattr(
+                evals_sqlite_module,
+                "eval_run_invocation_from_json",
+                reject_invocation_rehydration,
+            )
+
+            writer = asyncio.create_task(store._run(occupy_writer))
+            assert await asyncio.to_thread(writer_started.wait, 2)
+            observation = await asyncio.wait_for(
+                store.load_run_observation(lease.run.id),
+                timeout=0.25,
+            )
+            assert observation is not None
+            assert observation.status is EvalRunStatus.RUNNING
+            assert observation.ownership == lease.run.ownership
+
+            release_writer.set()
+            await writer
+            with pytest.raises(AssertionError, match="immutable invocation"):
+                await store.load_run(lease.run.id)
+        finally:
+            release_writer.set()
+            if writer is not None:
+                await asyncio.gather(writer, return_exceptions=True)
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_sqlite_terminal_watchers_do_not_starve_checkpoint_or_result_publication(
+    tmp_path,
+    caplog,
+) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        result, checkpoint = await _result_with_checkpoint(corpus)
+        path = tmp_path / "evals.db"
+        owner = SQLiteEvalStore(path)
+        observers = []
+        waiters = []
+        try:
+            await _save_corpus(owner, corpus)
+            await _admit_run(owner, _request(corpus, run_id="watched-run"))
+            lease = await owner.claim_run()
+            assert lease is not None
+            assert await owner.load_run(lease.run.id) is not None
+            observers = [SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE) for _ in range(3)]
+            stores = [owner, *observers]
+            waiters = [
+                asyncio.create_task(
+                    store.wait_for_run_terminal(
+                        lease.run.id,
+                        timeout_seconds=2,
+                        poll_interval_seconds=0.001,
+                        max_poll_interval_seconds=0.05,
+                    )
+                )
+                for store in stores
+                for _ in range(8)
+            ]
+            await asyncio.sleep(0.03)
+
+            checkpoint_started_at = asyncio.get_running_loop().time()
+            await owner.save_trial_checkpoint(
+                lease.claim,
+                checkpoint,
+                redact_json=_NO_SECRETS.redact_json,
+            )
+            assert asyncio.get_running_loop().time() - checkpoint_started_at < 1.0
+
+            publication_started_at = asyncio.get_running_loop().time()
+            completed = await _publish_result(owner, lease.claim, result)
+            assert asyncio.get_running_loop().time() - publication_started_at < 1.0
+            assert completed.status is EvalRunStatus.COMPLETED
+            observations = await asyncio.wait_for(asyncio.gather(*waiters), timeout=2)
+            assert all(
+                observation is not None and observation.status is EvalRunStatus.COMPLETED
+                for observation in observations
+            )
+        finally:
+            if waiters:
+                await asyncio.gather(*waiters, return_exceptions=True)
+            await asyncio.gather(*(store.close() for store in observers))
+            await owner.close()
+
+    caplog.set_level(logging.DEBUG)
+    asyncio.run(exercise())
+    events = {getattr(record, "cayu_eval_store_event", None) for record in caplog.records}
+    assert {
+        "run_status_read",
+        "full_run_rehydration",
+        "checkpoint_write",
+        "result_publication",
+    } <= events
+
+
+def test_sqlite_eval_writers_retry_across_store_instances(tmp_path, caplog) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        result, checkpoint = await _result_with_checkpoint(corpus)
+        path = tmp_path / "evals.db"
+        stores = [SQLiteEvalStore(path, writer_contention_policy=_fast_contention_policy())]
+        blocker = sqlite3.connect(path)
+        checkpoint_tasks = []
+        publication_tasks = []
+        try:
+            await _save_corpus(stores[0], corpus)
+            stores.extend(
+                SQLiteEvalStore(
+                    path,
+                    schema_mode=SchemaMode.VALIDATE,
+                    writer_contention_policy=_fast_contention_policy(),
+                )
+                for _ in range(3)
+            )
+            leases = []
+            for index, store in enumerate(stores, start=1):
+                await _admit_run(
+                    store,
+                    _request(
+                        corpus,
+                        run_id=f"contended-run-{index}",
+                        idempotency_digit=str(index),
+                    ),
+                )
+                lease = await store.claim_run(target_key=corpus.target_key)
+                assert lease is not None
+                leases.append(lease)
+
+            blocker.execute("BEGIN IMMEDIATE")
+            checkpoint_tasks = [
+                asyncio.create_task(
+                    store.save_trial_checkpoint(
+                        lease.claim,
+                        checkpoint,
+                        redact_json=_NO_SECRETS.redact_json,
+                    )
+                )
+                for store, lease in zip(stores, leases, strict=True)
+            ]
+            await asyncio.sleep(0.1)
+            blocker.commit()
+            await asyncio.wait_for(asyncio.gather(*checkpoint_tasks), timeout=2)
+
+            blocker.execute("BEGIN IMMEDIATE")
+            publication_tasks = [
+                asyncio.create_task(_publish_result(store, lease.claim, result))
+                for store, lease in zip(stores, leases, strict=True)
+            ]
+            await asyncio.sleep(0.1)
+            blocker.commit()
+            completed = await asyncio.wait_for(asyncio.gather(*publication_tasks), timeout=2)
+            assert all(record.status is EvalRunStatus.COMPLETED for record in completed)
+            for store, lease in zip(stores, leases, strict=True):
+                assert await store.load_result(lease.claim.run_id) == result
+        finally:
+            blocker.rollback()
+            blocker.close()
+            tasks = (*checkpoint_tasks, *publication_tasks)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*(store.close() for store in reversed(stores)))
+
+    caplog.set_level(logging.INFO, logger=evals_sqlite_module.__name__)
+    asyncio.run(exercise())
+    events = {getattr(record, "cayu_eval_store_event", None) for record in caplog.records}
+    assert "sqlite_writer.lock_wait" in events
+    assert "sqlite_writer.retry" in events
+    operations = {
+        getattr(record, "eval_operation", None)
+        for record in caplog.records
+        if hasattr(record, "eval_operation")
+    }
+    assert operations == {"save_trial_checkpoint", "publish_result"}
+
+
+def test_sqlite_eval_writer_contention_is_bounded_and_retryable(tmp_path, caplog) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        result, checkpoint = await _result_with_checkpoint(corpus)
+        path = tmp_path / "evals.db"
+        store = SQLiteEvalStore(
+            path,
+            writer_contention_policy=_fast_contention_policy(max_wait_seconds=0.08),
+        )
+        blocker = sqlite3.connect(path)
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run()
+            assert lease is not None
+            await store.save_trial_checkpoint(
+                lease.claim,
+                checkpoint,
+                redact_json=_NO_SECRETS.redact_json,
+            )
+
+            blocker.execute("BEGIN IMMEDIATE")
+            with pytest.raises(EvalStoreTransientContention, match="bounded"):
+                await asyncio.wait_for(
+                    _publish_result(store, lease.claim, result),
+                    timeout=0.5,
+                )
+            blocker.commit()
+
+            running = await store.load_run(lease.claim.run_id)
+            assert running is not None
+            assert running.status is EvalRunStatus.RUNNING
+            assert await store.load_trial_checkpoints(lease.claim) == (checkpoint,)
+            completed = await _publish_result(store, lease.claim, result)
+            assert completed.status is EvalRunStatus.COMPLETED
+        finally:
+            blocker.rollback()
+            blocker.close()
+            await store.close()
+
+    caplog.set_level(logging.INFO, logger=evals_sqlite_module.__name__)
+    asyncio.run(exercise())
+    assert "sqlite_writer.contention_exhausted" in {
+        getattr(record, "cayu_eval_store_event", None) for record in caplog.records
+    }
+
+
+def test_sqlite_eval_writer_contention_budget_includes_store_queue(tmp_path, caplog) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        store = SQLiteEvalStore(
+            tmp_path / "evals.db",
+            writer_contention_policy=_fast_contention_policy(max_wait_seconds=0.08),
+        )
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        writer = None
+
+        def occupy_writer(_connection) -> None:
+            writer_started.set()
+            if not release_writer.wait(timeout=5):
+                raise AssertionError("Timed out releasing the SQLite eval writer.")
+
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run()
+            assert lease is not None
+            writer = asyncio.create_task(store._run(occupy_writer))
+            assert await asyncio.to_thread(writer_started.wait, 2)
+
+            started_at = asyncio.get_running_loop().time()
+            with pytest.raises(EvalStoreTransientContention, match="bounded"):
+                await asyncio.wait_for(
+                    store.save_trial_checkpoint(
+                        lease.claim,
+                        _terminal_trial_checkpoint(corpus),
+                        redact_json=_NO_SECRETS.redact_json,
+                    ),
+                    timeout=0.4,
+                )
+            assert asyncio.get_running_loop().time() - started_at < 0.3
+            assert not writer.done()
+        finally:
+            release_writer.set()
+            if writer is not None:
+                await asyncio.gather(writer, return_exceptions=True)
+            await store.close()
+
+    caplog.set_level(logging.INFO, logger=evals_sqlite_module.__name__)
+    asyncio.run(exercise())
+    assert "sqlite_writer.contention_exhausted" in {
+        getattr(record, "cayu_eval_store_event", None) for record in caplog.records
+    }
+
+
+def test_sqlite_eval_heartbeat_retries_writer_contention(tmp_path, caplog) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        path = tmp_path / "evals.db"
+        store = SQLiteEvalStore(path, writer_contention_policy=_fast_contention_policy())
+        blocker = sqlite3.connect(path)
+        heartbeat = None
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run(lease_seconds=30)
+            assert lease is not None
+            assert lease.run.ownership is not None
+
+            blocker.execute("BEGIN IMMEDIATE")
+            heartbeat = asyncio.create_task(store.heartbeat_run(lease.claim, extend_seconds=30))
+            await asyncio.sleep(0.1)
+            blocker.commit()
+            renewed = await asyncio.wait_for(heartbeat, timeout=1)
+            assert renewed.ownership is not None
+            assert renewed.ownership.epoch == lease.claim.epoch
+            assert renewed.ownership.lease_expires_at > lease.run.ownership.lease_expires_at
+        finally:
+            blocker.rollback()
+            blocker.close()
+            if heartbeat is not None:
+                await asyncio.gather(heartbeat, return_exceptions=True)
+            await store.close()
+
+    caplog.set_level(logging.INFO, logger=evals_sqlite_module.__name__)
+    asyncio.run(exercise())
+    events = {
+        getattr(record, "cayu_eval_store_event", None)
+        for record in caplog.records
+        if getattr(record, "eval_operation", None) == "heartbeat_run"
+    }
+    assert {"sqlite_writer.lock_wait", "sqlite_writer.retry"} <= events
+
+
+def test_sqlite_eval_writer_contention_wait_is_cancellation_aware(tmp_path) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        path = tmp_path / "evals.db"
+        store = SQLiteEvalStore(
+            path,
+            writer_contention_policy=_fast_contention_policy(),
+        )
+        blocker = sqlite3.connect(path)
+        publication = None
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run()
+            assert lease is not None
+            blocker.execute("BEGIN IMMEDIATE")
+            publication = asyncio.create_task(
+                store.save_trial_checkpoint(
+                    lease.claim,
+                    _terminal_trial_checkpoint(corpus),
+                    redact_json=_NO_SECRETS.redact_json,
+                )
+            )
+            await asyncio.sleep(0.05)
+            publication.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(publication, timeout=0.2)
+            blocker.commit()
+            running = await store.load_run(lease.claim.run_id)
+            assert running is not None
+            assert running.status is EvalRunStatus.RUNNING
+            assert await store.load_trial_checkpoints(lease.claim) == ()
+        finally:
+            blocker.rollback()
+            blocker.close()
+            if publication is not None:
+                await asyncio.gather(publication, return_exceptions=True)
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_sqlite_eval_writer_revalidates_claim_after_lock_wait(tmp_path, caplog) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        path = tmp_path / "evals.db"
+        store = SQLiteEvalStore(
+            path,
+            writer_contention_policy=_fast_contention_policy(),
+        )
+        blocker = sqlite3.connect(path)
+        publication = None
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run(lease_seconds=1)
+            assert lease is not None
+            blocker.execute("BEGIN IMMEDIATE")
+            publication = asyncio.create_task(
+                store.save_trial_checkpoint(
+                    lease.claim,
+                    _terminal_trial_checkpoint(corpus),
+                    redact_json=_NO_SECRETS.redact_json,
+                )
+            )
+            await asyncio.sleep(1.05)
+            blocker.commit()
+            with pytest.raises(EvalRunClaimLost, match="expired"):
+                await asyncio.wait_for(publication, timeout=0.5)
+        finally:
+            blocker.rollback()
+            blocker.close()
+            if publication is not None:
+                await asyncio.gather(publication, return_exceptions=True)
+            await store.close()
+
+    caplog.set_level(logging.INFO, logger=evals_sqlite_module.__name__)
+    asyncio.run(exercise())
+    assert "sqlite_writer.claim_lost" in {
+        getattr(record, "cayu_eval_store_event", None) for record in caplog.records
+    }
 
 
 def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
@@ -1249,7 +1708,7 @@ def test_sqlite_eval_store_rolls_back_interrupted_corpus_projection(tmp_path) ->
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_rolls_back_interrupted_result_publication(tmp_path) -> None:
+def test_sqlite_eval_store_rolls_back_interrupted_result_publication(tmp_path, caplog) -> None:
     async def exercise() -> None:
         path = tmp_path / "evals.db"
         corpus = _corpus(trials=1)
@@ -1301,4 +1760,8 @@ def test_sqlite_eval_store_rolls_back_interrupted_result_publication(tmp_path) -
         finally:
             await store.close()
 
+    caplog.set_level(logging.ERROR, logger=evals_sqlite_module.__name__)
     asyncio.run(exercise())
+    assert "sqlite_writer.permanent_storage_failure" in {
+        getattr(record, "cayu_eval_store_event", None) for record in caplog.records
+    }

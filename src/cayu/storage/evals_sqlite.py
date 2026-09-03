@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import sqlite3
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any, ClassVar
 from uuid import uuid4
 
@@ -65,6 +69,7 @@ from cayu.evals.store import (
     EvalRunClaimLost,
     EvalRunFailureCode,
     EvalRunLease,
+    EvalRunObservation,
     EvalRunOwnership,
     EvalRunPage,
     EvalRunQuery,
@@ -86,6 +91,7 @@ from cayu.evals.store import (
     EvalScenarioTrialProgress,
     EvalStore,
     EvalStoreResultTooLarge,
+    EvalStoreTransientContention,
     EvalSuiteCatalogEntry,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
@@ -143,6 +149,38 @@ from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
 _SQLITE_EVAL_MIN_REQUIRED_REVISION = 74
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteEvalWriterContentionPolicy:
+    """Bounded SQLite lock acquisition and retry policy for paid-effect evidence."""
+
+    max_wait_seconds: float = 60.0
+    lock_attempt_seconds: float = 0.25
+    initial_backoff_seconds: float = 0.01
+    max_backoff_seconds: float = 0.25
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_wait_seconds",
+            "lock_attempt_seconds",
+            "initial_backoff_seconds",
+            "max_backoff_seconds",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise TypeError(f"{field_name} must be a number.")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{field_name} must be finite and greater than zero.")
+        if self.lock_attempt_seconds > self.max_wait_seconds:
+            raise ValueError("lock_attempt_seconds cannot exceed max_wait_seconds.")
+        if self.initial_backoff_seconds > self.max_backoff_seconds:
+            raise ValueError("initial_backoff_seconds cannot exceed max_backoff_seconds.")
+
+
+DEFAULT_SQLITE_EVAL_WRITER_CONTENTION_POLICY = SQLiteEvalWriterContentionPolicy()
+
 _RUN_COLUMNS = """
     run_id,
     idempotency_key,
@@ -173,6 +211,14 @@ _RUN_COLUMNS = """
     authored_suite_launch_lane
 """
 
+_RUN_OBSERVATION_COLUMNS = """
+    run_id,
+    status,
+    updated_at,
+    ownership_epoch,
+    lease_expires_at
+"""
+
 _RESULT_RECORD_COLUMNS = """
     revision,
     origin,
@@ -198,6 +244,11 @@ def _parse_optional_datetime(value: str | None) -> datetime | None:
     return None if value is None else sqlite_support.parse_datetime(value)
 
 
+def _is_sqlite_writer_contention(error: sqlite3.Error) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return type(code) is int and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
 def _request_from_row(row: sqlite3.Row) -> EvalRunRequest:
     invocation = eval_run_invocation_from_json(row["invocation_json"])
     if row["authored_suite_launch_revision"] != invocation.authored_suite_launch_revision:
@@ -215,6 +266,26 @@ def _request_from_row(row: sqlite3.Row) -> EvalRunRequest:
         suite_revision=row["suite_revision"],
         max_concurrency=row["max_concurrency"],
         invocation=invocation,
+    )
+
+
+def _run_observation_from_row(row: sqlite3.Row) -> EvalRunObservation:
+    status = EvalRunStatus(row["status"])
+    ownership = None
+    if status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
+        lease_expires_at = _parse_optional_datetime(row["lease_expires_at"])
+        if lease_expires_at is None:
+            raise RuntimeError("Stored active eval run has no lease expiry.")
+        ownership = EvalRunOwnership(
+            epoch=row["ownership_epoch"],
+            lease_expires_at=lease_expires_at,
+        )
+    return EvalRunObservation(
+        run_id=row["run_id"],
+        status=status,
+        attempt_count=row["ownership_epoch"],
+        updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        ownership=ownership,
     )
 
 
@@ -375,6 +446,9 @@ class SQLiteEvalStore(EvalStore):
         *,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
         read_only: bool = False,
+        writer_contention_policy: SQLiteEvalWriterContentionPolicy = (
+            DEFAULT_SQLITE_EVAL_WRITER_CONTENTION_POLICY
+        ),
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -386,6 +460,10 @@ class SQLiteEvalStore(EvalStore):
             raise TypeError("schema_mode must be a SchemaMode.")
         if type(read_only) is not bool:
             raise TypeError("read_only must be a bool.")
+        if type(writer_contention_policy) is not SQLiteEvalWriterContentionPolicy:
+            raise TypeError(
+                "writer_contention_policy must be an exact SQLiteEvalWriterContentionPolicy."
+            )
         diagnostic_inspection = sqlite_support.current_diagnostic_store_inspection() is not None
         diagnostic_source_missing = sqlite_support.diagnostic_sqlite_source_missing(db_path)
         if diagnostic_inspection:
@@ -399,6 +477,7 @@ class SQLiteEvalStore(EvalStore):
             raise ValueError("Read-only SQLite EvalStores require schema_mode=VALIDATE.")
         self.path = db_path
         self._diagnostic_source_missing = diagnostic_source_missing
+        self.writer_contention_policy = writer_contention_policy
         self._lock = asyncio.Lock()
         effective_db_path = Path(":memory:") if diagnostic_source_missing else db_path
         self._connection = (
@@ -425,20 +504,245 @@ class SQLiteEvalStore(EvalStore):
         except BaseException:
             self._connection.close()
             raise
+        if str(effective_db_path) == ":memory:":
+            self._read_connection = self._connection
+            self._read_lock = self._lock
+            self._read_executor = self._executor
+        else:
+            try:
+                self._read_connection = (
+                    sqlite_support.connect_read_only_inspection(effective_db_path)
+                    if read_only
+                    else sqlite_support.connect(effective_db_path, read_only=True)
+                )
+                self._read_lock = asyncio.Lock()
+                self._read_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="cayu-evals-sqlite-read",
+                )
+            except BaseException:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+                self._connection.close()
+                raise
 
-    async def _run(self, operation):
+    async def _run(
+        self,
+        operation,
+        *,
+        worker_started: asyncio.Event | None = None,
+    ):
         return await _run_off_thread_with_connection_ownership(
             self._lock,
             self._connection,
             operation,
             executor=self._executor,
+            worker_started=worker_started,
+        )
+
+    async def _run_read(self, operation):
+        if self._read_connection is self._connection:
+            return await self._run(operation)
+        return await _run_off_thread_with_connection_ownership(
+            self._read_lock,
+            self._read_connection,
+            operation,
+            executor=self._read_executor,
+        )
+
+    async def _run_eval_writer(
+        self,
+        operation,
+        *,
+        operation_name: str,
+        run_id: str,
+    ):
+        """Run an eval authority/publication write with bounded contention retry."""
+
+        policy = self.writer_contention_policy
+        started_at = monotonic()
+        deadline = started_at + policy.max_wait_seconds
+        attempt = 0
+        backoff_seconds = policy.initial_backoff_seconds
+        while True:
+            attempt += 1
+            remaining_seconds = deadline - monotonic()
+            if remaining_seconds <= 0:
+                self._log_writer_event(
+                    "contention_exhausted",
+                    operation_name=operation_name,
+                    run_id=run_id,
+                    attempt=attempt - 1,
+                    waited_seconds=monotonic() - started_at,
+                )
+                raise EvalStoreTransientContention(
+                    "SQLite eval publication exhausted its bounded writer-contention budget."
+                )
+
+            def configured_operation(connection: sqlite3.Connection):
+                operation_remaining_seconds = deadline - monotonic()
+                if operation_remaining_seconds <= 0:
+                    raise EvalStoreTransientContention(
+                        "SQLite eval publication exhausted its bounded writer-contention budget."
+                    )
+                lock_attempt_milliseconds = max(
+                    1,
+                    math.ceil(
+                        min(policy.lock_attempt_seconds, operation_remaining_seconds) * 1_000
+                    ),
+                )
+                previous_timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                connection.execute(f"PRAGMA busy_timeout = {lock_attempt_milliseconds}")
+                try:
+                    return operation(connection)
+                finally:
+                    connection.execute(f"PRAGMA busy_timeout = {previous_timeout}")
+
+            worker_started = asyncio.Event()
+            write_attempt = asyncio.create_task(
+                self._run(
+                    configured_operation,
+                    worker_started=worker_started,
+                )
+            )
+            write_attempt.add_done_callback(lambda _task, event=worker_started: event.set())
+            try:
+                await asyncio.wait_for(
+                    worker_started.wait(),
+                    timeout=remaining_seconds,
+                )
+                result = await write_attempt
+                completion_event = {
+                    "save_trial_checkpoint": "checkpoint_write",
+                    "publish_result": "result_publication",
+                }.get(operation_name)
+                if completion_event is not None:
+                    logger.debug(
+                        "SQLite eval publication operation completed.",
+                        extra={
+                            "cayu_eval_store_event": completion_event,
+                            "eval_store_kind": "sqlite",
+                            "eval_operation": operation_name,
+                            "eval_run_id": run_id,
+                            "duration_seconds": monotonic() - started_at,
+                            "attempt": attempt,
+                        },
+                    )
+                return result
+            except asyncio.CancelledError:
+                write_attempt.cancel()
+                await asyncio.gather(write_attempt, return_exceptions=True)
+                raise
+            except TimeoutError as exc:
+                write_attempt.cancel()
+                await asyncio.gather(write_attempt, return_exceptions=True)
+                self._log_writer_event(
+                    "contention_exhausted",
+                    operation_name=operation_name,
+                    run_id=run_id,
+                    attempt=attempt,
+                    waited_seconds=monotonic() - started_at,
+                )
+                raise EvalStoreTransientContention(
+                    "SQLite eval publication exhausted its bounded writer-contention budget."
+                ) from exc
+            except EvalStoreTransientContention as exc:
+                self._log_writer_event(
+                    "contention_exhausted",
+                    operation_name=operation_name,
+                    run_id=run_id,
+                    attempt=attempt,
+                    waited_seconds=monotonic() - started_at,
+                )
+                raise EvalStoreTransientContention(
+                    "SQLite eval publication exhausted its bounded writer-contention budget."
+                ) from exc
+            except EvalRunClaimLost:
+                self._log_writer_event(
+                    "claim_lost",
+                    operation_name=operation_name,
+                    run_id=run_id,
+                    attempt=attempt,
+                    waited_seconds=monotonic() - started_at,
+                )
+                raise
+            except sqlite3.Error as exc:
+                if not _is_sqlite_writer_contention(exc):
+                    self._log_writer_event(
+                        "permanent_storage_failure",
+                        operation_name=operation_name,
+                        run_id=run_id,
+                        attempt=attempt,
+                        waited_seconds=monotonic() - started_at,
+                    )
+                    raise
+                waited_seconds = monotonic() - started_at
+                self._log_writer_event(
+                    "lock_wait",
+                    operation_name=operation_name,
+                    run_id=run_id,
+                    attempt=attempt,
+                    waited_seconds=waited_seconds,
+                )
+                remaining_seconds = deadline - monotonic()
+                if remaining_seconds <= 0:
+                    self._log_writer_event(
+                        "contention_exhausted",
+                        operation_name=operation_name,
+                        run_id=run_id,
+                        attempt=attempt,
+                        waited_seconds=waited_seconds,
+                    )
+                    raise EvalStoreTransientContention(
+                        "SQLite eval publication exhausted its bounded writer-contention budget."
+                    ) from exc
+                delay_seconds = min(backoff_seconds, remaining_seconds)
+                self._log_writer_event(
+                    "retry",
+                    operation_name=operation_name,
+                    run_id=run_id,
+                    attempt=attempt,
+                    waited_seconds=waited_seconds,
+                    retry_in_seconds=delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+                backoff_seconds = min(backoff_seconds * 2, policy.max_backoff_seconds)
+
+    @staticmethod
+    def _log_writer_event(
+        event: str,
+        *,
+        operation_name: str,
+        run_id: str,
+        attempt: int,
+        waited_seconds: float,
+        retry_in_seconds: float | None = None,
+    ) -> None:
+        level = logging.ERROR if event == "permanent_storage_failure" else logging.INFO
+        logger.log(
+            level,
+            "SQLite eval writer %s.",
+            event.replace("_", " "),
+            extra={
+                "cayu_eval_store_event": f"sqlite_writer.{event}",
+                "eval_operation": operation_name,
+                "eval_run_id": run_id,
+                "attempt": attempt,
+                "waited_seconds": waited_seconds,
+                "retry_in_seconds": retry_in_seconds,
+            },
         )
 
     async def close(self) -> None:
         try:
-            await self._run(lambda connection: connection.close())
+            if self._read_connection is not self._connection:
+                await self._run_read(lambda connection: connection.close())
         finally:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            if self._read_executor is not self._executor:
+                self._read_executor.shutdown(wait=True, cancel_futures=True)
+            try:
+                await self._run(lambda connection: connection.close())
+            finally:
+                self._executor.shutdown(wait=True, cancel_futures=True)
 
     async def save_corpus(
         self,
@@ -1152,12 +1456,48 @@ class SQLiteEvalStore(EvalStore):
 
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         run_id = _store_identifier(run_id, "run_id")
+        started_at = monotonic()
 
         def operation(connection: sqlite3.Connection) -> EvalRunRecord | None:
             row = self._load_run_row(connection, run_id)
             return None if row is None else _run_record_from_row(row)
 
-        return await self._run(operation)
+        try:
+            return await self._run(operation)
+        finally:
+            logger.debug(
+                "SQLite eval run fully rehydrated.",
+                extra={
+                    "cayu_eval_store_event": "full_run_rehydration",
+                    "eval_store_kind": "sqlite",
+                    "eval_run_id": run_id,
+                    "duration_seconds": monotonic() - started_at,
+                },
+            )
+
+    async def load_run_observation(self, run_id: str) -> EvalRunObservation | None:
+        run_id = _store_identifier(run_id, "run_id")
+        started_at = monotonic()
+
+        def operation(connection: sqlite3.Connection) -> EvalRunObservation | None:
+            row = connection.execute(
+                f"SELECT {_RUN_OBSERVATION_COLUMNS} FROM cayu_eval_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            return None if row is None else _run_observation_from_row(row)
+
+        try:
+            return await self._run_read(operation)
+        finally:
+            logger.debug(
+                "SQLite eval run status observed.",
+                extra={
+                    "cayu_eval_store_event": "run_status_read",
+                    "eval_store_kind": "sqlite",
+                    "eval_run_id": run_id,
+                    "duration_seconds": monotonic() - started_at,
+                },
+            )
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
@@ -1482,7 +1822,61 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        return await self._run(operation)
+        return await self._run_eval_writer(
+            operation,
+            operation_name="heartbeat_run",
+            run_id=claim.run_id,
+        )
+
+    async def heartbeat_run_observation(
+        self,
+        claim: EvalRunClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        extend_seconds = _lease_seconds(extend_seconds)
+
+        def operation(connection: sqlite3.Connection) -> EvalRunObservation:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                updated = connection.execute(
+                    """
+                    UPDATE cayu_eval_runs
+                    SET lease_expires_at = ?, updated_at = ?
+                    WHERE run_id = ? AND claim_id = ? AND ownership_epoch = ?
+                      AND status IN (?, ?) AND lease_expires_at > ?
+                    """,
+                    (
+                        _format_datetime(now + timedelta(seconds=extend_seconds)),
+                        _format_datetime(now),
+                        claim.run_id,
+                        claim.claim_id,
+                        claim.epoch,
+                        str(EvalRunStatus.RUNNING),
+                        str(EvalRunStatus.CANCELLING),
+                        _format_datetime(now),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise EvalRunClaimLost("Eval run claim is no longer live.")
+                row = connection.execute(
+                    f"SELECT {_RUN_OBSERVATION_COLUMNS} FROM cayu_eval_runs WHERE run_id = ?",
+                    (claim.run_id,),
+                ).fetchone()
+                connection.commit()
+                assert row is not None
+                return _run_observation_from_row(row)
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_eval_writer(
+            operation,
+            operation_name="heartbeat_run",
+            run_id=claim.run_id,
+        )
 
     async def request_cancel(self, run_id: str) -> EvalRunRecord:
         run_id = _store_identifier(run_id, "run_id")
@@ -1764,7 +2158,11 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        await self._run(operation)
+        await self._run_eval_writer(
+            operation,
+            operation_name="save_trial_checkpoint",
+            run_id=claim.run_id,
+        )
 
     async def submit_scenario_approval(
         self,
@@ -1938,7 +2336,11 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        return await self._run(operation)
+        return await self._run_eval_writer(
+            operation,
+            operation_name="publish_result",
+            run_id=claim.run_id,
+        )
 
     async def fail_run(
         self,
@@ -2768,4 +3170,8 @@ class SQLiteEvalStore(EvalStore):
         )
 
 
-__all__ = ["SQLiteEvalStore"]
+__all__ = [
+    "DEFAULT_SQLITE_EVAL_WRITER_CONTENTION_POLICY",
+    "SQLiteEvalStore",
+    "SQLiteEvalWriterContentionPolicy",
+]

@@ -1041,9 +1041,29 @@ async def assert_eval_store_conformance(
     assert "claim_id" not in active_public_json
     assert "idempotency_key" not in active_public_json
     assert "owner_id" not in active_public_json
+    observation = await store.load_run_observation(admitted.id)
+    assert observation is not None
+    assert observation.run_id == admitted.id
+    assert observation.status is EvalRunStatus.RUNNING
+    assert observation.attempt_count == claimed.claim.epoch
+    assert observation.ownership == active_public_record.ownership
+    assert "invocation" not in observation.model_dump_json()
+    assert await store.load_run_observation("missing-run") is None
+    terminal_wait = asyncio.create_task(
+        store.wait_for_run_terminal(
+            admitted.id,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.001,
+            max_poll_interval_seconds=0.05,
+        )
+    )
     claim = claimed.claim
     renewed = await store.heartbeat_run(claim)
     assert renewed.ownership is not None
+    renewed_observation = await store.heartbeat_run_observation(claim)
+    assert renewed_observation.status is EvalRunStatus.RUNNING
+    assert renewed_observation.ownership is not None
+    assert renewed_observation.ownership.epoch == claim.epoch
     cancelling = await store.request_cancel(admitted.id)
     assert cancelling.status is EvalRunStatus.CANCELLING
     with pytest.raises(EvalRunStateConflict):
@@ -1055,6 +1075,10 @@ async def assert_eval_store_conformance(
     cancelled = await store.finish_cancel(claim)
     assert cancelled.status is EvalRunStatus.CANCELLED
     assert await store.finish_cancel(claim) == cancelled
+    terminal_observation = await terminal_wait
+    assert terminal_observation is not None
+    assert terminal_observation.status is EvalRunStatus.CANCELLED
+    assert terminal_observation.terminal is True
 
     result_request = _request(corpus, suffix="b")
     await store.admit_run(

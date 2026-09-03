@@ -84,6 +84,7 @@ from cayu.evals.store import (
     EvalScenarioTrialPhase,
     EvalScenarioTrialProgress,
     EvalStore,
+    EvalStoreTransientContention,
 )
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.runtime.approvals import (
@@ -942,15 +943,21 @@ async def run_compiled_eval_scenario(
                 result, public_data = execution
                 if public_data is None:
                     raise RuntimeError("Scenario trial execution lost its public projection.")
-                await store.save_trial_checkpoint(
-                    claim,
-                    EvalRunTrialCheckpoint(
-                        case_id=case.id,
-                        result=result,
-                        public_data=public_data,
-                    ),
-                    redact_json=target.app.redact_json,
+                checkpoint = EvalRunTrialCheckpoint(
+                    case_id=case.id,
+                    result=result,
+                    public_data=public_data,
                 )
+                while True:
+                    try:
+                        await store.save_trial_checkpoint(
+                            claim,
+                            checkpoint,
+                            redact_json=target.app.redact_json,
+                        )
+                        break
+                    except EvalStoreTransientContention:
+                        await asyncio.sleep(0.25)
                 slots[trial_number - 1] = execution
 
     async with memory_attribution_read_lifecycle, asyncio.TaskGroup() as group:

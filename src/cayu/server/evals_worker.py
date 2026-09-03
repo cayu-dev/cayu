@@ -32,6 +32,8 @@ from cayu.evals.scenario_execution import (
 )
 from cayu.evals.scenario_preflight import ScenarioLaunchBindingV2, preflight_eval_scenario
 from cayu.evals.store import (
+    EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS,
+    EVAL_RUN_MIN_OBSERVATION_INTERVAL_SECONDS,
     EvalRunClaim,
     EvalRunClaimLost,
     EvalRunFailureCode,
@@ -40,6 +42,7 @@ from cayu.evals.store import (
     EvalRunStatus,
     EvalRunTrialCheckpoint,
     EvalScenarioTrialFailureCode,
+    EvalStoreTransientContention,
 )
 from cayu.evals.suite_authoring import EvalSuiteDocument
 from cayu.evals.suite_execution import corpus_for_authored_scenario_case
@@ -561,6 +564,45 @@ class EvalRunCoordinator:
         monitor: asyncio.Task[_ClaimMonitorOutcome],
     ) -> None:
         target = prepared.target
+
+        async def persist_trial_checkpoint(checkpoint: EvalRunTrialCheckpoint) -> None:
+            retry_seconds = min(max(self._config.poll_interval_seconds, 0.05), 1.0)
+            while True:
+                try:
+                    await self._config.store.save_trial_checkpoint(
+                        lease.claim,
+                        checkpoint,
+                        redact_json=target.app.redact_json,
+                    )
+                    return
+                except EvalStoreTransientContention:
+                    logger.warning(
+                        "Durable eval checkpoint publication exhausted its transient "
+                        "contention budget; the completed trial remains attached and "
+                        "will be retried."
+                    )
+                    await asyncio.sleep(retry_seconds)
+
+        async def save_trial_checkpoint(case_id, result, public_data) -> None:
+            started_at = asyncio.get_running_loop().time()
+            try:
+                await persist_trial_checkpoint(
+                    EvalRunTrialCheckpoint(
+                        case_id=case_id,
+                        result=result,
+                        public_data=public_data,
+                    )
+                )
+            finally:
+                logger.debug(
+                    "Durable eval checkpoint write finished.",
+                    extra={
+                        "cayu_eval_store_event": "checkpoint_write",
+                        "eval_run_id": lease.claim.run_id,
+                        "duration_seconds": (asyncio.get_running_loop().time() - started_at),
+                    },
+                )
+
         if prepared.scenario is None:
             checkpoints = await self._config.store.load_trial_checkpoints(lease.claim)
             completed_trials = {
@@ -570,17 +612,6 @@ class EvalRunCoordinator:
                 )
                 for checkpoint in checkpoints
             }
-
-            async def save_trial_checkpoint(case_id, result, public_data) -> None:
-                await self._config.store.save_trial_checkpoint(
-                    lease.claim,
-                    EvalRunTrialCheckpoint(
-                        case_id=case_id,
-                        result=result,
-                        public_data=public_data,
-                    ),
-                    redact_json=target.app.redact_json,
-                )
 
             execution_coro = _run_compiled_corpus_suite(
                 target,
@@ -673,15 +704,32 @@ class EvalRunCoordinator:
             )
             return
         try:
-            await self._config.store.publish_result(
-                claim,
-                execution.result(),
-                redact_json=target.app.redact_json,
-            )
+            started_at = asyncio.get_running_loop().time()
+            try:
+                await self._config.store.publish_result(
+                    claim,
+                    execution.result(),
+                    redact_json=target.app.redact_json,
+                )
+            finally:
+                logger.debug(
+                    "Durable eval result publication finished.",
+                    extra={
+                        "cayu_eval_store_event": "result_publication",
+                        "eval_run_id": claim.run_id,
+                        "duration_seconds": asyncio.get_running_loop().time() - started_at,
+                    },
+                )
         except EvalRunClaimLost:
             return
         except EvalRunStateConflict:
             await self._finish_cancel_if_requested(claim)
+        except EvalStoreTransientContention:
+            logger.warning(
+                "Durable eval result publication was deferred by transient "
+                "store contention; retained checkpoints will be reclaimed."
+            )
+            await self._release_after_interruption(claim)
         except Exception:
             await self._finalize_failure(
                 claim,
@@ -722,11 +770,19 @@ class EvalRunCoordinator:
 
     async def _monitor_claim(self, claim: EvalRunClaim) -> _ClaimMonitorOutcome:
         heartbeat_interval = min(self._config.lease_seconds / 4, 30.0)
+        observation_interval = max(
+            self._config.poll_interval_seconds,
+            EVAL_RUN_MIN_OBSERVATION_INTERVAL_SECONDS,
+        )
+        maximum_observation_interval = max(
+            observation_interval,
+            EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS,
+        )
         loop = asyncio.get_running_loop()
         next_heartbeat = loop.time() + heartbeat_interval
         while True:
             wait_seconds = min(
-                self._config.poll_interval_seconds,
+                observation_interval,
                 max(0.0, next_heartbeat - loop.time()),
             )
             with contextlib.suppress(TimeoutError):
@@ -735,13 +791,13 @@ class EvalRunCoordinator:
                 return _ClaimMonitorOutcome.STOPPING
             try:
                 if loop.time() >= next_heartbeat:
-                    record = await self._config.store.heartbeat_run(
+                    record = await self._config.store.heartbeat_run_observation(
                         claim,
                         extend_seconds=self._config.lease_seconds,
                     )
                     next_heartbeat = loop.time() + heartbeat_interval
                 else:
-                    record = await self._config.store.load_run(claim.run_id)
+                    record = await self._config.store.load_run_observation(claim.run_id)
                     if (
                         record is None
                         or record.ownership is None
@@ -750,12 +806,22 @@ class EvalRunCoordinator:
                         return _ClaimMonitorOutcome.CLAIM_LOST
             except asyncio.CancelledError:
                 raise
+            except EvalStoreTransientContention:
+                logger.warning(
+                    "Durable eval heartbeat was deferred by transient store contention; "
+                    "the live fenced claim will be retried."
+                )
+                continue
             except Exception:
                 return _ClaimMonitorOutcome.CLAIM_LOST
             if record.status is EvalRunStatus.CANCELLING:
                 return _ClaimMonitorOutcome.CANCELLING
             if record.status is not EvalRunStatus.RUNNING:
                 return _ClaimMonitorOutcome.CLAIM_LOST
+            observation_interval = min(
+                observation_interval * 2,
+                maximum_observation_interval,
+            )
 
     async def _refresh_claim(self, claim: EvalRunClaim):
         try:

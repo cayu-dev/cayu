@@ -4,6 +4,8 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
@@ -11,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from time import monotonic
 from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
@@ -116,6 +119,9 @@ EVAL_STORE_MAX_CURSOR_BYTES = 1_024
 EVAL_STORE_MAX_IDENTIFIER_CHARS = 128
 EVAL_STORE_MAX_LEASE_SECONDS = 3_600
 EVAL_STORE_MAX_CLAIM_TARGETS = 128
+EVAL_RUN_MIN_OBSERVATION_INTERVAL_SECONDS = 0.05
+EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS = 1.0
+EVAL_RUN_MAX_TERMINAL_WAIT_SECONDS = 300.0
 _EVAL_STORE_MAX_BIGINT = 2**63 - 1
 EVAL_RUN_INVOCATION_MAX_BYTES = 64 << 10
 EVAL_SCENARIO_PROGRESS_MAX_BYTES = 256 << 10
@@ -124,6 +130,8 @@ EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS = EVAL_CORPUS_MAX_CASES * EVAL_CORPUS_MAX_T
 
 _STORE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _CURSOR_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 class _EvalStoreModel(BaseModel):
@@ -162,6 +170,17 @@ def _aware_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware.")
     return value.astimezone(UTC)
+
+
+def _bounded_positive_seconds(value: float, field_name: str, *, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{field_name} must be a number.")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be finite and greater than zero.")
+    if value > maximum:
+        raise ValueError(f"{field_name} cannot exceed {maximum:g} seconds.")
+    return value
 
 
 def _exact_model(value: BaseModel, model_type: type[BaseModel], field_name: str):
@@ -221,6 +240,10 @@ class EvalRunStateConflict(ValueError):
 
 class EvalRunClaimLost(RuntimeError):
     """A worker no longer owns the live fenced claim required for a mutation."""
+
+
+class EvalStoreTransientContention(RuntimeError):
+    """A bounded durable eval-store write exhausted its transient contention budget."""
 
 
 class EvalResultConflict(ValueError):
@@ -1918,6 +1941,43 @@ class EvalRunOwnership(_EvalStoreModel):
         return _aware_utc(value, info.field_name)
 
 
+class EvalRunObservation(_EvalStoreModel):
+    """Small mutable-lifecycle projection that never rehydrates run invocation data."""
+
+    run_id: StrictStr
+    status: EvalRunStatus
+    attempt_count: StrictInt = Field(ge=0, le=_EVAL_STORE_MAX_BIGINT)
+    updated_at: datetime
+    ownership: EvalRunOwnership | None = None
+
+    @field_validator("run_id")
+    @classmethod
+    def validate_run_id(cls, value: str, info) -> str:
+        return _store_identifier(value, info.field_name)
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_updated_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> EvalRunObservation:
+        active = self.status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}
+        if active != (self.ownership is not None):
+            raise ValueError("Only active eval run observations require ownership.")
+        if self.ownership is not None and self.attempt_count != self.ownership.epoch:
+            raise ValueError("Active eval run attempt count must match its ownership epoch.")
+        return self
+
+    @property
+    def id(self) -> str:
+        return self.run_id
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in TERMINAL_EVAL_RUN_STATUSES
+
+
 class EvalRunClaim(_EvalStoreModel):
     run_id: StrictStr
     claim_id: StrictStr = Field(repr=False)
@@ -2046,6 +2106,19 @@ class EvalRunRecord(_EvalStoreModel):
     @property
     def id(self) -> str:
         return self.spec.run_id
+
+
+def eval_run_observation(record: EvalRunRecord) -> EvalRunObservation:
+    """Project a full public run record into its lightweight lifecycle shape."""
+
+    record = _exact_model(record, EvalRunRecord, "record")
+    return EvalRunObservation(
+        run_id=record.id,
+        status=record.status,
+        attempt_count=record.attempt_count,
+        updated_at=record.updated_at,
+        ownership=record.ownership,
+    )
 
 
 class EvalRunLease(_EvalStoreModel):
@@ -3052,6 +3125,74 @@ class EvalStore(ABC):
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         """Load one run's public lifecycle projection."""
 
+    async def load_run_observation(self, run_id: str) -> EvalRunObservation | None:
+        """Load mutable claim/status state without requiring immutable invocation data.
+
+        Custom stores retain compatibility through this full-record fallback. Built-in
+        stores override it with a small indexed projection.
+        """
+
+        record = await self.load_run(run_id)
+        return None if record is None else eval_run_observation(record)
+
+    async def wait_for_run_terminal(
+        self,
+        run_id: str,
+        *,
+        timeout_seconds: float = 30.0,
+        poll_interval_seconds: float = EVAL_RUN_MIN_OBSERVATION_INTERVAL_SECONDS,
+        max_poll_interval_seconds: float = EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS,
+    ) -> EvalRunObservation | None:
+        """Wait within a strict deadline for a terminal run observation.
+
+        Polling begins no faster than the public 50 ms floor and exponentially backs
+        off to the caller's bounded ceiling. A missing run returns ``None``; deadline
+        exhaustion raises ``TimeoutError``.
+        """
+
+        run_id = _store_identifier(run_id, "run_id")
+        timeout_seconds = _bounded_positive_seconds(
+            timeout_seconds,
+            "timeout_seconds",
+            maximum=EVAL_RUN_MAX_TERMINAL_WAIT_SECONDS,
+        )
+        poll_interval_seconds = _bounded_positive_seconds(
+            poll_interval_seconds,
+            "poll_interval_seconds",
+            maximum=EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS,
+        )
+        max_poll_interval_seconds = _bounded_positive_seconds(
+            max_poll_interval_seconds,
+            "max_poll_interval_seconds",
+            maximum=EVAL_RUN_MAX_OBSERVATION_INTERVAL_SECONDS,
+        )
+        interval = max(
+            poll_interval_seconds,
+            EVAL_RUN_MIN_OBSERVATION_INTERVAL_SECONDS,
+        )
+        if interval > max_poll_interval_seconds:
+            raise ValueError(
+                "max_poll_interval_seconds cannot be less than the effective polling floor."
+            )
+
+        deadline = monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for eval run to finish: {run_id}")
+            try:
+                async with asyncio.timeout(remaining):
+                    observation = await self.load_run_observation(run_id)
+            except TimeoutError as exc:
+                raise TimeoutError(f"Timed out waiting for eval run to finish: {run_id}") from exc
+            if observation is None or observation.terminal:
+                return observation
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for eval run to finish: {run_id}")
+            await asyncio.sleep(min(interval, remaining))
+            interval = min(interval * 2, max_poll_interval_seconds)
+
     @abstractmethod
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         """List run projections in newest-first keyset order."""
@@ -3096,6 +3237,20 @@ class EvalStore(ABC):
         extend_seconds: int = 300,
     ) -> EvalRunRecord:
         """Extend one still-live fenced run claim."""
+
+    async def heartbeat_run_observation(
+        self,
+        claim: EvalRunClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        """Extend a claim and return only its mutable lifecycle projection.
+
+        Custom stores retain compatibility through the full-record heartbeat.
+        Built-in stores override this method to avoid immutable rehydration.
+        """
+
+        return eval_run_observation(await self.heartbeat_run(claim, extend_seconds=extend_seconds))
 
     @abstractmethod
     async def request_cancel(self, run_id: str) -> EvalRunRecord:
@@ -3742,9 +3897,39 @@ class InMemoryEvalStore(EvalStore):
 
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         run_id = _store_identifier(run_id, "run_id")
-        async with self._lock:
-            state = self._runs.get(run_id)
-            return None if state is None else self._record(state)
+        started_at = monotonic()
+        try:
+            async with self._lock:
+                state = self._runs.get(run_id)
+                return None if state is None else self._record(state)
+        finally:
+            logger.debug(
+                "In-memory eval run fully rehydrated.",
+                extra={
+                    "cayu_eval_store_event": "full_run_rehydration",
+                    "eval_store_kind": "memory",
+                    "eval_run_id": run_id,
+                    "duration_seconds": monotonic() - started_at,
+                },
+            )
+
+    async def load_run_observation(self, run_id: str) -> EvalRunObservation | None:
+        run_id = _store_identifier(run_id, "run_id")
+        started_at = monotonic()
+        try:
+            async with self._lock:
+                state = self._runs.get(run_id)
+                return None if state is None else self._observation(state)
+        finally:
+            logger.debug(
+                "In-memory eval run status observed.",
+                extra={
+                    "cayu_eval_store_event": "run_status_read",
+                    "eval_store_kind": "memory",
+                    "eval_run_id": run_id,
+                    "duration_seconds": monotonic() - started_at,
+                },
+            )
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
@@ -3915,6 +4100,21 @@ class InMemoryEvalStore(EvalStore):
             state.lease_expires_at = now + timedelta(seconds=extend_seconds)
             state.updated_at = now
             return self._record(state)
+
+    async def heartbeat_run_observation(
+        self,
+        claim: EvalRunClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        extend_seconds = _lease_seconds(extend_seconds)
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            now = self._now()
+            state.lease_expires_at = now + timedelta(seconds=extend_seconds)
+            state.updated_at = now
+            return self._observation(state)
 
     async def request_cancel(self, run_id: str) -> EvalRunRecord:
         run_id = _store_identifier(run_id, "run_id")
@@ -4459,6 +4659,23 @@ class InMemoryEvalStore(EvalStore):
             ),
         )
 
+    @staticmethod
+    def _observation(state: _MemoryRunState) -> EvalRunObservation:
+        ownership = None
+        if state.status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
+            assert state.lease_expires_at is not None
+            ownership = EvalRunOwnership(
+                epoch=state.epoch,
+                lease_expires_at=state.lease_expires_at,
+            )
+        return EvalRunObservation(
+            run_id=state.request.run_id,
+            status=state.status,
+            attempt_count=state.epoch,
+            updated_at=state.updated_at,
+            ownership=ownership,
+        )
+
 
 def _copy_query(value, model_type):
     if value is None:
@@ -4679,6 +4896,7 @@ __all__ = [
     "EvalStore",
     "EvalStorePublicationRejected",
     "EvalStoreResultTooLarge",
+    "EvalStoreTransientContention",
     "EvalSuiteCatalogEntry",
     "EvalSuiteCatalogPage",
     "EvalSuiteCatalogQuery",

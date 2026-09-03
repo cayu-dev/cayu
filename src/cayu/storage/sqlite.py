@@ -756,6 +756,7 @@ async def _run_off_thread_with_connection_ownership(
     operation: Callable[[sqlite3.Connection], _T],
     *,
     executor: Executor | None = None,
+    worker_started: asyncio.Event | None = None,
     interrupt_on_cancellation: bool = False,
 ) -> _T:
     """Keep a SQLite connection owned until its off-thread operation terminates.
@@ -785,6 +786,8 @@ async def _run_off_thread_with_connection_ownership(
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         worker = loop.run_in_executor(executor, context.run, capture_outcome)
+        if worker_started is not None:
+            worker_started.set()
         cancellation: asyncio.CancelledError | None = None
 
         while not worker.done():

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any, ClassVar, LiteralString, cast
 from uuid import uuid4
 
@@ -62,6 +64,7 @@ from cayu.evals.store import (
     EvalRunClaimLost,
     EvalRunFailureCode,
     EvalRunLease,
+    EvalRunObservation,
     EvalRunOwnership,
     EvalRunPage,
     EvalRunQuery,
@@ -138,6 +141,8 @@ from cayu.storage.postgres import _PostgresStoreBase
 
 _POSTGRES_EVAL_MIN_REQUIRED_REVISION = 74
 
+logger = logging.getLogger(__name__)
+
 _RUN_COLUMNS = """
     run_id,
     idempotency_key,
@@ -166,6 +171,14 @@ _RUN_COLUMNS = """
     trial_checkpoint_bytes,
     authored_suite_launch_revision,
     authored_suite_launch_lane
+"""
+
+_RUN_OBSERVATION_COLUMNS = """
+    run_id,
+    status,
+    updated_at,
+    ownership_epoch,
+    lease_expires_at
 """
 
 _RESULT_RECORD_COLUMNS = """
@@ -215,6 +228,20 @@ def _request_from_row(row: Any) -> EvalRunRequest:
         suite_revision=row[5],
         max_concurrency=row[6],
         invocation=invocation,
+    )
+
+
+def _run_observation_from_row(row: Any) -> EvalRunObservation:
+    status = EvalRunStatus(row[1])
+    ownership = None
+    if status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
+        ownership = EvalRunOwnership(epoch=row[3], lease_expires_at=row[4])
+    return EvalRunObservation(
+        run_id=row[0],
+        status=status,
+        attempt_count=row[3],
+        updated_at=row[2],
+        ownership=ownership,
     )
 
 
@@ -1085,10 +1112,45 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
 
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         run_id = _store_identifier(run_id, "run_id")
+        started_at = monotonic()
         await self._ensure_ready()
-        async with self._connection() as conn, conn.cursor() as cur:
-            row = await self._load_run_row(cur, run_id)
-            return None if row is None else _run_record_from_row(row)
+        try:
+            async with self._connection() as conn, conn.cursor() as cur:
+                row = await self._load_run_row(cur, run_id)
+                return None if row is None else _run_record_from_row(row)
+        finally:
+            logger.debug(
+                "PostgreSQL eval run fully rehydrated.",
+                extra={
+                    "cayu_eval_store_event": "full_run_rehydration",
+                    "eval_store_kind": "postgres",
+                    "eval_run_id": run_id,
+                    "duration_seconds": monotonic() - started_at,
+                },
+            )
+
+    async def load_run_observation(self, run_id: str) -> EvalRunObservation | None:
+        run_id = _store_identifier(run_id, "run_id")
+        started_at = monotonic()
+        await self._ensure_ready()
+        try:
+            async with self._connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT {_RUN_OBSERVATION_COLUMNS} FROM cayu_eval_runs WHERE run_id = %s",
+                    (run_id,),
+                )
+                row = await cur.fetchone()
+                return None if row is None else _run_observation_from_row(row)
+        finally:
+            logger.debug(
+                "PostgreSQL eval run status observed.",
+                extra={
+                    "cayu_eval_store_event": "run_status_read",
+                    "eval_store_kind": "postgres",
+                    "eval_run_id": run_id,
+                    "duration_seconds": monotonic() - started_at,
+                },
+            )
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
@@ -1396,6 +1458,64 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     updated = await self._require_run_row(cur, claim.run_id)
                 await conn.commit()
                 return _run_record_from_row(updated)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def heartbeat_run_observation(
+        self,
+        claim: EvalRunClaim,
+        *,
+        extend_seconds: int = 300,
+    ) -> EvalRunObservation:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        extend_seconds = _lease_seconds(extend_seconds)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT run_id, status, claim_id, ownership_epoch, lease_expires_at
+                        FROM cayu_eval_runs
+                        WHERE run_id = %s
+                        FOR UPDATE
+                        """,
+                        (claim.run_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise EvalRunClaimLost("Eval run claim is no longer live.")
+                    now = await _database_now(cur)
+                    if row[2] != claim.claim_id or row[3] != claim.epoch:
+                        raise EvalRunClaimLost("Eval run claim is no longer owned by this worker.")
+                    if EvalRunStatus(row[1]) not in {
+                        EvalRunStatus.RUNNING,
+                        EvalRunStatus.CANCELLING,
+                    }:
+                        raise EvalRunClaimLost("Eval run is no longer active.")
+                    if row[4] is None or row[4] <= now:
+                        raise EvalRunClaimLost("Eval run claim lease has expired.")
+                    await cur.execute(
+                        """
+                        UPDATE cayu_eval_runs
+                        SET lease_expires_at = %s, updated_at = %s
+                        WHERE run_id = %s
+                        """,
+                        (
+                            now + timedelta(seconds=extend_seconds),
+                            now,
+                            claim.run_id,
+                        ),
+                    )
+                    await cur.execute(
+                        f"SELECT {_RUN_OBSERVATION_COLUMNS} FROM cayu_eval_runs WHERE run_id = %s",
+                        (claim.run_id,),
+                    )
+                    updated = await cur.fetchone()
+                await conn.commit()
+                assert updated is not None
+                return _run_observation_from_row(updated)
             except BaseException:
                 await conn.rollback()
                 raise
