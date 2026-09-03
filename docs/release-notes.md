@@ -457,6 +457,25 @@ publication boundary, so removing a prior project and recreating an empty destin
 its historical receipt an unrelated failure. Pre-existing non-empty targets and concurrent
 replacements still fail closed and are never adopted or cleaned up.
 
+### Generator plans publish through a crash-recoverable transaction
+
+`cayu generate slice`, `tool`, and `service-context` now apply multi-path project edits through a
+bounded project-scoped transaction journal. New content is synchronized before durable commit
+intent; exact originals are moved into synchronized private backups during the recorded commit
+sequence before replacements cross their pinned, atomic no-replace boundaries. A subsequent
+non-dry invocation recovers an interrupted transaction before
+planning, while `--dry-run` remains write-free and reports that recovery is required. Exact retries
+use one content- and identity-bound terminal receipt. Process loss therefore leaves a complete old
+project, a complete new project, authenticated recoverable transaction state, or a bounded conflict
+when it lands after private-directory allocation but before the external preparation owner is
+durable. Recovery preserves that unauthenticated directory for operator inspection; it never adopts,
+deletes, or treats it as transaction authority. Recovery also never adopts or overwrites a later
+user edit, replaced parent, malformed record, link/reparse point, or
+same-content object with different filesystem identity. Private population uses the identity-pinned
+stage writer; created-directory modes participate in recovery fingerprints; and terminal cleanup
+deletes only the exact bounded inventory sealed into its external cleanup claim. Existing generator
+plan schema, generated source, verification commands, and successful CLI presentation are unchanged.
+
 ### Semantic watches retain evidence without self-authorizing effects
 
 Applications can now explicitly evaluate one bounded observation through the existing

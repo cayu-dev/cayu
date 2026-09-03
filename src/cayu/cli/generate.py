@@ -2,22 +2,34 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
 import hashlib
 import json
 import keyword
 import re
-import shutil
 import sys
-import tempfile
 import textwrap
 import tomllib
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, ParamSpec, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
+from cayu.cli._generator_transaction import (
+    GeneratorTransactionEdit,
+    GeneratorTransactionError,
+    GeneratorTransactionPrecondition,
+    GeneratorTransactionRequest,
+    apply_generator_transaction,
+    encode_generator_transaction_content,
+    generator_planning_guard,
+    generator_transaction_staged_byte_limit,
+    recover_generator_transaction,
+    validate_generator_transaction_collection_bounds,
+)
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, resolve_project
 from cayu.cli.scaffold import (
@@ -38,6 +50,8 @@ from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION
 
 _IDENTIFIER_RE = re.compile(r"[a-z][a-z0-9_]*")
 GENERATOR_PLAN_SCHEMA_VERSION = APP_MANIFEST_SCHEMA_VERSION
+_P = ParamSpec("_P")
+_PlanT = TypeVar("_PlanT", bound="GeneratorPlan | ServiceContextMigrationPlan")
 
 
 class GeneratorEdit(BaseModel):
@@ -112,6 +126,18 @@ class _AgentModuleSnapshot:
 class _RegionStatement:
     key: str
     source: str
+
+
+def _guarded_generator_plan(
+    function: Callable[_P, _PlanT],
+) -> Callable[_P, _PlanT]:
+    @functools.wraps(function)
+    def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _PlanT:
+        project = resolve_project(command="cayu generate")
+        with generator_planning_guard(project.root):
+            return function(*args, **kwargs)
+
+    return guarded
 
 
 def add_generate_parser(subparsers: Any) -> None:
@@ -193,6 +219,8 @@ def _run_generate(args: argparse.Namespace) -> int:
     if args.generate_command not in {"slice", "tool", "service-context"}:
         return 2
     try:
+        project = resolve_project(command="cayu generate")
+        recover_generator_transaction(project.root, dry_run=args.dry_run)
         if args.generate_command == "slice":
             plan = plan_slice(
                 name=args.name,
@@ -207,7 +235,7 @@ def _run_generate(args: argparse.Namespace) -> int:
             )
         else:
             plan = plan_service_context()
-    except (ProjectError, ValueError, OSError) as exc:
+    except (GeneratorTransactionError, ProjectError, ValueError, OSError) as exc:
         if args.output_format == "json":
             print(
                 json.dumps(
@@ -254,6 +282,7 @@ def _run_generate(args: argparse.Namespace) -> int:
     return 0 if plan.status in {"ready", "already_present"} else 1
 
 
+@_guarded_generator_plan
 def plan_service_context() -> ServiceContextMigrationPlan:
     """Plan the narrow generated-service migration without rewriting user code."""
 
@@ -495,6 +524,7 @@ def _registration_target(root: Path) -> tuple[str, Path]:
     return legacy_relative, _generated_path(root, legacy_relative)
 
 
+@_guarded_generator_plan
 def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
     """Plan the first tool tracer bullet for the updated scaffold starter."""
 
@@ -757,6 +787,7 @@ def plan_tool(*, tool_name: str, agent_name: str, effect: str) -> GeneratorPlan:
     )
 
 
+@_guarded_generator_plan
 def plan_slice(*, name: str, tool_name: str, effect: str) -> GeneratorPlan:
     name = _identifier(name, "slice name")
     tool_name = _identifier(tool_name, "tool name")
@@ -1606,80 +1637,18 @@ def _region_contains_only(
 
 
 def apply_slice_plan(plan: GeneratorPlan) -> None:
-    """Apply a ready slice plan as an all-or-nothing filesystem transaction."""
+    """Apply a ready slice plan through the durable generator transaction owner."""
 
     if plan.status != "ready":
         raise GeneratorApplyError(f"Only ready generator plans can be applied, not {plan.status}.")
     project = resolve_project(command="cayu generate")
-    root = project.root.resolve()
-    targets: list[tuple[GeneratorEdit, Path]] = []
-    seen: set[Path] = set()
     try:
-        _validate_plan_preconditions(plan, root)
-        for edit in plan.edits:
-            target = _generated_path(root, edit.path)
-            if target in seen:
-                raise GeneratorApplyError(f"Generator plan contains duplicate path: {edit.path}")
-            seen.add(target)
-            _validate_edit_preimage(edit, target)
-            targets.append((edit, target))
-    except (_GeneratedPathError, OSError) as exc:
-        raise GeneratorApplyError(str(exc)) from exc
-
-    stage_root = Path(tempfile.mkdtemp(prefix=".cayu-generate-", dir=root))
-    staged: dict[str, Path] = {}
-    backups: dict[str, Path] = {}
-    applied: list[tuple[GeneratorEdit, Path]] = []
-    created_directories: list[Path] = []
-    try:
-        for index, (edit, target) in enumerate(targets):
-            staged_path = stage_root / f"edit-{index}"
-            staged_path.write_bytes(edit.content.encode("utf-8"))
-            if edit.operation == "update_region":
-                staged_path.chmod(target.stat().st_mode)
-                backup_path = stage_root / f"backup-{index}"
-                backup_path.write_bytes(target.read_bytes())
-                backup_path.chmod(target.stat().st_mode)
-                backups[edit.path] = backup_path
-            staged[edit.path] = staged_path
-
-        for edit, target in targets:
-            try:
-                _validate_plan_preconditions(
-                    plan,
-                    root,
-                    applied_edits={item.path: item for item, _target in applied},
-                )
-                _generated_path(root, edit.path)
-                _validate_edit_preimage(edit, target)
-                _create_missing_parents(root, target.parent, created_directories)
-                staged[edit.path].replace(target)
-                applied.append((edit, target))
-            except (GeneratorApplyError, _GeneratedPathError, OSError) as exc:
-                raise GeneratorApplyError(str(exc)) from exc
+        apply_generator_transaction(project.root, _transaction_request(plan))
+    except GeneratorTransactionError as exc:
+        suffix = f" ({', '.join(exc.paths)})" if exc.paths else ""
+        raise GeneratorApplyError(f"{exc}{suffix}") from exc
     except Exception as exc:
-        rollback_errors: list[str] = []
-        for edit, target in reversed(applied):
-            try:
-                if edit.operation == "create":
-                    target.unlink()
-                else:
-                    backups[edit.path].replace(target)
-            except OSError as rollback_exc:
-                rollback_errors.append(f"{edit.path}: {rollback_exc}")
-        for directory in reversed(created_directories):
-            with suppress(OSError):
-                directory.rmdir()
-        if rollback_errors:
-            details = "; ".join(rollback_errors)
-            raise GeneratorApplyError(
-                f"{exc}; rollback could not restore every path: {details}"
-            ) from exc
-        if isinstance(exc, GeneratorApplyError):
-            raise
         raise GeneratorApplyError(str(exc)) from exc
-    finally:
-        shutil.rmtree(stage_root, ignore_errors=True)
 
 
 def apply_service_context_plan(plan: ServiceContextMigrationPlan) -> None:
@@ -1703,63 +1672,44 @@ def apply_service_context_plan(plan: ServiceContextMigrationPlan) -> None:
     )
 
 
-def _validate_plan_preconditions(
-    plan: GeneratorPlan,
-    root: Path,
-    *,
-    applied_edits: dict[str, GeneratorEdit] | None = None,
-) -> None:
-    seen: set[Path] = set()
-    applied_edits = applied_edits or {}
-    for precondition in plan.preconditions:
-        path = _generated_path(root, precondition.path)
-        if path in seen:
-            raise GeneratorApplyError(
-                f"Generator plan contains duplicate precondition: {precondition.path}"
-            )
-        seen.add(path)
-        applied = applied_edits.get(precondition.path)
-        expected_sha256 = (
-            applied.content_sha256 if applied is not None else precondition.content_sha256
+def _transaction_request(plan: GeneratorPlan) -> GeneratorTransactionRequest:
+    validate_generator_transaction_collection_bounds(
+        edit_count=len(plan.edits),
+        precondition_count=len(plan.preconditions),
+    )
+    remaining = generator_transaction_staged_byte_limit()
+    edits: list[GeneratorTransactionEdit] = []
+    for edit in plan.edits:
+        content = encode_generator_transaction_content(
+            edit.content,
+            remaining_bytes=remaining,
         )
-        if not path.is_file() or _sha256(path.read_bytes()) != expected_sha256:
-            raise GeneratorApplyError(f"{precondition.path} changed after the plan was created.")
-
-
-def _validate_edit_preimage(edit: GeneratorEdit, target: Path) -> None:
-    content_sha256 = _sha256(edit.content.encode("utf-8"))
-    if content_sha256 != edit.content_sha256:
-        raise GeneratorApplyError(f"Planned content hash does not match for {edit.path}.")
-    if edit.operation == "create":
-        if edit.preimage_sha256 is not None:
-            raise GeneratorApplyError(f"Create edit has an unexpected preimage for {edit.path}.")
-        if target.exists() or target.is_symlink():
-            raise GeneratorApplyError(f"{edit.path} changed after the plan was created.")
-        return
-    if edit.preimage_sha256 is None:
-        raise GeneratorApplyError(f"Update edit is missing its preimage hash for {edit.path}.")
-    if not target.is_file() or _sha256(target.read_bytes()) != edit.preimage_sha256:
-        raise GeneratorApplyError(f"{edit.path} changed after the plan was created.")
-
-
-def _create_missing_parents(root: Path, parent: Path, created: list[Path]) -> None:
-    missing: list[Path] = []
-    current = parent
-    while current != root and not current.exists():
-        missing.append(current)
-        current = current.parent
-    if current != root:
-        try:
-            current.relative_to(root)
-        except ValueError as exc:
-            raise GeneratorApplyError(
-                f"Generated parent escapes the project root: {current}"
-            ) from exc
-    if current.is_symlink() or not current.is_dir():
-        raise GeneratorApplyError(f"Generated parent is not a real directory: {current}")
-    for directory in reversed(missing):
-        directory.mkdir()
-        created.append(directory)
+        remaining -= len(content)
+        edits.append(
+            GeneratorTransactionEdit(
+                path=edit.path,
+                operation=edit.operation,
+                content=content,
+                content_sha256=edit.content_sha256,
+                preimage_sha256=edit.preimage_sha256,
+            )
+        )
+    return GeneratorTransactionRequest(
+        schema_version=plan.schema_version,
+        slice_name=plan.slice_name,
+        tool_name=plan.tool_name,
+        effect=plan.effect,
+        authoring_state=plan.authoring_state.value,
+        edits=tuple(edits),
+        preconditions=tuple(
+            GeneratorTransactionPrecondition(
+                path=precondition.path,
+                content_sha256=precondition.content_sha256,
+            )
+            for precondition in plan.preconditions
+        ),
+        verification_commands=plan.verification_commands,
+    )
 
 
 def _generated_path(root: Path, relative: str) -> Path:

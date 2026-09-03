@@ -9636,6 +9636,47 @@ once the complete stage is sealed, an identical invocation can therefore finish 
 publication without regenerating private material or reporting a completed project as an unrelated
 non-empty target. An ordinary pre-existing
 non-empty target remains rejected.
+
+`cayu generate slice`, `tool`, and `service-context` publish their independent
+project-file edits through a separate project-scoped generator transaction owner. The owner
+defensively copies and bounds the schema-15 plan, rejects duplicate, Unicode/case-aliased, and
+ancestor-overlapping edit paths, and records the exact root, parent, preimage, precondition,
+after-image, mode, and staged-file identities before durable commit intent. It caps one operation
+at 256 edits, 1,024 preconditions, 128 path components, 1,024 UTF-8 path bytes, 64 MiB of staged
+content, a 4 MiB append-only journal, and one bounded latest terminal receipt. A source path does
+not change before the synchronized journal records commit intent. Updates move the exact original
+into the transaction namespace before publishing the exact staged regular file with atomic
+no-replace semantics; newly missing ancestry is built, synchronized, structurally sealed, and
+published as one no-replace subtree rather than created incrementally in the user repository.
+Every namespace transition synchronizes both parents and rechecks pinned platform identities.
+Private staging is populated only through the identity-pinned stage writer, so replacement of the
+transaction root or a created-tree ancestor cannot redirect a write outside the owned directory.
+Every staged regular file is synchronized before commit intent becomes durable. On Windows, a
+published file or created subtree restores destination-parent ACL inheritance before its
+publication transition is recorded.
+
+A non-dry generator invocation settles an exact pending transaction before constructing its next
+plan. Direct planning holds the shared project fence and fails closed while recovery is required;
+`--dry-run` remains write-free and reports that pending state instead of changing it. Process loss
+before commit intent leaves the complete old project. Once the preparation owner is durable,
+recovery removes or resumes only that authenticated state. If process loss occurs in the narrow
+interval after the private preparation directory is allocated but before its external owner marker
+is durable, recovery preserves the unauthenticated directory as a bounded conflict for operator
+inspection instead of adopting or deleting it. Process loss after commit intent resumes the exact
+commit, while an ordinary failure or process-control signal durably selects rollback and
+restores the complete old project before the original signal returns whenever authority remains
+provable. A changed root, parent, precondition, target, backup, staged value, created subtree,
+private record, or created-directory mode is explicit recoverable conflict state: recovery preserves
+every path and never overwrites a later user or generator edit. The bounded terminal receipt binds the complete request
+and published filesystem authority, so acknowledgement loss and identical direct retries converge
+without repeating edits; a successor transaction replaces that receipt only while its exact prior
+identity remains authoritative. Terminal deletion first publishes a token-bound cleanup claim
+outside the owned directory. The claim seals the exact bounded inventory, identities, modes, sizes,
+and regular-file digests that deletion may consume; an added or changed entry fails closed and is
+preserved. The claim remains until the exact directory is gone, so process loss after removal of the
+directory's final internal marker is still recoverable. Generator plan JSON and successful CLI
+output remain unchanged.
+
 Filesystem roots, the current working directory and its ancestors, and the user's home directory
 and its ancestors are protected export targets.
 Artifact metadata is provenance, not a substitute for the authenticated runtime handshake.

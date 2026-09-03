@@ -1654,21 +1654,356 @@ def test_apply_slice_plan_rolls_back_a_mid_commit_failure(
     monkeypatch.chdir(project)
     plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
     before = _files(project)
-    real_replace = Path.replace
+    from cayu.cli import _generator_transaction
+
+    real_rename = _generator_transaction._rename_no_replace
     commits = 0
 
-    def fail_second_commit(source: Path, target: Path) -> Path:
+    def fail_second_commit(
+        source: Path,
+        target: Path,
+        *,
+        expected,
+        expected_source_parent,
+        expected_destination_parent,
+        label: str,
+        unexpected_policy=_generator_transaction._UnexpectedRenamePolicy.RESTORE_SOURCE,
+    ) -> None:
         nonlocal commits
-        if ".cayu-generate-" in source.as_posix() and ".cayu-generate-" not in target.as_posix():
+        if label == "generator stage":
             commits += 1
             if commits == 2:
                 raise OSError("simulated commit failure")
-        return real_replace(source, target)
+        real_rename(
+            source,
+            target,
+            expected=expected,
+            expected_source_parent=expected_source_parent,
+            expected_destination_parent=expected_destination_parent,
+            label=label,
+            unexpected_policy=unexpected_policy,
+        )
 
-    monkeypatch.setattr(Path, "replace", fail_second_commit)
+    monkeypatch.setattr(_generator_transaction, "_rename_no_replace", fail_second_commit)
 
     with pytest.raises(GeneratorApplyError, match="simulated commit failure"):
         apply_slice_plan(plan)
 
     assert _files(project) == before
+
+
+def test_apply_slice_plan_restores_a_source_replaced_at_the_commit_boundary(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.cli import _generator_transaction
+
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    updated = next(edit for edit in plan.edits if edit.operation == "update_region")
+    target = project / updated.path
+    replacement = target.with_name(f".{target.name}.editor-save")
+    replacement.write_bytes(b"operator edit\n")
+    real_rename = _generator_transaction._rename_names_no_replace
+    swapped = False
+
+    def swap_after_pin(**kwargs) -> None:
+        nonlocal swapped
+        if (
+            Path(kwargs["source_parent_path"]) == target.parent
+            and kwargs["source_name"] == target.name
+            and not swapped
+        ):
+            swapped = True
+            os.replace(replacement, target)
+        real_rename(**kwargs)
+
+    monkeypatch.setattr(_generator_transaction, "_rename_names_no_replace", swap_after_pin)
+    with pytest.raises(GeneratorApplyError, match="namespace transition"):
+        apply_slice_plan(plan)
+
+    assert swapped
+    assert target.read_bytes() == b"operator edit\n"
+    with pytest.raises(GeneratorApplyError):
+        apply_slice_plan(plan)
+    assert target.read_bytes() == b"operator edit\n"
+
+
+def test_apply_slice_plan_preserves_a_destination_replaced_after_publication(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.cli import _generator_transaction
+
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    updated = next(edit for edit in plan.edits if edit.operation == "update_region")
+    target = project / updated.path
+    replacement = target.with_name(f".{target.name}.editor-save")
+    replacement.write_bytes(b"operator edit\n")
+    real_rename = _generator_transaction._rename_names_no_replace
+    swapped = False
+
+    def swap_public_destination_after_rename(**kwargs) -> None:
+        nonlocal swapped
+        real_rename(**kwargs)
+        if (
+            Path(kwargs["destination_parent_path"]) == target.parent
+            and kwargs["destination_name"] == target.name
+            and not swapped
+        ):
+            swapped = True
+            os.replace(replacement, target)
+
+    monkeypatch.setattr(
+        _generator_transaction,
+        "_rename_names_no_replace",
+        swap_public_destination_after_rename,
+    )
+    with pytest.raises(GeneratorApplyError, match="namespace transition"):
+        apply_slice_plan(plan)
+
+    assert swapped
+    assert target.read_bytes() == b"operator edit\n"
+    with pytest.raises(GeneratorApplyError):
+        apply_slice_plan(plan)
+    assert target.read_bytes() == b"operator edit\n"
+
+
+def test_apply_slice_plan_rejects_a_self_consistent_receipt_for_other_edits(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.cli import _generator_transaction, generate
+
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    request = generate._transaction_request(plan)
+    unrelated = project / "pyproject.toml"
+    state = project / ".cayu" / "generator-transactions"
+    state.mkdir(parents=True)
+    receipt_payload: dict[str, object] = {
+        "schema_version": _generator_transaction._SCHEMA_VERSION,
+        "request_digest": request.digest,
+        "root_identity": _generator_transaction._capture_directory_identity(
+            project,
+            label="project root",
+        ).as_json(),
+        "edits": [
+            {
+                "path": "pyproject.toml",
+                "snapshot": _generator_transaction._snapshot_regular(
+                    unrelated,
+                    label="unrelated file",
+                ).payload(),
+                "parent_identity": _generator_transaction._capture_directory_identity(
+                    project,
+                    label="project root",
+                ).as_json(),
+            }
+        ],
+        "preconditions": [],
+        "created_roots": [],
+    }
+    receipt_payload["receipt_sha256"] = _generator_transaction._sha256(
+        _generator_transaction._canonical_json(receipt_payload)
+    )
+    (state / "receipt.json").write_bytes(
+        _generator_transaction._canonical_json(receipt_payload) + b"\n"
+    )
+    before = _stable_files(project)
+
+    with pytest.raises(
+        GeneratorApplyError,
+        match="receipt does not match the exact request",
+    ):
+        apply_slice_plan(plan)
+
+    assert _stable_files(project) == before
+
+
+def test_apply_slice_plan_rejects_edit_count_before_copying_content(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.cli import _generator_transaction, generate
+
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    assert len(plan.edits) > 1
+    monkeypatch.setattr(_generator_transaction, "_MAX_EDITS", len(plan.edits) - 1)
+
+    def copied_too_early(*_args, **_kwargs):
+        pytest.fail("oversized public plans must be rejected before content copying")
+
+    monkeypatch.setattr(generate, "encode_generator_transaction_content", copied_too_early)
+
+    with pytest.raises(GeneratorApplyError, match="between 1 and"):
+        apply_slice_plan(plan)
+
+    assert not (project / ".cayu" / "generator-transactions").exists()
+
+
+def test_apply_slice_plan_accepts_exact_edit_count_before_dispatch(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.cli import _generator_transaction, generate
+
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    monkeypatch.chdir(project)
+    plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+    monkeypatch.setattr(_generator_transaction, "_MAX_EDITS", len(plan.edits))
+    observed = []
+
+    def capture(_root: Path, request) -> None:
+        observed.append(request)
+
+    monkeypatch.setattr(generate, "apply_generator_transaction", capture)
+
+    apply_slice_plan(plan)
+
+    assert len(observed) == 1
+    assert len(observed[0].edits) == len(plan.edits)
+
+
+def test_generate_cli_recovers_a_crashed_transaction_before_replanning(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    script = """
+import os
+from cayu.cli import _generator_transaction
+from cayu.cli.generate import apply_slice_plan, plan_slice
+
+plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+
+def crash(phase):
+    if phase == "new_published:0":
+        os._exit(73)
+
+_generator_transaction._fault = crash
+apply_slice_plan(plan)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project,
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2] / "src")},
+        text=True,
+    )
+    assert crashed.returncode == 73, crashed.stderr
+    monkeypatch.chdir(project)
+
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "analyst",
+                "--tool",
+                "analyze_document",
+                "--effect",
+                "none",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "already_present"
+    assert (project / "agents" / "analyst.py").is_file()
+    assert (project / "tools" / "analyze_document.py").is_file()
+    assert not (project / ".cayu" / "generator-transactions" / "active").exists()
     assert not list(project.glob(".cayu-generate-*"))
+
+
+def test_generate_cli_dry_run_reports_pending_recovery_without_writes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    script = """
+import os
+from cayu.cli import _generator_transaction
+from cayu.cli.generate import apply_slice_plan, plan_slice
+
+plan = plan_slice(name="analyst", tool_name="analyze_document", effect="none")
+
+def crash(phase):
+    if phase == "phase:committing":
+        os._exit(73)
+
+_generator_transaction._fault = crash
+apply_slice_plan(plan)
+"""
+    crashed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project,
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2] / "src")},
+        text=True,
+    )
+    assert crashed.returncode == 73, crashed.stderr
+    state = project / ".cayu" / "generator-transactions"
+    before = {
+        path.relative_to(state).as_posix(): path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.chdir(project)
+
+    assert (
+        main(
+            [
+                "generate",
+                "slice",
+                "analyst",
+                "--tool",
+                "analyze_document",
+                "--effect",
+                "none",
+                "--dry-run",
+                "--json",
+            ]
+        )
+        == 2
+    )
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["error"]["code"] == "GENERATOR_PLAN_FAILED"
+    assert "rerun without --dry-run" in result["error"]["message"]
+    assert before == {
+        path.relative_to(state).as_posix(): path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }

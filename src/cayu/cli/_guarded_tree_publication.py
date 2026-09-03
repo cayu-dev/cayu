@@ -3667,12 +3667,21 @@ def _capture_tree_authority(
     *,
     expected: _Identity,
     require_cleanup_access: bool = False,
+    entry_limit: int | None = None,
 ) -> tuple[str, tuple[_CleanupEntry, ...]]:
+    if entry_limit is None:
+        entry_limit = _TREE_ENTRY_LIMIT
+    if type(entry_limit) is not int or entry_limit <= 0:
+        raise GuardedTreePublicationError(
+            "tree_limit",
+            "guarded publication tree has an invalid entry limit",
+        )
     if os.name == "nt":
         return _seal_tree_on_windows(
             path,
             expected=expected,
             require_cleanup_access=require_cleanup_access,
+            entry_limit=entry_limit,
         )
     flags = (
         os.O_RDONLY
@@ -3715,7 +3724,7 @@ def _capture_tree_authority(
             f"{stat.S_IMODE(root_value.st_mode):o}\0".encode()
         )
         entries: list[_CleanupEntry] = []
-        entry_budget = _TreeEntryBudget(_TREE_ENTRY_LIMIT)
+        entry_budget = _TreeEntryBudget(entry_limit)
         _seal_directory_from_fd(
             descriptor,
             root_path=path,
@@ -3948,10 +3957,11 @@ def _seal_tree_on_windows(
     *,
     expected: _Identity,
     require_cleanup_access: bool,
+    entry_limit: int,
 ) -> tuple[str, tuple[_CleanupEntry, ...]]:
     digest = hashlib.sha256()
     entries: list[_CleanupEntry] = []
-    entry_budget = _TreeEntryBudget(_TREE_ENTRY_LIMIT)
+    entry_budget = _TreeEntryBudget(entry_limit)
     if require_cleanup_access:
         before = path.stat(follow_symlinks=False)
         if _capture_stable_identity(before, path=path) != expected:
