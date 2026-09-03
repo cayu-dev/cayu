@@ -46,6 +46,7 @@ from cayu.runtime import (
     DispatchHandle,
     DispatchRequest,
     DispatchStatus,
+    DurableWorkerMetrics,
     EventQuery,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAuthorityDecision,
@@ -6442,6 +6443,91 @@ def test_hundred_idle_dispatch_workers_share_bounded_store_polling(
         assert groups == {}
 
     asyncio.run(scenario())
+
+
+def test_run_worker_does_not_count_an_empty_claim_as_an_active_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("unused")])
+    claim_started = asyncio.Event()
+    release_claim = asyncio.Event()
+    metrics = DurableWorkerMetrics()
+    original_claim = h.tasks.claim_task
+
+    async def block_empty_claim(worker_id, query=None, *, lease_seconds=300):
+        claim_started.set()
+        await release_claim.wait()
+        return await original_claim(worker_id, query, lease_seconds=lease_seconds)
+
+    monkeypatch.setattr(h.tasks, "claim_task", block_empty_claim)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="metrics-worker",
+                stop=stop,
+                poll_interval_s=1.0,
+                metrics=metrics,
+                reconcile_terminal_receipts=False,
+                reclaim_expired_leases=False,
+            )
+        )
+        await asyncio.wait_for(claim_started.wait(), timeout=1)
+        snapshot = metrics.snapshot()
+        assert snapshot.active_handlers == 0
+        assert snapshot.active_pollers == 1
+        release_claim.set()
+        stop.set()
+        await asyncio.wait_for(worker, timeout=1)
+
+    asyncio.run(scenario())
+    assert metrics.snapshot().active_handlers == 0
+
+
+def test_run_worker_counts_only_claimed_dispatch_execution_as_an_active_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = _build([_batch("first answer"), _batch("dispatch answer")])
+    _create_resumable_session(h.app, "metrics-active-handler")
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
+    metrics = DurableWorkerMetrics()
+    original_dispatch = h.app._dispatch_queued
+
+    async def block_dispatch(envelope):
+        dispatch_started.set()
+        await release_dispatch.wait()
+        async for event in original_dispatch(envelope):
+            yield event
+
+    monkeypatch.setattr(h.app, "_dispatch_queued", block_dispatch)
+
+    async def scenario() -> None:
+        await h.app.dispatch(_dispatch_request("metrics-active-handler", "metrics-dispatch"))
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            h.dispatcher.run_worker(
+                h.app,
+                worker_id="metrics-worker",
+                stop=stop,
+                poll_interval_s=1.0,
+                metrics=metrics,
+                reconcile_terminal_receipts=False,
+                reclaim_expired_leases=False,
+            )
+        )
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+        snapshot = metrics.snapshot()
+        assert snapshot.active_handlers == 1
+        assert snapshot.active_pollers == 0
+        stop.set()
+        release_dispatch.set()
+        await asyncio.wait_for(worker, timeout=5)
+
+    asyncio.run(scenario())
+    assert metrics.snapshot().active_handlers == 0
 
 
 @pytest.mark.parametrize(

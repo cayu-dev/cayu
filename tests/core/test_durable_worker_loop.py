@@ -7,6 +7,7 @@ import pytest
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerCadence,
     DurableWorkerDemandPolicy,
+    DurableWorkerMetrics,
     DurableWorkerPollerGroup,
     DurableWorkerStep,
     DurableWorkerWaitResult,
@@ -242,6 +243,146 @@ def test_worker_polling_backoff_jitters_within_bounds_and_resets_on_claim() -> N
         assert poller.next_wake_at() == pytest.approx(3.75)
 
     asyncio.run(scenario())
+
+
+def test_worker_metrics_snapshot_is_content_free_and_bounded() -> None:
+    now = 0.0
+    group = DurableWorkerPollerGroup()
+    policy = DurableWorkerDemandPolicy(
+        dispatch_latency_s=1.0,
+        minimum_idle_delay_s=0.1,
+        maximum_idle_delay_s=1.0,
+        jitter_ratio=0.0,
+    )
+    poller = group.subscribe(policy, clock=lambda: now)
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def empty() -> None:
+            return None
+
+        async def task() -> str:
+            return "opaque-task-id-is-not-recorded"
+
+        poller.begin_step()
+        await poller.claim(empty)
+        now = 0.1
+        poller.note_hint()
+        now = 0.35
+        poller.begin_step()
+        await poller.claim(task)
+
+    try:
+        asyncio.run(scenario())
+        snapshot = poller.metrics_snapshot()
+    finally:
+        poller.close()
+    assert snapshot.configured_handler_capacity == 1
+    assert snapshot.active_handlers == 0
+    assert snapshot.active_pollers == 0
+    assert snapshot.claim_attempts == 2
+    assert snapshot.empty_claims == 1
+    assert snapshot.successful_claims == 1
+    assert snapshot.failed_claims == 0
+    assert snapshot.cancelled_claims == 0
+    assert snapshot.wake_hints_received == 1
+    assert snapshot.wake_hints_accepted == 1
+    assert snapshot.hint_to_claim_latency_samples == 1
+    assert snapshot.hint_to_claim_latency_total_s == pytest.approx(0.25)
+    assert snapshot.hint_to_claim_latency_max_s == pytest.approx(0.25)
+
+
+def test_worker_metrics_keep_failed_and_cancelled_claims_out_of_empty_claims() -> None:
+    now = 0.0
+    metrics = DurableWorkerMetrics()
+    poller = DurableWorkerPollerGroup().subscribe(
+        DurableWorkerDemandPolicy(
+            dispatch_latency_s=1.0,
+            minimum_idle_delay_s=0.1,
+            jitter_ratio=0.0,
+        ),
+        clock=lambda: now,
+    )
+    poller.set_metrics(metrics)
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def failed_claim() -> None:
+            raise RuntimeError("store unavailable")
+
+        async def cancelled_claim() -> None:
+            raise asyncio.CancelledError
+
+        poller.begin_step()
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await poller.claim(failed_claim)
+        now = 0.1
+        poller.begin_step()
+        with pytest.raises(asyncio.CancelledError):
+            await poller.claim(cancelled_claim)
+
+    try:
+        asyncio.run(scenario())
+        snapshot = metrics.snapshot()
+    finally:
+        poller.close()
+    assert snapshot.claim_attempts == 2
+    assert snapshot.empty_claims == 0
+    assert snapshot.successful_claims == 0
+    assert snapshot.failed_claims == 1
+    assert snapshot.cancelled_claims == 1
+    assert snapshot.store_failures == 1
+
+
+@pytest.mark.parametrize(
+    ("with_maintenance_deadline", "expected_fallback_polls"),
+    ((False, 1), (True, 0)),
+)
+def test_worker_metrics_count_only_claim_audit_timeouts_as_fallback_polls(
+    *,
+    with_maintenance_deadline: bool,
+    expected_fallback_polls: int,
+) -> None:
+    now = 0.0
+    metrics = DurableWorkerMetrics()
+    stop = asyncio.Event()
+
+    async def scenario() -> None:
+        nonlocal now
+
+        async def step(step_now: float, _handled: int) -> DurableWorkerStep:
+            return DurableWorkerStep(
+                idle=True,
+                next_wake_at=step_now + 0.25 if with_maintenance_deadline else None,
+            )
+
+        async def wait(
+            seconds: float,
+            _wait_stop: asyncio.Event | None,
+        ) -> DurableWorkerWaitResult:
+            nonlocal now
+            now += seconds
+            stop.set()
+            return DurableWorkerWaitResult.TIMEOUT
+
+        await run_durable_worker_loop(
+            step,
+            poll_interval_s=10.0,
+            stop=stop,
+            wait=wait,
+            demand_policy=DurableWorkerDemandPolicy(
+                dispatch_latency_s=10.0,
+                minimum_idle_delay_s=1.0,
+                jitter_ratio=0.0,
+            ),
+            clock=lambda: now,
+            metrics=metrics,
+        )
+
+    asyncio.run(scenario())
+    assert metrics.snapshot().fallback_poll_activations == expected_fallback_polls
 
 
 def test_hundred_worker_empty_cohort_has_one_fair_authoritative_poller() -> None:

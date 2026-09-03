@@ -7,6 +7,10 @@ from cayu.core.billing import (
     ResolvedBillingIdentity,
     UnresolvedBillingIdentity,
 )
+from cayu.runtime._durable_worker_loop import (
+    DurableWorkerMetrics,
+    DurableWorkerMetricsSnapshot,
+)
 from cayu.runtime._environment_lifecycle import EnvironmentCapacityError
 from cayu.runtime._invocation_lifecycle import (
     INVOCATION_LIFECYCLE_COMMAND_VERSION,
@@ -1284,6 +1288,8 @@ __all__ = [
     "DispatchRuntime",
     "DispatchStatus",
     "Dispatcher",
+    "DurableWorkerMetrics",
+    "DurableWorkerMetricsSnapshot",
     "EgressAuthorityAdoptionHandler",
     "EgressAuthorityAdoptionResult",
     "EgressAuthorityTransitionConflict",

@@ -49,6 +49,7 @@ from cayu.runtime._durable_subagents import (
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerCadence,
     DurableWorkerDemandPolicy,
+    DurableWorkerMetrics,
     DurableWorkerPoller,
     DurableWorkerStep,
     run_durable_lease_heartbeat,
@@ -1130,6 +1131,7 @@ class TaskStoreDispatcher(Dispatcher):
                 )
         claim_task_types = self._claim_task_types()
         loop = asyncio.get_running_loop()
+        poller_context = _RUN_WORKER_DEMAND_POLLER.get()
 
         async def claim_next_task() -> tuple[Task, str, _DispatchLeaseAuthority, float] | None:
             for offset in range(len(claim_task_types)):
@@ -1171,7 +1173,6 @@ class TaskStoreDispatcher(Dispatcher):
                 )
             return None
 
-        poller_context = _RUN_WORKER_DEMAND_POLLER.get()
         if poller_context is not None and poller_context[0] is self:
             claim = await poller_context[1].claim(
                 claim_next_task,
@@ -1182,6 +1183,8 @@ class TaskStoreDispatcher(Dispatcher):
             claimed = await claim_next_task()
         if claimed is None:
             return None
+        if poller_context is not None and poller_context[0] is self:
+            poller_context[1].metrics.handler_started()
         task, claimed_task_type, lease_authority, claim_deadline_monotonic = claimed
         # Fail malformed or unauthenticated queue authority terminally rather than letting
         # the task be reclaimed and re-run forever. Only the immutable task row is consulted
@@ -2474,6 +2477,7 @@ class TaskStoreDispatcher(Dispatcher):
         worker_id: str,
         stop: asyncio.Event,
         poll_interval_s: float = 1.0,
+        metrics: DurableWorkerMetrics | None = None,
         minimum_idle_delay_s: float | None = None,
         maximum_idle_delay_s: float | None = None,
         idle_backoff_multiplier: float = 2.0,
@@ -2486,6 +2490,8 @@ class TaskStoreDispatcher(Dispatcher):
         """Claim and run with bounded adaptive demand and independent maintenance."""
 
         validate_worker_interval(poll_interval_s, "poll_interval_s")
+        if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
+            raise TypeError("metrics must be a DurableWorkerMetrics instance.")
         demand_policy = DurableWorkerDemandPolicy(
             dispatch_latency_s=poll_interval_s,
             minimum_idle_delay_s=minimum_idle_delay_s,
@@ -2507,6 +2513,8 @@ class TaskStoreDispatcher(Dispatcher):
             demand_policy,
             clock=loop.time,
         )
+        if metrics is not None:
+            poller.set_metrics(metrics)
         reconciliation_cadence = DurableWorkerCadence(reconciliation_every_s)
         reclaim_cadence = DurableWorkerCadence(reclaim_every_s)
 
@@ -2547,18 +2555,22 @@ class TaskStoreDispatcher(Dispatcher):
         async def run_step(_now: float, _handled: int) -> DurableWorkerStep:
             meaningful_activity = False
             if reconcile_terminal_receipts:
-                _, reconciled = await reconciliation_cadence.run_if_due(
+                reconciliation_ran, reconciled = await reconciliation_cadence.run_if_due(
                     reconcile,
                     now=loop.time(),
                     clock=loop.time,
                 )
+                if reconciliation_ran:
+                    poller.metrics.maintenance(recovery=True)
                 meaningful_activity = meaningful_activity or bool(reconciled)
             if reclaim_expired_leases:
-                _, reclaimed = await reclaim_cadence.run_if_due(
+                reclaim_ran, reclaimed = await reclaim_cadence.run_if_due(
                     reclaim,
                     now=loop.time(),
                     clock=loop.time,
                 )
+                if reclaim_ran:
+                    poller.metrics.maintenance(reclaim=True)
                 meaningful_activity = meaningful_activity or bool(reclaimed)
             if stop.is_set():
                 return DurableWorkerStep(stop=True, activity=meaningful_activity)
@@ -2581,6 +2593,7 @@ class TaskStoreDispatcher(Dispatcher):
                     override_turn = await poller.claim(
                         lambda: process_next(runtime, worker_id=worker_id),
                         maximum_active_s=self._lease_seconds,
+                        store_failure_on_exception=False,
                     )
                     handle = override_turn.value
             except Exception as exc:
@@ -2592,6 +2605,8 @@ class TaskStoreDispatcher(Dispatcher):
                 )
                 handle = None
             finally:
+                if uses_base_claim_boundary and poller.last_claimed:
+                    poller.metrics.handler_finished()
                 if poller_token is not None:
                     _RUN_WORKER_DEMAND_POLLER.reset(poller_token)
                 _RUN_WORKER_RECONCILIATION_DISPATCHER.reset(suppression_token)
@@ -2641,6 +2656,7 @@ class TaskStoreDispatcher(Dispatcher):
                 ),
                 demand_policy=demand_policy,
                 poller=poller,
+                metrics=metrics if metrics is not None else poller.metrics,
             )
         finally:
             if admission_wakeup is not None:

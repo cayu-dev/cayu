@@ -2994,6 +2994,18 @@ timeouts do not. A compatible content-free admission hint resets the delay and
 makes its selected worker immediately eligible, but that worker must still win
 the ordinary atomic store claim.
 
+Applications may pass a shared `DurableWorkerMetrics` instance to
+`run_task_worker(...)` or `TaskStoreDispatcher.run_worker(...)`. Its immutable
+`snapshot()` exposes only bounded counts and timing aggregates for configured
+capacity, active handlers/pollers, claim outcomes, hints, fallback polling,
+maintenance, store failures, idle backoff, and hint-consumption-to-claim
+latency. Failed and cancelled claims remain distinct from successful empty
+claims. It never records task IDs, payloads, prompts, secrets, private session
+identities, or raw query values. Metrics are process-local diagnostics; durable
+claims and leases remain authoritative. True task-admission-to-claim latency
+requires backend-aware admission evidence and is not inferred from the time a
+worker coroutine consumes a hint.
+
 Runtime-owned worker cadences keep claim polling, expired-lease reclaim,
 interrupted-task recovery, terminal-receipt reconciliation, and lease heartbeat
 independent. Both adapters expose `reclaim_every_s`; the generic worker now

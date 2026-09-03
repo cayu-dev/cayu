@@ -58,6 +58,7 @@ from cayu.core.runtime_authority import SessionRunFenced
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerCadence,
     DurableWorkerDemandPolicy,
+    DurableWorkerMetrics,
     DurableWorkerPollerGroup,
     DurableWorkerStep,
     run_durable_lease_heartbeat,
@@ -268,6 +269,7 @@ async def run_task_worker(
     query: TaskQuery | None = None,
     lease_seconds: int = 300,
     poll_interval_s: float = 1.0,
+    metrics: DurableWorkerMetrics | None = None,
     minimum_idle_delay_s: float | None = None,
     maximum_idle_delay_s: float | None = None,
     idle_backoff_multiplier: float = 2.0,
@@ -314,6 +316,8 @@ async def run_task_worker(
     if lease_seconds <= 0:
         raise ValueError("lease_seconds must be positive.")
     validate_worker_interval(poll_interval_s, "poll_interval_s")
+    if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
+        raise TypeError("metrics must be a DurableWorkerMetrics instance.")
     demand_policy = DurableWorkerDemandPolicy(
         dispatch_latency_s=poll_interval_s,
         minimum_idle_delay_s=minimum_idle_delay_s,
@@ -410,6 +414,8 @@ async def run_task_worker(
         poller = subscribe_to_poller((query,), demand_policy, clock=monotonic)
     else:
         poller = DurableWorkerPollerGroup().subscribe(demand_policy, clock=monotonic)
+    if metrics is not None:
+        poller.set_metrics(metrics)
     reclaim_cadence = DurableWorkerCadence(every_s=reclaim_every_s)
 
     async def reclaim_expired_tasks() -> bool:
@@ -447,6 +453,7 @@ async def run_task_worker(
             and interrupted_handoff_supported
             and loop.time() >= next_interrupted_handoff_recovery_at
         ):
+            poller.metrics.maintenance(recovery=True)
             recovery_page = await _recover_expired_interrupted_task_handoffs(
                 app,
                 task_store,
@@ -522,11 +529,13 @@ async def run_task_worker(
                 activity=meaningful_activity,
             )
         if reclaim:
-            _, reclaimed = await reclaim_cadence.run_if_due(
+            reclaim_ran, reclaimed = await reclaim_cadence.run_if_due(
                 reclaim_expired_tasks,
                 now=loop.time(),
                 clock=loop.time,
             )
+            if reclaim_ran:
+                poller.metrics.maintenance(reclaim=True)
             meaningful_activity = meaningful_activity or bool(reclaimed)
 
         async def claim_next_task() -> Task | None:
@@ -615,7 +624,11 @@ async def run_task_worker(
                 continue_immediately=True,
                 activity=True,
             )
-        await _handle_with_heartbeat(app, task_store, task, handler, worker_id, lease_seconds)
+        poller.metrics.handler_started()
+        try:
+            await _handle_with_heartbeat(app, task_store, task, handler, worker_id, lease_seconds)
+        finally:
+            poller.metrics.handler_finished()
         next_interrupted_continuation_scan_at = 0.0
         return DurableWorkerStep(
             handled=handled_this_step + 1,
@@ -639,6 +652,7 @@ async def run_task_worker(
             wait=(_wait_or_stop if admission_wakeup is None else admission_wakeup.wait_for_worker),
             demand_policy=demand_policy,
             poller=poller,
+            metrics=metrics if metrics is not None else poller.metrics,
         )
     finally:
         if admission_wakeup is not None:

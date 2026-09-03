@@ -24,6 +24,155 @@ _MaintenanceOutcomeT = TypeVar("_MaintenanceOutcomeT")
 _ClaimT = TypeVar("_ClaimT")
 
 
+@dataclass(frozen=True)
+class DurableWorkerMetricsSnapshot:
+    """Content-free operational measurements for one worker cohort."""
+
+    configured_handler_capacity: int
+    active_handlers: int
+    active_pollers: int
+    claim_attempts: int
+    empty_claims: int
+    successful_claims: int
+    failed_claims: int
+    cancelled_claims: int
+    wake_hints_received: int
+    wake_hints_accepted: int
+    fallback_poll_activations: int
+    reclaim_operations: int
+    recovery_operations: int
+    store_failures: int
+    hint_to_claim_latency_samples: int
+    hint_to_claim_latency_total_s: float
+    hint_to_claim_latency_max_s: float
+    current_idle_backoff_s: float
+    maximum_idle_backoff_s: float
+
+
+class DurableWorkerMetrics:
+    """Bounded, process-local metrics shared by one worker cohort."""
+
+    def __init__(self, *, configured_handler_capacity: int = 1) -> None:
+        if type(configured_handler_capacity) is not int or configured_handler_capacity <= 0:
+            raise ValueError("configured_handler_capacity must be a positive integer.")
+        self._lock = Lock()
+        self._configured_handler_capacity = configured_handler_capacity
+        self._active_handlers = 0
+        self._active_pollers = 0
+        self._claim_attempts = 0
+        self._empty_claims = 0
+        self._successful_claims = 0
+        self._failed_claims = 0
+        self._cancelled_claims = 0
+        self._wake_hints_received = 0
+        self._wake_hints_accepted = 0
+        self._fallback_poll_activations = 0
+        self._reclaim_operations = 0
+        self._recovery_operations = 0
+        self._store_failures = 0
+        self._hint_to_claim_latency_samples = 0
+        self._hint_to_claim_latency_total_s = 0.0
+        self._hint_to_claim_latency_max_s = 0.0
+        self._current_idle_backoff_s = 0.0
+        self._maximum_idle_backoff_s = 0.0
+
+    def snapshot(self, *, active_pollers: int | None = None) -> DurableWorkerMetricsSnapshot:
+        if active_pollers is not None and (type(active_pollers) is not int or active_pollers < 0):
+            raise ValueError("active_pollers must be a non-negative integer.")
+        with self._lock:
+            return DurableWorkerMetricsSnapshot(
+                configured_handler_capacity=self._configured_handler_capacity,
+                active_handlers=self._active_handlers,
+                active_pollers=self._active_pollers if active_pollers is None else active_pollers,
+                claim_attempts=self._claim_attempts,
+                empty_claims=self._empty_claims,
+                successful_claims=self._successful_claims,
+                failed_claims=self._failed_claims,
+                cancelled_claims=self._cancelled_claims,
+                wake_hints_received=self._wake_hints_received,
+                wake_hints_accepted=self._wake_hints_accepted,
+                fallback_poll_activations=self._fallback_poll_activations,
+                reclaim_operations=self._reclaim_operations,
+                recovery_operations=self._recovery_operations,
+                store_failures=self._store_failures,
+                hint_to_claim_latency_samples=self._hint_to_claim_latency_samples,
+                hint_to_claim_latency_total_s=self._hint_to_claim_latency_total_s,
+                hint_to_claim_latency_max_s=self._hint_to_claim_latency_max_s,
+                current_idle_backoff_s=self._current_idle_backoff_s,
+                maximum_idle_backoff_s=self._maximum_idle_backoff_s,
+            )
+
+    def handler_started(self) -> None:
+        with self._lock:
+            self._active_handlers += 1
+
+    def handler_finished(self) -> None:
+        with self._lock:
+            self._active_handlers = max(0, self._active_handlers - 1)
+
+    def claim_completed(self, *, claimed: bool) -> None:
+        with self._lock:
+            self._claim_attempts += 1
+            if claimed:
+                self._successful_claims += 1
+            else:
+                self._empty_claims += 1
+
+    def claim_failed(self, *, store_failure: bool) -> None:
+        with self._lock:
+            self._claim_attempts += 1
+            self._failed_claims += 1
+            self._store_failures += int(store_failure)
+
+    def claim_cancelled(self) -> None:
+        with self._lock:
+            self._claim_attempts += 1
+            self._cancelled_claims += 1
+
+    def wake_hint(self, *, accepted: bool) -> None:
+        with self._lock:
+            self._wake_hints_received += 1
+            if accepted:
+                self._wake_hints_accepted += 1
+
+    def fallback_poll(self) -> None:
+        with self._lock:
+            self._fallback_poll_activations += 1
+
+    def maintenance(self, *, reclaim: bool = False, recovery: bool = False) -> None:
+        with self._lock:
+            self._reclaim_operations += int(reclaim)
+            self._recovery_operations += int(recovery)
+
+    def store_failure(self) -> None:
+        with self._lock:
+            self._store_failures += 1
+
+    def hint_to_claim_latency(self, seconds: float) -> None:
+        if not isfinite(seconds) or seconds < 0:
+            return
+        with self._lock:
+            self._hint_to_claim_latency_samples += 1
+            self._hint_to_claim_latency_total_s += seconds
+            self._hint_to_claim_latency_max_s = max(
+                self._hint_to_claim_latency_max_s,
+                seconds,
+            )
+
+    def idle_backoff(self, seconds: float) -> None:
+        if not isfinite(seconds) or seconds < 0:
+            return
+        with self._lock:
+            self._current_idle_backoff_s = seconds
+            self._maximum_idle_backoff_s = max(self._maximum_idle_backoff_s, seconds)
+
+    def active_pollers(self, count: int) -> None:
+        if type(count) is not int or count < 0:
+            raise ValueError("active pollers must be a non-negative integer.")
+        with self._lock:
+            self._active_pollers = count
+
+
 class DurableWorkerWaitResult(StrEnum):
     """Reason the shared worker's bounded idle wait ended."""
 
@@ -115,6 +264,9 @@ class DurableWorkerPollerGroup:
         self._preferred_token: int | None = None
         self._active_token: int | None = None
         self._active_until: float | None = None
+        self._metrics = DurableWorkerMetrics()
+        self._metrics_explicit = False
+        self._last_consumed_hint_at: float | None = None
         self._next_poll_at = 0.0
         self._next_empty_delay_s = 0.0
 
@@ -127,6 +279,21 @@ class DurableWorkerPollerGroup:
     def active_poller_count(self) -> int:
         with self._lock:
             return 0 if self._active_token is None else 1
+
+    @property
+    def metrics(self) -> DurableWorkerMetrics:
+        return self._metrics
+
+    def set_metrics(self, metrics: DurableWorkerMetrics) -> None:
+        if not isinstance(metrics, DurableWorkerMetrics):
+            raise TypeError("metrics must be a DurableWorkerMetrics instance.")
+        with self._lock:
+            if self._metrics is metrics:
+                return
+            if self._metrics_explicit or len(self._tokens) > 1:
+                raise ValueError("All workers in one cohort must share one metrics instance.")
+            self._metrics = metrics
+            self._metrics_explicit = True
 
     def subscribe(
         self,
@@ -188,6 +355,7 @@ class DurableWorkerPollerGroup:
                 return False
             self._active_token = token
             self._active_until = None if maximum_active_s is None else now + maximum_active_s
+            self._metrics.active_pollers(1)
             return True
 
     def _finish(
@@ -204,11 +372,16 @@ class DurableWorkerPollerGroup:
                 return
             self._active_token = None
             self._active_until = None
+            self._metrics.active_pollers(0)
             self._preferred_token = self._successor_token(token)
+            if claimed and self._last_consumed_hint_at is not None:
+                self._metrics.hint_to_claim_latency(max(now - self._last_consumed_hint_at, 0.0))
+                self._last_consumed_hint_at = None
             policy = self._required_policy()
             if claimed:
                 self._next_empty_delay_s = policy.minimum_idle_delay_s
                 self._next_poll_at = now
+                self._metrics.idle_backoff(policy.minimum_idle_delay_s)
                 return
             delay = _jittered_idle_delay(
                 self._next_empty_delay_s,
@@ -216,6 +389,7 @@ class DurableWorkerPollerGroup:
                 random_source=random_source,
             )
             self._next_poll_at = now + delay
+            self._metrics.idle_backoff(delay)
             self._next_empty_delay_s = min(
                 policy.maximum_idle_delay_s,
                 self._next_empty_delay_s * policy.backoff_multiplier,
@@ -270,6 +444,7 @@ class DurableWorkerPollerGroup:
             if self._active_token == token:
                 self._active_token = None
                 self._active_until = None
+                self._metrics.active_pollers(0)
             if self._preferred_token == token:
                 self._preferred_token = (
                     None if not self._tokens else self._tokens[index % len(self._tokens)]
@@ -326,6 +501,10 @@ class DurableWorkerPoller:
     def last_claimed(self) -> bool:
         return self._last_claimed
 
+    @property
+    def metrics(self) -> DurableWorkerMetrics:
+        return self._group.metrics
+
     def begin_step(self) -> None:
         self._last_attempted = False
         self._last_claimed = False
@@ -335,11 +514,14 @@ class DurableWorkerPoller:
         action: Callable[[], Awaitable[_ClaimT | None]],
         *,
         maximum_active_s: float | None = None,
+        store_failure_on_exception: bool = True,
     ) -> DurableWorkerClaim[_ClaimT]:
         if not callable(action):
             raise TypeError("Durable worker claim action must be callable.")
         if maximum_active_s is not None:
             validate_worker_interval(maximum_active_s, "maximum_active_s")
+        if type(store_failure_on_exception) is not bool:
+            raise TypeError("store_failure_on_exception must be a bool.")
         now = self._clock()
         if not self._group._begin(
             self._token,
@@ -352,7 +534,19 @@ class DurableWorkerPoller:
         self._last_attempted = True
         try:
             value = await action()
-        except BaseException:
+        except asyncio.CancelledError:
+            self._group.metrics.claim_cancelled()
+            self._group._finish(
+                self._token,
+                now=self._clock(),
+                claimed=False,
+                random_source=self._random_source,
+            )
+            raise
+        except BaseException as exc:
+            self._group.metrics.claim_failed(
+                store_failure=store_failure_on_exception and isinstance(exc, Exception)
+            )
             self._group._finish(
                 self._token,
                 now=self._clock(),
@@ -361,6 +555,7 @@ class DurableWorkerPoller:
             )
             raise
         self._last_claimed = value is not None
+        self._group.metrics.claim_completed(claimed=self._last_claimed)
         self._group._finish(
             self._token,
             now=self._clock(),
@@ -371,6 +566,8 @@ class DurableWorkerPoller:
 
     def note_hint(self) -> None:
         self._forced = True
+        self._group.metrics.wake_hint(accepted=True)
+        self._group._last_consumed_hint_at = self._clock()
         self._group._reset(
             self._token,
             now=self._clock(),
@@ -391,6 +588,12 @@ class DurableWorkerPoller:
     def next_wake_at(self) -> float:
         now = self._clock()
         return self._group._deadline(self._token, now=now, forced=self._forced)
+
+    def metrics_snapshot(self) -> DurableWorkerMetricsSnapshot:
+        return self._group.metrics.snapshot()
+
+    def set_metrics(self, metrics: DurableWorkerMetrics) -> None:
+        self._group.set_metrics(metrics)
 
     def close(self) -> None:
         if self._closed:
@@ -559,6 +762,7 @@ async def run_durable_worker_loop(
     demand_policy: DurableWorkerDemandPolicy | None = None,
     poller: DurableWorkerPoller | None = None,
     clock: Callable[[], float] | None = None,
+    metrics: DurableWorkerMetrics | None = None,
 ) -> int:
     """Run adapter steps with adaptive idle waits and one stop contract."""
 
@@ -571,6 +775,8 @@ async def run_durable_worker_loop(
         raise ValueError("poll_interval_s must equal demand_policy.dispatch_latency_s.")
     if poller is not None and not isinstance(poller, DurableWorkerPoller):
         raise TypeError("poller must be a DurableWorkerPoller.")
+    if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
+        raise TypeError("metrics must be a DurableWorkerMetrics instance.")
     if max_handled is not None and max_handled < 0:
         raise ValueError("max_handled must be a non-negative integer.")
 
@@ -606,7 +812,7 @@ async def run_durable_worker_loop(
         now = worker_clock()
         _validate_worker_clock(now)
         if poller is None:
-            idle_wait_s = _jittered_idle_delay(
+            poll_wait_s = _jittered_idle_delay(
                 local_empty_delay_s,
                 policy=demand_policy,
                 random_source=random,
@@ -617,17 +823,27 @@ async def run_durable_worker_loop(
                     local_empty_delay_s * demand_policy.backoff_multiplier,
                 )
         else:
-            idle_wait_s = max(poller.next_wake_at() - now, 0.0)
+            poll_wait_s = max(poller.next_wake_at() - now, 0.0)
+        if metrics is not None:
+            metrics.idle_backoff(poll_wait_s)
+        idle_wait_s = poll_wait_s
+        fallback_poll_due = True
         if outcome.next_wake_at is not None:
-            idle_wait_s = min(
-                idle_wait_s,
-                max(outcome.next_wake_at - now, 0.0),
-            )
+            adapter_wait_s = max(outcome.next_wake_at - now, 0.0)
+            if adapter_wait_s < idle_wait_s:
+                idle_wait_s = adapter_wait_s
+                fallback_poll_due = False
         if idle_wait_s == 0:
             continue
         wait_result = _normalize_worker_wait_result(await wait(idle_wait_s, stop))
         if wait_result is DurableWorkerWaitResult.STOP:
             break
+        if (
+            metrics is not None
+            and fallback_poll_due
+            and wait_result is DurableWorkerWaitResult.TIMEOUT
+        ):
+            metrics.fallback_poll()
         if wait_result is DurableWorkerWaitResult.HINT:
             if poller is None:
                 local_empty_delay_s = demand_policy.minimum_idle_delay_s
