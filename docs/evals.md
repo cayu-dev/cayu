@@ -1424,6 +1424,37 @@ then downloads the validated report JSON or server-rendered HTML. This action
 validates and reports an already defined campaign; it does not silently invent
 variants, interventions, reference truth, or missing trials.
 
+### Credential-free causal-memory reference
+
+The repository's `scripts/run_causal_memory_reference_campaign.py` composes
+those existing contracts into one bounded reference. It loads the checked
+standard Evals corpus, opens application-owned isolated knowledge overlays, and
+submits each fixed `MemoryInterventionTrialRequest` to
+`MemoryInterventionExecutor`. Cayu owns the snapshot verification, trial
+identity, runtime execution, recall and context evidence, exact recovery,
+portable publication, and paired report. The application owns the overlay
+bytes, access scope, deterministic provider, evaluator mapping, and declared
+outcome markers.
+
+Recovery is trial-identity based: an ordinary rerun can recover completed work
+and dispatch only the missing trials without changing how new provider requests
+are audited. Terminal abnormal executions remain in the complete report matrix
+with their exact execution availability even when portable assertion evidence
+cannot be produced.
+
+That is also the bounded integration seam for downstream systems such as Cayu
+Compound: they may choose or rank already-declared candidates and then call
+`run_causal_memory_reference_campaign(...)` for this reference fixture, or wire
+their own application adapters to `MemoryInterventionExecutor` and
+`build_memory_experiment_report(...)`. They do not bypass Cayu's execution and
+evidence contracts, and Cayu does not take ownership of their search or ranking
+policy.
+
+The report language is deliberately narrow. A paired delta says that the
+measured output changed under an exact declared memory intervention. It does not
+claim that the model attended to a record, used it in hidden reasoning, or that
+the result generalizes beyond the frozen corpus and candidate.
+
 ## Capturing terminal session evidence
 
 The built-in in-memory, SQLite, and PostgreSQL session stores expose

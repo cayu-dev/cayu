@@ -60,6 +60,49 @@ empty results are complete.
 `--output` retains a report. Keep private production-shaped corpora and reports
 outside this repository.
 
+## Causal-memory reference campaign
+
+`causal-memory-campaign-corpus-v1.json` is a standard Evals corpus for the
+credential-free fixed-candidate campaign. Run it with:
+
+```bash
+PYTHONPATH=src python scripts/run_causal_memory_reference_campaign.py \
+  --output causal-memory-report.json
+```
+
+The runner executes two paired repetitions of `as_declared`,
+`automatic_recall_off`, `omit_items`, and `replace_items` from one verified
+`AgentSnapshot`. It uses `ScriptedModelProvider`, but otherwise enters the real
+RecallEngine, admission, checkpoint compaction, knowledge/transcript fusion,
+context composition, provider request, receipt/exposure, intervention journal,
+portable assertion, and memory-report paths. Every trial receives a separate
+in-memory knowledge overlay while sessions, snapshots, and intervention phases
+are durable SQLite state. The command then starts a new Python process with no
+provider scripts and requires exact report recovery before publishing output.
+An ordinary rerun may combine already durable trials with newly dispatched
+trials; each new request is audited against that trial's declared case and
+variant rather than its position in the new process's request list. Cancelled,
+timed-out, failed, outcome-unknown, conflicting, or indeterminate executions
+remain visible with their exact terminal availability instead of being filtered
+out of the matrix.
+
+The fixtures cover helpful and neutral admitted memory, current versus
+superseded or expired records, a weaker conflicting record exposed after
+omission, irrelevant and unauthorized silence, a task switch followed by a
+post-compaction short follow-up, duplicate knowledge/transcript recall, and an
+adversarial replacement rejected by the safety gate. JSON is the complete
+machine-readable report; use `--format html` for the existing deterministic
+human report. `--state-directory PATH` retains recovery evidence, and
+`--recover-only` verifies an already completed campaign without allowing a
+provider dispatch. Recovery from the same retained state is byte-for-byte
+stable. Independent clean runs preserve the matrix and recommendations; their
+runtime-generated session/evidence identities and timestamps are intentionally
+not a cross-run byte-stability promise.
+
+This campaign establishes only that measured outputs changed under the declared
+interventions for this fixed corpus and scripted candidate. It does not establish
+model attention, hidden reasoning, universal causality, or production quality.
+
 ## Memory evidence overhead
 
 `memory-evidence-performance-v1.json` is the hermetic 50-pair baseline for the durable

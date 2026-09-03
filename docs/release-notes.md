@@ -89,6 +89,21 @@ guard.
 
 ## Unreleased
 
+### A credential-free campaign exercises causal memory end to end
+
+The checked causal-memory reference corpus now runs repeated `as_declared`,
+`automatic_recall_off`, `omit_items`, and adversarial `replace_items` trials from
+one verified AgentSnapshot. Its deterministic provider still traverses Cayu's
+ordinary recall, admission, checkpoint compaction, context exposure, durable
+intervention, portable assertion, and paired report paths. The runner rejects
+cross-trial overlay reuse and stale, expired, irrelevant, or unauthorized
+provider exposure, then proves exact recovery in a new process with provider
+dispatch disabled. Mixed recovered/new runs audit new requests by exact trial
+identity, and abnormal terminal executions remain explicit report rows instead
+of being survivor-filtered. The published result claims only a measured output
+change under the declared intervention, not hidden model use or universal
+causality.
+
 ### Recovery cleanup now has shared finite deadlines
 
 `CayuApp` now supervises recovery cleanup through a shared

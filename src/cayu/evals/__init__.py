@@ -47,6 +47,16 @@ from cayu.evals.calibration import (
     run_eval_judge_calibration_trial,
 )
 from cayu.evals.capacity import DEFAULT_EVAL_MAX_ACTIVE_TRIALS, EvalExecutionCapacity
+from cayu.evals.causal_memory_campaign import (
+    CAUSAL_MEMORY_CAMPAIGN_EXPERIMENT_ID,
+    CAUSAL_MEMORY_CAMPAIGN_REPETITIONS,
+    CAUSAL_MEMORY_CAMPAIGN_SUITE_ID,
+    CAUSAL_MEMORY_CAMPAIGN_TARGET_KEY,
+    CAUSAL_MEMORY_CAMPAIGN_VARIANTS,
+    build_causal_memory_reference_corpus,
+    load_causal_memory_reference_corpus,
+    run_causal_memory_reference_campaign,
+)
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -727,6 +737,11 @@ __all__ = [
     "CAPTURED_EVALUATION_RESULT_SCHEMA_VERSION",
     "CAPTURED_RUN_SCORE_MAX_BYTES",
     "CAPTURED_RUN_SCORE_SCHEMA_VERSION",
+    "CAUSAL_MEMORY_CAMPAIGN_EXPERIMENT_ID",
+    "CAUSAL_MEMORY_CAMPAIGN_REPETITIONS",
+    "CAUSAL_MEMORY_CAMPAIGN_SUITE_ID",
+    "CAUSAL_MEMORY_CAMPAIGN_TARGET_KEY",
+    "CAUSAL_MEMORY_CAMPAIGN_VARIANTS",
     "CORPUS_EXECUTION_COMPARISON_MAX_BYTES",
     "CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES",
     "CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES",
@@ -1242,6 +1257,7 @@ __all__ = [
     "assertion_spec_revision",
     "authored_suite_launch_settings",
     "build_captured_evaluation_candidate",
+    "build_causal_memory_reference_corpus",
     "build_memory_experiment_report",
     "build_promotion_candidate",
     "capture_eval_scenario_from_session",
@@ -1306,6 +1322,7 @@ __all__ = [
     "final_output_text",
     "inspect_eval_corpus",
     "inspect_eval_scenario",
+    "load_causal_memory_reference_corpus",
     "load_corpus_execution_result",
     "load_eval_corpus",
     "load_eval_run",
@@ -1341,6 +1358,7 @@ __all__ = [
     "replace_eval_scenario_artifact_requirement",
     "replay_session",
     "revise_eval_case",
+    "run_causal_memory_reference_campaign",
     "run_compiled_eval_scenario",
     "run_corpus_suite",
     "run_eval_case",
