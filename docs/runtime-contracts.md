@@ -934,6 +934,39 @@ strings through Bash, so Cayu maps process-form commands with shell quoting
 before sending them to E2B; this keeps Cayu's public command contract stable
 while making the E2B-specific execution semantics explicit.
 
+Large immutable environment inputs are a distinct capability from workspace
+materialization and mutable sync. `ImmutableInputProjection` binds the complete
+regular-file manifest, executable modes, format and bounds, guest target,
+policy, Runtime compatibility, and authorization scope. Its fingerprint is the
+reuse identity: changed bytes, policy, target, build compatibility, or authority
+must select another materialization. `ImmutableInputStore` copies an exact
+source into a private read-only object once, atomically publishes it, and keeps
+attachment and release state in a locked, fsync-backed registry. Exact retries
+converge; a released attachment identity cannot become active again; a fresh
+process can verify an orphaned exact object, replay an attachment, release an
+exact reference, or collect only an unreferenced object. Source drift,
+materialization drift, unsafe entries, registry identity conflicts, active
+collection, and unsupported adapter semantics fail closed with typed evidence.
+
+The Docker implementation is restricted to strict evidence-bearing creation.
+Only manager-issued mount authorities are accepted, immutable targets cannot
+overlap writable tmpfs or `/workspace`, live Docker inspection must report the
+exact source and destination with `RW=false`, and a root write probe must be
+refused before `read_only_host_inputs` becomes `live_verified`. The mutable
+workspace binding never traverses an immutable target. Terminal cleanup closes
+the exact container before releasing materialization references. It first
+records the exact container in the durable attachment state, so recovery can
+reactivate references when that container remains or finish their release when
+an exact daemon lookup proves it is gone. Garbage collection therefore cannot
+remove bytes still mounted by an owned live container. Docker CREATE uses a
+durable allocation scope and deterministic provider name, so intent replay
+recovers the same container instead of submitting an untracked replacement.
+Diagnostics are content-free: projection and content identities, logical and
+physical byte counts, references, attachments, reuse, wait reason, and cleanup
+state only. Docker reconnect reattaches only the exact retained container after
+re-verifying its immutable mounts and root write refusal; persistence of a
+materialization alone is not evidence that a prior container can be reattached.
+
 ## ToolPolicy
 
 Authorizes registered tool calls immediately before execution.

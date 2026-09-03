@@ -21,6 +21,7 @@ from cayu._validation import (
 )
 from cayu.capabilities import CapabilityDetail
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
+from cayu.immutable_inputs import DockerImmutableInputMount
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -159,6 +160,7 @@ class _DockerRuntimeEvidence:
     toolchain_profile_fingerprint: str | None
     required_executables: tuple[str, ...]
     executable_availability: tuple[tuple[str, bool], ...]
+    immutable_input_mounts: tuple[tuple[str, str], ...]
     observed_at: datetime
     valid_until: datetime
 
@@ -175,6 +177,7 @@ class _DockerRuntimeEvidence:
             "restrictions": self.restrictions.model_dump(mode="json"),
             "toolchain_profile_fingerprint": self.toolchain_profile_fingerprint,
             "required_executables": list(self.required_executables),
+            "immutable_input_mounts": [list(value) for value in self.immutable_input_mounts],
         }
         return (
             "sha256:"
@@ -356,6 +359,7 @@ def _verify_strict_container_inspection(
     network_mode: str,
     runtime: str | None,
     seccomp_profile: str | None,
+    immutable_input_mounts: tuple[DockerImmutableInputMount, ...] = (),
 ) -> tuple[str, str]:
     if inspection.get("Id") != container_id:
         raise DockerRuntimeConfigurationError("container_identity_drift")
@@ -438,14 +442,83 @@ def _verify_strict_container_inspection(
         raise DockerRuntimeConfigurationError("host_device_present")
     if _require_sequence(host.get("DeviceRequests"), "device_request_malformed"):
         raise DockerRuntimeConfigurationError("host_device_request_present")
+    expected_by_target = {mount.target_path: mount for mount in immutable_input_mounts}
+    observed_host_mounts: set[tuple[str, str]] = set()
+    for mount in _require_sequence(host.get("Mounts"), "mount_configuration_malformed"):
+        mounted = _require_mapping(mount, "mount_configuration_entry_malformed")
+        expected = expected_by_target.get(str(mounted.get("Target")))
+        if (
+            expected is None
+            or mounted.get("Type") != "bind"
+            or mounted.get("Source") != expected.source_path
+            or mounted.get("ReadOnly") is not True
+        ):
+            raise DockerRuntimeConfigurationError("immutable_input_host_mount_drift")
+        observed_host_mounts.add((expected.source_path, expected.target_path))
+    expected_mounts = {(mount.source_path, mount.target_path) for mount in immutable_input_mounts}
+    if observed_host_mounts != expected_mounts:
+        raise DockerRuntimeConfigurationError("immutable_input_host_mount_missing")
+
+    observed_immutable_mounts: set[tuple[str, str]] = set()
     for mount in _require_sequence(inspection.get("Mounts"), "mounts_malformed"):
         mounted = _require_mapping(mount, "mount_entry_malformed")
-        if mounted.get("Type") not in {None, "tmpfs"}:
-            raise DockerRuntimeConfigurationError("host_mount_present")
         destination = mounted.get("Destination")
-        if destination not in expected_tmpfs:
-            raise DockerRuntimeConfigurationError("unexpected_mount_present")
+        if mounted.get("Type") in {None, "tmpfs"}:
+            if destination not in expected_tmpfs:
+                raise DockerRuntimeConfigurationError("unexpected_mount_present")
+            continue
+        expected = expected_by_target.get(str(destination))
+        if (
+            expected is None
+            or mounted.get("Type") != "bind"
+            or mounted.get("Source") != expected.source_path
+            or mounted.get("RW") is not False
+        ):
+            raise DockerRuntimeConfigurationError("immutable_input_mount_drift")
+        observed_immutable_mounts.add((expected.source_path, expected.target_path))
+    if observed_immutable_mounts != expected_mounts:
+        raise DockerRuntimeConfigurationError("immutable_input_mount_missing")
     return image_id, image_reference
+
+
+def _normalize_immutable_input_mounts(
+    mounts: Sequence[DockerImmutableInputMount],
+    *,
+    restrictions: DockerWorkloadRestrictions | None,
+) -> tuple[DockerImmutableInputMount, ...]:
+    if isinstance(mounts, str | bytes):
+        raise TypeError("immutable_input_mounts must be a sequence of manager-issued mounts.")
+    values = tuple(mounts)
+    if len(values) > 32:
+        raise ValueError("Docker supports at most 32 immutable input mounts.")
+    if any(type(value) is not DockerImmutableInputMount for value in values):
+        raise TypeError("Docker immutable input mounts must be manager-issued authorities.")
+    targets = [value.target_path for value in values]
+    if len(targets) != len(set(targets)):
+        raise ValueError("Docker immutable input mount targets must be unique.")
+    if tuple(sorted(targets)) != tuple(targets):
+        raise ValueError("Docker immutable input mounts must be sorted by target path.")
+    if any(
+        right.startswith(left.rstrip("/") + "/")
+        for index, left in enumerate(targets)
+        for right in targets[index + 1 :]
+    ):
+        raise ValueError("Docker immutable input mount targets must not overlap.")
+    tmpfs_targets = (
+        () if restrictions is None else tuple(mount.target for mount in restrictions.tmpfs)
+    )
+    for value in values:
+        source = _validate_mount_path(value.source_path)
+        if source != value.source_path:
+            raise ValueError("Docker immutable input source must be a normalized managed path.")
+        if any(
+            value.target_path == target
+            or target.startswith(value.target_path.rstrip("/") + "/")
+            or value.target_path.startswith(target.rstrip("/") + "/")
+            for target in tmpfs_targets
+        ):
+            raise ValueError("Immutable input target cannot overlap a configured tmpfs mount.")
+    return values
 
 
 async def _inspect_strict_container(
@@ -467,6 +540,35 @@ async def _inspect_strict_container(
     except (TypeError, ValueError):
         raise DockerRuntimeConfigurationError("container_inspection_malformed") from None
     return _require_mapping(decoded, "container_inspection_malformed")
+
+
+async def _lookup_docker_container_ids(
+    docker_path: str,
+    *,
+    filter_value: str,
+) -> tuple[str, ...]:
+    result = await _run_docker(
+        docker_path,
+        [
+            "container",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--filter",
+            filter_value,
+            "--format",
+            "{{.ID}}",
+        ],
+        timeout_s=30,
+    )
+    if result.exit_code != 0 or result.timed_out:
+        raise DockerRuntimeConfigurationError("container_lookup_unavailable")
+    identifiers = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+    if len(identifiers) > 1 or any(
+        _DOCKER_CONTAINER_ID_PATTERN.fullmatch(value) is None for value in identifiers
+    ):
+        raise DockerRuntimeConfigurationError("container_lookup_ambiguous")
+    return identifiers
 
 
 async def _probe_strict_container(
@@ -501,6 +603,42 @@ async def _probe_strict_container(
         )
         availability.append((executable, result.exit_code == 0 and not result.timed_out))
     return tuple(availability)
+
+
+async def _probe_immutable_input_mounts(
+    docker_path: str,
+    container_id: str,
+    mounts: tuple[DockerImmutableInputMount, ...],
+    *,
+    docker_cli_env_allowlist: Sequence[str],
+) -> None:
+    """Prove the daemon rejects a root write instead of trusting mount syntax."""
+
+    for mount in mounts:
+        probe_name = f".cayu-read-only-probe-{uuid4().hex}"
+        result = await _run_docker(
+            docker_path,
+            [
+                "exec",
+                "-u",
+                "root",
+                container_id,
+                "sh",
+                "-c",
+                'probe="$1/$2"; if (: >"$probe") 2>/dev/null; then rm -f -- "$probe"; exit 73; fi',
+                "cayu-immutable-input-probe",
+                mount.target_path,
+                probe_name,
+            ],
+            docker_cli_env_allowlist=docker_cli_env_allowlist,
+            timeout_s=30,
+        )
+        if result.timed_out or result.exit_code != 0:
+            raise DockerRuntimeConfigurationError(
+                "immutable_input_write_not_refused"
+                if result.exit_code == 73
+                else "immutable_input_read_only_probe_failed"
+            )
 
 
 def _build_docker_exec_argv(
@@ -862,6 +1000,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 "cancellation_cleanup": self.cancellation_cleanup,
                 "timeout_cleanup": self.timeout_cleanup,
                 "required_executables": list(evidence.required_executables),
+                "immutable_input_mounts": [
+                    {"projection_fingerprint": fingerprint, "target_path": target}
+                    for fingerprint, target in evidence.immutable_input_mounts
+                ],
                 "process_transport": (
                     "python_subreaper_supervisor_v2"
                     if "python3" in evidence.required_executables
@@ -957,6 +1099,51 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         self.timeout_cleanup = validate_runner_cleanup_policy(timeout_cleanup, "timeout_cleanup")
 
     @classmethod
+    async def resolve_container_id(
+        cls,
+        name: str,
+        *,
+        docker_path: str | None = None,
+    ) -> str | None:
+        """Resolve one exact Docker name without authorizing replacement."""
+
+        del cls
+        name = require_clean_nonblank(name, "name")
+        docker = _require_docker(docker_path)
+        identifiers = await _lookup_docker_container_ids(
+            docker,
+            # Docker treats a name filter as a regular expression. Escape the
+            # caller-controlled literal so an apparent exact-name lookup can
+            # never authorize an unrelated container (for example, name=".*").
+            filter_value=f"name=^/{re.escape(name)}$",
+        )
+        return None if not identifiers else identifiers[0]
+
+    @classmethod
+    async def container_exists(
+        cls,
+        container_id: str,
+        *,
+        docker_path: str | None = None,
+    ) -> bool:
+        """Return exact presence only after a successful daemon lookup."""
+
+        del cls
+        if (
+            type(container_id) is not str
+            or _DOCKER_CONTAINER_ID_PATTERN.fullmatch(container_id) is None
+        ):
+            raise ValueError("container_id must be a full lowercase Docker container ID.")
+        docker = _require_docker(docker_path)
+        identifiers = await _lookup_docker_container_ids(
+            docker,
+            filter_value=f"id={container_id}",
+        )
+        if identifiers and identifiers[0] != container_id:
+            raise DockerRuntimeConfigurationError("container_lookup_identity_drift")
+        return bool(identifiers)
+
+    @classmethod
     async def create(
         cls,
         name: str,
@@ -987,6 +1174,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         workload_restrictions: DockerWorkloadRestrictions | None = None,
         required_executables: Sequence[str] = (),
         toolchain_profile_fingerprint: str | None = None,
+        immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -1011,10 +1199,11 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         descendants orphaned by a worker exit are reaped after they finish.
 
         ``image_identity`` plus ``workload_restrictions`` selects the strict,
-        evidence-bearing path. It requires an exact no-network, no-mount,
-        credential-free container and ``replace=False``; the resulting runner
-        retains the full container ID and verifies the live Docker inspection
-        before it can be exposed.
+        evidence-bearing path. It requires an exact no-network, no-writable-host-mount,
+        credential-free container and ``replace=False``; manager-issued immutable
+        input mounts are the only supported host projections. The resulting runner
+        retains the full container ID and verifies the live Docker inspection and
+        root write refusal before it can be exposed.
         """
         docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
@@ -1036,6 +1225,14 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 workload_restrictions.model_dump(mode="python")
             )
         )
+        immutable_mounts = _normalize_immutable_input_mounts(
+            immutable_input_mounts,
+            restrictions=owned_restrictions,
+        )
+        if immutable_mounts and not strict_mode:
+            raise ValueError(
+                "Immutable input mounts require strict evidence-bearing Docker creation."
+            )
         executable_requirements = _normalize_required_executables(required_executables)
         if toolchain_profile_fingerprint is not None and (
             type(toolchain_profile_fingerprint) is not str
@@ -1150,6 +1347,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     "--mount",
                     f"type=bind,source={ca_host},target={ca_guest},readonly",
                 ]
+            for immutable_mount in immutable_mounts:
+                run_argv += [
+                    "--mount",
+                    "type=bind,"
+                    f"source={immutable_mount.source_path},"
+                    f"target={immutable_mount.target_path},readonly",
+                ]
             if strict_mode:
                 # Ignore image-authored ENTRYPOINT/CMD startup hooks. The exact
                 # admitted command path starts only through later docker exec.
@@ -1239,6 +1443,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     network_mode="none",
                     runtime=runtime,
                     seccomp_profile=seccomp_profile,
+                    immutable_input_mounts=immutable_mounts,
+                )
+                await _probe_immutable_input_mounts(
+                    docker,
+                    owned_container_id,
+                    immutable_mounts,
+                    docker_cli_env_allowlist=docker_cli_allowlist,
                 )
                 executable_availability = await _probe_strict_container(
                     docker,
@@ -1261,6 +1472,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     toolchain_profile_fingerprint=toolchain_profile_fingerprint,
                     required_executables=executable_requirements,
                     executable_availability=executable_availability,
+                    immutable_input_mounts=tuple(
+                        (mount.projection_fingerprint, mount.target_path)
+                        for mount in immutable_mounts
+                    ),
                     observed_at=observed_at,
                     valid_until=observed_at + timedelta(seconds=300),
                 )
@@ -1315,6 +1530,7 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
         docker_path: str | None = None,
         required_executables: Sequence[str] = (),
         toolchain_profile_fingerprint: str | None = None,
+        immutable_input_mounts: Sequence[DockerImmutableInputMount] = (),
     ) -> DockerRunner:
         """Reattach to one exact strict container after re-verifying live evidence."""
 
@@ -1342,6 +1558,10 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             raise ValueError("Strict Docker reconnect cwd must be inside bounded tmpfs.")
         runtime = _validate_runtime(runtime)
         seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
+        immutable_mounts = _normalize_immutable_input_mounts(
+            immutable_input_mounts,
+            restrictions=owned_restrictions,
+        )
         executable_requirements = _normalize_required_executables(required_executables)
         if toolchain_profile_fingerprint is not None and (
             type(toolchain_profile_fingerprint) is not str
@@ -1364,6 +1584,13 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             network_mode="none",
             runtime=runtime,
             seccomp_profile=seccomp_profile,
+            immutable_input_mounts=immutable_mounts,
+        )
+        await _probe_immutable_input_mounts(
+            docker,
+            container_id,
+            immutable_mounts,
+            docker_cli_env_allowlist=(),
         )
         executable_availability = await _probe_strict_container(
             docker,
@@ -1386,6 +1613,9 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
             toolchain_profile_fingerprint=toolchain_profile_fingerprint,
             required_executables=executable_requirements,
             executable_availability=executable_availability,
+            immutable_input_mounts=tuple(
+                (mount.projection_fingerprint, mount.target_path) for mount in immutable_mounts
+            ),
             observed_at=observed_at,
             valid_until=observed_at + timedelta(seconds=300),
         )
@@ -1516,6 +1746,29 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     remediation_code="use_verified_docker_restrictions",
                 ),
             )
+        read_only_input_claim = (
+            live_claim(
+                "read_only_host_inputs",
+                observation="supported",
+                details=(
+                    CapabilityDetail(
+                        name="projection_count",
+                        value=len(evidence.immutable_input_mounts),
+                    ),
+                    CapabilityDetail(
+                        name="manager_bind_mount",
+                        value=True,
+                    ),
+                    CapabilityDetail(name="root_write_refused", value=True),
+                ),
+            )
+            if evidence.immutable_input_mounts
+            else ExecutionCapabilityClaim.unsupported(
+                "read_only_host_inputs",
+                reason_code="docker_host_inputs_not_mounted",
+                remediation_code="configure_immutable_input_projection",
+            )
+        )
         unsupported = (
             ExecutionCapabilityClaim.unsupported(
                 "untrusted_code_isolation",
@@ -1526,11 +1779,6 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                 "brokered_egress",
                 reason_code="docker_network_disabled",
                 remediation_code="select_brokered_egress",
-            ),
-            ExecutionCapabilityClaim.unsupported(
-                "read_only_host_inputs",
-                reason_code="docker_host_inputs_not_mounted",
-                remediation_code="use_workspace_sync",
             ),
         )
         executable_availability = dict(evidence.executable_availability)
@@ -1576,10 +1824,15 @@ class DockerRunner(Runner, RunnerBinaryStreamCapability):
                     "host_filesystem_isolation",
                     observation="supported",
                     details=(
-                        CapabilityDetail(name="host_mount_count", value=0),
+                        CapabilityDetail(
+                            name="read_only_host_mount_count",
+                            value=len(evidence.immutable_input_mounts),
+                        ),
+                        CapabilityDetail(name="writable_host_mount_count", value=0),
                         CapabilityDetail(name="cwd_bounded_tmpfs", value=True),
                     ),
                 ),
+                read_only_input_claim,
                 live_claim(
                     "confirmed_cancellation",
                     observation="supported",

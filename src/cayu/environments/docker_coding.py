@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -43,11 +43,22 @@ from cayu.environments.docker_toolchains import (
     verify_local_docker_coding_toolchain_dependencies,
 )
 from cayu.environments.factory import (
+    EnvironmentAllocationContext,
+    EnvironmentAllocationScope,
+    EnvironmentAllocationState,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
+)
+from cayu.immutable_inputs import (
+    DockerImmutableInputMount,
+    ImmutableInputAdapterCapability,
+    ImmutableInputAttachment,
+    ImmutableInputStore,
+    LocalImmutableInput,
+    docker_immutable_input_capability,
 )
 from cayu.runners import ExecCommand, Runner
 from cayu.runners.docker import DockerRunner, validate_docker_seccomp_profile
@@ -99,6 +110,12 @@ class _DockerCodingBindAuthority:
     git_transformed_baseline_paths: frozenset[str]
 
 
+@dataclass(slots=True)
+class _ImmutableInputFinalizeState:
+    snapshot: WorkspaceSnapshot | None
+    runner_closed: bool = False
+
+
 class DockerWorkspaceTransferLimits(BaseModel):
     """Finite copy-in/copy-back limits for one coding container."""
 
@@ -122,6 +139,129 @@ class DockerWorkspaceTransferLimits(BaseModel):
     )
 
 
+def _validate_immutable_inputs(
+    inputs: Sequence[LocalImmutableInput],
+    *,
+    store: ImmutableInputStore | None,
+    runtime_compatibility_fingerprint: str | None,
+) -> tuple[LocalImmutableInput, ...]:
+    if isinstance(inputs, str | bytes):
+        raise TypeError("immutable_inputs must be a sequence of LocalImmutableInput values.")
+    values = tuple(inputs)
+    if len(values) > 32:
+        raise ValueError("Docker coding supports at most 32 immutable inputs.")
+    if any(type(value) is not LocalImmutableInput for value in values):
+        raise TypeError("immutable_inputs must contain exact LocalImmutableInput values.")
+    if store is not None and not isinstance(store, ImmutableInputStore):
+        raise TypeError("immutable_input_store must be ImmutableInputStore or None.")
+    if values and store is None:
+        raise ValueError("immutable_input_store is required when immutable_inputs are configured.")
+    if runtime_compatibility_fingerprint is not None and (
+        type(runtime_compatibility_fingerprint) is not str
+        or len(runtime_compatibility_fingerprint) != 71
+        or not runtime_compatibility_fingerprint.startswith("sha256:")
+        or any(
+            character not in "0123456789abcdef"
+            for character in runtime_compatibility_fingerprint.removeprefix("sha256:")
+        )
+    ):
+        raise ValueError(
+            "immutable_input_runtime_compatibility_fingerprint must be a lowercase SHA-256."
+        )
+    if values and runtime_compatibility_fingerprint is None:
+        raise ValueError(
+            "immutable_input_runtime_compatibility_fingerprint is required with immutable inputs."
+        )
+    for value in values:
+        if value.projection.runtime_compatibility_fingerprint != runtime_compatibility_fingerprint:
+            raise ValueError("Immutable input runtime compatibility identity does not match.")
+        if store is not None and (
+            store.root.is_relative_to(value.root) or value.root.is_relative_to(store.root)
+        ):
+            raise ValueError("Immutable input source and managed store must not overlap.")
+    ordered = tuple(sorted(values, key=lambda value: value.projection.target_path))
+    targets = tuple(value.projection.target_path for value in ordered)
+    if len(targets) != len(set(targets)):
+        raise ValueError("Immutable input target paths must be unique.")
+    for index, target in enumerate(targets):
+        if any(
+            other.startswith(target.rstrip("/") + "/") or target.startswith(other.rstrip("/") + "/")
+            for other in targets[index + 1 :]
+        ):
+            raise ValueError("Immutable input target paths must not overlap.")
+    return ordered
+
+
+def _immutable_input_attachment_id(
+    request: EnvironmentFactoryRequest,
+    source: LocalImmutableInput,
+) -> str:
+    return _immutable_input_attachment_id_from_owner(
+        session_id=request.session_id,
+        environment_name=request.environment_name,
+        source=source,
+    )
+
+
+def _immutable_input_attachment_id_from_owner(
+    *,
+    session_id: str,
+    environment_name: str,
+    source: LocalImmutableInput,
+) -> str:
+    material = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "environment_name": environment_name,
+        "projection_fingerprint": source.projection.fingerprint,
+    }
+    return (
+        "docker:"
+        + sha256(
+            canonical_durable_json_bytes(material, "docker_immutable_input_attachment")
+        ).hexdigest()
+    )
+
+
+def _docker_coding_container_name(
+    request: EnvironmentFactoryRequest,
+    *,
+    configuration_fingerprint: str,
+    allocation_id: str | None = None,
+) -> str:
+    if allocation_id is not None:
+        return f"cayu-coding-{allocation_id}"
+    material = {
+        "schema_version": 1,
+        "session_id": request.session_id,
+        "environment_name": request.environment_name,
+        "configuration_fingerprint": configuration_fingerprint,
+    }
+    return (
+        "cayu-coding-"
+        + sha256(canonical_durable_json_bytes(material, "docker_coding_container_name")).hexdigest()
+    )
+
+
+async def _release_immutable_input_attachments(
+    store: ImmutableInputStore,
+    attachments: tuple[ImmutableInputAttachment, ...],
+) -> None:
+    failures: list[BaseException] = []
+    for attachment in attachments:
+        try:
+            await store.release(attachment.attachment_id)
+        except BaseException as error:
+            failures.append(error)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup(
+            "Docker immutable input releases failed.",
+            failures,
+        )
+
+
 class DockerCodingWorkspaceBinding(SyncBinding):
     """Sync a projected host tree and establish an ephemeral guest Git baseline."""
 
@@ -131,6 +271,8 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         target_workspace: RunnerWorkspace,
         limits: DockerWorkspaceTransferLimits,
         source_copy_authority: CodingProductSourceCopyAuthority | None = None,
+        immutable_input_store: ImmutableInputStore | None = None,
+        immutable_input_attachments: Sequence[ImmutableInputAttachment] = (),
         path: str = "/workspace",
     ) -> None:
         if not isinstance(target_workspace, RunnerWorkspace):
@@ -143,6 +285,13 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             raise TypeError(
                 "source_copy_authority must be CodingProductSourceCopyAuthority or None."
             )
+        attachments = tuple(immutable_input_attachments)
+        if any(type(value) is not ImmutableInputAttachment for value in attachments):
+            raise TypeError(
+                "immutable_input_attachments must contain exact ImmutableInputAttachment values."
+            )
+        if attachments and not isinstance(immutable_input_store, ImmutableInputStore):
+            raise ValueError("immutable_input_store is required with immutable input attachments.")
         expected_exclusions = frozenset(DOCKER_CODING_PROTECTED_DIRECTORY_NAMES)
         if not expected_exclusions.issubset(target_workspace.excluded_directory_names):
             raise ValueError(
@@ -150,8 +299,11 @@ class DockerCodingWorkspaceBinding(SyncBinding):
             )
         self._docker_target = target_workspace
         self._source_copy_authority = source_copy_authority
+        self._immutable_input_store = immutable_input_store
+        self._immutable_input_attachments = attachments
         self._coding_authority_lock = threading.Lock()
         self._coding_authorities: dict[str, _DockerCodingBindAuthority] = {}
+        self._immutable_finalize_states: dict[str, _ImmutableInputFinalizeState] = {}
         super().__init__(
             target_workspace=target_workspace,
             path=path,
@@ -470,26 +622,79 @@ class DockerCodingWorkspaceBinding(SyncBinding):
         outcome: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> WorkspaceSnapshot | None:
-        authority = self._bind_authority(bound)
-        final_git_evidence = (
-            None
-            if authority.source is None
-            else await _capture_final_git_evidence(bound, authority)
+        state_key = bound.state_key
+        if state_key is None:
+            raise RuntimeError("Docker coding finalization lost its sync generation.")
+        with self._coding_authority_lock:
+            cleanup_state = self._immutable_finalize_states.get(state_key)
+        if cleanup_state is None:
+            if self._immutable_input_attachments:
+                self._defer_finalize_release(bound)
+            authority = self._bind_authority(bound)
+            final_git_evidence = (
+                None
+                if authority.source is None
+                else await _capture_final_git_evidence(bound, authority)
+            )
+            await _require_no_publishable_ignored_paths(bound)
+            snapshot = await super().finalize(bound, outcome=outcome, metadata=metadata)
+            final_snapshot = (
+                snapshot
+                if snapshot is None or final_git_evidence is None
+                else replace(
+                    snapshot,
+                    metadata={**snapshot.metadata, "final_git_evidence": final_git_evidence},
+                )
+            )
+            if not self._immutable_input_attachments:
+                self._discard_bind_authority(bound)
+                return final_snapshot
+            cleanup_state = _ImmutableInputFinalizeState(snapshot=final_snapshot)
+            with self._coding_authority_lock:
+                existing = self._immutable_finalize_states.setdefault(
+                    state_key,
+                    cleanup_state,
+                )
+            if existing is not cleanup_state:  # pragma: no cover - finalize is generation-owned
+                raise RuntimeError("Docker immutable input finalization raced its owner.")
+
+        runner = bound.runner
+        if not isinstance(runner, DockerRunner):  # pragma: no cover - bind invariant
+            raise AssertionError("Docker immutable input cleanup lost its exact runner.")
+        store = self._immutable_input_store
+        if store is None:  # pragma: no cover - constructor invariant
+            raise AssertionError("Docker immutable input cleanup lost its store.")
+        if not cleanup_state.runner_closed:
+            container_id = runner.container_id
+            if container_id is None:  # pragma: no cover - strict runner invariant
+                raise AssertionError("Docker immutable input cleanup lost its container id.")
+            await store.mark_container_closing(
+                self._immutable_input_attachments,
+                container_id=container_id,
+            )
+            await runner.close()
+            with self._coding_authority_lock:
+                retained_state = self._immutable_finalize_states.get(state_key)
+                if retained_state is not cleanup_state:
+                    raise RuntimeError("Docker immutable input cleanup lost its retry state.")
+                cleanup_state.runner_closed = True
+        await _release_immutable_input_attachments(
+            store,
+            self._immutable_input_attachments,
         )
-        await _require_no_publishable_ignored_paths(bound)
-        snapshot = await super().finalize(bound, outcome=outcome, metadata=metadata)
-        if snapshot is None:
-            self._discard_bind_authority(bound)
-            return None
+        if not super().abandon(bound):  # pragma: no cover - SyncBinding contract
+            raise RuntimeError("Docker immutable input cleanup retained sync ownership.")
+        with self._coding_authority_lock:
+            self._immutable_finalize_states.pop(state_key, None)
         self._discard_bind_authority(bound)
-        if final_git_evidence is None:
-            return snapshot
-        return replace(
-            snapshot,
-            metadata={**snapshot.metadata, "final_git_evidence": final_git_evidence},
-        )
+        return cleanup_state.snapshot
 
     def abandon(self, bound: BoundWorkspace) -> bool:
+        state_key = bound.state_key
+        if state_key is not None:
+            with self._coding_authority_lock:
+                if state_key in self._immutable_finalize_states:
+                    return False
         abandoned = super().abandon(bound)
         if abandoned:
             self._discard_bind_authority(bound)
@@ -528,6 +733,9 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         runtime: str | None = None,
         seccomp_profile: str | None = None,
         docker_path: str | None = None,
+        immutable_inputs: Sequence[LocalImmutableInput] = (),
+        immutable_input_store: ImmutableInputStore | None = None,
+        immutable_input_runtime_compatibility_fingerprint: str | None = None,
     ) -> None:
         if not isinstance(source_workspace, LocalWorkspace):
             raise TypeError("source_workspace must be LocalWorkspace.")
@@ -605,6 +813,15 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         self.seccomp_profile = validate_docker_seccomp_profile(seccomp_profile)
         self.docker_path = docker_path
         self._seccomp_sha256 = _read_seccomp_sha256(seccomp_profile)
+        self.immutable_inputs = _validate_immutable_inputs(
+            immutable_inputs,
+            store=immutable_input_store,
+            runtime_compatibility_fingerprint=(immutable_input_runtime_compatibility_fingerprint),
+        )
+        self.immutable_input_store = immutable_input_store
+        self.immutable_input_runtime_compatibility_fingerprint = (
+            immutable_input_runtime_compatibility_fingerprint
+        )
         self._configuration_fingerprint = _docker_coding_configuration_fingerprint(
             image_identity=self.image_identity,
             restrictions=self.restrictions,
@@ -615,16 +832,28 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
             source_excluded_directory_names=self.source_workspace.excluded_directory_names,
             source_excluded_path_patterns=self.source_workspace.excluded_path_patterns,
+            immutable_input_projection_fingerprints=tuple(
+                item.projection.fingerprint for item in self.immutable_inputs
+            ),
+            immutable_input_runtime_compatibility_fingerprint=(
+                self.immutable_input_runtime_compatibility_fingerprint
+            ),
         )
         self._profile_identity = ExecutionProfileBehaviorIdentity(
             name="cayu.docker_coding_environment",
-            behavior_version="10",
+            behavior_version="11",
             implementation_version=self._configuration_fingerprint,
         )
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
         return self._profile_identity
+
+    @property
+    def immutable_input_capability(self) -> ImmutableInputAdapterCapability:
+        """Describe the concrete read-only projection mechanism used by this factory."""
+
+        return docker_immutable_input_capability()
 
     def construction_admission_candidate(self) -> ExecutionAdmissionCandidate:
         return self._configured_candidate()
@@ -643,6 +872,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         request: EnvironmentFactoryRequest,
         *,
         target_workspace: RunnerWorkspace,
+        immutable_input_attachments: Sequence[ImmutableInputAttachment] = (),
     ) -> DockerCodingWorkspaceBinding:
         """Construct the exact request-bound publication seam for an admitted runner."""
 
@@ -659,9 +889,61 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             target_workspace=target_workspace,
             limits=self.transfer_limits,
             source_copy_authority=source_copy_authority,
+            immutable_input_store=self.immutable_input_store,
+            immutable_input_attachments=immutable_input_attachments,
         )
 
+    def allocation_scope(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> EnvironmentAllocationScope | None:
+        self._validate_request(request)
+        if request.operation is not EnvironmentFactoryOperation.CREATE:
+            return None
+        return EnvironmentAllocationScope(
+            provider="docker",
+            adapter_generation="cayu.docker_coding.v11",
+        )
+
+    async def create_recoverable(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> EnvironmentFactoryResult:
+        self._validate_request(request)
+        if not isinstance(allocation, EnvironmentAllocationContext):
+            raise TypeError("Recoverable Docker coding requires an allocation context.")
+        if request.operation is not EnvironmentFactoryOperation.CREATE:
+            raise ValueError("Recoverable Docker coding only accepts create operations.")
+        expected_name = _docker_coding_container_name(
+            request,
+            configuration_fingerprint=self._configuration_fingerprint,
+            allocation_id=allocation.intent.allocation_id,
+        )
+        expected_metadata = {
+            "container_name": expected_name,
+            "configuration_fingerprint": self._configuration_fingerprint,
+        }
+        if allocation.state is EnvironmentAllocationState.UNPREPARED:
+            await allocation.prepare(expected_metadata)
+        if allocation.intent.provider_metadata != expected_metadata:
+            raise RuntimeError("Docker coding allocation intent changed after preparation.")
+        if allocation.state is EnvironmentAllocationState.REAPING:
+            await self._reap_interrupted_allocation(allocation, container_name=expected_name)
+            raise RuntimeError("A reaping Docker coding allocation cannot be replaced.")
+        if allocation.state is EnvironmentAllocationState.REAPED:
+            raise RuntimeError("A reaped Docker coding allocation cannot be replaced.")
+        return await self._create(request, allocation=allocation)
+
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        return await self._create(request, allocation=None)
+
+    async def _create(
+        self,
+        request: EnvironmentFactoryRequest,
+        *,
+        allocation: EnvironmentAllocationContext | None,
+    ) -> EnvironmentFactoryResult:
         self._validate_request(request)
         effective_requirements = request.execution_requirements.model_copy(
             update={
@@ -687,41 +969,53 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
         if _read_seccomp_sha256(self.seccomp_profile) != self._seccomp_sha256:
             raise RuntimeError("Docker coding seccomp profile changed after factory admission.")
 
-        if request.operation is EnvironmentFactoryOperation.CREATE:
-            runner = await DockerRunner.create(
-                f"cayu-coding-{uuid4().hex}",
-                image=self.image_identity.reference,
-                runtime=self.runtime,
-                default_cwd="/workspace",
-                close_action="remove",
-                docker_path=self.docker_path,
-                replace=False,
-                cancellation_cleanup="sandbox",
-                timeout_cleanup="sandbox",
-                credential_mode=CredentialMode.TRUSTED_TOOL,
-                allow_raw_secret_env=False,
-                network="none",
-                seccomp_profile=self.seccomp_profile,
-                image_identity=self.image_identity,
-                workload_restrictions=self.restrictions,
-                required_executables=self.required_executables,
-                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
-            )
-        else:
-            container_id = cast("str", request.reconnect_metadata.get("container_id"))
-            runner = await DockerRunner.reconnect_strict(
-                f"cayu-coding-reconnect-{container_id[:12]}",
-                container_id=container_id,
-                image_identity=self.image_identity,
-                workload_restrictions=self.restrictions,
-                default_cwd="/workspace",
-                runtime=self.runtime,
-                seccomp_profile=self.seccomp_profile,
-                docker_path=self.docker_path,
-                required_executables=self.required_executables,
-                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
-            )
+        attachments: tuple[ImmutableInputAttachment, ...] = ()
+        runner: DockerRunner | None = None
         try:
+            if request.operation is EnvironmentFactoryOperation.RECONNECT:
+                await self._reconcile_interrupted_immutable_cleanup(request)
+            attachments = await self._attach_immutable_inputs(request)
+            immutable_mounts = tuple(attachment.docker_mount() for attachment in attachments)
+            if request.operation is EnvironmentFactoryOperation.CREATE:
+                if allocation is not None:
+                    if allocation.state is EnvironmentAllocationState.PREPARED:
+                        await allocation.mark_dispatched()
+                    if allocation.state is EnvironmentAllocationState.ACKNOWLEDGED:
+                        acknowledged = allocation.acknowledged_reconnect_metadata
+                        if acknowledged is None:
+                            raise RuntimeError(
+                                "Docker coding allocation acknowledgement disappeared."
+                            )
+                        container_id = cast("str", acknowledged.get("container_id"))
+                        runner = await self._reconnect_runner(
+                            container_id,
+                            immutable_mounts=immutable_mounts,
+                        )
+                    elif allocation.state is EnvironmentAllocationState.DISPATCHED:
+                        container_name = cast(
+                            "str",
+                            allocation.intent.provider_metadata.get("container_name"),
+                        )
+                        runner = await self._create_or_recover_runner(
+                            container_name,
+                            immutable_mounts=immutable_mounts,
+                        )
+                    else:
+                        raise RuntimeError("Docker coding allocation is not dispatchable.")
+                else:
+                    runner = await self._create_or_recover_runner(
+                        _docker_coding_container_name(
+                            request,
+                            configuration_fingerprint=self._configuration_fingerprint,
+                        ),
+                        immutable_mounts=immutable_mounts,
+                    )
+            else:
+                container_id = cast("str", request.reconnect_metadata.get("container_id"))
+                runner = await self._reconnect_runner(
+                    container_id,
+                    immutable_mounts=immutable_mounts,
+                )
             exact_container_id = runner.container_id
             if exact_container_id is None:
                 raise RuntimeError("Docker coding runner lost its exact container identity.")
@@ -735,6 +1029,14 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 or final_evidence.tool_requirements is None
                 or tuple(claim.executable for claim in final_evidence.tool_requirements.executables)
                 != self.required_executables
+                or (
+                    bool(self.immutable_inputs)
+                    and (
+                        final_evidence.claim_for("read_only_host_inputs") is None
+                        or final_evidence.claim_for("read_only_host_inputs").state
+                        != "live_verified"
+                    )
+                )
             ):
                 raise RuntimeError(
                     "Docker coding runner did not produce exact final environment evidence."
@@ -767,6 +1069,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
             binding = self.create_workspace_binding(
                 request,
                 target_workspace=workspace,
+                immutable_input_attachments=attachments,
             )
             evidence_metadata = final_decision.evidence.to_metadata()
             metadata = {
@@ -791,6 +1094,20 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                     self.source_workspace.excluded_directory_names
                 ),
                 "source_excluded_path_patterns": list(self.source_workspace.excluded_path_patterns),
+                "immutable_inputs": [
+                    {
+                        "attachment_id": attachment.attachment_id,
+                        "projection_fingerprint": attachment.projection.fingerprint,
+                        "content_root": attachment.projection.content_root,
+                        "target_path": attachment.projection.target_path,
+                        "logical_bytes": attachment.projection.logical_bytes,
+                        "reused": attachment.reused,
+                    }
+                    for attachment in attachments
+                ],
+                "immutable_input_capability": self.immutable_input_capability.model_dump(
+                    mode="json"
+                ),
             }
             environment = Environment(
                 EnvironmentSpec(
@@ -808,10 +1125,23 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 image_fingerprint=self.image_identity.fingerprint,
                 toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
             )
+            if allocation is not None:
+                if allocation.state is EnvironmentAllocationState.DISPATCHED:
+                    await allocation.acknowledge(reconnect_metadata)
+                elif allocation.acknowledged_reconnect_metadata != reconnect_metadata:
+                    raise RuntimeError(
+                        "Recovered Docker coding allocation changed its durable identity."
+                    )
 
             async def release(action: EnvironmentFactoryReleaseAction) -> None:
                 if action is EnvironmentFactoryReleaseAction.DISCARD:
                     await runner.close()
+                    await self._release_immutable_inputs(attachments)
+                    if (
+                        allocation is not None
+                        and allocation.state is EnvironmentAllocationState.REAPING
+                    ):
+                        await allocation.mark_reaped()
 
             return EnvironmentFactoryResult(
                 environment=environment,
@@ -820,16 +1150,194 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 release=release,
             )
         except BaseException as original:
-            if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            if request.operation is EnvironmentFactoryOperation.RECONNECT or allocation is not None:
                 raise
-            try:
-                await runner.close()
-            except BaseException as cleanup_error:
+            cleanup_error: BaseException | None = None
+            if runner is not None:
+                try:
+                    await runner.close()
+                except BaseException as error:
+                    cleanup_error = error
+            if cleanup_error is None:
+                try:
+                    await self._release_immutable_inputs(attachments)
+                except BaseException as error:
+                    cleanup_error = error
+            if cleanup_error is not None:
                 raise BaseExceptionGroup(
-                    "Docker coding creation and exact container cleanup both failed.",
+                    "Docker coding creation and resource cleanup both failed.",
                     [original, cleanup_error],
                 ) from None
             raise
+
+    async def _create_or_recover_runner(
+        self,
+        container_name: str,
+        *,
+        immutable_mounts: tuple[DockerImmutableInputMount, ...],
+    ) -> DockerRunner:
+        existing_id = await DockerRunner.resolve_container_id(
+            container_name,
+            docker_path=self.docker_path,
+        )
+        if existing_id is not None:
+            return await self._reconnect_runner(
+                existing_id,
+                immutable_mounts=immutable_mounts,
+            )
+        try:
+            return await DockerRunner.create(
+                container_name,
+                image=self.image_identity.reference,
+                runtime=self.runtime,
+                default_cwd="/workspace",
+                close_action="remove",
+                docker_path=self.docker_path,
+                replace=False,
+                cancellation_cleanup="sandbox",
+                timeout_cleanup="sandbox",
+                credential_mode=CredentialMode.TRUSTED_TOOL,
+                allow_raw_secret_env=False,
+                network="none",
+                seccomp_profile=self.seccomp_profile,
+                image_identity=self.image_identity,
+                workload_restrictions=self.restrictions,
+                required_executables=self.required_executables,
+                toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+                immutable_input_mounts=immutable_mounts,
+            )
+        except Exception:
+            recovered_id = await DockerRunner.resolve_container_id(
+                container_name,
+                docker_path=self.docker_path,
+            )
+            if recovered_id is None:
+                raise
+            return await self._reconnect_runner(
+                recovered_id,
+                immutable_mounts=immutable_mounts,
+            )
+
+    async def _reconnect_runner(
+        self,
+        container_id: str,
+        *,
+        immutable_mounts: tuple[DockerImmutableInputMount, ...],
+    ) -> DockerRunner:
+        return await DockerRunner.reconnect_strict(
+            f"cayu-coding-reconnect-{container_id[:12]}",
+            container_id=container_id,
+            image_identity=self.image_identity,
+            workload_restrictions=self.restrictions,
+            default_cwd="/workspace",
+            runtime=self.runtime,
+            seccomp_profile=self.seccomp_profile,
+            docker_path=self.docker_path,
+            required_executables=self.required_executables,
+            toolchain_profile_fingerprint=self.toolchain_profile.fingerprint,
+            immutable_input_mounts=immutable_mounts,
+        )
+
+    async def _reconcile_interrupted_immutable_cleanup(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> None:
+        store = self.immutable_input_store
+        if store is None or not self.immutable_inputs:
+            return
+        attachment_ids = tuple(
+            _immutable_input_attachment_id(request, source) for source in self.immutable_inputs
+        )
+        closing_container_id = await store.interrupted_cleanup_container_id(attachment_ids)
+        if closing_container_id is None:
+            return
+        expected_container_id = cast("str", request.reconnect_metadata.get("container_id"))
+        if closing_container_id != expected_container_id:
+            raise RuntimeError("Immutable input cleanup names another Docker container.")
+        container_exists = await DockerRunner.container_exists(
+            closing_container_id,
+            docker_path=self.docker_path,
+        )
+        reactivated = await store.reconcile_interrupted_container_cleanup(
+            attachment_ids,
+            container_id=closing_container_id,
+            container_exists=container_exists,
+        )
+        if not reactivated:
+            raise RuntimeError(
+                "Docker immutable input cleanup completed after the container disappeared."
+            )
+
+    async def _reap_interrupted_allocation(
+        self,
+        allocation: EnvironmentAllocationContext,
+        *,
+        container_name: str,
+    ) -> None:
+        container_id = await DockerRunner.resolve_container_id(
+            container_name,
+            docker_path=self.docker_path,
+        )
+        if container_id is not None:
+            runner = DockerRunner(
+                container_name,
+                close_action="remove",
+                docker_path=self.docker_path,
+                _container_id=container_id,
+            )
+            await runner.close()
+        store = self.immutable_input_store
+        if store is not None:
+            for source in self.immutable_inputs:
+                await store.release(
+                    _immutable_input_attachment_id_from_owner(
+                        session_id=allocation.intent.session_id,
+                        environment_name=allocation.intent.environment_name,
+                        source=source,
+                    )
+                )
+        await allocation.mark_reaped()
+
+    async def _attach_immutable_inputs(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> tuple[ImmutableInputAttachment, ...]:
+        if not self.immutable_inputs:
+            return ()
+        store = self.immutable_input_store
+        if store is None:  # pragma: no cover - constructor invariant
+            raise AssertionError("Docker immutable input store was not retained.")
+        attached: list[ImmutableInputAttachment] = []
+        try:
+            for source in self.immutable_inputs:
+                attached.append(
+                    await store.attach(
+                        source,
+                        attachment_id=_immutable_input_attachment_id(request, source),
+                        owner_id=request.session_id,
+                    )
+                )
+        except BaseException as original:
+            try:
+                await self._release_immutable_inputs(tuple(attached))
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "Docker immutable input attachment and rollback both failed.",
+                    [original, cleanup_error],
+                ) from None
+            raise
+        return tuple(attached)
+
+    async def _release_immutable_inputs(
+        self,
+        attachments: tuple[ImmutableInputAttachment, ...],
+    ) -> None:
+        store = self.immutable_input_store
+        if store is None:
+            if attachments:  # pragma: no cover - constructor invariant
+                raise AssertionError("Docker immutable input store was not retained.")
+            return
+        await _release_immutable_input_attachments(store, attachments)
 
     def _validate_request(self, request: EnvironmentFactoryRequest) -> None:
         if not isinstance(request, EnvironmentFactoryRequest):
@@ -875,6 +1383,15 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                     remediation_code="use_verified_docker_restrictions",
                 ),
             )
+        read_only_input_claim = (
+            ExecutionCapabilityClaim.declared("read_only_host_inputs")
+            if self.immutable_inputs
+            else ExecutionCapabilityClaim.unsupported(
+                "read_only_host_inputs",
+                reason_code="docker_host_inputs_not_mounted",
+                remediation_code="configure_immutable_input_projection",
+            )
+        )
         unsupported = (
             ExecutionCapabilityClaim.unsupported(
                 "untrusted_code_isolation",
@@ -885,11 +1402,6 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 "brokered_egress",
                 reason_code="docker_network_disabled",
                 remediation_code="select_brokered_egress",
-            ),
-            ExecutionCapabilityClaim.unsupported(
-                "read_only_host_inputs",
-                reason_code="docker_host_inputs_not_mounted",
-                remediation_code="use_workspace_sync",
             ),
         )
         evidence = ExecutionCapabilityEvidence(
@@ -905,6 +1417,7 @@ class DockerCodingEnvironmentFactory(EnvironmentFactory):
                 ExecutionCapabilityClaim.declared("confirmed_cancellation"),
                 ExecutionCapabilityClaim.declared("confirmed_cleanup"),
                 ExecutionCapabilityClaim.declared("reconnect"),
+                read_only_input_claim,
                 *unsupported,
             ),
             tool_requirements=ExecutionToolRequirementEvidence(
@@ -1493,9 +2006,11 @@ def _docker_coding_configuration_fingerprint(
     toolchain_profile_fingerprint: str,
     source_excluded_directory_names: tuple[str, ...],
     source_excluded_path_patterns: tuple[str, ...],
+    immutable_input_projection_fingerprints: tuple[str, ...],
+    immutable_input_runtime_compatibility_fingerprint: str | None,
 ) -> str:
     material = {
-        "schema": "cayu.docker_coding_environment.v1",
+        "schema": "cayu.docker_coding_environment.v2",
         "image_identity": image_identity.model_dump(mode="json"),
         "restrictions": restrictions.model_dump(mode="json"),
         "required_executables": list(required_executables),
@@ -1505,7 +2020,15 @@ def _docker_coding_configuration_fingerprint(
         "toolchain_profile_fingerprint": toolchain_profile_fingerprint,
         "network": "none",
         "default_cwd": "/workspace",
-        "host_mounts": False,
+        "host_mounts": (
+            "verified_read_only_immutable_inputs"
+            if immutable_input_projection_fingerprints
+            else False
+        ),
+        "immutable_input_projection_fingerprints": list(immutable_input_projection_fingerprints),
+        "immutable_input_runtime_compatibility_fingerprint": (
+            immutable_input_runtime_compatibility_fingerprint
+        ),
         "credential_mode": CredentialMode.TRUSTED_TOOL.value,
         "protected_directory_names": list(DOCKER_CODING_PROTECTED_DIRECTORY_NAMES),
         "source_excluded_directory_names": list(source_excluded_directory_names),

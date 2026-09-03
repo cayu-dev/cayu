@@ -41,6 +41,10 @@ from cayu.environments._sync_staging import (
     _CapacityLease,
     _SealedTarArchive,
 )
+from cayu.immutable_inputs import (
+    ImmutableInputAdapterCapability,
+    ImmutableInputProjectionCapability,
+)
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces import (
     BoundedTarReader,
@@ -612,6 +616,15 @@ class WorkspaceBinding(ABC):
             observer=type(self).__name__,
         )
 
+    def input_capability(self) -> ImmutableInputAdapterCapability:
+        """Describe how this binding exposes environment input bytes."""
+
+        return ImmutableInputAdapterCapability(
+            adapter=type(self).__name__,
+            capability=ImmutableInputProjectionCapability.WORKSPACE_MATERIALIZATION,
+            mechanism="workspace_binding",
+        )
+
     def observe_writer_isolation(
         self,
         bound: BoundWorkspace,
@@ -873,6 +886,13 @@ class NoWorkspaceBinding(WorkspaceBinding):
     ) -> WorkspaceSnapshot | None:
         _validate_finalize_request(bound, outcome=outcome, metadata=metadata)
         return None
+
+    def input_capability(self) -> ImmutableInputAdapterCapability:
+        return ImmutableInputAdapterCapability(
+            adapter=type(self).__name__,
+            capability=ImmutableInputProjectionCapability.UNSUPPORTED,
+            reason_code="workspace_not_exposed",
+        )
 
 
 class GitRepositoryBinding(WorkspaceBinding):
@@ -1441,6 +1461,14 @@ class SyncBinding(WorkspaceBinding):
             )
         self._state_lock = threading.Lock()
         self._states: dict[str, _SyncBindingState] = {}
+
+    def input_capability(self) -> ImmutableInputAdapterCapability:
+        return ImmutableInputAdapterCapability(
+            adapter=type(self).__name__,
+            capability=ImmutableInputProjectionCapability.MUTABLE_SYNC_BINDING,
+            mechanism="bounded_workspace_copy",
+            explicit_copy_fallback=True,
+        )
 
     def _archive_policy(
         self,

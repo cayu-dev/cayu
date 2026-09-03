@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -22,16 +23,22 @@ from cayu import (
     DockerImageIdentity,
     DockerWorkloadRestrictions,
     DockerWorkspaceTransferLimits,
+    EnvironmentAllocationContext,
+    EnvironmentAllocationIntent,
+    EnvironmentAllocationState,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     ExecCommand,
     ExecutionAdmissionError,
     ExecutionRequirements,
+    ImmutableInputProjectionCapability,
+    ImmutableInputStore,
     LocalRunner,
     SyncBinding,
     SyncBindingSourceConflictError,
     evaluate_execution_admission,
+    inspect_local_immutable_input,
 )
 from cayu._coding_product_authority import (
     CODING_PRODUCT_SOURCE_AUTHORITY_METADATA_KEY,
@@ -52,6 +59,52 @@ from cayu.workspaces.revisions import (
 _CONTAINER_ID = "a" * 64
 _IMAGE_ID = "sha256:" + ("b" * 64)
 _IMAGE_REFERENCE = "cayu/coding@sha256:" + ("c" * 64)
+
+
+class _TestAllocationContext(EnvironmentAllocationContext):
+    def __init__(
+        self,
+        intent: EnvironmentAllocationIntent,
+        *,
+        state: EnvironmentAllocationState = EnvironmentAllocationState.UNPREPARED,
+    ) -> None:
+        self._intent = intent
+        self._state = state
+        self._acknowledgement: dict[str, Any] | None = None
+
+    @property
+    def intent(self) -> EnvironmentAllocationIntent:
+        return self._intent
+
+    @property
+    def state(self) -> EnvironmentAllocationState:
+        return self._state
+
+    @property
+    def acknowledged_reconnect_metadata(self) -> dict[str, Any] | None:
+        return self._acknowledgement
+
+    async def prepare(
+        self,
+        provider_metadata: Mapping[str, Any],
+    ) -> EnvironmentAllocationIntent:
+        self._intent = self._intent.with_provider_metadata(provider_metadata)
+        self._state = EnvironmentAllocationState.PREPARED
+        return self._intent
+
+    async def mark_dispatched(self) -> None:
+        self._state = EnvironmentAllocationState.DISPATCHED
+
+    async def acknowledge(self, reconnect_metadata: Mapping[str, Any]) -> None:
+        self._acknowledgement = dict(reconnect_metadata)
+        self._state = EnvironmentAllocationState.ACKNOWLEDGED
+
+    async def mark_reaping(self) -> bool:
+        self._state = EnvironmentAllocationState.REAPING
+        return True
+
+    async def mark_reaped(self) -> None:
+        self._state = EnvironmentAllocationState.REAPED
 
 
 def _image_identity() -> DockerImageIdentity:
@@ -97,6 +150,7 @@ def _inspection(
     restrictions: DockerWorkloadRestrictions,
     *,
     network_mode: str = "none",
+    immutable_mount: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     tmpfs: dict[str, str] = {}
     args = restrictions.run_args()
@@ -123,10 +177,33 @@ def _inspection(
             "CapAdd": list(restrictions.capability_add),
             "Tmpfs": tmpfs,
             "Binds": [],
+            "Mounts": (
+                []
+                if immutable_mount is None
+                else [
+                    {
+                        "Type": "bind",
+                        "Source": immutable_mount[0],
+                        "Target": immutable_mount[1],
+                        "ReadOnly": True,
+                    }
+                ]
+            ),
             "Devices": [],
             "DeviceRequests": [],
         },
-        "Mounts": [],
+        "Mounts": (
+            []
+            if immutable_mount is None
+            else [
+                {
+                    "Type": "bind",
+                    "Source": immutable_mount[0],
+                    "Destination": immutable_mount[1],
+                    "RW": False,
+                }
+            ]
+        ),
     }
 
 
@@ -789,6 +866,202 @@ def test_docker_coding_factory_declares_bounded_tools_and_immutable_identity(
     )
 
 
+def test_docker_coding_factory_binds_immutable_projection_identity(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    input_root = tmp_path / "runtime"
+    input_root.mkdir()
+    (input_root / "runtime.bin").write_bytes(b"runtime")
+    runtime_compatibility = "sha256:" + ("d" * 64)
+    immutable_input = inspect_local_immutable_input(
+        input_root,
+        target_path="/opt/cayu/inputs/runtime",
+        policy_fingerprint="sha256:" + ("a" * 64),
+        runtime_compatibility_fingerprint=runtime_compatibility,
+        authorization_scope_fingerprint="sha256:" + ("c" * 64),
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(workspace_root),
+        image_identity=_image_identity(),
+        immutable_inputs=(immutable_input,),
+        immutable_input_store=store,
+        immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,
+    )
+    default_factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(workspace_root),
+        image_identity=_image_identity(),
+    )
+    claim = factory.construction_admission_candidate().evidence.claim_for("read_only_host_inputs")
+
+    assert factory.immutable_input_capability.capability is (
+        ImmutableInputProjectionCapability.SHARED_READ_ONLY
+    )
+    assert claim is not None
+    assert claim.state == "declared"
+    assert (
+        factory.execution_profile_identity.implementation_version
+        != default_factory.execution_profile_identity.implementation_version
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="immutable-session",
+        agent_name="agent",
+        environment_name="coding",
+    )
+    first = asyncio.run(factory._attach_immutable_inputs(request))
+    recovered_factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(workspace_root),
+        image_identity=_image_identity(),
+        immutable_inputs=(immutable_input,),
+        immutable_input_store=ImmutableInputStore(store.root),
+        immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,
+    )
+    replay = asyncio.run(recovered_factory._attach_immutable_inputs(request))
+
+    assert replay[0].attachment_id == first[0].attachment_id
+    assert store.inspect()[0].reference_count == 1
+    assert store.inspect()[0].attachment_count == 1
+    asyncio.run(recovered_factory._release_immutable_inputs(replay))
+
+    with pytest.raises(ValueError, match="runtime compatibility"):
+        DockerCodingEnvironmentFactory(
+            source_workspace=LocalWorkspace(workspace_root),
+            image_identity=_image_identity(),
+            immutable_inputs=(immutable_input,),
+            immutable_input_store=store,
+            immutable_input_runtime_compatibility_fingerprint="sha256:" + ("e" * 64),
+        )
+
+
+def test_docker_coding_binding_closes_runner_before_releasing_immutable_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    input_root = tmp_path / "runtime"
+    source_root.mkdir()
+    target_root.mkdir()
+    input_root.mkdir()
+    (input_root / "runtime.bin").write_bytes(b"runtime")
+    runner, source_workspace, base_binding = _coding_product_test_binding(
+        source_root,
+        target_root,
+    )
+    immutable_input = inspect_local_immutable_input(
+        input_root,
+        target_path="/opt/cayu/inputs/runtime",
+        policy_fingerprint="sha256:" + ("a" * 64),
+        runtime_compatibility_fingerprint="sha256:" + ("b" * 64),
+        authorization_scope_fingerprint="sha256:" + ("c" * 64),
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+    attachment = store.attach_sync(
+        immutable_input,
+        attachment_id="docker:binding",
+        owner_id="binding-session",
+    )
+    binding = DockerCodingWorkspaceBinding(
+        target_workspace=base_binding._docker_target,
+        limits=DockerWorkspaceTransferLimits(),
+        immutable_input_store=store,
+        immutable_input_attachments=(attachment,),
+    )
+    closed = False
+
+    async def close_runner() -> None:
+        nonlocal closed
+        assert store.inspect()[0].reference_count == 1
+        closed = True
+
+    monkeypatch.setattr(runner, "close", close_runner)
+
+    async def run() -> None:
+        bound = await binding.bind(
+            source_workspace,
+            runner,
+            session_id="binding-session",
+        )
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert closed is True
+    assert store.inspect()[0].reference_count == 0
+
+
+def test_docker_coding_binding_retries_release_after_runner_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    input_root = tmp_path / "runtime"
+    source_root.mkdir()
+    target_root.mkdir()
+    input_root.mkdir()
+    (input_root / "runtime.bin").write_bytes(b"runtime")
+    runner, source_workspace, base_binding = _coding_product_test_binding(
+        source_root,
+        target_root,
+    )
+    immutable_input = inspect_local_immutable_input(
+        input_root,
+        target_path="/opt/cayu/inputs/runtime",
+        policy_fingerprint="sha256:" + ("a" * 64),
+        runtime_compatibility_fingerprint="sha256:" + ("b" * 64),
+        authorization_scope_fingerprint="sha256:" + ("c" * 64),
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+    attachment = store.attach_sync(
+        immutable_input,
+        attachment_id="docker:release-retry",
+        owner_id="binding-session",
+    )
+    binding = DockerCodingWorkspaceBinding(
+        target_workspace=base_binding._docker_target,
+        limits=DockerWorkspaceTransferLimits(),
+        immutable_input_store=store,
+        immutable_input_attachments=(attachment,),
+    )
+    close_calls = 0
+    release_calls = 0
+    original_release = store.release
+
+    async def close_runner() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    async def flaky_release(attachment_id: str) -> None:
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise OSError("simulated durable registry failure after close")
+        await original_release(attachment_id)
+
+    monkeypatch.setattr(runner, "close", close_runner)
+    monkeypatch.setattr(store, "release", flaky_release)
+
+    async def run() -> None:
+        bound = await binding.bind(
+            source_workspace,
+            runner,
+            session_id="binding-session",
+        )
+        with pytest.raises(OSError, match="registry failure after close"):
+            await binding.finalize(bound, outcome="completed")
+        assert binding.abandon(bound) is False
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert close_calls == 1
+    assert release_calls == 2
+    assert store.inspect()[0].reference_count == 0
+
+
 def test_docker_coding_factory_refuses_weakened_privilege_restrictions(
     tmp_path: Path,
 ) -> None:
@@ -888,25 +1161,57 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
 ) -> None:
     restrictions = DockerWorkloadRestrictions()
     calls: list[list[str]] = []
+    workspace_root = tmp_path / "workspace"
+    input_root = tmp_path / "runtime"
+    workspace_root.mkdir()
+    input_root.mkdir()
+    (input_root / "runtime.bin").write_bytes(b"runtime")
+    image_identity = _image_identity()
+    immutable_input = inspect_local_immutable_input(
+        input_root,
+        target_path="/opt/cayu/inputs/runtime",
+        policy_fingerprint="sha256:" + ("a" * 64),
+        runtime_compatibility_fingerprint=image_identity.fingerprint,
+        authorization_scope_fingerprint="sha256:" + ("c" * 64),
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+    mount_source: str | None = None
 
     async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        nonlocal mount_source
         del kwargs
         calls.append(command.argv)
         docker_args = command.argv[1:]
         if docker_args[0] == "run":
+            mount_argument = docker_args[docker_args.index("--mount") + 1]
+            mount_source = mount_argument.split("source=", 1)[1].split(",", 1)[0]
             return ExecResult(stdout=_CONTAINER_ID)
         if docker_args[0] == "inspect":
-            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+            assert mount_source is not None
+            return ExecResult(
+                stdout=json.dumps(
+                    _inspection(
+                        restrictions,
+                        immutable_mount=(
+                            mount_source,
+                            immutable_input.projection.target_path,
+                        ),
+                    )
+                )
+            )
         if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
             return ExecResult(stdout=restrictions.user)
         return ExecResult()
 
     monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
     factory = DockerCodingEnvironmentFactory(
-        source_workspace=LocalWorkspace(tmp_path),
-        image_identity=_image_identity(),
+        source_workspace=LocalWorkspace(workspace_root),
+        image_identity=image_identity,
         restrictions=restrictions,
         docker_path="/usr/bin/docker",
+        immutable_inputs=(immutable_input,),
+        immutable_input_store=store,
+        immutable_input_runtime_compatibility_fingerprint=image_identity.fingerprint,
     )
     create_request = EnvironmentFactoryRequest(
         session_id="reconnect",
@@ -921,6 +1226,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         assert created.release is not None
         await created.release(EnvironmentFactoryReleaseAction.PRESERVE)
         assert not any(call[1:3] == ["rm", "-f"] for call in calls)
+        assert store.inspect()[0].reference_count == 1
 
         reconnect_request = replace(
             create_request,
@@ -933,6 +1239,7 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         assert reconnected.reconnect_metadata == created.reconnect_metadata
         assert reconnected.environment.runner is not None
         assert reconnected.environment.runner.container_id == _CONTAINER_ID
+        assert store.inspect()[0].reference_count == 1
         assert (
             reconnected.environment.runner.execution_capability_evidence()
             .claim_for("reconnect")
@@ -941,12 +1248,210 @@ def test_docker_coding_factory_reconnects_exact_preserved_container(
         )
         assert reconnected.release is not None
         await reconnected.release(EnvironmentFactoryReleaseAction.DISCARD)
+        assert store.inspect()[0].reference_count == 0
 
     asyncio.run(run())
 
     assert sum(call[1] == "run" for call in calls) == 1
     assert sum(call[1] == "inspect" for call in calls) == 2
     assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
+
+
+def test_docker_coding_same_create_request_recovers_one_named_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    restrictions = DockerWorkloadRestrictions()
+    calls: list[list[str]] = []
+    container_exists = False
+
+    async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        nonlocal container_exists
+        del kwargs
+        calls.append(command.argv)
+        docker_args = command.argv[1:]
+        if docker_args[:2] == ["container", "ls"]:
+            return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
+        if docker_args[0] == "run":
+            container_exists = True
+            return ExecResult(stdout=_CONTAINER_ID)
+        if docker_args[0] == "inspect":
+            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+        if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
+            return ExecResult(stdout=restrictions.user)
+        if docker_args[:2] == ["rm", "-f"]:
+            container_exists = False
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        image_identity=_image_identity(),
+        restrictions=restrictions,
+        docker_path="/usr/bin/docker",
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="same-create",
+        agent_name="agent",
+        environment_name="coding",
+    )
+
+    async def run() -> None:
+        scope = factory.allocation_scope(request)
+        assert scope is not None
+        assert scope.provider == "docker"
+        first = await factory.create(request)
+        second = await factory.create(request)
+        assert first.reconnect_metadata == second.reconnect_metadata
+        assert first.release is not None
+        assert second.release is not None
+        await first.release(EnvironmentFactoryReleaseAction.PRESERVE)
+        await second.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(run())
+
+    assert sum(call[1] == "run" for call in calls) == 1
+    assert sum(call[1] == "inspect" for call in calls) == 2
+    assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
+
+
+def test_docker_coding_recoverable_allocation_reuses_dispatched_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    restrictions = DockerWorkloadRestrictions()
+    calls: list[list[str]] = []
+    container_exists = False
+
+    async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        nonlocal container_exists
+        del kwargs
+        calls.append(command.argv)
+        docker_args = command.argv[1:]
+        if docker_args[:2] == ["container", "ls"]:
+            return ExecResult(stdout=(_CONTAINER_ID + "\n") if container_exists else "")
+        if docker_args[0] == "run":
+            container_exists = True
+            return ExecResult(stdout=_CONTAINER_ID)
+        if docker_args[0] == "inspect":
+            return ExecResult(stdout=json.dumps(_inspection(restrictions)))
+        if docker_args[:2] == ["exec", _CONTAINER_ID] and "id -u" in docker_args[-1]:
+            return ExecResult(stdout=restrictions.user)
+        if docker_args[:2] == ["rm", "-f"]:
+            container_exists = False
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(tmp_path),
+        image_identity=_image_identity(),
+        restrictions=restrictions,
+        docker_path="/usr/bin/docker",
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="recoverable-create",
+        agent_name="agent",
+        environment_name="coding",
+    )
+    intent = EnvironmentAllocationIntent(
+        allocation_id="ealloc_" + ("d" * 32),
+        provider="docker",
+        adapter_generation="cayu.docker_coding.v11",
+        session_id=request.session_id,
+        environment_name=request.environment_name,
+        requested_operation=EnvironmentFactoryOperation.CREATE,
+    )
+
+    async def run() -> None:
+        first_context = _TestAllocationContext(intent)
+        first = await factory.create_recoverable(request, first_context)
+        assert first_context.state is EnvironmentAllocationState.ACKNOWLEDGED
+        assert first_context.acknowledged_reconnect_metadata == first.reconnect_metadata
+
+        recovered_context = _TestAllocationContext(
+            first_context.intent,
+            state=EnvironmentAllocationState.DISPATCHED,
+        )
+        recovered = await factory.create_recoverable(request, recovered_context)
+        assert recovered_context.state is EnvironmentAllocationState.ACKNOWLEDGED
+        assert recovered.reconnect_metadata == first.reconnect_metadata
+        assert first.release is not None
+        assert recovered.release is not None
+        await first.release(EnvironmentFactoryReleaseAction.PRESERVE)
+        assert await recovered_context.mark_reaping() is True
+        await recovered.release(EnvironmentFactoryReleaseAction.DISCARD)
+        assert recovered_context.state is EnvironmentAllocationState.REAPED
+
+    asyncio.run(run())
+
+    assert sum(call[1] == "run" for call in calls) == 1
+    assert sum(call[1] == "inspect" for call in calls) == 2
+    assert calls[-1][1:] == ["rm", "-f", _CONTAINER_ID]
+
+
+def test_docker_coding_reconnect_releases_interrupted_finalize_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    input_root = tmp_path / "runtime"
+    workspace_root.mkdir()
+    input_root.mkdir()
+    (input_root / "runtime.bin").write_bytes(b"runtime")
+    image_identity = _image_identity()
+    immutable_input = inspect_local_immutable_input(
+        input_root,
+        target_path="/opt/cayu/inputs/runtime",
+        policy_fingerprint="sha256:" + ("a" * 64),
+        runtime_compatibility_fingerprint=image_identity.fingerprint,
+        authorization_scope_fingerprint="sha256:" + ("c" * 64),
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(workspace_root),
+        image_identity=image_identity,
+        docker_path="/usr/bin/docker",
+        immutable_inputs=(immutable_input,),
+        immutable_input_store=store,
+        immutable_input_runtime_compatibility_fingerprint=image_identity.fingerprint,
+    )
+    create_request = EnvironmentFactoryRequest(
+        session_id="interrupted-finalize",
+        agent_name="agent",
+        environment_name="coding",
+    )
+    attachment = store.attach_sync(
+        immutable_input,
+        attachment_id=docker_coding_module._immutable_input_attachment_id(
+            create_request,
+            immutable_input,
+        ),
+        owner_id=create_request.session_id,
+    )
+    store.mark_container_closing_sync((attachment,), container_id=_CONTAINER_ID)
+    reconnect_request = replace(
+        create_request,
+        operation=EnvironmentFactoryOperation.RECONNECT,
+        reconnect_metadata=docker_coding_module._docker_coding_reconnect_metadata(
+            container_id=_CONTAINER_ID,
+            configuration_fingerprint=factory._configuration_fingerprint,
+            image_fingerprint=image_identity.fingerprint,
+            toolchain_profile_fingerprint=factory.toolchain_profile.fingerprint,
+        ),
+    )
+
+    async def fake_run_subprocess(command, **kwargs: Any) -> ExecResult:
+        del kwargs
+        docker_args = command.argv[1:]
+        assert docker_args[:2] == ["container", "ls"]
+        return ExecResult(stdout="")
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    with pytest.raises(RuntimeError, match="cleanup completed"):
+        asyncio.run(factory.create(reconnect_request))
+
+    assert ImmutableInputStore(store.root).inspect()[0].reference_count == 0
 
 
 def test_docker_coding_factory_structurally_refuses_a_missing_final_executable(

@@ -35,6 +35,35 @@ def test_require_docker_missing_raises(monkeypatch):
         _require_docker(None)
 
 
+def test_resolve_container_id_escapes_regex_name(monkeypatch):
+    calls: list[list[str]] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        calls.append(command.argv)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    assert (
+        asyncio.run(DockerRunner.resolve_container_id("untrusted.*", docker_path="/usr/bin/docker"))
+        is None
+    )
+    assert calls == [
+        [
+            "/usr/bin/docker",
+            "container",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--filter",
+            r"name=^/untrusted\.\*$",
+            "--format",
+            "{{.ID}}",
+        ]
+    ]
+
+
 def test_docker_runner_declares_browser_workload_only_for_exact_image() -> None:
     pinned = DockerRunner(
         "browser",

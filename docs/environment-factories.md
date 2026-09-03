@@ -345,6 +345,79 @@ fails the task/session with `workspace_output_committed=false`, and can be retri
 binding policy and, when `source_conflict_policy="require_revision"`, the original revision baseline;
 it does not repeat model or tool execution.
 
+### Shared immutable Docker inputs
+
+Use an immutable input projection for large runtime or support trees that many
+Docker environments must read but must never change. Unlike `SyncBinding`, this
+path materializes an exact tree once in a private manager store and attaches the
+same host object to each container as a read-only bind mount. The mutable
+`/workspace` copy-in/copy-back lifecycle remains separate.
+
+```python
+from hashlib import sha256
+
+from cayu import (
+    DockerCodingEnvironmentFactory,
+    DockerImageIdentity,
+    ImmutableInputStore,
+    LocalWorkspace,
+    inspect_local_immutable_input,
+)
+
+
+def identity(label: str) -> str:
+    return "sha256:" + sha256(label.encode()).hexdigest()
+
+
+image = DockerImageIdentity(
+    reference="registry.example/coding@sha256:" + ("a" * 64)
+)
+runtime_compatibility = image.fingerprint
+runtime_input = inspect_local_immutable_input(
+    "/srv/cayu/runtime-input",
+    target_path="/opt/cayu/inputs/runtime",
+    policy_fingerprint=identity("runtime-input-policy-v1"),
+    runtime_compatibility_fingerprint=runtime_compatibility,
+    authorization_scope_fingerprint=identity("tenant-and-purpose-scope"),
+)
+store = ImmutableInputStore("/var/lib/cayu/immutable-inputs")
+factory = DockerCodingEnvironmentFactory(
+    source_workspace=LocalWorkspace("/srv/cayu/workspace"),
+    image_identity=image,
+    immutable_inputs=(runtime_input,),
+    immutable_input_store=store,
+    immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,
+)
+```
+
+The projection identity binds the exact file manifest and executable modes,
+format version, normalized target, copy limits, policy, Runtime compatibility,
+and authorization scope. Sources may contain only regular files and real
+directories; symlinks and special entries fail inspection. Targets must be
+dedicated paths outside `/workspace`, `/tmp`, `/proc`, `/sys`, and `/dev`, and
+must not overlap another immutable or tmpfs target. Keep the source, mutable
+workspace, and mode-`0700` store in separate directory trees.
+
+`DockerRunner` accepts only opaque mounts issued by `ImmutableInputStore`. It
+verifies the daemon's exact bind-mount inspection and proves that even a root
+process cannot create a probe file before it exposes the runner. A successful
+workspace finalizer hashes and publishes only `/workspace`, closes the
+container, and then releases its durable immutable-input references. Exact
+attachment replay, release, orphaned-publication adoption, inspection, and
+garbage collection work from a fresh `ImmutableInputStore` instance and do not
+depend on process-local counters. `store.inspect()` returns only identities,
+logical and physical bytes, counts, reuse, wait reason, and cleanup state; it
+never returns file names or contents.
+
+Adapters report `shared_read_only`, `mutable_sync_binding`,
+`workspace_materialization`, or `unsupported` through
+`input_capability()`. Use `require_immutable_input_projection(...)` to reject
+weaker adapters. A bounded mutable copy is accepted only when the application
+sets `allow_bounded_copy_fallback=True`; no adapter silently downgrades the
+guarantee. Docker reconnect verifies the exact retained container and its
+immutable mounts; deterministic attachment replay retains one durable reference
+for that same physical container instead of allocating a duplicate.
+
 A `SyncBinding` target plan factory is an identity-resolution boundary, not an
 allocation owner: `target_workspace_plan_factory` returns a
 `SyncTargetWorkspacePlan` containing an already lifecycle-owned, quiescent

@@ -190,6 +190,29 @@ proves that the live input is unchanged. PostgreSQL commits the pending receipt
 with revision progress and replays the original evidence when final delivery is
 retried.
 
+### Docker fan-out can share exact read-only inputs
+
+`ImmutableInputProjection` and `ImmutableInputStore` now materialize a bounded
+regular-file tree once and durably reference it from many strict Docker coding
+environments. Reuse identity includes exact content and executable modes,
+format and limits, target, policy, Runtime compatibility, and authorization
+scope. The store converges across threads and fresh processes, recovers exact
+orphaned publications after acknowledgement loss, rejects mutation with typed
+evidence, and reports content-free size, reference, reuse, wait, and cleanup
+diagnostics.
+
+Docker accepts only manager-issued immutable mounts. Before exposure it verifies
+the daemon's exact read-only mount state and proves that a root write is refused.
+The mutable `/workspace` finalizer cannot traverse or publish immutable inputs;
+it records durable container-closing intent, closes the container, and then
+releases durable references. Fresh recovery reconciles that intent against an
+exact Docker lookup. Deterministic allocation replay also resolves the same
+container rather than issuing a duplicate. The 100-environment fan-out path uses
+one physical materialization rather than 100 workspace copies.
+Bindings now distinguish shared read-only projection, explicit bounded mutable
+copy, ordinary workspace materialization, and unsupported behavior so callers
+cannot silently downgrade the requested guarantee.
+
 ### Recovery cleanup now has shared finite deadlines
 
 `CayuApp` now supervises recovery cleanup through a shared

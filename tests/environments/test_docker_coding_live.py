@@ -11,10 +11,14 @@ import pytest
 from cayu import (
     DockerCodingEnvironmentFactory,
     DockerImageIdentity,
+    EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
     ExecCommand,
     ExecutionRequirements,
+    ImmutableInputStore,
     LocalWorkspace,
+    inspect_local_immutable_input,
 )
 
 _REQUIRE_ENV = "CAYU_REQUIRE_DOCKER_CODING"
@@ -165,3 +169,95 @@ def test_real_docker_coding_round_trip_is_bounded_and_excludes_host_git(
     assert (tmp_path / ".git" / "objects" / "host-only").read_text(
         encoding="utf-8"
     ) == "host metadata"
+
+
+def test_100_real_docker_environments_share_one_immutable_input(
+    tmp_path: Path,
+) -> None:
+    docker_path, image, image_id = _configuration_or_skip()
+    workspace_root = tmp_path / "workspace"
+    input_root = tmp_path / "runtime"
+    workspace_root.mkdir()
+    input_root.mkdir()
+    expected = b"shared immutable runtime\n"
+    (input_root / "runtime.txt").write_bytes(expected)
+    image_identity = DockerImageIdentity(reference=image, content_digest=image_id)
+    runtime_compatibility = image_identity.fingerprint
+    immutable_input = inspect_local_immutable_input(
+        input_root,
+        target_path="/opt/cayu/inputs/runtime",
+        policy_fingerprint="sha256:" + ("a" * 64),
+        runtime_compatibility_fingerprint=runtime_compatibility,
+        authorization_scope_fingerprint="sha256:" + ("c" * 64),
+    )
+    store = ImmutableInputStore(tmp_path / "managed")
+    factory = DockerCodingEnvironmentFactory(
+        source_workspace=LocalWorkspace(workspace_root),
+        image_identity=image_identity,
+        immutable_inputs=(immutable_input,),
+        immutable_input_store=store,
+        immutable_input_runtime_compatibility_fingerprint=runtime_compatibility,
+        docker_path=docker_path,
+    )
+
+    async def run() -> None:
+        results: list[EnvironmentFactoryResult] = []
+
+        async def create_one(index: int) -> None:
+            result = await factory.create(
+                EnvironmentFactoryRequest(
+                    session_id=f"live-immutable-{index}",
+                    agent_name="coding-agent",
+                    environment_name="coding",
+                )
+            )
+            results.append(result)
+
+        try:
+            outcomes = await asyncio.gather(
+                *(create_one(index) for index in range(100)),
+                return_exceptions=True,
+            )
+            failures = [value for value in outcomes if isinstance(value, BaseException)]
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise BaseExceptionGroup("Docker fan-out creation failed.", failures)
+            runners = [result.environment.runner for result in results]
+            assert all(runner is not None for runner in runners)
+            reads = await asyncio.gather(
+                *(
+                    runner.exec(  # type: ignore[union-attr]
+                        ExecCommand.process(
+                            "python3",
+                            "-c",
+                            "from pathlib import Path; "
+                            "raise SystemExit("
+                            "Path('/opt/cayu/inputs/runtime/runtime.txt').read_bytes() "
+                            f"!= {expected!r})",
+                        )
+                    )
+                    for runner in runners
+                )
+            )
+            assert all(read.exit_code == 0 for read in reads)
+            diagnostic = store.inspect()[0]
+            assert diagnostic.reference_count == 100
+            assert diagnostic.reuse_count == 99
+            assert len(tuple((store.root / "objects").iterdir())) == 1
+        finally:
+            releases = [result.release for result in results]
+            assert all(release is not None for release in releases)
+            await asyncio.gather(
+                *(
+                    release(EnvironmentFactoryReleaseAction.DISCARD)  # type: ignore[misc]
+                    for release in releases
+                )
+            )
+
+    asyncio.run(run())
+
+    diagnostic = store.inspect()[0]
+    assert diagnostic.reference_count == 0
+    assert diagnostic.cleanup_state == "eligible"
+    assert store.collect(immutable_input.projection.fingerprint) is True
