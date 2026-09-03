@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
 from cayu._exception_groups import exception_cause, set_exception_cause
-from cayu.core import AgentSpec, EventType, Message, ThinkingConfig, ToolCallPart
+from cayu.core import (
+    AgentSpec,
+    EventType,
+    ExecutionProfileBehaviorIdentity,
+    Message,
+    ThinkingConfig,
+    ToolCallPart,
+)
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event
 from cayu.providers import (
@@ -23,6 +31,7 @@ from cayu.providers import (
     ProviderOperationMode,
     ProviderOperationSnapshot,
     ProviderOperationStartIdempotencySupport,
+    ProviderOperationStartRecoveryRequest,
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
@@ -31,6 +40,7 @@ from cayu.runtime import (
     CayuApp,
     EventQuery,
     EventRecord,
+    IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
     PersistedEventSideEffectClaim,
@@ -50,6 +60,7 @@ from cayu.runtime._model_step_executor import (
     ModelCompletionRecoveryContext,
     _raise_terminal_model_attempt_failure,
 )
+from cayu.runtime._recovery_coordinator import ModelCompletionManualRecoveryRequired
 from cayu.runtime.provider_operations import (
     ProviderOperationAccountingStatus,
     ProviderOperationCancellationStatus,
@@ -58,6 +69,7 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
 )
 from cayu.runtime.sessions import ModelCompletionStageRequest, ModelCompletionStageResult
+from cayu.storage import SQLiteSessionStore
 from cayu.vaults import SecretRedactor
 
 
@@ -380,6 +392,119 @@ class _CancellationResistantCancelAdapter(_ReconnectableAdapter):
             self.local_cancellation_observed.set()
             await self.cancel_release.wait()
             raise
+
+
+class _ConcurrentCancellationBackend:
+    def __init__(self, *, expected_operations: int) -> None:
+        self.expected_operations = expected_operations
+        self.states: dict[str, ProviderOperationState] = {}
+        self.statuses: dict[str, ProviderOperationStatus] = {}
+        self.cancel_calls: dict[str, int] = {}
+        self.recover_start_calls: list[str] = []
+        self.retrieve_calls: list[str] = []
+        self.local_cancellation_observed: set[str] = set()
+        self.all_local_cancellations_observed = asyncio.Event()
+        self.cancel_release = asyncio.Event()
+
+
+class _ConcurrentCancellationAdapter(ProviderOperationAdapter):
+    def __init__(self, backend: _ConcurrentCancellationBackend) -> None:
+        self.backend = backend
+
+    @property
+    def start_idempotency_support(self) -> ProviderOperationStartIdempotencySupport:
+        return ProviderOperationStartIdempotencySupport.EXACT
+
+    @property
+    def cancellation_support(self) -> ProviderOperationCancellationSupport:
+        return ProviderOperationCancellationSupport.SUPPORTED
+
+    @staticmethod
+    def _events() -> AsyncIterator[ModelStreamEvent]:
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            return
+            yield  # pragma: no cover - keeps this an async generator
+
+        return events()
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        state = ProviderOperationState(
+            operation_id=request.idempotency_key,
+            stream_protocol="concurrent-cancellation-v1",
+        )
+        self.backend.states[request.idempotency_key] = state
+        self.backend.statuses[state.operation_id] = ProviderOperationStatus.IN_PROGRESS
+        return ProviderOperationConnection(
+            state=state,
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=self._events(),
+        )
+
+    async def recover_start(
+        self,
+        request: ProviderOperationStartRecoveryRequest,
+    ) -> ProviderOperationConnection:
+        self.backend.recover_start_calls.append(request.idempotency_key)
+        state = self.backend.states[request.idempotency_key]
+        return ProviderOperationConnection(
+            state=state,
+            status=self.backend.statuses[state.operation_id],
+            events=self._events(),
+        )
+
+    async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.backend.retrieve_calls.append(state.operation_id)
+        return ProviderOperationSnapshot(
+            state=state,
+            status=self.backend.statuses[state.operation_id],
+        )
+
+    async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
+        raise AssertionError(f"terminal provider operation reconnected: {state.operation_id}")
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.backend.cancel_calls[state.operation_id] = (
+            self.backend.cancel_calls.get(state.operation_id, 0) + 1
+        )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.backend.local_cancellation_observed.add(state.operation_id)
+            if len(self.backend.local_cancellation_observed) == self.backend.expected_operations:
+                self.backend.all_local_cancellations_observed.set()
+            await self.backend.cancel_release.wait()
+        self.backend.statuses[state.operation_id] = ProviderOperationStatus.CANCELLED
+        return ProviderOperationSnapshot(
+            state=state,
+            status=ProviderOperationStatus.CANCELLED,
+        )
+
+
+class _ConcurrentCancellationProvider(ModelProvider):
+    name = "concurrent-cancellation"
+
+    def __init__(self, backend: _ConcurrentCancellationBackend) -> None:
+        self.adapter = _ConcurrentCancellationAdapter(backend)
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:concurrent-provider-cancellation",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    @property
+    def provider_operation_mode(self) -> ProviderOperationMode:
+        return ProviderOperationMode.BACKGROUND
+
+    @property
+    def provider_operations(self) -> ProviderOperationAdapter:
+        return self.adapter
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        raise AssertionError("background provider must not use stream")
 
 
 class _FailingOperationStreamAdapter(_ReconnectableAdapter):
@@ -2236,7 +2361,7 @@ def test_cancellation_during_definite_absence_cleanup_propagates() -> None:
     assert cancel_calls == 1
 
 
-def test_timed_out_provider_cancellation_releases_with_uncertain_cleanup_evidence(
+def test_timed_out_provider_cancellation_remains_owned_until_drained(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> tuple[bool, int]:
@@ -2267,14 +2392,164 @@ def test_timed_out_provider_cancellation_releases_with_uncertain_cleanup_evidenc
         await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
         await asyncio.wait_for(task, timeout=1)
         assert task.done()
+        retained = app.provider_operation_cancellation_status()
+        assert retained.active_owners == 1
+        assert retained.active_tasks == 1
         adapter.cancel_release.set()
-        await asyncio.sleep(0)
+        assert await app.drain_provider_operation_cancellations(timeout_s=1) is True
+        drained = app.provider_operation_cancellation_status()
+        assert drained.active_owners == 0
+        assert drained.active_tasks == 0
         return task.done(), adapter.cancel_calls
 
     done, cancel_calls = asyncio.run(scenario())
 
     assert done
     assert cancel_calls == 1
+
+
+def test_runtime_shutdown_drains_concurrent_definite_absence_cancellations_before_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        operation_count = 12
+        monkeypatch.setattr(
+            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS",
+            0.0,
+        )
+        database_path = tmp_path / "provider-cancellation-shutdown.sqlite3"
+        store = _FailProviderStartedSQLiteStore(database_path)
+        backend = _ConcurrentCancellationBackend(expected_operations=operation_count)
+        provider = _ConcurrentCancellationProvider(backend)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_ids = [
+            f"shutdown-provider-cancellation-{index}" for index in range(operation_count)
+        ]
+
+        runs = [
+            asyncio.create_task(
+                _collect_run_events(
+                    app,
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "cancel after definite absence")],
+                    ),
+                )
+            )
+            for session_id in session_ids
+        ]
+        await asyncio.wait_for(
+            backend.all_local_cancellations_observed.wait(),
+            timeout=20,
+        )
+        run_outcomes = await asyncio.wait_for(
+            asyncio.gather(*runs, return_exceptions=True),
+            timeout=20,
+        )
+        assert all(isinstance(outcome, _ShutdownProcessLoss) for outcome in run_outcomes)
+
+        retained = app.provider_operation_cancellation_status()
+        assert retained.active_owners == operation_count
+        assert retained.active_tasks == operation_count
+        assert set(backend.cancel_calls.values()) == {1}
+
+        drain_task = asyncio.create_task(app.drain_provider_operation_cancellations(timeout_s=5))
+        await asyncio.sleep(0)
+        backend.cancel_release.set()
+        assert await drain_task is True
+        drained = app.provider_operation_cancellation_status()
+        assert drained.admissions_sealed is True
+        assert drained.active_owners == 0
+        assert drained.active_tasks == 0
+        assert drained.completed_owners == operation_count
+        assert set(backend.cancel_calls.values()) == {1}
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and task.get_name().startswith("cayu-provider-operation-cancel")
+        ]
+        await store.close()
+
+        recovered_store = SQLiteSessionStore(database_path)
+        recovered_provider = _ConcurrentCancellationProvider(backend)
+        recovered_app = CayuApp(session_store=recovered_store, enable_logging=False)
+        recovered_app.register_provider(recovered_provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        requests = [
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_for_seconds=0,
+            )
+            for session_id in session_ids
+        ]
+        await asyncio.gather(
+            *(recovered_app.recover_incomplete_session(request) for request in requests)
+        )
+
+        for session_id in session_ids:
+            session = await recovered_store.load(session_id)
+            assert session is not None
+            assert session.status is SessionStatus.INTERRUPTED
+            inspection = await inspect_provider_operation(recovered_store, session_id)
+            assert (
+                inspection.status
+                is ProviderOperationInspectionStatus.PROVIDER_OPERATION_UNAVAILABLE
+            )
+            events = await recovered_store.load_events(session_id)
+            started_events = [
+                event for event in events if event.type is EventType.PROVIDER_OPERATION_STARTED
+            ]
+            assert len(started_events) == 1
+            assert started_events[0].payload["status"] == ProviderOperationStatus.CANCELLED.value
+            assert (
+                sum(
+                    event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
+                )
+                == 1
+            )
+            interrupted_events = [
+                event for event in events if event.type is EventType.SESSION_INTERRUPTED
+            ]
+            assert len(interrupted_events) == 1, [
+                (event.id, event.payload) for event in interrupted_events
+            ]
+
+        recovered_start_calls = tuple(backend.recover_start_calls)
+        retrieve_calls = tuple(backend.retrieve_calls)
+        replay_outcomes = await asyncio.gather(
+            *(recovered_app.recover_incomplete_session(request) for request in requests),
+            return_exceptions=True,
+        )
+        assert all(
+            isinstance(outcome, ModelCompletionManualRecoveryRequired)
+            for outcome in replay_outcomes
+        )
+        assert tuple(backend.recover_start_calls) == recovered_start_calls
+        assert tuple(backend.retrieve_calls) == retrieve_calls
+        assert set(backend.cancel_calls.values()) == {1}
+        for session_id in session_ids:
+            events = await recovered_store.load_events(session_id)
+            assert sum(event.type is EventType.PROVIDER_OPERATION_STARTED for event in events) == 1
+            assert (
+                sum(
+                    event.type is EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED for event in events
+                )
+                == 1
+            )
+            interrupted_events = [
+                event for event in events if event.type is EventType.SESSION_INTERRUPTED
+            ]
+            assert len(interrupted_events) == 1, [
+                (event.id, event.payload) for event in interrupted_events
+            ]
+        await recovered_store.close()
+
+    asyncio.run(scenario())
 
 
 def test_operator_inspection_rejects_contradictory_operation_identity() -> None:
@@ -2762,6 +3037,19 @@ class _FailBeforeCommitOnEventStore(InMemorySessionStore):
         if event.type == self.fail_on and not self.failed:
             self.failed = True
             raise self.failure
+        await super().append_event(session_id, event)
+
+
+class _ShutdownProcessLoss(BaseException):
+    pass
+
+
+class _FailProviderStartedSQLiteStore(SQLiteSessionStore):
+    invocation_lifecycle_command_version = 1
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type is EventType.PROVIDER_OPERATION_STARTED:
+            raise _ShutdownProcessLoss("process stopped before provider identity publication")
         await super().append_event(session_id, event)
 
 

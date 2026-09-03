@@ -8593,6 +8593,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     cayu_app = CayuApp()
     drain_timeouts = []
     recovery_drain_timeouts = []
+    provider_cancellation_drain_timeouts = []
     environment_drain_timeouts = []
     knowledge_drain_timeouts = []
     knowledge_seals = 0
@@ -8614,6 +8615,10 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         recovery_drain_timeouts.append(timeout_s)
         return True
 
+    async def drain_provider_operation_cancellations(*, timeout_s):
+        provider_cancellation_drain_timeouts.append(timeout_s)
+        return True
+
     def seal_knowledge_publications():
         nonlocal knowledge_seals
         knowledge_seals += 1
@@ -8624,6 +8629,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
 
     cayu_app.drain_background_interruptions = drain_background_interruptions
     cayu_app.drain_recovery_cleanups = drain_recovery_cleanups
+    cayu_app.drain_provider_operation_cancellations = drain_provider_operation_cancellations
     cayu_app.drain_environment_cleanups = drain_environment_cleanups
     cayu_app.seal_knowledge_publications = seal_knowledge_publications
     cayu_app.drain_knowledge_publications = drain_knowledge_publications
@@ -8643,12 +8649,34 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
 
     assert drain_timeouts == [2.5]
     assert recovery_drain_timeouts == [2.5]
+    assert provider_cancellation_drain_timeouts == [2.5]
     assert environment_drain_timeouts == [2.5]
     assert knowledge_seals == 1
     assert knowledge_drain_timeouts == [1.5]
     assert len(resume_calls) == 1
     assert type(resume_calls[0]) is int
     assert resume_calls[0] >= 0
+
+
+def test_mount_cayu_reports_unresolved_provider_cancellation_owners(caplog) -> None:
+    server = FastAPI()
+    cayu_app = CayuApp()
+
+    async def unresolved_provider_cancellations(*, timeout_s):
+        assert timeout_s == 10.0
+        return False
+
+    cayu_app.drain_provider_operation_cancellations = unresolved_provider_cancellations
+    cayu_app.provider_operation_cancellation_status = lambda: SimpleNamespace(active_owners=3)
+    mount_cayu(server, cayu_app, path="/cayu", dashboard=False, access=OpenAccess())
+
+    with caplog.at_level(logging.WARNING, logger="cayu.server"), TestClient(server):
+        pass
+
+    assert (
+        "3 provider-operation cancellation owner(s) remained unresolved after the "
+        "10.000s shutdown grace period."
+    ) in caplog.messages
 
 
 def test_mount_cayu_drains_cascades_when_startup_recovery_fails() -> None:
@@ -13461,6 +13489,11 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         assert timeout_s == 10.0
         return True
 
+    async def drain_provider_operation_cancellations(*, timeout_s):
+        calls.append("provider_cancellation_drain")
+        assert timeout_s == 10.0
+        return True
+
     async def resume_pending_interruption_cascades(*, interrupting_inactive_for_seconds):
         calls.append("resume_cascades")
         assert interrupting_inactive_for_seconds == 60
@@ -13469,6 +13502,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     app.recover_incomplete_sessions = recover
     app.recover_persisted_event_side_effects = recover_event_side_effects
     app.drain_background_interruptions = drain_background_interruptions
+    app.drain_provider_operation_cancellations = drain_provider_operation_cancellations
     app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     server = create_server(
         app,
@@ -13502,6 +13536,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         "recover",
         "resume_cascades",
         "drain",
+        "provider_cancellation_drain",
         "user_stop",
     ]
     assert len(requests) == 1

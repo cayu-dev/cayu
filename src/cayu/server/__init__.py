@@ -785,6 +785,26 @@ async def _drain_recovery_cleanups(app: CayuApp, *, timeout_s: float) -> None:
         )
 
 
+async def _drain_provider_operation_cancellations(
+    app: CayuApp,
+    *,
+    timeout_s: float,
+) -> None:
+    try:
+        drained = await app.drain_provider_operation_cancellations(timeout_s=timeout_s)
+    except Exception:
+        logger.exception("Failed to drain provider-operation cancellations during shutdown.")
+        return
+    if not drained:
+        status = app.provider_operation_cancellation_status()
+        logger.warning(
+            "%d provider-operation cancellation owner(s) remained unresolved after the "
+            "%.3fs shutdown grace period.",
+            status.active_owners,
+            timeout_s,
+        )
+
+
 async def _drain_knowledge_publications(app: CayuApp, *, timeout_s: float) -> None:
     try:
         drained = await app.drain_knowledge_publications(timeout_s=timeout_s)
@@ -809,6 +829,10 @@ async def _drain_server_owned_work(
             timeout_s=lifecycle.interruption_shutdown_grace_seconds,
         )
         await _drain_recovery_cleanups(
+            app,
+            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+        )
+        await _drain_provider_operation_cancellations(
             app,
             timeout_s=lifecycle.interruption_shutdown_grace_seconds,
         )
@@ -974,6 +998,10 @@ def _compose_interruption_drain_lifespan(
                         try:
                             await _drain_background_interruptions(app, timeout_s=timeout_s)
                             await _drain_recovery_cleanups(app, timeout_s=timeout_s)
+                            await _drain_provider_operation_cancellations(
+                                app,
+                                timeout_s=timeout_s,
+                            )
                             await _drain_environment_cleanups(app, timeout_s=timeout_s)
                         finally:
                             await _drain_knowledge_publications(

@@ -7607,6 +7607,33 @@ An eventual start acknowledgement may publish cleanup evidence only under the
 dispatching run epoch or its exact single successor recovery claim. It never
 borrows authority from a later resumed or replacement run epoch.
 
+Every provider-operation cancellation runs under a `CayuApp`-owned lifecycle,
+including cancellation after definite absence of the started event. The
+lifecycle deduplicates concurrent ownership by adapter and exact operation
+identity, retains cancellation that outlives the request-local settlement
+window, and bounds the process to 1,024 active owners. Capacity exhaustion
+fails the new cancellation admission closed while leaving existing ownership
+unchanged. `CayuApp.provider_operation_cancellation_status()` exposes only
+content-free owner/task and outcome counts. On shutdown,
+`CayuApp.drain_provider_operation_cancellations(...)` seals new admissions,
+requests cancellation once from each owner that has not already received it,
+and waits for all retained work within a finite grace period. Repeated drains
+are idempotent. Cayu's server lifespans call this boundary after interruption
+and recovery cleanup can no longer create cancellation work; if the grace
+period expires, the server reports the exact unresolved owner count. Durable
+starting, cancellation-claim, terminal-session, and recovery-required evidence
+remains the authority after process loss; a process-local task result never
+authorizes redispatch or duplicate terminal settlement.
+If cancellation resolution crossed the durable event boundary before process
+loss, a recovery owner replays that exact outcome under its new cancellation
+claim and never invokes the provider cancellation operation again. Confirmed
+cancellation can therefore finish its original budget settlement, and a
+provider completion that won the race can continue exact-result recovery,
+without duplicating the remote cancellation side effect.
+A durable cancellation request without a matching resolution is uncertain
+provider dispatch: recovery records an unconfirmed outcome and fails closed
+without invoking provider cancellation again.
+
 The provider-issued operation id and stream protocol are publicly inspectable;
 the bounded durable recovery metadata is retained only in the internal event
 record. Recovery metadata has a runtime-owned monotonic cursor (a strict

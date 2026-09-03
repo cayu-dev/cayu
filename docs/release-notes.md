@@ -89,6 +89,20 @@ guard.
 
 ## Unreleased
 
+### Provider-operation cancellation drains before Runtime shutdown
+
+`CayuApp` now owns every provider-operation cancellation task under one bounded
+lifecycle. Cancellation that exceeds its request-local cleanup window remains
+tracked instead of becoming a detached task, and application code can inspect
+content-free ownership counts with
+`provider_operation_cancellation_status()`. The bounded
+`drain_provider_operation_cancellations(...)` shutdown boundary seals new
+admissions, requests cancellation once, and waits for retained owners. Both
+standalone and mounted Cayu server lifespans compose that drain and report the
+number of owners that exceed the configured shutdown grace period. Repeated
+shutdown and fresh-runtime recovery reuse durable operation identity without
+duplicating provider cancellation or terminal recovery evidence.
+
 ### Durable dispatch ownership now uses store time and reusable fencing
 
 Cayu now has a small internal durable-operation ownership component for

@@ -710,6 +710,16 @@ class RecoverableProviderOperation:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderOperationCancellationResolution:
+    """Latest durable cancellation outcome for one exact provider operation."""
+
+    status: ProviderOperationCancellationStatus
+    provider_status: ProviderOperationStatus | None = None
+    error_type: str | None = None
+    resolution_recorded: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class RecoverableProviderOperationStart:
     """Durable start-only evidence bound to one active model attempt."""
 
@@ -804,6 +814,48 @@ def _completion_scope(event: Event, *, label: str) -> tuple[str, str]:
     ):
         raise ProviderOperationEvidenceError(f"{label} provider scope is malformed.")
     return provider, model
+
+
+def provider_operation_cancellation_event_id(
+    *,
+    stage_id: str,
+    run_epoch: int,
+    event_type: EventType,
+    cancellation_status: str,
+    provider_status: ProviderOperationStatus | None = None,
+    error_type: str | None = None,
+) -> str:
+    """Return the exact identity of one cancellation request or resolution."""
+
+    stage_id = require_durable_clean_nonblank(stage_id, "stage_id")
+    if type(run_epoch) is not int or not 0 <= run_epoch <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Provider-operation cancellation run epoch is invalid.")
+    if event_type not in {
+        EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+        EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+    }:
+        raise ValueError("Provider-operation cancellation event type is invalid.")
+    cancellation_status = require_durable_clean_nonblank(
+        cancellation_status,
+        "cancellation_status",
+    )
+    if provider_status is not None and type(provider_status) is not ProviderOperationStatus:
+        raise TypeError("provider_status must be a ProviderOperationStatus.")
+    if error_type is not None:
+        error_type = require_durable_clean_nonblank(error_type, "error_type")
+    identity_material = canonical_durable_json_bytes(
+        {
+            "schema_version": 1,
+            "stage_id": stage_id,
+            "run_epoch": run_epoch,
+            "event_type": event_type.value,
+            "cancellation_status": cancellation_status,
+            "provider_status": None if provider_status is None else provider_status.value,
+            "error_type": error_type,
+        },
+        "provider_operation_cancellation_identity",
+    )
+    return f"provider-cancel:v1:{sha256(identity_material).hexdigest()}"
 
 
 def provider_operation_progress_storage_key(stage_id: str) -> str:
@@ -1462,6 +1514,191 @@ async def load_recoverable_provider_operation(
         max_attempts=latest.max_attempts,
         source_run_epoch=latest.source_run_epoch,
         accepted_stream_events=accepted_stream_events,
+    )
+
+
+async def load_provider_operation_cancellation_resolution(
+    session_store: SessionStore,
+    stage: ModelCompletionStage,
+    operation: RecoverableProviderOperation,
+) -> ProviderOperationCancellationResolution | None:
+    """Load the latest exact cancellation result without replaying provider work."""
+
+    records = await session_store.query_events(
+        EventQuery(
+            session_id=stage.session_id,
+            event_types=(
+                EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+                EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+            ),
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    if not records:
+        return None
+    event = records[0].event
+    try:
+        event_type = EventType(event.type)
+    except ValueError:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence has an invalid event type."
+        ) from None
+    raw_model_step_id = event.payload.get("model_step_id")
+    raw_model_attempt_id = event.payload.get("model_attempt_id")
+    if (
+        raw_model_step_id != operation.model_attempt_identity.model_step_id
+        or raw_model_attempt_id != operation.model_attempt_identity.model_attempt_id
+    ):
+        return None
+    _require_provider_operation_event_profile(
+        event,
+        stage=stage,
+        label="Provider-operation cancellation evidence",
+    )
+    expected_identity = (
+        operation.interaction_id,
+        operation.step,
+        operation.attempt,
+        operation.max_attempts,
+        operation.model_attempt_identity.model_step_id,
+        operation.model_attempt_identity.model_attempt_id,
+    )
+    if _model_identity(event, label="Provider-operation cancellation evidence") != (
+        expected_identity
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence changed its owning interaction or attempt."
+        )
+    if _provider_scope(event, label="Provider-operation cancellation evidence") != (
+        operation.provider,
+        operation.model,
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence changed its provider scope."
+        )
+    if (
+        _provider_operation_epoch(
+            event,
+            label="Provider-operation cancellation evidence",
+        )
+        != operation.source_run_epoch
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence changed its source run epoch."
+        )
+    if (
+        event.payload.get("operation_id") != operation.state.operation_id
+        or event.payload.get("stream_protocol") != operation.state.stream_protocol
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence changed operation identity."
+        )
+    try:
+        status = ProviderOperationCancellationStatus(event.payload.get("cancellation_status"))
+    except ValueError:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence has an invalid status."
+        ) from None
+    raw_provider_status = event.payload.get("provider_status")
+    try:
+        provider_status = (
+            None if raw_provider_status is None else ProviderOperationStatus(raw_provider_status)
+        )
+    except ValueError:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation resolution has an invalid provider status."
+        ) from None
+    raw_error_type = event.payload.get("error_type")
+    if raw_error_type is not None and type(raw_error_type) is not str:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation resolution has an invalid error type."
+        )
+    error_type = (
+        None
+        if raw_error_type is None
+        else require_durable_clean_nonblank(raw_error_type, "error_type")
+    )
+    publishing_run_epoch = event.payload.get("run_epoch")
+    current_session = await session_store.load(stage.session_id)
+    if (
+        current_session is None
+        or type(publishing_run_epoch) is not int
+        or not operation.source_run_epoch <= publishing_run_epoch <= current_session.run_epoch
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation publishing run epoch is invalid."
+        )
+    if event.id != provider_operation_cancellation_event_id(
+        stage_id=stage.stage_id,
+        run_epoch=publishing_run_epoch,
+        event_type=event_type,
+        cancellation_status=status.value,
+        provider_status=provider_status,
+        error_type=error_type,
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation evidence has a contradictory event identity."
+        )
+    if event_type is EventType.PROVIDER_OPERATION_CANCEL_REQUESTED:
+        if (
+            status is not ProviderOperationCancellationStatus.REQUESTED
+            or provider_status is not None
+            or error_type is not None
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation cancellation request has terminal result evidence."
+            )
+        # Publication of the request happens immediately before provider dispatch.
+        # After process loss Cayu cannot distinguish a pre-dispatch crash from a
+        # lost acknowledgement, so replay must fail closed rather than risk a
+        # duplicate remote cancellation side effect.
+        return ProviderOperationCancellationResolution(
+            status=ProviderOperationCancellationStatus.FAILED,
+            error_type="CancellationUnconfirmed",
+            resolution_recorded=False,
+        )
+    if status in {
+        ProviderOperationCancellationStatus.NOT_REQUESTED,
+        ProviderOperationCancellationStatus.REQUESTED,
+    }:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation resolution has a nonterminal status."
+        )
+    expected_status = (
+        None
+        if provider_status is None
+        else {
+            ProviderOperationStatus.CANCELLED: ProviderOperationCancellationStatus.CANCELLED,
+            ProviderOperationStatus.COMPLETED: ProviderOperationCancellationStatus.COMPLETED,
+            ProviderOperationStatus.QUEUED: ProviderOperationCancellationStatus.PENDING,
+            ProviderOperationStatus.IN_PROGRESS: ProviderOperationCancellationStatus.PENDING,
+            ProviderOperationStatus.UNAVAILABLE: ProviderOperationCancellationStatus.UNAVAILABLE,
+            ProviderOperationStatus.FAILED: ProviderOperationCancellationStatus.FAILED,
+            ProviderOperationStatus.EXPIRED: ProviderOperationCancellationStatus.FAILED,
+        }[provider_status]
+    )
+    if provider_status is not None:
+        if status is not expected_status or error_type is not None:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation cancellation resolution contradicts provider status."
+            )
+    elif status is ProviderOperationCancellationStatus.UNSUPPORTED:
+        if error_type is not None:
+            raise ProviderOperationEvidenceError(
+                "Unsupported provider cancellation has contradictory error evidence."
+            )
+    elif (
+        status is not ProviderOperationCancellationStatus.FAILED
+        or error_type != "CancellationUnconfirmed"
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation cancellation resolution lacks provider status evidence."
+        )
+    return ProviderOperationCancellationResolution(
+        status=status,
+        provider_status=provider_status,
+        error_type=error_type,
     )
 
 
@@ -2830,6 +3067,7 @@ async def inspect_provider_operation(
 __all__ = [
     "PROVIDER_OPERATION_RESOLUTION_METADATA_MAX_BYTES",
     "ProviderOperationAccountingStatus",
+    "ProviderOperationCancellationResolution",
     "ProviderOperationCancellationStatus",
     "ProviderOperationEvidenceError",
     "ProviderOperationInspection",
@@ -2851,11 +3089,13 @@ __all__ = [
     "copy_provider_operation_resolution_request",
     "inspect_provider_operation",
     "load_pending_provider_operation_disposition",
+    "load_provider_operation_cancellation_resolution",
     "load_provider_operation_resolution",
     "load_recoverable_provider_operation",
     "load_recoverable_provider_operation_start",
     "pending_provider_operation_disposition_from_checkpoint",
     "prepare_provider_operation_resolution_request",
+    "provider_operation_cancellation_event_id",
     "provider_operation_duplicate_request_risk",
     "provider_operation_resolution_request_digest",
     "provider_operation_resolution_storage_key",

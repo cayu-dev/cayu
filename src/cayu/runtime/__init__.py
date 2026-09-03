@@ -496,6 +496,9 @@ from cayu.runtime.memory_context import (
     AutomaticRecallSourceConfig,
 )
 from cayu.runtime.outcomes import RunOutcome, StructuredOutputResult, run_to_completion
+from cayu.runtime.provider_operation_cancellation import (
+    ProviderOperationCancellationLifecycleSnapshot,
+)
 from cayu.runtime.provider_operations import (
     ProviderOperationAccountingStatus,
     ProviderOperationCancellationStatus,
@@ -1474,6 +1477,7 @@ __all__ = [
     "Provenance",
     "ProviderManifest",
     "ProviderOperationAccountingStatus",
+    "ProviderOperationCancellationLifecycleSnapshot",
     "ProviderOperationCancellationStatus",
     "ProviderOperationEvidenceError",
     "ProviderOperationInspection",

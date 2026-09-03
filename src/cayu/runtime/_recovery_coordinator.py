@@ -445,6 +445,7 @@ _TERMINAL_FINALIZATION_PROCESS_CONTROL_SIGNALS = (
 _MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
 _TERMINAL_EVIDENCE_REPAIR_NAMESPACE = UUID("bd021bef-ec8f-4e1e-950d-734e2c9ac513")
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
+_PROVIDER_OPERATION_UNAVAILABLE_INTERRUPT_NAMESPACE = UUID("c7b311fa-d36b-4ecb-a93a-c96e4c047f01")
 _INCOMPLETE_RECOVERY_CURSOR_VERSION = 1
 # Opaque store cursors require consuming each fetched page completely. When
 # only one result slot remains, that can force one-candidate pages; cap the
@@ -19776,13 +19777,20 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Unavailable provider operation cannot pause the current session status."
                 )
-            interrupted_event = await self._event_writer.emit(
+            interrupted_event = event_with_runtime_generated_id(
                 Event(
+                    id=str(
+                        uuid5(
+                            _PROVIDER_OPERATION_UNAVAILABLE_INTERRUPT_NAMESPACE,
+                            f"{session.id}\0{active_model_stage.stage.stage_id}\0"
+                            f"{unavailable_event.id}",
+                        )
+                    ),
                     type=EventType.SESSION_INTERRUPTED,
                     session_id=session.id,
-                    interaction_id=unavailable_event.interaction_id,
                     agent_name=session.agent_name,
                     environment_name=environment_name,
+                    timestamp=unavailable_event.timestamp,
                     payload={
                         "interruption_type": "provider_operation_unavailable",
                         "stage_id": active_model_stage.stage.stage_id,
@@ -19792,6 +19800,10 @@ class RecoveryCoordinator:
                         ),
                     },
                 )
+            )
+            persisted_interrupted = await self._event_writer.persist_exact_replay(interrupted_event)
+            [interrupted_event] = await self._event_writer.fan_out_persisted(
+                [persisted_interrupted]
             )
             events.append(interrupted_event)
             return IncompleteSessionRecoveryResult(

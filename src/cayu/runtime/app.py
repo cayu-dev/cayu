@@ -338,6 +338,10 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicyAction,
     copy_mcp_manifest_policy,
 )
+from cayu.runtime.provider_operation_cancellation import (
+    ProviderOperationCancellationLifecycle,
+    ProviderOperationCancellationLifecycleSnapshot,
+)
 from cayu.runtime.provider_operations import (
     ProviderOperationRecoveryResult,
     ProviderOperationResolutionAction,
@@ -1337,6 +1341,7 @@ class CayuApp:
         self._session_control = SessionControl[SessionUsageTracker](
             session_store=self._runtime_session_store
         )
+        self._provider_operation_cancellation_lifecycle = ProviderOperationCancellationLifecycle()
         self._model_step_executor = ModelStepExecutor(
             session_store=self._runtime_session_store,
             event_writer=self._event_writer,
@@ -1356,6 +1361,9 @@ class CayuApp:
             apply_limit_evaluation=self._apply_model_step_limit_evaluation,
             stop_for_budget_reservation_failure=(
                 self._stop_for_model_step_budget_reservation_failure
+            ),
+            provider_operation_cancellation_lifecycle=(
+                self._provider_operation_cancellation_lifecycle
             ),
         )
         self._tool_round_executor = ToolRoundExecutor(
@@ -2029,6 +2037,27 @@ class CayuApp:
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         return await self._session_engine.drain_background_interruptions(timeout_s=timeout_s)
+
+    def provider_operation_cancellation_status(
+        self,
+    ) -> ProviderOperationCancellationLifecycleSnapshot:
+        """Return content-free process-local provider-cancellation ownership state."""
+
+        return self._provider_operation_cancellation_lifecycle.snapshot()
+
+    def seal_provider_operation_cancellations(self) -> None:
+        """Reject new cancellation owners and request cancellation from active owners."""
+
+        self._provider_operation_cancellation_lifecycle.seal()
+
+    async def drain_provider_operation_cancellations(
+        self,
+        *,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Seal and boundedly drain every Runtime-owned provider cancellation."""
+
+        return await self._provider_operation_cancellation_lifecycle.drain(timeout_s=timeout_s)
 
     def recovery_cleanup_status(self) -> RecoveryCleanupSupervisorSnapshot:
         """Return content-free process-local cleanup supervision state."""

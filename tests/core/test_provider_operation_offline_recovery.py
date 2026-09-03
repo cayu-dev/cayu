@@ -812,6 +812,54 @@ class _CrashAfterCancellationEventStore(InMemorySessionStore):
         return result
 
 
+class _CrashBeforeCancellationResolutionStore(InMemorySessionStore):
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self, *, ownership_clock=None) -> None:
+        super().__init__(ownership_clock=ownership_clock)
+        self.crashed = False
+
+    async def publish_checkpoint_and_events_with_store_time(self, session_id: str, **kwargs):
+        if not self.crashed and any(
+            event.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED for event in kwargs["events"]
+        ):
+            self.crashed = True
+            raise _SimulatedProcessLoss(
+                "worker died after provider cancellation but before resolution publication"
+            )
+        return await super().publish_checkpoint_and_events_with_store_time(
+            session_id,
+            **kwargs,
+        )
+
+
+class _CorruptCancellationEvidenceStore(_CrashAfterCancellationEventStore):
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self, corruption: Literal["event_id", "run_epoch"]) -> None:
+        super().__init__(EventType.PROVIDER_OPERATION_CANCEL_RESOLVED)
+        self.corruption = corruption
+        self.corrupt_cancellation_evidence = False
+
+    async def query_events(self, query):
+        records = await super().query_events(query)
+        if not self.corrupt_cancellation_evidence:
+            return records
+        corrupted = []
+        for record in records:
+            if record.event.type is not EventType.PROVIDER_OPERATION_CANCEL_RESOLVED:
+                corrupted.append(record)
+                continue
+            if self.corruption == "event_id":
+                event = record.event.model_copy(update={"id": "provider-cancel:v1:corrupt"})
+            else:
+                payload = dict(record.event.payload)
+                payload["run_epoch"] = "corrupt"
+                event = record.event.model_copy(update={"payload": payload})
+            corrupted.append(record.model_copy(update={"event": event}))
+        return corrupted
+
+
 class _FailCancellationClaimHeartbeatStore(InMemorySessionStore):
     invocation_lifecycle_command_version = 1
 
@@ -7635,6 +7683,66 @@ def test_provider_completion_winning_cancellation_is_reconciled_before_interrupt
     asyncio.run(scenario())
 
 
+def test_recovery_reuses_completed_cancellation_resolution_before_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        model_step_executor,
+        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
+        timedelta(seconds=120),
+    )
+    monkeypatch.setattr(
+        model_step_executor,
+        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
+        60.0,
+    )
+
+    async def scenario() -> None:
+        store_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        store = _CrashAfterCancellationEventStore(
+            EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+            ownership_clock=lambda: store_now[0],
+        )
+        provider = _CompletionWinsCancellationProvider()
+        session_id = "offline-provider-completion-resolved-before-crash"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(provider, default=True)
+        first_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in first_app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="lose the worker before retrieving the completed operation",
+                )
+            ):
+                pass
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+        assert not any(
+            event.type is EventType.MODEL_COMPLETED for event in await store.load_events(session_id)
+        )
+
+        store_now[0] += timedelta(seconds=240)
+        recovered_app = CayuApp(session_store=store, enable_logging=False)
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery = await recovered_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_for_seconds=0,
+            )
+        )
+
+        assert recovery.status is SessionStatus.INTERRUPTED
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+        durable = await store.load_events(session_id)
+        assert sum(event.type is EventType.MODEL_COMPLETED for event in durable) == 1
+        assert await store.load_active_model_completion_stage(session_id) is None
+
+    asyncio.run(scenario())
+
+
 def test_lost_cancellation_acknowledgement_remains_truthfully_unconfirmed() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()
@@ -7668,6 +7776,165 @@ def test_lost_cancellation_acknowledgement_remains_truthfully_unconfirmed() -> N
         assert len(resolved) == 1
         assert resolved[0].payload["error_type"] == "CancellationUnconfirmed"
         assert await store.load_active_model_completion_stage(session_id) is not None
+
+    asyncio.run(scenario())
+
+
+def test_recovery_does_not_repeat_a_durably_resolved_provider_cancellation() -> None:
+    async def scenario() -> None:
+        store = _CrashAfterCancellationEventStore(EventType.PROVIDER_OPERATION_CANCEL_RESOLVED)
+        provider = _LostCancellationAcknowledgementProvider()
+        session_id = "offline-provider-cancellation-resolved-before-crash"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(provider, default=True)
+        first_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in first_app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="lose the worker after durable cancellation resolution",
+                )
+            ):
+                pass
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+
+        recovered_app = CayuApp(session_store=store, enable_logging=False)
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery = await recovered_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_for_seconds=0,
+            )
+        )
+
+        assert recovery.status is SessionStatus.INTERRUPTED
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+        assert (
+            sum(
+                event.type is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED
+                for event in await store.load_events(session_id)
+            )
+            == 1
+        )
+        inspection = await inspect_provider_operation(store, session_id)
+        assert inspection.cancellation_status is ProviderOperationCancellationStatus.FAILED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("corruption", ["event_id", "run_epoch"])
+def test_recovery_rejects_malformed_durable_cancellation_authority(
+    corruption: Literal["event_id", "run_epoch"],
+) -> None:
+    async def scenario() -> None:
+        store = _CorruptCancellationEvidenceStore(corruption)
+        provider = _LostCancellationAcknowledgementProvider()
+        session_id = f"offline-provider-cancellation-corrupt-{corruption}"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(provider, default=True)
+        first_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in first_app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="lose the worker after durable cancellation resolution",
+                )
+            ):
+                pass
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+
+        store.corrupt_cancellation_evidence = True
+        recovered_app = CayuApp(session_store=store, enable_logging=False)
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(ProviderOperationEvidenceError):
+            await recovered_app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session_id,
+                    inactive_for_seconds=0,
+                )
+            )
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+
+    asyncio.run(scenario())
+
+
+def test_recovery_does_not_repeat_an_uncertain_provider_cancellation_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        model_step_executor,
+        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
+        timedelta(seconds=120),
+    )
+    monkeypatch.setattr(
+        model_step_executor,
+        "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
+        60.0,
+    )
+
+    async def scenario() -> None:
+        store_now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        store = _CrashBeforeCancellationResolutionStore(ownership_clock=lambda: store_now[0])
+        provider = _CancellableOfflineOperationProvider()
+        session_id = "offline-provider-cancellation-dispatched-before-crash"
+        await _stage_offline_operation(store, session_id=session_id, provider=provider)
+
+        first_app = CayuApp(session_store=store, enable_logging=False)
+        first_app.register_provider(provider, default=True)
+        first_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(_SimulatedProcessLoss):
+            async for _event in first_app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="lose the worker before cancellation resolution publication",
+                )
+            ):
+                pass
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+        assert [
+            event.type
+            for event in await store.load_events(session_id)
+            if event.type
+            in {
+                EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+                EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+            }
+        ] == [EventType.PROVIDER_OPERATION_CANCEL_REQUESTED]
+
+        store_now[0] += timedelta(seconds=240)
+        recovered_app = CayuApp(session_store=store, enable_logging=False)
+        recovered_app.register_provider(provider, default=True)
+        recovered_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        recovery = await recovered_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=session_id,
+                inactive_for_seconds=0,
+            )
+        )
+
+        assert recovery.status is SessionStatus.INTERRUPTED
+        assert provider.adapter.cancel_calls == [provider.adapter.state]
+        cancellation_events = [
+            event
+            for event in await store.load_events(session_id)
+            if event.type
+            in {
+                EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+                EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+            }
+        ]
+        assert [event.type for event in cancellation_events] == [
+            EventType.PROVIDER_OPERATION_CANCEL_REQUESTED,
+            EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
+        ]
+        inspection = await inspect_provider_operation(store, session_id)
+        assert inspection.cancellation_status is ProviderOperationCancellationStatus.FAILED
 
     asyncio.run(scenario())
 
@@ -7886,12 +8153,12 @@ def test_expired_cancellation_claim_allows_worker_loss_takeover(
     monkeypatch.setattr(
         model_step_executor,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_LEASE",
-        timedelta(milliseconds=10),
+        timedelta(seconds=120),
     )
     monkeypatch.setattr(
         model_step_executor,
         "_PROVIDER_OPERATION_CANCELLATION_CLAIM_HEARTBEAT_SECONDS",
-        3600.0,
+        60.0,
     )
 
     async def scenario() -> None:
@@ -7950,7 +8217,7 @@ def test_expired_cancellation_claim_allows_worker_loss_takeover(
             ):
                 pass
 
-        store_now[0] += timedelta(milliseconds=20)
+        store_now[0] += timedelta(seconds=240)
         recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(
                 session_id=session_id,
@@ -7965,7 +8232,7 @@ def test_expired_cancellation_claim_allows_worker_loss_takeover(
         assert checkpoint is not None
         assert "__cayu_provider_operation_cancellation_claim_v1__" not in checkpoint
         expected_cancel_calls = (
-            2 if crash_after is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED else 1
+            1 if crash_after is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED else 0
         )
         assert provider.adapter.cancel_calls == [provider.adapter.state] * expected_cancel_calls
         if crash_after is EventType.PROVIDER_OPERATION_CANCEL_RESOLVED:
